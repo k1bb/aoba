@@ -30,6 +30,7 @@ import math
 import torch
 
 from aoba import constants as C
+from aoba.kernels import solve_tridiagonal_batched
 from aoba.thermodynamics import (
     diagnose_pressure_temperature,
     esat_ice,
@@ -307,98 +308,80 @@ def step_microphysics(
     qn_after = qn_mid + evap_delta
     qp_after = qp_mid - evap_delta
 
-    # Account for latent heat of liquid<->ice conversion & rain evaporation / snow sublimation
-    # Moist static energy conservation: c_pd * T_li_new = c_pd * T_li + L_f0 * (delta_frozen_precip)
-    # - L_eff_precip * evap_delta + L_f0 * (omega_n - omega_p) * conv_delta
-    omega_n_cur = liquid_fraction_condensate(temp)
+    # Account for latent heat of autoconversion/accretion, phase changes & evaporation/sublimation.
+    # Because T_li is defined relative to non-precipitating cloud condensate only
+    # (c_pd * T_li = c_pd * T - L_eff_cloud * q_cond), moist static energy conservation
+    # c_pd * T_li - L_eff_prec * q_p = const requires +L_eff_prec * (conv_delta - evap_delta)
+    # plus fusion adjustment (L_eff_prec_cur - L_eff_prec_old) * q_p = L_f0 * (omega_p_old - omega_p_cur) * q_p:
     _, _, _, omega_p_cur = partition_precipitating_hydrometeors(temp, qp_after)
     l_eff_prec = omega_p_cur * C.L_V0 + (1.0 - omega_p_cur) * C.L_S0
 
-    # Phase-adjustment between cloud condensate phase omega_n and precip phase omega_p,
-    # plus evaporative cooling of unsaturated air (since T_li measures vapor enthalpy baseline)
     dt_li_micro = (
-        (C.L_F0 / C.CP_D) * (omega_n_cur - omega_p_cur) * conv_delta
-        - (l_eff_prec / C.CP_D) * evap_delta
+        (l_eff_prec / C.CP_D) * (conv_delta - evap_delta)
         + (C.L_F0 / C.CP_D) * (omega_p_old - omega_p_cur) * qp
     )
     t_li_after = t_li + dt_li_micro
 
-    # 5. Hydrometeor & Cloud-Ice Sedimentation (KR03 Eqs. A19 & A32-A33)
-    # Determine safe sub-step count so terminal fall CFL <= 0.7 everywhere
-    dz_min_val = float(dz_c.min().item())
-    max_vt_est = 12.0  # Upper bound on bulk rain terminal speed [m s^-1]
-    n_sub = max(1, int(math.ceil(dt * max_vt_est / max(0.7 * dz_min_val, 1.0))))
-    dt_sub = dt / n_sub
-
-    nz = rho_d.shape[0]
-    col_shape = rho_d.shape[1:]
-    rain_accum = torch.zeros(col_shape, dtype=rho_d.dtype, device=rho_d.device)
-    snow_accum = torch.zeros(col_shape, dtype=rho_d.dtype, device=rho_d.device)
-
-    mass_air = rho_d * dz_c  # Dry-air column mass per layer [kg m^-2]
+    # 5. Unconditionally Stable Implicit Donor-Cell Sedimentation via Metal/PyTorch Batched Thomas Solver
+    # (KR03 Eqs. A19 & A32-A33; SCALE-RM Sec. 6.1: exact mass conservation at arbitrary dt with zero CPU sync!)
+    mass_air = torch.clamp(rho_d * dz_c, min=1.0e-4)  # Dry-air column mass per layer [kg m^-2]
     inv_sqrt_rho_sed = torch.rsqrt(torch.clamp(rho_d, min=0.01))
 
     f_exp_r = 1.0 + 0.25 * B_FALL_RAIN
     f_exp_s = 1.0 + 0.25 * B_FALL_SNOW
     f_exp_g = 1.0 + 0.25 * B_FALL_GRAUPEL
 
-    for _ in range(n_sub):
-        q_r_s, q_s_s, q_g_s, omega_p_s = partition_precipitating_hydrometeors(temp, qp_after)
-        rr = torch.clamp(rho_d * q_r_s, min=0.0)
-        rs = torch.clamp(rho_d * q_s_s, min=0.0)
-        rg = torch.clamp(rho_d * q_g_s, min=0.0)
+    q_r_s, q_s_s, q_g_s, omega_p_s = partition_precipitating_hydrometeors(temp, qp_after)
+    rr = torch.clamp(rho_d * q_r_s, min=0.0)
+    rs = torch.clamp(rho_d * q_s_s, min=0.0)
+    rg = torch.clamp(rho_d * q_g_s, min=0.0)
 
-        # Downward mass fluxes [kg m^-2 s^-1] at layer centers (KR03 Eq. A19), bounded by layer mass / dt_sub
-        flux_r = torch.minimum(
-            _FALL_PREF_R * inv_sqrt_rho_sed * (torch.pow(rr + eps_small, f_exp_r) - (eps_small ** f_exp_r)),
-            0.85 * mass_air * q_r_s / dt_sub,
-        )
-        flux_s = torch.minimum(
-            _FALL_PREF_S * inv_sqrt_rho_sed * (torch.pow(rs + eps_small, f_exp_s) - (eps_small ** f_exp_s)),
-            0.85 * mass_air * q_s_s / dt_sub,
-        )
-        flux_g = torch.minimum(
-            _FALL_PREF_G * inv_sqrt_rho_sed * (torch.pow(rg + eps_small, f_exp_g) - (eps_small ** f_exp_g)),
-            0.85 * mass_air * q_g_s / dt_sub,
-        )
-        flux_p_tot = flux_r + flux_s + flux_g
+    flux_r0 = _FALL_PREF_R * inv_sqrt_rho_sed * (torch.pow(rr + eps_small, f_exp_r) - (eps_small ** f_exp_r))
+    flux_s0 = _FALL_PREF_S * inv_sqrt_rho_sed * (torch.pow(rs + eps_small, f_exp_s) - (eps_small ** f_exp_s))
+    flux_g0 = _FALL_PREF_G * inv_sqrt_rho_sed * (torch.pow(rg + eps_small, f_exp_g) - (eps_small ** f_exp_g))
+    flux_p0 = flux_r0 + flux_s0 + flux_g0
 
-        # Upwind flux divergence from above (k+1 -> k; flux at model top k=nz is zero)
-        flux_in_p = torch.zeros_like(flux_p_tot)
-        flux_in_p[:-1] = flux_p_tot[1:]
-        dqp_sed = (flux_in_p - flux_p_tot) * dt_sub / mass_air
-        qp_after = torch.clamp(qp_after + dqp_sed, min=0.0)
+    # Effective precipitation mass-flux coefficient rate_p = rho_d * V_p [kg m^-2 s^-1]
+    rate_p = torch.where(
+        qp_after > 1.0e-12,
+        torch.minimum(flux_p0 / torch.clamp(qp_after, min=1.0e-12), 15.0 * rho_d),
+        torch.zeros_like(qp_after),
+    )
+    dl_sed = torch.zeros_like(qp_after)
+    du_p = torch.zeros_like(qp_after)
+    du_p[:-1] = -dt * rate_p[1:] / mass_air[:-1]
+    diag_p = 1.0 + dt * rate_p / mass_air
+    qp_sed = torch.clamp(solve_tridiagonal_batched(dl_sed, diag_p, du_p, qp_after), min=0.0)
 
-        rain_accum = rain_accum + flux_r[0] * dt_sub
-        snow_accum = snow_accum + (flux_s[0] + flux_g[0]) * dt_sub
+    p_sfc_tot = rate_p[0] * qp_sed[0]  # Exact surface precipitation rate [kg m^-2 s^-1]
+    rain_rate = omega_p_s[0] * p_sfc_tot
+    snow_rate = (1.0 - omega_p_s[0]) * p_sfc_tot
 
-        # Cloud-ice sedimentation (KR03 Eqs. A32-A33)
-        flux_qi = torch.minimum(
-            rho_d * VT_CLOUD_ICE * q_i,
-            0.85 * mass_air * q_i / dt_sub,
-        )
-        flux_in_qi = torch.zeros_like(flux_qi)
-        flux_in_qi[:-1] = flux_qi[1:]
-        dqn_sed = (flux_in_qi - flux_qi) * dt_sub / mass_air
-        qn_after = torch.clamp(qn_after + dqn_sed, min=0.0)
-        q_i = torch.clamp(q_i + dqn_sed, min=0.0)
-        # KR03 Eq. (A33): cloud ice sedimentation does not change in-situ T, so T_li adjusts
-        t_li_after = t_li_after - (C.L_S0 / C.CP_D) * dqn_sed
-        snow_accum = snow_accum + flux_qi[0] * dt_sub
+    # Implicit cloud-ice sedimentation (KR03 Eqs. A32-A33)
+    rate_qi = rho_d * VT_CLOUD_ICE
+    du_qi = torch.zeros_like(q_i)
+    du_qi[:-1] = -dt * rate_qi[1:] / mass_air[:-1]
+    diag_qi = 1.0 + dt * rate_qi / mass_air
+    qi_sed = torch.clamp(solve_tridiagonal_batched(dl_sed, diag_qi, du_qi, q_i), min=0.0)
+
+    dqn_sed = qi_sed - q_i
+    qn_final = torch.clamp(qn_after + dqn_sed, min=0.0)
+    t_li_after = t_li_after - (C.L_S0 / C.CP_D) * dqn_sed
+    snow_rate = snow_rate + rate_qi[0] * qi_sed[0]
 
     # 6. Final saturation adjustment & exact moist potential temperature reconstruction
-    temp_new, qv_new, qc_new, qi_new = saturation_adjustment(t_li_after, pres, qn_after)
+    temp_new, qv_new, qc_new, qi_new = saturation_adjustment(t_li_after, pres, qn_final)
     theta_new = temp_new / exner
     theta_m_new = theta_new * (1.0 + C.RV_OVER_RD * qv_new)
 
     return MicrophysicsResult(
         theta_m_c=theta_m_new,
-        q_n=qn_after,
-        q_p=qp_after,
+        q_n=qn_final,
+        q_p=qp_sed,
         temp_c=temp_new,
         q_v=qv_new,
         q_c=qc_new,
         q_i=qi_new,
-        precip_rain=rain_accum / dt,
-        precip_snow=snow_accum / dt,
+        precip_rain=rain_rate,
+        precip_snow=snow_rate,
     )

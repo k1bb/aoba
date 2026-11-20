@@ -336,7 +336,8 @@ def step_mynn_level25(
     shf_sfc: torch.Tensor,
     evap_sfc: torch.Tensor,
     dt: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_hydrometeors: bool = False,
+):
     """Advance vertical PBL mixing and prognostic doubled TKE `qke = q^2 = 2e` via MYNN Level 2.5.
 
     All 3D/column fields have leading dimension `nz` (`k = 0` lowest full level, `k = nz - 1` top),
@@ -529,8 +530,31 @@ def step_mynn_level25(
         rhs[0] = rhs[0] + dt * sfc_flux / mass_c[0]
         return solve_tridiagonal_batched(dl, diag, du, rhs)
 
-    u_new = _diffuse_implicit(u, k_m_int, tau_x_sfc)
-    v_new = _diffuse_implicit(v, k_m_int, tau_y_sfc)
+    def _diffuse_momentum_implicit(vel: torch.Tensor, k_diff: torch.Tensor, tau_sfc: torch.Tensor) -> torch.Tensor:
+        """Implicit PBL momentum diffusion with unconditionally stable implicit surface drag on diag[0]."""
+        fc = dt * rho_int * k_diff / dz_int
+        dl = torch.zeros_like(vel)
+        du = torch.zeros_like(vel)
+        dl[1:] = -fc / mass_c[1:]
+        du[:-1] = -fc / mass_c[:-1]
+        diag = 1.0 - dl - du
+        rhs = vel.clone()
+
+        # Decompose surface stress into implicit Rayleigh drag when opposing flow (tau_sfc * vel[0] < 0)
+        opposing = (tau_sfc * vel[0]) < 0.0
+        vel0_abs = torch.clamp(vel[0].abs(), min=0.10)
+        r_drag = torch.where(opposing, tau_sfc.abs() / vel0_abs, torch.zeros_like(tau_sfc))
+        explicit_rem = torch.where(
+            opposing,
+            tau_sfc + r_drag * vel[0],  # Zero whenever |vel[0]| >= 0.10 m/s
+            torch.clamp(tau_sfc, -0.5 * mass_c[0] / max(dt, 1.0), 0.5 * mass_c[0] / max(dt, 1.0)),
+        )
+        diag[0] = diag[0] + dt * r_drag / mass_c[0]
+        rhs[0] = rhs[0] + dt * explicit_rem / mass_c[0]
+        return solve_tridiagonal_batched(dl, diag, du, rhs)
+
+    u_new = _diffuse_momentum_implicit(u, k_m_int, tau_x_sfc)
+    v_new = _diffuse_momentum_implicit(v, k_m_int, tau_y_sfc)
 
     # Convert upward sensible heat flux [W m^-2] to kinematic rho_d * w'theta_l' flux [kg m^-2 K s^-1]
     cp_eff_0 = C.CP_D + C.CP_V * q_v[0]
@@ -540,9 +564,11 @@ def step_mynn_level25(
 
     # Reconstruct updated moist potential temperature theta_m_c from diffused (theta_l_new, q_n_new)
     t_li_new = theta_l_new * exner
-    temp_new, qv_new, _, _ = saturation_adjustment(t_li_new, pres, q_n_new)
+    temp_new, qv_new, qc_new, qi_new = saturation_adjustment(t_li_new, pres, q_n_new)
     theta_m_new = (temp_new / exner) * (1.0 + C.RV_OVER_RD * qv_new)
 
+    if return_hydrometeors:
+        return u_new, v_new, theta_m_new, q_n_new, qke_new, k_m_int, k_h_int, qv_new, qc_new, qi_new
     return u_new, v_new, theta_m_new, q_n_new, qke_new, k_m_int, k_h_int
 
 

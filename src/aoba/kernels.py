@@ -72,13 +72,14 @@ def _get_metal_lib():
     return _METAL_SHADER_LIB
 
 
+@torch.jit.script
 def solve_tridiagonal_pytorch(
     dl: torch.Tensor,
     d: torch.Tensor,
     du: torch.Tensor,
     rhs: torch.Tensor,
 ) -> torch.Tensor:
-    """Pure-PyTorch batched Thomas algorithm along dim=0 for shape [K, ...].
+    """Pure-PyTorch JIT-compiled batched Thomas algorithm along dim=0 for shape [K, ...].
 
     Reference: Toon et al. (1989, J. Geophys. Res., 94, Eqs. 45-47).
     """
@@ -99,7 +100,7 @@ def solve_tridiagonal_pytorch(
         c_list.append(c_prev)
         d_list.append(d_prev)
 
-    x_list: list[torch.Tensor] = [torch.empty(0)] * K
+    x_list: list[torch.Tensor] = [d_prev] * K
     x_next = d_list[K - 1]
     x_list[K - 1] = x_next
     for k in range(K - 2, -1, -1):

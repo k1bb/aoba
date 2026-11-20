@@ -696,6 +696,8 @@ def step_crm_physics_and_dynamics(
         crm.theta_m = crm.theta_m + dt_crm * dtheta_m_ls_dt.view(nz, n_col, 1, 1)
     if dq_n_ls_dt is not None:
         crm.q_n = torch.clamp(crm.q_n + dt_crm * dq_n_ls_dt.view(nz, n_col, 1, 1), min=0.0)
+        q_cond_ls = torch.minimum(crm.q_c + crm.q_i, crm.q_n)
+        crm.q_v = torch.clamp(crm.q_n - q_cond_ls, min=0.0)
     if rad_heating_k_s is not None:
         # Convert dT/dt [K s^-1] to d(theta_m)/dt via (1 + RV_OVER_RD * q_v) / Exner
         _, exner_rad, _ = diagnose_pressure_temperature(crm.rho_d, crm.theta_m, crm.q_v)
@@ -711,17 +713,38 @@ def step_crm_physics_and_dynamics(
         crm.u = crm.u + du_relax
         crm.v = crm.v + dv_relax
 
-    # 2. Acoustic/nonhydrostatic RK3-HEVI + Zalesak 3D FCT sub-steps (auto-enforce horizontal acoustic CFL)
-    dt_cfl_max = 0.25 * min(crm.dx, crm.dy) / 350.0
-    n_sub = max(n_dyn_substeps, int(math.ceil(dt_crm / max(dt_cfl_max, 0.1))))
-    dt_sub = dt_crm / float(n_sub)
+    # 2. Acoustic/nonhydrostatic RK3-HEVI + Flux-Averaged Zalesak 3D FCT (Skamarock et al., 2012, Sec. 3c)
+    #Note: When ny == 1 and nx == 1 (1D column spinup mode), horizontal acoustic waves vanish identically!
+    if ny == 1 and nx == 1:
+        n_sub = max(n_dyn_substeps, 0)
+    else:
+        # 2D periodic C-grid RK3 acoustic limit is c_s * dt / dx < sqrt(3) / (2 * sqrt(2)) = 0.612
+        dt_cfl_max = 0.45 * min(crm.dx, crm.dy) / 350.0
+        n_sub = max(n_dyn_substeps, int(math.ceil(dt_crm / max(dt_cfl_max, 0.1))))
+    dt_sub = dt_crm / float(max(n_sub, 1))
     dz_fct = dz_c_col if dz_c_col is not None else vgrid.dzeta_c
 
-    for _ in range(n_sub):
-        rho_before = crm.rho_d.clone()
-        fx, fy, fz = step_crm_rk3_hevi(crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col)
-        crm.q_n = fct_advect_3d(crm.q_n, rho_before, crm.rho_d, fx, fy, fz, crm.dx, crm.dy, dz_fct, dt_sub)
-        crm.q_p = fct_advect_3d(crm.q_p, rho_before, crm.rho_d, fx, fy, fz, crm.dx, crm.dy, dz_fct, dt_sub)
+    # Group acoustic substeps into advective super-steps (<= 60 s) via exact time-averaged mass fluxes
+    adv_group = max(1, min(n_sub, int(math.floor(60.0 / max(dt_sub, 1.0e-3)))))
+    s_idx = 0
+    while s_idx < n_sub:
+        k_cnt = min(adv_group, n_sub - s_idx)
+        rho_start = crm.rho_d.clone()
+        fx_acc = torch.zeros_like(crm.rho_d)
+        fy_acc = torch.zeros_like(crm.rho_d)
+        fz_acc = torch.zeros_like(crm.w)
+        for _ in range(k_cnt):
+            fx, fy, fz = step_crm_rk3_hevi(crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col)
+            fx_acc = fx_acc + fx
+            fy_acc = fy_acc + fy
+            fz_acc = fz_acc + fz
+        inv_k = 1.0 / float(k_cnt)
+        dt_adv = dt_sub * float(k_cnt)
+        crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_acc * inv_k, fy_acc * inv_k, fz_acc * inv_k, crm.dx, crm.dy, dz_fct, dt_adv)
+        crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_acc * inv_k, fy_acc * inv_k, fz_acc * inv_k, crm.dx, crm.dy, dz_fct, dt_adv)
+        q_cond_adv = torch.minimum(crm.q_c + crm.q_i, crm.q_n)
+        crm.q_v = torch.clamp(crm.q_n - q_cond_adv, min=0.0)
+        s_idx += k_cnt
 
     # Expand column vertical metrics across `[Nz, m_sub]` if terrain-following
     zc_flat = (
@@ -748,7 +771,7 @@ def step_crm_physics_and_dynamics(
                 return arr.view(n_col, 1, 1).expand(n_col, ny, nx).reshape(m_sub)
             return arr.reshape(m_sub)
 
-        u_f, v_f, thm_f, qn_f, qke_f, _, _ = step_mynn_level25(
+        u_f, v_f, thm_f, qn_f, qke_f, _, _, qv_f, qc_f, qi_f = step_mynn_level25(
             rho_d=crm.rho_d.reshape(nz, m_sub),
             u=crm.u.reshape(nz, m_sub),
             v=crm.v.reshape(nz, m_sub),
@@ -768,12 +791,16 @@ def step_crm_physics_and_dynamics(
             shf_sfc=_bcast_sfc(sfc_fluxes.shf),
             evap_sfc=_bcast_sfc(sfc_fluxes.evap),
             dt=dt_crm,
+            return_hydrometeors=True,
         )
         crm.u = u_f.reshape(nz, n_col, ny, nx)
         crm.v = v_f.reshape(nz, n_col, ny, nx)
         crm.theta_m = thm_f.reshape(nz, n_col, ny, nx)
         crm.q_n = qn_f.reshape(nz, n_col, ny, nx)
         crm.qke = qke_f.reshape(nz, n_col, ny, nx)
+        crm.q_v = qv_f.reshape(nz, n_col, ny, nx)
+        crm.q_c = qc_f.reshape(nz, n_col, ny, nx)
+        crm.q_i = qi_f.reshape(nz, n_col, ny, nx)
 
     # 4. SAM 1-moment mixed-phase microphysics & sub-cycled sedimentation
     mp = step_microphysics(

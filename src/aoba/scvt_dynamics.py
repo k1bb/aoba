@@ -24,12 +24,13 @@ References
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import torch
 
 from aoba import constants as C
 from aoba.kernels import solve_tridiagonal_batched
 from aoba.scvt_mesh import SCVTMesh, project_cell_vectors_to_edges, reconstruct_cell_winds
-from aoba.thermodynamics import diagnose_pressure_temperature, rcemip_analytic_sounding
+from aoba.thermodynamics import diagnose_pressure_temperature, qsat_mixed, rcemip_analytic_sounding
 from aoba.vertical_grid import VerticalGrid, compute_stf_heights
 
 
@@ -98,18 +99,16 @@ def init_global_hydrostatic_atmosphere(
         env_z = torch.exp(-((zc64 - 4000.0) / 3500.0) ** 2)
         temp64 = temp64 + env_z * wave.unsqueeze(0)
 
+    # Exact barometric surface pressure for piecewise-linear lapse rate
+    p_sfc64 = p_sl * torch.pow(torch.clamp(1.0 - lapse * zw64[0] / t_sl, min=0.2), C.GRAVITY / (C.R_D * lapse))
+
     if moist:
-        # 75% surface RH decaying with altitude scale height 3.5 km
-        es_sl = 611.2 * torch.exp(17.67 * (t_sl - C.T_FREEZE) / (t_sl - 29.65))
-        q0 = 0.75 * C.EPS_WATER * es_sl / (p_sl - es_sl)
-        qv64 = q0.unsqueeze(0) * torch.exp(-zc64 / 3500.0) * torch.exp(-((zc64 / 7500.0) ** 2))
-        qv64 = torch.clamp(qv64, min=1.0e-7)
+        # Sub-saturated mixed-phase relative humidity profile (65% at surface -> 15% aloft; zero startup ice flash!)
+        p_approx = p_sl * torch.pow(torch.clamp(1.0 - lapse * zc64 / t_sl.unsqueeze(0), min=0.05), C.GRAVITY / (C.R_D * lapse))
+        rh_prof = 0.65 * torch.exp(-((zc64 - zw64[0:1]) / 4500.0) ** 1.5)
+        qv64 = torch.clamp(rh_prof * qsat_mixed(temp64, p_approx)[0], min=1.0e-7)
     else:
         qv64 = torch.zeros_like(zc64)
-
-    # Surface pressure at terrain height zw64[0] from sea-level p_sl via barometric integral
-    t_mean_topo = t_sl - 0.5 * lapse * zw64[0]
-    p_sfc64 = p_sl * torch.exp(-C.GRAVITY * zw64[0] / (C.R_D * t_mean_topo))
 
     p64 = torch.empty_like(zc64)
     rho64 = torch.empty_like(zc64)
@@ -321,6 +320,149 @@ def fct_advect_scvt(
 # ---------------------------------------------------------------------------
 # 4. Global Nonhydrostatic RK3-HEVI Step on SCVT Voronoi C-Grid
 # ---------------------------------------------------------------------------
+@torch.jit.script
+def _scvt_fast_acoustic_hevi_cpu_gpu(
+    n_ac: int,
+    dt_ac: float,
+    beta_hevi: float,
+    gravity: float,
+    accum_fluxes: bool,
+    m0: torch.Tensor,
+    Thm0: torch.Tensor,
+    u0: torch.Tensor,
+    w0: torch.Tensor,
+    udotz0: torch.Tensor,
+    pres_s: torch.Tensor,
+    dp_dThm_s: torch.Tensor,
+    Thm_s: torch.Tensor,
+    fac_z0: torch.Tensor,
+    fac_z1: torch.Tensor,
+    rtot_e: torch.Tensor,
+    dc_e: torch.Tensor,
+    tend_u_slow: torch.Tensor,
+    tend_Thm_slow: torch.Tensor,
+    sponge_c: torch.Tensor,
+    sponge_w: torch.Tensor,
+    area_e: torch.Tensor,
+    zw_slope_e: torch.Tensor,
+    valid_ce: torch.Tensor,
+    area_c: torch.Tensor,
+    m_edge: torch.Tensor,
+    thm_e: torch.Tensor,
+    rho_dw: torch.Tensor,
+    rtot_w: torch.Tensor,
+    thm_w: torch.Tensor,
+    dz_c: torch.Tensor,
+    dz_w_int: torch.Tensor,
+    q_load: torch.Tensor,
+    dl: torch.Tensor,
+    diag: torch.Tensor,
+    du: torch.Tensor,
+    c0: torch.Tensor,
+    c1: torch.Tensor,
+    dv_edge: torch.Tensor,
+    edges_on_cell: torch.Tensor,
+    edge_sign_on_cell: torch.Tensor,
+    area_cell: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """JIT-compiled MPAS split-explicit horizontal acoustic + vertical HEVI loop."""
+    m_k = m0
+    Thm_k = Thm0
+    u_k = u0
+    w_k = w0
+    udotz_k = udotz0
+
+    uh_accum = torch.zeros_like(u0)
+    om_accum = torch.zeros_like(w0)
+    rho_dw_safe = torch.clamp(rho_dw, min=1.0e-5)
+
+    for _ in range(n_ac):
+        p_k = pres_s + dp_dThm_s * (Thm_k - Thm_s)
+        pgf_e = -(p_k[:, c1] * fac_z1 - p_k[:, c0] * fac_z0) / (rtot_e * dc_e)
+
+        u_next = u_k + dt_ac * (tend_u_slow + pgf_e - sponge_c * u_k)
+        u_int_next = 0.5 * (u_next[:-1] + u_next[1:])
+        uz_next = area_e * u_int_next * zw_slope_e
+        udotz_next = (uz_next[:, edges_on_cell] * valid_ce).sum(dim=-1) / area_c
+
+        uh_k = m_edge * (1.10 * u_next - 0.10 * u_k)
+        fTh_h_k = uh_k * thm_e
+        div_h_m = (((uh_k * dv_edge)[:, edges_on_cell]) * edge_sign_on_cell).sum(dim=-1) / area_cell
+        div_h_Thm = (((fTh_h_k * dv_edge)[:, edges_on_cell]) * edge_sign_on_cell).sum(dim=-1) / area_cell
+
+        om_old = torch.zeros_like(w_k)
+        om_old[1:-1] = rho_dw * (w_k[1:-1] - udotz_k)
+
+        m_dag = m_k - dt_ac * (div_h_m + (om_old[1:] - om_old[:-1]))
+        fTh_z_old = torch.zeros_like(w_k)
+        fTh_z_old[1:-1] = thm_w * om_old[1:-1]
+        Thm_dag = Thm_k + dt_ac * (-div_h_Thm - (fTh_z_old[1:] - fTh_z_old[:-1]) + tend_Thm_slow)
+
+        p_dag = pres_s + dp_dThm_s * (Thm_dag - Thm_s)
+        rho_k = m_k / dz_c
+        rho_dag = m_dag / dz_c
+        rtot_k_w = 0.5 * (rho_k[:-1] * q_load[:-1] + rho_k[1:] * q_load[1:])
+        rtot_dag_w = 0.5 * (rho_dag[:-1] * q_load[:-1] + rho_dag[1:] * q_load[1:])
+
+        p_blend = (1.0 - beta_hevi) * p_k + beta_hevi * p_dag
+        rtot_blend_w = (1.0 - beta_hevi) * rtot_k_w + beta_hevi * rtot_dag_w
+        nh_imbal = (p_blend[1:] - p_blend[:-1]) / dz_w_int + rtot_blend_w * gravity
+
+        fz_phys_k = rho_dw * w_k[1:-1]
+        rhs_om = (
+            -rho_dw * (udotz_next - udotz_k)
+            + dt_ac * (-(rho_dw / rtot_w) * nh_imbal - sponge_w * fz_phys_k)
+        )
+        # Inlined batched Thomas tridiagonal solve along dim=0
+        K_tri = diag.shape[0]
+        c_list: list[torch.Tensor] = []
+        d_list: list[torch.Tensor] = []
+        inv_b0 = 1.0 / diag[0]
+        c_prev = du[0] * inv_b0
+        d_prev = rhs_om[0] * inv_b0
+        c_list.append(c_prev)
+        d_list.append(d_prev)
+        for kk in range(1, K_tri):
+            inv_den = 1.0 / (diag[kk] - dl[kk] * c_prev)
+            c_prev = du[kk] * inv_den if kk < K_tri - 1 else torch.zeros_like(d_prev)
+            d_prev = (rhs_om[kk] - dl[kk] * d_prev) * inv_den
+            c_list.append(c_prev)
+            d_list.append(d_prev)
+        x_list: list[torch.Tensor] = [d_prev] * K_tri
+        x_nx = d_list[K_tri - 1]
+        x_list[K_tri - 1] = x_nx
+        for kk in range(K_tri - 2, -1, -1):
+            x_nx = d_list[kk] - c_list[kk] * x_nx
+            x_list[kk] = x_nx
+        dom = torch.stack(x_list, dim=0)
+
+        om_new = om_old.clone()
+        om_new[1:-1] = om_old[1:-1] + dom
+
+        m_next = torch.clamp(
+            m_dag - beta_hevi * dt_ac * (om_new[1:] - om_old[1:] - (om_new[:-1] - om_old[:-1])),
+            min=1.0e-3,
+        )
+        dfTh_z = torch.zeros_like(w_k)
+        dfTh_z[1:-1] = thm_w * dom
+        Thm_next = Thm_dag - beta_hevi * dt_ac * (dfTh_z[1:] - dfTh_z[:-1])
+
+        w_next = torch.zeros_like(w_k)
+        w_next[1:-1] = udotz_next + om_new[1:-1] / rho_dw_safe
+
+        if accum_fluxes:
+            uh_accum = uh_accum + uh_k
+            om_accum = om_accum + ((1.0 - beta_hevi) * om_old + beta_hevi * om_new)
+
+        m_k = m_next
+        Thm_k = Thm_next
+        u_k = u_next
+        w_k = w_next
+        udotz_k = udotz_next
+
+    return m_k, Thm_k, u_k, w_k, uh_accum, om_accum
+
+
 def step_scvt_rk3_hevi(
     state: GlobalAtmosState,
     mesh: SCVTMesh,
@@ -351,9 +493,11 @@ def step_scvt_rk3_hevi(
     sponge_c = vgrid.sponge_c.unsqueeze(1)
 
     # Scale-aware horizontal divergence damping & del^4 hyperviscosity (Skamarock et al., 2012, Sec. 3d)
-    dx_mean = float(mesh.dc_edge.mean().item())
-    nu_div = 0.04 * (dx_mean ** 2) / max(dt_dyn, 1.0)
-    nu_4 = 0.003 * (dx_mean ** 4) / max(dt_dyn, 1.0)
+    # Note: on hexagonal Voronoi grids dv_edge ~ dc_edge / sqrt(3), so max(|lambda(lap4)|) ~ 480 / dc_min^4;
+    # setting nu_4 = 0.0002 * dc_min^4 / dt_dyn keeps |dt_dyn * nu_4 * lambda_max| < 0.10 unconditionally!
+    dx_min = float(mesh.dc_edge.min().item())
+    nu_div = 0.02 * (dx_min ** 2) / max(dt_dyn, 1.0)
+    nu_4 = 0.0002 * (dx_min ** 4) / max(dt_dyn, 1.0)
 
     lap2_u0, grad_div_u0 = compute_vector_laplacian_edge(mesh, state.u_edge)
     lap4_u0, _ = compute_vector_laplacian_edge(mesh, lap2_u0)
@@ -381,6 +525,16 @@ def step_scvt_rk3_hevi(
     du_ext = du_phys_edge if du_phys_edge is not None else torch.zeros_like(u0)
     dThm_ext = (m0 * dtheta_m_phys) if dtheta_m_phys is not None else torch.zeros_like(Thm0)
 
+    # Precompute stage-invariant edge/cell stencil views
+    zw_slope_e = (state.z_w[1:-1, c1] - state.z_w[1:-1, c0]) / dc_e
+    valid_ce = (mesh.edge_sign_on_cell != 0.0).to(u0.dtype)
+    v0_e = mesh.verts_on_edge[:, 0]
+    v1_e = mesh.verts_on_edge[:, 1]
+    ep_idx = mesh.trisk_edges
+    w_trisk = mesh.trisk_weights.unsqueeze(0)
+    # Terrain-following acoustic Courant limit over steep Earth2014 Himalayas/Antarctica (dt_ac <= ~350 s on Glevel-3)
+    dt_ac_max = max(0.16 * dx_min / 350.0, 1.0)
+
     rk_taus = (dt_dyn / 3.0, 0.5 * dt_dyn, dt_dyn)
     for stage_idx, dtau in enumerate(rk_taus):
         rho_s = m_s / dz_c
@@ -390,113 +544,58 @@ def step_scvt_rk3_hevi(
             torch.clamp(C.R_D * rho_thm_vol / C.P_REF, min=1.0e-7),
             gamma,
         )
+        dp_dThm_s = gamma * pres_s / torch.clamp(Thm_s, min=1.0e-3)
         rtot_s = rho_s * q_load
 
-        # Horizontal layer dry-mass flux U_e = m_e * u_e [kg m^-1 s^-1]
+        # Stage-frozen edge scalars & Zängl (2012) / Lin (1997) midpoint-altitude log-hydrostatic PGF factors
         m_edge = 0.5 * (m_s[:, c0] + m_s[:, c1])
-        uh_e = m_edge * u_s
-
-        # 3rd/2nd-order upwind-stabilized horizontal Theta_m flux
         thm_e = 0.5 * (thm_s[:, c0] + thm_s[:, c1]) - 0.15 * torch.sign(u_s) * (thm_s[:, c1] - thm_s[:, c0])
-        fTh_h = uh_e * thm_e
+        rtot_e = torch.clamp(0.5 * (rtot_s[:, c0] + rtot_s[:, c1]), min=1.0e-5)
+        dz_10 = state.z_c[:, c1] - state.z_c[:, c0]
+        fac_z0 = torch.exp(-0.5 * (rtot_s[:, c0] * C.GRAVITY / torch.clamp(pres_s[:, c0], min=10.0)) * dz_10)
+        fac_z1 = torch.exp(+0.5 * (rtot_s[:, c1] * C.GRAVITY / torch.clamp(pres_s[:, c1], min=10.0)) * dz_10)
 
-        div_h_m = compute_scvt_divergence(mesh, uh_e)
-        div_h_Thm = compute_scvt_divergence(mesh, fTh_h)
-
-        # --- Vector-Invariant Momentum RHS on SCVT Edges (Ringler et al., 2010, Eqs. 20-26) ---
+        # --- Slow Vector-Invariant Momentum RHS Evaluated Once per RK3 Stage ---
         zeta_v = compute_scvt_vorticity(mesh, u_s)
-        eta_v = zeta_v + mesh.f_vert.unsqueeze(0)  # Absolute vorticity [Nz, N_verts]
-        v0_e = mesh.verts_on_edge[:, 0]
-        v1_e = mesh.verts_on_edge[:, 1]
-        eta_e = 0.5 * (eta_v[:, v0_e] + eta_v[:, v1_e])  # [Nz, N_edges]
-
-        # Exact energy-conserving skew-symmetric TRiSK rotational + Coriolis acceleration:
-        # rot_acc[e] = sum_{s} w_{e, ep} * 0.5 * (eta_e[e] + eta_e[ep]) * u_s[ep]
-        ep_idx = mesh.trisk_edges       # [N_edges, 10]
-        w_trisk = mesh.trisk_weights    # [N_edges, 10]
+        eta_v = zeta_v + mesh.f_vert.unsqueeze(0)
+        eta_e = 0.5 * (eta_v[:, v0_e] + eta_v[:, v1_e])
         eta_pair = 0.5 * (eta_e.unsqueeze(-1) + eta_e[:, ep_idx])
-        rot_acc = (w_trisk.unsqueeze(0) * eta_pair * u_s[:, ep_idx]).sum(dim=-1)
+        rot_acc = (w_trisk * eta_pair * u_s[:, ep_idx]).sum(dim=-1)
 
-        # Cell kinetic energy K_i = (1 / (2 * A_i)) * sum_{e in cell i} A_e * u_e^2 (Ringler et al., Eq. 20)
         ke_edge = area_e * (u_s * u_s)
-        valid_ce = (mesh.edge_sign_on_cell != 0.0).to(u_s.dtype)
         ke_cell = 0.5 * (ke_edge[:, mesh.edges_on_cell] * valid_ce).sum(dim=-1) / area_c
         grad_ke = (ke_cell[:, c1] - ke_cell[:, c0]) / dc_e
 
-        # Terrain-following horizontal pressure-gradient force (Klemp, 2011, Eq. 1)
-        rtot_e = 0.5 * (rtot_s[:, c0] + rtot_s[:, c1])
-        dp_dx_zeta = (pres_s[:, c1] - pres_s[:, c0]) / dc_e
-        # Vertical pressure derivative dp/dz at full levels via log-pressure interpolation
-        dp_dz_c = torch.empty_like(pres_s)
-        dp_dz_int = (pres_s[1:] - pres_s[:-1]) / dz_w_int
-        dp_dz_c[0] = dp_dz_int[0]
-        dp_dz_c[1:-1] = 0.5 * (dp_dz_int[:-1] + dp_dz_int[1:])
-        dp_dz_c[-1] = dp_dz_int[-1]
-        dp_dz_e = 0.5 * (dp_dz_c[:, c0] + dp_dz_c[:, c1])
-        pgf_e = -(dp_dx_zeta - dp_dz_e * slope_z_e) / torch.clamp(rtot_e, min=1.0e-5)
-
-        # Contravariant vertical velocity tilde_w = w - u . grad(z) at interior interfaces 1..Nz-1
-        zw_slope_e = (state.z_w[1:-1, c1] - state.z_w[1:-1, c0]) / dc_e
         u_int_e = 0.5 * (u_s[:-1] + u_s[1:])
-        # Dot product (u . grad z)_cell via Perot-like flux reconstruction
         uz_edge = area_e * u_int_e * zw_slope_e
-        u_dot_gradz = (uz_edge[:, mesh.edges_on_cell] * valid_ce).sum(dim=-1) / area_c
+        u_dot_gradz_s = (uz_edge[:, mesh.edges_on_cell] * valid_ce).sum(dim=-1) / area_c
 
-        # Vertical momentum advection -tilde_w * du/dz
-        w_tilde_int = w_s[1:-1] - u_dot_gradz
-        wt_e = 0.5 * (w_tilde_int[:, c0] + w_tilde_int[:, c1])
+        w_tilde_s = w_s[1:-1] - u_dot_gradz_s
+        wt_e = 0.5 * (w_tilde_s[:, c0] + w_tilde_s[:, c1])
         du_dz_int = (u_s[1:] - u_s[:-1]) / dz_w_e
         vadv_u = torch.zeros_like(u_s)
         vadv_u[:-1] += -0.5 * wt_e * du_dz_int
         vadv_u[1:] += -0.5 * wt_e * du_dz_int
 
-        u_new = u0 + dtau * (rot_acc - grad_ke + pgf_e + vadv_u + visc_u + du_ext - sponge_c * u_s)
+        tend_u_slow = rot_acc - grad_ke + vadv_u + visc_u + du_ext
+        tend_Thm_slow = visc_Thm + dThm_ext
 
-        # --- Implicit Vertical HEVI Solver on Contravariant Flux Omega_z = rho_{d,w} * (w - u.grad z) ---
+        # Stage-frozen vertical HEVI Helmholtz tridiagonal coefficients for step dt_ac
+        n_ac = max(1, int(math.ceil(dtau / dt_ac_max)))
+        dt_ac = dtau / float(n_ac)
+
         rho_dw = 0.5 * (rho_s[:-1] + rho_s[1:])
-        rtot_w = 0.5 * (rtot_s[:-1] + rtot_s[1:])
+        rtot_w = torch.clamp(0.5 * (rtot_s[:-1] + rtot_s[1:]), min=1.0e-5)
         thm_w = 0.5 * (thm_s[:-1] + thm_s[1:])
 
-        om_old = torch.zeros_like(w_s)
-        om_old[1:-1] = rho_dw * w_tilde_int
-
-        # Provisional coupled mass & Theta_m at om_old
-        m_dag = m0 - dtau * (div_h_m + (om_old[1:] - om_old[:-1]))
-        fTh_z_old = torch.zeros_like(w_s)
-        fTh_z_old[1:-1] = thm_w * om_old[1:-1]
-        Thm_dag = Thm0 + dtau * (-div_h_Thm - (fTh_z_old[1:] - fTh_z_old[:-1]) + visc_Thm + dThm_ext)
-
-        rho_dag = m_dag / dz_c
-        p_dag = C.P_REF * torch.pow(
-            torch.clamp(C.R_D * (Thm_dag / dz_c) / C.P_REF, min=1.0e-7),
-            gamma,
-        )
-        dp_dThm_m = gamma * p_dag / torch.clamp(Thm_dag, min=1.0e-3)  # dp / d(m * theta_m) [Pa m^2 kg^-1 K^-1]
-        rtot_dag_w = 0.5 * (rho_dag[:-1] * q_load[:-1] + rho_dag[1:] * q_load[1:])
-
-        p_blend = (1.0 - beta_hevi) * pres_s + beta_hevi * p_dag
-        rtot_blend_w = (1.0 - beta_hevi) * rtot_w + beta_hevi * rtot_dag_w
-        nh_imbal = (p_blend[1:] - p_blend[:-1]) / dz_w_int + rtot_blend_w * C.GRAVITY
-
-        fz_phys0 = rho_dw * w0[1:-1]
-        fz_phys_old = rho_dw * w_s[1:-1]
-        rhs_om = (
-            (fz_phys0 - fz_phys_old)
-            + dtau * (
-                -(rho_dw / torch.clamp(rtot_w, min=1.0e-5)) * nh_imbal
-                - sponge_w * fz_phys_old
-            )
-        )
-
-        fac_p = ((beta_hevi * dtau) ** 2) * (rho_dw / (rtot_w * dz_w_int))
-        fac_g = ((beta_hevi * dtau) ** 2) * (0.5 * C.GRAVITY * (rho_dw / rtot_w))
-
-        c_dn = dp_dThm_m[:-1]
-        c_up = dp_dThm_m[1:]
+        fac_p = ((beta_hevi * dt_ac) ** 2) * (rho_dw / (rtot_w * dz_w_int))
+        fac_g = ((beta_hevi * dt_ac) ** 2) * (0.5 * C.GRAVITY * (rho_dw / rtot_w))
+        c_dn = dp_dThm_s[:-1]
+        c_up = dp_dThm_s[1:]
 
         diag = torch.clamp(
             1.0
-            + dtau * sponge_w
+            + dt_ac * sponge_w
             + fac_p * thm_w * (c_up + c_dn)
             + fac_g * (q_load[1:] / dz_c[1:] - q_load[:-1] / dz_c[:-1]),
             min=0.5,
@@ -506,34 +605,137 @@ def step_scvt_rk3_hevi(
         dl[1:] = -fac_p[1:] * c_dn[1:] * thm_w[:-1] + fac_g[1:] * (q_load[1:-1] / dz_c[1:-1])
         du[:-1] = -fac_p[:-1] * c_up[:-1] * thm_w[1:] - fac_g[:-1] * (q_load[1:-1] / dz_c[1:-1])
 
-        dom = solve_tridiagonal_batched(dl, diag, du, rhs_om)
+        # --- Fast Horizontal Acoustic + Vertical Implicit HEVI Loop from U^0 over n_ac steps of dt_ac ---
+        udotz0 = u_dot_gradz_s if stage_idx == 0 else (
+            ((area_e * 0.5 * (u0[:-1] + u0[1:]) * zw_slope_e)[:, mesh.edges_on_cell] * valid_ce).sum(dim=-1) / area_c
+        )
 
-        om_new = om_old.clone()
-        om_new[1:-1] = om_old[1:-1] + dom
+        if u0.device.type != "mps":
+            m_s, Thm_s, u_s, w_s, uh_accum, om_accum = _scvt_fast_acoustic_hevi_cpu_gpu(
+                n_ac=n_ac,
+                dt_ac=dt_ac,
+                beta_hevi=beta_hevi,
+                gravity=C.GRAVITY,
+                accum_fluxes=(stage_idx == 2),
+                m0=m0,
+                Thm0=Thm0,
+                u0=u0,
+                w0=w0,
+                udotz0=udotz0,
+                pres_s=pres_s,
+                dp_dThm_s=dp_dThm_s,
+                Thm_s=Thm_s,
+                fac_z0=fac_z0,
+                fac_z1=fac_z1,
+                rtot_e=rtot_e,
+                dc_e=dc_e,
+                tend_u_slow=tend_u_slow,
+                tend_Thm_slow=tend_Thm_slow,
+                sponge_c=sponge_c,
+                sponge_w=sponge_w,
+                area_e=area_e,
+                zw_slope_e=zw_slope_e,
+                valid_ce=valid_ce,
+                area_c=area_c,
+                m_edge=m_edge,
+                thm_e=thm_e,
+                rho_dw=rho_dw,
+                rtot_w=rtot_w,
+                thm_w=thm_w,
+                dz_c=dz_c,
+                dz_w_int=dz_w_int,
+                q_load=q_load,
+                dl=dl,
+                diag=diag,
+                du=du,
+                c0=c0,
+                c1=c1,
+                dv_edge=mesh.dv_edge,
+                edges_on_cell=mesh.edges_on_cell,
+                edge_sign_on_cell=mesh.edge_sign_on_cell,
+                area_cell=mesh.area_cell,
+            )
+        else:
+            m_k = m0
+            Thm_k = Thm0
+            u_k = u0
+            w_k = w0
+            udotz_k = udotz0
+            uh_accum = torch.zeros_like(u0)
+            om_accum = torch.zeros_like(w0)
 
-        m_new = torch.clamp(m_dag - beta_hevi * dtau * (om_new[1:] - om_old[1:] - (om_new[:-1] - om_old[:-1])), min=1.0e-3)
-        dfTh_z = torch.zeros_like(w_s)
-        dfTh_z[1:-1] = thm_w * dom
-        Thm_new = Thm_dag - beta_hevi * dtau * (dfTh_z[1:] - dfTh_z[:-1])
+            for _ in range(n_ac):
+                p_k = pres_s + dp_dThm_s * (Thm_k - Thm_s)
+                pgf_e = -(p_k[:, c1] * fac_z1 - p_k[:, c0] * fac_z0) / (rtot_e * dc_e)
 
-        # Recover physical w = u . grad(z) + Omega_z / rho_{d,w}
-        u_int_new = 0.5 * (u_new[:-1] + u_new[1:])
-        uz_new = area_e * u_int_new * zw_slope_e
-        udotz_new = (uz_new[:, mesh.edges_on_cell] * valid_ce).sum(dim=-1) / area_c
+                u_next = u_k + dt_ac * (tend_u_slow + pgf_e - sponge_c * u_k)
+                u_int_next = 0.5 * (u_next[:-1] + u_next[1:])
+                uz_next = area_e * u_int_next * zw_slope_e
+                udotz_next = (uz_next[:, mesh.edges_on_cell] * valid_ce).sum(dim=-1) / area_c
 
-        rho_new = m_new / dz_c
-        rho_dw_new = 0.5 * (rho_new[:-1] + rho_new[1:])
-        w_new = torch.zeros_like(w_s)
-        w_new[1:-1] = udotz_new + om_new[1:-1] / torch.clamp(rho_dw_new, min=1.0e-5)
+                uh_k = m_edge * (1.10 * u_next - 0.10 * u_k)
+                fTh_h_k = uh_k * thm_e
+                div_h_m = compute_scvt_divergence(mesh, uh_k)
+                div_h_Thm = compute_scvt_divergence(mesh, fTh_h_k)
 
-        m_s = m_new
-        Thm_s = Thm_new
-        u_s = u_new
-        w_s = w_new
+                om_old = torch.zeros_like(w_k)
+                om_old[1:-1] = rho_dw * (w_k[1:-1] - udotz_k)
+
+                m_dag = m_k - dt_ac * (div_h_m + (om_old[1:] - om_old[:-1]))
+                fTh_z_old = torch.zeros_like(w_k)
+                fTh_z_old[1:-1] = thm_w * om_old[1:-1]
+                Thm_dag = Thm_k + dt_ac * (-div_h_Thm - (fTh_z_old[1:] - fTh_z_old[:-1]) + tend_Thm_slow)
+
+                p_dag = pres_s + dp_dThm_s * (Thm_dag - Thm_s)
+                rho_k = m_k / dz_c
+                rho_dag = m_dag / dz_c
+                rtot_k_w = 0.5 * (rho_k[:-1] * q_load[:-1] + rho_k[1:] * q_load[1:])
+                rtot_dag_w = 0.5 * (rho_dag[:-1] * q_load[:-1] + rho_dag[1:] * q_load[1:])
+
+                p_blend = (1.0 - beta_hevi) * p_k + beta_hevi * p_dag
+                rtot_blend_w = (1.0 - beta_hevi) * rtot_k_w + beta_hevi * rtot_dag_w
+                nh_imbal = (p_blend[1:] - p_blend[:-1]) / dz_w_int + rtot_blend_w * C.GRAVITY
+
+                fz_phys_k = rho_dw * w_k[1:-1]
+                rhs_om = (
+                    -rho_dw * (udotz_next - udotz_k)
+                    + dt_ac * (-(rho_dw / rtot_w) * nh_imbal - sponge_w * fz_phys_k)
+                )
+                dom = solve_tridiagonal_batched(dl, diag, du, rhs_om)
+
+                om_new = om_old.clone()
+                om_new[1:-1] = om_old[1:-1] + dom
+
+                m_next = torch.clamp(
+                    m_dag - beta_hevi * dt_ac * (om_new[1:] - om_old[1:] - (om_new[:-1] - om_old[:-1])),
+                    min=1.0e-3,
+                )
+                dfTh_z = torch.zeros_like(w_k)
+                dfTh_z[1:-1] = thm_w * dom
+                Thm_next = Thm_dag - beta_hevi * dt_ac * (dfTh_z[1:] - dfTh_z[:-1])
+
+                w_next = torch.zeros_like(w_k)
+                w_next[1:-1] = udotz_next + om_new[1:-1] / torch.clamp(rho_dw, min=1.0e-5)
+
+                if stage_idx == 2:
+                    uh_accum = uh_accum + uh_k
+                    om_accum = om_accum + ((1.0 - beta_hevi) * om_old + beta_hevi * om_new)
+
+                m_k = m_next
+                Thm_k = Thm_next
+                u_k = u_next
+                w_k = w_next
+                udotz_k = udotz_next
+
+            m_s = m_k
+            Thm_s = Thm_k
+            u_s = u_k
+            w_s = w_k
 
         if stage_idx == 2:
-            uh_final = uh_e
-            om_final = (1.0 - beta_hevi) * om_old + beta_hevi * om_new
+            inv_nac = 1.0 / float(n_ac)
+            uh_final = uh_accum * inv_nac
+            om_final = om_accum * inv_nac
 
     state.rho_d = m_s / dz_c
     state.u_edge = u_s

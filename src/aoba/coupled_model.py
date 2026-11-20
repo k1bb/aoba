@@ -415,9 +415,16 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
     thm_before_dyn = atmos.theta_m.clone()
     qn_before_dyn = atmos.q_n.clone()
 
-    dt_hdyn = dt / float(cfg.n_host_dyn_substeps)
-    for _ in range(cfg.n_host_dyn_substeps):
-        m_old = (atmos.rho_d * atmos.dz_c).clone()
+    # Host RK3-HEVI performs internal MPAS split-explicit acoustic sub-stepping automatically;
+    # enforce synoptic/gravity-wave RK3 Courant limit dt_hdyn <= min(900 s, 0.40 * dc_min / 80)
+    dt_adv_host = min(900.0, 0.40 * float(mesh.dc_edge.min().item()) / 80.0)
+    n_hdyn = max(cfg.n_host_dyn_substeps, int(math.ceil(dt / max(dt_adv_host, 1.0))))
+    dt_hdyn = dt / float(n_hdyn)
+
+    m_old_host = (atmos.rho_d * atmos.dz_c).clone()
+    uh_acc = torch.zeros_like(atmos.u_edge)
+    om_acc = torch.zeros_like(atmos.w)
+    for _ in range(n_hdyn):
         uh_e, om_z = step_scvt_rk3_hevi(
             state=atmos,
             mesh=mesh,
@@ -425,13 +432,24 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
             dt_dyn=dt_hdyn,
             du_phys_edge=du_oro_edge,
         )
-        m_new = atmos.rho_d * atmos.dz_c
-        atmos.q_n = fct_advect_scvt(mesh, atmos.q_n, m_old, m_new, uh_e, om_z, dt_hdyn)
-        atmos.q_p = fct_advect_scvt(mesh, atmos.q_p, m_old, m_new, uh_e, om_z, dt_hdyn)
+        uh_acc = uh_acc + uh_e
+        om_acc = om_acc + om_z
+
+    inv_nh = 1.0 / float(n_hdyn)
+    m_new_host = atmos.rho_d * atmos.dz_c
+    atmos.q_n = fct_advect_scvt(mesh, atmos.q_n, m_old_host, m_new_host, uh_acc * inv_nh, om_acc * inv_nh, dt)
+    atmos.q_p = fct_advect_scvt(mesh, atmos.q_p, m_old_host, m_new_host, uh_acc * inv_nh, om_acc * inv_nh, dt)
 
     dthm_ls = (atmos.theta_m - thm_before_dyn) / dt
     dqn_ls = (atmos.q_n - qn_before_dyn) / dt
     u_host_new, v_host_new = reconstruct_cell_winds(mesh, atmos.u_edge)
+
+    # Align surface momentum drag coefficient with post-dynamics lowest-layer wind so drag strictly opposes flow
+    old_spd0 = torch.sqrt(u_cell[0] * u_cell[0] + v_cell[0] * v_cell[0] + 1.0e-4)
+    tau_mag0 = torch.sqrt(sfc_diag.tau_x * sfc_diag.tau_x + sfc_diag.tau_y * sfc_diag.tau_y)
+    drag_c0 = tau_mag0 / old_spd0
+    sfc_diag.tau_x = -drag_c0 * u_host_new[0]
+    sfc_diag.tau_y = -drag_c0 * v_host_new[0]
 
     # 7. 1:1 Embedded 3D CRM Physics & Convective Transport Across All SCVT Columns
     rain_new = torch.zeros_like(pres_sfc)
@@ -515,6 +533,9 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
 
     model.rad_cache["rain"] = rain_new
     model.rad_cache["snow"] = snow_new
+    model.rad_cache["evap"] = sfc_diag.evap
+    model.rad_cache["shf"] = sfc_diag.shf
+    model.rad_cache["gpp"] = sfc_diag.gpp
 
     # 8. Local Solar Noon Smith/Scott-Smith EEO Acclimation + Daily LAI + Monthly Köppen Accumulators
     _, _, temp_after = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
