@@ -338,6 +338,12 @@ kernel void crm_stage_thermo(
     rho_tot_s[gid] = r * q_load[gid];
 }
 
+inline float ws3_face(float qm2, float qm1, float q0, float qp1, float vel) {
+    float sgn = (vel > 0.0f) ? 1.0f : ((vel < 0.0f) ? -1.0f : 0.0f);
+    return ((-qm2 + 7.0f * qm1 + 7.0f * q0 - qp1)
+            + sgn * (qp1 - 3.0f * q0 + 3.0f * qm1 - qm2)) * (1.0f / 12.0f);
+}
+
 kernel void crm_stage_uv_flux(
     device const float* rho_s      [[buffer(0)]],
     device const float* rho_tot_s  [[buffer(1)]],
@@ -382,20 +388,22 @@ kernel void crm_stage_uv_flux(
     uint ix = rem - iy * nx;
     uint col_dz = (dz_cols > 1u) ? col : 0u;
 
+    uint ix_m2 = (ix >= 2u) ? (ix - 2u) : ((nx == 1u) ? 0u : (ix + nx - 2u));
     uint ix_m1 = (ix > 0u) ? (ix - 1u) : (nx - 1u);
     uint ix_p1 = (ix + 1u < nx) ? (ix + 1u) : 0u;
-    uint ix_p2 = (ix + 2u < nx) ? (ix + 2u) : (ix + 2u - nx);
-    if (nx == 1u) ix_p2 = 0u;
+    uint ix_p2 = (ix + 2u < nx) ? (ix + 2u) : ((nx == 1u) ? 0u : (ix + 2u - nx));
 
+    uint iy_m2 = (iy >= 2u) ? (iy - 2u) : ((ny == 1u) ? 0u : (iy + ny - 2u));
     uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
     uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
-    uint iy_p2 = (iy + 2u < ny) ? (iy + 2u) : (iy + 2u - ny);
-    if (ny == 1u) iy_p2 = 0u;
+    uint iy_p2 = (iy + 2u < ny) ? (iy + 2u) : ((ny == 1u) ? 0u : (iy + 2u - ny));
 
     uint base_k = k * M + col * stride_c;
+    uint idx_xm2 = base_k + iy * nx + ix_m2;
     uint idx_xm1 = base_k + iy * nx + ix_m1;
     uint idx_xp1 = base_k + iy * nx + ix_p1;
     uint idx_xp2 = base_k + iy * nx + ix_p2;
+    uint idx_ym2 = base_k + iy_m2 * nx + ix;
     uint idx_ym1 = base_k + iy_m1 * nx + ix;
     uint idx_yp1 = base_k + iy_p1 * nx + ix;
     uint idx_yp2 = base_k + iy_p2 * nx + ix;
@@ -432,36 +440,66 @@ kernel void crm_stage_uv_flux(
         + 0.25f * sgn_v * (th_yp2 - 3.0f * th_yp1 + 3.0f * th0 - th_ym1)
     ) / 12.0f;
 
-    float uc_self = 0.5f * (u0 + u_s[idx_xm1]);
-    float uc_yp1  = 0.5f * (u_s[idx_yp1] + u_s[idx_yp1_xm1]);
-    float vc_self = 0.5f * (v0 + v_s[idx_ym1]);
-    float vc_xp1  = 0.5f * (v_s[idx_xp1] + v_s[idx_ym1_xp1]);
+    float u_xm2 = u_s[idx_xm2];
+    float u_xm1 = u_s[idx_xm1];
+    float u_xp1 = u_s[idx_xp1];
+    float u_xp2 = u_s[idx_xp2];
+    float u_ym2 = u_s[idx_ym2];
+    float u_ym1 = u_s[idx_ym1];
+    float u_yp1 = u_s[idx_yp1];
+    float u_yp2 = u_s[idx_yp2];
 
-    float v_at_u = 0.5f * (vc_self + vc_xp1);
-    float u_at_v = 0.5f * (uc_self + uc_yp1);
+    float v_xm2 = v_s[idx_xm2];
+    float v_xm1 = v_s[idx_xm1];
+    float v_xp1 = v_s[idx_xp1];
+    float v_xp2 = v_s[idx_xp2];
+    float v_ym2 = v_s[idx_ym2];
+    float v_ym1 = v_s[idx_ym1];
+    float v_yp1 = v_s[idx_yp1];
+    float v_yp2 = v_s[idx_yp2];
 
-    float adv_u = -u0 * (u_s[idx_xp1] - u_s[idx_xm1]) * (0.5f * inv_dx)
-                  - v_at_u * (u_s[idx_yp1] - u_s[idx_ym1]) * (0.5f * inv_dy);
-    float adv_v = -u_at_v * (v_s[idx_xp1] - v_s[idx_xm1]) * (0.5f * inv_dx)
-                  - v0 * (v_s[idx_yp1] - v_s[idx_ym1]) * (0.5f * inv_dy);
+    float u_c_left  = 0.5f * (u0 + u_xm1);
+    float u_c_right = 0.5f * (u0 + u_xp1);
+    float v_u_bot   = 0.5f * (v_ym1 + v_s[idx_ym1_xp1]);
+    float v_u_top   = 0.5f * (v0 + v_xp1);
 
-    float du_dz = 0.0f;
-    float dv_dz = 0.0f;
+    float u_v_left  = 0.5f * (u_xm1 + u_s[idx_yp1_xm1]);
+    float u_v_right = 0.5f * (u0 + u_yp1);
+    float v_c_bot   = 0.5f * (v0 + v_ym1);
+    float v_c_top   = 0.5f * (v0 + v_yp1);
+
+    float adv_u =
+        -(u_c_right * (ws3_face(u_xm1, u0, u_xp1, u_xp2, u_c_right) - u0)
+          - u_c_left * (ws3_face(u_xm2, u_xm1, u0, u_xp1, u_c_left) - u0)) * inv_dx
+        - (v_u_top * (ws3_face(u_ym1, u0, u_yp1, u_yp2, v_u_top) - u0)
+           - v_u_bot * (ws3_face(u_ym2, u_ym1, u0, u_yp1, v_u_bot) - u0)) * inv_dy;
+
+    float adv_v =
+        -(u_v_right * (ws3_face(v_xm1, v0, v_xp1, v_xp2, u_v_right) - v0)
+          - u_v_left * (ws3_face(v_xm2, v_xm1, v0, v_xp1, u_v_left) - v0)) * inv_dx
+        - (v_c_top * (ws3_face(v_ym1, v0, v_yp1, v_yp2, v_c_top) - v0)
+           - v_c_bot * (ws3_face(v_ym2, v_ym1, v0, v_yp1, v_c_bot) - v0)) * inv_dy;
+
+    float v_at_u = 0.5f * (v_u_bot + v_u_top);
+    float u_at_v = 0.5f * (u_v_left + u_v_right);
+
+    float vadv_u = 0.0f;
+    float vadv_v = 0.0f;
     if (k < nz - 1u) {
         float dzw = dz_w_int[k * dz_cols + col_dz];
         uint kp1 = (k + 1u) * M;
         float w_ux = 0.5f * (w_s[kp1 + tid] + w_s[kp1 + col * stride_c + iy * nx + ix_p1]);
         float w_vy = 0.5f * (w_s[kp1 + tid] + w_s[kp1 + col * stride_c + iy_p1 * nx + ix]);
-        du_dz += 0.5f * w_ux * (u_s[kp1 + tid] - u0) / dzw;
-        dv_dz += 0.5f * w_vy * (v_s[kp1 + tid] - v0) / dzw;
+        if (w_ux < 0.0f) vadv_u += -w_ux * (u_s[kp1 + tid] - u0) / dzw;
+        if (w_vy < 0.0f) vadv_v += -w_vy * (v_s[kp1 + tid] - v0) / dzw;
     }
     if (k > 0u) {
         float dzw = dz_w_int[(k - 1u) * dz_cols + col_dz];
         uint km1 = (k - 1u) * M;
         float w_ux = 0.5f * (w_s[k * M + tid] + w_s[k * M + col * stride_c + iy * nx + ix_p1]);
         float w_vy = 0.5f * (w_s[k * M + tid] + w_s[k * M + col * stride_c + iy_p1 * nx + ix]);
-        du_dz += 0.5f * w_ux * (u0 - u_s[km1 + tid]) / dzw;
-        dv_dz += 0.5f * w_vy * (v0 - v_s[km1 + tid]) / dzw;
+        if (w_ux > 0.0f) vadv_u += -w_ux * (u0 - u_s[km1 + tid]) / dzw;
+        if (w_vy > 0.0f) vadv_v += -w_vy * (v0 - v_s[km1 + tid]) / dzw;
     }
 
     float fc = (has_cor != 0u) ? f_cor[col] : 0.0f;
@@ -469,8 +507,8 @@ kernel void crm_stage_uv_flux(
     float um = u_mean[k * n_col + col];
     float vm = v_mean[k * n_col + col];
 
-    tend_u_slow[gid] = adv_u - du_dz + fc * v_at_u + du_sgs[gid] - sp * (u0 - um);
-    tend_v_slow[gid] = adv_v - dv_dz - fc * u_at_v + dv_sgs[gid] - sp * (v0 - vm);
+    tend_u_slow[gid] = adv_u + vadv_u + fc * v_at_u + du_sgs[gid] - sp * (u0 - um);
+    tend_v_slow[gid] = adv_v + vadv_v - fc * u_at_v + dv_sgs[gid] - sp * (v0 - vm);
 }
 
 kernel void crm_stage_w_hevi(
@@ -515,15 +553,23 @@ kernel void crm_stage_w_hevi(
     uint ix = rem - iy * nx;
     uint col_dz = (dz_cols > 1u) ? col : 0u;
 
+    uint ix_m2 = (ix >= 2u) ? (ix - 2u) : ((nx == 1u) ? 0u : (ix + nx - 2u));
     uint ix_m1 = (ix > 0u) ? (ix - 1u) : (nx - 1u);
     uint ix_p1 = (ix + 1u < nx) ? (ix + 1u) : 0u;
+    uint ix_p2 = (ix + 2u < nx) ? (ix + 2u) : ((nx == 1u) ? 0u : (ix + 2u - nx));
+    uint iy_m2 = (iy >= 2u) ? (iy - 2u) : ((ny == 1u) ? 0u : (iy + ny - 2u));
     uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
     uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
+    uint iy_p2 = (iy + 2u < ny) ? (iy + 2u) : ((ny == 1u) ? 0u : (iy + 2u - ny));
 
+    uint tid_xm2 = col * stride_c + iy * nx + ix_m2;
     uint tid_xm1 = col * stride_c + iy * nx + ix_m1;
     uint tid_xp1 = col * stride_c + iy * nx + ix_p1;
+    uint tid_xp2 = col * stride_c + iy * nx + ix_p2;
+    uint tid_ym2 = col * stride_c + iy_m2 * nx + ix;
     uint tid_ym1 = col * stride_c + iy_m1 * nx + ix;
     uint tid_yp1 = col * stride_c + iy_p1 * nx + ix;
+    uint tid_yp2 = col * stride_c + iy_p2 * nx + ix;
 
     uint idx_m = m * M + tid;
     uint idx_mp1 = (m + 1u) * M + tid;
@@ -532,16 +578,27 @@ kernel void crm_stage_w_hevi(
     float inv_dx = 1.0f / f_params[3];
     float inv_dy = 1.0f / f_params[4];
 
-    float uc_m   = 0.5f * (u_s[m * M + tid] + u_s[m * M + tid_xm1]);
-    float uc_mp1 = 0.5f * (u_s[(m + 1u) * M + tid] + u_s[(m + 1u) * M + tid_xm1]);
-    float vc_m   = 0.5f * (v_s[m * M + tid] + v_s[m * M + tid_ym1]);
-    float vc_mp1 = 0.5f * (v_s[(m + 1u) * M + tid] + v_s[(m + 1u) * M + tid_ym1]);
-    float u_w = 0.5f * (uc_m + uc_mp1);
-    float v_w = 0.5f * (vc_m + vc_mp1);
+    float u_w_left  = 0.5f * (u_s[m * M + tid_xm1] + u_s[(m + 1u) * M + tid_xm1]);
+    float u_w_right = 0.5f * (u_s[idx_m]           + u_s[idx_mp1]);
+    float v_w_bot   = 0.5f * (v_s[m * M + tid_ym1] + v_s[(m + 1u) * M + tid_ym1]);
+    float v_w_top   = 0.5f * (v_s[idx_m]           + v_s[idx_mp1]);
 
     float w_int = w_s[idx_mp1];
-    float dw_dx = (w_s[(m + 1u) * M + tid_xp1] - w_s[(m + 1u) * M + tid_xm1]) * (0.5f * inv_dx);
-    float dw_dy = (w_s[(m + 1u) * M + tid_yp1] - w_s[(m + 1u) * M + tid_ym1]) * (0.5f * inv_dy);
+    uint wm1_base = (m + 1u) * M;
+    float w_xm2 = w_s[wm1_base + tid_xm2];
+    float w_xm1 = w_s[wm1_base + tid_xm1];
+    float w_xp1 = w_s[wm1_base + tid_xp1];
+    float w_xp2 = w_s[wm1_base + tid_xp2];
+    float w_ym2 = w_s[wm1_base + tid_ym2];
+    float w_ym1 = w_s[wm1_base + tid_ym1];
+    float w_yp1 = w_s[wm1_base + tid_yp1];
+    float w_yp2 = w_s[wm1_base + tid_yp2];
+
+    float adv_w_h =
+        -(u_w_right * (ws3_face(w_xm1, w_int, w_xp1, w_xp2, u_w_right) - w_int)
+          - u_w_left * (ws3_face(w_xm2, w_xm1, w_int, w_xp1, u_w_left) - w_int)) * inv_dx
+        - (v_w_top * (ws3_face(w_ym1, w_int, w_yp1, w_yp2, v_w_top) - w_int)
+           - v_w_bot * (ws3_face(w_ym2, w_ym1, w_int, w_yp1, v_w_bot) - w_int)) * inv_dy;
 
     float dz_m = dz_c[m * dz_cols + col_dz];
     float dz_mp1 = dz_c[(m + 1u) * dz_cols + col_dz];
@@ -549,8 +606,8 @@ kernel void crm_stage_w_hevi(
 
     float dw_dz_dn = (w_int - w_s[idx_m]) / dz_m;
     float dw_dz_up = (w_s[idx_mp2] - w_int) / dz_mp1;
-    float adv_w = -u_w * dw_dx - v_w * dw_dy - w_int * 0.5f * (dw_dz_dn + dw_dz_up);
-    tend_w_slow[gid] = adv_w + dw_sgs[idx_mp1];
+    float adv_w_v = -(max(w_int, 0.0f) * dw_dz_dn + min(w_int, 0.0f) * dw_dz_up);
+    tend_w_slow[gid] = adv_w_h + adv_w_v + dw_sgs[idx_mp1];
 
     float rdw = 0.5f * (rho_s[idx_m] + rho_s[idx_mp1]);
     float rtw = 0.5f * (rho_tot_s[idx_m] + rho_tot_s[idx_mp1]);

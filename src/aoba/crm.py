@@ -421,6 +421,58 @@ def _compute_3d_sgs_tendencies(
     return du_sgs, dv_sgs, dw_sgs, d_Thm_sgs
 
 
+def _ws3_horizontal_advect(
+    q: torch.Tensor,
+    u_left: torch.Tensor,
+    v_bot: torch.Tensor,
+    dx: float,
+    dy: float,
+) -> torch.Tensor:
+    """3rd-order Wicker-Skamarock (2002) upwind-biased horizontal momentum advection.
+
+    Evaluated in cancellation-free flux-difference form on the control-volume faces
+    surrounding `q` (`u_left` on the `-x` face and `v_bot` on the `-y` face), avoiding
+    finite-time shock blowup of non-conservative 2nd-order centered `-u du/dx`.
+    """
+    qx_m2 = torch.roll(q, 2, -1)
+    qx_m1 = torch.roll(q, 1, -1)
+    qx_p1 = torch.roll(q, -1, -1)
+    q_x_left = (
+        (-qx_m2 + 7.0 * qx_m1 + 7.0 * q - qx_p1)
+        + torch.sign(u_left) * (qx_p1 - 3.0 * q + 3.0 * qx_m1 - qx_m2)
+    ) / 12.0
+    q_x_right = torch.roll(q_x_left, -1, -1)
+    u_right = torch.roll(u_left, -1, -1)
+
+    qy_m2 = torch.roll(q, 2, -2)
+    qy_m1 = torch.roll(q, 1, -2)
+    qy_p1 = torch.roll(q, -1, -2)
+    q_y_bot = (
+        (-qy_m2 + 7.0 * qy_m1 + 7.0 * q - qy_p1)
+        + torch.sign(v_bot) * (qy_p1 - 3.0 * q + 3.0 * qy_m1 - qy_m2)
+    ) / 12.0
+    q_y_top = torch.roll(q_y_bot, -1, -2)
+    v_top = torch.roll(v_bot, -1, -2)
+
+    return (
+        -(u_right * (q_x_right - q) - u_left * (q_x_left - q)) / dx
+        - (v_top * (q_y_top - q) - v_bot * (q_y_bot - q)) / dy
+    )
+
+
+def _upwind_vertical_advect(
+    q: torch.Tensor,
+    w_int: torch.Tensor,
+    dz_w_int: torch.Tensor,
+) -> torch.Tensor:
+    """First-order upwind vertical advection tendency `-w * dq/dz` on stretched interfaces."""
+    dq_dz_int = (q[1:] - q[:-1]) / dz_w_int
+    out = torch.zeros_like(q)
+    out[1:] += -torch.clamp(w_int, min=0.0) * dq_dz_int
+    out[:-1] += -torch.clamp(w_int, max=0.0) * dq_dz_int
+    return out
+
+
 @torch.jit.script
 def _crm_fast_acoustic_hevi_torch(
     n_ac: int,
@@ -668,29 +720,21 @@ def step_crm_rk3_hevi(
             + 0.25 * torch.sign(v_s) * (thm_yp2 - 3.0 * thm_yp1 + 3.0 * thm_s - thm_ym1)
         ) / 12.0
 
-        # Stage-frozen Slow Tendencies (advection + Coriolis + SGS + upper Rayleigh sponge on anomalies)
-        u_c = 0.5 * (u_s + torch.roll(u_s, 1, -1))
-        v_c = 0.5 * (v_s + torch.roll(v_s, 1, -2))
+        # Stage-frozen Slow Tendencies (WS3 horizontal + upwind vertical momentum advection, Coriolis, SGS, Rayleigh sponge)
+        u_s_im1 = torch.roll(u_s, 1, -1)
+        v_s_jm1 = torch.roll(v_s, 1, -2)
+        u_c = 0.5 * (u_s + u_s_im1)
+        v_c = 0.5 * (v_s + v_s_jm1)
+        v_u_bot = 0.5 * (v_s_jm1 + torch.roll(v_s_jm1, -1, -1))
+        u_v_left = 0.5 * (u_s_im1 + torch.roll(u_s_im1, -1, -2))
 
-        adv_u = (
-            -u_s * (torch.roll(u_s, -1, -1) - torch.roll(u_s, 1, -1)) / (2.0 * dx)
-            - 0.5 * (v_c + torch.roll(v_c, -1, -1)) * (torch.roll(u_s, -1, -2) - torch.roll(u_s, 1, -2)) / (2.0 * dy)
-        )
-        adv_v = (
-            -0.5 * (u_c + torch.roll(u_c, -1, -2)) * (torch.roll(v_s, -1, -1) - torch.roll(v_s, 1, -1)) / (2.0 * dx)
-            - v_s * (torch.roll(v_s, -1, -2) - torch.roll(v_s, 1, -2)) / (2.0 * dy)
-        )
+        adv_u = _ws3_horizontal_advect(u_s, u_c, v_u_bot, dx, dy)
+        adv_v = _ws3_horizontal_advect(v_s, u_v_left, v_c, dx, dy)
 
-        du_dz = torch.zeros_like(u_s)
-        dv_dz = torch.zeros_like(v_s)
-        du_int = (u_s[1:] - u_s[:-1]) / dz_w_int
-        dv_int = (v_s[1:] - v_s[:-1]) / dz_w_int
         w_ux = 0.5 * (w_s[1:-1] + torch.roll(w_s[1:-1], -1, -1))
         w_vy = 0.5 * (w_s[1:-1] + torch.roll(w_s[1:-1], -1, -2))
-        du_dz[:-1] += 0.5 * w_ux * du_int
-        du_dz[1:] += 0.5 * w_ux * du_int
-        dv_dz[:-1] += 0.5 * w_vy * dv_int
-        dv_dz[1:] += 0.5 * w_vy * dv_int
+        vadv_u = _upwind_vertical_advect(u_s, w_ux, dz_w_int)
+        vadv_v = _upwind_vertical_advect(v_s, w_vy, dz_w_int)
 
         cor_u = f_cor * 0.5 * (v_c + torch.roll(v_c, -1, -1)) if f_cor is not None else 0.0
         cor_v = -f_cor * 0.5 * (u_c + torch.roll(u_c, -1, -2)) if f_cor is not None else 0.0
@@ -698,17 +742,17 @@ def step_crm_rk3_hevi(
         u_anom = u_s - u_s.mean(dim=(-2, -1), keepdim=True)
         v_anom = v_s - v_s.mean(dim=(-2, -1), keepdim=True)
 
-        tend_u_slow = adv_u - du_dz + cor_u + du_sgs - sponge_c * u_anom
-        tend_v_slow = adv_v - dv_dz + cor_v + dv_sgs - sponge_c * v_anom
+        tend_u_slow = adv_u + vadv_u + cor_u + du_sgs - sponge_c * u_anom
+        tend_v_slow = adv_v + vadv_v + cor_v + dv_sgs - sponge_c * v_anom
 
         w_int = w_s[1:-1]
-        u_w = 0.5 * (u_c[:-1] + u_c[1:])
-        v_w = 0.5 * (v_c[:-1] + v_c[1:])
-        dw_dx = (torch.roll(w_int, -1, -1) - torch.roll(w_int, 1, -1)) / (2.0 * dx)
-        dw_dy = (torch.roll(w_int, -1, -2) - torch.roll(w_int, 1, -2)) / (2.0 * dy)
-        dw_dz_c = (w_s[1:] - w_s[:-1]) / dz_c
-        adv_w = -u_w * dw_dx - v_w * dw_dy - w_int * 0.5 * (dw_dz_c[:-1] + dw_dz_c[1:])
-        tend_w_slow = adv_w + dw_sgs[1:-1]
+        u_w_left = 0.5 * (u_s_im1[:-1] + u_s_im1[1:])
+        v_w_bot = 0.5 * (v_s_jm1[:-1] + v_s_jm1[1:])
+        adv_w_h = _ws3_horizontal_advect(w_int, u_w_left, v_w_bot, dx, dy)
+        dw_dz_dn = (w_int - w_s[:-2]) / dz_c[:-1]
+        dw_dz_up = (w_s[2:] - w_int) / dz_c[1:]
+        adv_w_v = -(torch.clamp(w_int, min=0.0) * dw_dz_dn + torch.clamp(w_int, max=0.0) * dw_dz_up)
+        tend_w_slow = adv_w_h + adv_w_v + dw_sgs[1:-1]
         tend_Thm_slow = dThm_sgs
 
         # Acoustic substep count & stage-frozen Vertical HEVI Helmholtz tridiagonal matrix
