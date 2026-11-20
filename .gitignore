@@ -1,0 +1,41 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing & linting caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / CloudStorage metadata
+.DS_Store
+Icon?
+
+# Private reference papers & literature (NEVER upload to GitHub)
+/references/
+references/
+
+# Simulation outputs, checkpoints, and large datasets (keep out of Git & Google Drive sync)
+outputs/
+checkpoints/
+data/raw/
+data/processed/
+*.nc
+*.nc4
+*.zarr/
+*.pt
+*.pth
+*.npz
+*.h5
