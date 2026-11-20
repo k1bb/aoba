@@ -123,3 +123,46 @@ def export_aoba_snapshot_xarray(model: "AOBAState") -> xr.Dataset:
         },
     )
     return ds
+
+
+def export_scvt_mesh_xarray(model: "AOBAState") -> xr.Dataset:
+    """Export UGRID-1.0 SCVT Voronoi polygon topology for direct native-grid Cartopy plotting."""
+    import torch
+
+    mesh = model.mesh
+    ev = mesh.edges_on_vert
+    ce_on_v = mesh.cells_on_edge[ev]
+    xyz_sum = mesh.xyz_cell[ce_on_v].sum(dim=(1, 2))
+    xyz_vert = xyz_sum / torch.clamp(torch.norm(xyz_sum, dim=-1, keepdim=True), min=1.0e-12)
+    lat_vert_deg = torch.rad2deg(torch.asin(torch.clamp(xyz_vert[:, 2], -1.0, 1.0))).detach().cpu().numpy()
+    lon_vert_deg = torch.rad2deg(torch.atan2(xyz_vert[:, 1], xyz_vert[:, 0])).detach().cpu().numpy()
+
+    e_cell = mesh.edges_on_cell
+    sgn_cell = mesh.edge_sign_on_cell
+    verts_on_cell = torch.where(
+        sgn_cell >= 0.0,
+        mesh.verts_on_edge[e_cell, 0],
+        mesh.verts_on_edge[e_cell, 1],
+    ).detach().cpu().numpy()
+
+    return xr.Dataset(
+        data_vars={
+            "area_cell": (("n_cell",), mesh.area_cell.detach().cpu().numpy(), {"units": "m2"}),
+            "surf_type": (("n_cell",), mesh.surf_type.detach().cpu().numpy(), {"long_name": "0=Ocean, 1=Land, 2=IceSheet"}),
+            "z_topo": (("n_cell",), mesh.z_topo.detach().cpu().numpy(), {"units": "m"}),
+            "verts_on_cell": (("n_cell", "max_n_vert"), verts_on_cell),
+            "n_edges_on_cell": (("n_cell",), mesh.n_edges_on_cell.detach().cpu().numpy()),
+        },
+        coords={
+            "lat_cell": ("n_cell", np.rad2deg(mesh.lat_cell.detach().cpu().numpy()), {"units": "degrees_north"}),
+            "lon_cell": ("n_cell", np.rad2deg(mesh.lon_cell.detach().cpu().numpy()), {"units": "degrees_east"}),
+            "lat_vert_deg": ("n_vert", lat_vert_deg, {"units": "degrees_north"}),
+            "lon_vert_deg": ("n_vert", lon_vert_deg, {"units": "degrees_east"}),
+            "zeta_c": ("nz", model.vgrid.zeta_c.detach().cpu().numpy(), {"units": "m"}),
+            "zeta_w": ("nz_w", model.vgrid.zeta_w.detach().cpu().numpy(), {"units": "m"}),
+        },
+        attrs={
+            "Conventions": "CF-1.11 UGRID-1.0",
+            "glevel": model.cfg.glevel,
+        },
+    )

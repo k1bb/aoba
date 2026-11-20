@@ -53,13 +53,13 @@ class AOBAConfig:
 
     glevel: int = 3                          # SCVT mesh level (3 -> 642 cells; 4 -> 2562; 5 -> 10242)
     nz: int = 32                             # Shared Charney-Phillips vertical levels
-    crm_nx: int = 16                         # Embedded CRM x-grid points per SCVT cell (default 2D 16x1 = 64 km curtain)
+    crm_nx: int = 8                          # Embedded CRM x-grid points per SCVT cell (default 2D 8x1 = 64 km curtain)
     crm_ny: int = 1                          # Embedded CRM y-grid points (1 = SP-CAM 2.5D curtain for Mac climate runs)
-    crm_dx: float = 4000.0                   # Embedded CRM horizontal spacing [m]
-    dt_host: float = 180.0                   # Coupled host / physics / SP time step [s]
-    n_host_dyn_substeps: int = 2             # Host RK3-HEVI acoustic/gravity substeps per dt_host
-    n_crm_dyn_substeps: int = 6              # Embedded CRM RK3-HEVI substeps per dt_host
-    rad_stride: int = 4                      # Radiation evaluation stride (steps)
+    crm_dx: float = 8000.0                   # Embedded CRM horizontal spacing [m] (permits 60 s CFL substeps)
+    dt_host: float = 720.0                   # Coupled host / physics / SP time step [s] (12 min climate coupling)
+    n_host_dyn_substeps: int = 1             # Minimum host RK3-HEVI substeps per dt_host (auto-increased if CFL requires)
+    n_crm_dyn_substeps: int = 12             # Embedded CRM RK3-HEVI substeps per dt_host (12 x 60 s = 720 s)
+    rad_stride: int = 5                      # Radiation evaluation stride (steps; 5 x 720 s = 3600 s = 1 hr)
     crm_col_chunk: int = 16384               # Column batch chunk size for CRM evaluation (Unified Memory single-pass)
     co2_ppmv: float = 400.0                  # Well-mixed atmospheric CO2 concentration [ppmv]
     solar_constant: float = C.SOLAR_CONSTANT # Total solar irradiance S_0 [W m^-2]
