@@ -1,10 +1,66 @@
 """AOBA: Autonomous Optimality Biosphere-Atmosphere model."""
 
 from aoba import constants
-from aoba.io_zarr import append_zarr, load_zarr, save_zarr
+from aoba.biosphere import (
+    BiosphereState,
+    allocate_two_leaf_capacity,
+    canopy_light_absorption_depury,
+    canopy_two_stream_albedo_dai,
+    compute_two_leaf_gas_exchange,
+    init_biosphere_state,
+    lambert_w0,
+    non_rectangular_hyperbola,
+    smith_omega,
+    update_daily_acclimation_smith,
+    update_daily_lai_root_height,
+)
+from aoba.coupled_model import (
+    AOBAConfig,
+    AOBAState,
+    GlobalStepDiagnostics,
+    compute_orbital_insolation,
+    diagnose_model_koppen_geiger,
+    init_aoba_model,
+    step_aoba_model,
+)
+from aoba.crm import (
+    CRMState,
+    SPTendencies,
+    build_discrete_hydrostatic_rcemip_crm,
+    fct_advect_3d,
+    step_coupled_crm_rce,
+    step_crm_physics_and_dynamics,
+    step_crm_rk3_hevi,
+)
+from aoba.io_zarr import append_zarr, export_aoba_snapshot_xarray, load_zarr, save_zarr
 from aoba.kernels import solve_tridiagonal_batched
+from aoba.koppen import KOPPEN_NAMES, classify_koppen_geiger
+from aoba.microphysics import MicrophysicsResult, step_microphysics
+from aoba.ocean_ekman import EkmanOceanState, init_ekman_ocean_state, step_ekman_ocean_voronoi
+from aoba.orography import compute_orographic_drag_lott_miller
 from aoba.radiation import RadiationOutput, compute_four_band_radiation, compute_solar_zenith
 from aoba.runtime import get_data_dir, get_device, get_output_dir
+from aoba.scvt_dynamics import (
+    GlobalAtmosState,
+    compute_held_suarez_forcing,
+    compute_scvt_divergence,
+    compute_scvt_vorticity,
+    fct_advect_scvt,
+    init_global_hydrostatic_atmosphere,
+    step_scvt_rk3_hevi,
+)
+from aoba.scvt_mesh import SCVTMesh, build_scvt_mesh, project_cell_vectors_to_edges, reconstruct_cell_winds
+from aoba.surface import (
+    SURF_ICESHEET,
+    SURF_LAND,
+    SURF_OCEAN,
+    SurfaceFluxDiagnostics,
+    SurfaceState,
+    compute_surface_albedos,
+    init_surface_state,
+    step_multilayer_soil_thermodynamics,
+    step_surface,
+)
 from aoba.thermodynamics import (
     diagnose_pressure_temperature,
     esat_ice,
@@ -14,9 +70,16 @@ from aoba.thermodynamics import (
     rcemip_analytic_sounding,
     saturation_adjustment,
 )
+from aoba.turbulence import (
+    canopy_roughness_raupach,
+    compute_smagorinsky_lilly_3d,
+    compute_surface_transfer,
+    ocean_roughness_miller,
+    step_mynn_level25,
+)
 from aoba.vertical_grid import VerticalGrid, build_vertical_grid, compute_stf_heights
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "__version__",
     "constants",
@@ -37,7 +100,66 @@ __all__ = [
     "RadiationOutput",
     "compute_solar_zenith",
     "compute_four_band_radiation",
+    "MicrophysicsResult",
+    "step_microphysics",
+    "canopy_roughness_raupach",
+    "ocean_roughness_miller",
+    "compute_surface_transfer",
+    "step_mynn_level25",
+    "compute_smagorinsky_lilly_3d",
+    "BiosphereState",
+    "non_rectangular_hyperbola",
+    "smith_omega",
+    "canopy_light_absorption_depury",
+    "allocate_two_leaf_capacity",
+    "canopy_two_stream_albedo_dai",
+    "init_biosphere_state",
+    "update_daily_acclimation_smith",
+    "compute_two_leaf_gas_exchange",
+    "lambert_w0",
+    "update_daily_lai_root_height",
+    "SURF_OCEAN",
+    "SURF_LAND",
+    "SURF_ICESHEET",
+    "SurfaceState",
+    "SurfaceFluxDiagnostics",
+    "init_surface_state",
+    "compute_surface_albedos",
+    "step_multilayer_soil_thermodynamics",
+    "step_surface",
+    "CRMState",
+    "SPTendencies",
+    "build_discrete_hydrostatic_rcemip_crm",
+    "fct_advect_3d",
+    "step_crm_rk3_hevi",
+    "step_crm_physics_and_dynamics",
+    "step_coupled_crm_rce",
+    "SCVTMesh",
+    "build_scvt_mesh",
+    "reconstruct_cell_winds",
+    "project_cell_vectors_to_edges",
+    "GlobalAtmosState",
+    "init_global_hydrostatic_atmosphere",
+    "compute_scvt_divergence",
+    "compute_scvt_vorticity",
+    "fct_advect_scvt",
+    "step_scvt_rk3_hevi",
+    "compute_held_suarez_forcing",
+    "compute_orographic_drag_lott_miller",
+    "EkmanOceanState",
+    "init_ekman_ocean_state",
+    "step_ekman_ocean_voronoi",
+    "KOPPEN_NAMES",
+    "classify_koppen_geiger",
+    "AOBAConfig",
+    "AOBAState",
+    "GlobalStepDiagnostics",
+    "compute_orbital_insolation",
+    "init_aoba_model",
+    "step_aoba_model",
+    "diagnose_model_koppen_geiger",
     "save_zarr",
     "append_zarr",
     "load_zarr",
+    "export_aoba_snapshot_xarray",
 ]

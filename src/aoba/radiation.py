@@ -55,6 +55,10 @@ class RadiationOutput:
     sfc_lw_net: torch.Tensor       # Net downward LW absorbed by surface (LW_dn - LW_up) [W m^-2] [...]
     sfc_par_wm2: torch.Tensor      # Downward surface PAR energy flux [W m^-2] [...]
     sfc_ppfd: torch.Tensor         # Downward surface PPFD [umol photons m^-2 s^-1] [...]
+    sfc_sw1_dir_dn: torch.Tensor   # Downward surface direct-beam SW1 flux [W m^-2] [...]
+    sfc_sw1_dif_dn: torch.Tensor   # Downward surface diffuse SW1 flux [W m^-2] [...]
+    sfc_sw2_dir_dn: torch.Tensor   # Downward surface direct-beam SW2 flux [W m^-2] [...]
+    sfc_sw2_dif_dn: torch.Tensor   # Downward surface diffuse SW2 flux [W m^-2] [...]
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +258,9 @@ def toon_two_stream_sw(
     mu0_in: torch.Tensor,
     f_toa: torch.Tensor,
     albedo_sfc: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    albedo_sfc_dif: torch.Tensor | None = None,
+    return_sfc_split: bool = False,
+) -> tuple[torch.Tensor, ...]:
     """Solve multi-layer solar two-stream radiative transfer (delta-Quadrature).
 
     All vertical inputs here are in TOP-DOWN order: index 0 = TOA layer, index N-1 = surface layer.
@@ -359,9 +365,10 @@ def toon_two_stream_sw(
         E[2:two_N:2] = e3[:-1] * (cp_0[1:] - cp_t[:-1]) + e1[:-1] * (cm_t[:-1] - cm_0[1:])
 
     # Bottom row 2N - 1 (l = 2N): surface boundary (Eq. 37 & Eq. 43)
-    r_sfc = torch.clamp(albedo_sfc, min=0.0, max=1.0)
+    r_dir = torch.clamp(albedo_sfc, min=0.0, max=1.0)
+    r_sfc = r_dir if albedo_sfc_dif is None else torch.clamp(albedo_sfc_dif, min=0.0, max=1.0)
     direct_sfc = mu0 * f_beam0 * att_bot[-1]
-    s_sfc = r_sfc * direct_sfc
+    s_sfc = r_dir * direct_sfc
     A[-1] = e1[-1] - r_sfc * e3[-1]
     B[-1] = e2[-1] - r_sfc * e4[-1]
     E[-1] = s_sfc - cp_t[-1] + r_sfc * cm_t[-1]
@@ -389,6 +396,10 @@ def toon_two_stream_sw(
     day_expand = day_mask.unsqueeze(0)
     flux_up = torch.where(day_expand, torch.clamp(flux_up, min=0.0), torch.zeros_like(flux_up))
     flux_dn = torch.where(day_expand, flux_dn, torch.zeros_like(flux_dn))
+    if return_sfc_split:
+        sfc_dir = torch.where(day_mask, torch.clamp(f_dn_dir_base[-1], min=0.0), torch.zeros_like(f_beam0))
+        sfc_dif = torch.where(day_mask, torch.clamp(flux_dn[-1] - sfc_dir, min=0.0), torch.zeros_like(f_beam0))
+        return flux_up, flux_dn, sfc_dir, sfc_dif
     return flux_up, flux_dn
 
 
@@ -501,9 +512,11 @@ def compute_four_band_radiation(
     mu0: torch.Tensor,
     s_toa: torch.Tensor,
     co2_ppmv: float = C.CO2_RCEMIP_PPMV,
-    emiss_sfc: float = 0.98,
+    emiss_sfc: float | torch.Tensor = 0.98,
     re_liq_um: float = 10.0,
     re_ice_um: float = 50.0,
+    albedo_vis_dif: torch.Tensor | None = None,
+    albedo_nir_dif: torch.Tensor | None = None,
 ) -> RadiationOutput:
     """Evaluate 4-band (SW1, SW2, LW1, LW2) radiative fluxes and heating rates.
 
@@ -582,11 +595,25 @@ def compute_four_band_radiation(
     om_sw2 = scat_sw2 / torch.clamp(tau_sw2, min=1.0e-8)
     g_sw2 = g_c2
 
-    sw1_up, sw1_dn = toon_two_stream_sw(
-        tau_sw1, om_sw1, g_sw1, mu0, C.SOLAR_FRAC_SW1 * s_toa, albedo_vis
+    sw1_up, sw1_dn, sfc_sw1_dir, sfc_sw1_dif = toon_two_stream_sw(
+        tau_sw1,
+        om_sw1,
+        g_sw1,
+        mu0,
+        C.SOLAR_FRAC_SW1 * s_toa,
+        albedo_vis,
+        albedo_sfc_dif=albedo_vis_dif,
+        return_sfc_split=True,
     )
-    sw2_up, sw2_dn = toon_two_stream_sw(
-        tau_sw2, om_sw2, g_sw2, mu0, C.SOLAR_FRAC_SW2 * s_toa, albedo_nir
+    sw2_up, sw2_dn, sfc_sw2_dir, sfc_sw2_dif = toon_two_stream_sw(
+        tau_sw2,
+        om_sw2,
+        g_sw2,
+        mu0,
+        C.SOLAR_FRAC_SW2 * s_toa,
+        albedo_nir,
+        albedo_sfc_dif=albedo_nir_dif,
+        return_sfc_split=True,
     )
 
     sw_up_td = sw1_up + sw2_up
@@ -676,4 +703,8 @@ def compute_four_band_radiation(
         sfc_lw_net=sfc_lw_net,
         sfc_par_wm2=sfc_par_wm2,
         sfc_ppfd=sfc_ppfd,
+        sfc_sw1_dir_dn=sfc_sw1_dir,
+        sfc_sw1_dif_dn=sfc_sw1_dif,
+        sfc_sw2_dir_dn=sfc_sw2_dir,
+        sfc_sw2_dif_dn=sfc_sw2_dif,
     )

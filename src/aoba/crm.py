@@ -1,0 +1,1010 @@
+"""3D Compressible Nonhydrostatic HEVI Cloud-Resolving Model (CRM), Zalesak FCT, & RCE Driver.
+
+Implements the embedded doubly periodic 3D Arakawa C-grid / Charney-Phillips nonhydrostatic
+CRM (`N_x x N_y = 8 x 8`, `dx = dy = 4 km` default) batched across `N_col` host columns for
+both standalone Radiative-Convective Equilibrium (RCE) and 1:1 Superparameterization (SP).
+
+References
+----------
+- Skamarock et al. (2012, Mon. Wea. Rev., 140, 3090-3105, Sec. 2-3):
+  Compressible flux-form moist Euler equations using `(rho_d, Theta_m = rho_d * theta_m)`
+  and 3-stage Wicker & Skamarock (2002) RK3 + Horizontally Explicit / Vertically Implicit
+  (HEVI) acoustic-gravity integration.
+- Klemp, Skamarock, & Dudhia (2007, Mon. Wea. Rev., 135, 2897-2913) &
+  Nishizawa et al. (2025, SCALE-RM v5.5.5, Ch. 3 Eqs. 3.1-3.105):
+  Off-centered implicit vertical Helmholtz tridiagonal solver on `F_z = rho_d * w`
+  guaranteeing exact discrete mass and moist-potential-temperature conservation, plus
+  upper-tropospheric/stratospheric Rayleigh sponge damping.
+- Zalesak (1979, J. Comput. Phys., 31, 335-362, Eqs. 1-17) &
+  SCALE-RM (Nishizawa et al., 2025, App. A.2 Eqs. A.20-A.35):
+  Multidimensional positive-definite Flux-Corrected Transport (FCT) combining 1st-order
+  monotone donor-cell upwind fluxes with 4th-order centered fluxes.
+- Khairoutdinov & Randall (2003, J. Atmos. Sci., 60, 607-623),
+  Khairoutdinov, Randall, & DeMott (2005, J. Atmos. Sci., 62, 2136-2154), &
+  Yamazaki & Miura (2024, J. Adv. Model. Earth Syst., 16, e2023MS004133):
+  3D CRM formulation and large-scale Superparameterization tendency coupling.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+import torch
+
+from aoba import constants as C
+from aoba.biosphere import update_daily_acclimation_smith, update_daily_lai_root_height
+from aoba.kernels import solve_tridiagonal_batched
+from aoba.microphysics import step_microphysics
+from aoba.radiation import compute_four_band_radiation
+from aoba.surface import SurfaceFluxDiagnostics, SurfaceState, compute_surface_albedos, step_surface
+from aoba.thermodynamics import (
+    diagnose_pressure_temperature,
+    rcemip_analytic_sounding,
+    saturation_adjustment,
+)
+from aoba.turbulence import TKE_MIN, compute_smagorinsky_lilly_3d, step_mynn_level25
+from aoba.vertical_grid import VerticalGrid
+
+
+@dataclass
+class CRMState:
+    """Batched 3D nonhydrostatic CRM state on `[Nz, N_col, Ny, Nx]` Arakawa C-grid."""
+
+    rho_d: torch.Tensor    # Dry air density [kg m^-3], shape [Nz, N_col, Ny, Nx]
+    u: torch.Tensor        # Zonal velocity at x-edges (i+1/2) [m s^-1], shape [Nz, N_col, Ny, Nx]
+    v: torch.Tensor        # Meridional velocity at y-edges (j+1/2) [m s^-1], shape [Nz, N_col, Ny, Nx]
+    w: torch.Tensor        # Vertical velocity at z-interfaces [m s^-1], shape [Nz+1, N_col, Ny, Nx]
+    theta_m: torch.Tensor  # Modified moist potential temperature [K], shape [Nz, N_col, Ny, Nx]
+    q_n: torch.Tensor      # Non-precipitating water q_v + q_c + q_i [kg kg^-1], shape [Nz, N_col, Ny, Nx]
+    q_p: torch.Tensor      # Precipitating water q_r + q_s + q_g [kg kg^-1], shape [Nz, N_col, Ny, Nx]
+    q_v: torch.Tensor      # Diagnosed water vapor mixing ratio [kg kg^-1], shape [Nz, N_col, Ny, Nx]
+    q_c: torch.Tensor      # Diagnosed cloud liquid mixing ratio [kg kg^-1], shape [Nz, N_col, Ny, Nx]
+    q_i: torch.Tensor      # Diagnosed cloud ice mixing ratio [kg kg^-1], shape [Nz, N_col, Ny, Nx]
+    qke: torch.Tensor      # Doubled MYNN subgrid TKE 2*e [m^2 s^-2], shape [Nz, N_col, Ny, Nx]
+    dx: float = 4000.0     # Horizontal x-spacing [m]
+    dy: float = 4000.0     # Horizontal y-spacing [m]
+    f_coriolis: torch.Tensor | None = None  # Column Coriolis parameter [s^-1], shape [N_col]
+
+
+@dataclass
+class SPTendencies:
+    """Horizontal-mean CRM physics/convective tendencies returned to host SCVT columns."""
+
+    dtheta_m_dt: torch.Tensor   # [Nz, N_col] [K s^-1]
+    dq_n_dt: torch.Tensor       # [Nz, N_col] [kg kg^-1 s^-1]
+    dq_p_dt: torch.Tensor       # [Nz, N_col] [kg kg^-1 s^-1]
+    du_dt: torch.Tensor         # [Nz, N_col] [m s^-2]
+    dv_dt: torch.Tensor         # [Nz, N_col] [m s^-2]
+    precip_rain: torch.Tensor   # Mean surface rain rate [N_col] [kg m^-2 s^-1]
+    precip_snow: torch.Tensor   # Mean surface snow/ice rate [N_col] [kg m^-2 s^-1]
+
+
+# ---------------------------------------------------------------------------
+# 1. Exact Discrete Hydrostatic Initialization
+# ---------------------------------------------------------------------------
+def build_discrete_hydrostatic_rcemip_crm(
+    vgrid: VerticalGrid,
+    n_col: int = 1,
+    ny: int = 8,
+    nx: int = 8,
+    dx: float = 4000.0,
+    dy: float = 4000.0,
+    t_sfc: float = 300.0,
+    p_sfc: float = 101480.0,
+    f_coriolis: float = 0.0,
+    pert_amplitude_k: float = 0.05,
+    seed: int = 42,
+) -> CRMState:
+    """Initialize a discretely hydrostatic RCEMIP 3D CRM state on `vgrid.device`.
+
+    Iteratively refines dry density `rho_d[k]` from the analytic Wing et al. (2018) sounding
+    in `float64` so that discrete vertical pressure differences satisfy:
+
+        (p[k] - p[k-1]) / dz_w[k] + 0.5 * (rho_tot[k] + rho_tot[k-1]) * g == 0
+
+    to machine precision before casting to `vgrid.dtype`, preventing spurious startup acoustic
+    waves on `float32` GPU.
+    """
+    dev = vgrid.zeta_c.device
+    dtype = vgrid.zeta_c.dtype
+    nz = vgrid.nz
+
+    z_c64 = vgrid.zeta_c.cpu().to(dtype=torch.float64)
+    z_w64 = vgrid.zeta_w.cpu().to(dtype=torch.float64)
+    prof = rcemip_analytic_sounding(z_c64, z_w64, sst=t_sfc, p_sfc=p_sfc)
+
+    temp = prof["temp_c"].clone()     # [Nz]
+    qv = prof["qv_c"].clone()         # [Nz]
+    gamma = C.GAMMA_D
+
+    # Integrate discrete hydrostatic pressure from p_sfc upward
+    dz_0 = float(z_c64[0] - z_w64[0])
+    tv_0 = temp[0] * (1.0 + C.RV_OVER_RD * qv[0]) / (1.0 + qv[0])
+    p_col = torch.empty(nz, dtype=torch.float64)
+    p_col[0] = p_sfc * torch.exp(-C.GRAVITY * dz_0 / (C.R_D * tv_0))
+
+    rho_d_col = p_col.clone()
+    rho_d_col[0] = p_col[0] / (C.R_D * temp[0] * (1.0 + C.RV_OVER_RD * qv[0]))
+
+    for k in range(1, nz):
+        dz_wk = float(z_c64[k] - z_c64[k - 1])
+        rho_tot_below = rho_d_col[k - 1] * (1.0 + qv[k - 1])
+        # Solve p_k - p_{k-1} + 0.5 * dz_wk * g * (rho_tot_below + p_k * (1 + qv_k) / (R_d * T_k * (1 + rv/rd * qv_k))) = 0
+        fac_k = (1.0 + qv[k]) / (C.R_D * temp[k] * (1.0 + C.RV_OVER_RD * qv[k]))
+        p_col[k] = (p_col[k - 1] - 0.5 * dz_wk * C.GRAVITY * rho_tot_below) / (
+            1.0 + 0.5 * dz_wk * C.GRAVITY * fac_k
+        )
+        rho_d_col[k] = p_col[k] / (C.R_D * temp[k] * (1.0 + C.RV_OVER_RD * qv[k]))
+
+    # Exact theta_m consistent with full compressible EOS p = p_0 * (R_d * rho_d * theta_m / p_0)^gamma
+    theta_m_col = (C.P_REF / (C.R_D * rho_d_col)) * torch.pow(p_col / C.P_REF, 1.0 / gamma)
+
+    shape4 = (nz, n_col, ny, nx)
+    rho_d = rho_d_col.to(device=dev, dtype=dtype).view(nz, 1, 1, 1).expand(shape4).clone()
+    theta_m = theta_m_col.to(device=dev, dtype=dtype).view(nz, 1, 1, 1).expand(shape4).clone()
+    q_v = qv.to(device=dev, dtype=dtype).view(nz, 1, 1, 1).expand(shape4).clone()
+
+    if pert_amplitude_k > 0.0:
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(seed)
+        # Zero-mean random boundary-layer thermal noise in lowest 4 levels (Wing et al., 2018)
+        noise = (torch.rand((4, n_col, ny, nx), generator=gen, dtype=torch.float32) - 0.5) * 2.0 * pert_amplitude_k
+        noise = noise - noise.mean(dim=(-2, -1), keepdim=True)
+        theta_m[:4] = theta_m[:4] + noise.to(device=dev, dtype=dtype)
+
+    zeros = torch.zeros(shape4, device=dev, dtype=dtype)
+    w = torch.zeros((nz + 1, n_col, ny, nx), device=dev, dtype=dtype)
+    qke = torch.full(shape4, 2.0 * TKE_MIN, device=dev, dtype=dtype)
+    f_cor = torch.full((n_col,), f_coriolis, device=dev, dtype=dtype)
+
+    return CRMState(
+        rho_d=rho_d,
+        u=zeros.clone(),
+        v=zeros.clone(),
+        w=w,
+        theta_m=theta_m,
+        q_n=q_v.clone(),
+        q_p=zeros.clone(),
+        q_v=q_v,
+        q_c=zeros.clone(),
+        q_i=zeros.clone(),
+        qke=qke,
+        dx=dx,
+        dy=dy,
+        f_coriolis=f_cor,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Zalesak (1979) 3D Positive-Definite Flux-Corrected Transport (FCT)
+# ---------------------------------------------------------------------------
+def fct_advect_3d(
+    q: torch.Tensor,
+    rho_old: torch.Tensor,
+    rho_new: torch.Tensor,
+    fx: torch.Tensor,
+    fy: torch.Tensor,
+    fz: torch.Tensor,
+    dx: float,
+    dy: float,
+    dz_c: torch.Tensor,
+    dt: float,
+) -> torch.Tensor:
+    """Advect non-negative tracer `q` over `dt` with exact conservation & positivity.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Tracer mixing ratio `[Nz, N_col, Ny, Nx]`, `q >= 0`.
+    rho_old, rho_new : torch.Tensor
+        Dry air density before and after mass continuity step `[Nz, N_col, Ny, Nx]`, satisfying
+        `rho_new == rho_old - dt * (div_x(fx) + div_y(fy) + div_z(fz))`.
+    fx, fy : torch.Tensor
+        Horizontal mass fluxes `[Nz, N_col, Ny, Nx]` at `(i+1/2, j)` and `(i, j+1/2)` [kg m^-2 s^-1].
+    fz : torch.Tensor
+        Vertical mass flux `[Nz+1, N_col, Ny, Nx]` at interfaces `k-1/2` (`fz[0] == fz[Nz] == 0`).
+    dz_c : torch.Tensor
+        Layer thickness `[Nz]` or `[Nz, 1, 1, 1]` [m].
+
+    References
+    ----------
+    - Zalesak (1979, J. Comput. Phys., 31, Eqs. 1-17).
+    - Nishizawa et al. (2025, SCALE-RM v5.5.5, App. A.2 Eqs. A.20-A.35).
+    """
+    nz = q.shape[0]
+    dz = dz_c.view(nz, -1, 1, 1)
+    eps = 1.0e-20
+
+    # --- 1. Low-order 1st-order donor-cell upwind fluxes ---
+    # fx[i] sits at face (i + 1/2) between cell i and cell (i + 1) mod Nx
+    q_xp1 = torch.roll(q, shifts=-1, dims=-1)
+    q_xm1 = torch.roll(q, shifts=1, dims=-1)
+    q_xp2 = torch.roll(q, shifts=-2, dims=-1)
+    fl_x = torch.clamp(fx, min=0.0) * q + torch.clamp(fx, max=0.0) * q_xp1
+
+    # fy[j] sits at face (j + 1/2) between cell j and cell (j + 1) mod Ny
+    q_yp1 = torch.roll(q, shifts=-1, dims=-2)
+    q_ym1 = torch.roll(q, shifts=1, dims=-2)
+    q_yp2 = torch.roll(q, shifts=-2, dims=-2)
+    fl_y = torch.clamp(fy, min=0.0) * q + torch.clamp(fy, max=0.0) * q_yp1
+
+    # fz[m] (m = 1..Nz-1) sits between cell m-1 (below) and cell m (above)
+    fl_z = torch.zeros_like(fz)
+    fz_int = fz[1:-1]
+    fl_z[1:-1] = torch.clamp(fz_int, min=0.0) * q[:-1] + torch.clamp(fz_int, max=0.0) * q[1:]
+
+    # Transported & diffused (monotone low-order) update
+    div_fl = (
+        (fl_x - torch.roll(fl_x, shifts=1, dims=-1)) / dx
+        + (fl_y - torch.roll(fl_y, shifts=1, dims=-2)) / dy
+        + (fl_z[1:] - fl_z[:-1]) / dz
+    )
+    rho_safe = torch.clamp(rho_new, min=1.0e-5)
+    q_td = torch.clamp((rho_old * q - dt * div_fl) / rho_safe, min=0.0)
+
+    # --- 2. High-order 4th-order centered horizontal & 2nd/4th-order vertical fluxes ---
+    fh_x = fx * ((-q_xm1 + 7.0 * q + 7.0 * q_xp1 - q_xp2) / 12.0)
+    fh_y = fy * ((-q_ym1 + 7.0 * q + 7.0 * q_yp1 - q_yp2) / 12.0)
+    fh_z = torch.zeros_like(fz)
+    fh_z[1:-1] = fz_int * (0.5 * (q[:-1] + q[1:]))
+    if nz >= 4:
+        fh_z[2:-2] = fz[2:-2] * ((-q[:-3] + 7.0 * q[1:-2] + 7.0 * q[2:-1] - q[3:]) / 12.0)
+
+    # Anti-diffusive fluxes A = F^H - F^L
+    ax = fh_x - fl_x
+    ay = fh_y - fl_y
+    az = fh_z - fl_z
+
+    # --- 3. Local neighborhood bounds q_max, q_min from (q, q_td) ---
+    q_hi0 = torch.maximum(q, q_td)
+    q_lo0 = torch.minimum(q, q_td)
+
+    q_max = torch.maximum(
+        q_hi0,
+        torch.maximum(
+            torch.maximum(torch.roll(q_hi0, 1, -1), torch.roll(q_hi0, -1, -1)),
+            torch.maximum(torch.roll(q_hi0, 1, -2), torch.roll(q_hi0, -1, -2)),
+        ),
+    )
+    q_min = torch.minimum(
+        q_lo0,
+        torch.minimum(
+            torch.minimum(torch.roll(q_lo0, 1, -1), torch.roll(q_lo0, -1, -1)),
+            torch.minimum(torch.roll(q_lo0, 1, -2), torch.roll(q_lo0, -1, -2)),
+        ),
+    )
+    # Include vertical neighbors
+    q_z_up = torch.cat([q_hi0[1:], q_hi0[-1:]], dim=0)
+    q_z_dn = torch.cat([q_hi0[:1], q_hi0[:-1]], dim=0)
+    q_max = torch.maximum(q_max, torch.maximum(q_z_up, q_z_dn))
+
+    q_zlo_up = torch.cat([q_lo0[1:], q_lo0[-1:]], dim=0)
+    q_zlo_dn = torch.cat([q_lo0[:1], q_lo0[:-1]], dim=0)
+    q_min = torch.minimum(q_min, torch.minimum(q_zlo_up, q_zlo_dn))
+
+    # --- 4. Zalesak P^+, P^-, Q^+, Q^-, R^+, R^- (SCALE-RM Eqs. A.27-A.34) ---
+    ax_im1 = torch.roll(ax, shifts=1, dims=-1)
+    ay_jm1 = torch.roll(ay, shifts=1, dims=-2)
+
+    # Net incoming anti-diffusive mass per unit volume * dt
+    p_plus = dt * (
+        (torch.clamp(ax_im1, min=0.0) - torch.clamp(ax, max=0.0)) / dx
+        + (torch.clamp(ay_jm1, min=0.0) - torch.clamp(ay, max=0.0)) / dy
+        + (torch.clamp(az[:-1], min=0.0) - torch.clamp(az[1:], max=0.0)) / dz
+    )
+    # Net outgoing anti-diffusive mass per unit volume * dt
+    p_minus = dt * (
+        (torch.clamp(ax, min=0.0) - torch.clamp(ax_im1, max=0.0)) / dx
+        + (torch.clamp(ay, min=0.0) - torch.clamp(ay_jm1, max=0.0)) / dy
+        + (torch.clamp(az[1:], min=0.0) - torch.clamp(az[:-1], max=0.0)) / dz
+    )
+
+    q_plus = rho_safe * torch.clamp(q_max - q_td, min=0.0)
+    q_minus = rho_safe * torch.clamp(q_td - q_min, min=0.0)
+
+    r_plus = torch.where(p_plus > eps, torch.clamp(q_plus / (p_plus + eps), 0.0, 1.0), torch.ones_like(q_td))
+    r_minus = torch.where(p_minus > eps, torch.clamp(q_minus / (p_minus + eps), 0.0, 1.0), torch.ones_like(q_td))
+
+    # Face limiters C_x, C_y, C_z in [0, 1]
+    rp_xp1 = torch.roll(r_plus, shifts=-1, dims=-1)
+    rm_xp1 = torch.roll(r_minus, shifts=-1, dims=-1)
+    cx = torch.where(ax >= 0.0, torch.minimum(r_minus, rp_xp1), torch.minimum(r_plus, rm_xp1))
+
+    rp_yp1 = torch.roll(r_plus, shifts=-1, dims=-2)
+    rm_yp1 = torch.roll(r_minus, shifts=-1, dims=-2)
+    cy = torch.where(ay >= 0.0, torch.minimum(r_minus, rp_yp1), torch.minimum(r_plus, rm_yp1))
+
+    cz = torch.zeros_like(az)
+    cz[1:-1] = torch.where(
+        az[1:-1] >= 0.0,
+        torch.minimum(r_minus[:-1], r_plus[1:]),
+        torch.minimum(r_plus[:-1], r_minus[1:]),
+    )
+
+    ax_lim = cx * ax
+    ay_lim = cy * ay
+    az_lim = cz * az
+
+    div_anti = (
+        (ax_lim - torch.roll(ax_lim, shifts=1, dims=-1)) / dx
+        + (ay_lim - torch.roll(ay_lim, shifts=1, dims=-2)) / dy
+        + (az_lim[1:] - az_lim[:-1]) / dz
+    )
+    q_final = torch.clamp(q_td - (dt / rho_safe) * div_anti, min=0.0)
+    return q_final
+
+
+# ---------------------------------------------------------------------------
+# 3. 3D Compressible Nonhydrostatic RK3-HEVI Dynamical Step
+# ---------------------------------------------------------------------------
+def _compute_3d_sgs_tendencies(
+    rho_d: torch.Tensor,
+    u: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    theta_m: torch.Tensor,
+    dx: float,
+    dy: float,
+    dz_c: torch.Tensor,
+    dz_w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute anisotropic 3D Smagorinsky-Lilly SGS momentum & heat tendencies (SCALE-RM Sec. 8.1.2)."""
+    nz = rho_d.shape[0]
+    dz = dz_c.view(nz, -1, 1, 1)
+    dz_int = dz_w.view(nz - 1, -1, 1, 1) if dz_w.shape[0] == nz - 1 else dz_w[1:-1].view(nz - 1, -1, 1, 1)
+
+    # Velocity gradients at cell centers for strain-rate magnitude |S|
+    du_dx = (u - torch.roll(u, 1, -1)) / dx
+    dv_dy = (v - torch.roll(v, 1, -2)) / dy
+    dw_dz = (w[1:] - w[:-1]) / dz
+
+    u_c = 0.5 * (u + torch.roll(u, 1, -1))
+    v_c = 0.5 * (v + torch.roll(v, 1, -2))
+    du_dy = 0.5 * (torch.roll(u_c, -1, -2) - torch.roll(u_c, 1, -2)) / dy
+    dv_dx = 0.5 * (torch.roll(v_c, -1, -1) - torch.roll(v_c, 1, -1)) / dx
+
+    du_dz_int = (u_c[1:] - u_c[:-1]) / dz_int
+    dv_dz_int = (v_c[1:] - v_c[:-1]) / dz_int
+    du_dz = torch.zeros_like(u_c)
+    dv_dz = torch.zeros_like(v_c)
+    du_dz[:-1] += 0.5 * du_dz_int
+    du_dz[1:] += 0.5 * du_dz_int
+    dv_dz[:-1] += 0.5 * dv_dz_int
+    dv_dz[1:] += 0.5 * dv_dz_int
+
+    s2 = (
+        2.0 * (du_dx * du_dx + dv_dy * dv_dy + dw_dz * dw_dz)
+        + (du_dy + dv_dx) ** 2
+        + du_dz * du_dz
+        + dv_dz * dv_dz
+    )
+    strain_mag = torch.sqrt(torch.clamp(s2, min=1.0e-12))
+
+    dth_dz_int = (theta_m[1:] - theta_m[:-1]) / dz_int
+    n2_int = (C.GRAVITY / torch.clamp(0.5 * (theta_m[1:] + theta_m[:-1]), min=200.0)) * dth_dz_int
+    n2 = torch.zeros_like(theta_m)
+    n2[:-1] += 0.5 * n2_int
+    n2[1:] += 0.5 * n2_int
+
+    nu_sgs, d_sgs = compute_smagorinsky_lilly_3d(strain_mag, n2, dx, dy, dz)
+
+    # Horizontal eddy flux divergences (vertical PBL turbulence is handled implicitly by MYNN 2.5)
+    lap_u = (torch.roll(u, -1, -1) - 2.0 * u + torch.roll(u, 1, -1)) / (dx * dx) + (
+        torch.roll(u, -1, -2) - 2.0 * u + torch.roll(u, 1, -2)
+    ) / (dy * dy)
+    lap_v = (torch.roll(v, -1, -1) - 2.0 * v + torch.roll(v, 1, -1)) / (dx * dx) + (
+        torch.roll(v, -1, -2) - 2.0 * v + torch.roll(v, 1, -2)
+    ) / (dy * dy)
+
+    w_lap = (torch.roll(w, -1, -1) - 2.0 * w + torch.roll(w, 1, -1)) / (dx * dx) + (
+        torch.roll(w, -1, -2) - 2.0 * w + torch.roll(w, 1, -2)
+    ) / (dy * dy)
+    nu_w = torch.zeros_like(w)
+    nu_w[1:-1] = 0.5 * (nu_sgs[:-1] + nu_sgs[1:])
+
+    # Conservative horizontal scalar SGS flux for Theta_m
+    d_x = 0.5 * (d_sgs + torch.roll(d_sgs, -1, -1))
+    d_y = 0.5 * (d_sgs + torch.roll(d_sgs, -1, -2))
+    rho_x = 0.5 * (rho_d + torch.roll(rho_d, -1, -1))
+    rho_y = 0.5 * (rho_d + torch.roll(rho_d, -1, -2))
+    fth_x = -rho_x * d_x * (torch.roll(theta_m, -1, -1) - theta_m) / dx
+    fth_y = -rho_y * d_y * (torch.roll(theta_m, -1, -2) - theta_m) / dy
+    d_Thm_sgs = -(fth_x - torch.roll(fth_x, 1, -1)) / dx - (fth_y - torch.roll(fth_y, 1, -2)) / dy
+
+    # Add small 4th-order background horizontal numerical filter tau_div to control 2*dx grid noise
+    nu_bg = 0.004 * (dx * dy) / 10.0  # ~640 m^2 s^-1 at dx = 4 km
+    du_sgs = (nu_sgs + nu_bg) * lap_u
+    dv_sgs = (nu_sgs + nu_bg) * lap_v
+    dw_sgs = torch.zeros_like(w)
+    dw_sgs[1:-1] = (nu_w[1:-1] + nu_bg) * w_lap[1:-1]
+
+    return du_sgs, dv_sgs, dw_sgs, d_Thm_sgs
+
+
+def step_crm_rk3_hevi(
+    crm: CRMState,
+    vgrid: VerticalGrid,
+    dt_dyn: float,
+    beta_hevi: float = 0.60,
+    z_c_col: torch.Tensor | None = None,
+    dz_c_col: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Advance `(rho_d, u, v, w, theta_m)` over one RK3-HEVI step `dt_dyn` [s].
+
+    Returns the stage-averaged mass fluxes `(fx_avg, fy_avg, fz_avg)` matching the
+    continuity change `(crm.rho_d_new - crm.rho_d_old)` to machine precision for
+    subsequent Zalesak 3D FCT tracer advection (`Skamarock et al., 2012`, Sec. 3c).
+    """
+    nz = vgrid.nz
+    dx = crm.dx
+    dy = crm.dy
+    dz_c = dz_c_col.view(nz, -1, 1, 1) if dz_c_col is not None else vgrid.dzeta_c.view(nz, 1, 1, 1)
+    dz_w_int = (
+        (z_c_col[1:] - z_c_col[:-1]).view(nz - 1, -1, 1, 1)
+        if z_c_col is not None
+        else (vgrid.zeta_c[1:] - vgrid.zeta_c[:-1]).view(nz - 1, 1, 1, 1)
+    )
+    sponge_w = vgrid.sponge_w[1:-1].view(nz - 1, 1, 1, 1)
+    sponge_c = vgrid.sponge_c.view(nz, 1, 1, 1)
+
+    rho0 = crm.rho_d
+    u0 = crm.u
+    v0 = crm.v
+    w0 = crm.w
+    Thm0 = rho0 * crm.theta_m
+    q_load = 1.0 + crm.q_n + crm.q_p  # Exact moist mass loading rho_tot / rho_d
+
+    # Compute SGS tendencies once at start of RK3 step (Skamarock et al., 2012, Sec. 3)
+    du_sgs, dv_sgs, dw_sgs, dThm_sgs = _compute_3d_sgs_tendencies(
+        rho0, u0, v0, w0, crm.theta_m, dx, dy, dz_c, dz_w_int
+    )
+
+    rho_s = rho0
+    u_s = u0
+    v_s = v0
+    w_s = w0
+    Thm_s = Thm0
+
+    # Wicker & Skamarock (2002) 3-stage RK3 sub-steps: dtau = (dt/3, dt/2, dt)
+    rk_taus = (dt_dyn / 3.0, 0.5 * dt_dyn, dt_dyn)
+    fx_final = torch.zeros_like(rho0)
+    fy_final = torch.zeros_like(rho0)
+    fz_final = torch.zeros_like(w0)
+
+    gamma = C.GAMMA_D
+    f_cor = crm.f_coriolis.view(1, -1, 1, 1) if crm.f_coriolis is not None else None
+
+    for stage_idx, dtau in enumerate(rk_taus):
+        thm_s = Thm_s / torch.clamp(rho_s, min=1.0e-5)
+        pres_s = C.P_REF * torch.pow(
+            torch.clamp(C.R_D * Thm_s / C.P_REF, min=1.0e-7),
+            gamma,
+        )
+        rho_tot_s = rho_s * q_load
+
+        # Horizontal mass fluxes at C-grid edges: fx at (i+1/2), fy at (j+1/2)
+        rho_x = 0.5 * (rho_s + torch.roll(rho_s, -1, -1))
+        rho_y = 0.5 * (rho_s + torch.roll(rho_s, -1, -2))
+        fx = rho_x * u_s
+        fy = rho_y * v_s
+
+        # 4th-order horizontal Theta_m flux with tiny 3rd-order upwind stabilization (Wicker & Skamarock, 2002)
+        thm_xm1 = torch.roll(thm_s, 1, -1)
+        thm_xp1 = torch.roll(thm_s, -1, -1)
+        thm_xp2 = torch.roll(thm_s, -2, -1)
+        thm_face_x = (-thm_xm1 + 7.0 * thm_s + 7.0 * thm_xp1 - thm_xp2) / 12.0
+        upw_x = torch.abs(fx) * (thm_xp2 - 3.0 * thm_xp1 + 3.0 * thm_s - thm_xm1) / 12.0
+        fTh_x = fx * thm_face_x + 0.25 * upw_x
+
+        thm_ym1 = torch.roll(thm_s, 1, -2)
+        thm_yp1 = torch.roll(thm_s, -1, -2)
+        thm_yp2 = torch.roll(thm_s, -2, -2)
+        thm_face_y = (-thm_ym1 + 7.0 * thm_s + 7.0 * thm_yp1 - thm_yp2) / 12.0
+        upw_y = torch.abs(fy) * (thm_yp2 - 3.0 * thm_yp1 + 3.0 * thm_s - thm_ym1) / 12.0
+        fTh_y = fy * thm_face_y + 0.25 * upw_y
+
+        div_h_rho = (fx - torch.roll(fx, 1, -1)) / dx + (fy - torch.roll(fy, 1, -2)) / dy
+        div_h_Thm = (fTh_x - torch.roll(fTh_x, 1, -1)) / dx + (fTh_y - torch.roll(fTh_y, 1, -2)) / dy
+
+        # Horizontal momentum tendencies (advection + pressure gradient + Coriolis + sponge + SGS)
+        rho_tot_x = 0.5 * (rho_tot_s + torch.roll(rho_tot_s, -1, -1))
+        rho_tot_y = 0.5 * (rho_tot_s + torch.roll(rho_tot_s, -1, -2))
+        pgf_u = -(torch.roll(pres_s, -1, -1) - pres_s) / (dx * rho_tot_x)
+        pgf_v = -(torch.roll(pres_s, -1, -2) - pres_s) / (dy * rho_tot_y)
+
+        u_c = 0.5 * (u_s + torch.roll(u_s, 1, -1))
+        v_c = 0.5 * (v_s + torch.roll(v_s, 1, -2))
+        w_c = 0.5 * (w_s[:-1] + w_s[1:])
+
+        adv_u = (
+            -u_s * (torch.roll(u_s, -1, -1) - torch.roll(u_s, 1, -1)) / (2.0 * dx)
+            - 0.5 * (v_c + torch.roll(v_c, -1, -1)) * (torch.roll(u_s, -1, -2) - torch.roll(u_s, 1, -2)) / (2.0 * dy)
+        )
+        adv_v = (
+            -0.5 * (u_c + torch.roll(u_c, -1, -2)) * (torch.roll(v_s, -1, -1) - torch.roll(v_s, 1, -1)) / (2.0 * dx)
+            - v_s * (torch.roll(v_s, -1, -2) - torch.roll(v_s, 1, -2)) / (2.0 * dy)
+        )
+
+        # Vertical advection of u, v
+        du_dz = torch.zeros_like(u_s)
+        dv_dz = torch.zeros_like(v_s)
+        du_int = (u_s[1:] - u_s[:-1]) / dz_w_int
+        dv_int = (v_s[1:] - v_s[:-1]) / dz_w_int
+        w_ux = 0.5 * (w_s[1:-1] + torch.roll(w_s[1:-1], -1, -1))
+        w_vy = 0.5 * (w_s[1:-1] + torch.roll(w_s[1:-1], -1, -2))
+        du_dz[:-1] += 0.5 * w_ux * du_int
+        du_dz[1:] += 0.5 * w_ux * du_int
+        dv_dz[:-1] += 0.5 * w_vy * dv_int
+        dv_dz[1:] += 0.5 * w_vy * dv_int
+
+        cor_u = f_cor * 0.5 * (v_c + torch.roll(v_c, -1, -1)) if f_cor is not None else 0.0
+        cor_v = -f_cor * 0.5 * (u_c + torch.roll(u_c, -1, -2)) if f_cor is not None else 0.0
+
+        # Damp sponge anomalies toward horizontal mean
+        u_anom = u_s - u_s.mean(dim=(-2, -1), keepdim=True)
+        v_anom = v_s - v_s.mean(dim=(-2, -1), keepdim=True)
+
+        u_new = u0 + dtau * (adv_u - du_dz + pgf_u + cor_u + du_sgs - sponge_c * u_anom)
+        v_new = v0 + dtau * (adv_v - dv_dz + pgf_v + cor_v + dv_sgs - sponge_c * v_anom)
+
+        # --- Implicit Vertical HEVI Solver on F_z = rho_{d,w} * w at interfaces 1..Nz-1 ---
+        rho_dw = 0.5 * (rho_s[:-1] + rho_s[1:])            # [Nz-1, N_col, Ny, Nx]
+        rho_tot_w = 0.5 * (rho_tot_s[:-1] + rho_tot_s[1:])
+        q_load_w = 0.5 * (q_load[:-1] + q_load[1:])
+        thm_w = 0.5 * (thm_s[:-1] + thm_s[1:])             # Interface theta_m [Nz-1, ...]
+
+        fz_old = torch.zeros_like(w_s)
+        fz_old[1:-1] = rho_dw * w_s[1:-1]
+
+        # Explicit horizontal + vertical momentum advection of w
+        w_int = w_s[1:-1]
+        u_w = 0.5 * (u_c[:-1] + u_c[1:])
+        v_w = 0.5 * (v_c[:-1] + v_c[1:])
+        dw_dx = (torch.roll(w_int, -1, -1) - torch.roll(w_int, 1, -1)) / (2.0 * dx)
+        dw_dy = (torch.roll(w_int, -1, -2) - torch.roll(w_int, 1, -2)) / (2.0 * dy)
+        dw_dz_c = (w_s[1:] - w_s[:-1]) / dz_c
+        adv_w = -u_w * dw_dx - v_w * dw_dy - w_int * 0.5 * (dw_dz_c[:-1] + dw_dz_c[1:])
+
+        # Provisional states evaluated at fz_old (including FULL explicit + old-stage vertical flux)
+        div_z_fz_old = (fz_old[1:] - fz_old[:-1]) / dz_c
+        fTh_z_old = torch.zeros_like(w_s)
+        fTh_z_old[1:-1] = thm_w * fz_old[1:-1]
+        div_z_Thm_old = (fTh_z_old[1:] - fTh_z_old[:-1]) / dz_c
+
+        rho_dag = rho0 - dtau * (div_h_rho + div_z_fz_old)
+        Thm_dag = Thm0 + dtau * (-div_h_Thm - div_z_Thm_old + dThm_sgs)
+
+        p_dag = C.P_REF * torch.pow(
+            torch.clamp(C.R_D * Thm_dag / C.P_REF, min=1.0e-7),
+            gamma,
+        )
+        dp_dThm = gamma * p_dag / torch.clamp(Thm_dag, min=1.0e-3)  # c_s^2 / theta_m [Nz, ...]
+        rho_tot_dag_w = 0.5 * (rho_dag[:-1] * q_load[:-1] + rho_dag[1:] * q_load[1:])
+
+        # Vertical acceleration residual using (1 - beta) * old state + beta * dag state
+        p_blend = (1.0 - beta_hevi) * pres_s + beta_hevi * p_dag
+        rtot_blend_w = (1.0 - beta_hevi) * rho_tot_w + beta_hevi * rho_tot_dag_w
+
+        # Exact hydrostatic cancellation when (dp / dz_w + rho_tot_w * g) == 0!
+        nh_imbalance = (p_blend[1:] - p_blend[:-1]) / dz_w_int + rtot_blend_w * C.GRAVITY
+        rhs_fz = (
+            (rho_dw * w0[1:-1] - fz_old[1:-1])
+            + dtau * (
+                rho_dw * (adv_w + dw_sgs[1:-1])
+                - (rho_dw / torch.clamp(rho_tot_w, min=1.0e-5)) * nh_imbalance
+                - sponge_w * fz_old[1:-1]
+            )
+        )
+
+        # Build tridiagonal Helmholtz matrix for delta_Fz = Fz_new - Fz_old on m = 0..Nz-2 (interfaces 1..Nz-1):
+        # Cell k = m (below interface m) has thickness dz_c[m], dp_dThm[m]
+        # Cell k = m+1 (above interface m) has thickness dz_c[m+1], dp_dThm[m+1]
+        fac_p = ((beta_hevi * dtau) ** 2) * (rho_dw / (rho_tot_w * dz_w_int))
+        fac_g = ((beta_hevi * dtau) ** 2) * (0.5 * C.GRAVITY * (rho_dw / rho_tot_w))
+
+        c_dn = dp_dThm[:-1] / dz_c[:-1]   # [Nz-1, ...]
+        c_up = dp_dThm[1:] / dz_c[1:]     # [Nz-1, ...]
+
+        diag = (
+            1.0
+            + dtau * sponge_w
+            + fac_p * thm_w * (c_up + c_dn)
+            + fac_g * (q_load[1:] / dz_c[1:] - q_load[:-1] / dz_c[:-1])
+        )
+        # Ensure strict positivity of diagonal even under extreme Courant numbers
+        diag = torch.clamp(diag, min=0.5)
+
+        dl = torch.zeros_like(diag)
+        du = torch.zeros_like(diag)
+        # Interface m couples to m-1 via cell m (below):
+        dl[1:] = -fac_p[1:] * c_dn[1:] * thm_w[:-1] + fac_g[1:] * (q_load[1:-1] / dz_c[1:-1])
+        # Interface m couples to m+1 via cell m+1 (above):
+        du[:-1] = -fac_p[:-1] * c_up[:-1] * thm_w[1:] - fac_g[:-1] * (q_load[1:-1] / dz_c[1:-1])
+
+        dfz = solve_tridiagonal_batched(dl, diag, du, rhs_fz)
+
+        fz_new = fz_old.clone()
+        fz_new[1:-1] = fz_old[1:-1] + dfz
+
+        # Exact conservative flux-form updates of rho_d and Theta_m!
+        rho_new = rho_dag - beta_hevi * dtau * (fz_new[1:] - fz_old[1:] - (fz_new[:-1] - fz_old[:-1])) / dz_c
+        rho_new = torch.clamp(rho_new, min=1.0e-5)
+
+        dfTh_z = torch.zeros_like(w_s)
+        dfTh_z[1:-1] = thm_w * dfz
+        Thm_new = Thm_dag - beta_hevi * dtau * (dfTh_z[1:] - dfTh_z[:-1]) / dz_c
+
+        rho_dw_new = 0.5 * (rho_new[:-1] + rho_new[1:])
+        w_new = torch.zeros_like(w_s)
+        w_new[1:-1] = fz_new[1:-1] / torch.clamp(rho_dw_new, min=1.0e-5)
+
+        rho_s = rho_new
+        u_s = u_new
+        v_s = v_new
+        w_s = w_new
+        Thm_s = Thm_new
+
+        if stage_idx == 2:
+            fx_final = fx
+            fy_final = fy
+            # Exact effective vertical mass flux consistent with (rho_new - rho0):
+            # rho_new == rho0 - dt_dyn * (div_h_rho + div_z(fz_eff))
+            fz_final = (1.0 - beta_hevi) * fz_old + beta_hevi * fz_new
+
+    crm.rho_d = rho_s
+    crm.u = u_s
+    crm.v = v_s
+    crm.w = w_s
+    crm.theta_m = Thm_s / crm.rho_d
+
+    return fx_final, fy_final, fz_final
+
+
+def step_crm_physics_and_dynamics(
+    crm: CRMState,
+    vgrid: VerticalGrid,
+    dt_crm: float,
+    n_dyn_substeps: int = 1,
+    u_host_target: torch.Tensor | None = None,
+    v_host_target: torch.Tensor | None = None,
+    tau_sp_mom: float = 600.0,
+    dtheta_m_ls_dt: torch.Tensor | None = None,
+    dq_n_ls_dt: torch.Tensor | None = None,
+    sfc_fluxes: SurfaceFluxDiagnostics | None = None,
+    rad_heating_k_s: torch.Tensor | None = None,
+    z_c_col: torch.Tensor | None = None,
+    z_w_col: torch.Tensor | None = None,
+    dz_c_col: torch.Tensor | None = None,
+) -> SPTendencies:
+    """Advance 3D CRM by `dt_crm` [s] (RK3-HEVI + Zalesak FCT + MYNN 2.5 + SAM Microphysics).
+
+    Returns horizontal-mean Superparameterization convective/microphysical/turbulent tendencies
+    for the host SCVT grid (`Khairoutdinov et al., 2005`; `Yamazaki & Miura, 2024`).
+    """
+    nz, n_col, ny, nx = crm.rho_d.shape
+    m_sub = n_col * ny * nx
+
+    # Record initial horizontal-mean profiles before CRM physics + subgrid transport
+    thm_mean_0 = crm.theta_m.mean(dim=(-2, -1))
+    qn_mean_0 = crm.q_n.mean(dim=(-2, -1))
+    qp_mean_0 = crm.q_p.mean(dim=(-2, -1))
+    u_mean_0 = crm.u.mean(dim=(-2, -1))
+    v_mean_0 = crm.v.mean(dim=(-2, -1))
+
+    # 1. Apply optional large-scale host forcing & radiative heating
+    if dtheta_m_ls_dt is not None:
+        crm.theta_m = crm.theta_m + dt_crm * dtheta_m_ls_dt.view(nz, n_col, 1, 1)
+    if dq_n_ls_dt is not None:
+        crm.q_n = torch.clamp(crm.q_n + dt_crm * dq_n_ls_dt.view(nz, n_col, 1, 1), min=0.0)
+    if rad_heating_k_s is not None:
+        # Convert dT/dt [K s^-1] to d(theta_m)/dt via (1 + RV_OVER_RD * q_v) / Exner
+        _, exner_rad, _ = diagnose_pressure_temperature(crm.rho_d, crm.theta_m, crm.q_v)
+        q_fac = 1.0 + C.RV_OVER_RD * crm.q_v
+        rad_3d = rad_heating_k_s.view(nz, n_col, 1, 1) if rad_heating_k_s.ndim == 2 else rad_heating_k_s
+        crm.theta_m = crm.theta_m + dt_crm * rad_3d * q_fac / exner_rad
+
+    # Relax horizontal-mean CRM momentum toward host velocity if coupled in SP mode
+    if u_host_target is not None and v_host_target is not None:
+        alpha_m = min(dt_crm / max(tau_sp_mom, dt_crm), 1.0)
+        du_relax = alpha_m * (u_host_target.view(nz, n_col, 1, 1) - crm.u.mean(dim=(-2, -1), keepdim=True))
+        dv_relax = alpha_m * (v_host_target.view(nz, n_col, 1, 1) - crm.v.mean(dim=(-2, -1), keepdim=True))
+        crm.u = crm.u + du_relax
+        crm.v = crm.v + dv_relax
+
+    # 2. Acoustic/nonhydrostatic RK3-HEVI + Zalesak 3D FCT sub-steps (auto-enforce horizontal acoustic CFL)
+    dt_cfl_max = 0.25 * min(crm.dx, crm.dy) / 350.0
+    n_sub = max(n_dyn_substeps, int(math.ceil(dt_crm / max(dt_cfl_max, 0.1))))
+    dt_sub = dt_crm / float(n_sub)
+    dz_fct = dz_c_col if dz_c_col is not None else vgrid.dzeta_c
+
+    for _ in range(n_sub):
+        rho_before = crm.rho_d.clone()
+        fx, fy, fz = step_crm_rk3_hevi(crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col)
+        crm.q_n = fct_advect_3d(crm.q_n, rho_before, crm.rho_d, fx, fy, fz, crm.dx, crm.dy, dz_fct, dt_sub)
+        crm.q_p = fct_advect_3d(crm.q_p, rho_before, crm.rho_d, fx, fy, fz, crm.dx, crm.dy, dz_fct, dt_sub)
+
+    # Expand column vertical metrics across `[Nz, m_sub]` if terrain-following
+    zc_flat = (
+        z_c_col.unsqueeze(-1).unsqueeze(-1).expand(nz, n_col, ny, nx).reshape(nz, m_sub)
+        if z_c_col is not None
+        else vgrid.zeta_c.view(nz, 1)
+    )
+    zw_flat = (
+        z_w_col.unsqueeze(-1).unsqueeze(-1).expand(nz + 1, n_col, ny, nx).reshape(nz + 1, m_sub)
+        if z_w_col is not None
+        else vgrid.zeta_w.view(nz + 1, 1)
+    )
+    dz_flat = (
+        dz_c_col.unsqueeze(-1).unsqueeze(-1).expand(nz, n_col, ny, nx).reshape(nz, m_sub)
+        if dz_c_col is not None
+        else vgrid.dzeta_c.view(nz, 1)
+    )
+
+    # 3. Implicit MYNN Level 2.5 vertical boundary-layer turbulence
+    if sfc_fluxes is not None:
+        # Broadcast host/column surface fluxes `[N_col]` or `[N_col, Ny, Nx]` across `[N_col * Ny * Nx]`
+        def _bcast_sfc(arr: torch.Tensor) -> torch.Tensor:
+            if arr.ndim == 1:
+                return arr.view(n_col, 1, 1).expand(n_col, ny, nx).reshape(m_sub)
+            return arr.reshape(m_sub)
+
+        u_f, v_f, thm_f, qn_f, qke_f, _, _ = step_mynn_level25(
+            rho_d=crm.rho_d.reshape(nz, m_sub),
+            u=crm.u.reshape(nz, m_sub),
+            v=crm.v.reshape(nz, m_sub),
+            theta_m_c=crm.theta_m.reshape(nz, m_sub),
+            q_n=crm.q_n.reshape(nz, m_sub),
+            q_v=crm.q_v.reshape(nz, m_sub),
+            q_c=crm.q_c.reshape(nz, m_sub),
+            q_i=crm.q_i.reshape(nz, m_sub),
+            qke=crm.qke.reshape(nz, m_sub),
+            z_c=zc_flat,
+            z_w=zw_flat,
+            dz_c=dz_flat,
+            u_star=_bcast_sfc(sfc_fluxes.u_star),
+            sfc_buoy_flux=_bcast_sfc(sfc_fluxes.buoy_flux),
+            tau_x_sfc=_bcast_sfc(sfc_fluxes.tau_x),
+            tau_y_sfc=_bcast_sfc(sfc_fluxes.tau_y),
+            shf_sfc=_bcast_sfc(sfc_fluxes.shf),
+            evap_sfc=_bcast_sfc(sfc_fluxes.evap),
+            dt=dt_crm,
+        )
+        crm.u = u_f.reshape(nz, n_col, ny, nx)
+        crm.v = v_f.reshape(nz, n_col, ny, nx)
+        crm.theta_m = thm_f.reshape(nz, n_col, ny, nx)
+        crm.q_n = qn_f.reshape(nz, n_col, ny, nx)
+        crm.qke = qke_f.reshape(nz, n_col, ny, nx)
+
+    # 4. SAM 1-moment mixed-phase microphysics & sub-cycled sedimentation
+    mp = step_microphysics(
+        rho_d=crm.rho_d.reshape(nz, m_sub),
+        theta_m_c=crm.theta_m.reshape(nz, m_sub),
+        q_n=crm.q_n.reshape(nz, m_sub),
+        q_p=crm.q_p.reshape(nz, m_sub),
+        q_v_prev=crm.q_v.reshape(nz, m_sub),
+        dz_c=dz_flat,
+        dt=dt_crm,
+    )
+    crm.theta_m = mp.theta_m_c.reshape(nz, n_col, ny, nx)
+    crm.q_n = mp.q_n.reshape(nz, n_col, ny, nx)
+    crm.q_p = mp.q_p.reshape(nz, n_col, ny, nx)
+    crm.q_v = mp.q_v.reshape(nz, n_col, ny, nx)
+    crm.q_c = mp.q_c.reshape(nz, n_col, ny, nx)
+    crm.q_i = mp.q_i.reshape(nz, n_col, ny, nx)
+
+    rain_col = mp.precip_rain.reshape(n_col, ny, nx).mean(dim=(-2, -1))
+    snow_col = mp.precip_snow.reshape(n_col, ny, nx).mean(dim=(-2, -1))
+
+    # Diagnose net CRM physics/convective tendencies relative to pre-step + LS forcing
+    thm_ls = dtheta_m_ls_dt if dtheta_m_ls_dt is not None else torch.zeros_like(thm_mean_0)
+    qn_ls = dq_n_ls_dt if dq_n_ls_dt is not None else torch.zeros_like(qn_mean_0)
+
+    dthm_crm = (crm.theta_m.mean(dim=(-2, -1)) - thm_mean_0) / dt_crm - thm_ls
+    dqn_crm = (crm.q_n.mean(dim=(-2, -1)) - qn_mean_0) / dt_crm - qn_ls
+    dqp_crm = (crm.q_p.mean(dim=(-2, -1)) - qp_mean_0) / dt_crm
+    du_crm = (crm.u.mean(dim=(-2, -1)) - u_mean_0) / dt_crm
+    dv_crm = (crm.v.mean(dim=(-2, -1)) - v_mean_0) / dt_crm
+
+    return SPTendencies(
+        dtheta_m_dt=dthm_crm,
+        dq_n_dt=dqn_crm,
+        dq_p_dt=dqp_crm,
+        du_dt=du_crm,
+        dv_dt=dv_crm,
+        precip_rain=rain_col,
+        precip_snow=snow_col,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. Coupled Single-Column / 3D CRM Radiative-Convective Equilibrium Driver
+# ---------------------------------------------------------------------------
+@dataclass
+class RCEDiagnostics:
+    """Instantaneous column-mean diagnostics from `step_coupled_crm_rce`."""
+
+    olr: torch.Tensor          # Outgoing longwave radiation at TOA [N_col] [W m^-2]
+    asr: torch.Tensor          # Absorbed shortwave radiation at TOA [N_col] [W m^-2]
+    precip_tot: torch.Tensor   # Total surface precipitation [N_col] [kg m^-2 s^-1]
+    shf: torch.Tensor          # Surface sensible heat flux [N_col] [W m^-2]
+    lhf: torch.Tensor          # Surface latent heat flux [N_col] [W m^-2]
+    gpp: torch.Tensor          # Canopy GPP (over land) [N_col] [umol CO2 m^-2 s^-1]
+    max_w: float               # Peak 3D vertical velocity magnitude [m s^-1]
+
+
+def step_coupled_crm_rce(
+    crm: CRMState,
+    sfc: SurfaceState,
+    vgrid: VerticalGrid,
+    dt_crm: float,
+    step_idx: int,
+    cos_zenith: torch.Tensor,
+    solar_constant: float = 551.58,
+    co2_ppmv: float = 400.0,
+    n_dyn_substeps: int = 2,
+    rad_stride: int = 1,
+    cached_rad_cache: dict[str, torch.Tensor] | None = None,
+) -> RCEDiagnostics:
+    """Advance coupled 3D CRM + Radiation + Surface + Two-Leaf Biosphere by `dt_crm` [s].
+
+    Follows RCEMIP (`Wing et al., 2018`: `S_0 = 551.58 W m^-2`, `cos_zenith = cos(42.05 deg) = 0.7426`
+    for insolation `409.6 W m^-2` over ocean or diurnal/constant forcing over land).
+    """
+    nz, n_col, ny, nx = crm.rho_d.shape
+
+    # 1. Column-mean thermodynamic profiles for radiation & surface coupling
+    rho_mean = crm.rho_d.mean(dim=(-2, -1))
+    thm_mean = crm.theta_m.mean(dim=(-2, -1))
+    qv_mean = crm.q_v.mean(dim=(-2, -1))
+    qc_mean = crm.q_c.mean(dim=(-2, -1))
+    qi_mean = crm.q_i.mean(dim=(-2, -1))
+    u1_mean = crm.u[0].mean(dim=(-2, -1))
+    v1_mean = crm.v[0].mean(dim=(-2, -1))
+
+    pres_mean, _, temp_mean = diagnose_pressure_temperature(rho_mean, thm_mean, qv_mean)
+    dz_0 = float((vgrid.zeta_c[0] - vgrid.zeta_w[0]).item())
+    pres_sfc = pres_mean[0] + C.GRAVITY * rho_mean[0] * (1.0 + qv_mean[0]) * dz_0
+    z_ref_rel = torch.clamp(vgrid.zeta_c[0] - sfc.bio.h_canopy * 0.65, min=5.0)
+
+    # 2. Surface albedos & 2-stream gray/window radiative transfer
+    alb_vd, alb_vf, alb_nd, alb_nf, _, lai_exp, _, _ = compute_surface_albedos(sfc, cos_zenith)
+    need_rad = (cached_rad_cache is None) or (step_idx % max(rad_stride, 1) == 0)
+    if need_rad:
+        # Radiative skin temperature & interface pressure/temperature profiles [nz + 1, N_col]
+        t_rad_in = torch.where(sfc.surf_type == 0, sfc.t_ocean_ml, sfc.t_canopy)
+        pres_w = torch.empty((nz + 1, n_col), device=rho_mean.device, dtype=rho_mean.dtype)
+        pres_w[0] = pres_sfc
+        pres_w[1:-1] = torch.sqrt(torch.clamp(pres_mean[:-1] * pres_mean[1:], min=1.0))
+        pres_w[-1] = torch.clamp(0.5 * pres_mean[-1], min=10.0)
+
+        temp_w = torch.empty((nz + 1, n_col), device=rho_mean.device, dtype=rho_mean.dtype)
+        temp_w[0] = temp_mean[0]
+        temp_w[1:-1] = 0.5 * (temp_mean[:-1] + temp_mean[1:])
+        temp_w[-1] = temp_mean[-1]
+
+        s_toa = torch.full_like(cos_zenith, solar_constant)
+        rad = compute_four_band_radiation(
+            pres_c=pres_mean,
+            pres_w=pres_w,
+            temp_c=temp_mean,
+            temp_w=temp_w,
+            dz_c=vgrid.dzeta_c.view(nz, 1),
+            rho_d_c=rho_mean,
+            qv_c=qv_mean,
+            qc_c=qc_mean,
+            qi_c=qi_mean,
+            t_sfc=t_rad_in,
+            albedo_vis=alb_vd,
+            albedo_nir=alb_nd,
+            mu0=cos_zenith,
+            s_toa=s_toa,
+            co2_ppmv=co2_ppmv,
+            albedo_vis_dif=alb_vf,
+            albedo_nir_dif=alb_nf,
+        )
+        sfc_lw_dn = rad.lw_flux_dn[0]
+        if cached_rad_cache is not None:
+            cached_rad_cache["dt_rad"] = rad.q_rad_net
+            cached_rad_cache["sw1_dir"] = rad.sfc_sw1_dir_dn
+            cached_rad_cache["sw1_dif"] = rad.sfc_sw1_dif_dn
+            cached_rad_cache["sw2_dir"] = rad.sfc_sw2_dir_dn
+            cached_rad_cache["sw2_dif"] = rad.sfc_sw2_dif_dn
+            cached_rad_cache["lw_dn"] = sfc_lw_dn
+            cached_rad_cache["olr"] = rad.toa_olr
+            cached_rad_cache["asr"] = rad.toa_asr
+        dt_rad = rad.q_rad_net
+        sw1_dir, sw1_dif = rad.sfc_sw1_dir_dn, rad.sfc_sw1_dif_dn
+        sw2_dir, sw2_dif = rad.sfc_sw2_dir_dn, rad.sfc_sw2_dif_dn
+        lw_dn = sfc_lw_dn
+        olr, asr = rad.toa_olr, rad.toa_asr
+    else:
+        dt_rad = cached_rad_cache["dt_rad"]
+        sw1_dir, sw1_dif = cached_rad_cache["sw1_dir"], cached_rad_cache["sw1_dif"]
+        sw2_dir, sw2_dif = cached_rad_cache["sw2_dir"], cached_rad_cache["sw2_dif"]
+        lw_dn = cached_rad_cache["lw_dn"]
+        olr, asr = cached_rad_cache["olr"], cached_rad_cache["asr"]
+
+    rain_prev = cached_rad_cache.get("rain", torch.zeros_like(pres_sfc)) if cached_rad_cache is not None else torch.zeros_like(pres_sfc)
+    snow_prev = cached_rad_cache.get("snow", torch.zeros_like(pres_sfc)) if cached_rad_cache is not None else torch.zeros_like(pres_sfc)
+
+    # 3. Surface energy/water balance & Two-Leaf gas exchange
+    sfc_diag = step_surface(
+        sfc=sfc,
+        u_1=u1_mean,
+        v_1=v1_mean,
+        temp_1=temp_mean[0],
+        qv_1=qv_mean[0],
+        pres_1=pres_mean[0],
+        pres_sfc=pres_sfc,
+        z_ref_rel=z_ref_rel,
+        sw1_dir_down=sw1_dir,
+        sw1_dif_down=sw1_dif,
+        sw2_dir_down=sw2_dir,
+        sw2_dif_down=sw2_dif,
+        lw_down=lw_dn,
+        precip_rain=rain_prev,
+        precip_snow=snow_prev,
+        mu0=cos_zenith,
+        co2_ppmv=co2_ppmv,
+        dt=dt_crm,
+    )
+
+    # 4. 3D CRM Dynamics + Zalesak FCT + MYNN 2.5 + SAM Microphysics
+    sp_out = step_crm_physics_and_dynamics(
+        crm=crm,
+        vgrid=vgrid,
+        dt_crm=dt_crm,
+        n_dyn_substeps=n_dyn_substeps,
+        sfc_fluxes=sfc_diag,
+        rad_heating_k_s=dt_rad,
+    )
+    if cached_rad_cache is not None:
+        cached_rad_cache["rain"] = sp_out.precip_rain
+        cached_rad_cache["snow"] = sp_out.precip_snow
+
+    # 5. Daily EEO acclimation & LAI update once per simulated solar day
+    steps_per_day = max(int(round(C.SECONDS_PER_DAY / dt_crm)), 1)
+    if (step_idx + 1) % steps_per_day == 0 and (sfc.surf_type == 1).any():
+        is_veg = sfc.surf_type == 1
+        es_1 = 611.2 * torch.exp(17.67 * (temp_mean[0] - C.T_FREEZE) / torch.clamp(temp_mean[0] - 29.65, min=10.0))
+        e_1 = qv_mean[0] * pres_mean[0] / (C.EPS_WATER + (1.0 - C.EPS_WATER) * qv_mean[0])
+        vpd_1 = torch.clamp(es_1 - e_1, min=50.0)
+        update_daily_acclimation_smith(
+            bio=sfc.bio,
+            midday_vis_beam=sw1_dir,
+            midday_vis_diff=sw1_dif,
+            midday_mu0=torch.clamp(cos_zenith, min=0.1),
+            midday_temp=temp_mean[0] + 1.5,
+            midday_vpd=vpd_1,
+            night_temp=temp_mean[0] - 3.0,
+            pres_sfc=pres_sfc,
+            co2_ppmv=co2_ppmv,
+            lai_exposed=lai_exp,
+            is_vegetated_land=is_veg,
+        )
+        precip_mm_day = (sp_out.precip_rain + sp_out.precip_snow) * C.SECONDS_PER_DAY
+        pet_mm_day = torch.clamp((sw1_dir + sw1_dif + sw2_dir + sw2_dif) * C.SECONDS_PER_DAY / C.L_V0, min=0.1)
+        ppfd_mol_day = (4.57 * sw1_dir + 4.24 * sw1_dif) * 1.0e-6 * C.SECONDS_PER_DAY
+        ws_beta = torch.clamp(sfc.w_root / (0.5 * torch.clamp(sfc.bio.s_root_cap, min=20.0)), 0.0, 1.0)
+        update_daily_lai_root_height(
+            bio=sfc.bio,
+            daily_precip_mm=precip_mm_day,
+            daily_pet_mm=pet_mm_day,
+            daily_ppfd_mol_m2=ppfd_mol_day,
+            daily_temp_k=temp_mean[0],
+            daily_vpd_pa=vpd_1,
+            pres_sfc=pres_sfc,
+            co2_ppmv=co2_ppmv,
+            water_stress_beta=ws_beta,
+            is_vegetated_land=is_veg,
+        )
+
+    return RCEDiagnostics(
+        olr=olr,
+        asr=asr,
+        precip_tot=sp_out.precip_rain + sp_out.precip_snow,
+        shf=sfc_diag.shf,
+        lhf=sfc_diag.lhf,
+        gpp=sfc_diag.gpp,
+        max_w=float(crm.w.abs().max().item()),
+    )

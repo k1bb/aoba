@@ -2,17 +2,19 @@
 
 > **Language**: English | [日本語 (README_ja.md)](README_ja.md)
 
-**AOBA** is a lightweight, GPU-native superparameterized global nonhydrostatic climate model coupled with an eco-evolutionary optimality (EEO) terrestrial biosphere and a wind-driven Ekman slab ocean. Given only minimal external boundary conditions—**land–sea/ice-sheet geometry, surface topography (`Earth2014`), planetary rotation period, solar insolation, and atmospheric gas concentrations**—AOBA investigates whether the coupled atmosphere–surface ocean–ecosystem system can autonomously generate Earth's climate and biome zones and how such a minimally constrained system predicts future climate-zone shifts without cumulus parameterizations, ocean $Q$-fluxes, or plant-functional-type (PFT) tuning tables.
+**AOBA** is a lightweight, GPU-native superparameterized global nonhydrostatic climate model coupled with an eco-evolutionary optimality (EEO) terrestrial biosphere and a wind-driven Ekman slab ocean. Given only minimal external boundary conditions—**land–sea/ice-sheet geometry, surface topography (`Earth2014`), planetary rotation period, solar insolation, and atmospheric gas concentrations**—AOBA investigates whether the coupled atmosphere–surface ocean–ecosystem system can autonomously generate Earth's climate and biome zones and how such a minimally constrained system predicts future climate-zone shifts without cumulus parameterizations, ocean $Q$-fluxes, soil/albedo lookup maps, or plant-functional-type (PFT) tuning tables.
 
 ## Core Design Principles
 
-1. **Unified Compressible Nonhydrostatic Dynamics on Orthogonal C-Grids (SCVT Host + 3D CRM)**:
-   - **Global Host Core**: Solves the 3D flux-form compressible nonhydrostatic equations on a **Spherical Centroidal Voronoi Tessellation (SCVT) orthogonal Arakawa C-grid** with **TRiSK** geostrophic/energy-compatible operators and **Charney–Phillips** vertical staggering using Horizontally Explicit Vertically Implicit (HEVI) time integration (Ringler et al., 2008, 2010; Thuburn et al., 2009; Klemp, 2011; Skamarock et al., 2012; Gassmann, 2013). This eliminates polar singularities, spectral Gibbs ringing near steep mountain ranges, and A-grid checkerboard vertical-velocity ($w$) noise.
-   - **Embedded 3D CRM (Superparameterization)**: Embeds periodic `8 × 8` 3D nonhydrostatic C-grid/Charney–Phillips CRMs ($\Delta x = \Delta y = 4\ \mathrm{km}$, $N_z = 32$ levels to $z_{\mathrm{top}} \approx 24\ \mathrm{km}$; Khairoutdinov & Randall, 2003; Khairoutdinov et al., 2005; Nishizawa et al., 2025), supporting both 1-to-1 coupling (`Glevel-4`: $2,562$ cells) and 4-to-1 icosahedral blockwise coupling (`Glevel-5`: $10,242$ cells at $\sim 120\ \mathrm{km}$ host resolution paired with $2,562$ CRMs; Yamazaki & Miura, 2024).
-2. **PFT-Free Autonomous C₃/C₄ Vegetation, Prognostic LAI, and Root-Zone Sizing**: Land surface tiles couple directly to CRM/host columns (Lee & Khairoutdinov, 2015; Lin et al., 2023) via least-cost C₃ and C₄ optimality models (Prentice et al., 2014; Wang et al., 2017; Stocker et al., 2020; Mengoli et al., 2022; Scott & Smith, 2022; Luo et al., 2024; Lavergne et al., 2026), EEO leaf-area dynamics (Cai et al., 2025; Zhou et al., 2025), and drought-bridging root-zone storage capacity (Gao et al., 2014; Davis et al., 2017). Soil drying regulates transpiration and canopy $\mathrm{LAI}$ dynamically without empirical PFT stress curves.
-3. **Displacement-Following Smoothed Terrain Datum & Autonomous Canopy Structure**: Canopy height $h_c$ scales with local resource limits (Kempes et al., 2011), determining zero-plane displacement $d$ and roughness length $z_{0m}$ continuously from $h_c$ and $\mathrm{LAI}$ (Raupach, 1994; Harman & Finnigan, 2007) above the smoothed terrain-following datum $z_{\mathrm{datum}} = z_{\mathrm{topo}} + d$ (Klemp, 2011).
-4. **Analytical Four-Band Two-Stream Radiation & 1.5-Layer Voronoi Ekman Slab Ocean**: A lookup-table-free four-band two-stream radiative solver (Lacis & Hansen, 1974; Toon et al., 1989; Slingo, 1989; Ebert & Curry, 1992; Weaver & Ramanathan, 1995; Koll & Cronin, 2018) couples clouds, water vapor, $\mathrm{CO}_2$, and surface PAR/albedo over a zero-$Q$-flux 1.5-layer wind-driven Ekman slab ocean (Codron, 2012) and thermodynamic sea ice (Semtner, 1976) discretized on the exact same Voronoi C-grid.
-5. **Single-Codebase GPU Portability (`Float32` PyTorch + Fused Vertical HEVI)**: Runs natively on Apple Silicon GPUs (`mps` Unified Memory, ~1–1.5 GB RAM) at ~7–11 simulated years per day on a Mac mini (`M4 Pro`), and scales without model changes to NVIDIA GPUs (`cuda`).
+1. **Unified Compressible Nonhydrostatic Dynamics on Orthogonal C-Grids (1-to-1 SCVT Host + 3D CRM)**:
+   - **Global Host Core**: Solves the 3D flux-form compressible nonhydrostatic equations on a **Spherical Centroidal Voronoi Tessellation (SCVT) orthogonal Arakawa C-grid** with **TRiSK** geostrophic/energy-compatible operators, **Charney–Phillips** vertical staggering, Horizontally Explicit Vertically Implicit (HEVI) time integration, and subgrid low-level mountain blocking + orographic gravity-wave drag derived directly from 5-arc-min `Earth2014` subgrid relief (Ringler et al., 2008, 2010; Thuburn et al., 2009; Klemp, 2011; Skamarock et al., 2012; Gassmann, 2013; Lott & Miller, 1997).
+   - **1-to-1 Embedded 3D CRM & Turbulence Hierarchy**: Each host Voronoi cell embeds its own periodic `8 × 8` 3D nonhydrostatic C-grid/Charney–Phillips CRM (`1:1` correspondence; $\Delta x = \Delta y = 4\ \mathrm{km}$, $N_z = 32$ levels to $z_{\mathrm{top}} \approx 24\ \mathrm{km}$; Khairoutdinov & Randall, 2003; Khairoutdinov et al., 2005; Yamazaki & Miura, 2024; Nishizawa et al., 2025), coupled with **MYNN Level 2.5** boundary-layer closure (Nakanishi & Niino, 2009) and anisotropic **Smagorinsky–Lilly** 3D SGS turbulence.
+2. **PFT-Free Two-Leaf C₃/C₄ Optimality Biosphere, Multi-Layer Freeze–Thaw Soil, and Snow Physics**:
+   - **Two-Leaf EEO Acclimation & Stomatal Closure**: Canopy biochemical capacities ($V_{c\max 25}, J_{\max 25}, V_{p\max 25}$) and leaf dark respiration ($R_{25}$) follow the non-rectangular-hyperbola optimality formulation of Smith et al. (2019) and Scott & Smith (2022), acclimate via exponential moving average (EMA) smoothing of local-solar-noon downward shortwave irradiance followed by two-stream canopy light absorption, and partition analytically into sunlit and shaded leaves in proportion to the acclimated absorbed PPFD profile (de Pury & Farquhar, 1997; Dai et al., 2004; Prentice et al., 2014; Heskel et al., 2016; Smith et al., 2019; Mengoli et al., 2022; Scott & Smith, 2022; Luo et al., 2024; Ren et al., 2024, 2025; Lavergne et al., 2026).
+   - **Complete Land Hydrology, Albedo, & Permafrost Thermodynamics**: Partitions evapotranspiration into sunlit/shaded transpiration, wet-canopy interception loss, and stability-corrected bare-soil evaporation (Dai et al., 2004; Sakaguchi & Zeng, 2009; Lee & Khairoutdinov, 2015; MATSIRO6, 2021), paired with drought-bridging root-zone storage $S_R$ (Gao et al., 2014; Davis et al., 2017), prognostic EEO $\mathrm{LAI}$ (Cai et al., 2025; Zhou et al., 2025), moisture-dependent bare-soil VIS/NIR albedo (Oleson et al., 2013), multi-layer implicit soil heat conduction with freeze–thaw phase change (SCALE-RM, 2025; MATSIRO6, 2021), and fractional snow cover with snow-burial canopy masking, aging albedo, and ocean-conserving runoff (Yang et al., 1997; Swenson & Lawrence, 2012; Nitta et al., 2014; Abolafia-Rosenzweig et al., 2021).
+3. **Displacement-Following Smoothed Terrain Datum & Modern Roughness Sublayer (RSL)**: Canopy height $h_c$ scales with local resource limits (Kempes et al., 2011), determining zero-plane displacement $d$, roughness length $z_{0m}$, and analytical RSL stability corrections (Raupach, 1994; Harman & Finnigan, 2007; De Ridder, 2010; Bonan et al., 2018; Lee et al., 2020; Meier et al., 2022) above the smoothed terrain datum $z_{\mathrm{datum}} = z_{\mathrm{topo}} + d$ (Klemp, 2011).
+4. **Analytical Four-Band Two-Stream Radiation & 1.5-Layer Voronoi Ekman Ocean + Fractional Sea Ice**: A lookup-table-free four-band two-stream radiative solver (Lacis & Hansen, 1974; Toon et al., 1989; Slingo, 1989; Ebert & Curry, 1992; Weaver & Ramanathan, 1995; Koll & Cronin, 2018) couples clouds, water vapor, $\mathrm{CO}_2$, and surface PAR/albedo over a zero-$Q$-flux 1.5-layer wind-driven Ekman slab ocean (Codron, 2012), fractional-lead thermodynamic sea ice (Semtner, 1976; SCALE-RM, 2025), solar-zenith-dependent sea-surface albedo (Briegleb et al., 1986), and viscous-Charnock ocean roughness (Miller et al., 1992).
+5. **Single-Codebase GPU Portability (`Float32` PyTorch + Fused Metal/CUDA Vertical HEVI)**: Runs natively on Apple Silicon GPUs (`mps` Unified Memory, ~1–1.5 GB RAM) at ~8–11 simulated years per day on a Mac mini (`M4 Pro`), and scales without model changes to NVIDIA GPUs (`cuda`).
 
 ## Repository Structure
 
@@ -21,29 +23,44 @@ aoba/
 ├── README.md              # Project overview (English)
 ├── README_ja.md           # Project overview (Japanese)
 ├── docs/
-│   ├── architecture.md    # Governing equations & literature traceability (English)
-│   └── architecture_ja.md # Governing equations & literature traceability (Japanese)
+│   ├── architecture.md    # Governing architecture & literature traceability (English)
+│   ├── architecture_ja.md # Governing architecture & literature traceability (Japanese)
+│   ├── formulation.md     # Full mathematical model description (English)
+│   └── formulation_ja.md  # Full mathematical model description (Japanese)
 ├── data/                  # Local boundary (Earth2014) & validation (Köppen-Geiger) data (git-ignored)
-├── references/            # Local literature archive (strictly git-ignored; never pushed)
+├── references/            # Local literature archive (74 PDFs; strictly git-ignored)
 ├── src/
-│   └── aoba/
-│       ├── __init__.py
-│       └── runtime.py     # Device selection (MPS / CUDA / CPU) & path management
-├── tests/                 # Unit and conservation tests
-├── scripts/               # Benchmark & experiment runners
+│   └── aoba/              # PyTorch + Metal/CUDA model source packages (15 modules)
+├── tests/                 # Unit, physical-forcing, and conservation tests (CPU + MPS)
+├── scripts/               # RCE, Held-Suarez, Global AOBA runners & Zarr-to-NetCDF tool
 └── pyproject.toml
+```
+
+## Quick Start
+
+```bash
+# Run the full verification suite on CPU + Apple Silicon MPS GPU
+PYTHONPATH=src python tests/test_phase1_foundation.py
+PYTHONPATH=src python tests/test_phase1_physics_biosphere.py
+PYTHONPATH=src python tests/test_phase1_crm_rce.py
+PYTHONPATH=src python tests/test_phase2_phase3_global.py
+
+# Launch RCE, Held-Suarez, or full Global 1:1 Superparameterized AOBA (Zarr v3 output)
+PYTHONPATH=src python scripts/run_rce.py --surface land --days 2.0
+PYTHONPATH=src python scripts/run_held_suarez.py --glevel 3 --days 5.0
+PYTHONPATH=src python scripts/run_global_aoba.py --glevel 3 --co2-ppmv 400 --days 5.0
 ```
 
 ## Storage & Git Protection Policy
 
-- **Simulation Outputs (`Zarr v3` Native)**: All model history streams, restart checkpoints, and mesh caches use **CF/UGRID-compliant Zarr v3 (`.zarr`)** exclusively (defaulting to `~/aoba_outputs`, configurable via `AOBA_OUTPUT_DIR`); conversion to NetCDF4 (`.nc`) for external tools (`cdo`, Panoply) is handled strictly by standalone post-processing scripts.
+- **Simulation Outputs (`Zarr v3` Native)**: All model history streams, restart checkpoints, and mesh caches use **CF/UGRID-compliant Zarr v3 (`.zarr`)** exclusively (defaulting to `~/aoba_outputs`, configurable via `AOBA_OUTPUT_DIR`); conversion to NetCDF4 (`.nc`) for external tools (`cdo`, Panoply) is handled strictly by `scripts/zarr_to_netcdf.py`.
 - **Protected Local Directories**: Both `references/` and `data/` are backed up locally via Google Drive and triple-locked (`.gitignore`, `.git/info/exclude`, and `.git/hooks/pre-commit`) so they are never pushed to GitHub.
 
 ## Development Roadmap
 
-- **Phase 1**: Single-column host (`B = 1`) embedded `8 × 8` 3D C-grid/Charney–Phillips HEVI CRM + 4-band radiation + subgrid C₃/C₄ EEO land / slab-ocean radiative–convective equilibrium (RCE) testbed (Wing et al., 2018).
-- **Phase 2**: Global SCVT Voronoi C-grid (TRiSK) + Charney–Phillips HEVI nonhydrostatic host core with smoothed `Earth2014` topography and Held–Suarez verification (Held & Suarez, 1994).
-- **Phase 3**: Global superparameterized coupling (`Glevel-4` 1:1 SP and `Glevel-5` 4:1 blockwise SP) over continents, `Earth2014` topography, and 1.5-layer Ekman slab ocean + sea ice, benchmarked against observed Köppen–Geiger climate zones (Beck et al., 2018, 2023).
+- **Phase 1**: Single-column host (`B = 1`) embedded `8 × 8` 3D C-grid/Charney–Phillips HEVI CRM + MYNN 2.5 / RSL turbulence + 4-band radiation + subgrid Two-Leaf C₃/C₄ EEO land / slab-ocean radiative–convective equilibrium (RCE) testbed (Wing et al., 2018).
+- **Phase 2**: Global SCVT Voronoi C-grid (TRiSK) + Charney–Phillips HEVI nonhydrostatic host core with smoothed `Earth2014` topography, Lott & Miller (1997) subgrid orographic drag, and Held–Suarez verification (Held & Suarez, 1994).
+- **Phase 3**: Global `1:1` superparameterized coupling (`Glevel-4` standard / `Glevel-5` high-res) over continents, `Earth2014` topography, and 1.5-layer Ekman slab ocean + fractional sea ice, benchmarked against observed Köppen–Geiger climate zones (Beck et al., 2018, 2023).
 - **Phase 4**: Future climate-zone projection and factorial experiments under elevated $\mathrm{CO}_2$ (isolating radiative forcing, physiological stomatal/$\mathrm{C}_3\text{--}\mathrm{C}_4$/$\mathrm{LAI}$ feedbacks, and wind-driven Ekman ocean response).
 
 ## License
