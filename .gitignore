@@ -23,15 +23,15 @@ env/
 .DS_Store
 Icon?
 
-# Private reference papers & literature (NEVER upload to GitHub)
+# Private reference papers, literature, and local datasets (NEVER upload to GitHub)
 /references/
 references/
+/data/
+data/
 
-# Simulation outputs, checkpoints, and large datasets (keep out of Git & Google Drive sync)
+# Simulation outputs and checkpoints (keep out of Git & Google Drive sync)
 outputs/
 checkpoints/
-data/raw/
-data/processed/
 *.nc
 *.nc4
 *.zarr/
@@ -39,3 +39,5 @@ data/processed/
 *.pth
 *.npz
 *.h5
+*.bin
+*.tif

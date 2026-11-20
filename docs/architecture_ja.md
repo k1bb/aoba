@@ -1,86 +1,73 @@
-# AOBA モデルアーキテクチャおよび支配方程式仕様書
+# AOBA モデルアーキテクチャおよび根拠文献トレーサビリティ仕様書
 
 > **言語 (Language)**: [English (architecture.md)](architecture.md) | 日本語
 
-## 1. 科学的目的
+## 1. 科学的目的とモデル記述書基準
 
-AOBA は、普遍的な生態進化的最適性（EEO: Eco-Evolutionary Optimality）植生モデルと全球大気大循環モデルを、積雲パラメタリゼーション・処方された非地形性重力波抵抗ソース・植物機能型（PFT）パラメータ表を一切用いずに結合する軽量数値モデルである。外部から与える空間境界条件は、地球軌道要素に基づく太陽入射、海陸分布マスク、および平滑化地表面標高 $z_{\mathrm{topo}}(\lambda, \varphi)$ のみに限定される。
+AOBA は以下の2つの根源的な問いを解くために設計された結合気候・生態系モデルである：
+1. 外部境界条件として**「`Earth2014`（Hirt & Rexer, 2015）による海陸・氷床分布と地表面標高 $z_{\mathrm{topo}}$、自転角速度 $\Omega$、太陽軌道入射 $S_0$、大気ガス濃度（$\mathrm{CO}_2, \mathrm{O}_2$）」のみ**を与えたとき、大気大循環・海洋表層・陸面生態系の結合系は地球の気候帯・バイオーム帯を自律的に再現できるか（Beck et al., 2018, 2023 のケッペン・ガイガー気候区分で検証）。
+2. 積雲パラメタリゼーション・処方海洋 $Q$ フラックス・植物機能型（PFT）パラメータ表といった経験的境界制約を排した最小制約モデルは、高 $\mathrm{CO}_2$ 下における将来の気候帯再編をどのように予測するか。
+
+**モデル記述書・文献トレーサビリティ原則**: *Description of MIROC6 AGCM* (2021)、*Description of MATSIRO6* (2021)、および *Detailed formulation of SCALE-RM* (2025) の明快さと数学的網羅性を基準とし、`src/aoba/` 内のすべての連続系方程式・座標変換・スタガード空間離散化・時間積分・物理定数を明示的に文書化するとともに、根拠となる査読論文・技術報告書の著者・出版年・節番号・式番号をコード内に明記する。
 
 ---
 
-## 2. マルチスケール格子階層と座標系
+## 2. 統一非静力学力学フレームワークとマルチスケール格子階層
 
-### 2.1 ホスト全球大循環力学コア（Host Global Dynamical Core）
-- **支配方程式**: 渦度 $\zeta$・発散 $D$・仮温度 $T_v$・比湿 $q_v$・対数地表気圧 $\ln p_s$ を予報変数とする球面3次元静力学プリミティブ方程式系。
-- **水平格子**: `128 × 64` ガウス格子上の T42 三角切断スペクトル変換法（水平コラム数 $N_{\mathrm{host}} = 8,192$、赤道格子間隔 $\Delta \lambda \approx 2.8125^\circ$；オプションとして力学移流のみ T63 とするデュアル切断にも対応可能）。
-- **鉛直格子**: 地表面から中部〜上部成層圏 $z_{\mathrm{top}} \approx 38\ \mathrm{km}$（$p_{\mathrm{top}} \approx 3\ \mathrm{hPa}$）までを覆う $N_z = 50$ 層の地形追従 $\sigma = p / p_s$（またはハイブリッド $\sigma\text{--}p$）座標。境界層の発達とエントレインメントを陽に解像するため、下層 $2\ \mathrm{km}$ 以下に約15層を集中配置する（最下層厚 $\Delta z_1 = 60\ \mathrm{m}$）。
-- **時間積分**: セミインプリシット時間積分（$\Delta t_{\mathrm{GCM}} = 900\ \mathrm{s} = 15\ \mathrm{min}$）。
+### 2.1 全球ホスト力学コア：球面重心ボロノイ直交 C-grid (TRiSK) ＋ 鉛直 Charney–Phillips HEVI
+- **根拠文献**: Ringler, Ju, & Gunzburger (2008, *Ocean Dynamics*, 58, 475–498); Thuburn, Ringler, Skamarock, & Klemp (2009, *J. Comput. Phys.*, 228, 8321–8335); Ringler, Thuburn, Klemp, & Skamarock (2010, *J. Comput. Phys.*, 229, 3065–3090); Klemp (2011, *Mon. Wea. Rev.*, 139, 2163–2169); Staniforth & Thuburn (2012, *Q. J. R. Meteorol. Soc.*, 138, 1–26); Skamarock et al. (2012, *Mon. Wea. Rev.*, 140, 3090–3105); Gassmann (2013, *Q. J. R. Meteorol. Soc.*, 139, 152–175); Held & Suarez (1994, *Bull. Amer. Meteor. Soc.*, 75, 1825–1830).
+- **支配方程式**: 乾燥空気密度 $\rho_d$、セル辺法線運動量、鉛直運動量 $\rho_d w$、湿潤温位フラックス変数 $\rho_d \theta_m$（水蒸気浮力効果を含む；Seidel & Yang, 2024）、および水物質 $(\rho_d q_n, \rho_d q_p)$ を予報する3次元フラックス保存型完全圧縮性非静力学オイラー方程式系。
+- **水平 SCVT 直交 Arakawa C-grid**: 正二十面体再帰分割と球面上の Lloyd 反復（Ringler et al., 2008）により生成される準一様ボロノイ格子を用いる：
+  - `Glevel-4`: $N_{\mathrm{cells}} = 2,562$ セル（$\Delta x \approx 240\ \mathrm{km}$）、$N_{\mathrm{edges}} = 7,680$。
+  - `Glevel-5`: $N_{\mathrm{cells}} = 10,242$ セル（$\Delta x \approx 120\ \mathrm{km}$）、$N_{\mathrm{edges}} = 30,720$。
+  - ボロノイ辺と双対ドロネー線分が厳密に直交するため、A-grid 特有の $2\Delta x$ 圧力・発散デカップリングによる鉛直流 $w$ の数値ノイズも、Cubed-Sphere 特有の非直交頂点・パネル境界の刻印も生じない。**TRiSK** 接線風速再構成により定常地衡流モードの厳密維持・エネルギー保存・渦位（PV）整合性を満たし、六角形 C-grid 固有の非発散回転モードは4階超粘性／Smagorinsky 散逸で制御する（Skamarock et al., 2012; Gassmann, 2013）。
+- **鉛直 Charney–Phillips 格子 ＆ 平滑化高度ベース地形追従座標**: 上端 $z_{\mathrm{top}} \approx 24\ \mathrm{km}$（$p_{\mathrm{top}} \approx 25\ \mathrm{hPa}$）までの $N_z = 32$ 層（$2\ \mathrm{km}$ 以下の境界層に約13層・最下層厚 $\Delta z_1 = 60\ \mathrm{m}$、自由対流圏 $2\text{--}16\ \mathrm{km}$ に約14層、上部 $16\text{--}24\ \mathrm{km}$ にレイリー減衰スポンジ緩衝層5層）。湿潤温位 $\theta_m$ と鉛直流 $w$ をともに層境界に置く **Charney–Phillips 配置**（Gassmann, 2013）と高度方向に段階平滑化した地形追従座標（Klemp, 2011）により、鉛直 $2\Delta z$ 浮力計算モードと急峻山岳上の偽上昇流を防ぐ。
+- **HEVI 時間積分**: 3段 Runge–Kutta（RK3）＋ 鉛直陰解法（HEVI：融合バッチ Thomas 三重対角カーネル）および正値単調 Flux-Corrected Transport（FCT）スカラー移流を用いる（Skamarock et al., 2012; Nishizawa et al., 2025）。
 
-### 2.2 変位追従型の実効空力基準面（樹冠・地形の統合処理）
-高木林（樹高 $h_c \le 45\ \mathrm{m}$）が発達した際に樹冠上端やゼロ面変位が大気最下層参照高度 $z_1$ を突き抜けて接地層フラックス計算が破綻する問題を防ぐため、大気境界層および埋め込み CRM の鉛直相対高度座標 $\tilde{z}$ の下端原点（$\tilde{z} = 0$）を以下の**実効空力基準面（Effective Aerodynamic Datum）**に定義する：
-$$
-z_{\mathrm{datum}} = z_{\mathrm{topo}} + d
-$$
-ここで $z_{\mathrm{topo}}$ は平滑化された地表面標高、$d \approx \frac{2}{3} h_c$ はゼロ面変位高度である。CRM 最下層の層厚を $\Delta z_1 = 60\ \mathrm{m}$（最下層中心の相対高度 $\tilde{z}_1 = 30\ \mathrm{m}$）に設定することで、物理的に取り得るすべての樹冠高に対して常に以下の幾何学的順序が恒等的に成立する：
-$$
-\tilde{z}_1 = 30\ \mathrm{m} > (h_c - d) > z_{0m}
-$$
-これにより、モニン・オブコフ相似則（MOST）の対数プロファイル $\ln(\tilde{z}_1 / z_{0m})$ に特異点が生じることを完全に排除し、樹冠直上の粗度サブレイヤ（RSL: Roughness Sublayer）による混合強化補正と滑らかに接続する。
+### 2.2 変位追従型の実効空力基準面と自律樹冠構造
+- **根拠文献**: Hirt & Rexer (2015, *Int. J. Appl. Earth Obs. Geoinf.*, 39, 103–112); Kempes et al. (2011, *PLoS ONE*, 6, e20551); Raupach (1994, *Boundary-Layer Meteorol.*, 71, 211–216); Harman & Finnigan (2007, *Boundary-Layer Meteorol.*, 123, 339–363).
+- **`Earth2014` 境界標高と厳密な海陸・氷床マスク**: 5分格子 `Earth2014`（`SUR2014`, `TBI2014`, `ICE2014`）からセル面積平均標高 $z_{\mathrm{topo}}$ とともに、開水面（$\mathrm{SUR} - \mathrm{TBI} > 0$）、接地氷床（$\mathrm{ICE} > 0,\ \mathrm{SUR} = \mathrm{TBI}$）、および海面下内陸盆地を含む非氷河陸地を代数的に厳密分離する。
+- **実効空力基準面**: 維管束アロメトリと局所資源収支から最大樹冠高 $h_c$ を決定し（Kempes et al., 2011）、ゼロ面変位 $d(h_c, \mathrm{LAI})$ と運動量粗度長 $z_{0m}(h_c, \mathrm{LAI})$ を連続評価して粗度サブレイヤ（RSL）補正と接続する（Raupach, 1994; Harman & Finnigan, 2007）。鉛直座標の下端原点を
+  $$
+  z_{\mathrm{datum}} = z_{\mathrm{topo}} + d
+  $$
+  に定義することで、最下層中心（$\tilde{z}_1 = 30\ \mathrm{m}$）において常に $\tilde{z}_1 > (h_c - d) > z_{0m}$ が成立する。
 
-### 2.3 埋め込み小型3次元アネラスティック雲解像モデル（3D CRM）
-- **GPU バッチテンソル形状**: `Float32` 精度で `[B = 8192, nz = 50, ny = 8, nx = 8]`（全地球総セル数 約2,621万点；3次元変数1本あたり約 105 MB、モデル全体の作業メモリ 約 3 GB）。
-- **計算領域と変数配置**: 各ホスト格子内に水平二重周期境界を持つ $32\ \mathrm{km} \times 32\ \mathrm{km}$ 領域（$\Delta x = \Delta y = 4\ \mathrm{km}$）を設定。水平 Arakawa C-grid、鉛直 Charney–Phillips 格子（層境界に液水温位 $\theta_l$ と鉛直風 $w$、層中心に水平風 $u, v$・擾乱圧力 $p'$・水分変数 $q_n, q_p$ を配置）を採用する。鉛直座標は実効基準面からの相対高度 $\tilde{z} = z - z_{\mathrm{datum}}$ とし、各ホスト格子の地表気圧 $p_s$（チベット等の高標高を含む）に整合した基本場密度・温位プロファイル $\bar{\rho}(\tilde{z}; p_s), \bar{\theta}(\tilde{z}; p_s)$ を用いる。
-- **楕円型圧力ポアソンソルバ**: アネラスティック非発散条件 $\nabla_h \cdot (\bar{\rho}\mathbf{u}_h) + \partial_{\tilde{z}}(\bar{\rho}w) = 0$ を満たす診断圧力方程式を、事前計算した $8 \times 8$ 実数直交離散フーリエ変換行列とのバッチ行列積（`matmul`：$x, y$ 両方向）および鉛直方向のバッチ三重対角ソルバ（Thomas 法）によって直接解く。複素数 FFT に依存せず純粋な `Float32` 行列演算のみで完結するため、Apple Silicon (`mps`) と NVIDIA (`cuda`) の双方で高速・安定に動作する。時間刻み幅は $\Delta t_{\mathrm{CRM}} = 15\text{--}20\ \mathrm{s}$。
-- **3次元運動量輸送と重力波の自律表現**: 2次元 CRM 特有の異方性・逆勾配運動量輸送バイアスを排し、3次元風速 $(u, v, w)$ によって全方位（360°）への対流性内部重力波の自発的励起、成層圏（$z \le 38\ \mathrm{km}$）への鉛直伝播、臨界層吸収および非線形砕波、ならびに3次元対流運動量輸送を直接解像する。得られた水平平均風速傾向項 $(\partial_t \bar{u}, \partial_t \bar{v})_{\mathrm{CRM}}$ をそのままホスト大循環へ返すことで、処方重力波源なしに偏西風ジェットの流路を自律決定させる。
+### 2.3 埋め込み3次元非静力学雲解像モデル（3D CRM）とブロック結合
+- **根拠文献**: Khairoutdinov & Randall (2003, *J. Atmos. Sci.*, 60, 607–623); Khairoutdinov, Randall, & DeMott (2005, *J. Atmos. Sci.*, 62, 2136–2154); Yamazaki & Miura (2024, *JAMES*, 16, e2023MS003836); Nishizawa, Tomita, & Team SCALE (2025, *SCALE-RM v5.5.5*, Ch. 2–6 & App. A.2).
+- **統一ソルバとテンソル構造**: 水平二重周期 $32\ \mathrm{km} \times 32\ \mathrm{km}$ の直交正方形 Arakawa C-grid × 鉛直 Charney–Phillips 格子（`[B_crm, nz = 32, ny = 8, nx = 8]`、$\Delta x = \Delta y = 4\ \mathrm{km}$、$\Delta t_{\mathrm{CRM}} = 12\text{--}15\ \mathrm{s}$）を用い、ホスト全球コアと完全に同一の圧縮性非静力学 HEVI 鉛直ソルバ・熱力学・FCT 移流を共有する。
+- **1:1 フル SP および 4:1 ブロック SP**: `Glevel-4` での 1:1 結合（$B_{\mathrm{crm}} = 2,562$）に加え、`Glevel-5`（$10,242$ セル、約 $120\ \mathrm{km}$ 解像度）の親ボロノイ4セル単位で CRM（$B_{\mathrm{crm}} = 2,562$）を共有する 4:1 ブロック結合（Yamazaki & Miura, 2024）に対応し、積乱雲による加熱・加湿および3次元対流運動量輸送傾向項をホスト循環へ返す。
 
 ---
 
 ## 3. 雲微物理および4バンド解析的2ストリーム放射
 
 ### 3.1 2変数・診断氷相分配型 1モーメント雲微物理
-Khairoutdinov & Randall (2003, SAM) に倣い、水物質の3次元予報変数を以下の2つのみに抑える：
-1. 非降水総水分比湿 $q_n = q_v + q_c + q_i$（水蒸気 ＋ 雲水 ＋ 雲氷）
-2. 降水総水分比湿 $q_p = q_r + q_s$（雨水 ＋ 雪・氷降水）
-
-飽和調節によって生じる凝結水 $\max(0, q_n - q^*(T, p))$ および降水 $q_p$ の液相・氷相比率は、気温 $T_{00} = 253.15\ \mathrm{K}$ から $T_0 = 273.16\ \mathrm{K}$ の間の線形ランプ関数 $\omega(T) \in [0, 1]$ により診断的に配分する。これにより最小のメモリ消費で凝結・凍結潜熱と上層巻雲（氷雲）の放射フィードバックを表現する。
+- **根拠文献**: Khairoutdinov & Randall (2003, *J. Atmos. Sci.*, 60, App. A–B).
+- **定式化**: 非降水総水分比湿 $q_n = q_v + q_c + q_i$ と降水総水分比湿 $q_p = q_r + q_s$ の2変数を予報し、凝結水 $\max(0, q_n - q^*(T, p))$ と降水 $q_p$ の液相・氷相比率を $253.15\text{--}273.16\ \mathrm{K}$ の線形ランプ関数 $\omega(T) \in [0, 1]$ で診断配分することで、自動変換・捕捉成長・落下・蒸発／昇華・凍結潜熱・氷雲放射効果を表現する。
 
 ### 3.2 ルックアップテーブル不要の4バンド解析的2ストリーム放射
-放射伝達は $\Delta t_{\mathrm{rad}} = 900\ \mathrm{s}$（15分）ごとに CRM 各コラムで独立に評価する（CRM の各サブステップでは瞬時の太陽天頂角余弦 $\mu_0(t)$ で短波フラックスをスケーリングして滑らかな日変化を保つ）：
-- **SW1（紫外・可視光・PAR バンド：太陽定数の約 50%）**: 成層圏の一様オゾン鉛直プロファイル $\mathrm{O}_3(p)$ による短波吸収（処方された南北分布なしに太陽幾何学のみで成層圏温度構造を形成）、雲による $\delta$-Eddington 散乱反射、および地表面可視アルベド $\alpha_{\mathrm{vis}}$ を解く。地表到達フラックスがそのまま Pモデルの光合成有効放射（$\mathrm{PAR}$）となる。
-- **SW2（近赤外バンド：太陽定数の約 50%）**: 対流圏水蒸気 $q_v$ による吸収、雲の散乱・吸収、および植生特有の強い近赤外反射率 $\alpha_{\mathrm{nir}}$ を解く。
-- **LW1（水蒸気・CO₂ 吸収バンド：熱放射の約 68%）**: 圧力ブロードニングを伴う水蒸気光学的厚さと対数的な CO₂ 光学的厚さ、および雲射出率から対流圏の放射冷却（約 $1.5\text{--}2\ \mathrm{K\ d^{-1}}$：積乱雲を駆動する熱機関）を生成する。
-- **LW2（波長 8–12 $\mu\mathrm{m}$ 大気の窓バンド：熱放射の約 32%）**: 水蒸気連続吸収（$\propto q_v^2 p / p_0$）と雲水・雲氷による強い赤外吸収を扱う。これにより晴天夜間の地表面放射冷却（安定境界層形成と翌朝の混合層発達の起点）および上層かなとこ雲の温室効果を再現する。
+- **根拠文献**: Toon et al. (1989, *J. Geophys. Res.*, 94, 16,287–16,301); Lacis & Hansen (1974, *J. Atmos. Sci.*, 31, 118–133); Slingo (1989, *J. Atmos. Sci.*, 46, 1419–1427); Ebert & Curry (1992, *J. Geophys. Res.*, 97, 3831–3836); Weaver & Ramanathan (1995, *J. Geophys. Res.*, 100, 11,585–11,591); Koll & Cronin (2018, *PNAS*, 115, 10293–10298); Wing et al. (2018, *Geosci. Model Dev.*, 11, 793–813); Sherwood et al. (2020, *Rev. Geophys.*, 58, e2019RG000678).
+- **ソルバ構成**: Toon et al. (1989) の統一三重対角2ストリームソルバを $\Delta t_{\mathrm{rad}} = 900\ \mathrm{s}$ ごとに評価する（サブステップでは瞬時太陽天頂角余弦 $\mu_0(t)$ でスケーリング）：
+  - **SW1（紫外・可視光・PAR：太陽定数の約 50%）**: Wing et al. (2018, Eq. 4) の一様背景オゾン $\mathrm{O}_3(p)$ と Lacis & Hansen (1974) の吸収式で対流圏界面の安定キャップを形成し、水雲・氷雲の $\delta$-Eddington 散乱（Slingo, 1989; Ebert & Curry, 1992）と地表可視アルベド $\alpha_{\mathrm{vis}}$ を解く。地表透過光がそのまま生態系の $\mathrm{PAR}$ となる。
+  - **SW2（近赤外：太陽定数の約 50%）**: Lacis & Hansen (1974) の水蒸気吸収、雲の散乱・吸収、植生・雪氷の近赤外反射率 $\alpha_{\mathrm{nir}}$ を解く。
+  - **LW1（水蒸気・CO₂ 吸収帯：比率 $1 - \beta \approx 0.68$）**: 圧力ブロードニング水蒸気光学的厚さと対数型 $\mathrm{CO}_2$ 光学的厚さ（Weaver & Ramanathan, 1995; Koll & Cronin, 2018; Sherwood et al., 2020）および雲射出率から対流圏放射冷却（約 $1.5\text{--}2\ \mathrm{K\ d^{-1}}$）を生成する。
+  - **LW2（8–12 $\mu\mathrm{m}$ 大気の窓バンド：比率 $\beta \approx 0.32$）**: 水蒸気自己連続吸収（$\propto q_v^2 p / p_0$；Koll & Cronin, 2018）と水雲・氷雲の質量吸収（Ebert & Curry, 1992）を解き、晴天 OLR 線形性・夜間地表冷却・かなとこ雲温室効果を再現する。
 
 ---
 
-## 4. サブグリッド自律陸面（Pモデル ＋ EEO LAI）とスラブ海洋
+## 4. サブグリッド自律生態系と 1.5層ボロノイ・エクマン海洋
 
-各ホスト格子は `8 × 8 = 64` 個の地表面タイル（全地球で `[B = 8192, ny = 8, nx = 8]` ＝ 524,288 タイル）を持ち、3D CRM の最下層コラムと1対1で直接フラックスを交換する。
+地表面タイルは SLM／MAML 方式（Lee & Khairoutdinov, 2015; Lin et al., 2023）に従って上空の大気コラムと直接フラックスを交換する。
 
-### 4.1 葉レベルの純粋 Pモデル（水分ストレス関数なしの光合成・気孔最適化）
-- **最適葉内・大気 CO₂ 比 $\chi = c_i / c_a$**: 最小コスト仮説に基づき、水蒸気飽差 $D$（VPD）、光呼吸補償点 $\Gamma^*(T, p_s)$（標高による地表気圧 $p_s$ 依存性を含む）、および水の粘性・温度に依存するパラメータ $\xi(T, \eta^*)$ から次式で決定する：
-  $$
-  \chi = \frac{\Gamma^*}{c_a} + \left(1 - \frac{\Gamma^*}{c_a}\right)\frac{\xi}{\xi + \sqrt{D}}
-  $$
-- **順化と日変化の分離**: 光合成能力 $(V_{c\max 25}, J_{\max 25})$ は昼間環境の指数移動平均（時定数 $\tau_{\mathrm{acclim}} = 15\ \mathrm{d}$）に対して自律順化し、瞬時の気孔コンダクタンス $g_s$ と地表面熱収支（$R_n = H + \lambda E + G$）は毎ステップ解かれる。
+### 4.1 最適性理論に基づく C₃・C₄ 光合成順化と C₃/C₄ 割合の自律決定
+- **根拠文献**: Farquhar, von Caemmerer, & Berry (1980); Bernacchi et al. (2001, 2003); Prentice et al. (2014); Wang et al. (2017); Stocker et al. (2020); Mengoli et al. (2022); Scott & Smith (2022); Luo et al. (2024); Lavergne et al. (2026).
+- **順化と優占率決定**: 最小コスト C₃（$\chi_{\mathrm{C3}}$）および C₄（Scott & Smith, 2022）の光合成能力は昼間環境に対して時定数 $\tau_{\mathrm{acclim}} = 15\ \mathrm{d}$ で順化し（Mengoli et al., 2022）、瞬時の気孔コンダクタンス $g_s$ と地表熱収支（$R_n = H + \lambda E + G$；MATSIRO6 Document Writing Team, 2021）を毎ステップ解く。自然植生の C₄ 割合 $F_4 \in [0, 1]$ は C₄・C₃ 最適光合成の相対優位性から自律決定される（Luo et al., 2024; Lavergne et al., 2026）。
 
-### 4.2 EEO による樹冠緑度（fAPAR）と予報 LAI
-Cai et al. (2025, *Commun. Earth Environ.*) および Zhou et al. (2025, *Glob. Change Biol.*) に準拠し、PFT や経験的水理形質を導入することなく、葉の炭素コスト制限と水供給制限の共制限から目標緑度 $\mathrm{fAPAR}^*$ を決定する：
-1. **エネルギー（光・炭素コスト）制限の上限 $\mathrm{fAPAR}_c$**:
-   $$
-   \mathrm{fAPAR}_c = 1 - \frac{z_L}{k A_0}
-   $$
-   ここで $A_0$ は $\mathrm{fAPAR} = 1$ としたときの純粋 Pモデルによるポテンシャル同化速度、$k = 0.5$ は樹冠消散係数、$z_L$ は単位 LAI あたりの葉の維持・構築コスト速度である。
-2. **水供給制限の上限 $\mathrm{fAPAR}_w$**:
-   $$
-   \mathrm{fAPAR}_w = \frac{c_a(1 - \chi)}{1.6 D}\frac{S_w}{A_0}
-   $$
-   ここで $S_w(W)$ は単層根圏土壌水分バケット $\frac{dW}{dt} = P_{\mathrm{rain}} + M_{\mathrm{snow}} - E - R_{\mathrm{runoff}}$（$0 \le W \le W_{\max}$）から持続的に供給可能な水フラックスである。
-3. **実現する樹冠緑度と予報 LAI**:
-   $$
-   \mathrm{fAPAR}^* = \max\!\left(0,\, \min(\mathrm{fAPAR}_c,\, \mathrm{fAPAR}_w)\right), \qquad \mathrm{LAI}^* = -\frac{1}{k}\ln(1 - \mathrm{fAPAR}^*)
-   $$
-   予報変数としての $\mathrm{LAI}$ は葉の展開・落葉の時定数をもって目標値 $\mathrm{LAI}^*$ へ追従し、蒸散コンダクタンス・粗度・変位高度 $d$・2バンド地表面アルベド $(\alpha_{\mathrm{vis}}, \alpha_{\mathrm{nir}})$ を自律的に変化させる（単層の積雪バケット $S_{\mathrm{snow}}$ を併用）。
+### 4.2 最適根圏貯水容量・根圏水供給閉合と予報 EEO LAI
+- **根拠文献**: Gao et al. (2014); Davis et al. (2017); Sellers et al. (1986); Cai et al. (2025); Zhou et al. (2025).
+- **根圏容量設計と予報 LAI**: 根圏有効貯水容量 $W_{\max} = S_R$ を乾季累積水不足に対する質量収支最適性原理（Gao et al., 2014）から自律決定し、根圏からの最大水供給速度 $S_w(W) = c_w W / S_R$（Davis et al., 2017）で実蒸散を閉じる。年最大緑度 $\mathrm{fAPAR}_{\max} = \max\!\left(0,\, \min(\mathrm{fAPAR}_c,\, \mathrm{fAPAR}_w)\right)$ と日次の Lambert $W_0$ 定常葉面積 $L_s$ に対して予報 $\mathrm{LAI}$ が追従し（$\alpha = 0.067$；Cai et al., 2025; Zhou et al., 2025）、乾季の土壌乾燥を落葉・LAI 低下として表現しつつ、2ストリーム樹冠反射（Sellers et al., 1986; MATSIRO6 Document Writing Team, 2021）および積雪・氷床面から2バンドアルベド $(\alpha_{\mathrm{vis}}, \alpha_{\mathrm{nir}})$ を決定する。
 
-### 4.3 スラブ混合層海洋および熱力学海氷
-海洋タイルは混合層厚 $H_{\mathrm{ml}} = 50\ \mathrm{m}$ の熱収支 $C_{\mathrm{ml}} \partial_t T_{\mathrm{ocn}} = F_{\mathrm{net,sfc}}$（デフォルトでは処方 Qフラックス＝0）で時間発展し、結氷温度（$T_f = 271.35\ \mathrm{K}$）以下では熱力学海氷による高アルベド化と断熱効果を表現する。
+### 4.3 1.5層ボロノイ C-grid 風成エクマン海洋および熱力学海氷
+- **根拠文献**: Codron (2012, *Climate Dynamics*, 38, 379–389); Semtner (1976, *J. Phys. Oceanogr.*, 6, 379–389).
+- **処方 $Q$ フラックス不要のエクマン・スラブ海洋**: ホストと同一の SCVT ボロノイ C-grid 上（海岸線エッジで法線流量 $= 0$）で、海面風応力が駆動する表層混合層（$H_{\mathrm{ml}} = 50\ \mathrm{m}$）のエクマン輸送・沿岸／赤道湧昇・下層補償流との熱交換・水平渦拡散を**処方 $Q$ フラックス完全ゼロ**で解き（Codron, 2012）、結氷点（$T_f = 271.35\ \mathrm{K}$）以下では Semtner (1976) の熱力学海氷モデルと結合する。
