@@ -1,4 +1,10 @@
-"""Hardware backend selection and cloud-safe output directory management."""
+"""Hardware backend selection, data directory discovery, and output directory management.
+
+References
+----------
+- Repository I/O specification: Zarr v3 native output in ~/aoba_outputs; local protected
+  boundary/validation datasets in <repo>/data (Hirt & Rexer, 2015; Beck et al., 2018).
+"""
 
 from __future__ import annotations
 
@@ -24,3 +30,10 @@ def get_output_dir(run_name: str | None = None) -> Path:
     target = base / run_name if run_name else base
     target.mkdir(parents=True, exist_ok=True)
     return target
+
+
+def get_data_dir() -> Path:
+    """Return path to local boundary and validation datasets."""
+    if "AOBA_DATA_DIR" in os.environ:
+        return Path(os.environ["AOBA_DATA_DIR"]).expanduser()
+    return Path(__file__).resolve().parents[2] / "data"
