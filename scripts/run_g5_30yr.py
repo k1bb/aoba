@@ -23,6 +23,7 @@ from aoba.coupled_model import (
 )
 from aoba.io_zarr import (
     append_zarr,
+    diagnose_subgrid_2d_fields,
     export_aoba_snapshot_xarray,
     export_scvt_mesh_xarray,
     save_zarr,
@@ -47,8 +48,30 @@ def _move_obj_tensors(obj, target_device: torch.device):
     return obj
 
 
+def _serialize_surface(sfc_obj) -> dict:
+    """Detach and transfer all `SurfaceState` and embedded `BiosphereState` tensors to CPU."""
+    return {
+        k: (
+            {bk: bv.detach().cpu() if isinstance(bv, torch.Tensor) else bv for bk, bv in v.__dict__.items()}
+            if k == "bio"
+            else (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+        )
+        for k, v in sfc_obj.__dict__.items()
+    }
+
+
+def _restore_surface(sfc_target, payload: dict, device: torch.device) -> None:
+    """Restore serialized `SurfaceState` tensors onto `device`."""
+    for k, v in payload.items():
+        if k == "bio":
+            for bk, bv in v.items():
+                setattr(sfc_target.bio, bk, bv.to(device=device) if isinstance(bv, torch.Tensor) else bv)
+        else:
+            setattr(sfc_target, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+
+
 def _save_restart_atomic(model: AOBAState, path: Path) -> None:
-    """Save complete prognostic `AOBAState` cleanly via atomic temp file + rename."""
+    """Save complete prognostic `AOBAState` (including subgrid `sfc_sub`) via atomic temp file + rename."""
     payload = {
         "cfg": model.cfg,
         "sim_time_sec": model.sim_time_sec,
@@ -61,16 +84,15 @@ def _save_restart_atomic(model: AOBAState, path: Path) -> None:
             type(model.crm)(**{k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.crm.__dict__.items()}),
             torch.device("cpu"),
         ),
-        "sfc": {
-            k: (
-                {bk: bv.detach().cpu() if isinstance(bv, torch.Tensor) else bv for bk, bv in v.__dict__.items()}
-                if k == "bio"
-                else (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
-            )
-            for k, v in model.sfc.__dict__.items()
-        },
+        "sfc": _serialize_surface(model.sfc),
+        "sfc_sub": _serialize_surface(model.sfc_sub) if model.sfc_sub is not None else None,
         "ocn": {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.ocn.__dict__.items()},
         "clim": {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.clim.__dict__.items()},
+        "clim_sub": (
+            {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.clim_sub.__dict__.items()}
+            if model.clim_sub is not None
+            else None
+        ),
         "rad_cache": {k: v.detach().cpu() for k, v in model.rad_cache.items()},
     }
     tmp = path.with_suffix(".pt.tmp")
@@ -79,7 +101,7 @@ def _save_restart_atomic(model: AOBAState, path: Path) -> None:
 
 
 def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device) -> None:
-    """Restore prognostic tensors and accumulators from `restart.pt` into `model`."""
+    """Restore prognostic tensors (including subgrid `sfc_sub` & `clim_sub`) from `restart.pt`."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.sim_time_sec = float(ckpt["sim_time_sec"])
     model.step_count = int(ckpt["step_count"])
@@ -87,16 +109,16 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         setattr(model.atmos, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     for k, v in ckpt["crm"].__dict__.items():
         setattr(model.crm, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
-    for k, v in ckpt["sfc"].items():
-        if k == "bio":
-            for bk, bv in v.items():
-                setattr(model.sfc.bio, bk, bv.to(device=device) if isinstance(bv, torch.Tensor) else bv)
-        else:
-            setattr(model.sfc, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+    _restore_surface(model.sfc, ckpt["sfc"], device)
+    if ckpt.get("sfc_sub") is not None and model.sfc_sub is not None:
+        _restore_surface(model.sfc_sub, ckpt["sfc_sub"], device)
     for k, v in ckpt["ocn"].items():
         setattr(model.ocn, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     for k, v in ckpt["clim"].items():
         setattr(model.clim, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+    if ckpt.get("clim_sub") is not None and model.clim_sub is not None:
+        for k, v in ckpt["clim_sub"].items():
+            setattr(model.clim_sub, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     model.rad_cache = {k: v.to(device=device) for k, v in ckpt["rad_cache"].items()}
 
 
@@ -123,9 +145,13 @@ def _build_monthly_mean_xarray(model: AOBAState, sums: dict[str, torch.Tensor], 
     for name, unit in units_3d.items():
         arr = (sums[name] * inv).detach().cpu().numpy()[None, :, :]
         data_vars[name] = (("time", "nz", "n_cell"), arr, {"units": unit})
+    for name, (_, unit) in diagnose_subgrid_2d_fields(model).items():
+        arr = (sums[name] * inv).detach().cpu().numpy()[None, :, :, :]
+        data_vars[name] = (("time", "n_cell", "crm_y", "crm_x"), arr, {"units": unit})
 
     data_vars["koppen_code"] = (("time", "n_cell"), kg30.detach().cpu().numpy()[None, :])
     data_vars["koppen_major"] = (("time", "n_cell"), kg5.detach().cpu().numpy()[None, :])
+    _, _, ny, nx = model.crm.rho_d.shape
 
     return xr.Dataset(
         data_vars=data_vars,
@@ -134,6 +160,8 @@ def _build_monthly_mean_xarray(model: AOBAState, sums: dict[str, torch.Tensor], 
             "nz": ("nz", model.vgrid.zeta_c.detach().cpu().numpy(), {"units": "m", "positive": "up"}),
             "lat_cell": ("n_cell", lat_deg, {"units": "degrees_north"}),
             "lon_cell": ("n_cell", lon_deg, {"units": "degrees_east"}),
+            "crm_y": ("crm_y", np.arange(ny, dtype=np.float32) * model.crm.dy, {"units": "m"}),
+            "crm_x": ("crm_x", np.arange(nx, dtype=np.float32) * model.crm.dx, {"units": "m"}),
         },
         attrs={
             "Conventions": "CF-1.11 UGRID-1.0",
@@ -244,6 +272,7 @@ def main() -> None:
                     "q_v": model.atmos.q_v,
                     "u_zonal": u_c,
                     "v_merid": v_c,
+                    **{k: val for k, (val, _) in diagnose_subgrid_2d_fields(model).items()},
                 }
                 if m_cnt == 0:
                     m_sums = {k: v.clone() for k, v in sample.items()}

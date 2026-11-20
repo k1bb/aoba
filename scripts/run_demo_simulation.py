@@ -53,6 +53,7 @@ from aoba.biosphere import (
 )
 from aoba.coupled_model import (
     AOBAConfig,
+    broadcast_host_surface_to_subgrid,
     compute_orbital_insolation,
     diagnose_model_koppen_geiger,
     init_aoba_model,
@@ -486,6 +487,7 @@ def main() -> None:
         val = getattr(model.sfc.bio, attr)
         if isinstance(val, torch.Tensor):
             setattr(model_sp.sfc.bio, attr, val.to(dev_sp).clone())
+    broadcast_host_surface_to_subgrid(model_sp)
     model_sp.ocn.t_sub_ml = model.ocn.t_sub_ml.to(dev_sp).clone()
     model_sp.ocn.w_ekman = model.ocn.w_ekman.to(dev_sp).clone()
 

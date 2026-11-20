@@ -83,6 +83,8 @@ class SPTendencies:
     dv_dt: torch.Tensor         # [Nz, N_col] [m s^-2]
     precip_rain: torch.Tensor   # Mean surface rain rate [N_col] [kg m^-2 s^-1]
     precip_snow: torch.Tensor   # Mean surface snow/ice rate [N_col] [kg m^-2 s^-1]
+    precip_rain_sub: torch.Tensor | None = None  # Subcolumn rain rate [N_col, Ny, Nx] [kg m^-2 s^-1]
+    precip_snow_sub: torch.Tensor | None = None  # Subcolumn snow/ice rate [N_col, Ny, Nx] [kg m^-2 s^-1]
 
 
 # ---------------------------------------------------------------------------
@@ -997,8 +999,10 @@ def step_crm_physics_and_dynamics(
     crm.q_c = mp.q_c.reshape(nz, n_col, ny, nx)
     crm.q_i = mp.q_i.reshape(nz, n_col, ny, nx)
 
-    rain_col = mp.precip_rain.reshape(n_col, ny, nx).mean(dim=(-2, -1))
-    snow_col = mp.precip_snow.reshape(n_col, ny, nx).mean(dim=(-2, -1))
+    rain_sub = mp.precip_rain.reshape(n_col, ny, nx)
+    snow_sub = mp.precip_snow.reshape(n_col, ny, nx)
+    rain_col = rain_sub.mean(dim=(-2, -1))
+    snow_col = snow_sub.mean(dim=(-2, -1))
 
     # Diagnose net CRM physics/convective tendencies relative to pre-step + LS forcing
     thm_ls = dtheta_m_ls_dt if dtheta_m_ls_dt is not None else torch.zeros_like(thm_mean_0)
@@ -1018,6 +1022,8 @@ def step_crm_physics_and_dynamics(
         dv_dt=dv_crm,
         precip_rain=rain_col,
         precip_snow=snow_col,
+        precip_rain_sub=rain_sub,
+        precip_snow_sub=snow_sub,
     )
 
 
@@ -1056,91 +1062,121 @@ def step_coupled_crm_rce(
     for insolation `409.6 W m^-2` over ocean or diurnal/constant forcing over land).
     """
     nz, n_col, ny, nx = crm.rho_d.shape
+    m_sub = n_col * ny * nx
+    is_subgrid_sfc = sfc.surf_type.numel() == m_sub and m_sub != n_col
 
-    # 1. Column-mean thermodynamic profiles for radiation & surface coupling
-    rho_mean = crm.rho_d.mean(dim=(-2, -1))
-    thm_mean = crm.theta_m.mean(dim=(-2, -1))
-    qv_mean = crm.q_v.mean(dim=(-2, -1))
-    qc_mean = crm.q_c.mean(dim=(-2, -1))
-    qi_mean = crm.q_i.mean(dim=(-2, -1))
-    u1_mean = crm.u[0].mean(dim=(-2, -1))
-    v1_mean = crm.v[0].mean(dim=(-2, -1))
+    def _expand_col(t: torch.Tensor) -> torch.Tensor:
+        return t.view(n_col, 1, 1).expand(n_col, ny, nx).reshape(m_sub)
 
-    pres_mean, _, temp_mean = diagnose_pressure_temperature(rho_mean, thm_mean, qv_mean)
+    def _mean_sub(t: torch.Tensor) -> torch.Tensor:
+        return t.reshape(n_col, ny, nx).mean(dim=(-2, -1))
+
+    # 1. Subcolumn thermodynamic & centered lowest-layer wind profiles [Nz, m_sub]
+    rho_sub = crm.rho_d.reshape(nz, m_sub)
+    thm_sub = crm.theta_m.reshape(nz, m_sub)
+    qv_sub = crm.q_v.reshape(nz, m_sub)
+    qc_sub = crm.q_c.reshape(nz, m_sub)
+    qi_sub = crm.q_i.reshape(nz, m_sub)
+    u0_sub = (0.5 * (crm.u[0] + torch.roll(crm.u[0], 1, dims=-1))).reshape(m_sub)
+    v0_sub = (0.5 * (crm.v[0] + torch.roll(crm.v[0], 1, dims=-2))).reshape(m_sub)
+
+    pres_sub, _, temp_sub = diagnose_pressure_temperature(rho_sub, thm_sub, qv_sub)
     dz_0 = float((vgrid.zeta_c[0] - vgrid.zeta_w[0]).item())
-    pres_sfc = pres_mean[0] + C.GRAVITY * rho_mean[0] * (1.0 + qv_mean[0]) * dz_0
-    z_ref_rel = torch.clamp(vgrid.zeta_c[0] - sfc.bio.h_canopy * 0.65, min=5.0)
+    pres_sfc_sub = pres_sub[0] + C.GRAVITY * rho_sub[0] * (1.0 + qv_sub[0]) * dz_0
+    mu0_sub = _expand_col(cos_zenith)
+    mu0_sfc = mu0_sub if is_subgrid_sfc else cos_zenith
+    pres_sfc_in = pres_sfc_sub if is_subgrid_sfc else _mean_sub(pres_sfc_sub)
+    temp1_in = temp_sub[0] if is_subgrid_sfc else _mean_sub(temp_sub[0])
+    qv1_in = qv_sub[0] if is_subgrid_sfc else _mean_sub(qv_sub[0])
+    pres1_in = pres_sub[0] if is_subgrid_sfc else _mean_sub(pres_sub[0])
+    u1_in = u0_sub if is_subgrid_sfc else _mean_sub(u0_sub)
+    v1_in = v0_sub if is_subgrid_sfc else _mean_sub(v0_sub)
+    z_ref_rel = torch.clamp(vgrid.zeta_c[0] - sfc.bio.h_canopy.reshape(-1) * 0.65, min=5.0)
 
-    # 2. Surface albedos & 2-stream gray/window radiative transfer
-    alb_vd, alb_vf, alb_nd, alb_nf, _, lai_exp, _, _ = compute_surface_albedos(sfc, cos_zenith)
+    # 2. Subcolumn surface albedos & ICA 4-band radiative transfer across all [Nz, m_sub]
+    alb_vd, alb_vf, alb_nd, alb_nf, _, lai_exp, _, _ = compute_surface_albedos(
+        sfc, mu0_sfc.reshape(sfc.surf_type.shape)
+    )
     need_rad = (cached_rad_cache is None) or (step_idx % max(rad_stride, 1) == 0)
     if need_rad:
-        # Radiative skin temperature & interface pressure/temperature profiles [nz + 1, N_col]
-        t_rad_in = torch.where(sfc.surf_type == 0, sfc.t_ocean_ml, sfc.t_canopy)
-        pres_w = torch.empty((nz + 1, n_col), device=rho_mean.device, dtype=rho_mean.dtype)
-        pres_w[0] = pres_sfc
-        pres_w[1:-1] = torch.sqrt(torch.clamp(pres_mean[:-1] * pres_mean[1:], min=1.0))
-        pres_w[-1] = torch.clamp(0.5 * pres_mean[-1], min=10.0)
+        t_rad_raw = torch.where(sfc.surf_type == 0, sfc.t_ocean_ml, sfc.t_canopy).reshape(-1)
+        t_rad_in = t_rad_raw if is_subgrid_sfc else _expand_col(t_rad_raw)
+        alb_vd_sub = alb_vd.reshape(-1) if is_subgrid_sfc else _expand_col(alb_vd)
+        alb_vf_sub = alb_vf.reshape(-1) if is_subgrid_sfc else _expand_col(alb_vf)
+        alb_nd_sub = alb_nd.reshape(-1) if is_subgrid_sfc else _expand_col(alb_nd)
+        alb_nf_sub = alb_nf.reshape(-1) if is_subgrid_sfc else _expand_col(alb_nf)
 
-        temp_w = torch.empty((nz + 1, n_col), device=rho_mean.device, dtype=rho_mean.dtype)
-        temp_w[0] = temp_mean[0]
-        temp_w[1:-1] = 0.5 * (temp_mean[:-1] + temp_mean[1:])
-        temp_w[-1] = temp_mean[-1]
+        pres_w = torch.empty((nz + 1, m_sub), device=rho_sub.device, dtype=rho_sub.dtype)
+        pres_w[0] = pres_sfc_sub
+        pres_w[1:-1] = torch.sqrt(torch.clamp(pres_sub[:-1] * pres_sub[1:], min=1.0))
+        pres_w[-1] = torch.clamp(0.5 * pres_sub[-1], min=10.0)
 
-        s_toa = torch.full_like(cos_zenith, solar_constant)
+        temp_w = torch.empty((nz + 1, m_sub), device=rho_sub.device, dtype=rho_sub.dtype)
+        temp_w[0] = temp_sub[0]
+        temp_w[1:-1] = 0.5 * (temp_sub[:-1] + temp_sub[1:])
+        temp_w[-1] = temp_sub[-1]
+
+        s_toa = torch.full_like(mu0_sub, solar_constant)
         rad = compute_four_band_radiation(
-            pres_c=pres_mean,
+            pres_c=pres_sub,
             pres_w=pres_w,
-            temp_c=temp_mean,
+            temp_c=temp_sub,
             temp_w=temp_w,
-            dz_c=vgrid.dzeta_c.view(nz, 1),
-            rho_d_c=rho_mean,
-            qv_c=qv_mean,
-            qc_c=qc_mean,
-            qi_c=qi_mean,
+            dz_c=vgrid.dzeta_c.view(nz, 1).expand(nz, m_sub),
+            rho_d_c=rho_sub,
+            qv_c=qv_sub,
+            qc_c=qc_sub,
+            qi_c=qi_sub,
             t_sfc=t_rad_in,
-            albedo_vis=alb_vd,
-            albedo_nir=alb_nd,
-            mu0=cos_zenith,
+            albedo_vis=alb_vd_sub,
+            albedo_nir=alb_nd_sub,
+            mu0=mu0_sub,
             s_toa=s_toa,
             co2_ppmv=co2_ppmv,
-            albedo_vis_dif=alb_vf,
-            albedo_nir_dif=alb_nf,
+            albedo_vis_dif=alb_vf_sub,
+            albedo_nir_dif=alb_nf_sub,
         )
-        sfc_lw_dn = rad.lw_flux_dn[0]
+        dt_rad = rad.q_rad_net.reshape(nz, n_col, ny, nx)
+        sw1_dir_sub, sw1_dif_sub = rad.sfc_sw1_dir_dn, rad.sfc_sw1_dif_dn
+        sw2_dir_sub, sw2_dif_sub = rad.sfc_sw2_dir_dn, rad.sfc_sw2_dif_dn
+        lw_dn_sub = rad.lw_flux_dn[0]
+        olr_sub, asr_sub = rad.toa_olr, rad.toa_asr
         if cached_rad_cache is not None:
-            cached_rad_cache["dt_rad"] = rad.q_rad_net
-            cached_rad_cache["sw1_dir"] = rad.sfc_sw1_dir_dn
-            cached_rad_cache["sw1_dif"] = rad.sfc_sw1_dif_dn
-            cached_rad_cache["sw2_dir"] = rad.sfc_sw2_dir_dn
-            cached_rad_cache["sw2_dif"] = rad.sfc_sw2_dif_dn
-            cached_rad_cache["lw_dn"] = sfc_lw_dn
-            cached_rad_cache["olr"] = rad.toa_olr
-            cached_rad_cache["asr"] = rad.toa_asr
-        dt_rad = rad.q_rad_net
-        sw1_dir, sw1_dif = rad.sfc_sw1_dir_dn, rad.sfc_sw1_dif_dn
-        sw2_dir, sw2_dif = rad.sfc_sw2_dir_dn, rad.sfc_sw2_dif_dn
-        lw_dn = sfc_lw_dn
-        olr, asr = rad.toa_olr, rad.toa_asr
+            cached_rad_cache["dt_rad"] = dt_rad
+            cached_rad_cache["sw1_dir"] = sw1_dir_sub
+            cached_rad_cache["sw1_dif"] = sw1_dif_sub
+            cached_rad_cache["sw2_dir"] = sw2_dir_sub
+            cached_rad_cache["sw2_dif"] = sw2_dif_sub
+            cached_rad_cache["lw_dn"] = lw_dn_sub
+            cached_rad_cache["olr"] = olr_sub
+            cached_rad_cache["asr"] = asr_sub
     else:
         dt_rad = cached_rad_cache["dt_rad"]
-        sw1_dir, sw1_dif = cached_rad_cache["sw1_dir"], cached_rad_cache["sw1_dif"]
-        sw2_dir, sw2_dif = cached_rad_cache["sw2_dir"], cached_rad_cache["sw2_dif"]
-        lw_dn = cached_rad_cache["lw_dn"]
-        olr, asr = cached_rad_cache["olr"], cached_rad_cache["asr"]
+        sw1_dir_sub, sw1_dif_sub = cached_rad_cache["sw1_dir"], cached_rad_cache["sw1_dif"]
+        sw2_dir_sub, sw2_dif_sub = cached_rad_cache["sw2_dir"], cached_rad_cache["sw2_dif"]
+        lw_dn_sub = cached_rad_cache["lw_dn"]
+        olr_sub, asr_sub = cached_rad_cache["olr"], cached_rad_cache["asr"]
 
-    rain_prev = cached_rad_cache.get("rain", torch.zeros_like(pres_sfc)) if cached_rad_cache is not None else torch.zeros_like(pres_sfc)
-    snow_prev = cached_rad_cache.get("snow", torch.zeros_like(pres_sfc)) if cached_rad_cache is not None else torch.zeros_like(pres_sfc)
+    sw1_dir = sw1_dir_sub if is_subgrid_sfc else _mean_sub(sw1_dir_sub)
+    sw1_dif = sw1_dif_sub if is_subgrid_sfc else _mean_sub(sw1_dif_sub)
+    sw2_dir = sw2_dir_sub if is_subgrid_sfc else _mean_sub(sw2_dir_sub)
+    sw2_dif = sw2_dif_sub if is_subgrid_sfc else _mean_sub(sw2_dif_sub)
+    lw_dn = lw_dn_sub if is_subgrid_sfc else _mean_sub(lw_dn_sub)
+    olr = _mean_sub(olr_sub)
+    asr = _mean_sub(asr_sub)
 
-    # 3. Surface energy/water balance & Two-Leaf gas exchange
+    rain_prev = cached_rad_cache.get("rain", torch.zeros_like(pres_sfc_in)) if cached_rad_cache is not None else torch.zeros_like(pres_sfc_in)
+    snow_prev = cached_rad_cache.get("snow", torch.zeros_like(pres_sfc_in)) if cached_rad_cache is not None else torch.zeros_like(pres_sfc_in)
+
+    # 3. Surface energy/water balance & Two-Leaf gas exchange (subgrid MAML or host mean)
     sfc_diag = step_surface(
         sfc=sfc,
-        u_1=u1_mean,
-        v_1=v1_mean,
-        temp_1=temp_mean[0],
-        qv_1=qv_mean[0],
-        pres_1=pres_mean[0],
-        pres_sfc=pres_sfc,
+        u_1=u1_in,
+        v_1=v1_in,
+        temp_1=temp1_in,
+        qv_1=qv1_in,
+        pres_1=pres1_in,
+        pres_sfc=pres_sfc_in,
         z_ref_rel=z_ref_rel,
         sw1_dir_down=sw1_dir,
         sw1_dif_down=sw1_dif,
@@ -1149,7 +1185,7 @@ def step_coupled_crm_rce(
         lw_down=lw_dn,
         precip_rain=rain_prev,
         precip_snow=snow_prev,
-        mu0=cos_zenith,
+        mu0=mu0_sfc,
         co2_ppmv=co2_ppmv,
         dt=dt_crm,
     )
@@ -1163,31 +1199,33 @@ def step_coupled_crm_rce(
         sfc_fluxes=sfc_diag,
         rad_heating_k_s=dt_rad,
     )
+    rain_next_in = sp_out.precip_rain_sub.reshape(m_sub) if (is_subgrid_sfc and sp_out.precip_rain_sub is not None) else sp_out.precip_rain
+    snow_next_in = sp_out.precip_snow_sub.reshape(m_sub) if (is_subgrid_sfc and sp_out.precip_snow_sub is not None) else sp_out.precip_snow
     if cached_rad_cache is not None:
-        cached_rad_cache["rain"] = sp_out.precip_rain
-        cached_rad_cache["snow"] = sp_out.precip_snow
+        cached_rad_cache["rain"] = rain_next_in
+        cached_rad_cache["snow"] = snow_next_in
 
     # 5. Daily EEO acclimation & LAI update once per simulated solar day
     steps_per_day = max(int(round(C.SECONDS_PER_DAY / dt_crm)), 1)
     if (step_idx + 1) % steps_per_day == 0 and (sfc.surf_type == 1).any():
         is_veg = sfc.surf_type == 1
-        es_1 = 611.2 * torch.exp(17.67 * (temp_mean[0] - C.T_FREEZE) / torch.clamp(temp_mean[0] - 29.65, min=10.0))
-        e_1 = qv_mean[0] * pres_mean[0] / (C.EPS_WATER + (1.0 - C.EPS_WATER) * qv_mean[0])
+        es_1 = 611.2 * torch.exp(17.67 * (temp1_in - C.T_FREEZE) / torch.clamp(temp1_in - 29.65, min=10.0))
+        e_1 = qv1_in * pres1_in / (C.EPS_WATER + (1.0 - C.EPS_WATER) * qv1_in)
         vpd_1 = torch.clamp(es_1 - e_1, min=50.0)
         update_daily_acclimation_smith(
             bio=sfc.bio,
             midday_vis_beam=sw1_dir,
             midday_vis_diff=sw1_dif,
-            midday_mu0=torch.clamp(cos_zenith, min=0.1),
-            midday_temp=temp_mean[0] + 1.5,
+            midday_mu0=torch.clamp(mu0_sfc, min=0.1),
+            midday_temp=temp1_in + 1.5,
             midday_vpd=vpd_1,
-            night_temp=temp_mean[0] - 3.0,
-            pres_sfc=pres_sfc,
+            night_temp=temp1_in - 3.0,
+            pres_sfc=pres_sfc_in,
             co2_ppmv=co2_ppmv,
             lai_exposed=lai_exp,
             is_vegetated_land=is_veg,
         )
-        precip_mm_day = (sp_out.precip_rain + sp_out.precip_snow) * C.SECONDS_PER_DAY
+        precip_mm_day = (rain_next_in + snow_next_in) * C.SECONDS_PER_DAY
         pet_mm_day = torch.clamp((sw1_dir + sw1_dif + sw2_dir + sw2_dif) * C.SECONDS_PER_DAY / C.L_V0, min=0.1)
         ppfd_mol_day = (4.57 * sw1_dir + 4.24 * sw1_dif) * 1.0e-6 * C.SECONDS_PER_DAY
         ws_beta = torch.clamp(sfc.w_root / (0.5 * torch.clamp(sfc.bio.s_root_cap, min=20.0)), 0.0, 1.0)
@@ -1196,20 +1234,24 @@ def step_coupled_crm_rce(
             daily_precip_mm=precip_mm_day,
             daily_pet_mm=pet_mm_day,
             daily_ppfd_mol_m2=ppfd_mol_day,
-            daily_temp_k=temp_mean[0],
+            daily_temp_k=temp1_in,
             daily_vpd_pa=vpd_1,
-            pres_sfc=pres_sfc,
+            pres_sfc=pres_sfc_in,
             co2_ppmv=co2_ppmv,
             water_stress_beta=ws_beta,
             is_vegetated_land=is_veg,
         )
 
+    shf_out = _mean_sub(sfc_diag.shf) if is_subgrid_sfc else sfc_diag.shf
+    lhf_out = _mean_sub(sfc_diag.lhf) if is_subgrid_sfc else sfc_diag.lhf
+    gpp_out = _mean_sub(sfc_diag.gpp) if is_subgrid_sfc else sfc_diag.gpp
+
     return RCEDiagnostics(
         olr=olr,
         asr=asr,
         precip_tot=sp_out.precip_rain + sp_out.precip_snow,
-        shf=sfc_diag.shf,
-        lhf=sfc_diag.lhf,
-        gpp=sfc_diag.gpp,
+        shf=shf_out,
+        lhf=lhf_out,
+        gpp=gpp_out,
         max_w=float(crm.w.abs().max().item()),
     )

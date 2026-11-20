@@ -51,6 +51,60 @@ def load_zarr(store_path: str | Path) -> xr.Dataset:
     return xr.open_zarr(path, consolidated=False)
 
 
+def diagnose_subgrid_2d_fields(model: "AOBAState") -> dict[str, tuple]:
+    """Compute column-integrated CRM, ICA radiative, and MAML surface 2D subgrid fields `[n_cell, ny, nx]`."""
+    from aoba import constants as C
+    from aoba.surface import SURF_OCEAN
+
+    crm = model.crm
+    nz, nc, ny, nx = crm.rho_d.shape
+    m_sub = nc * ny * nx
+    dz_4 = model.atmos.dz_c[:, :, None, None]
+
+    def _rsub(t):
+        return t.reshape(nc, ny, nx)
+
+    rc = model.rad_cache
+    z_sub = _rsub(crm.rho_d[0].new_zeros(m_sub))
+    rain_s = _rsub(rc["rain_sub"]) if "rain_sub" in rc else z_sub
+    snow_s = _rsub(rc["snow_sub"]) if "snow_sub" in rc else z_sub
+    sw1_dir_s = _rsub(rc["sw1_dir_sub"]) if "sw1_dir_sub" in rc else z_sub
+    sw1_dif_s = _rsub(rc["sw1_dif_sub"]) if "sw1_dif_sub" in rc else z_sub
+    sw2_dir_s = _rsub(rc["sw2_dir_sub"]) if "sw2_dir_sub" in rc else z_sub
+    sw2_dif_s = _rsub(rc["sw2_dif_sub"]) if "sw2_dif_sub" in rc else z_sub
+    lw_dn_s = _rsub(rc["lw_dn_sub"]) if "lw_dn_sub" in rc else z_sub
+    olr_s = _rsub(rc["olr_sub"]) if "olr_sub" in rc else z_sub
+    shf_s = _rsub(rc["shf_sub"]) if "shf_sub" in rc else z_sub
+    evap_s = _rsub(rc["evap_sub"]) if "evap_sub" in rc else z_sub
+    gpp_s = _rsub(rc["gpp_sub"]) if "gpp_sub" in rc else z_sub
+
+    fields: dict[str, tuple] = {
+        "lwp_sub": ((crm.rho_d * crm.q_c * dz_4).sum(dim=0), "kg m-2"),
+        "iwp_sub": ((crm.rho_d * crm.q_i * dz_4).sum(dim=0), "kg m-2"),
+        "w_max_sub": (crm.w.max(dim=0).values, "m s-1"),
+        "precip_mm_day_sub": ((rain_s + snow_s) * C.SECONDS_PER_DAY, "mm day-1"),
+        "sw1_dir_sub": (sw1_dir_s, "W m-2"),
+        "sw1_dif_sub": (sw1_dif_s, "W m-2"),
+        "sw_dn_sub": (sw1_dir_s + sw1_dif_s + sw2_dir_s + sw2_dif_s, "W m-2"),
+        "lw_dn_sub": (lw_dn_s, "W m-2"),
+        "olr_sub": (olr_s, "W m-2"),
+        "shf_sub": (shf_s, "W m-2"),
+        "evap_mm_day_sub": (evap_s * C.SECONDS_PER_DAY, "mm day-1"),
+        "gpp_sub": (gpp_s, "umol m-2 s-1"),
+    }
+
+    if model.sfc_sub is not None and model.sfc_sub.t_canopy.numel() == m_sub:
+        ss = model.sfc_sub
+        t_sfc_s = _rsub(ss.t_ocean_ml.where(ss.surf_type == SURF_OCEAN, ss.t_canopy))
+        fields["t_sfc_sub"] = (t_sfc_s, "K")
+        fields["m_seaice_sub"] = (_rsub(ss.m_seaice), "kg m-2")
+        fields["swe_land_sub"] = (_rsub(ss.swe_land), "kg m-2")
+        fields["w_root_sub"] = (_rsub(ss.w_root), "kg m-2")
+        fields["lai_sub"] = (_rsub(ss.bio.lai), "m2 m-2")
+
+    return fields
+
+
 def export_aoba_snapshot_xarray(model: "AOBAState") -> xr.Dataset:
     """Package the current global `AOBAState` into a CF-1.11 / UGRID-1.0 `xarray.Dataset`."""
     from aoba import constants as C
@@ -76,6 +130,16 @@ def export_aoba_snapshot_xarray(model: "AOBAState") -> xr.Dataset:
     def _c2(t):
         # [nz, n_cell] -> [1, nz, n_cell]
         return t.detach().cpu().numpy()[None, :, :]
+
+    def _c3(t):
+        # [n_cell, ny, nx] -> [1, n_cell, ny, nx]
+        return t.detach().cpu().numpy()[None, :, :, :]
+
+    sub_vars = {
+        k: (("time", "n_cell", "crm_y", "crm_x"), _c3(val), {"units": unit})
+        for k, (val, unit) in diagnose_subgrid_2d_fields(model).items()
+    }
+    _, _, ny, nx = model.crm.rho_d.shape
 
     ds = xr.Dataset(
         data_vars={
@@ -108,12 +172,15 @@ def export_aoba_snapshot_xarray(model: "AOBAState") -> xr.Dataset:
             "q_v": (("time", "nz", "n_cell"), _c2(atmos.q_v), {"units": "kg kg-1"}),
             "u_zonal": (("time", "nz", "n_cell"), _c2(u_c), {"units": "m s-1"}),
             "v_merid": (("time", "nz", "n_cell"), _c2(v_c), {"units": "m s-1"}),
+            **sub_vars,
         },
         coords={
             "time": ("time", t_days, {"units": "days since 2000-03-20 00:00:00"}),
             "nz": ("nz", model.vgrid.zeta_c.detach().cpu().numpy(), {"units": "m", "positive": "up"}),
             "lat_cell": ("n_cell", lat_deg, {"units": "degrees_north", "standard_name": "latitude"}),
             "lon_cell": ("n_cell", lon_deg, {"units": "degrees_east", "standard_name": "longitude"}),
+            "crm_y": ("crm_y", np.arange(ny, dtype=np.float32) * model.crm.dy, {"units": "m"}),
+            "crm_x": ("crm_x", np.arange(nx, dtype=np.float32) * model.crm.dx, {"units": "m"}),
         },
         attrs={
             "Conventions": "CF-1.11 UGRID-1.0",

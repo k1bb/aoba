@@ -25,6 +25,9 @@ def main() -> None:
     parser.add_argument("--var", type=str, default="u_zonal", help="Variable name to plot")
     parser.add_argument("--time-idx", type=int, default=-1, help="Time index")
     parser.add_argument("--lev-idx", type=int, default=14, help="Vertical level index if 3D (default ~upper troposphere)")
+    parser.add_argument("--sub-stat", choices=["mean", "std", "min", "max", "idx"], default="mean", help="Reduction across CRM subcolumns if plotting *_sub")
+    parser.add_argument("--crm-y", type=int, default=0, help="CRM y-index when --sub-stat=idx")
+    parser.add_argument("--crm-x", type=int, default=0, help="CRM x-index when --sub-stat=idx")
     parser.add_argument("--out", type=str, default="native_map.png", help="Output PNG path")
     args = parser.parse_args()
 
@@ -34,6 +37,11 @@ def main() -> None:
     da = ds_d[args.var].isel(time=args.time_idx)
     if "nz" in da.dims:
         da = da.isel(nz=args.lev_idx)
+    if "crm_y" in da.dims and "crm_x" in da.dims:
+        if args.sub_stat == "idx":
+            da = da.isel(crm_y=args.crm_y, crm_x=args.crm_x)
+        else:
+            da = getattr(da, args.sub_stat)(dim=("crm_y", "crm_x"))
     vals = da.values
 
     polys, owners = build_voronoi_polygons_platecarree(

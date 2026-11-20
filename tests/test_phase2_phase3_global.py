@@ -225,6 +225,15 @@ def test_full_global_coupled_aoba_and_zarr_v3_io(device: str) -> None:
     assert diag.seaice_area_million_km2 > 0.0
     assert not torch.isnan(model.atmos.theta_m).any()
     assert not torch.isnan(model.atmos.u_edge).any()
+    assert model.sfc_sub is not None
+    nc = model.mesh.n_cells
+    n_sub = cfg.crm_ny * cfg.crm_nx
+    assert model.sfc_sub.t_canopy.numel() == nc * n_sub
+    # True subgrid MAML + ICA radiation: CRM perturbations induce subcolumn surface & radiative spread
+    t_can_sub_spread = float(model.sfc_sub.t_canopy.reshape(nc, n_sub).std(dim=-1).max().item())
+    assert t_can_sub_spread > 1.0e-5
+    assert torch.allclose(model.sfc.t_canopy, model.sfc_sub.t_canopy.reshape(nc, n_sub).mean(dim=-1), atol=1.0e-5)
+    assert model.rad_cache["q_rad_sub"].shape == (cfg.nz, nc * n_sub)
 
     # Export to CF-1.11 / UGRID-1.0 Zarr v3 and verify round-trip reload
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -235,7 +244,12 @@ def test_full_global_coupled_aoba_and_zarr_v3_io(device: str) -> None:
         assert ds_reloaded.attrs["Conventions"] == "CF-1.11 UGRID-1.0"
         assert ds_reloaded.sizes["n_cell"] == 162
         assert ds_reloaded.sizes["nz"] == 32
+        assert ds_reloaded.sizes["crm_y"] == cfg.crm_ny
+        assert ds_reloaded.sizes["crm_x"] == cfg.crm_nx
         assert "koppen_code" in ds_reloaded.data_vars
+        assert "lwp_sub" in ds_reloaded.data_vars
+        assert "t_sfc_sub" in ds_reloaded.data_vars
+        assert "sw1_dir_sub" in ds_reloaded.data_vars
 
 
 if __name__ == "__main__":
