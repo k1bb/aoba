@@ -33,7 +33,11 @@ import math
 import torch
 
 from aoba import constants as C
-from aoba.kernels import solve_tridiagonal_batched
+from aoba.kernels import (
+    can_use_crm_metal,
+    dispatch_crm_mynn_metal,
+    solve_tridiagonal_batched,
+)
 from aoba.thermodynamics import diagnose_pressure_temperature, qsat_mixed, saturation_adjustment
 
 # ---------------------------------------------------------------------------
@@ -62,6 +66,15 @@ MYNN_RF2: float = MYNN_B1 * MYNN_GAMMA1 / MYNN_F2
 MYNN_RFC: float = MYNN_GAMMA1 / (MYNN_GAMMA1 + MYNN_GAMMA2)
 
 TKE_MIN: float = 1.0e-4  # Minimum prognostic TKE e_min [m^2 s^-2] (q^2_min = 2e-4)
+
+_MYNN_METAL_CONSTS: list[float] = [
+    C.P_REF, C.R_D, C.CP_D, C.CP_V, C.GAMMA_D, C.KAPPA_D,
+    C.RV_OVER_RD, C.EPS_WATER, C.ZVIR, C.GRAVITY, C.VON_KARMAN,
+    C.L_V0, C.L_S0, C.E_TRIPLE, C.T_FREEZE, C.T_ICE_ALL, C.T_LIQ_ALL,
+    TKE_MIN, MYNN_B1, MYNN_B2, MYNN_C1, MYNN_C2, MYNN_C3, MYNN_C5,
+    MYNN_A1, MYNN_A2, MYNN_GAMMA1, MYNN_GAMMA2,
+    MYNN_F1, MYNN_F2, MYNN_RF1, MYNN_RF2, MYNN_RFC,
+]
 
 # De Ridder (2010, Eq. 22) analytical RSL parameters
 RSL_MU_M: float = 2.59
@@ -353,6 +366,17 @@ def step_mynn_level25(
     - Nishizawa et al. (2025, SCALE-RM v5.5.5, Sec. 8.2.1 Eqs. 8.96-8.176).
     """
     nz = rho_d.shape[0]
+    if can_use_crm_metal(rho_d) and rho_d.ndim == 2:
+        res = dispatch_crm_mynn_metal(
+            rho_d=rho_d, u=u, v=v, theta_m_c=theta_m_c,
+            q_n=q_n, q_v=q_v, q_c=q_c, q_i=q_i, qke=qke,
+            z_c=z_c, z_w=z_w, dz_c=dz_c,
+            u_star=u_star, sfc_buoy_flux=sfc_buoy_flux,
+            tau_x_sfc=tau_x_sfc, tau_y_sfc=tau_y_sfc,
+            shf_sfc=shf_sfc, evap_sfc=evap_sfc,
+            dt=dt, mynn_consts=_MYNN_METAL_CONSTS,
+        )
+        return res if return_hydrometeors else res[:7]
     q2 = torch.clamp(qke, min=2.0 * TKE_MIN)
     q_vel = torch.sqrt(q2)
 

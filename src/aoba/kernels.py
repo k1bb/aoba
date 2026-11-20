@@ -17,10 +17,27 @@ pure-PyTorch implementation for CPU and CUDA backends.
 
 from __future__ import annotations
 
+from typing import Any
 import torch
 
+from aoba.kernels_extra import (
+    EXTRA_METAL_SHADER_SRC,
+    run_crm_fct_advect_metal,
+    run_crm_microphysics_metal,
+    run_crm_mynn_metal,
+    run_crm_sgs_metal,
+    run_scvt_div_metal,
+    run_scvt_fast_acoustic_metal,
+    run_scvt_scalar_lap_metal,
+    run_scvt_trisk_rot_metal,
+    run_scvt_vec_lap_metal,
+    run_scvt_vorticity_metal,
+)
+
 _MAX_METAL_K: int = 128
+_MAX_COL_METAL_K: int = 64
 _METAL_SHADER_LIB = None
+_CRM_WS_CACHE: dict[tuple[int, int, int, int, int, int], dict[str, torch.Tensor]] = {}
 
 _METAL_THOMAS_SRC = """
 #include <metal_stdlib>
@@ -651,7 +668,7 @@ kernel void crm_stage_w_hevi(
 def _get_metal_lib():
     global _METAL_SHADER_LIB
     if _METAL_SHADER_LIB is None and hasattr(torch.mps, "compile_shader"):
-        _METAL_SHADER_LIB = torch.mps.compile_shader(_METAL_THOMAS_SRC)
+        _METAL_SHADER_LIB = torch.mps.compile_shader(_METAL_THOMAS_SRC + EXTRA_METAL_SHADER_SRC)
     return _METAL_SHADER_LIB
 
 
@@ -737,15 +754,107 @@ def solve_tridiagonal_batched(
 
 
 def can_use_crm_metal(rho0: torch.Tensor) -> bool:
-    """Return True when the fused CRM acoustic+HEVI Metal shader can be dispatched."""
+    """Return True when the fused CRM/SCVT Metal shaders can be dispatched."""
     nz = rho0.shape[0]
     return (
         rho0.device.type == "mps"
         and rho0.dtype == torch.float32
-        and 2 <= nz <= _MAX_METAL_K
+        and 2 <= nz <= _MAX_COL_METAL_K
         and not rho0.requires_grad
         and _get_metal_lib() is not None
     )
+
+
+def dispatch_crm_fct_advect_metal(
+    q_batch: torch.Tensor,
+    rho_old: torch.Tensor,
+    rho_new: torch.Tensor,
+    fx: torch.Tensor,
+    fy: torch.Tensor,
+    fz: torch.Tensor,
+    dx: float,
+    dy: float,
+    dz_c: torch.Tensor,
+    dt: float,
+) -> torch.Tensor:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_crm_fct_advect_metal(lib, q_batch, rho_old, rho_new, fx, fy, fz, dx, dy, dz_c, dt)
+
+
+def dispatch_crm_sgs_metal(
+    rho_d: torch.Tensor,
+    u: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    theta_m: torch.Tensor,
+    dx: float,
+    dy: float,
+    dz_c: torch.Tensor,
+    dz_w_int: torch.Tensor,
+    gravity: float,
+    c_s: float = 0.18,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_crm_sgs_metal(lib, rho_d, u, v, w, theta_m, dx, dy, dz_c, dz_w_int, gravity, c_s)
+
+
+def dispatch_crm_microphysics_metal(
+    rho_d: torch.Tensor,
+    theta_m_c: torch.Tensor,
+    q_n: torch.Tensor,
+    q_p: torch.Tensor,
+    q_v_prev: torch.Tensor,
+    dz_c: torch.Tensor,
+    dt: float,
+    mp_consts: list[float],
+) -> tuple[torch.Tensor, ...]:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_crm_microphysics_metal(lib, rho_d, theta_m_c, q_n, q_p, q_v_prev, dz_c, dt, mp_consts)
+
+
+def dispatch_scvt_fast_acoustic_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_scvt_fast_acoustic_metal(lib, **kwargs)
+
+
+def dispatch_crm_mynn_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_crm_mynn_metal(lib, **kwargs)
+
+
+def dispatch_scvt_div_metal(mesh: Any, flux_edge: torch.Tensor) -> torch.Tensor:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_scvt_div_metal(lib, mesh, flux_edge)
+
+
+def dispatch_scvt_vorticity_metal(mesh: Any, u_edge: torch.Tensor) -> torch.Tensor:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_scvt_vorticity_metal(lib, mesh, u_edge)
+
+
+def dispatch_scvt_vec_lap_metal(mesh: Any, u_edge: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_scvt_vec_lap_metal(lib, mesh, u_edge)
+
+
+def dispatch_scvt_scalar_lap_metal(mesh: Any, phi_cell: torch.Tensor) -> torch.Tensor:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_scvt_scalar_lap_metal(lib, mesh, phi_cell)
+
+
+def dispatch_scvt_trisk_rot_metal(mesh: Any, zeta_v: torch.Tensor, u_edge: torch.Tensor) -> torch.Tensor:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_scvt_trisk_rot_metal(lib, mesh, zeta_v, u_edge)
 
 
 def run_crm_rk3_hevi_metal(
@@ -803,60 +912,87 @@ def run_crm_rk3_hevi_metal(
     has_cor = 1 if f_cor is not None else 0
     fcor_c = f_cor.view(n_col).contiguous() if f_cor is not None else torch.zeros(1, device=dev, dtype=torch.float32)
 
-    # Persistent single-allocation ping-pong & stage-prep buffers across all 3 RK3 stages
-    rho_a = torch.empty_like(rho0_c)
-    Thm_a = torch.empty_like(Thm0_c)
-    u_a = torch.empty_like(u0_c)
-    v_a = torch.empty_like(v0_c)
-    w_a = torch.empty_like(w0_c)
+    ws_key = (dev.index or 0, nz, n_col, ny, nx, dz_cols)
+    ws = _CRM_WS_CACHE.get(ws_key)
+    if ws is None:
+        if len(_CRM_WS_CACHE) >= 8:
+            _CRM_WS_CACHE.pop(next(iter(_CRM_WS_CACHE)))
+        shape_w = (nz - 1, n_col, ny, nx)
+        ws = {
+            "rho_a": torch.empty_like(rho0_c),
+            "Thm_a": torch.empty_like(Thm0_c),
+            "u_a": torch.empty_like(u0_c),
+            "v_a": torch.empty_like(v0_c),
+            "w_a": torch.empty_like(w0_c),
+            "rho_b": torch.empty_like(rho0_c),
+            "Thm_b": torch.empty_like(Thm0_c),
+            "u_b": torch.empty_like(u0_c),
+            "v_b": torch.empty_like(v0_c),
+            "w_b": torch.empty_like(w0_c),
+            "fx_buf": torch.empty_like(rho0_c),
+            "fy_buf": torch.empty_like(rho0_c),
+            "fx_acc": torch.empty_like(rho0_c),
+            "fy_acc": torch.empty_like(rho0_c),
+            "fz_acc": torch.empty_like(w0_c),
+            "dummy": torch.zeros(1, device=dev, dtype=torch.float32),
+            "thm_s": torch.empty_like(rho0_c),
+            "Thm_ref": torch.empty_like(rho0_c),
+            "pres_s": torch.empty_like(rho0_c),
+            "dp_dThm_s": torch.empty_like(rho0_c),
+            "rho_tot_s": torch.empty_like(rho0_c),
+            "rho_x": torch.empty_like(rho0_c),
+            "rho_y": torch.empty_like(rho0_c),
+            "rtot_x_inv": torch.empty_like(rho0_c),
+            "rtot_y_inv": torch.empty_like(rho0_c),
+            "thm_x_eff": torch.empty_like(rho0_c),
+            "thm_y_eff": torch.empty_like(rho0_c),
+            "tend_u_slow": torch.empty_like(rho0_c),
+            "tend_v_slow": torch.empty_like(rho0_c),
+            "tend_w_slow": torch.empty(shape_w, device=dev, dtype=torch.float32),
+            "rho_dw": torch.empty(shape_w, device=dev, dtype=torch.float32),
+            "rho_tot_w": torch.empty(shape_w, device=dev, dtype=torch.float32),
+            "thm_w": torch.empty(shape_w, device=dev, dtype=torch.float32),
+            "dl": torch.empty(shape_w, device=dev, dtype=torch.float32),
+            "diag": torch.empty(shape_w, device=dev, dtype=torch.float32),
+            "du": torch.empty(shape_w, device=dev, dtype=torch.float32),
+            "u_th": torch.tensor([total_pts], dtype=torch.uint32, device=dev),
+            "u_sw": torch.tensor([nz, n_col, ny, nx, dz_cols, 0], dtype=torch.uint32, device=dev),
+            "u_uv_0": torch.tensor([nz, n_col, ny, nx, 0, 0], dtype=torch.uint32, device=dev),
+            "u_uv_1": torch.tensor([nz, n_col, ny, nx, 1, 0], dtype=torch.uint32, device=dev),
+            "u_hevi_0": torch.tensor([nz, n_col, ny, nx, dz_cols, 0], dtype=torch.uint32, device=dev),
+            "u_hevi_1": torch.tensor([nz, n_col, ny, nx, dz_cols, 1], dtype=torch.uint32, device=dev),
+        }
+        _CRM_WS_CACHE[ws_key] = ws
 
-    rho_b = torch.empty_like(rho0_c)
-    Thm_b = torch.empty_like(Thm0_c)
-    u_b = torch.empty_like(u0_c)
-    v_b = torch.empty_like(v0_c)
-    w_b = torch.empty_like(w0_c)
+    rho_a, Thm_a, u_a, v_a, w_a = ws["rho_a"], ws["Thm_a"], ws["u_a"], ws["v_a"], ws["w_a"]
+    rho_b, Thm_b, u_b, v_b, w_b = ws["rho_b"], ws["Thm_b"], ws["u_b"], ws["v_b"], ws["w_b"]
+    fx_buf, fy_buf = ws["fx_buf"], ws["fy_buf"]
+    fx_acc, fy_acc, fz_acc = ws["fx_acc"], ws["fy_acc"], ws["fz_acc"]
+    fx_acc.zero_()
+    fy_acc.zero_()
+    fz_acc.zero_()
+    dummy = ws["dummy"]
 
-    fx_buf = torch.empty_like(rho0_c)
-    fy_buf = torch.empty_like(rho0_c)
-    fx_acc = torch.zeros_like(rho0_c)
-    fy_acc = torch.zeros_like(rho0_c)
-    fz_acc = torch.zeros_like(w0_c)
-    dummy = torch.zeros(1, device=dev, dtype=torch.float32)
+    thm_s, Thm_ref, pres_s, dp_dThm_s, rho_tot_s = (
+        ws["thm_s"], ws["Thm_ref"], ws["pres_s"], ws["dp_dThm_s"], ws["rho_tot_s"]
+    )
+    rho_x, rho_y, rtot_x_inv, rtot_y_inv = ws["rho_x"], ws["rho_y"], ws["rtot_x_inv"], ws["rtot_y_inv"]
+    thm_x_eff, thm_y_eff, tend_u_slow, tend_v_slow = (
+        ws["thm_x_eff"], ws["thm_y_eff"], ws["tend_u_slow"], ws["tend_v_slow"]
+    )
+    tend_w_slow, rho_dw, rho_tot_w, thm_w, dl, diag, du = (
+        ws["tend_w_slow"], ws["rho_dw"], ws["rho_tot_w"], ws["thm_w"], ws["dl"], ws["diag"], ws["du"]
+    )
 
-    thm_s = torch.empty_like(rho0_c)
-    Thm_ref = torch.empty_like(rho0_c)
-    pres_s = torch.empty_like(rho0_c)
-    dp_dThm_s = torch.empty_like(rho0_c)
-    rho_tot_s = torch.empty_like(rho0_c)
-
-    rho_x = torch.empty_like(rho0_c)
-    rho_y = torch.empty_like(rho0_c)
-    rtot_x_inv = torch.empty_like(rho0_c)
-    rtot_y_inv = torch.empty_like(rho0_c)
-    thm_x_eff = torch.empty_like(rho0_c)
-    thm_y_eff = torch.empty_like(rho0_c)
-    tend_u_slow = torch.empty_like(rho0_c)
-    tend_v_slow = torch.empty_like(rho0_c)
-
-    shape_w = (nz - 1, n_col, ny, nx)
-    tend_w_slow = torch.empty(shape_w, device=dev, dtype=torch.float32)
-    rho_dw = torch.empty(shape_w, device=dev, dtype=torch.float32)
-    rho_tot_w = torch.empty(shape_w, device=dev, dtype=torch.float32)
-    thm_w = torch.empty(shape_w, device=dev, dtype=torch.float32)
-    dl = torch.empty(shape_w, device=dev, dtype=torch.float32)
-    diag = torch.empty(shape_w, device=dev, dtype=torch.float32)
-    du = torch.empty(shape_w, device=dev, dtype=torch.float32)
-
-    u_th = torch.tensor([total_pts], dtype=torch.uint32, device=dev)
+    u_th, u_sw = ws["u_th"], ws["u_sw"]
     f_th = torch.tensor([p_ref, r_d, gamma_d], dtype=torch.float32, device=dev)
     u_suv = torch.tensor([nz, n_col, ny, nx, dz_cols, has_cor], dtype=torch.uint32, device=dev)
     f_suv = torch.tensor([dx, dy], dtype=torch.float32, device=dev)
-    u_sw = torch.tensor([nz, n_col, ny, nx, dz_cols, 0], dtype=torch.uint32, device=dev)
 
     rho_s, Thm_s, u_s, v_s, w_s = rho0_c, Thm0_c, u0_c, v0_c, w0_c
-    fx_final = torch.zeros_like(rho0_c)
-    fy_final = torch.zeros_like(rho0_c)
-    fz_final = torch.zeros_like(w0_c)
+    fx_final = dummy
+    fy_final = dummy
+    fz_final = dummy
 
     import math as _math
     rk_taus = (dt_dyn / 3.0, 0.5 * dt_dyn, dt_dyn)
@@ -864,7 +1000,6 @@ def run_crm_rk3_hevi_metal(
         n_ac = max(1, int(_math.ceil(dtau / max(dt_ac_max, 0.1))))
         dt_ac = dtau / float(n_ac)
 
-        # Stage reference thermodynamics + Slow RHS + HEVI tridiagonal coefficients (3 fused kernels)
         lib.crm_stage_thermo(rho_s, Thm_s, ql_c, thm_s, pres_s, dp_dThm_s, rho_tot_s, u_th, f_th, threads=total_pts)
         u_mean = u_s.mean(dim=(-2, -1)).contiguous()
         v_mean = v_s.mean(dim=(-2, -1)).contiguous()
@@ -882,10 +1017,8 @@ def run_crm_rk3_hevi_metal(
             u_sw, f_hevi, threads=n_int_pts,
         )
 
-        # Snapshot stage reference Thm_s BEFORE resetting ping-pong buffer A (in case Thm_s aliases Thm_a)
         Thm_ref.copy_(Thm_s)
 
-        # Initialize ping-pong state A from t^n (U^0)
         rho_a.copy_(rho0_c)
         Thm_a.copy_(Thm0_c)
         u_a.copy_(u0_c)
@@ -893,41 +1026,59 @@ def run_crm_rk3_hevi_metal(
         w_a.copy_(w0_c)
 
         accum = stage_idx == 2
-        accum_u = 1 if accum else 0
-        fx_out = fx_acc if accum else dummy
-        fy_out = fy_acc if accum else dummy
-        fz_out = fz_acc if accum else dummy
-
-        u_uv = torch.tensor([nz, n_col, ny, nx, accum_u, 0], dtype=torch.uint32, device=dev)
-        f_uv = torch.tensor([dt_ac, dx, dy], dtype=torch.float32, device=dev)
-        u_hevi = torch.tensor([nz, n_col, ny, nx, dz_cols, accum_u], dtype=torch.uint32, device=dev)
-
-        cur = (rho_a, Thm_a, u_a, v_a, w_a)
-        nxt = (rho_b, Thm_b, u_b, v_b, w_b)
-
-        for _ in range(n_ac):
-            rho_c, Thm_c, u_c, v_c, w_c = cur
-            rho_n, Thm_n, u_n, v_n, w_n = nxt
-            lib.crm_fast_uv_flux(
-                rho_x, rho_y, rtot_x_inv, rtot_y_inv, pres_s, dp_dThm_s, Thm_ref,
-                tend_u_slow, tend_v_slow, Thm_c, u_c, v_c,
-                u_n, v_n, fx_buf, fy_buf, fx_out, fy_out,
-                u_uv, f_uv, threads=total_pts,
+        if ny == 1 and 1 < nx <= 32 and nz <= 32 and (64 % nx == 0):
+            c_tg = 64 // nx
+            n_tg = (n_col + c_tg - 1) // c_tg
+            u_2d = torch.tensor(
+                [nz, n_col, nx, dz_cols, n_ac, 1 if accum else 0],
+                dtype=torch.uint32,
+                device=dev,
             )
-            lib.crm_fast_hevi_col(
-                rho_c, Thm_c, w_c, fx_buf, fy_buf, thm_x_eff, thm_y_eff,
-                pres_s, dp_dThm_s, Thm_ref, ql_c, tend_w_slow, tTh_c,
+            f_2d = torch.tensor([dt_ac, beta_hevi, gravity, dx], dtype=torch.float32, device=dev)
+            lib.crm_2d_fast_hevi_loop(
+                rho_a, Thm_a, u_a, v_a, w_a,
+                rho_x, rtot_x_inv, thm_x_eff, pres_s, dp_dThm_s, Thm_ref, ql_c,
+                tend_u_slow, tend_v_slow, tend_w_slow, tTh_c,
                 rho_dw, rho_tot_w, thm_w, dl, diag, du, dzc_c, dzw_c, spw_c,
-                rho_n, Thm_n, w_n, fz_out,
-                u_hevi, f_hevi, threads=M,
+                fx_acc, fy_acc, fz_acc, u_2d, f_2d,
+                threads=(n_tg * 64,), group_size=(64,),
             )
-            cur, nxt = nxt, cur
+            rho_s, Thm_s, u_s, v_s, w_s = rho_a, Thm_a, u_a, v_a, w_a
+        else:
+            fx_out = fx_acc if accum else dummy
+            fy_out = fy_acc if accum else dummy
+            fz_out = fz_acc if accum else dummy
 
-        rho_s, Thm_s, u_s, v_s, w_s = cur
+            u_uv = ws["u_uv_1"] if accum else ws["u_uv_0"]
+            f_uv = torch.tensor([dt_ac, dx, dy], dtype=torch.float32, device=dev)
+            u_hevi = ws["u_hevi_1"] if accum else ws["u_hevi_0"]
+
+            cur = (rho_a, Thm_a, u_a, v_a, w_a)
+            nxt = (rho_b, Thm_b, u_b, v_b, w_b)
+
+            for _ in range(n_ac):
+                rho_c, Thm_c, u_c, v_c, w_c = cur
+                rho_n, Thm_n, u_n, v_n, w_n = nxt
+                lib.crm_fast_uv_flux(
+                    rho_x, rho_y, rtot_x_inv, rtot_y_inv, pres_s, dp_dThm_s, Thm_ref,
+                    tend_u_slow, tend_v_slow, Thm_c, u_c, v_c,
+                    u_n, v_n, fx_buf, fy_buf, fx_out, fy_out,
+                    u_uv, f_uv, threads=total_pts,
+                )
+                lib.crm_fast_hevi_col(
+                    rho_c, Thm_c, w_c, fx_buf, fy_buf, thm_x_eff, thm_y_eff,
+                    pres_s, dp_dThm_s, Thm_ref, ql_c, tend_w_slow, tTh_c,
+                    rho_dw, rho_tot_w, thm_w, dl, diag, du, dzc_c, dzw_c, spw_c,
+                    rho_n, Thm_n, w_n, fz_out,
+                    u_hevi, f_hevi, threads=M,
+                )
+                cur, nxt = nxt, cur
+
+            rho_s, Thm_s, u_s, v_s, w_s = cur
         if accum:
             inv_nac = 1.0 / float(n_ac)
             fx_final = fx_acc * inv_nac
             fy_final = fy_acc * inv_nac
             fz_final = fz_acc * inv_nac
 
-    return rho_s, Thm_s, u_s, v_s, w_s, fx_final, fy_final, fz_final
+    return rho_s.clone(), Thm_s.clone(), u_s.clone(), v_s.clone(), w_s.clone(), fx_final, fy_final, fz_final

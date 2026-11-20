@@ -53,14 +53,14 @@ class AOBAConfig:
 
     glevel: int = 3                          # SCVT mesh level (3 -> 642 cells; 4 -> 2562; 5 -> 10242)
     nz: int = 32                             # Shared Charney-Phillips vertical levels
-    crm_nx: int = 8                          # Embedded CRM x-grid points per SCVT cell
-    crm_ny: int = 8                          # Embedded CRM y-grid points per SCVT cell
+    crm_nx: int = 16                         # Embedded CRM x-grid points per SCVT cell (default 2D 16x1 = 64 km curtain)
+    crm_ny: int = 1                          # Embedded CRM y-grid points (1 = SP-CAM 2.5D curtain for Mac climate runs)
     crm_dx: float = 4000.0                   # Embedded CRM horizontal spacing [m]
     dt_host: float = 180.0                   # Coupled host / physics / SP time step [s]
     n_host_dyn_substeps: int = 2             # Host RK3-HEVI acoustic/gravity substeps per dt_host
     n_crm_dyn_substeps: int = 6              # Embedded CRM RK3-HEVI substeps per dt_host
     rad_stride: int = 4                      # Radiation evaluation stride (steps)
-    crm_col_chunk: int = 256                 # Column batch chunk size for CRM evaluation on GPU
+    crm_col_chunk: int = 16384               # Column batch chunk size for CRM evaluation (Unified Memory single-pass)
     co2_ppmv: float = 400.0                  # Well-mixed atmospheric CO2 concentration [ppmv]
     solar_constant: float = C.SOLAR_CONSTANT # Total solar irradiance S_0 [W m^-2]
     omega: float = C.OMEGA_EARTH             # Planetary rotation rate [rad s^-1]
@@ -460,73 +460,104 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
         dv_crm_c = torch.zeros_like(v_host_new)
 
         chunk = max(cfg.crm_col_chunk, 1)
-        for i0 in range(0, nc, chunk):
-            i1 = min(i0 + chunk, nc)
-            sl = slice(i0, i1)
-            # Synchronize horizontal-mean CRM dry density with host column while keeping 3D buoyant perturbations
-            rho_crm_sl = model.crm.rho_d[:, sl]
-            drho_mean = (atmos.rho_d[:, sl] - rho_crm_sl.mean(dim=(-2, -1))).unsqueeze(-1).unsqueeze(-1)
-            sub_crm = CRMState(
-                rho_d=torch.clamp(rho_crm_sl + drho_mean, min=1.0e-5),
-                u=model.crm.u[:, sl],
-                v=model.crm.v[:, sl],
-                w=model.crm.w[:, sl],
-                theta_m=model.crm.theta_m[:, sl],
-                q_n=model.crm.q_n[:, sl],
-                q_p=model.crm.q_p[:, sl],
-                q_v=model.crm.q_v[:, sl],
-                q_c=model.crm.q_c[:, sl],
-                q_i=model.crm.q_i[:, sl],
-                qke=model.crm.qke[:, sl],
-                dx=cfg.crm_dx,
-                dy=cfg.crm_dx,
-                f_coriolis=mesh.f_cell[sl],
-            )
-            # Slice surface fluxes for chunk
-            sub_sfc = type(sfc_diag)(
-                **{k: v[sl] for k, v in sfc_diag.__dict__.items()}
-            )
+        if chunk >= nc:
+            drho_mean = (atmos.rho_d - model.crm.rho_d.mean(dim=(-2, -1))).unsqueeze(-1).unsqueeze(-1)
+            model.crm.rho_d = torch.clamp(model.crm.rho_d + drho_mean, min=1.0e-5)
+            model.crm.f_coriolis = mesh.f_cell
             sp = step_crm_physics_and_dynamics(
-                crm=sub_crm,
+                crm=model.crm,
                 vgrid=vgrid,
                 dt_crm=dt,
                 n_dyn_substeps=cfg.n_crm_dyn_substeps,
-                u_host_target=u_host_new[:, sl],
-                v_host_target=v_host_new[:, sl],
+                u_host_target=u_host_new,
+                v_host_target=v_host_new,
                 tau_sp_mom=dt,
-                dtheta_m_ls_dt=dthm_ls[:, sl],
-                dq_n_ls_dt=dqn_ls[:, sl],
-                sfc_fluxes=sub_sfc,
-                rad_heating_k_s=q_rad[:, sl],
-                z_c_col=atmos.z_c[:, sl],
-                z_w_col=atmos.z_w[:, sl],
-                dz_c_col=atmos.dz_c[:, sl],
+                dtheta_m_ls_dt=dthm_ls,
+                dq_n_ls_dt=dqn_ls,
+                sfc_fluxes=sfc_diag,
+                rad_heating_k_s=q_rad,
+                z_c_col=atmos.z_c,
+                z_w_col=atmos.z_w,
+                dz_c_col=atmos.dz_c,
             )
-            # Write updated 3D subgrid CRM arrays back & couple horizontal-mean state to host!
-            model.crm.rho_d[:, sl] = sub_crm.rho_d
-            model.crm.u[:, sl] = sub_crm.u
-            model.crm.v[:, sl] = sub_crm.v
-            model.crm.w[:, sl] = sub_crm.w
-            model.crm.theta_m[:, sl] = sub_crm.theta_m
-            model.crm.q_n[:, sl] = sub_crm.q_n
-            model.crm.q_p[:, sl] = sub_crm.q_p
-            model.crm.q_v[:, sl] = sub_crm.q_v
-            model.crm.q_c[:, sl] = sub_crm.q_c
-            model.crm.q_i[:, sl] = sub_crm.q_i
-            model.crm.qke[:, sl] = sub_crm.qke
+            atmos.theta_m = model.crm.theta_m.mean(dim=(-2, -1))
+            atmos.q_n = model.crm.q_n.mean(dim=(-2, -1))
+            atmos.q_p = model.crm.q_p.mean(dim=(-2, -1))
+            atmos.q_v = model.crm.q_v.mean(dim=(-2, -1))
+            atmos.q_c = model.crm.q_c.mean(dim=(-2, -1))
+            atmos.q_i = model.crm.q_i.mean(dim=(-2, -1))
+            du_crm_c = (model.crm.u.mean(dim=(-2, -1)) - u_host_new) / dt
+            dv_crm_c = (model.crm.v.mean(dim=(-2, -1)) - v_host_new) / dt
+            rain_new = sp.precip_rain
+            snow_new = sp.precip_snow
+        else:
+            for i0 in range(0, nc, chunk):
+                i1 = min(i0 + chunk, nc)
+                sl = slice(i0, i1)
+                # Synchronize horizontal-mean CRM dry density with host column while keeping 3D buoyant perturbations
+                rho_crm_sl = model.crm.rho_d[:, sl]
+                drho_mean = (atmos.rho_d[:, sl] - rho_crm_sl.mean(dim=(-2, -1))).unsqueeze(-1).unsqueeze(-1)
+                sub_crm = CRMState(
+                    rho_d=torch.clamp(rho_crm_sl + drho_mean, min=1.0e-5),
+                    u=model.crm.u[:, sl],
+                    v=model.crm.v[:, sl],
+                    w=model.crm.w[:, sl],
+                    theta_m=model.crm.theta_m[:, sl],
+                    q_n=model.crm.q_n[:, sl],
+                    q_p=model.crm.q_p[:, sl],
+                    q_v=model.crm.q_v[:, sl],
+                    q_c=model.crm.q_c[:, sl],
+                    q_i=model.crm.q_i[:, sl],
+                    qke=model.crm.qke[:, sl],
+                    dx=cfg.crm_dx,
+                    dy=cfg.crm_dx,
+                    f_coriolis=mesh.f_cell[sl],
+                )
+                # Slice surface fluxes for chunk
+                sub_sfc = type(sfc_diag)(
+                    **{k: v[sl] for k, v in sfc_diag.__dict__.items()}
+                )
+                sp = step_crm_physics_and_dynamics(
+                    crm=sub_crm,
+                    vgrid=vgrid,
+                    dt_crm=dt,
+                    n_dyn_substeps=cfg.n_crm_dyn_substeps,
+                    u_host_target=u_host_new[:, sl],
+                    v_host_target=v_host_new[:, sl],
+                    tau_sp_mom=dt,
+                    dtheta_m_ls_dt=dthm_ls[:, sl],
+                    dq_n_ls_dt=dqn_ls[:, sl],
+                    sfc_fluxes=sub_sfc,
+                    rad_heating_k_s=q_rad[:, sl],
+                    z_c_col=atmos.z_c[:, sl],
+                    z_w_col=atmos.z_w[:, sl],
+                    dz_c_col=atmos.dz_c[:, sl],
+                )
+                # Write updated 3D subgrid CRM arrays back & couple horizontal-mean state to host!
+                model.crm.rho_d[:, sl] = sub_crm.rho_d
+                model.crm.u[:, sl] = sub_crm.u
+                model.crm.v[:, sl] = sub_crm.v
+                model.crm.w[:, sl] = sub_crm.w
+                model.crm.theta_m[:, sl] = sub_crm.theta_m
+                model.crm.q_n[:, sl] = sub_crm.q_n
+                model.crm.q_p[:, sl] = sub_crm.q_p
+                model.crm.q_v[:, sl] = sub_crm.q_v
+                model.crm.q_c[:, sl] = sub_crm.q_c
+                model.crm.q_i[:, sl] = sub_crm.q_i
+                model.crm.qke[:, sl] = sub_crm.qke
 
-            atmos.theta_m[:, sl] = sub_crm.theta_m.mean(dim=(-2, -1))
-            atmos.q_n[:, sl] = sub_crm.q_n.mean(dim=(-2, -1))
-            atmos.q_p[:, sl] = sub_crm.q_p.mean(dim=(-2, -1))
-            atmos.q_v[:, sl] = sub_crm.q_v.mean(dim=(-2, -1))
-            atmos.q_c[:, sl] = sub_crm.q_c.mean(dim=(-2, -1))
-            atmos.q_i[:, sl] = sub_crm.q_i.mean(dim=(-2, -1))
+                atmos.theta_m[:, sl] = sub_crm.theta_m.mean(dim=(-2, -1))
+                atmos.q_n[:, sl] = sub_crm.q_n.mean(dim=(-2, -1))
+                atmos.q_p[:, sl] = sub_crm.q_p.mean(dim=(-2, -1))
+                atmos.q_v[:, sl] = sub_crm.q_v.mean(dim=(-2, -1))
+                atmos.q_c[:, sl] = sub_crm.q_c.mean(dim=(-2, -1))
+                atmos.q_i[:, sl] = sub_crm.q_i.mean(dim=(-2, -1))
 
-            # Net momentum tendency from surface stress + MYNN PBL + convective momentum transport
-            du_crm_c[:, sl] = (sub_crm.u.mean(dim=(-2, -1)) - u_host_new[:, sl]) / dt
-            dv_crm_c[:, sl] = (sub_crm.v.mean(dim=(-2, -1)) - v_host_new[:, sl]) / dt
-            rain_new[sl] = sp.precip_rain
-            snow_new[sl] = sp.precip_snow
+                # Net momentum tendency from surface stress + MYNN PBL + convective momentum transport
+                du_crm_c[:, sl] = (sub_crm.u.mean(dim=(-2, -1)) - u_host_new[:, sl]) / dt
+                dv_crm_c[:, sl] = (sub_crm.v.mean(dim=(-2, -1)) - v_host_new[:, sl]) / dt
+                rain_new[sl] = sp.precip_rain
+                snow_new[sl] = sp.precip_snow
 
         du_sp_edge = project_cell_vectors_to_edges(mesh, du_crm_c, dv_crm_c)
         atmos.u_edge = atmos.u_edge + dt * du_sp_edge

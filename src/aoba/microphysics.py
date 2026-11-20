@@ -30,7 +30,11 @@ import math
 import torch
 
 from aoba import constants as C
-from aoba.kernels import solve_tridiagonal_batched
+from aoba.kernels import (
+    can_use_crm_metal,
+    dispatch_crm_microphysics_metal,
+    solve_tridiagonal_batched,
+)
 from aoba.thermodynamics import (
     diagnose_pressure_temperature,
     esat_ice,
@@ -156,6 +160,22 @@ _AEM_G, _BEM_G = _precompute_evap_coeffs(
     A_FALL_GRAUPEL, B_FALL_GRAUPEL, RHO_GRAUPEL, N0_GRAUPEL, AF_GRAUPEL, BF_GRAUPEL
 )
 
+_MP_METAL_CONSTS: list[float] = [
+    C.P_REF, C.R_D, C.R_V, C.CP_D, C.GAMMA_D, C.KAPPA_D,
+    C.RV_OVER_RD, C.EPS_WATER, C.L_V0, C.L_F0, C.L_S0,
+    C.E_TRIPLE, C.T_FREEZE, C.T_TRIPLE, C.T_ICE_ALL, C.T_LIQ_ALL,
+    QC_AUTOCONV_THRESH, QI_AGGREG_THRESH, RATE_AUTOCONV, RATE_ICE_AGGREG,
+    VT_CLOUD_ICE, T0_PRECIP, T00_PRECIP, T0_GRAUPEL, T00_GRAUPEL,
+    DIFF_VAPOR_0C, K_THERM_AIR_0C,
+    SHAPE_RAIN, SHAPE_SNOW, SHAPE_GRAUPEL,
+    N0_RAIN, N0_SNOW, N0_GRAUPEL,
+    B_FALL_RAIN, B_FALL_SNOW, B_FALL_GRAUPEL,
+    _FALL_PREF_R, _FALL_PREF_S, _FALL_PREF_G,
+    _ACCR_RC, _ACCR_SC, _ACCR_GC,
+    _ACCR_RI, _ACCR_SI, _ACCR_GI,
+    _AEM_R, _BEM_R, _AEM_S, _BEM_S, _AEM_G, _BEM_G,
+]
+
 
 @dataclass
 class MicrophysicsResult:
@@ -214,6 +234,23 @@ def step_microphysics(
     - Nishizawa et al. (2025, SCALE-RM v5.5.5, Sec. 2.6 Eq. 2.64).
     """
     eps_small = 1.0e-15
+    if can_use_crm_metal(rho_d) and (rho_d.ndim in (2, 4)):
+        thm_new, qn_f, qp_s, t_new, qv_new, qc_new, qi_new, r_rate, s_rate = (
+            dispatch_crm_microphysics_metal(
+                rho_d, theta_m_c, q_n, q_p, q_v_prev, dz_c, dt, _MP_METAL_CONSTS
+            )
+        )
+        return MicrophysicsResult(
+            theta_m_c=thm_new,
+            q_n=qn_f,
+            q_p=qp_s,
+            temp_c=t_new,
+            q_v=qv_new,
+            q_c=qc_new,
+            q_i=qi_new,
+            precip_rain=r_rate,
+            precip_snow=s_rate,
+        )
     qn = torch.clamp(q_n, min=0.0)
     qp = torch.clamp(q_p, min=0.0)
     qv_guess = torch.minimum(torch.clamp(q_v_prev, min=0.0), qn)

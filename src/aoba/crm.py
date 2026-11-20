@@ -33,7 +33,13 @@ import torch
 
 from aoba import constants as C
 from aoba.biosphere import update_daily_acclimation_smith, update_daily_lai_root_height
-from aoba.kernels import can_use_crm_metal, run_crm_rk3_hevi_metal, solve_tridiagonal_batched
+from aoba.kernels import (
+    can_use_crm_metal,
+    dispatch_crm_fct_advect_metal,
+    dispatch_crm_sgs_metal,
+    run_crm_rk3_hevi_metal,
+    solve_tridiagonal_batched,
+)
 from aoba.microphysics import step_microphysics
 from aoba.radiation import compute_four_band_radiation
 from aoba.surface import SurfaceFluxDiagnostics, SurfaceState, compute_surface_albedos, step_surface
@@ -212,6 +218,10 @@ def fct_advect_3d(
     - Nishizawa et al. (2025, SCALE-RM v5.5.5, App. A.2 Eqs. A.20-A.35).
     """
     nz = q.shape[0]
+    if can_use_crm_metal(rho_old) and can_use_crm_metal(q):
+        return dispatch_crm_fct_advect_metal(
+            q.unsqueeze(0), rho_old, rho_new, fx, fy, fz, dx, dy, dz_c, dt
+        )[0]
     dz = dz_c.view(nz, -1, 1, 1)
     eps = 1.0e-20
 
@@ -350,6 +360,11 @@ def _compute_3d_sgs_tendencies(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute anisotropic 3D Smagorinsky-Lilly SGS momentum & heat tendencies (SCALE-RM Sec. 8.1.2)."""
     nz = rho_d.shape[0]
+    if can_use_crm_metal(rho_d):
+        dz_w_int = dz_w if dz_w.shape[0] == nz - 1 else dz_w[1:-1]
+        return dispatch_crm_sgs_metal(
+            rho_d, u, v, w, theta_m, dx, dy, dz_c, dz_w_int, C.GRAVITY, 0.18
+        )
     dz = dz_c.view(nz, -1, 1, 1)
     dz_int = dz_w.view(nz - 1, -1, 1, 1) if dz_w.shape[0] == nz - 1 else dz_w[1:-1].view(nz - 1, -1, 1, 1)
 
@@ -887,8 +902,24 @@ def step_crm_physics_and_dynamics(
             fz_acc = fz_acc + fz
         inv_k = 1.0 / float(k_cnt)
         dt_adv = dt_sub * float(k_cnt)
-        crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_acc * inv_k, fy_acc * inv_k, fz_acc * inv_k, crm.dx, crm.dy, dz_fct, dt_adv)
-        crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_acc * inv_k, fy_acc * inv_k, fz_acc * inv_k, crm.dx, crm.dy, dz_fct, dt_adv)
+        if can_use_crm_metal(crm.rho_d):
+            q_np = dispatch_crm_fct_advect_metal(
+                torch.stack([crm.q_n, crm.q_p], dim=0),
+                rho_start,
+                crm.rho_d,
+                fx_acc * inv_k,
+                fy_acc * inv_k,
+                fz_acc * inv_k,
+                crm.dx,
+                crm.dy,
+                dz_fct,
+                dt_adv,
+            )
+            crm.q_n = q_np[0]
+            crm.q_p = q_np[1]
+        else:
+            crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_acc * inv_k, fy_acc * inv_k, fz_acc * inv_k, crm.dx, crm.dy, dz_fct, dt_adv)
+            crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_acc * inv_k, fy_acc * inv_k, fz_acc * inv_k, crm.dx, crm.dy, dz_fct, dt_adv)
         q_cond_adv = torch.minimum(crm.q_c + crm.q_i, crm.q_n)
         crm.q_v = torch.clamp(crm.q_n - q_cond_adv, min=0.0)
         s_idx += k_cnt

@@ -28,7 +28,16 @@ import math
 import torch
 
 from aoba import constants as C
-from aoba.kernels import solve_tridiagonal_batched
+from aoba.kernels import (
+    can_use_crm_metal,
+    dispatch_scvt_div_metal,
+    dispatch_scvt_fast_acoustic_metal,
+    dispatch_scvt_scalar_lap_metal,
+    dispatch_scvt_trisk_rot_metal,
+    dispatch_scvt_vec_lap_metal,
+    dispatch_scvt_vorticity_metal,
+    solve_tridiagonal_batched,
+)
 from aoba.scvt_mesh import SCVTMesh, project_cell_vectors_to_edges, reconstruct_cell_winds
 from aoba.thermodynamics import diagnose_pressure_temperature, qsat_mixed, rcemip_analytic_sounding
 from aoba.vertical_grid import VerticalGrid, compute_stf_heights
@@ -158,6 +167,8 @@ def compute_scvt_divergence(
 
     Satisfies exact spherical integral conservation: `sum_i A_i * div_i == 0`.
     """
+    if flux_edge.ndim == 2 and can_use_crm_metal(flux_edge):
+        return dispatch_scvt_div_metal(mesh, flux_edge)
     le_flux = flux_edge * mesh.dv_edge  # [..., n_edges]
     gathered = le_flux[..., mesh.edges_on_cell]  # [..., n_cells, 6]
     return (gathered * mesh.edge_sign_on_cell).sum(dim=-1) / mesh.area_cell
@@ -168,6 +179,8 @@ def compute_scvt_vorticity(
     u_edge: torch.Tensor,
 ) -> torch.Tensor:
     """Discrete Stokes curl `(1 / A_v) * sum_{e in vert v} s_{v,e} * dc_e * u_edge[..., e]`."""
+    if u_edge.ndim == 2 and can_use_crm_metal(u_edge):
+        return dispatch_scvt_vorticity_metal(mesh, u_edge)
     dc_u = u_edge * mesh.dc_edge  # [..., n_edges]
     ev = mesh.edges_on_vert       # [n_verts, 3]
     return (dc_u[..., ev] * mesh.edge_sign_on_vert).sum(dim=-1) / mesh.area_vert
@@ -178,6 +191,8 @@ def compute_vector_laplacian_edge(
     u_edge: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute vector Laplacian `grad(div u) - curl(zeta)` and pure grad-div on edges `[..., n_edges]`."""
+    if u_edge.ndim == 2 and can_use_crm_metal(u_edge):
+        return dispatch_scvt_vec_lap_metal(mesh, u_edge)
     div_c = compute_scvt_divergence(mesh, u_edge)      # [..., n_cells]
     zeta_v = compute_scvt_vorticity(mesh, u_edge)      # [..., n_verts]
 
@@ -200,6 +215,8 @@ def compute_scalar_laplacian_cell(
     phi_cell: torch.Tensor,
 ) -> torch.Tensor:
     """Compute conservative cell-centered scalar Laplacian `div(grad(phi))` `[..., n_cells]`."""
+    if phi_cell.ndim == 2 and can_use_crm_metal(phi_cell):
+        return dispatch_scvt_scalar_lap_metal(mesh, phi_cell)
     c0 = mesh.cells_on_edge[:, 0]
     c1 = mesh.cells_on_edge[:, 1]
     grad_e = (phi_cell[..., c1] - phi_cell[..., c0]) / mesh.dc_edge
@@ -557,10 +574,13 @@ def step_scvt_rk3_hevi(
 
         # --- Slow Vector-Invariant Momentum RHS Evaluated Once per RK3 Stage ---
         zeta_v = compute_scvt_vorticity(mesh, u_s)
-        eta_v = zeta_v + mesh.f_vert.unsqueeze(0)
-        eta_e = 0.5 * (eta_v[:, v0_e] + eta_v[:, v1_e])
-        eta_pair = 0.5 * (eta_e.unsqueeze(-1) + eta_e[:, ep_idx])
-        rot_acc = (w_trisk * eta_pair * u_s[:, ep_idx]).sum(dim=-1)
+        if can_use_crm_metal(u_s):
+            rot_acc = dispatch_scvt_trisk_rot_metal(mesh, zeta_v, u_s)
+        else:
+            eta_v = zeta_v + mesh.f_vert.unsqueeze(0)
+            eta_e = 0.5 * (eta_v[:, v0_e] + eta_v[:, v1_e])
+            eta_pair = 0.5 * (eta_e.unsqueeze(-1) + eta_e[:, ep_idx])
+            rot_acc = (w_trisk * eta_pair * u_s[:, ep_idx]).sum(dim=-1)
 
         ke_edge = area_e * (u_s * u_s)
         ke_cell = 0.5 * (ke_edge[:, mesh.edges_on_cell] * valid_ce).sum(dim=-1) / area_c
@@ -654,6 +674,49 @@ def step_scvt_rk3_hevi(
                 edges_on_cell=mesh.edges_on_cell,
                 edge_sign_on_cell=mesh.edge_sign_on_cell,
                 area_cell=mesh.area_cell,
+            )
+        elif can_use_crm_metal(m0):
+            m_s, Thm_s, u_s, w_s, uh_accum, om_accum = dispatch_scvt_fast_acoustic_metal(
+                n_ac=n_ac,
+                dt_ac=dt_ac,
+                beta_hevi=beta_hevi,
+                gravity=C.GRAVITY,
+                accum_fluxes=(stage_idx == 2),
+                m0=m0,
+                Thm0=Thm0,
+                u0=u0,
+                w0=w0,
+                udotz0=udotz0,
+                pres_s=pres_s,
+                dp_dThm_s=dp_dThm_s,
+                Thm_ref=Thm_s,
+                fac_z0=fac_z0,
+                fac_z1=fac_z1,
+                rtot_e=rtot_e,
+                dc_e=dc_e,
+                tend_u_slow=tend_u_slow,
+                tend_Thm_slow=tend_Thm_slow,
+                sponge_c=sponge_c,
+                sponge_w=sponge_w,
+                area_e=area_e,
+                zw_slope_e=zw_slope_e,
+                dv_edge=mesh.dv_edge,
+                area_cell=mesh.area_cell,
+                edges_on_cell=mesh.edges_on_cell,
+                edge_sign_on_cell=mesh.edge_sign_on_cell,
+                c0=c0,
+                c1=c1,
+                m_edge=m_edge,
+                thm_e=thm_e,
+                rho_dw=rho_dw,
+                rtot_w=rtot_w,
+                thm_w=thm_w,
+                dz_c=dz_c,
+                dz_w_int=dz_w_int,
+                q_load=q_load,
+                dl=dl,
+                diag=diag,
+                du=du,
             )
         else:
             m_k = m0
