@@ -355,6 +355,20 @@ def _discover_active_processes() -> list[dict[str, Any]]:
             pid_s, cpu_s, etime_s, cmd = parts
             m_out = re.search(r"--out-dir\s+([^\s]+)", cmd)
             out_dir = str(Path(m_out.group(1)).expanduser()) if m_out else ""
+            if not out_dir:
+                m_cfg = re.search(r"--config\s+([^\s]+)", cmd)
+                if m_cfg:
+                    cfg_p = Path(m_cfg.group(1)).expanduser()
+                    if cfg_p.exists():
+                        try:
+                            cfg_loaded = load_aoba_toml(cfg_p)
+                            raw_od = str(cfg_loaded.get("output", {}).get("out_dir", "")).strip()
+                            if raw_od:
+                                out_dir = str(Path(raw_od).expanduser())
+                        except Exception:
+                            pass
+                        if not out_dir:
+                            out_dir = str(cfg_p.parent)
             procs.append({
                 "pid": int(pid_s),
                 "cpu_pct": cpu_s,
@@ -370,7 +384,7 @@ def _discover_active_processes() -> list[dict[str, Any]]:
 def _discover_output_dirs(extra_dir: str = "") -> list[str]:
     """List candidate AOBA output directories containing mesh/Zarr/CSV/live preview files."""
     candidates: list[Path] = []
-    base = get_output_dir("").parent
+    base = get_output_dir(None)
     if base.exists():
         for child in sorted(base.iterdir(), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True):
             if child.is_dir():
@@ -1371,6 +1385,11 @@ async function fetchInitial() {
     if (el) el.textContent = `${h.chip_name} · ${gpuTxt} · ${h.total_ram_gb} GB · ${h.perf_cores} P-cores`;
   }
   renderAll();
+  const urlTab = new URLSearchParams(window.location.search).get("tab") || window.location.hash.replace(/^#/, "");
+  if (urlTab && document.getElementById("tab-" + urlTab)) {
+    const tabBtn = document.querySelector(`.tab-btn[onclick*="'${urlTab}'"]`);
+    switchTab(urlTab, tabBtn);
+  }
   fetchMonitorOnce();
 }
 
