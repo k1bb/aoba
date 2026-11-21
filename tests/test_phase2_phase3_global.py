@@ -557,6 +557,75 @@ def test_land_energy_balance_newton_iterations(device: str) -> None:
     assert err[10] < err[3] and err[10] < 1.0  # W m^-2 mean error vs the 40-pass fixed point
 
 
+def test_multilayer_richards_hydrology_and_dynamic_roots(device: str) -> None:
+    """Verify exact mass conservation, topsoil decoupling, ice impedance, gravity drainage, and S_R dynamic roots."""
+    from aoba.biosphere import compute_optimal_soil_water_beta, init_biosphere_state
+    from aoba.surface import (
+        RHO_WATER,
+        SOIL_LAYER_DEPTHS,
+        SOIL_POROSITY,
+        compute_root_zone_weights_and_water,
+        step_multilayer_soil_hydrology,
+    )
+
+    dev = torch.device(device)
+    dz = torch.tensor(SOIL_LAYER_DEPTHS, device=dev).unsqueeze(1)
+    n = 4  # [0: moist draining, 1: intense rain/overflow, 2: frozen soil, 3: topsoil drying + deep roots]
+    w_liq = torch.tensor(
+        [
+            [0.35, 0.40, 0.05, 0.25],
+            [0.32, 0.38, 0.05, 0.28],
+            [0.30, 0.36, 0.05, 0.28],
+            [0.28, 0.34, 0.05, 0.28],
+            [0.28, 0.34, 0.05, 0.28],
+        ],
+        device=dev,
+    )
+    w_ice = torch.zeros_like(w_liq)
+    w_ice[:, 2] = 0.35  # Nearly frozen column 2
+    rain = torch.tensor([0.0, 2.0e-3, 1.0e-3, 0.0], device=dev)
+    melt = torch.zeros(n, device=dev)
+    e_soil = torch.tensor([1.0e-5, 0.0, 0.0, 2.0e-4], device=dev)
+    e_trans = torch.tensor([5.0e-5, 0.0, 0.0, 8.0e-5], device=dev)
+    dew = torch.zeros(n, device=dev)
+    s_cap = torch.tensor([150.0, 150.0, 150.0, 450.0], device=dev)
+    is_ice = torch.zeros(n, dtype=torch.bool, device=dev)
+    dt = 720.0
+
+    m0 = (RHO_WATER * dz * w_liq).sum(dim=0)
+    w_next, r_sfc, r_sub = step_multilayer_soil_hydrology(
+        w_liq, w_ice, rain, melt, e_soil, e_trans, dew, s_cap, is_ice, dt
+    )
+    m1 = (RHO_WATER * dz * w_next).sum(dim=0)
+    expected_dm = dt * (rain + melt + dew - e_soil - e_trans - r_sfc - r_sub)
+    assert torch.isfinite(w_next).all() and (w_next >= 0.0).all()
+    assert (w_next + w_ice <= SOIL_POROSITY + 1.0e-5).all()
+    assert torch.allclose(m1 - m0, expected_dm, atol=5.0e-3, rtol=1.0e-4)
+
+    # Column 0 drains gravitationally; column 1 generates surface runoff; column 2 ice blocks infiltration
+    assert float(r_sub[0].item()) > 0.0
+    assert float(r_sfc[1].item()) > 0.0
+    assert float(r_sfc[2].item()) > 0.99 * float(rain[2].item())
+
+    # Column 3 topsoil (5 cm) dries sharply over 16 hours under e_soil while deep layers remain moist
+    w_cur = w_liq[:, 3:4].clone()
+    w_i3 = torch.zeros_like(w_cur)
+    for _ in range(80):
+        w_cur, _, _ = step_multilayer_soil_hydrology(
+            w_cur, w_i3, rain[3:4], melt[3:4], e_soil[3:4], e_trans[3:4], dew[3:4], s_cap[3:4], is_ice[3:4], dt
+        )
+    assert float(w_cur[0, 0].item()) < float(w_cur[3, 0].item()) - 0.10
+
+    # Dynamic rooting depth z_root(S_R): deep roots (S_R=450) access deep water when top layers dry
+    w_dry_top = torch.tensor([[0.05, 0.05], [0.10, 0.10], [0.28, 0.28], [0.28, 0.28], [0.28, 0.28]], device=dev)
+    bio = init_biosphere_state((2,), torch.tensor([True, True], device=dev), device=dev)
+    bio.s_root_cap = torch.tensor([50.0, 450.0], device=dev)
+    w_av, _, _ = compute_root_zone_weights_and_water(w_dry_top, bio.s_root_cap)
+    beta = compute_optimal_soil_water_beta(w_av, bio)
+    assert float(w_av[1].item()) > 5.0 * float(w_av[0].item())
+    assert float(beta[1].item()) > float(beta[0].item()) + 0.3
+
+
 if __name__ == "__main__":
     for dev in _available_devices():
         print(f"Running Phase 2 & Phase 3 Global AOBA tests on device={dev}...")
@@ -569,4 +638,5 @@ if __name__ == "__main__":
         test_mineral_dust_emission_transport_and_radiation(dev)
         test_clm5_canopy_hydrology_and_dsl_soil_resistance(dev)
         test_land_energy_balance_newton_iterations(dev)
+        test_multilayer_richards_hydrology_and_dynamic_roots(dev)
     print("ALL PHASE 2 & PHASE 3 GLOBAL AOBA TESTS PASSED!")

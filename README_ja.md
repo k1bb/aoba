@@ -18,7 +18,7 @@
 4. **4バンド解析的2ストリーム放射 ＆ ボロノイ C-grid 1.5層エクマン＋浅水波海洋・部分海氷**: ルックアップテーブル不要の4バンド2ストリーム放射ソルバ（Lacis & Hansen, 1974; Toon et al., 1989; Slingo, 1989; Ebert & Curry, 1992; Weaver & Ramanathan, 1995; Koll & Cronin, 2018）と、処方 $Q$ フラックス不要の 1.5層風成エクマン輸送＋低減重力浅水波（亜熱帯循環・赤道波）＋渦拡散スラブ海洋（Codron, 2012）、部分海氷面積率（リード）を伴う熱力学海氷（Semtner, 1976; SCALE-RM, 2025）、太陽天頂角依存海面アルベド（Briegleb et al., 1986）、および滑面粘性＋Charnock 海面粗度（Miller et al., 1992）を結合します。
 5. **動的・平衡加速 SIA 氷床結合 ＆ 単一 TOML パラメータ一元管理＋対話型 GUI**:
    - **動的氷床モデル**: `Earth2014` 岩盤標高上に Glen 流動則 ($n=3$) 浅氷近似（SIA）＋EMA 気候 SMB 平滑＋アイソスタシー＋スピンアップ加速率を備え、氷床消長に伴う地形変化を測高外挿・対数気圧鉛直再補間により大気・CRM 座標へ無矛盾に反映します（`src/aoba/icesheet.py`）。
-   - **モデル設定と Web Studio (`AOBA Studio`)**: 全204項目の格子設定（`glevel`, `nz`, CRM 格子数・間隔）・カレンダー／固定日射設定・惑星外力・出力／月末リスタート設定・物理定数を単一ファイル [`config/aoba_default.toml`](config/aoba_default.toml) に集約し、Web GUI ([`scripts/aoba_config_gui.py`](scripts/aoba_config_gui.py)) で設定の視覚化・ハードウェア自動チャンク最適化・実行監視・**CPU 処理による T₂ / 日平均降水量 / LAI の回転3地球正射図法リアルタイムプレビュー**を提供します。
+   - **モデル設定と Web Studio (`AOBA Studio`)**: 全206項目の格子設定（`glevel`, `nz`, CRM 格子数・間隔）・カレンダー／固定日射設定・惑星外力・出力／月末リスタート設定・物理定数を単一ファイル [`config/aoba_default.toml`](config/aoba_default.toml) に集約し、Web GUI ([`scripts/aoba_config_gui.py`](scripts/aoba_config_gui.py)) で設定の視覚化・ハードウェア自動チャンク最適化・実行監視・**CPU 処理による T₂ / 日平均降水量 / LAI の回転3地球正射図法リアルタイムプレビュー**を提供します。
 6. **単一コードでの GPU ポータビリティ（`Float32` PyTorch ＋ Metal/CUDA 融合鉛直 HEVI ソルバ）**: Apple Silicon GPU（`mps`、Kahan 補償加算による海洋長期保存対応）および NVIDIA GPU（`cuda`）で単一コードのまま計算を実行できます。
 
 ## ディレクトリ構成

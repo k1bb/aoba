@@ -78,6 +78,8 @@ KAPPA_DRY_SOIL: float = 0.30       # Dry mineral soil thermal conductivity [W m^
 SOIL_POROSITY: float = 0.43        # Volumetric saturation porosity w_sat [m^3 m^-3] (Clapp & Hornberger, 1978)
 PSI_SAT_SOIL: float = -0.20        # Saturated matric head psi_s [m] (Clapp & Hornberger, 1978)
 B_CLAPP_SOIL: float = 5.39         # Clapp & Hornberger (1978) retention exponent b [-]
+K_SAT_SOIL: float = 7.0e-6         # Saturated hydraulic conductivity K_sat [m s^-1] (Clapp & Hornberger, 1978, Table 2 loam)
+ICE_IMPEDANCE_OMEGA: float = 6.0   # Frozen-soil hydraulic impedance exponent Omega [-] (Swenson et al., 2012; CLM5 Eq. 7.89)
 
 # Canopy hydrology (CLM5 Tech. Note Sec. 7.1, Eqs. 7.4, 7.12, 7.23; Dickinson et al., 1993)
 WC_MAX_PER_LAI: float = 0.10       # Maximum liquid canopy storage per unit LAI p_liq [kg m^-2] (CLM5 Eq. 7.12)
@@ -222,6 +224,7 @@ def init_surface_state(
 
     swe0 = torch.where(is_ice, torch.full(shape, SWE_GLACIER_MAX, device=dev, dtype=f_dtype), torch.zeros(shape, device=dev, dtype=f_dtype))
 
+    w_root0, _, _ = compute_root_zone_weights_and_water(w_liq, bio.s_root_cap)
     return SurfaceState(
         surf_type=st,
         z_topo=z_t,
@@ -229,7 +232,7 @@ def init_surface_state(
         t_soil=t_soil,
         w_liq_soil=w_liq,
         w_ice_soil=w_ice,
-        w_root=torch.where(is_veg, 0.65 * bio.s_root_cap, torch.zeros(shape, device=dev, dtype=f_dtype)),
+        w_root=torch.where(is_veg, w_root0, torch.zeros(shape, device=dev, dtype=f_dtype)),
         w_canopy=torch.zeros(shape, device=dev, dtype=f_dtype),
         t_canopy=t_land0.clone(),
         swe_land=swe0.clone(),
@@ -459,6 +462,205 @@ def step_multilayer_soil_thermodynamics(
 
 
 # ---------------------------------------------------------------------------
+# 4b. Five-Layer Implicit Richards Soil Hydrology & Dynamic Rooting Depth
+# ---------------------------------------------------------------------------
+def compute_root_zone_weights_and_water(
+    w_liq_soil: torch.Tensor,
+    s_root_cap: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Diagnose vertically integrated root-zone plant-available water `W_avail` and layer uptake weights.
+
+    Maps the Gao et al. (2014) optimal root-zone storage capacity `S_R` [kg m^-2] onto an effective
+    dynamic rooting depth `z_root` [m] over AOBA's 5-layer soil grid using Clapp & Hornberger (1978)
+    field capacity (`psi_fc = -3.3 m`) and wilting point (`psi_wp = -150 m`), and integrates liquid
+    plant-available water vertically for the Holtzman et al. (2024, Sec. 2.2.1 Eq. 1) stomatal
+    water-stress optimality (`beta_opt`):
+        z_root = clip(S_R / [rho_w * (theta_fc - theta_wp)], 0.15, Z_tot),
+        W_avail = sum_k rho_w * dz_k * alpha_root_k * max(theta_liq_k - theta_wp, 0).
+
+    Frozen layers naturally reduce `theta_liq_k`, eliminating any ad-hoc unfrozen fraction multiplier.
+    Returns `(w_avail [kg m^-2], w_uptake_weights [N_SOIL, ...], alpha_root [N_SOIL, ...])`.
+    """
+    dev = w_liq_soil.device
+    dtype = w_liq_soil.dtype
+    col_shape = w_liq_soil.shape[1:]
+    view_shape = (N_SOIL_LAYERS,) + (1,) * len(col_shape)
+
+    dz = torch.tensor(SOIL_LAYER_DEPTHS, device=dev, dtype=dtype).view(view_shape)
+    z_bot_vals = []
+    acc = 0.0
+    for d in SOIL_LAYER_DEPTHS:
+        acc += d
+        z_bot_vals.append(acc)
+    z_tot = acc
+    z_top = torch.tensor([0.0] + z_bot_vals[:-1], device=dev, dtype=dtype).view(view_shape)
+
+    theta_fc = SOIL_POROSITY * (abs(PSI_SAT_SOIL) / 3.3) ** (1.0 / B_CLAPP_SOIL)
+    theta_wp = SOIL_POROSITY * (abs(PSI_SAT_SOIL) / 150.0) ** (1.0 / B_CLAPP_SOIL)
+    dtheta_paw = max(theta_fc - theta_wp, 0.05)
+
+    z_root = torch.clamp(
+        torch.clamp(s_root_cap, min=20.0) / (RHO_WATER * dtheta_paw),
+        min=0.15,
+        max=z_tot,
+    )
+    alpha_root = torch.clamp((z_root.unsqueeze(0) - z_top) / dz, 0.0, 1.0)
+
+    avail_layer = RHO_WATER * dz * alpha_root * torch.clamp(w_liq_soil - theta_wp, min=0.0)
+    w_avail = avail_layer.sum(dim=0)
+
+    root_depth_w = alpha_root * dz
+    root_depth_w = root_depth_w / torch.clamp(root_depth_w.sum(dim=0, keepdim=True), min=1.0e-6)
+    w_up = torch.where(
+        w_avail.unsqueeze(0) > 1.0e-6,
+        avail_layer / torch.clamp(w_avail.unsqueeze(0), min=1.0e-6),
+        root_depth_w,
+    )
+    return w_avail, w_up, alpha_root
+
+
+def step_multilayer_soil_hydrology(
+    w_liq: torch.Tensor,
+    w_ice: torch.Tensor,
+    rain_thru: torch.Tensor,
+    melt_tot: torch.Tensor,
+    e_soil: torch.Tensor,
+    e_trans: torch.Tensor,
+    dew_ground: torch.Tensor,
+    s_root_cap: torch.Tensor,
+    is_ice: torch.Tensor,
+    dt: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Advance 5-layer volumetric liquid soil water via linearized implicit Richards equation.
+
+    Implements map-free unsaturated vertical water transport, frozen-soil hydraulic impedance,
+    saturation/infiltration-excess surface runoff, root-zone transpiration uptake, and free bottom
+    gravitational drainage on AOBA's 5-layer soil grid with exact mass conservation:
+    - Clapp & Hornberger (1978, WRR, 14, 601-604): retention `psi(s) = psi_s s^-b` and
+      hydraulic conductivity `K(s) = K_sat s^(2b+3)`.
+    - Swenson, Lawrence, & Lee (2012, J. Geophys. Res., 117, F02022) & Lawrence et al. (2020,
+      CLM5 Tech. Note, Sec. 7.3-7.5, Eqs. 7.89-7.129): ice impedance `f_ice = 10^(-Omega * f_i)`,
+      midpoint-saturation interface conductivity `K_{k+1/2}`, implicit tridiagonal Richards solver,
+      and free gravitational drainage `q_drain = K_bot`.
+
+    Returns `(w_liq_next [N_SOIL, ...], sfc_runoff [kg m^-2 s^-1], sub_runoff [kg m^-2 s^-1])`.
+    """
+    dev = w_liq.device
+    dtype = w_liq.dtype
+    col_shape = w_liq.shape[1:]
+    view_shape = (N_SOIL_LAYERS,) + (1,) * len(col_shape)
+
+    dz = torch.tensor(SOIL_LAYER_DEPTHS, device=dev, dtype=dtype).view(view_shape)
+    z_mid_vals = []
+    acc = 0.0
+    for d in SOIL_LAYER_DEPTHS:
+        z_mid_vals.append(acc + 0.5 * d)
+        acc += d
+    dz_int = torch.tensor(
+        [z_mid_vals[k + 1] - z_mid_vals[k] for k in range(N_SOIL_LAYERS - 1)],
+        device=dev,
+        dtype=dtype,
+    ).view((N_SOIL_LAYERS - 1,) + (1,) * len(col_shape))
+
+    w_l = torch.clamp(w_liq, min=0.0)
+    w_i = torch.clamp(w_ice, min=0.0)
+    theta_max = torch.clamp(SOIL_POROSITY - w_i, min=0.0)
+
+    # Ice impedance factor f_ice = 10^(-Omega * (w_ice / phi)) (Swenson et al., 2012; CLM5 Eq. 7.89)
+    ice_frac = torch.clamp(w_i / SOIL_POROSITY, 0.0, 1.0)
+    f_ice = torch.pow(10.0, -ICE_IMPEDANCE_OMEGA * ice_frac)
+
+    # Hydraulic head psi_k [m], derivative dpsi/dtheta > 0, and conductivities (Clapp & Hornberger, 1978)
+    s_min = 0.02
+    s_eff = torch.clamp(w_l / SOIL_POROSITY, s_min, 1.0)
+    th_safe = torch.clamp(w_l, min=s_min * SOIL_POROSITY)
+    psi = torch.clamp(PSI_SAT_SOIL * torch.pow(s_eff, -B_CLAPP_SOIL), min=-1.0e5)
+    dpsi_dth = torch.clamp(-B_CLAPP_SOIL * psi / th_safe, max=1.0e6)
+
+    exp_k = 2.0 * B_CLAPP_SOIL + 3.0
+    s_int = 0.5 * (s_eff[:-1] + s_eff[1:])
+    f_ice_int = torch.minimum(f_ice[:-1], f_ice[1:])
+    k_int = f_ice_int * K_SAT_SOIL * torch.pow(s_int, exp_k)  # [N_SOIL-1, ...] [m s^-1]
+
+    # Explicit Darcy flux q_{k+1/2} [m s^-1], positive downward (CLM5 Eq. 7.91)
+    q_int = k_int * (1.0 + (psi[:-1] - psi[1:]) / dz_int)
+
+    # Bottom free gravitational drainage q_bot = K_bot (CLM5 Sec. 7.5)
+    k_bot = f_ice[-1] * K_SAT_SOIL * torch.pow(s_eff[-1], exp_k)
+    dk_bot_dth = exp_k * k_bot / th_safe[-1]
+
+    # Map-free surface infiltration & saturation/frozen/Hortonian surface runoff [kg m^-2 s^-1]
+    q_liq_in = torch.clamp(rain_thru + melt_tot + dew_ground, min=0.0)
+    s_top_tot = torch.clamp((w_l[0] + w_i[0]) / SOIL_POROSITY, 0.0, 1.0)
+    f_imp = 1.0 - f_ice[0]
+    f_sat = f_imp + (1.0 - f_imp) * torch.pow(s_top_tot, 4.0)
+    q_infil_cap = RHO_WATER * f_ice[0] * K_SAT_SOIL * torch.clamp(
+        1.0 + (PSI_SAT_SOIL - psi[0]) / z_mid_vals[0], min=1.0, max=1.0e4
+    )
+    q_infil = torch.minimum((1.0 - f_sat) * q_liq_in, q_infil_cap)
+    q_infil = torch.where(is_ice, torch.zeros_like(q_infil), q_infil)
+    sfc_runoff_0 = torch.where(is_ice, q_liq_in, q_liq_in - q_infil)
+
+    # Root-zone transpiration sink weights across layers (Holtzman et al., 2024; Gao et al., 2014)
+    _, w_up, _ = compute_root_zone_weights_and_water(w_l, s_root_cap)
+    s_trans = (torch.clamp(e_trans, min=0.0) / RHO_WATER).unsqueeze(0) * w_up  # [N_SOIL, ...] [m s^-1]
+    s_trans = torch.where(is_ice.unsqueeze(0), torch.zeros_like(s_trans), s_trans)
+
+    # Linearized implicit tridiagonal Richards matrix (strictly diagonally dominant M-matrix; CLM5 Eqs. 7.115-7.129)
+    a_int = (k_int / dz_int) * dpsi_dth[:-1]  # dq_{k+1/2}/dtheta_k >= 0
+    c_int = (k_int / dz_int) * dpsi_dth[1:]   # -dq_{k+1/2}/dtheta_{k+1} >= 0
+
+    dl = torch.zeros_like(w_l)
+    du = torch.zeros_like(w_l)
+    diag = (dz / dt).expand_as(w_l).clone()
+    dl[1:] = -a_int
+    du[:-1] = -c_int
+    diag[:-1] = diag[:-1] + a_int
+    diag[1:] = diag[1:] + c_int
+    diag[-1] = diag[-1] + dk_bot_dth
+
+    rhs = torch.zeros_like(w_l)
+    e_soil_ms = torch.where(is_ice, torch.zeros_like(e_soil), torch.clamp(e_soil, min=0.0)) / RHO_WATER
+    rhs[0] = (q_infil / RHO_WATER - e_soil_ms) - q_int[0] - s_trans[0]
+    rhs[1:-1] = q_int[:-1] - q_int[1:] - s_trans[1:-1]
+    rhs[-1] = q_int[-1] - k_bot - s_trans[-1]
+
+    dtheta = solve_tridiagonal_batched(dl, diag, du, rhs)
+    theta_new = w_l + dtheta
+
+    # Linearized bottom drainage (exact mass closure if raw q_drain < 0)
+    q_drain_raw = k_bot + dk_bot_dth * dtheta[-1]
+    q_drain_neg = torch.clamp(-q_drain_raw, min=0.0)
+    q_drain = torch.clamp(q_drain_raw, min=0.0)
+    theta_new = theta_new.clone()
+    theta_new[-1] = theta_new[-1] - (dt / SOIL_LAYER_DEPTHS[-1]) * q_drain_neg
+
+    # Exact mass-conserving bounds: (1) bottom-up supersaturation sweep -> sfc_runoff
+    excess_mass = torch.zeros_like(w_l[0])
+    for k in range(N_SOIL_LAYERS - 1, -1, -1):
+        th_k = theta_new[k] + excess_mass / (RHO_WATER * SOIL_LAYER_DEPTHS[k])
+        over = torch.clamp(th_k - theta_max[k], min=0.0)
+        theta_new[k] = th_k - over
+        excess_mass = over * (RHO_WATER * SOIL_LAYER_DEPTHS[k])
+    sfc_runoff = sfc_runoff_0 + excess_mass / dt
+
+    # (2) Top-down non-negativity guard borrowing from neighbor / bottom drainage
+    deficit_mass = torch.zeros_like(w_l[0])
+    for k in range(N_SOIL_LAYERS):
+        th_k = theta_new[k] - deficit_mass / (RHO_WATER * SOIL_LAYER_DEPTHS[k])
+        under = torch.clamp(-th_k, min=0.0)
+        theta_new[k] = th_k + under
+        deficit_mass = under * (RHO_WATER * SOIL_LAYER_DEPTHS[k])
+
+    q_drain_mass = RHO_WATER * q_drain * dt
+    reduce_drain = torch.minimum(deficit_mass, q_drain_mass)
+    q_drain_mass = q_drain_mass - reduce_drain
+    sub_runoff = torch.where(is_ice, torch.zeros_like(q_drain_mass), q_drain_mass / dt)
+    w_liq_next = torch.where(is_ice.unsqueeze(0), w_liq, theta_new)
+    return w_liq_next, sfc_runoff, sub_runoff
+
+
+# ---------------------------------------------------------------------------
 # 5. Unified Land / Ice-Sheet / Ocean+Sea-Ice Time-Stepping Driver
 # ---------------------------------------------------------------------------
 def step_surface(
@@ -538,11 +740,9 @@ def step_surface(
     )
     ga_land = tr_land.c_h * tr_land.wind_eff  # Aerodynamic conductance 1 / r_a [m s^-1]
 
-    # Root-zone unfrozen liquid water availability & supply rate S_w (Davis et al., 2017)
-    unfrozen_frac = sfc.w_liq_soil[1:4].sum(dim=0) / torch.clamp(
-        (sfc.w_liq_soil[1:4] + sfc.w_ice_soil[1:4]).sum(dim=0), min=1.0e-4
-    )
-    water_stress = compute_optimal_soil_water_beta(sfc.w_root, sfc.bio, unfrozen_frac=unfrozen_frac)
+    # Vertically integrated root-zone plant-available liquid water & optimal stress beta (Holtzman et al., 2024; Gao et al., 2014)
+    w_avail_root, _, _ = compute_root_zone_weights_and_water(sfc.w_liq_soil, sfc.bio.s_root_cap)
+    water_stress = compute_optimal_soil_water_beta(w_avail_root, sfc.bio)
 
     # Sunlit/shaded leaf temperatures: sunlit leaves are slightly warmer under strong direct beam (Dai et al., 2004)
     gb_leaf = torch.clamp(0.01 * torch.sqrt(tr_land.u_star / 0.04) * torch.clamp(lai_exp, min=0.1), min=1.0e-3)
@@ -711,7 +911,7 @@ def step_surface(
     sw_max_rate = (1.05 / 3600.0) * water_stress * (sfc.bio.s_root_cap / 150.0)  # Max supply ~1.05 mm/hr [kg m^-2 s^-1]
     e_trans = torch.minimum(
         torch.minimum(evap_pos * (g_trans / w_tot_g), sw_max_rate),
-        torch.where(is_terrestrial, sfc.w_root / dt, evap_pos),
+        torch.where(is_terrestrial, w_avail_root / dt, evap_pos),
     )
     e_snow = torch.minimum(evap_pos * (g_snow_subl / w_tot_g), torch.where(is_terrestrial, sfc.swe_land / dt, evap_pos))
     max_soil_evap = RHO_WATER * SOIL_LAYER_DEPTHS[0] * torch.clamp(sfc.w_liq_soil[0] - 0.02, min=0.0) / dt
@@ -772,30 +972,21 @@ def step_surface(
         (1.0 - fresh_refresh) * (sfc.snow_age + age_inc),
     )
 
-    # Update root-zone water bucket W, topsoil volumetric moisture, & liquid runoff
-    water_in_soil = rain_thru + melt_tot - e_soil - (1.0 - 0.5 * (f_veg_rad > 0.1).to(dt_final.dtype)) * dew_neg
-    # Over grounded ice sheets or completely frozen topsoil, liquid water runs off
-    frozen_block = is_ice | (sfc.w_ice_soil[0] > 0.85 * SOIL_POROSITY)
-    infil = torch.where(frozen_block, torch.zeros_like(water_in_soil), water_in_soil)
-    sfc_runoff_ice = torch.where(frozen_block, torch.clamp(water_in_soil, min=0.0), torch.zeros_like(water_in_soil))
-
-    w_root_raw = sfc.w_root + dt * (infil - e_trans)
-    sub_runoff = torch.clamp(w_root_raw - sfc.bio.s_root_cap, min=0.0) / dt
-    w_root_next = torch.clamp(w_root_raw - sub_runoff * dt, min=0.0)
-    liq_runoff = sfc_runoff_ice + sub_runoff
-
-    # Synchronize volumetric liquid soil moisture profile with root-zone saturation for thermal conductivity
-    target_w_liq = torch.clamp(
-        (w_root_next / torch.clamp(sfc.bio.s_root_cap, min=20.0)) * (SOIL_POROSITY - sfc.w_ice_soil),
-        0.02,
-        SOIL_POROSITY,
+    # Advance 5-layer implicit Richards soil hydrology with dynamic rooting depth z_root(S_R)
+    # (Clapp & Hornberger, 1978; Swenson et al., 2012; CLM5 Sec. 7.3-7.5; Holtzman et al., 2024)
+    dew_ground = -(1.0 - 0.5 * (f_veg_rad > 0.1).to(dt_final.dtype)) * dew_neg  # Positive downward dew [kg m^-2 s^-1]
+    w_liq_hydro, sfc_runoff, sub_runoff = step_multilayer_soil_hydrology(
+        sfc.w_liq_soil, sfc.w_ice_soil, rain_thru, melt_tot, e_soil, e_trans, dew_ground,
+        sfc.bio.s_root_cap, is_ice, dt,
     )
-    w_liq_sync = torch.where(is_ice.unsqueeze(0), sfc.w_liq_soil, 0.90 * sfc.w_liq_soil + 0.10 * target_w_liq)
+    liq_runoff = sfc_runoff + sub_runoff
 
     # Advance 5-layer freeze-thaw soil heat conduction
     t_soil_new, w_liq_new, w_ice_new = step_multilayer_soil_thermodynamics(
-        sfc.t_soil, w_liq_sync, sfc.w_ice_soil, g_into_soil, dt
+        sfc.t_soil, w_liq_hydro, sfc.w_ice_soil, g_into_soil, dt
     )
+    # Synchronize diagnostic root-zone plant-available water W_avail after freeze-thaw update
+    w_root_next, _, _ = compute_root_zone_weights_and_water(w_liq_new, sfc.bio.s_root_cap)
 
     # =========================================================================
     # PART B: OCEAN + FRACTIONAL-LEAD SEA ICE (SCALE-RM Sec. 8.6 & MIROC6 Sec. 3.8)

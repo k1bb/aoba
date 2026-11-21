@@ -144,6 +144,8 @@ _MODULE_PARAM_MAP: dict[str, dict[str, tuple[Any, str]]] = {
         "soil_porosity": (_sfc, "SOIL_POROSITY"),
         "psi_sat_soil": (_sfc, "PSI_SAT_SOIL"),
         "b_clapp_soil": (_sfc, "B_CLAPP_SOIL"),
+        "k_sat_soil": (_sfc, "K_SAT_SOIL"),
+        "ice_impedance_omega": (_sfc, "ICE_IMPEDANCE_OMEGA"),
         "wc_max_per_lai": (_sfc, "WC_MAX_PER_LAI"),
         "alpha_intercept_liq": (_sfc, "ALPHA_INTERCEPT_LIQ"),
         "f_wet_max": (_sfc, "F_WET_MAX"),

@@ -583,7 +583,11 @@ def _apply_dynamic_icesheet_update(model: AOBAState) -> None:
         dg_sub = _cell_to_sub(newly_deglaciated_cell, nc, n_sub)
         sfc_sub.swe_land = torch.where(dg_sub, torch.zeros_like(sfc_sub.swe_land), sfc_sub.swe_land)
         sfc_sub.swe_max_season = torch.where(dg_sub, torch.full_like(sfc_sub.swe_max_season, 10.0), sfc_sub.swe_max_season)
-        sfc_sub.w_root = torch.where(dg_sub, 0.5 * sfc_sub.bio.s_root_cap, sfc_sub.w_root)
+        sfc_sub.w_liq_soil = torch.where(dg_sub.unsqueeze(0), torch.full_like(sfc_sub.w_liq_soil, 0.25), sfc_sub.w_liq_soil)
+        sfc_sub.w_ice_soil = torch.where(dg_sub.unsqueeze(0), torch.zeros_like(sfc_sub.w_ice_soil), sfc_sub.w_ice_soil)
+        from aoba.surface import compute_root_zone_weights_and_water
+        w_dg_avail, _, _ = compute_root_zone_weights_and_water(sfc_sub.w_liq_soil, sfc_sub.bio.s_root_cap)
+        sfc_sub.w_root = torch.where(dg_sub, w_dg_avail, sfc_sub.w_root)
         sfc_sub.bio.lai = torch.where(dg_sub, torch.full_like(sfc_sub.bio.lai, 0.25), sfc_sub.bio.lai)
         sfc_sub.bio.h_canopy = torch.where(dg_sub, torch.full_like(sfc_sub.bio.h_canopy, 0.5), sfc_sub.bio.h_canopy)
 
