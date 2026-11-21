@@ -1961,8 +1961,7 @@ async function fetchMonitorOnce() {
       const fracDay = ((Number(meta.sim_days) % 1.0) + 1.0) % 1.0;
       GLOBE_VIEW.subsolarLon = wrapLonDeg(180.0 - 360.0 * fracDay);
       const syncDay = document.getElementById("globe-sync-day")?.checked ?? true;
-      const spinOn = document.getElementById("globe-spin")?.checked ?? true;
-      if (!GLOBE_VIEW.manualOverride && syncDay && spinOn && !GLOBE_VIEW.dragging) {
+      if (!GLOBE_VIEW.manualOverride && syncDay && !GLOBE_VIEW.dragging) {
         GLOBE_VIEW.lon0 = GLOBE_VIEW.subsolarLon;
       }
     }
@@ -2165,6 +2164,7 @@ function renderOneGlobe(canvasId, kind, geo) {
 }
 
 let _lastAnimTs = 0;
+let _lastRenderKey = "";
 function animateGlobes(ts) {
   requestAnimationFrame(animateGlobes);
   const monPane = document.getElementById("tab-monitor");
@@ -2172,14 +2172,16 @@ function animateGlobes(ts) {
   const dt = Math.min((ts - (_lastAnimTs || ts)) / 1000.0, 0.1);
   _lastAnimTs = ts;
 
-  if ((document.getElementById("globe-spin")?.checked ?? true) && !GLOBE_VIEW.dragging) {
-    const syncDay = document.getElementById("globe-sync-day")?.checked ?? true;
-    let spd = Number(document.getElementById("globe-speed")?.value ?? 12);
-    if (syncDay && MON.wallSPerDay > 0) {
-      spd = -360.0 / Math.max(MON.wallSPerDay, 0.25);
-    }
+  const syncDay = document.getElementById("globe-sync-day")?.checked ?? true;
+  if (!syncDay && (document.getElementById("globe-spin")?.checked ?? true) && !GLOBE_VIEW.dragging) {
+    const spd = Number(document.getElementById("globe-speed")?.value ?? 12);
     GLOBE_VIEW.lon0 = wrapLonDeg(GLOBE_VIEW.lon0 + spd * dt);
   }
+  const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
+  const rKey = `${GLOBE_VIEW.lat0.toFixed(3)}|${GLOBE_VIEW.lon0.toFixed(3)}|${MON.raster?.sim_days ?? "idle"}|${MON.raster?.step ?? ""}|${drawGrid}|${LANG}`;
+  if (rKey === _lastRenderKey) return;
+  _lastRenderKey = rKey;
+
   const geo = getOrthoGeo();
   renderOneGlobe("globeT2", "t2", geo);
   renderOneGlobe("globeOLR", "olr", geo);
