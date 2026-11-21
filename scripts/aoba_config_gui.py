@@ -170,7 +170,7 @@ class CPUGlobePreviewEngine:
         lat_deg: np.ndarray,
         lon_deg: np.ndarray,
         t2_c: np.ndarray,
-        olr: np.ndarray,
+        precip: np.ndarray,
         lai: np.ndarray,
         surf_type: np.ndarray,
     ) -> dict[str, Any]:
@@ -179,7 +179,7 @@ class CPUGlobePreviewEngine:
         idxs, w, nn1 = self._get_interp_weights(lat_deg, lon_deg)
 
         t2_grid = (t2_c[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
-        olr_grid = (olr[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+        precip_grid = (precip[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
         lai_nn = np.where(surf_type == 1, lai, 0.0)
         lai_grid = (lai_nn[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
         surf_grid = surf_type[nn1].reshape(self.GRID_H, self.GRID_W).astype(np.uint8)
@@ -199,10 +199,10 @@ class CPUGlobePreviewEngine:
             "width": self.GRID_W,
             "height": self.GRID_H,
             "t2_range": [-45.0, 40.0],
-            "olr_range": [100.0, 340.0],
+            "precip_range": [0.0, 25.0],
             "lai_range": [0.0, 7.0],
             "t2_b64": self._quantize_u8(t2_grid, -45.0, 40.0),
-            "olr_b64": self._quantize_u8(olr_grid, 100.0, 340.0),
+            "precip_b64": self._quantize_u8(precip_grid, 0.0, 25.0),
             "lai_b64": self._quantize_u8(lai_grid, 0.0, 7.0),
             "surf_b64": base64.b64encode(surf_grid.tobytes()).decode("ascii"),
             "coast_b64": base64.b64encode(coast.tobytes()).decode("ascii"),
@@ -278,13 +278,13 @@ def _load_zarr_frame_payload(
             t2_k = t_sfc
         t2_c = t2_k - 273.15
 
-        if "olr" in ds:
-            olr = np.asarray(ds["olr"].isel(time=idx).values, dtype=np.float32)
-        elif "olr_sub" in ds:
-            arr = np.asarray(ds["olr_sub"].isel(time=idx).values, dtype=np.float32)
-            olr = arr.mean(axis=tuple(range(1, arr.ndim)))
+        if "precip_mm_day" in ds:
+            precip = np.asarray(ds["precip_mm_day"].isel(time=idx).values, dtype=np.float32)
+        elif "precip_mm_day_sub" in ds:
+            arr = np.asarray(ds["precip_mm_day_sub"].isel(time=idx).values, dtype=np.float32)
+            precip = arr.mean(axis=tuple(range(1, arr.ndim)))
         else:
-            olr = np.full_like(lat_deg, 240.0)
+            precip = np.zeros_like(lat_deg, dtype=np.float32)
 
         if "lai" in ds:
             lai = np.asarray(ds["lai"].isel(time=idx).values, dtype=np.float32)
@@ -294,7 +294,7 @@ def _load_zarr_frame_payload(
         else:
             lai = np.zeros_like(lat_deg, dtype=np.float32)
 
-        return lat_deg, lon_deg, t2_c, olr, lai, surf_type, f"{kind} ({frame_info['label']})"
+        return lat_deg, lon_deg, t2_c, precip, lai, surf_type, f"{kind} ({frame_info['label']})"
     finally:
         ds.close()
 
@@ -537,7 +537,11 @@ class RunManager:
                         lat_deg = np.asarray(zf["lat_deg"], dtype=np.float32)
                         lon_deg = np.asarray(zf["lon_deg"], dtype=np.float32)
                         t2_c = np.asarray(zf["t2_k"], dtype=np.float32) - 273.15
-                        olr = np.asarray(zf["olr"], dtype=np.float32)
+                        precip = (
+                            np.asarray(zf["precip_mm_day"], dtype=np.float32)
+                            if "precip_mm_day" in zf
+                            else np.zeros_like(t2_c)
+                        )
                         lai = np.asarray(zf["lai"], dtype=np.float32)
                         surf_type = np.asarray(zf["surf_type"], dtype=np.int8)
                         yr = int(zf["year"])
@@ -554,7 +558,7 @@ class RunManager:
                             calendar_type=str(fc.get("calendar_type", "gregorian")),
                         )
                         date_str = cal.date_at(sim_days * 86400.0).iso_date
-                    raster = self.engine.regrid_fields(lat_deg, lon_deg, t2_c, olr, lai, surf_type)
+                    raster = self.engine.regrid_fields(lat_deg, lon_deg, t2_c, precip, lai, surf_type)
                     meta = {
                         "source": "live_preview.npz",
                         "year": yr,
@@ -588,7 +592,7 @@ class RunManager:
                     lat_deg, lon_deg, t2_c, olr, lai, surf_type, src_lbl = _load_zarr_frame_payload(
                         out_root, finfo, kind_used
                     )
-                    raster = self.engine.regrid_fields(lat_deg, lon_deg, t2_c, olr, lai, surf_type)
+                    raster = self.engine.regrid_fields(lat_deg, lon_deg, t2_c, precip, lai, surf_type)
                     sim_d = float(finfo["sim_days"])
                     run_toml_p = out_root / "run_config.toml"
                     rc = load_aoba_toml(run_toml_p) if run_toml_p.exists() else {}
@@ -1004,7 +1008,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
     <div class="card">
       <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px;">
         <div>
-          <h2 style="margin:0;" data-i18n="globes_title">3地球 リアルタイム正射図法プレビュー (T<sub>2</sub> ・ OLR ・ LAI)</h2>
+          <h2 style="margin:0;" data-i18n="globes_title">3地球 日平均リアルタイム正射図法プレビュー (T<sub>2</sub> ・ 降水量 ・ LAI)</h2>
           <p class="sub" style="margin:2px 0 0;" data-i18n="globes_sub">ドラッグで任意の緯度経度へ傾け・回転できます。3つの地球儀が同期してゆっくり自転します。</p>
         </div>
         <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
@@ -1020,7 +1024,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div class="hover-banner">
-        <span id="hover-coords" data-i18n="hover_hint">地球儀の上にマウスを置くと、その地点の緯度経度・T₂・OLR・LAI が表示されます</span>
+        <span id="hover-coords" data-i18n="hover_hint">地球儀の上にマウスを置くと、その地点の緯度経度・T₂・降水量・LAI が表示されます</span>
         <span id="view-angles" style="color:var(--muted);">Center: lat +18.0°, lon +140.0°</span>
       </div>
 
@@ -1033,11 +1037,11 @@ _HTML_PAGE = r"""<!DOCTYPE html>
           <div class="cbar-labels"><span>-45°C</span><span>-10°C</span><span>+15°C</span><span>+40°C</span></div>
         </div>
         <div class="globe-card">
-          <h3 data-i18n="g_olr_title">大気上端外向き長波放射 OLR [W m⁻²]</h3>
-          <div class="g-sub" data-i18n="g_olr_sub">雲頂高度・亜熱帯乾燥帯のトレーサ</div>
+          <h3 data-i18n="g_olr_title">日平均降水量 Precip [mm d⁻¹]</h3>
+          <div class="g-sub" data-i18n="g_olr_sub">ITCZ・モンスーン・前線帯のトレーサ</div>
           <canvas id="globeOLR" class="globe-canvas" width="300" height="300"></canvas>
-          <div class="cbar" style="background:linear-gradient(90deg, #0f172a, #4c1d95, #be185d, #f59e0b, #fef08a);"></div>
-          <div class="cbar-labels"><span>100</span><span>180</span><span>260</span><span>340 W/m²</span></div>
+          <div class="cbar" style="background:linear-gradient(90deg, #0f172a, #1e3a8a, #0ea5e9, #34d399, #facc15, #f97316, #ec4899);"></div>
+          <div class="cbar-labels"><span>0</span><span>4</span><span>10</span><span>18</span><span>25+ mm/d</span></div>
         </div>
         <div class="globe-card">
           <h3 data-i18n="g_lai_title">葉面積指数 LAI [m² m⁻²]</h3>
@@ -1176,16 +1180,16 @@ const I18N = {
     mkpi_src: "データソース",
     mkpi_cpu: "CPU 投影処理時間",
     mkpi_latest: "最新全球 T<sub>s</sub> / OLR / LAI",
-    globes_title: "3地球 リアルタイム正射図法プレビュー (T<sub>2</sub> ・ OLR ・ LAI)",
+    globes_title: "3地球 日平均リアルタイム正射図法プレビュー (T<sub>2</sub> ・ 降水量 ・ LAI)",
     globes_sub: "ドラッグで任意の緯度経度へ傾け・回転できます。3つの地球儀が同期してゆっくり自転します。",
     lbl_spin: "自動回転",
     lbl_speed: "速度",
     lbl_grid: "経緯線",
     btn_reset_view: "視点リセット",
-    hover_hint: "地球儀の上にマウスを置くと、その地点の緯度経度・T₂・OLR・LAI が表示されます",
+    hover_hint: "地球儀の上にマウスを置くと、その地点の緯度経度・T₂・降水量・LAI が表示されます",
     g_t2_title: "地表付近気温 T<sub>2</sub> [°C]",
-    g_olr_title: "大気上端外向き長波放射 OLR [W m⁻²]",
-    g_olr_sub: "雲頂高度・亜熱帯乾燥帯のトレーサ",
+    g_olr_title: "日平均降水量 Precip [mm d⁻¹]",
+    g_olr_sub: "ITCZ・モンスーン・前線帯のトレーサ",
     g_lai_title: "葉面積指数 LAI [m² m⁻²]",
     g_lai_sub: "自律 EEO バイオーム分布（海＝濃紺・氷床＝白）",
     ts_title: "全球平均時系列モニター (daily_global.csv)",
@@ -1262,16 +1266,16 @@ const I18N = {
     mkpi_src: "Active Source",
     mkpi_cpu: "CPU Regrid Time",
     mkpi_latest: "Global Mean T<sub>s</sub> / OLR / LAI",
-    globes_title: "Live Rotating 3-Globe Orthographic Preview (T<sub>2</sub> · OLR · LAI)",
+    globes_title: "Live Daily-Mean 3-Globe Preview (T<sub>2</sub> · Precip · LAI)",
     globes_sub: "Drag any globe to tilt or spin synchronously across latitude and longitude.",
     lbl_spin: "Auto Spin",
     lbl_speed: "Speed",
     lbl_grid: "Graticule",
     btn_reset_view: "Reset View",
-    hover_hint: "Hover over any globe to inspect latitude, longitude, surface type, T₂, OLR, and LAI",
+    hover_hint: "Hover over any globe to inspect latitude, longitude, surface type, T₂, Precip, and LAI",
     g_t2_title: "Surface Air Temperature T<sub>2</sub> [°C]",
-    g_olr_title: "Outgoing Longwave Radiation OLR [W m⁻²]",
-    g_olr_sub: "Cloud-top height & subtropical dry belts",
+    g_olr_title: "Daily-Mean Precipitation [mm d⁻¹]",
+    g_olr_sub: "ITCZ, monsoon & storm-track tracer",
     g_lai_title: "Leaf Area Index LAI [m² m⁻²]",
     g_lai_sub: "Autonomous EEO biomes (Ocean=Navy, Ice=White)",
     ts_title: "Global-Mean Time Series (daily_global.csv)",
@@ -1978,7 +1982,7 @@ async function fetchMonitorOnce() {
     if (data.raster) {
       MON.raster = data.raster;
       MON.rawT2 = b64ToUint8(data.raster.t2_b64);
-      MON.rawOLR = b64ToUint8(data.raster.olr_b64);
+      MON.rawOLR = b64ToUint8(data.raster.precip_b64 || data.raster.olr_b64);
       MON.rawLAI = b64ToUint8(data.raster.lai_b64);
       MON.rawSurf = b64ToUint8(data.raster.surf_b64);
       MON.rawCoast = b64ToUint8(data.raster.coast_b64);
@@ -2003,7 +2007,7 @@ function makeColorLUT(stops) {
   return lut;
 }
 const LUT_T2  = makeColorLUT([[0,[30,27,75]],[0.24,[29,78,216]],[0.44,[56,189,248]],[0.60,[253,224,71]],[0.80,[249,115,22]],[1,[185,28,28]]]);
-const LUT_OLR = makeColorLUT([[0,[15,23,42]],[0.28,[76,29,149]],[0.54,[190,24,93]],[0.78,[245,158,11]],[1,[254,240,138]]]);
+const LUT_OLR = makeColorLUT([[0,[15,23,42]],[0.04,[30,58,138]],[0.16,[14,165,233]],[0.40,[52,211,153]],[0.68,[250,204,21]],[0.88,[249,115,22]],[1,[236,72,153]]]);
 const LUT_LAI = makeColorLUT([[0,[146,112,74]],[0.20,[163,163,50]],[0.45,[77,158,56]],[0.72,[21,128,61]],[1,[6,78,59]]]);
 
 function buildOrthographicCache(lat0Deg) {
@@ -2203,12 +2207,12 @@ function bindGlobeInteractions() {
       const col = Math.max(0, Math.min(359, Math.floor(lon + 180)));
       const idx = row * 360 + col;
       const t2v = -45 + (MON.rawT2[idx]/255) * 85;
-      const olrv = 100 + (MON.rawOLR[idx]/255) * 240;
+      const precipv = (MON.rawOLR[idx]/255) * 25.0;
       const laiv = (MON.rawLAI[idx]/255) * 7.0;
       const stype = MON.rawSurf[idx] === 0 ? (LANG==="ja"?"海洋":"Ocean") : (MON.rawSurf[idx] === 2 ? (LANG==="ja"?"氷床":"IceSheet") : (LANG==="ja"?"陸域":"Land"));
       const ptLbl = LANG === "ja" ? "地点" : "Point";
       document.getElementById("hover-coords").textContent =
-        `${ptLbl} (${lat.toFixed(1)}°, ${lon.toFixed(1)}°, ${stype}) — T₂: ${t2v.toFixed(1)} °C (${(t2v+273.15).toFixed(1)} K) | OLR: ${olrv.toFixed(0)} W/m² | LAI: ${laiv.toFixed(2)} m²/m²`;
+        `${ptLbl} (${lat.toFixed(1)}°, ${lon.toFixed(1)}°, ${stype}) — T₂: ${t2v.toFixed(1)} °C (${(t2v+273.15).toFixed(1)} K) | Precip: ${precipv.toFixed(1)} mm/d | LAI: ${laiv.toFixed(2)} m²/m²`;
     });
   });
   window.addEventListener("mouseup", () => { GLOBE_VIEW.dragging = false; GRID_VIEW.dragging = false; });

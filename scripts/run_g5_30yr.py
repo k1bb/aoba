@@ -231,17 +231,33 @@ def _write_live_preview_atomic(
     day_in_yr: float,
     sim_days: float,
     wall_s_per_day: float,
+    t2_k_override: torch.Tensor | None = None,
+    precip_mm_day_override: torch.Tensor | None = None,
+    olr_override: torch.Tensor | None = None,
 ) -> None:
-    """Atomically write lightweight 2D live-preview fields (`T2`, `OLR`, `LAI`) for the CPU GUI."""
+    """Atomically write lightweight 2D live-preview fields (`T2`, `Precip`, `LAI`, `OLR`) for the CPU GUI."""
     mesh = model.mesh
-    _, _, temp0 = diagnose_pressure_temperature(
-        model.atmos.rho_d[0:1], model.atmos.theta_m[0:1], model.atmos.q_v[0:1]
-    )
-    t_sfc = torch.where(mesh.surf_type == SURF_OCEAN, model.sfc.t_ocean_ml, model.sfc.t_canopy)
-    t2_k = 0.35 * t_sfc + 0.65 * temp0[0]
-    olr = model.rad_cache.get("olr", 0.85 * C.STEFAN_BOLTZMANN * torch.clamp(t_sfc, min=150.0) ** 4)
+    if t2_k_override is None:
+        _, _, temp0 = diagnose_pressure_temperature(
+            model.atmos.rho_d[0:1], model.atmos.theta_m[0:1], model.atmos.q_v[0:1]
+        )
+        t_sfc = torch.where(mesh.surf_type == SURF_OCEAN, model.sfc.t_ocean_ml, model.sfc.t_canopy)
+        t2_k = 0.35 * t_sfc + 0.65 * temp0[0]
+    else:
+        t2_k = t2_k_override
+    if precip_mm_day_override is None:
+        rain = model.rad_cache.get("rain", torch.zeros_like(t2_k))
+        snow = model.rad_cache.get("snow", torch.zeros_like(t2_k))
+        precip_mm_day = (rain + snow) * C.SECONDS_PER_DAY
+    else:
+        precip_mm_day = precip_mm_day_override
+    if olr_override is None:
+        t_sfc_olr = torch.where(mesh.surf_type == SURF_OCEAN, model.sfc.t_ocean_ml, model.sfc.t_canopy)
+        olr = model.rad_cache.get("olr", 0.85 * C.STEFAN_BOLTZMANN * torch.clamp(t_sfc_olr, min=150.0) ** 4)
+    else:
+        olr = olr_override
     lai = model.sfc.bio.lai
-    h_ice = model.icesheet.h_ice if model.icesheet is not None else torch.zeros_like(t_sfc)
+    h_ice = model.icesheet.h_ice if model.icesheet is not None else torch.zeros_like(t2_k)
 
     date_str = model.calendar.date_at(model.sim_time_sec).iso_date
     tmp_path = out_path.with_name(f".{out_path.name}.tmp.npz")
@@ -251,6 +267,7 @@ def _write_live_preview_atomic(
         lon_deg=np.rad2deg(mesh.lon_cell.detach().cpu().numpy()).astype(np.float32),
         surf_type=mesh.surf_type.detach().cpu().numpy().astype(np.int8),
         t2_k=t2_k.detach().cpu().numpy().astype(np.float32),
+        precip_mm_day=precip_mm_day.detach().cpu().numpy().astype(np.float32),
         olr=olr.detach().cpu().numpy().astype(np.float32),
         lai=lai.detach().cpu().numpy().astype(np.float32),
         h_ice=h_ice.detach().cpu().numpy().astype(np.float32),
@@ -420,6 +437,9 @@ def main() -> None:
 
         day_accum = {"ts": 0.0, "olr": 0.0, "asr": 0.0, "p": 0.0, "gpp": 0.0, "lai": 0.0, "ice": 0.0}
         day_cnt = 0
+        day_t2_sum: torch.Tensor | None = None
+        day_precip_sum: torch.Tensor | None = None
+        day_olr_sum: torch.Tensor | None = None
         m_idx = resume_m_idx if is_mid_resume else 0
         m_sums: dict[str, torch.Tensor] = resume_m_sums if is_mid_resume else {}
         m_cnt = resume_m_cnt if is_mid_resume else 0
@@ -442,6 +462,25 @@ def main() -> None:
             day_accum["lai"] += diag.land_mean_lai
             day_accum["ice"] += diag.seaice_area_million_km2
             day_cnt += 1
+
+            # Accumulate daily-mean 2D preview fields on device
+            _, _, temp0_p = diagnose_pressure_temperature(
+                model.atmos.rho_d[0:1], model.atmos.theta_m[0:1], model.atmos.q_v[0:1]
+            )
+            t_sfc_p = torch.where(model.mesh.surf_type == SURF_OCEAN, model.sfc.t_ocean_ml, model.sfc.t_canopy)
+            t2_inst = 0.35 * t_sfc_p + 0.65 * temp0_p[0]
+            rain_p = model.rad_cache.get("rain", torch.zeros_like(t2_inst))
+            snow_p = model.rad_cache.get("snow", torch.zeros_like(t2_inst))
+            precip_inst = (rain_p + snow_p) * C.SECONDS_PER_DAY
+            olr_inst = model.rad_cache.get("olr", 0.85 * C.STEFAN_BOLTZMANN * torch.clamp(t_sfc_p, min=150.0) ** 4)
+            if day_t2_sum is None:
+                day_t2_sum = t2_inst.clone()
+                day_precip_sum = precip_inst.clone()
+                day_olr_sum = olr_inst.clone()
+            else:
+                day_t2_sum += t2_inst
+                day_precip_sum += precip_inst
+                day_olr_sum += olr_inst
 
             if out_cfg.monthly_mean_enabled and (
                 step_in_yr % sample_stride == 0
@@ -518,10 +557,21 @@ def main() -> None:
                     )
                 for k in day_accum:
                     day_accum[k] = 0.0
-                day_cnt = 0
                 _write_live_preview_atomic(
-                    model, out_root / "live_preview.npz", year, day_num, diag.sim_time_days, wall_day
+                    model,
+                    out_root / "live_preview.npz",
+                    year,
+                    day_num,
+                    diag.sim_time_days,
+                    wall_day,
+                    t2_k_override=(day_t2_sum * inv_d) if day_t2_sum is not None else None,
+                    precip_mm_day_override=(day_precip_sum * inv_d) if day_precip_sum is not None else None,
+                    olr_override=(day_olr_sum * inv_d) if day_olr_sum is not None else None,
                 )
+                day_cnt = 0
+                day_t2_sum = None
+                day_precip_sum = None
+                day_olr_sum = None
 
             if out_cfg.monthly_mean_enabled and m_idx + 1 < len(mean_bounds) and step_in_yr >= mean_bounds[m_idx + 1]:
                 if m_cnt > 0 and (
