@@ -1309,6 +1309,7 @@ const PARAM_DOCS = {
   insolation_mode: { ja: "日射モード (seasonal: 季節変化 / perpetual_date: 固定日射)", en: "Insolation mode (seasonal / perpetual_date)" },
   fixed_insolation_date: { ja: "固定日射実験の基準日 (例: 2000-03-20 春分, 2000-06-21 夏至)", en: "Fixed orbital date for perpetual insolation experiments" },
   diurnal_cycle: { ja: "日変化あり (OFF にすると日平均日射を一定に保つ)", en: "Enable diurnal solar cycle (OFF = daily-mean insolation)" },
+  restart_monthly: { ja: "毎月末に途中再開用チェックポイント (restart_mid.pt) を保存", en: "Save mid-year restart checkpoint at the end of each month" },
   solar_constant: { ja: "太陽定数 S₀ [W m⁻²]", en: "Total solar irradiance S0 [W m^-2]" },
   omega: { ja: "惑星自転角速度 Ω [rad s⁻¹] (地球標準: 7.292115e-5)", en: "Planetary rotation rate Omega [rad s^-1]" },
   obliquity_deg: { ja: "地軸傾斜角 ε [deg]", en: "Axial obliquity [deg]" },

@@ -72,6 +72,7 @@ snapshots_include_2d = true
 snapshots_include_3d = true
 snapshots_include_subgrid_2d = true
 restart_interval_years = 1
+restart_monthly = true
 
 # --- Fundamental Physical & Planetary Constants ---
 [constants]

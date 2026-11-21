@@ -51,6 +51,7 @@ class OutputConfig:
     snapshots_include_3d: bool = True
     snapshots_include_subgrid_2d: bool = True
     restart_interval_years: int = 1
+    restart_monthly: bool = True                # Save mid-year restart checkpoint at end of each month
 
 
 # Module mapping for `[section]` -> `(module_obj, module_attr_name)`

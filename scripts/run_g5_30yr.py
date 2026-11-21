@@ -85,7 +85,7 @@ def _restore_surface(sfc_target, payload: dict, device: torch.device) -> None:
             setattr(sfc_target, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
 
 
-def _save_restart_atomic(model: AOBAState, path: Path) -> None:
+def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] | None = None) -> None:
     """Save complete prognostic `AOBAState` (including subgrid `sfc_sub`) via atomic temp file + rename."""
     payload = {
         "cfg": model.cfg,
@@ -120,12 +120,14 @@ def _save_restart_atomic(model: AOBAState, path: Path) -> None:
         },
         "rad_cache": {k: v.detach().cpu() for k, v in model.rad_cache.items()},
     }
+    if extra:
+        payload.update(extra)
     tmp = path.with_suffix(".pt.tmp")
     torch.save(payload, tmp)
     os.replace(tmp, path)
 
 
-def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device) -> None:
+def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device) -> dict[str, Any]:
     """Restore prognostic tensors (including subgrid `sfc_sub` & `clim_sub`) from `restart.pt`."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.sim_time_sec = float(ckpt["sim_time_sec"])
@@ -151,6 +153,7 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         for k, v in ckpt["mesh_dynamic"].items():
             setattr(model.mesh, k, v.to(device=device))
     model.rad_cache = {k: v.to(device=device) for k, v in ckpt["rad_cache"].items()}
+    return ckpt
 
 
 def _build_monthly_mean_xarray(
@@ -333,6 +336,10 @@ def main() -> None:
         save_zarr(export_scvt_mesh_xarray(model), mesh_zarr, overwrite=True)
 
     start_year = 1
+    resume_step_in_yr = 0
+    resume_m_idx = 0
+    resume_m_cnt = 0
+    resume_m_sums: dict[str, torch.Tensor] = {}
     if not args.no_resume:
         for y in range(years, 0, -1):
             y_dir = out_root / f"year_{y:04d}"
@@ -341,6 +348,16 @@ def main() -> None:
                 _load_restart_into_model(model, y_dir / "restart.pt", dev)
                 start_year = y + 1
                 break
+        if start_year <= years:
+            mid_pt = out_root / f"year_{start_year:04d}" / "restart_mid.pt"
+            if mid_pt.exists():
+                print(f"Resuming mid-year from {mid_pt}...", flush=True)
+                ckpt_mid = _load_restart_into_model(model, mid_pt, dev)
+                resume_step_in_yr = int(ckpt_mid.get("resume_step_in_yr", 0))
+                resume_m_idx = int(ckpt_mid.get("resume_m_idx", 0))
+                resume_m_cnt = int(ckpt_mid.get("resume_m_cnt", 0))
+                raw_msums = ckpt_mid.get("resume_m_sums", {}) or {}
+                resume_m_sums = {k: v.to(device=dev) for k, v in raw_msums.items()}
 
     # Expose initial T2 / OLR / LAI + Earth2014 continents immediately for Tab 5 live globes
     _write_live_preview_atomic(
@@ -386,13 +403,15 @@ def main() -> None:
         snap_zarr = (out_root / "snapshots.zarr") if single_partition else (y_dir / "snapshots.zarr")
         csv_path = y_dir / "daily_global.csv"
 
-        # Clean partial current-year Zarr only in yearly-partition mode
-        if not single_partition:
+        is_mid_resume = (year == start_year and resume_step_in_yr > 0)
+
+        # Clean partial current-year Zarr only in yearly-partition mode when starting year fresh
+        if not single_partition and not is_mid_resume:
             for p in (monthly_zarr, snap_zarr):
                 if p.exists():
                     shutil.rmtree(p)
 
-        if out_cfg.daily_csv_enabled:
+        if out_cfg.daily_csv_enabled and not (is_mid_resume and csv_path.exists()):
             with open(csv_path, "w", newline="") as f_csv:
                 csv.writer(f_csv).writerow([
                     "year", "date", "day_in_yr", "sim_days", "ts_k", "olr_wm2", "asr_wm2",
@@ -401,12 +420,18 @@ def main() -> None:
 
         day_accum = {"ts": 0.0, "olr": 0.0, "asr": 0.0, "p": 0.0, "gpp": 0.0, "lai": 0.0, "ice": 0.0}
         day_cnt = 0
-        m_idx = 0
-        m_sums: dict[str, torch.Tensor] = {}
-        m_cnt = 0
+        m_idx = resume_m_idx if is_mid_resume else 0
+        m_sums: dict[str, torch.Tensor] = resume_m_sums if is_mid_resume else {}
+        m_cnt = resume_m_cnt if is_mid_resume else 0
+        step_start = (resume_step_in_yr + 1) if is_mid_resume else 1
+        resume_step_in_yr = 0
+        resume_m_idx = 0
+        resume_m_cnt = 0
+        resume_m_sums = {}
         t_day0 = time.perf_counter()
+        prev_cal_month = model.calendar.date_at(model.sim_time_sec).month
 
-        for step_in_yr in range(1, steps_per_year + 1):
+        for step_in_yr in range(step_start, steps_per_year + 1):
             diag = step_aoba_model(model)
 
             day_accum["ts"] += diag.global_mean_t_sfc_k
@@ -535,6 +560,21 @@ def main() -> None:
                         snap_zarr,
                     )
 
+            cur_cal_month = model.calendar.date_at(model.sim_time_sec).month
+            if getattr(out_cfg, "restart_monthly", True) and cur_cal_month != prev_cal_month and step_in_yr < steps_per_year:
+                _save_restart_atomic(
+                    model,
+                    y_dir / "restart_mid.pt",
+                    extra={
+                        "resume_step_in_yr": step_in_yr,
+                        "resume_m_idx": m_idx,
+                        "resume_m_cnt": m_cnt,
+                        "resume_m_sums": {k: v.detach().cpu() for k, v in m_sums.items()},
+                    },
+                )
+                print(f"[Saved mid-year restart at {diag.date_str} (step {step_in_yr}/{steps_per_year})]", flush=True)
+            prev_cal_month = cur_cal_month
+
             if max_total_steps is not None and model.step_count >= max_total_steps:
                 stop_by_end_date = True
                 break
@@ -542,6 +582,7 @@ def main() -> None:
         if year % max(int(out_cfg.restart_interval_years), 1) == 0 or year == years or stop_by_end_date:
             _save_restart_atomic(model, y_dir / "restart.pt")
             (y_dir / "_COMPLETE").touch()
+            (y_dir / "restart_mid.pt").unlink(missing_ok=True)
         print(f"=== Completed Year {year:04d} / {years:04d} -> {y_dir} ===", flush=True)
         if stop_by_end_date:
             print(f"Reached target end_date ({out_cfg.end_date}) at {model.calendar.date_at(model.sim_time_sec).iso_date}.", flush=True)
