@@ -1,8 +1,9 @@
-"""Zero-Q-Flux 1.5-Layer Wind-Driven Ekman Ocean & Coastal Runoff Routing on SCVT Voronoi Grid.
+"""Zero-Q-Flux 1.5-Layer Wind-Driven Ekman + Reduced-Gravity Shallow-Water Ocean on SCVT Voronoi Grid.
 
-Implements Codron (2012, J. Climate, 25, 1747-1760) directly on the host SCVT Voronoi C-grid
-with zero normal flux across all land-ocean coastal edges, guaranteeing exact global ocean heat
-conservation without any prescribed Q-flux climatology.
+Implements Codron (2012, J. Climate, 25, 1747-1760) combined with 1.5-layer reduced-gravity
+shallow-water dynamics on the host SCVT Voronoi C-grid with zero normal flux across all
+land-ocean coastal edges, guaranteeing exact global ocean heat and volume conservation without
+any prescribed Q-flux climatology.
 
 References
 ----------
@@ -10,57 +11,76 @@ References
   Regularized equatorial + extratropical wind-driven Ekman transport `M_E`, mass-compensating
   sub-surface return flow `-M_E`, vertical upwelling/downwelling `W_E = div(M_E)`, and
   horizontal mesoscale eddy diffusion `kappa_h`.
+- Ringler, Thuburn, Klemp, & Skamarock (2010, J. Comput. Phys., 229, 3065-3090):
+  TRiSK energy-conserving Coriolis/vorticity operator on spherical Voronoi C-grids.
 - MIROC6 AGCM Document Writing Team (2021, Sec. 4.1.2):
   Conservative coastal routing of terrestrial river & glacier calving freshwater/fusion enthalpy.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+import math
 import torch
 
 from aoba import constants as C
-from aoba.scvt_dynamics import compute_scvt_divergence
+from aoba.scvt_dynamics import (
+    compute_scvt_divergence,
+    compute_scvt_vorticity,
+    compute_vector_laplacian_edge,
+)
 from aoba.scvt_mesh import SCVTMesh
 from aoba.surface import SURF_OCEAN, SurfaceState, _kahan_add
 
 
-# Codron (2012, Sec. 2a) standard physical parameters
+# Codron (2012, Sec. 2a) & 1.5-layer reduced-gravity shallow-water parameters
 H_THERMOCLINE: float = 200.0        # Sub-mixed-layer return-flow thickness H_2 [m]
 R_EKMAN_DAMP_DAYS: float = 2.0      # Equatorial Rayleigh friction timescale [days]
 R_EKMAN_DAMP: float = 1.0 / (R_EKMAN_DAMP_DAYS * C.SECONDS_PER_DAY)  # Equatorial Rayleigh friction [s^-1]
 KAPPA_OCN_HORIZ: float = 2.0e3      # Horizontal mesoscale eddy diffusivity kappa_h [m^2 s^-1]
 KAPPA_OCN_VERT: float = 2.0e-5      # Weak diapycnal exchange velocity [m s^-1]
+G_PRIME_OCN: float = 0.03           # First-baroclinic reduced gravity g' [m s^-2]
+TAU_SW_DRAG_DAYS: float = 180.0     # Interfacial/bottom Rayleigh drag timescale [days]
+R_SW_DRAG: float = 1.0 / (TAU_SW_DRAG_DAYS * C.SECONDS_PER_DAY)
+BETA_MUNK_REF: float = 2.28e-11     # Equatorial beta [m^-1 s^-1] for Munk boundary viscosity
+ENABLE_SHALLOW_WATER_OCN: bool = True
 
 
 def recompute_derived_constants() -> None:
-    """Refresh Rayleigh Ekman friction rate from damping timescale."""
-    global R_EKMAN_DAMP
+    """Refresh Rayleigh Ekman and shallow-water drag rates from damping timescales."""
+    global R_EKMAN_DAMP, R_SW_DRAG
     R_EKMAN_DAMP = 1.0 / (R_EKMAN_DAMP_DAYS * C.SECONDS_PER_DAY)
+    R_SW_DRAG = 1.0 / (TAU_SW_DRAG_DAYS * C.SECONDS_PER_DAY)
 
 
 @dataclass
 class EkmanOceanState:
-    """Sub-mixed-layer thermocline temperature & diagnostic upwelling on SCVT cells."""
+    """Sub-mixed-layer thermocline temperature, shallow-water state, & Ekman upwelling on SCVT."""
 
     t_sub_ml: torch.Tensor       # Layer-2 return-flow temperature T_2 [N_cells] [K]
-    w_ekman: torch.Tensor        # Diagnostic Ekman upwelling mass flux div(M_E) [N_cells] [kg m^-2 s^-1]
+    w_ekman: torch.Tensor        # Diagnostic vertical mass flux div(M_1) [N_cells] [kg m^-2 s^-1]
     h_sub_ml: float = H_THERMOCLINE
     t1_comp: torch.Tensor | None = None  # Kahan float32 rounding compensation for Layer-1 T_1 [K]
     t2_comp: torch.Tensor | None = None  # Kahan float32 rounding compensation for Layer-2 T_2 [K]
+    h_sw: torch.Tensor | None = None     # Active upper-ocean thickness H_sw = h_1 + H_2 + eta [N_cells] [m]
+    u_sw_edge: torch.Tensor | None = None  # Shallow-water normal velocity on edges [N_edges] [m s^-1]
 
 
 def init_ekman_ocean_state(
     sfc: SurfaceState,
     dt_thermocline_k: float = 6.0,
 ) -> EkmanOceanState:
-    """Initialize Layer-2 thermocline temperature `T_2 = max(T_freeze_ocn, T_1 - dt_thermocline)`."""
+    """Initialize Layer-2 thermocline temperature `T_2` and resting shallow-water thickness `H_sw`."""
     t2 = torch.clamp(sfc.t_ocean_ml - dt_thermocline_k, min=C.T_FREEZE_OCEAN)
+    is_ocean = sfc.surf_type == SURF_OCEAN
+    h_sw0 = torch.where(is_ocean, sfc.h_ocean_ml + H_THERMOCLINE, torch.zeros_like(t2))
     return EkmanOceanState(
         t_sub_ml=t2,
         w_ekman=torch.zeros_like(t2),
         t1_comp=torch.zeros_like(t2),
         t2_comp=torch.zeros_like(t2),
+        h_sw=h_sw0,
+        u_sw_edge=None,
     )
 
 
@@ -107,24 +127,80 @@ def step_ekman_ocean_voronoi(
     # Normal Ekman mass transport across edge c0 -> c1 (strictly 0 across coastlines!)
     mn_ek = (mx_ek * mesh.east_normal_edge + my_ek * mesh.north_normal_edge) * mask_edge
 
-    # Exact mass-conserving vertical Ekman upwelling flux W_E = div_SCVT(M_E) [kg m^-2 s^-1]
-    w_ek = compute_scvt_divergence(mesh, mn_ek) * is_ocean.to(mn_ek.dtype)
+    # 1b. 1.5-Layer Reduced-Gravity Shallow-Water Dynamics (Sverdrup/western-boundary gyres + Kelvin/Rossby waves)
+    is_ocean_f = is_ocean.to(mn_ek.dtype)
+    if ocn.h_sw is None:
+        ocn.h_sw = torch.where(is_ocean, sfc.h_ocean_ml + ocn.h_sub_ml, torch.zeros_like(sfc.t_ocean_ml))
+    if ocn.u_sw_edge is None:
+        ocn.u_sw_edge = torch.zeros_like(mn_ek)
+
+    h1_e = 0.5 * (sfc.h_ocean_ml[c0] + sfc.h_ocean_ml[c1])
+    if ENABLE_SHALLOW_WATER_OCN:
+        h_sw = ocn.h_sw
+        u_sw = ocn.u_sw_edge * mask_edge
+        tau_n_e = (tx_e * mesh.east_normal_edge + ty_e * mesh.north_normal_edge) * mask_edge
+
+        dc_min = float(mesh.dc_edge.min().item())
+        c_gw_max = math.sqrt(max(G_PRIME_OCN * 600.0, 1.0))
+        dt_sw_cfl = 0.40 * dc_min / max(c_gw_max, 5.0)
+        n_sw = max(1, int(math.ceil(dt / max(dt_sw_cfl, 1.0))))
+        dt_sw = dt / float(n_sw)
+
+        # Scale-aware Munk horizontal eddy viscosity so western boundary layers span ~1.6*dc_min cleanly
+        delta_munk = 1.6 * dc_min
+        a_h = min(BETA_MUNK_REF * (delta_munk ** 3), 0.08 * (dc_min ** 2) / max(dt_sw, 1.0))
+
+        v0_e = mesh.verts_on_edge[:, 0]
+        v1_e = mesh.verts_on_edge[:, 1]
+        ep_idx = mesh.trisk_edges
+        w_trisk = mesh.trisk_weights
+
+        for _ in range(n_sw):
+            zeta_v = compute_scvt_vorticity(mesh, u_sw)
+            eta_v = zeta_v + mesh.f_vert
+            eta_e = 0.5 * (eta_v[v0_e] + eta_v[v1_e])
+            eta_pair = 0.5 * (eta_e.unsqueeze(-1) + eta_e[ep_idx])
+            cor_sw = (w_trisk * eta_pair * u_sw[ep_idx]).sum(dim=-1)
+
+            h_e = torch.clamp(0.5 * (h_sw[c0] + h_sw[c1]), min=20.0)
+            pgf_sw = -G_PRIME_OCN * ((h_sw[c1] - h_sw[c0]) / mesh.dc_edge)
+            wind_acc = tau_n_e / (C.RHO_SEAWATER * h_e)
+            lap_u_sw, _ = compute_vector_laplacian_edge(mesh, u_sw)
+
+            u_sw = (u_sw + dt_sw * (cor_sw + pgf_sw + wind_acc + a_h * lap_u_sw - R_SW_DRAG * u_sw)) * mask_edge
+
+            # Upwind layer thickness flux guarantees positive thickness & exact coastal volume conservation
+            h_up = torch.where(u_sw >= 0.0, h_sw[c0], h_sw[c1])
+            div_hu = compute_scvt_divergence(mesh, h_up * u_sw * mask_edge) * is_ocean_f
+            h_sw = torch.where(is_ocean, torch.clamp(h_sw - dt_sw * div_hu, min=20.0, max=800.0), torch.zeros_like(h_sw))
+
+        ocn.u_sw_edge = u_sw
+        ocn.h_sw = h_sw
+
+        # Decompose geostrophic/gyre velocity u_g = u_sw - M_E / (rho_w * H_sw) to avoid double-counting Ekman
+        h_sw_e = torch.clamp(0.5 * (h_sw[c0] + h_sw[c1]), min=20.0)
+        u_g_e = (u_sw - mn_ek / (C.RHO_SEAWATER * h_sw_e)) * mask_edge
+        m1_edge = mn_ek + C.RHO_SEAWATER * h1_e * u_g_e
+    else:
+        m1_edge = mn_ek
+
+    # Exact mass-conserving vertical upwelling flux W_12 = div_SCVT(M_1) [kg m^-2 s^-1]
+    w_ek = compute_scvt_divergence(mesh, m1_edge) * is_ocean_f
     ocn.w_ekman = w_ek
 
-    # 2. Flux-form upwind heat transport for Layer 1 (+mn_ek) and Layer 2 (-mn_ek)
+    # 2. Flux-form upwind heat transport for Layer 1 (+m1_edge) and Layer 2 (-m1_edge)
     t1 = sfc.t_ocean_ml
     t2 = ocn.t_sub_ml
 
-    f1_adv = torch.clamp(mn_ek, min=0.0) * t1[c0] + torch.clamp(mn_ek, max=0.0) * t1[c1]
-    # Layer 2 return transport is mn_2 = -mn_ek:
-    mn_ret = -mn_ek
+    f1_adv = torch.clamp(m1_edge, min=0.0) * t1[c0] + torch.clamp(m1_edge, max=0.0) * t1[c1]
+    # Layer 2 return transport is m2_edge = -m1_edge:
+    mn_ret = -m1_edge
     f2_adv = torch.clamp(mn_ret, min=0.0) * t2[c0] + torch.clamp(mn_ret, max=0.0) * t2[c1]
 
     # Vertical upwind temperature across base of mixed layer: T_2 if upwelling (W_E > 0), T_1 if downwelling
     t_vert = torch.where(w_ek >= 0.0, t2, t1)
 
     # 3. Horizontal mesoscale eddy diffusion with zero-flux coastal Neumann boundary condition
-    h1_e = 0.5 * (sfc.h_ocean_ml[c0] + sfc.h_ocean_ml[c1])
     f1_diff = -C.RHO_SEAWATER * h1_e * KAPPA_OCN_HORIZ * ((t1[c1] - t1[c0]) / mesh.dc_edge) * mask_edge
     f2_diff = -C.RHO_SEAWATER * ocn.h_sub_ml * KAPPA_OCN_HORIZ * ((t2[c1] - t2[c0]) / mesh.dc_edge) * mask_edge
 

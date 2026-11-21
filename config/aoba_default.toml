@@ -216,12 +216,15 @@ k_beer_lai = 0.5
 sigma_zhou = 0.771
 alpha_ema_acclim = 0.067
 
-# --- Codron (2012) 1.5-Layer Wind-Driven Voronoi Ekman Ocean Parameters ---
+# --- Codron (2012) 1.5-Layer Wind-Driven Ekman + Reduced-Gravity Shallow-Water Ocean ---
 [ocean_ekman]
 h_thermocline = 200.0
 r_ekman_damp_days = 2.0
 kappa_ocn_horiz = 2000.0
 kappa_ocn_vert = 2e-05
+g_prime_ocn = 0.03
+tau_sw_drag_days = 180.0
+enable_shallow_water_ocn = true
 
 # --- Lott & Miller (1997) Subgrid Orographic Drag Parameters ---
 [orography]

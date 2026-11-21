@@ -153,6 +153,19 @@ def test_ekman_ocean_upwelling_and_heat_conservation(device: str) -> None:
     assert float(ocn.w_ekman[eq_ocn].mean().item()) > 0.0
     assert float(ocn.w_ekman[subtrop_ocn].mean().item()) < 0.0
 
+    # Verify 1.5-layer shallow-water state: finite, coastal normal velocity == 0, volume conserved
+    assert ocn.h_sw is not None and ocn.u_sw_edge is not None
+    assert not torch.isnan(ocn.h_sw).any() and not torch.isnan(ocn.u_sw_edge).any()
+    c0, c1 = mesh.cells_on_edge[:, 0], mesh.cells_on_edge[:, 1]
+    ocn_edge = (mesh.surf_type[c0] == SURF_OCEAN) & (mesh.surf_type[c1] == SURF_OCEAN)
+    assert float(ocn.u_sw_edge[~ocn_edge].abs().max().item()) == 0.0
+    assert float(ocn.u_sw_edge[ocn_edge].abs().max().item()) > 0.0
+    vol_sw = float((mesh.area_cell * is_ocn * ocn.h_sw).sum().item())
+    vol_init = float((mesh.area_cell * is_ocn * (sfc.h_ocean_ml + ocn.h_sub_ml)).sum().item())
+    assert abs(vol_sw - vol_init) / vol_init < 1.0e-5
+    # Subtropical gyre convergence should thicken h_sw relative to equatorial divergence
+    assert float(ocn.h_sw[subtrop_ocn].mean().item()) > float(ocn.h_sw[eq_ocn].mean().item())
+
 
 def test_koppen_geiger_beck_2018_table1(device: str) -> None:
     """Verify exact Beck et al. (2018, Table 1) 30-class classification across canonical stations."""

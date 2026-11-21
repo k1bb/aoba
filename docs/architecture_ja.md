@@ -68,7 +68,7 @@ AOBA は以下の2つの根源的な問いを解くために設計された結�
 
 ### 4.3 1.5層ボロノイ C-grid 風成エクマン海洋および部分海氷（リード）モデル
 - **根拠文献**: Semtner (1976); Briegleb et al. (1986); Miller, Beljaars, & Palmer (1992); Codron (2012); MIROC6 AGCM Document Writing Team (2021, Sec. 3.8); Nishizawa et al. (2025, Sec. 8.6).
-- **処方 $Q$ フラックス不要のエクマン海洋・部分海氷**: ホストと同一の SCVT ボロノイ C-grid 上（海岸線エッジで法線流量 $= 0$）で、海面風応力が駆動する表層混合層（$H_{\mathrm{ml}} = 50\ \mathrm{m}$）のエクマン熱輸送・沿岸／赤道湧昇・渦拡散を**処方 $Q$ フラックス完全ゼロ**で解き（Codron, 2012）、部分海氷被覆率 $f_i = \min(\sqrt{M_i/M_c}, 1)$・開水面／海氷別フラックス面積加重・降雪融解潜熱冷却・太陽天頂角依存海面アルベドを備えた熱力学海氷モデルと結合する（Semtner, 1976; Briegleb et al., 1986; MIROC6, 2021, Sec. 3.8; Nishizawa et al., 2025, Sec. 8.6）。
+- **処方 $Q$ フラックス不要のエクマン＋浅水波海洋・部分海氷**: ホストと同一の SCVT ボロノイ C-grid 上（海岸線エッジで法線流速・流量 $= 0$）で、海面風応力が駆動する表層混合層（$H_{\mathrm{ml}} = 50\ \mathrm{m}$）のエクマン熱輸送および 1.5層低減重力浅水波力学（$g' = 0.03\ \mathrm{m\ s^{-2}}$、TRiSK コリオリ、Munk 水平渦粘性、風成亜熱帯循環・西岸強化流・赤道ケルビン／ロスビー波）を**処方 $Q$ フラックス完全ゼロ**で解き（Codron, 2012）、部分海氷被覆率 $f_i = \min(\sqrt{M_i/M_c}, 1)$・開水面／海氷別フラックス面積加重・降雪融解潜熱冷却・太陽天頂角依存海面アルベドを備えた熱力学海氷モデルと結合する（Semtner, 1976; Briegleb et al., 1986; MIROC6, 2021, Sec. 3.8; Nishizawa et al., 2025, Sec. 8.6）。
 
 ---
 
@@ -79,4 +79,4 @@ AOBA は以下の2つの根源的な問いを解くために設計された結�
 - **結合アーキテクチャ**: `Earth2014.BED2014` および `ICE2014` から岩盤標高と初期氷厚を構築し、年次 EMA 平滑表面質量収支（SMB）と Glen 流動則 ($n=3$) による SCVT 上流有限体積 SIA 拡散、緩和型リソスタシー・アイソスタシー、およびスピンアップ加速率 $\alpha_{\mathrm{eff}}(t)$ を統合する。氷床厚変化による $|z_{\mathrm{topo}}^{\mathrm{new}} - z_{w,0}| \ge 0.05\ \mathrm{m}$ 発生時には Klemp STF 座標を再構築し、測高公式外挿＋対数気圧線形補間でホスト大気および全 CRM コラムを再補間しつつ `SURF_LAND <-> SURF_ICESHEET` 被覆遷移と開拓植生播種を自律実行する。
 
 ### 5.2 単一 TOML パラメータ一元管理と対話型 GUI (`src/aoba/params.py`, `scripts/aoba_config_gui.py`)
-- **透明性・再現性基盤**: 全格子設定 (`glevel`, `nz`, CRM 格子数・間隔)・外力・動的氷床オプション・出力ファイル種別／時間間隔（時間平均・瞬時値・2D/3D/サブグリッド2D）・全物理定数（13セクション・195項目）を単一の [`config/aoba_default.toml`](../config/aoba_default.toml) で一元管理し、`scripts/aoba_config_gui.py` から対話型可視化図付きで編集・保存して `scripts/run_g5_30yr.py --config ...` へ直接投入できる。
+- **透明性・再現性基盤**: 全格子設定 (`glevel`, `nz`, CRM 格子数・間隔)・外力・動的氷床オプション・出力ファイル種別／時間間隔（時間平均・瞬時値・2D/3D/サブグリッド2D）・全物理定数（13セクション・198項目）を単一の [`config/aoba_default.toml`](../config/aoba_default.toml) で一元管理し、`scripts/aoba_config_gui.py` から対話型可視化図付きで編集・保存して `scripts/run_g5_30yr.py --config ...` へ直接投入できる。

@@ -198,6 +198,9 @@ _MODULE_PARAM_MAP: dict[str, dict[str, tuple[Any, str]]] = {
         "r_ekman_damp_days": (_ocn, "R_EKMAN_DAMP_DAYS"),
         "kappa_ocn_horiz": (_ocn, "KAPPA_OCN_HORIZ"),
         "kappa_ocn_vert": (_ocn, "KAPPA_OCN_VERT"),
+        "g_prime_ocn": (_ocn, "G_PRIME_OCN"),
+        "tau_sw_drag_days": (_ocn, "TAU_SW_DRAG_DAYS"),
+        "enable_shallow_water_ocn": (_ocn, "ENABLE_SHALLOW_WATER_OCN"),
     },
     "orography": {
         "hn_crit": (_oro, "HN_CRIT"),
