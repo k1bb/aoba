@@ -458,7 +458,8 @@ def test_land_energy_balance_newton_iterations(device: str) -> None:
     import aoba.surface as surface_mod
     from aoba.surface import SURF_LAND, init_surface_state, step_surface
 
-    assert surface_mod.LAND_EB_ITERATIONS == 1  # Default keeps the single linearized pass
+    default_iters = surface_mod.LAND_EB_ITERATIONS
+    assert default_iters == 3  # Default: three Newton passes
     dev = torch.device(device)
     n = 400
 
@@ -490,7 +491,7 @@ def test_land_energy_balance_newton_iterations(device: str) -> None:
             assert torch.isfinite(diag.shf).all() and torch.isfinite(diag.lhf).all()
             out[k] = diag
     finally:
-        surface_mod.LAND_EB_ITERATIONS = 1
+        surface_mod.LAND_EB_ITERATIONS = default_iters
     err = {k: float((out[k].shf - out[40].shf).abs().mean().item()) for k in (1, 3, 10)}
     assert err[3] < 0.1 * err[1]  # Three passes remove >90% of the single-pass error
     assert err[10] < err[3] and err[10] < 1.0  # W m^-2 mean error vs the 40-pass fixed point

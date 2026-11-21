@@ -423,7 +423,7 @@ AOBA は PFT 分類・経験的パラメータ表を一切使わず、植物の�
 2. **樹冠遮断蒸発**: 濡れ葉部より $g_{\mathrm{inter}} = f'_{\mathrm{wet}} g_b$。濡れ面積は利用可能水量で制限され $f'_{\mathrm{wet}} = \min\{f_{\mathrm{wet}},\ W_c / (\Delta t\, E_{\mathrm{pot}})\}$（$E_{\mathrm{pot}} = \rho g_b (q_{\mathrm{sat}}(T_c) - q_a)$；CLM5 Eq. 5.111）、結露時（$E_{\mathrm{pot}} \le 0$）は葉全体が濡れる（$f'_{\mathrm{wet}} = 1$、蒸散ゼロ）。この制限で生じる潜熱の不足分は顕熱へ戻す（CLM5 Eq. 5.139）。降雨の樹冠遮断率は $f_{\mathrm{pi}} = \alpha_{\mathrm{liq}} \tanh L_{\mathrm{exp}}$（$\alpha_{\mathrm{liq}}=1$；CLM5 Eq. 7.4）とし、降雪は樹冠に貯留せず直接積雪へ落下する。
 3. **裸地蒸発・積雪昇華**: 表層飽和度 $s_0 = (w_{\mathrm{liq},0} + w_{\mathrm{ice},0}) / \phi_{\mathrm{soil}}$（$\phi_{\mathrm{soil}} = 0.43$）に対し、CLM5 の乾燥表層（DSL）土壌抵抗 $r_{\mathrm{soil}} = D_{\mathrm{SL}} / (D_v \tau)$（$D_{\mathrm{SL}} = D_{\max}(\theta_{\mathrm{init}} - \theta_1)/(\theta_{\mathrm{init}} - \theta_{\mathrm{air}})$、$D_{\max} = 15\ \mathrm{mm}$、$\theta_{\mathrm{init}} = 0.8\,\phi_{\mathrm{soil}}$、$\tau = \phi_{\mathrm{air}}^2 (\phi_{\mathrm{air}}/\phi_{\mathrm{soil}})^{3/b}$、$D_v = 2.12\times 10^{-5} (T_g / T_0)^{1.75}\ \mathrm{m^2\ s^{-1}}$；Swenson & Lawrence, 2014; CLM5 Eqs. 5.76–5.81）、ケルビン則による土壌表面相対湿度 $h_{\mathrm{soil}} = \exp(\psi_0 g / (R_v T_g))$（$\psi_0 = \psi_{\mathrm{sat}} s_0^{-b}$）、および Sakaguchi & Zeng (2009) の樹冠下安定度補正抵抗 $r_{d,\mathrm{uc}}$ を組み合わせて $g_{\mathrm{soil}} = (1 - A_{\mathrm{sn}})/(r_{d,\mathrm{uc}} + r_{\mathrm{soil}} + g_a^{-1})$、積雪面は $g_{\mathrm{snow}} = A_{\mathrm{sn}} / (r_{d,\mathrm{uc}} f_{\mathrm{veg}} + g_a^{-1})$ を与える。土壌空気の比湿が大気比湿を下回り大気が未飽和の場合は $q_{\mathrm{soil}} = q_a$ とし、極乾燥土壌への凝結を防ぐ（CLM5 Sec. 5.2）。
 
-複合地表面皮膜温度 $T_{\mathrm{skin}}$ に対し、正味放射 $R_n$・顕熱 $H$・潜熱 $LE$・積雪層断熱抵抗 $r_{\mathrm{sn}} = A_{\mathrm{sn}} (0.5 d_{\mathrm{sn}} / k_s)$ を含む地中伝導熱流 $G$ の線形化収支式を毎ステップ陰的求解し、積雪存在時（$\mathrm{SWE} > 10^{-3}\ \mathrm{kg\ m^{-2}}$）は $T_{\mathrm{skin}} \le T_0$ にクランプして余剰エネルギーを厳密に融雪熱量 $M_{\mathrm{snow}}$ へ振り分ける（MATSIRO6, Sec. 6.3.3）。
+複合地表面皮膜温度 $T_{\mathrm{skin}}$ に対し、正味放射 $R_n$・顕熱 $H$・潜熱 $LE$・積雪層断熱抵抗 $r_{\mathrm{sn}} = A_{\mathrm{sn}} (0.5 d_{\mathrm{sn}} / k_s)$ を含む地中伝導熱流 $G$ の線形化収支式を毎ステップ陰的求解し（固定回数 3 回のニュートン反復 `land_eb_iterations = 3`。CLM5 Sec. 5.3 は収束まで反復する。反復ごとに安定度依存の輸送係数と葉・林床・地表のコンダクタンスを更新し、気孔コンダクタンスはステップ開始時の値を保持する）、積雪存在時（$\mathrm{SWE} > 10^{-3}\ \mathrm{kg\ m^{-2}}$）は $T_{\mathrm{skin}} \le T_0$ にクランプして余剰エネルギーを厳密に融雪熱量 $M_{\mathrm{snow}}$ へ振り分ける（MATSIRO6, Sec. 6.3.3）。
 
 ### 8.2 部分積雪被覆・雪埋没遮蔽・エージングアルベド・氷河氷流出
 
@@ -551,12 +551,12 @@ $$
 
 ### 12.1 一元テキスト管理アーキテクチャと実行・GUI ツール (`src/aoba/params.py`, `scripts/aoba_config_gui.py`)
 
-モデルの再現性と透明性を保証するため、すべての格子設定・強制外力・動的氷床設定・出力ストリーム・物理定数（**13セクション・全203項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。
+モデルの再現性と透明性を保証するため、すべての格子設定・強制外力・動的氷床設定・出力ストリーム・物理定数（**13セクション・全204項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。
 - **ランタイム同期・ハードウェア自動チューニング (`src/aoba/params.py`, `src/aoba/runtime.py`)**: `load_aoba_toml()` で読み込んだ設定辞書に対し `build_configs_from_dict(cfg_dict, apply_modules=True)` を呼ぶと、`(AOBAConfig, OutputConfig)` インスタンスを生成すると同時に、`_MODULE_PARAM_MAP` に登録された `src/aoba/*` モジュールの全定数をライブ更新し、各モジュールの `recompute_derived_constants()`（`microphysics`, `turbulence`, `ocean_ekman`, `icesheet` 内の Metal 定数配列や導出係数を含む）を再計算する。さらに `detect_hardware_profile()` / `compute_optimal_chunks()` / `apply_runtime_tuning()` により実行マシンの GPU コア数・利用可能メモリ・P-core 数を自動検出し、メモリ予算 $B = 0.45\, M_{\mathrm{dev}}$ の範囲内で解像度を変えずに最速 1 パス／安全分割となる `crm_col_chunk`・`rad_col_chunk` と CPU スレッド数を自動適用する。
 - **Web GUI 統合ワークベンチ (`scripts/aoba_config_gui.py` / AOBA Studio)**: 標準ライブラリ（`http.server`）のみで動作するゼロ依存ローカル Web アプリ（`python scripts/aoba_config_gui.py --port 8765`）を備え、モデル設定から実行起動、プロセス監視、CPU リアルタイム可視化まで一気通貫で提供する：
   1. `glevel`（0〜6）の変更に連動してリアルタイム描画される**正二十面体 SCVT Voronoi 球面メッシュ可視化図 ＋ 1ホストセル対埋め込み CRM 領域スケール比較図 ＋ ストレッチ鉛直層・スポンジ層図**。
   2. 自転半減実験 (`0.5×Ω`)・LGM・`4×CO₂` プリセット、**カレンダー／固定日射設定**、および**氷床加速率 $\alpha_{\mathrm{eff}}(t)$／EMA 重み減衰曲線**プレビュー。
-  3. 出力ファイル種別・間隔設定、予想年間 Zarr/リスタート容量試算、および203パラメータ横断検索・TOML 保存。
+  3. 出力ファイル種別・間隔設定、予想年間 Zarr/リスタート容量試算、および204パラメータ横断検索・TOML 保存。
   4. **実行コントロール・ライブ監視・CPU リアルタイム日平均 3地球プレビュー**: GUI 上からの計算実行・停止、稼働中外部ジョブ（`run.log` / `daily_global.csv` / カレンダー日付 `YYYY-MM-DD`）の監視に加え、GPU 計算を一切阻害しない待機 CPU 上の `cKDTree` 球面再格子化エンジンにより、**日平均 `T2`（地表付近気温 $0.35 T_{\mathrm{sfc}} + 0.65 T_{a,z_1}$）・日平均降水量 `Precip [mm/d]`・`LAI`** の3つの正射図法地球儀を「1モデル日＝1周（$360^\circ / T_{\mathrm{wall,day}}$）」の実時間同期自転または任意速度でリアルタイム可視化する（`live_preview.npz`, `snapshots.zarr`, `monthly.zarr` に対応）。
 
 ### 12.2 出力ファイル種別・平均値 vs 瞬時値仕様 (`OutputConfig`, `src/aoba/io_zarr.py`)
@@ -571,9 +571,9 @@ $$
 | `snapshots.zarr` | **瞬時値** (スナップショット) | `snapshots_enabled`, `snapshots_periods_per_year` (既定 `12`), `snapshots_include_{2d,3d,subgrid_2d}` | 上記2D (`h_canopy`, `vcmax25_c3`, `f_c4` を含む)・3D変数 (`temp`, `pres`, `q_v`, `u_zonal`, `v_merid`) および上記サブグリッド2D瞬時場 (`*_sub`) |
 | `restart.pt` / `restart_mid.pt` | チェックポイント | `restart_interval_years` (既定 `1` 年), `restart_monthly` (既定 `true`), `zarr_dir_partition` | 完全な `GlobalAtmosState`, `CRMState`, `SurfaceState` (`sfc` & `sfc_sub`), `EkmanOceanState`, `IceSheetState`, `ClimateAccumulator`。`restart_monthly=true` 時は毎月末に `restart_mid.pt` を自動保存し、年内途中から Zarr/CSV 欠損なく決定論的再開可能 |
 
-### 12.3 全モデル設定・物理パラメータレジストリ（全13セクション・203項目）
+### 12.3 全モデル設定・物理パラメータレジストリ（全13セクション・204項目）
 
-表 12.1 に [`config/aoba_default.toml`](../config/aoba_default.toml) に定義された全203パラメータのセクション別完全リストを示す。
+表 12.1 に [`config/aoba_default.toml`](../config/aoba_default.toml) に定義された全204パラメータのセクション別完全リストを示す。
 
 #### `[grid]` — 水平・鉛直・サブグリッド CRM 格子設定（16項目）
 | TOML キー | 標準値 | 説明・単位 |
@@ -605,7 +605,7 @@ $$
 | `[radiation]` | 7 | `solar_frac_sw1 = 0.45976`, `lw_window_frac = 0.32`, `o3_g1 = 3.6478`, `o3_g2 = 0.83209`, `o3_g3 = 11.3515`, `par_frac_of_sw1 = 0.88`, `umol_per_joule_par = 4.57` (`constants.py` / `radiation.py`) |
 | `[microphysics]` | 27 | `rho_rain = 1000.0`, `rho_snow = 100.0`, `rho_graupel = 400.0`, `n0_rain = 8e6`, `n0_snow = 3e6`, `n0_graupel = 4e6`, `a_fall_rain = 842.0`, `b_fall_rain = 0.8`, `a_fall_snow = 4.84`, `b_fall_snow = 0.25`, `a_fall_graupel = 94.5`, `b_fall_graupel = 0.5`, `e_rc = 1.0`, `e_sc = 1.0`, `e_gc = 1.0`, `e_ri = 1.0`, `e_si = 0.1`, `e_gi = 0.1`, `qc_autoconv_thresh = 0.001`, `qi_aggreg_thresh = 1e-4`, `rate_autoconv = 0.001`, `rate_ice_aggreg = 0.001`, `vt_cloud_ice = 0.4`, `t0_precip = 283.16`, `t00_precip = 268.16`, `t0_graupel = 283.16`, `t00_graupel = 223.16` (`microphysics.py`) |
 | `[turbulence]` | 13 | `mynn_b1 = 24.0`, `mynn_b2 = 15.0`, `mynn_c2 = 0.75`, `mynn_c3 = 0.352`, `mynn_c5 = 0.2`, `mynn_gamma1 = 0.235`, `mynn_pr_n = 0.74`, `tke_min = 1e-4`, `rsl_mu_m = 2.59`, `rsl_mu_h = 0.95`, `rsl_nu = 0.5`, `rsl_lambda = 1.5`, `kinematic_visc_air = 1.5e-5` (`turbulence.py`) |
-| `[surface]` | 21 | `cs_dry_soil = 1.26e6`, `kappa_dry_soil = 0.3`, `soil_porosity = 0.43`, `psi_sat_soil = -0.2`, `b_clapp_soil = 5.39`, `wc_max_per_lai = 0.1`, `alpha_intercept_liq = 1.0`, `f_wet_max = 1.0`, `dsl_dmax_mm = 15.0`, `rho_snowpack = 250.0`, `swe_glacier_max = 1000.0`, `tau_snow_age = 1e6`, `alb_snow_vis_new = 0.9`, `alb_snow_nir_new = 0.7`, `alb_snow_vis_old = 0.65`, `alb_snow_nir_old = 0.35`, `emissivity_land = 0.98`, `emissivity_ocean = 0.985`, `mc_seaice_crit = 300.0`, `alb_seaice_vis = 0.72`, `alb_seaice_nir = 0.42` (`surface.py`) |
+| `[surface]` | 22 | `cs_dry_soil = 1.26e6`, `kappa_dry_soil = 0.3`, `soil_porosity = 0.43`, `psi_sat_soil = -0.2`, `b_clapp_soil = 5.39`, `wc_max_per_lai = 0.1`, `alpha_intercept_liq = 1.0`, `f_wet_max = 1.0`, `dsl_dmax_mm = 15.0`, `land_eb_iterations = 3`, `rho_snowpack = 250.0`, `swe_glacier_max = 1000.0`, `tau_snow_age = 1e6`, `alb_snow_vis_new = 0.9`, `alb_snow_nir_new = 0.7`, `alb_snow_vis_old = 0.65`, `alb_snow_nir_old = 0.35`, `emissivity_land = 0.98`, `emissivity_ocean = 0.985`, `mc_seaice_crit = 300.0`, `alb_seaice_vis = 0.72`, `alb_seaice_nir = 0.42` (`surface.py`) |
 | `[biosphere]` | 33 | `theta_nrh = 0.85`, `cost_c_smith = 0.05336251`, `phi_psii_ref_c3 = 0.257`, `beta_c3 = 146.0`, `beta_c4 = 166.0`, `gamma_star25_c3 = 4.332`, `kc25_c3 = 41.03`, `ko25_c3 = 28210.0`, `dha_gamma = 37830.0`, `dha_kc_c3 = 79430.0`, `dha_ko_c3 = 36380.0`, `gamma_star25_c4 = 2.6`, `kp25_umol_c4 = 60.5`, `dha_kp_c4 = 27200.0`, `kc25_c4 = 121.0`, `dha_kc_c4 = 64200.0`, `ko25_c4 = 29200.0`, `dha_ko_c4 = 10500.0`, `phi_leak_c4 = 0.2`, `gbs_c4 = 0.003`, `ha_vcmax = 71513.0`, `ha_jmax = 49884.0`, `ha_vpmax = 55000.0`, `hd_enzyme = 2e5`, `b_resp_ren = 0.018`, `leaf_scat_vis = 0.15`, `leaf_scat_nir = 0.8`, `kd_prime_par = 0.719`, `rho_cd_par = 0.036`, `z_foliage_cost = 12.227`, `k_beer_lai = 0.5`, `sigma_zhou = 0.771`, `alpha_ema_acclim = 0.067` (`biosphere.py`) |
 | `[ocean_ekman]` | 7 | `h_thermocline = 200.0`, `r_ekman_damp_days = 2.0`, `kappa_ocn_horiz = 2000.0`, `kappa_ocn_vert = 2e-5`, `g_prime_ocn = 0.03`, `tau_sw_drag_days = 180.0`, `enable_shallow_water_ocn = true` (`ocean_ekman.py`) |
 | `[orography]` | 3 | `hn_crit = 0.5`, `cd_block = 1.0`, `g_wave = 0.8` (`orography.py`) |

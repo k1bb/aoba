@@ -148,6 +148,7 @@ _MODULE_PARAM_MAP: dict[str, dict[str, tuple[Any, str]]] = {
         "alpha_intercept_liq": (_sfc, "ALPHA_INTERCEPT_LIQ"),
         "f_wet_max": (_sfc, "F_WET_MAX"),
         "dsl_dmax_mm": (_sfc, "DSL_DMAX_MM"),
+        "land_eb_iterations": (_sfc, "LAND_EB_ITERATIONS"),
         "rho_snowpack": (_sfc, "RHO_SNOWPACK"),
         "swe_glacier_max": (_sfc, "SWE_GLACIER_MAX"),
         "tau_snow_age": (_sfc, "TAU_SNOW_AGE"),

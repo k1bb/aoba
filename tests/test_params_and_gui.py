@@ -48,7 +48,7 @@ def test_toml_roundtrip_and_module_sync() -> None:
     defaults = default_config_dict()
     loaded = load_aoba_toml(toml_p)
     assert len(defaults) == 13
-    assert sum(len(v) for v in defaults.values()) == 203
+    assert sum(len(v) for v in defaults.values()) == 204
     assert set(loaded.keys()) == set(defaults.keys())
     for sec in defaults:
         assert set(loaded[sec].keys()) == set(defaults[sec].keys()), f"Key mismatch in [{sec}]"
@@ -124,7 +124,7 @@ def test_gui_server_endpoints() -> None:
             assert len(m_resp["verts_on_cell_b64"]) > 0 and len(m_resp["surf_type_b64"]) > 0
 
         state = json.loads(urllib.request.urlopen(f"{base}/api/state").read().decode("utf-8"))
-        assert state["param_count"] == 203
+        assert state["param_count"] == 204
         assert "grid" in state["config"]
 
         disc = json.loads(urllib.request.urlopen(f"{base}/api/runs/discover").read().decode("utf-8"))

@@ -172,6 +172,7 @@ wc_max_per_lai = 0.1
 alpha_intercept_liq = 1.0
 f_wet_max = 1.0
 dsl_dmax_mm = 15.0
+land_eb_iterations = 3
 rho_snowpack = 250.0
 swe_glacier_max = 1000.0
 tau_snow_age = 1000000.0
