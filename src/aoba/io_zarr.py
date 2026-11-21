@@ -105,7 +105,12 @@ def diagnose_subgrid_2d_fields(model: "AOBAState") -> dict[str, tuple]:
     return fields
 
 
-def export_aoba_snapshot_xarray(model: "AOBAState") -> xr.Dataset:
+def export_aoba_snapshot_xarray(
+    model: "AOBAState",
+    include_2d: bool = True,
+    include_3d: bool = True,
+    include_subgrid_2d: bool = True,
+) -> xr.Dataset:
     """Package the current global `AOBAState` into a CF-1.11 / UGRID-1.0 `xarray.Dataset`."""
     from aoba import constants as C
     from aoba.coupled_model import diagnose_model_koppen_geiger
@@ -141,21 +146,23 @@ def export_aoba_snapshot_xarray(model: "AOBAState") -> xr.Dataset:
     }
     _, _, ny, nx = model.crm.rho_d.shape
 
-    ds = xr.Dataset(
-        data_vars={
-            "mesh2d": xr.DataArray(
-                np.int32(0),
-                attrs={
-                    "cf_role": "mesh_topology",
-                    "topology_dimension": 2,
-                    "face_dimension": "n_cell",
-                    "edge_dimension": "n_edge",
-                    "face_coordinates": "lon_cell lat_cell",
-                },
-            ),
-            "area_cell": (("n_cell",), mesh.area_cell.detach().cpu().numpy(), {"units": "m2"}),
-            "surf_type": (("n_cell",), mesh.surf_type.detach().cpu().numpy(), {"long_name": "0=Ocean, 1=Land, 2=IceSheet"}),
-            "z_topo": (("n_cell",), mesh.z_topo.detach().cpu().numpy(), {"units": "m"}),
+    data_vars: dict[str, Any] = {
+        "mesh2d": xr.DataArray(
+            np.int32(0),
+            attrs={
+                "cf_role": "mesh_topology",
+                "topology_dimension": 2,
+                "face_dimension": "n_cell",
+                "edge_dimension": "n_edge",
+                "face_coordinates": "lon_cell lat_cell",
+            },
+        ),
+        "area_cell": (("n_cell",), mesh.area_cell.detach().cpu().numpy(), {"units": "m2"}),
+        "surf_type": (("n_cell",), mesh.surf_type.detach().cpu().numpy(), {"long_name": "0=Ocean, 1=Land, 2=IceSheet"}),
+        "z_topo": (("n_cell",), mesh.z_topo.detach().cpu().numpy(), {"units": "m"}),
+    }
+    if include_2d:
+        data_vars.update({
             "t_ocean_ml": (("time", "n_cell"), _c1(sfc.t_ocean_ml), {"units": "K"}),
             "t_canopy": (("time", "n_cell"), _c1(sfc.t_canopy), {"units": "K"}),
             "m_seaice": (("time", "n_cell"), _c1(sfc.m_seaice), {"units": "kg m-2"}),
@@ -167,21 +174,35 @@ def export_aoba_snapshot_xarray(model: "AOBAState") -> xr.Dataset:
             "f_c4": (("time", "n_cell"), _c1(sfc.bio.f_c4), {"units": "1"}),
             "koppen_code": (("time", "n_cell"), _c1(kg30), {"long_name": "Beck et al. (2018) 1..30 class"}),
             "koppen_major": (("time", "n_cell"), _c1(kg5), {"long_name": "1=A, 2=B, 3=C, 4=D, 5=E"}),
+        })
+        if model.icesheet is not None:
+            data_vars["h_ice"] = (("time", "n_cell"), _c1(model.icesheet.h_ice), {"units": "m"})
+            data_vars["z_topo_dyn"] = (("time", "n_cell"), _c1(mesh.z_topo), {"units": "m"})
+    if include_3d:
+        data_vars.update({
             "temp": (("time", "nz", "n_cell"), _c2(temp_c), {"units": "K"}),
             "pres": (("time", "nz", "n_cell"), _c2(pres_c), {"units": "Pa"}),
             "q_v": (("time", "nz", "n_cell"), _c2(atmos.q_v), {"units": "kg kg-1"}),
             "u_zonal": (("time", "nz", "n_cell"), _c2(u_c), {"units": "m s-1"}),
             "v_merid": (("time", "nz", "n_cell"), _c2(v_c), {"units": "m s-1"}),
-            **sub_vars,
-        },
-        coords={
-            "time": ("time", t_days, {"units": "days since 2000-03-20 00:00:00"}),
-            "nz": ("nz", model.vgrid.zeta_c.detach().cpu().numpy(), {"units": "m", "positive": "up"}),
-            "lat_cell": ("n_cell", lat_deg, {"units": "degrees_north", "standard_name": "latitude"}),
-            "lon_cell": ("n_cell", lon_deg, {"units": "degrees_east", "standard_name": "longitude"}),
-            "crm_y": ("crm_y", np.arange(ny, dtype=np.float32) * model.crm.dy, {"units": "m"}),
-            "crm_x": ("crm_x", np.arange(nx, dtype=np.float32) * model.crm.dx, {"units": "m"}),
-        },
+        })
+    if include_subgrid_2d:
+        data_vars.update(sub_vars)
+
+    coords: dict[str, Any] = {
+        "time": ("time", t_days, {"units": "days since 2000-03-20 00:00:00"}),
+        "lat_cell": ("n_cell", lat_deg, {"units": "degrees_north", "standard_name": "latitude"}),
+        "lon_cell": ("n_cell", lon_deg, {"units": "degrees_east", "standard_name": "longitude"}),
+    }
+    if include_3d:
+        coords["nz"] = ("nz", model.vgrid.zeta_c.detach().cpu().numpy(), {"units": "m", "positive": "up"})
+    if include_subgrid_2d:
+        coords["crm_y"] = ("crm_y", np.arange(ny, dtype=np.float32) * model.crm.dy, {"units": "m"})
+        coords["crm_x"] = ("crm_x", np.arange(nx, dtype=np.float32) * model.crm.dx, {"units": "m"})
+
+    ds = xr.Dataset(
+        data_vars=data_vars,
+        coords=coords,
         attrs={
             "Conventions": "CF-1.11 UGRID-1.0",
             "model": "AOBA (Autonomous Optimality Biosphere-Atmosphere)",

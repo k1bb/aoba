@@ -14,7 +14,10 @@
    - **完結した陸面水文・アルベド・永久凍土熱力学**: 蒸発散を陽葉／陰葉蒸散・濡れ樹冠遮断蒸発・安定度補正付き裸地土壌蒸発の3成分に分離し（Dai et al., 2004; Sakaguchi & Zeng, 2009; Lee & Khairoutdinov, 2015; MATSIRO6, 2021）、最適根圏貯水容量 $S_R$（Gao et al., 2014; Davis et al., 2017）、予報 EEO $\mathrm{LAI}$（Cai et al., 2025; Zhou et al., 2025）、土壌水分依存の2バンド裸地アルベド（Oleson et al., 2013）、凍結・融解相変化を伴う多層土壌熱伝導（SCALE-RM, 2025; MATSIRO6, 2021）、および部分積雪被覆率・雪埋没樹冠マスキング・2バンド積雪エージング・海洋還元水収支（Yang et al., 1997; Swenson & Lawrence, 2012; Nitta et al., 2014; Abolafia-Rosenzweig et al., 2021）を統合します。
 3. **変位追従型の平滑化地形基準面と最新粗度サブレイヤ（RSL）**: 局所の水・エネルギー制限から最大樹冠高 $h_c$ を決定し（Kempes et al., 2011）、ゼロ面変位 $d$・粗度長 $z_{0m}$・解析的 RSL 安定度補正（Raupach, 1994; Harman & Finnigan, 2007; De Ridder, 2010; Bonan et al., 2018; Lee et al., 2020; Meier et al., 2022）を実効基準面 $z_{\mathrm{datum}} = z_{\mathrm{topo}} + d$（Klemp, 2011）上で接続します。
 4. **4バンド解析的2ストリーム放射 ＆ ボロノイ C-grid 1.5層エクマン海洋・部分海氷**: ルックアップテーブル不要の4バンド2ストリーム放射ソルバ（Lacis & Hansen, 1974; Toon et al., 1989; Slingo, 1989; Ebert & Curry, 1992; Weaver & Ramanathan, 1995; Koll & Cronin, 2018）と、処方 $Q$ フラックス不要の 1.5層風成エクマン輸送＋渦拡散スラブ海洋（Codron, 2012）、部分海氷面積率（リード）を伴う熱力学海氷（Semtner, 1976; SCALE-RM, 2025）、太陽天頂角依存海面アルベド（Briegleb et al., 1986）、および滑面粘性＋Charnock 海面粗度（Miller et al., 1992）を結合します。
-5. **単一コードでの GPU ポータビリティ（`Float32` PyTorch ＋ Metal/CUDA 融合鉛直 HEVI ソルバ）**: Apple Silicon GPU（Mac mini `M4 Pro`、メモリ使用量 約 1〜1.5 GB）で1日あたり約 8〜11 年分の全球気候積分が動作し、NVIDIA GPU（`cuda`）へそのままスケールします。
+5. **動的・平衡加速 SIA 氷床結合 ＆ 単一 TOML パラメータ一元管理＋対話型 GUI**:
+   - **動的氷床モデル**: `Earth2014` 岩盤標高上に Glen 流動則 ($n=3$) 浅氷近似（SIA）＋EMA 気候 SMB 平滑＋アイソスタシー＋スピンアップ加速率を備え、氷床消長に伴う地形変化を測高外挿・対数気圧鉛直再補間により大気・CRM 座標へ無矛盾に反映します（`src/aoba/icesheet.py`）。
+   - **モデル透明性と統合 Web Studio (`AOBA Studio`)**: 全188項目の格子設定（`glevel`, `nz`, CRM 格子数・間隔）・惑星外力（自転速度 $\Omega$ 等）・出力ファイル種別（時間平均 vs 瞬時値, 2D/3D/サブグリッド2D）・全物理定数を単一ファイル [`config/aoba_default.toml`](config/aoba_default.toml) に集約し、Web GUI ([`scripts/aoba_config_gui.py`](scripts/aoba_config_gui.py)) で設定の視覚化からモデル実行・ログ/時系列監視・**CPU 処理による T₂ / OLR / LAI の回転3地球正射図法リアルタイムプレビュー**まで完結できます。
+6. **単一コードでの GPU ポータビリティ（`Float32` PyTorch ＋ Metal/CUDA 融合鉛直 HEVI ソルバ）**: Apple Silicon GPU（`mps`、M1 Max / M4 Pro 等のユニファイドメモリ）および NVIDIA GPU（`cuda`）で単一コードのまま高速積分できます。
 
 ## ディレクトリ構成
 
@@ -49,6 +52,10 @@ PYTHONPATH=src python tests/test_phase2_phase3_global.py
 PYTHONPATH=src python scripts/run_rce.py --surface land --days 2.0
 PYTHONPATH=src python scripts/run_held_suarez.py --glevel 3 --days 5.0
 PYTHONPATH=src python scripts/run_global_aoba.py --glevel 3 --co2-ppmv 400 --days 5.0
+
+# 統合 TOML 設定・GUI コンフィギュレータの起動とマルチ年実行
+PYTHONPATH=src python scripts/aoba_config_gui.py --toml config/aoba_default.toml
+PYTHONPATH=src python -u scripts/run_g5_30yr.py --config config/aoba_default.toml
 ```
 
 ## 出力ファイルとローカルディレクトリの保護方針

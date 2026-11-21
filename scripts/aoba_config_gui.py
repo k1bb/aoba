@@ -1,0 +1,2367 @@
+#!/usr/bin/env python3
+"""End-to-End Web GUI Workbench for AOBA: Configure, Launch, Monitor & Live 3-Globe CPU Preview.
+
+Zero-dependency stdlib HTTP server + HTML5 Canvas workbench offering:
+1. Interactive SCVT `glevel` globe + CRM subgrid scale + vertical levels visual configurator
+2. Planetary/orbital/dynamic-SIA ice-sheet presets & acceleration curve preview
+3. Output streams, time-mean vs instantaneous Zarr cadence, and storage estimator
+4. Searchable 188-parameter TOML registry editor & live TOML export
+5. Model Run Launcher + Live Process Monitor (CSV trajectories & `run.log` tail)
+6. Idle-CPU background SCVT->LatLon regridder driving 3 slowly rotating Orthographic Earth globes
+   for `T2` (surface air temperature), `OLR` (outgoing longwave radiation), and `LAI` (leaf area index),
+   compatible with both new `--config` runs (`live_preview.npz`) and existing Zarr runs (`PID ...`).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+import webbrowser
+
+import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC_DIR = _REPO_ROOT / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from aoba.params import (  # noqa: E402
+    SECTION_META,
+    build_configs_from_dict,
+    default_config_dict,
+    default_toml_path,
+    dump_aoba_toml,
+    load_aoba_toml,
+    merge_config_dicts,
+    save_aoba_toml,
+)
+from aoba.runtime import get_output_dir  # noqa: E402
+
+
+def _coerce_like_default(val: Any, default_val: Any) -> Any:
+    """Coerce JSON payload values back into the exact Python type of `default_val`."""
+    if isinstance(default_val, bool):
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "on")
+        return bool(val)
+    if isinstance(default_val, int):
+        return int(round(float(val)))
+    if isinstance(default_val, float):
+        return float(val)
+    return str(val)
+
+
+def sanitize_config_dict(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Merge arbitrary partial dict onto baseline defaults and coerce every known key's type."""
+    defaults = default_config_dict()
+    merged = merge_config_dicts(defaults, raw)
+    for sec, sec_defaults in defaults.items():
+        for k, def_v in sec_defaults.items():
+            try:
+                merged[sec][k] = _coerce_like_default(merged[sec][k], def_v)
+            except (TypeError, ValueError):
+                merged[sec][k] = def_v
+    return merged
+
+
+def count_modified_keys(cfg: dict[str, dict[str, Any]]) -> int:
+    """Count how many keys differ from factory defaults."""
+    defaults = default_config_dict()
+    n = 0
+    for sec, sec_defaults in defaults.items():
+        cur_sec = cfg.get(sec, {})
+        for k, def_v in sec_defaults.items():
+            cur_v = cur_sec.get(k, def_v)
+            if isinstance(def_v, float):
+                if abs(float(cur_v) - float(def_v)) > 1e-12 * max(1.0, abs(float(def_v))):
+                    n += 1
+            elif cur_v != def_v:
+                n += 1
+    return n
+
+
+# =============================================================================
+# CPU-Only SCVT -> Equirectangular Regridder & Live Run Monitor Engine
+# =============================================================================
+class CPUGlobePreviewEngine:
+    """Runs strictly on CPU (`numpy`/`scipy`) to convert SCVT simulation outputs into live raster maps."""
+
+    GRID_H = 180
+    GRID_W = 360
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._mesh_cache: dict[tuple[int, float, float], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._frame_cache: dict[tuple[str, str, int, float], dict[str, Any]] = {}
+        lat_centers = np.linspace(89.5, -89.5, self.GRID_H, dtype=np.float64)
+        lon_centers = np.linspace(-179.5, 179.5, self.GRID_W, dtype=np.float64)
+        lon2d, lat2d = np.meshgrid(lon_centers, lat_centers)
+        lat_r = np.deg2rad(lat2d.ravel())
+        lon_r = np.deg2rad(lon2d.ravel())
+        self._target_xyz = np.stack(
+            [np.cos(lat_r) * np.cos(lon_r), np.cos(lat_r) * np.sin(lon_r), np.sin(lat_r)],
+            axis=-1,
+        )
+
+    def _get_interp_weights(
+        self, lat_deg: np.ndarray, lon_deg: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Build or fetch cached 3-neighbor spherical IDW weights + nearest index on CPU."""
+        sig = (int(lat_deg.size), round(float(lat_deg[0]), 4), round(float(lon_deg[-1]), 4))
+        with self._lock:
+            cached = self._mesh_cache.get(sig)
+        if cached is not None:
+            return cached
+
+        lat_r = np.deg2rad(lat_deg.astype(np.float64))
+        lon_r = np.deg2rad(lon_deg.astype(np.float64))
+        src_xyz = np.stack(
+            [np.cos(lat_r) * np.cos(lon_r), np.cos(lat_r) * np.sin(lon_r), np.sin(lat_r)],
+            axis=-1,
+        )
+
+        try:
+            from scipy.spatial import cKDTree
+
+            tree = cKDTree(src_xyz)
+            dists, idxs = tree.query(self._target_xyz, k=3, workers=2)
+        except Exception:
+            # Pure-NumPy fallback via chordal cosine dot product
+            dots = self._target_xyz @ src_xyz.T
+            idxs = np.argpartition(-dots, kth=2, axis=1)[:, :3]
+            row_idx = np.arange(dots.shape[0])[:, None]
+            d_cos = np.clip(dots[row_idx, idxs], -1.0, 1.0)
+            dists = np.sqrt(np.maximum(2.0 * (1.0 - d_cos), 0.0))
+
+        nn1 = idxs[:, 0].astype(np.int32)
+        w = 1.0 / (dists * dists + 1.0e-5)
+        w /= w.sum(axis=1, keepdims=True)
+        res = (idxs.astype(np.int32), w.astype(np.float32), nn1)
+        with self._lock:
+            self._mesh_cache[sig] = res
+        return res
+
+    @staticmethod
+    def _quantize_u8(arr: np.ndarray, vmin: float, vmax: float) -> str:
+        norm = np.clip((arr - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0)
+        u8 = np.rint(norm * 255.0).astype(np.uint8)
+        return base64.b64encode(u8.tobytes()).decode("ascii")
+
+    def regrid_fields(
+        self,
+        lat_deg: np.ndarray,
+        lon_deg: np.ndarray,
+        t2_c: np.ndarray,
+        olr: np.ndarray,
+        lai: np.ndarray,
+        surf_type: np.ndarray,
+    ) -> dict[str, Any]:
+        """Regrid irregular SCVT cell arrays onto `[180, 360]` on CPU and encode compact Uint8 rasters."""
+        t0 = time.perf_counter()
+        idxs, w, nn1 = self._get_interp_weights(lat_deg, lon_deg)
+
+        t2_grid = (t2_c[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+        olr_grid = (olr[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+        lai_nn = np.where(surf_type == 1, lai, 0.0)
+        lai_grid = (lai_nn[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+        surf_grid = surf_type[nn1].reshape(self.GRID_H, self.GRID_W).astype(np.uint8)
+
+        # Coastline edge detection directly on CPU raster (`surf_type == 0` vs terrestrial `>= 1`)
+        is_land = surf_grid >= 1
+        coast = np.zeros_like(surf_grid)
+        diff_x = is_land != np.roll(is_land, 1, axis=1)
+        diff_y = np.zeros_like(is_land)
+        diff_y[1:, :] = is_land[1:, :] != is_land[:-1, :]
+        coast[(diff_x | diff_y)] = 1
+        # Crisp land mask forces LAI = 0 over oceans & ice sheets cleanly
+        lai_grid = np.where(surf_grid == 1, lai_grid, 0.0)
+
+        cpu_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            "width": self.GRID_W,
+            "height": self.GRID_H,
+            "t2_range": [-45.0, 40.0],
+            "olr_range": [100.0, 340.0],
+            "lai_range": [0.0, 7.0],
+            "t2_b64": self._quantize_u8(t2_grid, -45.0, 40.0),
+            "olr_b64": self._quantize_u8(olr_grid, 100.0, 340.0),
+            "lai_b64": self._quantize_u8(lai_grid, 0.0, 7.0),
+            "surf_b64": base64.b64encode(surf_grid.tobytes()).decode("ascii"),
+            "coast_b64": base64.b64encode(coast.tobytes()).decode("ascii"),
+            "cpu_regrid_ms": round(cpu_ms, 2),
+        }
+
+
+def _find_zarr_frames(out_root: Path, kind: str) -> list[dict[str, Any]]:
+    """List available `(store_path, time_idx, label, sim_days)` across `single` or `yearly` Zarr stores."""
+    import xarray as xr
+
+    frames: list[dict[str, Any]] = []
+    stores: list[tuple[str, Path]] = []
+    single_store = out_root / f"{kind}.zarr"
+    if single_store.exists():
+        stores.append(("single", single_store))
+    for ydir in sorted(out_root.glob("year_*")):
+        p = ydir / f"{kind}.zarr"
+        if p.exists():
+            stores.append((ydir.name, p))
+
+    for tag, store in stores:
+        try:
+            ds = xr.open_zarr(store, consolidated=False, decode_times=False)
+            t_vals = ds["time"].values if "time" in ds else np.arange(ds.sizes.get("time", 0), dtype=np.float64)
+            for idx, tv in enumerate(t_vals):
+                frames.append({
+                    "store": str(store),
+                    "local_idx": int(idx),
+                    "global_idx": len(frames),
+                    "sim_days": float(tv),
+                    "label": f"{tag} #{idx + 1} ({float(tv):.1f}d)",
+                })
+            ds.close()
+        except Exception:
+            continue
+    return frames
+
+
+def _load_zarr_frame_payload(
+    out_root: Path,
+    frame_info: dict[str, Any],
+    kind: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
+    """Extract `(lat, lon, t2_c, olr, lai, surf_type, source_label)` from a Zarr time slice."""
+    import xarray as xr
+
+    store = Path(frame_info["store"])
+    idx = int(frame_info["local_idx"])
+    ds = xr.open_zarr(store, consolidated=False, decode_times=False)
+    try:
+        lat_deg = np.asarray(ds["lat_cell"].values, dtype=np.float32)
+        lon_deg = np.asarray(ds["lon_cell"].values, dtype=np.float32)
+
+        surf_type = None
+        if "surf_type" in ds:
+            surf_type = np.asarray(ds["surf_type"].values, dtype=np.int8)
+        elif (out_root / "mesh.zarr").exists():
+            m = xr.open_zarr(out_root / "mesh.zarr", consolidated=False)
+            surf_type = np.asarray(m["surf_type"].values, dtype=np.int8)
+            m.close()
+        if surf_type is None:
+            surf_type = np.ones_like(lat_deg, dtype=np.int8)
+
+        t_ocn = np.asarray(ds["t_ocean_ml"].isel(time=idx).values, dtype=np.float32) if "t_ocean_ml" in ds else np.full_like(lat_deg, 288.0)
+        t_can = np.asarray(ds["t_canopy"].isel(time=idx).values, dtype=np.float32) if "t_canopy" in ds else t_ocn
+        t_sfc = np.where(surf_type == 0, t_ocn, t_can)
+
+        if "temp" in ds:
+            temp0 = np.asarray(ds["temp"].isel(time=idx, nz=0).values, dtype=np.float32)
+            t2_k = 0.35 * t_sfc + 0.65 * temp0
+        else:
+            t2_k = t_sfc
+        t2_c = t2_k - 273.15
+
+        if "olr" in ds:
+            olr = np.asarray(ds["olr"].isel(time=idx).values, dtype=np.float32)
+        elif "olr_sub" in ds:
+            arr = np.asarray(ds["olr_sub"].isel(time=idx).values, dtype=np.float32)
+            olr = arr.mean(axis=tuple(range(1, arr.ndim)))
+        else:
+            olr = np.full_like(lat_deg, 240.0)
+
+        if "lai" in ds:
+            lai = np.asarray(ds["lai"].isel(time=idx).values, dtype=np.float32)
+        elif "lai_sub" in ds:
+            arr = np.asarray(ds["lai_sub"].isel(time=idx).values, dtype=np.float32)
+            lai = arr.mean(axis=tuple(range(1, arr.ndim)))
+        else:
+            lai = np.zeros_like(lat_deg, dtype=np.float32)
+
+        return lat_deg, lon_deg, t2_c, olr, lai, surf_type, f"{kind} ({frame_info['label']})"
+    finally:
+        ds.close()
+
+
+def _read_csv_series(out_root: Path, max_points: int = 800) -> dict[str, list[float]]:
+    """Aggregate all `year_XXXX/daily_global.csv` series for real-time plotting."""
+    cols = ("sim_days", "ts_k", "olr_wm2", "asr_wm2", "net_toa_wm2", "precip_mm_d", "lai", "seaice_mkm2", "wall_s_per_day")
+    rows: list[list[float]] = []
+    for csv_p in sorted(out_root.glob("year_*/daily_global.csv")):
+        try:
+            with open(csv_p, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        rows.append([float(row[c]) for c in cols])
+                    except (KeyError, ValueError, TypeError):
+                        continue
+        except OSError:
+            continue
+
+    if len(rows) > max_points:
+        stride = max(len(rows) // max_points, 1)
+        rows = rows[::stride] + ([rows[-1]] if (len(rows) - 1) % stride != 0 else [])
+
+    out = {c: [] for c in cols}
+    for r in rows:
+        for i, c in enumerate(cols):
+            out[c].append(round(r[i], 3))
+    return out
+
+
+def _tail_log_lines(log_path: Path, n_lines: int = 75) -> str:
+    if not log_path.exists():
+        return ""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(lines[-n_lines:])
+    except OSError:
+        return ""
+
+
+def _discover_active_processes() -> list[dict[str, Any]]:
+    """Inspect active OS `run_g5_30yr.py` processes cleanly without disturbing them."""
+    procs: list[dict[str, Any]] = []
+    try:
+        res = subprocess.run(
+            ["ps", "-axo", "pid,%cpu,etime,command"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        for line in res.stdout.splitlines():
+            if "run_g5_30yr.py" not in line or "grep" in line:
+                continue
+            parts = line.strip().split(None, 3)
+            if len(parts) < 4:
+                continue
+            pid_s, cpu_s, etime_s, cmd = parts
+            m_out = re.search(r"--out-dir\s+([^\s]+)", cmd)
+            out_dir = str(Path(m_out.group(1)).expanduser()) if m_out else ""
+            procs.append({
+                "pid": int(pid_s),
+                "cpu_pct": cpu_s,
+                "etime": etime_s,
+                "out_dir": out_dir,
+                "command": cmd,
+            })
+    except Exception:
+        pass
+    return procs
+
+
+def _discover_output_dirs(extra_dir: str = "") -> list[str]:
+    """List candidate AOBA output directories containing mesh/Zarr/CSV/live preview files."""
+    candidates: list[Path] = []
+    base = get_output_dir("").parent
+    if base.exists():
+        for child in sorted(base.iterdir(), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True):
+            if child.is_dir():
+                if (child / "mesh.zarr").exists() or (child / "live_preview.npz").exists() or list(child.glob("year_*")):
+                    candidates.append(child)
+    if extra_dir:
+        ep = Path(extra_dir).expanduser()
+        if ep not in candidates and ep.exists():
+            candidates.insert(0, ep)
+    return [str(p) for p in candidates[:25]]
+
+
+# =============================================================================
+# Managed Process Controller (Launch & Safe Stop for GUI-spawned Runs Only)
+# =============================================================================
+class RunManager:
+    """Manages child `run_g5_30yr.py` subprocesses started from this GUI."""
+
+    def __init__(self, preview_engine: CPUGlobePreviewEngine) -> None:
+        self.engine = preview_engine
+        self._lock = threading.Lock()
+        self.proc: subprocess.Popen | None = None
+        self.proc_out_dir: str = ""
+        self.proc_log_path: str = ""
+        self.proc_toml_path: str = ""
+        self.last_watch_dir: str = ""
+
+    def get_managed_status(self) -> dict[str, Any]:
+        with self._lock:
+            if self.proc is None:
+                return {"running": False, "pid": None, "out_dir": self.proc_out_dir, "returncode": None}
+            rc = self.proc.poll()
+            return {
+                "running": rc is None,
+                "pid": self.proc.pid,
+                "out_dir": self.proc_out_dir,
+                "log_path": self.proc_log_path,
+                "toml_path": self.proc_toml_path,
+                "returncode": rc,
+            }
+
+    def start_run(
+        self,
+        cfg_dict: dict[str, dict[str, Any]],
+        device: str = "auto",
+        no_resume: bool = False,
+    ) -> dict[str, Any]:
+        with self._lock:
+            if self.proc is not None and self.proc.poll() is None:
+                return {"ok": False, "error": f"GUI から起動したジョブ (PID {self.proc.pid}) が既に稼働中です。"}
+
+            clean_cfg = sanitize_config_dict(cfg_dict)
+            g = int(clean_cfg["grid"]["glevel"])
+            yrs = int(clean_cfg["output"]["years"])
+            out_dir_raw = str(clean_cfg["output"].get("out_dir", "")).strip()
+            out_dir = Path(out_dir_raw).expanduser() if out_dir_raw else get_output_dir(f"glevel{g}_{yrs}yr")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            clean_cfg["output"]["out_dir"] = str(out_dir)
+
+            run_toml = out_dir / "run_config.toml"
+            save_aoba_toml(clean_cfg, run_toml)
+            log_path = out_dir / "run.log"
+
+            cmd = [sys.executable, "-u", str(_REPO_ROOT / "scripts" / "run_g5_30yr.py"), "--config", str(run_toml)]
+            if device and device != "auto":
+                cmd.extend(["--device", device])
+            if no_resume:
+                cmd.append("--no-resume")
+
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(_SRC_DIR)
+            log_file = open(log_path, "a", encoding="utf-8")
+            self.proc = subprocess.Popen(
+                cmd,
+                cwd=str(_REPO_ROOT),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+            )
+            log_file.close()
+            self.proc_out_dir = str(out_dir)
+            self.proc_log_path = str(log_path)
+            self.proc_toml_path = str(run_toml)
+            self.last_watch_dir = str(out_dir)
+            return {
+                "ok": True,
+                "pid": self.proc.pid,
+                "out_dir": str(out_dir),
+                "log_path": str(log_path),
+                "toml_path": str(run_toml),
+            }
+
+    def stop_managed_run(self) -> dict[str, Any]:
+        with self._lock:
+            if self.proc is None or self.proc.poll() is not None:
+                return {"ok": False, "error": "GUI 管理下の稼働中ジョブはありません（外部ジョブは保護のためここから停止できません）。"}
+            pid = self.proc.pid
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=2.0)
+            return {"ok": True, "pid": pid}
+
+    def build_monitor_payload(self, out_dir_str: str, source: str = "auto", frame_req: int = -1) -> dict[str, Any]:
+        active_procs = _discover_active_processes()
+        managed = self.get_managed_status()
+        discovered = _discover_output_dirs(self.last_watch_dir)
+
+        chosen_str = out_dir_str.strip()
+        if not chosen_str:
+            if managed.get("out_dir"):
+                chosen_str = managed["out_dir"]
+            elif active_procs and active_procs[0].get("out_dir"):
+                chosen_str = active_procs[0]["out_dir"]
+            elif discovered:
+                chosen_str = discovered[0]
+
+        payload: dict[str, Any] = {
+            "ok": True,
+            "out_dir": chosen_str,
+            "discovered_dirs": discovered,
+            "active_processes": active_procs,
+            "managed_run": managed,
+            "csv": {},
+            "log_tail": "",
+            "frames": [],
+            "active_frame_idx": -1,
+            "raster": None,
+            "meta": {},
+        }
+        if not chosen_str:
+            return payload
+
+        out_root = Path(chosen_str).expanduser()
+        if not out_root.exists():
+            payload["meta"] = {"status": "waiting_for_dir"}
+            return payload
+
+        payload["csv"] = _read_csv_series(out_root)
+        payload["log_tail"] = _tail_log_lines(out_root / "run.log", n_lines=80)
+
+        live_npz = out_root / "live_preview.npz"
+        snap_frames = _find_zarr_frames(out_root, "snapshots")
+        mon_frames = _find_zarr_frames(out_root, "monthly")
+
+        chosen_mode = source
+        if source == "auto":
+            if live_npz.exists():
+                chosen_mode = "live"
+            elif snap_frames:
+                chosen_mode = "snapshots"
+            elif mon_frames:
+                chosen_mode = "monthly"
+
+        if chosen_mode == "live" and live_npz.exists():
+            try:
+                mtime = live_npz.stat().st_mtime
+                cache_key = (str(out_root), "live", 0, mtime)
+                cached = self.engine._frame_cache.get(cache_key)
+                if cached is None:
+                    with np.load(live_npz) as zf:
+                        lat_deg = np.asarray(zf["lat_deg"], dtype=np.float32)
+                        lon_deg = np.asarray(zf["lon_deg"], dtype=np.float32)
+                        t2_c = np.asarray(zf["t2_k"], dtype=np.float32) - 273.15
+                        olr = np.asarray(zf["olr"], dtype=np.float32)
+                        lai = np.asarray(zf["lai"], dtype=np.float32)
+                        surf_type = np.asarray(zf["surf_type"], dtype=np.int8)
+                        yr = int(zf["year"])
+                        day_yr = float(zf["day_in_yr"])
+                        sim_days = float(zf["sim_days"])
+                        wall_spd = float(zf["wall_s_per_day"])
+                    raster = self.engine.regrid_fields(lat_deg, lon_deg, t2_c, olr, lai, surf_type)
+                    meta = {
+                        "source": "live_preview.npz",
+                        "year": yr,
+                        "day_in_yr": round(day_yr, 2),
+                        "sim_days": round(sim_days, 2),
+                        "wall_s_per_day": round(wall_spd, 2),
+                        "n_cells": int(lat_deg.size),
+                    }
+                    cached = {"raster": raster, "meta": meta}
+                    self.engine._frame_cache[cache_key] = cached
+                payload["raster"] = cached["raster"]
+                payload["meta"] = cached["meta"]
+                payload["frames"] = snap_frames if snap_frames else mon_frames
+                return payload
+            except Exception:
+                pass
+
+        frames = mon_frames if (chosen_mode == "monthly" and mon_frames) else (snap_frames if snap_frames else mon_frames)
+        kind_used = "monthly" if (chosen_mode == "monthly" and mon_frames) else ("snapshots" if snap_frames else "monthly")
+        payload["frames"] = frames
+        if frames:
+            idx = len(frames) - 1 if (frame_req < 0 or frame_req >= len(frames)) else int(frame_req)
+            finfo = frames[idx]
+            store_p = Path(finfo["store"])
+            mtime = store_p.stat().st_mtime if store_p.exists() else 0.0
+            cache_key = (str(out_root), kind_used, idx, mtime)
+            cached = self.engine._frame_cache.get(cache_key)
+            if cached is None:
+                try:
+                    lat_deg, lon_deg, t2_c, olr, lai, surf_type, src_lbl = _load_zarr_frame_payload(
+                        out_root, finfo, kind_used
+                    )
+                    raster = self.engine.regrid_fields(lat_deg, lon_deg, t2_c, olr, lai, surf_type)
+                    meta = {
+                        "source": src_lbl,
+                        "sim_days": round(float(finfo["sim_days"]), 2),
+                        "n_cells": int(lat_deg.size),
+                    }
+                    cached = {"raster": raster, "meta": meta}
+                    self.engine._frame_cache[cache_key] = cached
+                except Exception as exc:
+                    payload["meta"] = {"source": "error", "error": str(exc)}
+                    return payload
+            payload["raster"] = cached["raster"]
+            payload["meta"] = cached["meta"]
+            payload["active_frame_idx"] = idx
+        else:
+            payload["meta"] = {"source": "waiting_for_first_output"}
+
+        return payload
+
+
+# =============================================================================
+# Interactive Workbench HTML5 UI (Config + Run + Live 3 Rotating Globes)
+# =============================================================================
+_HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AOBA Studio — 設定・実行・監視・3地球リアルタイム可視化</title>
+<style>
+  :root {
+    --bg: #0c1119;
+    --panel: #141c27;
+    --panel-2: #1b2432;
+    --border: #2a374b;
+    --text: #e7eef8;
+    --muted: #93a4bd;
+    --accent: #38bdf8;
+    --accent-2: #34d399;
+    --warn: #fbbf24;
+    --danger: #f87171;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+  }
+  header {
+    background: linear-gradient(135deg, #101929 0%, #0d1423 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 22px;
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px;
+    position: sticky; top: 0; z-index: 30;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo-badge {
+    width: 38px; height: 38px; border-radius: 10px;
+    background: linear-gradient(135deg, #0284c7, #10b981);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; color: #fff; font-size: 16px;
+  }
+  .brand h1 { margin: 0; font-size: 17px; font-weight: 700; }
+  .brand p { margin: 0; font-size: 12px; color: var(--muted); }
+  .header-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .pill {
+    padding: 4px 10px; border-radius: 999px; font-size: 12px;
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+  }
+  .pill strong { color: var(--accent); }
+  .pill.modified strong { color: var(--warn); }
+  .pill.live { border-color: rgba(16, 185, 129, 0.5); color: #6ee7b7; }
+  button {
+    cursor: pointer; border-radius: 7px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text);
+    padding: 7px 13px; font-size: 13px; font-weight: 600;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  button:hover { background: #243043; border-color: #3d5270; }
+  button.primary { background: #0284c7; border-color: #0ea5e9; color: #fff; }
+  button.primary:hover { background: #0369a1; }
+  button.success { background: #059669; border-color: #10b981; color: #fff; }
+  button.success:hover { background: #047857; }
+  button.danger { background: #991b1b; border-color: #ef4444; color: #fee2e2; }
+  button.danger:hover { background: #7f1d1d; }
+  .tabs {
+    display: flex; gap: 4px; padding: 9px 22px 0;
+    border-bottom: 1px solid var(--border); background: #101620;
+    overflow-x: auto;
+  }
+  .tab-btn {
+    border: none; border-bottom: 2px solid transparent; border-radius: 6px 6px 0 0;
+    background: transparent; color: var(--muted); padding: 9px 14px; font-size: 13px;
+    white-space: nowrap;
+  }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); background: var(--panel); }
+  main { padding: 18px 22px 60px; max-width: 1520px; margin: 0 auto; }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+  .grid-2 { display: grid; grid-template-columns: 1.15fr 1fr; gap: 18px; }
+  .globes-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 1120px) { .grid-2, .globes-3 { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px 18px; margin-bottom: 16px;
+  }
+  .card h2 { margin: 0 0 6px; font-size: 15px; color: #f1f5f9; }
+  .card .sub { margin: 0 0 12px; font-size: 12.5px; color: var(--muted); }
+  .field-row {
+    display: grid; grid-template-columns: 1fr 165px; gap: 10px;
+    align-items: center; padding: 8px 0; border-bottom: 1px solid #1e2837;
+  }
+  .field-row:last-child { border-bottom: none; }
+  .field-label { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  .field-desc { font-size: 11.5px; color: var(--muted); }
+  .tag-mod {
+    font-size: 10px; padding: 1px 6px; border-radius: 4px;
+    background: rgba(251, 191, 36, 0.16); color: var(--warn); border: 1px solid rgba(251, 191, 36, 0.35);
+  }
+  input[type="text"], input[type="number"], select, textarea {
+    width: 100%; background: #0a0f17; border: 1px solid var(--border);
+    color: var(--text); border-radius: 6px; padding: 6px 9px;
+    font-size: 13px; font-family: var(--mono);
+  }
+  input[type="range"] { width: 100%; accent-color: var(--accent); }
+  .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
+  .switch input { width: 17px; height: 17px; accent-color: var(--accent-2); }
+  canvas { display: block; width: 100%; background: #070b12; border-radius: 10px; border: 1px solid #223045; }
+  .globe-card {
+    background: #0d131d; border: 1px solid #26344a; border-radius: 12px;
+    padding: 12px; text-align: center;
+  }
+  .globe-card h3 { margin: 0 0 4px; font-size: 14px; color: #e2e8f0; }
+  .globe-card .g-sub { font-size: 11.5px; color: var(--muted); margin-bottom: 8px; }
+  .globe-canvas { width: 100%; max-width: 310px; aspect-ratio: 1 / 1; margin: 0 auto; cursor: grab; border-radius: 10px; }
+  .globe-canvas:active { cursor: grabbing; }
+  .cbar {
+    height: 10px; border-radius: 5px; margin: 10px 16px 4px; border: 1px solid #334155;
+  }
+  .cbar-labels {
+    display: flex; justify-content: space-between; font-size: 11px; color: var(--muted);
+    font-family: var(--mono); padding: 0 14px;
+  }
+  .kpi-strip {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 10px; margin-top: 10px;
+  }
+  .kpi {
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px;
+  }
+  .kpi .k-title { font-size: 11px; color: var(--muted); }
+  .kpi .k-val { font-size: 15px; font-weight: 700; color: var(--accent); font-family: var(--mono); }
+  .preset-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; align-items: center; }
+  .cmd-box {
+    background: #0a0e14; border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font-family: var(--mono); font-size: 12px; color: #a5f3fc;
+    overflow-x: auto; white-space: nowrap;
+  }
+  .registry-layout { display: grid; grid-template-columns: 260px 1fr; gap: 16px; }
+  @media (max-width: 900px) { .registry-layout { grid-template-columns: 1fr; } }
+  .sec-list button {
+    width: 100%; text-align: left; margin-bottom: 5px; display: flex;
+    justify-content: space-between; align-items: center; font-weight: 500;
+  }
+  .sec-list button.active { background: #0c4a6e; border-color: #38bdf8; color: #fff; }
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; background: #064e3b;
+    border: 1px solid #10b981; color: #ecfdf5; padding: 10px 16px;
+    border-radius: 8px; font-size: 13px; font-weight: 600; display: none; z-index: 60;
+  }
+  .tree-box, .log-box {
+    background: #090d14; border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap;
+    overflow: auto; color: #cbd5e1; max-height: 290px;
+  }
+  .hover-banner {
+    background: #101a28; border: 1px solid #2b4263; border-radius: 8px;
+    padding: 8px 14px; font-family: var(--mono); font-size: 12.5px; color: #bae6fd;
+    margin-bottom: 12px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px;
+  }
+  .docs-layout { display: grid; grid-template-columns: 280px 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 960px) { .docs-layout { grid-template-columns: 1fr; } }
+  .doc-sidebar { position: sticky; top: 76px; max-height: calc(100vh - 100px); overflow-y: auto; }
+  .toc-link {
+    display: block; padding: 4px 6px; font-size: 12px; color: var(--muted);
+    text-decoration: none; border-radius: 5px; cursor: pointer;
+  }
+  .toc-link:hover { background: var(--panel-2); color: var(--accent); }
+  .toc-link.h3 { padding-left: 16px; font-size: 11.5px; }
+  .doc-content { max-height: calc(100vh - 140px); overflow-y: auto; padding: 20px 26px; font-size: 14px; line-height: 1.72; }
+  .doc-content h1 { font-size: 22px; margin-top: 0; border-bottom: 1px solid var(--border); padding-bottom: 8px; color: #f8fafc; }
+  .doc-content h2 { font-size: 17px; margin-top: 26px; border-bottom: 1px solid #223045; padding-bottom: 5px; color: var(--accent); }
+  .doc-content h3 { font-size: 15px; margin-top: 18px; color: #a7f3d0; }
+  .doc-content table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 12.5px; }
+  .doc-content th, .doc-content td { border: 1px solid var(--border); padding: 6px 9px; text-align: left; vertical-align: top; }
+  .doc-content th { background: var(--panel-2); color: #f1f5f9; }
+  .doc-content pre { background: #090d14; border: 1px solid var(--border); padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 12px; }
+  .doc-content code { background: #0d1522; padding: 1px 5px; border-radius: 4px; font-family: var(--mono); font-size: 12.5px; color: #bae6fd; }
+  .doc-content pre code { background: transparent; padding: 0; }
+  .doc-content blockquote { border-left: 3px solid var(--accent); margin: 10px 0; padding: 4px 12px; color: var(--muted); background: #101723; border-radius: 0 6px 6px 0; }
+  .math-block {
+    background: #0d1523; border: 1px solid #24344c; border-radius: 8px;
+    padding: 10px 16px; margin: 12px 0; overflow-x: auto;
+    font-family: "STIX Two Math", "Cambria Math", Georgia, serif; font-size: 15px; text-align: center; color: #f1f5f9;
+  }
+  .math-inline { font-family: "STIX Two Math", "Cambria Math", Georgia, serif; font-style: italic; color: #e0f2fe; padding: 0 1px; }
+  .math-frac { display: inline-flex; flex-direction: column; vertical-align: middle; text-align: center; font-size: 0.88em; margin: 0 3px; }
+  .math-frac > span:first-child { border-bottom: 1px solid #cbd5e1; padding: 0 4px 1px; }
+  .math-frac > span:last-child { padding: 1px 4px 0; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo-badge">AO</div>
+    <div>
+      <h1>AOBA Studio</h1>
+      <p data-i18n="brand_sub">設定 (TOML <span id="param-total">188</span>項目) → 実行 → 監視 → CPU リアルタイム 3地球可視化</p>
+    </div>
+  </div>
+  <div class="header-actions">
+    <span class="pill" id="mod-pill"><span data-i18n="mod_prefix">変更:</span> <strong id="mod-count">0</strong></span>
+    <span class="pill" id="run-badge" data-i18n="run_idle">実行監視待機中</span>
+    <button id="lang-btn" onclick="toggleLang()">🌐 日本語 / EN</button>
+    <button onclick="resetAll()" data-i18n="btn_reset">デフォルトに戻す</button>
+    <button class="success" onclick="saveTomlPrompt()" data-i18n="btn_save">TOML保存</button>
+    <button class="primary" onclick="launchFromStudio()" data-i18n="btn_launch">▶ この設定で実行＆監視</button>
+  </div>
+</header>
+
+<div class="tabs">
+  <button class="tab-btn active" onclick="switchTab('grid', this)" data-i18n="tab_grid">1. 格子・Glevel可視化</button>
+  <button class="tab-btn" onclick="switchTab('forcing', this)" data-i18n="tab_forcing">2. 惑星外力・動的氷床</button>
+  <button class="tab-btn" onclick="switchTab('output', this)" data-i18n="tab_output">3. 出力ファイル・間隔</button>
+  <button class="tab-btn" onclick="switchTab('registry', this)" data-i18n="tab_registry">4. 全物理パラメタ (188)</button>
+  <button class="tab-btn" onclick="switchTab('monitor', this)" data-i18n="tab_monitor">5. 実行・監視＆3地球プレビュー 🌍</button>
+  <button class="tab-btn" onclick="switchTab('toml', this)" data-i18n="tab_toml">6. TOML・CLI</button>
+  <button class="tab-btn" onclick="switchTab('docs', this)" data-i18n="tab_docs">7. ドキュメント 📖</button>
+</div>
+
+<main>
+  <!-- TAB 1: GRID & VISUAL DIAGRAM -->
+  <div id="tab-grid" class="tab-pane active">
+    <div class="grid-2">
+      <div class="card">
+        <h2 data-i18n="g_canvas_title">全球正20面体 SCVT 格子 &amp; 埋め込み CRM スケール図</h2>
+        <p class="sub" data-i18n="g_canvas_sub">Glevel に応じた全球 Voronoi セル分割と、埋め込まれる周期 CRM 領域・鉛直ストレッチ層をリアルタイム描画します。</p>
+        <canvas id="gridCanvas" width="760" height="440"></canvas>
+        <div class="kpi-strip">
+          <div class="kpi"><div class="k-title" data-i18n="kpi_ncell">全球セル数 N<sub>cell</sub></div><div class="k-val" id="kpi-ncell">-</div></div>
+          <div class="kpi"><div class="k-title" data-i18n="kpi_dx">ホスト平均格子幅 Δx</div><div class="k-val" id="kpi-dx">-</div></div>
+          <div class="kpi"><div class="k-title" data-i18n="kpi_crmw">CRM ドメイン幅</div><div class="k-val" id="kpi-crmw">-</div></div>
+          <div class="kpi"><div class="k-title" data-i18n="kpi_subcols">全球総サブカラム数</div><div class="k-val" id="kpi-subcols">-</div></div>
+          <div class="kpi"><div class="k-title" data-i18n="kpi_pts">総3D格子点 (×nz)</div><div class="k-val" id="kpi-pts">-</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2 data-i18n="g_ctrl_title">水平解像度 (SCVT) &amp; 子領域 CRM 設定</h2>
+        <div class="preset-bar">
+          <button onclick="applyGridPreset(3, 8, 1, 8000, 32, 720)" data-i18n="pre_g3">標準軽量 (G3, 8×1)</button>
+          <button onclick="applyGridPreset(4, 8, 1, 8000, 32, 720)" data-i18n="pre_g4">長期気候 (G4, 8×1)</button>
+          <button onclick="applyGridPreset(5, 8, 1, 8000, 32, 720)" data-i18n="pre_g5">高解像度 (G5, 8×1)</button>
+          <button onclick="applyGridPreset(4, 8, 8, 4000, 32, 600)" data-i18n="pre_3dcrm">3D CRM (G4, 8×8, 4km)</button>
+        </div>
+        <div class="field-row">
+          <div>
+            <div class="field-label">glevel <span class="field-desc">(正20面体再帰分割レベル: 0〜6)</span></div>
+            <input type="range" id="rng-glevel" min="0" max="6" step="1" oninput="setKey('grid','glevel',parseInt(this.value))" />
+          </div>
+          <input type="number" id="inp-grid-glevel" min="0" max="7" step="1" onchange="setKey('grid','glevel',parseInt(this.value))" />
+        </div>
+        <div id="grid-fields"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 2: FORCING & DYNAMIC ICESHEET -->
+  <div id="tab-forcing" class="tab-pane">
+    <div class="preset-bar">
+      <button onclick="applyForcingPreset('present')" data-i18n="pre_present">現代気候 (400 ppmv, 1×Ω)</button>
+      <button onclick="applyForcingPreset('half_omega')" data-i18n="pre_half_w">自転半減実験 (0.5×Ω)</button>
+      <button onclick="applyForcingPreset('slow_rot')" data-i18n="pre_slow_w">超低速自転 (0.25×Ω)</button>
+      <button onclick="applyForcingPreset('lgm')" data-i18n="pre_lgm">氷期実験 (185 ppmv + 動的氷床)</button>
+      <button onclick="applyForcingPreset('4xco2')" data-i18n="pre_4co2">4×CO₂ 温暖化 + 動的氷床</button>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <h2 data-i18n="f_title">惑星・軌道・大気境界外力 (Forcing)</h2>
+        <div id="forcing-fields"></div>
+      </div>
+      <div>
+        <div class="card">
+          <h2 data-i18n="ice_title">平衡/加速 SIA 氷床モデル設定 (Dynamic Ice Sheet)</h2>
+          <div id="icesheet-fields"></div>
+        </div>
+        <div class="card">
+          <h2 data-i18n="ice_chart_title">氷床加速係数 &amp; EMA 減衰曲線</h2>
+          <canvas id="iceCanvas" width="600" height="220"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 3: OUTPUT STREAMS & CADENCE -->
+  <div id="tab-output" class="tab-pane">
+    <div class="grid-2">
+      <div class="card">
+        <h2 data-i18n="out_title">出力ファイル種類・時間平均 / 瞬時値・変数群</h2>
+        <div id="output-fields"></div>
+      </div>
+      <div class="card">
+        <h2 data-i18n="out_tree_title">出力ディレクトリ構成 &amp; 推定データ容量</h2>
+        <div class="kpi-strip">
+          <div class="kpi"><div class="k-title" data-i18n="est_mean">時間平均 Zarr / 年</div><div class="k-val" id="est-mean-gb">-</div></div>
+          <div class="kpi"><div class="k-title" data-i18n="est_snap">瞬時値 Zarr / 年</div><div class="k-val" id="est-snap-gb">-</div></div>
+          <div class="kpi"><div class="k-title" data-i18n="est_rst">リスタート / 回</div><div class="k-val" id="est-rst-gb">-</div></div>
+          <div class="kpi"><div class="k-title" data-i18n="est_tot">合計 (全期間)</div><div class="k-val" id="est-total-gb">-</div></div>
+        </div>
+        <h3 style="margin:14px 0 6px; font-size:13px; color:var(--muted);" data-i18n="out_struct_lbl">生成されるディレクトリ構造</h3>
+        <div class="tree-box" id="output-tree"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 4: FULL PARAMETER REGISTRY -->
+  <div id="tab-registry" class="tab-pane">
+    <div class="card" style="padding:12px 16px; display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
+      <input type="text" id="search-box" placeholder="パラメタ名で検索 (例: v_cmax, albedo, sia, mynn...)" style="max-width:420px;" oninput="renderRegistrySection()" />
+      <label class="switch"><input type="checkbox" id="filter-mod" onchange="renderRegistrySection()" /> 変更された項目のみ表示</label>
+    </div>
+    <div class="registry-layout">
+      <div class="card sec-list" id="sec-buttons"></div>
+      <div class="card">
+        <h2 id="reg-sec-title">-</h2>
+        <p class="sub">保存された TOML から起動時に各モジュール定数・Metal カーネル定数へ自動同期されます。</p>
+        <div id="reg-fields"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 5: RUN, MONITOR & 3 ROTATING ORTHOGRAPHIC GLOBES -->
+  <div id="tab-monitor" class="tab-pane">
+    <div class="card">
+      <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between;">
+        <div>
+          <h2 style="margin:0;" data-i18n="mon_ctrl_title">実行コントロール ＆ CPU リアルタイム監視</h2>
+          <p class="sub" style="margin:2px 0 0;" data-i18n="mon_ctrl_sub">MPS GPU 上で稼働中の計算（既存の外部ジョブやこの画面から起動した実験）を邪魔せず、CPU バックグラウンド処理でリアルタイムプレビューを生成します。</p>
+        </div>
+        <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+          <select id="launch-device" style="width:110px;">
+            <option value="auto">Auto (MPS)</option>
+            <option value="mps">MPS GPU</option>
+            <option value="cpu">CPU</option>
+          </select>
+          <label class="switch" style="font-size:12px;"><input type="checkbox" id="launch-no-resume" /> <span data-i18n="lbl_no_resume">最初から (--no-resume)</span></label>
+          <button class="primary" onclick="launchFromStudio()" data-i18n="btn_run_new">▶ この設定で新規実行</button>
+          <button class="danger" id="btn-stop-run" onclick="stopManagedRun()" style="display:none;" data-i18n="btn_stop">■ 起動ジョブを停止</button>
+        </div>
+      </div>
+
+      <div style="display:grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap:10px; margin-top:12px; align-items:end;">
+        <div>
+          <label style="font-size:11.5px; color:var(--muted);" data-i18n="lbl_watch_dir">監視対象の出力ディレクトリ (既存実験を選択)</label>
+          <select id="watch-dir-select" onchange="onWatchDirSelect(this.value)"></select>
+        </div>
+        <div>
+          <label style="font-size:11.5px; color:var(--muted);" data-i18n="lbl_watch_src">表示ソース</label>
+          <select id="watch-source" onchange="fetchMonitorOnce()">
+            <option value="auto" data-i18n="opt_auto">自動 (Live優先 / Zarr)</option>
+            <option value="live" data-i18n="opt_live">Live Preview (日次)</option>
+            <option value="snapshots" data-i18n="opt_snap">Snapshots Zarr (瞬時値)</option>
+            <option value="monthly" data-i18n="opt_mon">Monthly Zarr (月平均)</option>
+          </select>
+        </div>
+        <div>
+          <label style="font-size:11.5px; color:var(--muted);" data-i18n="lbl_watch_frame">履歴フレーム選択 (Zarr閲覧時)</label>
+          <select id="watch-frame" onchange="fetchMonitorOnce()"></select>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button onclick="fetchMonitorOnce()" style="flex:1;" data-i18n="btn_refresh">⟳ 今すぐ更新</button>
+          <label class="switch" style="font-size:12px;"><input type="checkbox" id="auto-poll" checked /> <span data-i18n="lbl_autopoll">5秒自動</span></label>
+        </div>
+      </div>
+
+      <div class="kpi-strip">
+        <div class="kpi"><div class="k-title" data-i18n="mkpi_proc">稼働プロセス</div><div class="k-val" id="mon-proc">-</div></div>
+        <div class="kpi"><div class="k-title" data-i18n="mkpi_time">表示データ時刻</div><div class="k-val" id="mon-time">-</div></div>
+        <div class="kpi"><div class="k-title" data-i18n="mkpi_src">データソース</div><div class="k-val" id="mon-src" style="font-size:12px;">-</div></div>
+        <div class="kpi"><div class="k-title" data-i18n="mkpi_cpu">CPU 投影処理時間</div><div class="k-val" id="mon-cpums">-</div></div>
+        <div class="kpi"><div class="k-title" data-i18n="mkpi_latest">最新全球 T<sub>s</sub> / OLR / LAI</div><div class="k-val" id="mon-latest" style="font-size:12.5px;">-</div></div>
+      </div>
+    </div>
+
+    <!-- 3 ROTATING ORTHOGRAPHIC GLOBES -->
+    <div class="card">
+      <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px;">
+        <div>
+          <h2 style="margin:0;" data-i18n="globes_title">3地球 リアルタイム正射図法プレビュー (T<sub>2</sub> ・ OLR ・ LAI)</h2>
+          <p class="sub" style="margin:2px 0 0;" data-i18n="globes_sub">ドラッグで任意の緯度経度へ傾け・回転できます。3つの地球儀が同期してゆっくり自転します。</p>
+        </div>
+        <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
+          <label class="switch" style="font-size:12.5px;"><input type="checkbox" id="globe-spin" checked /> <span data-i18n="lbl_spin">自動回転</span></label>
+          <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted);">
+            <span data-i18n="lbl_speed">速度</span>
+            <input type="range" id="globe-speed" min="2" max="45" value="12" style="width:95px;" />
+          </div>
+          <label class="switch" style="font-size:12.5px;"><input type="checkbox" id="globe-grid" checked /> <span data-i18n="lbl_grid">経緯線</span></label>
+          <button onclick="resetGlobeView()" style="padding:5px 10px; font-size:12px;" data-i18n="btn_reset_view">視点リセット</button>
+        </div>
+      </div>
+
+      <div class="hover-banner">
+        <span id="hover-coords" data-i18n="hover_hint">地球儀の上にマウスを置くと、その地点の緯度経度・T₂・OLR・LAI が表示されます</span>
+        <span id="view-angles" style="color:var(--muted);">Center: lat +18.0°, lon +140.0°</span>
+      </div>
+
+      <div class="globes-3">
+        <div class="globe-card">
+          <h3 data-i18n="g_t2_title">地表付近気温 T<sub>2</sub> [°C]</h3>
+          <div class="g-sub">0.35 T<sub>sfc</sub> + 0.65 T<sub>a,z1</sub></div>
+          <canvas id="globeT2" class="globe-canvas" width="300" height="300"></canvas>
+          <div class="cbar" style="background:linear-gradient(90deg, #1e1b4b, #1d4ed8, #38bdf8, #fde047, #f97316, #b91c1c);"></div>
+          <div class="cbar-labels"><span>-45°C</span><span>-10°C</span><span>+15°C</span><span>+40°C</span></div>
+        </div>
+        <div class="globe-card">
+          <h3 data-i18n="g_olr_title">大気上端外向き長波放射 OLR [W m⁻²]</h3>
+          <div class="g-sub" data-i18n="g_olr_sub">雲頂高度・亜熱帯乾燥帯のトレーサ</div>
+          <canvas id="globeOLR" class="globe-canvas" width="300" height="300"></canvas>
+          <div class="cbar" style="background:linear-gradient(90deg, #0f172a, #4c1d95, #be185d, #f59e0b, #fef08a);"></div>
+          <div class="cbar-labels"><span>100</span><span>180</span><span>260</span><span>340 W/m²</span></div>
+        </div>
+        <div class="globe-card">
+          <h3 data-i18n="g_lai_title">葉面積指数 LAI [m² m⁻²]</h3>
+          <div class="g-sub" data-i18n="g_lai_sub">自律 EEO バイオーム分布（海＝濃紺・氷床＝白）</div>
+          <canvas id="globeLAI" class="globe-canvas" width="300" height="300"></canvas>
+          <div class="cbar" style="background:linear-gradient(90deg, #92704a, #a3a332, #4d9e38, #15803d, #064e3b);"></div>
+          <div class="cbar-labels"><span>0</span><span>2</span><span>4</span><span>7 m²/m²</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h2 data-i18n="ts_title">全球平均時系列モニター (`daily_global.csv`)</h2>
+        <canvas id="tsCanvas" width="700" height="270"></canvas>
+      </div>
+      <div class="card">
+        <h2 data-i18n="log_title">実行ログリアルタイム表示 (`run.log`)</h2>
+        <div class="log-box" id="run-log-box">...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 6: LIVE TOML & RUN COMMAND -->
+  <div id="tab-toml" class="tab-pane">
+    <div class="card">
+      <h2 data-i18n="toml_cmd_title">設定ファイルを指定した手動実行コマンド</h2>
+      <div class="cmd-box" id="run-cmd-box"></div>
+      <div style="margin-top:10px; display:flex; gap:8px;">
+        <button onclick="copyRunCmd()" data-i18n="btn_copy_cmd">コマンドをコピー</button>
+        <button onclick="downloadToml()" data-i18n="btn_dl_toml">TOMLダウンロード</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2 data-i18n="toml_preview_title">統合設定 TOML プレビュー</h2>
+      <div style="display:flex; gap:8px; margin-bottom:10px; align-items:center;">
+        <span style="font-size:13px; color:var(--muted); min-width:85px;" data-i18n="lbl_save_path">保存パス:</span>
+        <input type="text" id="toml-path-input" />
+        <button class="success" onclick="saveTomlDirect()" data-i18n="btn_save_direct">保存</button>
+      </div>
+      <textarea id="toml-preview" rows="24" readonly></textarea>
+    </div>
+  </div>
+
+  <!-- TAB 7: MODEL DOCUMENTATION READER -->
+  <div id="tab-docs" class="tab-pane">
+    <div class="docs-layout">
+      <div class="card doc-sidebar">
+        <h2 data-i18n="docs_menu_title">モデルドキュメント</h2>
+        <div style="display:flex; flex-direction:column; gap:6px; margin-bottom:12px;">
+          <button onclick="loadDoc('formulation')" id="docbtn-formulation" class="primary" data-i18n="doc_formulation">数理定式化モデル記述書 (全12章)</button>
+          <button onclick="loadDoc('architecture')" id="docbtn-architecture" data-i18n="doc_architecture">アーキテクチャ ＆ 根拠文献</button>
+          <button onclick="loadDoc('readme')" id="docbtn-readme" data-i18n="doc_readme">概要・クイックスタート (README)</button>
+        </div>
+        <div style="font-size:11.5px; color:var(--muted); margin-bottom:6px;" id="doc-filename-badge">-</div>
+        <hr style="border:none; border-top:1px solid var(--border); margin:10px 0;" />
+        <div style="font-size:12px; font-weight:700; color:var(--muted); margin-bottom:6px;" data-i18n="docs_toc_title">目次 (クリックで移動)</div>
+        <div id="doc-toc"></div>
+      </div>
+      <div class="card doc-content" id="doc-viewer">
+        <p style="color:var(--muted);">Loading documentation...</p>
+      </div>
+    </div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let STATE = { defaults: {}, config: {}, section_meta: {}, toml_path: "", param_count: 0 };
+let LANG = "ja";
+let CURRENT_DOC_BASE = "formulation";
+let ACTIVE_REG_SEC = "constants";
+let MON = { raster: null, rawT2: null, rawOLR: null, rawLAI: null, rawSurf: null, rawCoast: null, outDir: "" };
+let GLOBE_VIEW = { lat0: 18.0, lon0: 140.0, dragging: false, lastX: 0, lastY: 0, geoCacheLat: null, geoCache: null };
+
+const I18N = {
+  ja: {
+    brand_sub: '設定 (TOML <span id="param-total">188</span>項目) → 実行 → 監視 → CPU リアルタイム 3地球可視化',
+    mod_prefix: "変更:",
+    run_idle: "実行監視待機中",
+    btn_reset: "デフォルトに戻す",
+    btn_save: "TOML保存",
+    btn_launch: "▶ この設定で実行＆監視",
+    tab_grid: "1. 格子・Glevel可視化",
+    tab_forcing: "2. 惑星外力・動的氷床",
+    tab_output: "3. 出力ファイル・間隔",
+    tab_registry: "4. 全物理パラメタ (188)",
+    tab_monitor: "5. 実行・監視＆3地球プレビュー 🌍",
+    tab_toml: "6. TOML・CLI",
+    tab_docs: "7. ドキュメント 📖",
+    g_canvas_title: "全球正20面体 SCVT 格子 & 埋め込み CRM スケール図",
+    g_canvas_sub: "Glevel に応じた全球 Voronoi セル分割と、埋め込まれる周期 CRM 領域・鉛直ストレッチ層をリアルタイム描画します。",
+    kpi_ncell: "全球セル数 N<sub>cell</sub>",
+    kpi_dx: "ホスト平均格子幅 Δx",
+    kpi_crmw: "CRM ドメイン幅",
+    kpi_subcols: "全球総サブカラム数",
+    kpi_pts: "総3D格子点 (×nz)",
+    g_ctrl_title: "水平解像度 (SCVT) & 子領域 CRM 設定",
+    pre_g3: "標準軽量 (G3, 8×1)",
+    pre_g4: "長期気候 (G4, 8×1)",
+    pre_g5: "高解像度 (G5, 8×1)",
+    pre_3dcrm: "3D CRM (G4, 8×8, 4km)",
+    pre_present: "現代気候 (400 ppmv, 1×Ω)",
+    pre_half_w: "自転半減実験 (0.5×Ω)",
+    pre_slow_w: "超低速自転 (0.25×Ω)",
+    pre_lgm: "氷期実験 (185 ppmv + 動的氷床)",
+    pre_4co2: "4×CO₂ 温暖化 + 動的氷床",
+    f_title: "惑星・軌道・大気境界外力 (Forcing)",
+    ice_title: "平衡/加速 SIA 氷床モデル設定 (Dynamic Ice Sheet)",
+    ice_chart_title: "氷床加速係数 & EMA 減衰曲線",
+    out_title: "出力ファイル種類・時間平均 / 瞬時値・変数群",
+    out_tree_title: "出力ディレクトリ構成 & 推定データ容量",
+    est_mean: "時間平均 Zarr / 年",
+    est_snap: "瞬時値 Zarr / 年",
+    est_rst: "リスタート / 回",
+    est_tot: "合計 (全期間)",
+    out_struct_lbl: "生成されるディレクトリ構造",
+    mon_ctrl_title: "実行コントロール ＆ CPU リアルタイム監視",
+    mon_ctrl_sub: "MPS GPU 上で稼働中の計算（既存の外部ジョブやこの画面から起動した実験）を邪魔せず、CPU バックグラウンド処理でリアルタイムプレビューを生成します。",
+    lbl_no_resume: "最初から (--no-resume)",
+    btn_run_new: "▶ この設定で新規実行",
+    btn_stop: "■ 起動ジョブを停止",
+    lbl_watch_dir: "監視対象の出力ディレクトリ (既存実験を選択)",
+    lbl_watch_src: "表示ソース",
+    opt_auto: "自動 (Live優先 / Zarr)",
+    opt_live: "Live Preview (日次)",
+    opt_snap: "Snapshots Zarr (瞬時値)",
+    opt_mon: "Monthly Zarr (月平均)",
+    lbl_watch_frame: "履歴フレーム選択 (Zarr閲覧時)",
+    btn_refresh: "⟳ 今すぐ更新",
+    lbl_autopoll: "5秒自動",
+    mkpi_proc: "稼働プロセス",
+    mkpi_time: "表示データ時刻",
+    mkpi_src: "データソース",
+    mkpi_cpu: "CPU 投影処理時間",
+    mkpi_latest: "最新全球 T<sub>s</sub> / OLR / LAI",
+    globes_title: "3地球 リアルタイム正射図法プレビュー (T<sub>2</sub> ・ OLR ・ LAI)",
+    globes_sub: "ドラッグで任意の緯度経度へ傾け・回転できます。3つの地球儀が同期してゆっくり自転します。",
+    lbl_spin: "自動回転",
+    lbl_speed: "速度",
+    lbl_grid: "経緯線",
+    btn_reset_view: "視点リセット",
+    hover_hint: "地球儀の上にマウスを置くと、その地点の緯度経度・T₂・OLR・LAI が表示されます",
+    g_t2_title: "地表付近気温 T<sub>2</sub> [°C]",
+    g_olr_title: "大気上端外向き長波放射 OLR [W m⁻²]",
+    g_olr_sub: "雲頂高度・亜熱帯乾燥帯のトレーサ",
+    g_lai_title: "葉面積指数 LAI [m² m⁻²]",
+    g_lai_sub: "自律 EEO バイオーム分布（海＝濃紺・氷床＝白）",
+    ts_title: "全球平均時系列モニター (daily_global.csv)",
+    log_title: "実行ログリアルタイム表示 (run.log)",
+    toml_cmd_title: "設定ファイルを指定した手動実行コマンド",
+    btn_copy_cmd: "コマンドをコピー",
+    btn_dl_toml: "TOMLダウンロード",
+    toml_preview_title: "統合設定 TOML プレビュー",
+    lbl_save_path: "保存パス:",
+    btn_save_direct: "保存",
+    docs_menu_title: "モデルドキュメント",
+    doc_formulation: "数理定式化モデル記述書 (全12章)",
+    doc_architecture: "アーキテクチャ ＆ 根拠文献",
+    doc_readme: "概要・クイックスタート (README)",
+    docs_toc_title: "目次 (クリックで移動)",
+  },
+  en: {
+    brand_sub: 'Config (TOML <span id="param-total">188</span> keys) → Launch → Monitor → CPU Real-Time 3-Globe Preview',
+    mod_prefix: "Modified:",
+    run_idle: "Monitor Idle",
+    btn_reset: "Reset Defaults",
+    btn_save: "Save TOML",
+    btn_launch: "▶ Launch & Monitor",
+    tab_grid: "1. Grid & Glevel",
+    tab_forcing: "2. Forcing & Ice Sheet",
+    tab_output: "3. Output & Cadence",
+    tab_registry: "4. All Parameters (188)",
+    tab_monitor: "5. Run, Monitor & 3 Globes 🌍",
+    tab_toml: "6. TOML & CLI",
+    tab_docs: "7. Documentation 📖",
+    g_canvas_title: "Global Icosahedral SCVT Mesh & Embedded CRM Scale Diagram",
+    g_canvas_sub: "Live visualization of recursive icosahedral Voronoi cells, nested periodic CRM domain, and stretched vertical levels.",
+    kpi_ncell: "Global Cells N<sub>cell</sub>",
+    kpi_dx: "Host Cell Width Δx",
+    kpi_crmw: "CRM Domain Width",
+    kpi_subcols: "Total Subcolumns",
+    kpi_pts: "Total 3D Points (×nz)",
+    g_ctrl_title: "Horizontal Resolution (SCVT) & Subgrid CRM Settings",
+    pre_g3: "Light Test (G3, 8×1)",
+    pre_g4: "Climate Run (G4, 8×1)",
+    pre_g5: "High-Res (G5, 8×1)",
+    pre_3dcrm: "3D CRM (G4, 8×8, 4km)",
+    pre_present: "Present Day (400 ppmv, 1×Ω)",
+    pre_half_w: "Half Rotation (0.5×Ω)",
+    pre_slow_w: "Slow Rotation (0.25×Ω)",
+    pre_lgm: "LGM (185 ppmv + Dynamic Ice)",
+    pre_4co2: "4×CO₂ + Dynamic Ice Sheet",
+    f_title: "Planetary, Orbital & Atmospheric Forcing",
+    ice_title: "Equilibrium / Accelerated SIA Ice Sheet (Dynamic Ice Sheet)",
+    ice_chart_title: "Ice-Sheet Acceleration & EMA Weight Curve",
+    out_title: "Output File Types, Averaging vs Instantaneous & Variable Groups",
+    out_tree_title: "Output Directory Layout & Estimated Disk Usage",
+    est_mean: "Time-Mean Zarr / yr",
+    est_snap: "Snapshots Zarr / yr",
+    est_rst: "Restart / checkpoint",
+    est_tot: "Total Footprint",
+    out_struct_lbl: "Generated Directory Structure",
+    mon_ctrl_title: "Run Control & Idle-CPU Live Monitor",
+    mon_ctrl_sub: "Spawns runs or attaches to existing active runs without disturbing MPS GPU compute; regrids 3-globe previews strictly on CPU.",
+    lbl_no_resume: "Fresh Start (--no-resume)",
+    btn_run_new: "▶ Launch This Config",
+    btn_stop: "■ Stop GUI Run",
+    lbl_watch_dir: "Target Output Directory (auto-discovered)",
+    lbl_watch_src: "Data Source",
+    opt_auto: "Auto (Live / Zarr)",
+    opt_live: "Live Preview (Daily)",
+    opt_snap: "Snapshots Zarr (Inst.)",
+    opt_mon: "Monthly Zarr (Mean)",
+    lbl_watch_frame: "History Frame (Zarr)",
+    btn_refresh: "⟳ Refresh Now",
+    lbl_autopoll: "Auto 5s",
+    mkpi_proc: "Active Process",
+    mkpi_time: "Simulated Time",
+    mkpi_src: "Active Source",
+    mkpi_cpu: "CPU Regrid Time",
+    mkpi_latest: "Global Mean T<sub>s</sub> / OLR / LAI",
+    globes_title: "Live Rotating 3-Globe Orthographic Preview (T<sub>2</sub> · OLR · LAI)",
+    globes_sub: "Drag any globe to tilt or spin synchronously across latitude and longitude.",
+    lbl_spin: "Auto Spin",
+    lbl_speed: "Speed",
+    lbl_grid: "Graticule",
+    btn_reset_view: "Reset View",
+    hover_hint: "Hover over any globe to inspect latitude, longitude, surface type, T₂, OLR, and LAI",
+    g_t2_title: "Surface Air Temperature T<sub>2</sub> [°C]",
+    g_olr_title: "Outgoing Longwave Radiation OLR [W m⁻²]",
+    g_olr_sub: "Cloud-top height & subtropical dry belts",
+    g_lai_title: "Leaf Area Index LAI [m² m⁻²]",
+    g_lai_sub: "Autonomous EEO biomes (Ocean=Navy, Ice=White)",
+    ts_title: "Global-Mean Time Series (daily_global.csv)",
+    log_title: "Live Run Log (run.log)",
+    toml_cmd_title: "CLI Execution Command with Unified TOML",
+    btn_copy_cmd: "Copy Command",
+    btn_dl_toml: "Download TOML",
+    toml_preview_title: "Unified Configuration TOML Preview",
+    lbl_save_path: "Save Path:",
+    btn_save_direct: "Save",
+    docs_menu_title: "Model Documentation",
+    doc_formulation: "Mathematical Formulation (12 Chapters)",
+    doc_architecture: "Architecture & Literature Traceability",
+    doc_readme: "Overview & Quick Start (README)",
+    docs_toc_title: "Table of Contents",
+  },
+};
+
+const PARAM_DOCS = {
+  glevel: { ja: "正20面体格子の再帰分割回数 (0=12セル, 3=642, 4=2562, 5=10242)", en: "Icosahedral recursion level (N_cell = 10*4^g + 2)" },
+  nz: { ja: "大気・CRM 共通の鉛直層数", en: "Shared vertical Charney-Phillips levels" },
+  z_top: { ja: "モデル上端高度 [m]", en: "Model top height [m]" },
+  dz_min: { ja: "最下層の鉛直格子厚 [m]", en: "Lowest layer thickness [m]" },
+  z_sponge_base: { ja: "上空レーリーダンピング層の底面高度 [m]", en: "Rayleigh sponge layer base height [m]" },
+  tau_sponge_min: { ja: "モデル上端での最小減衰タイムスケール [s]", en: "Minimum damping timescale at model top [s]" },
+  terrain_scale_exp: { ja: "鉛直座標の地形追従減衰スケール指数 p", en: "Klemp STF vertical decay exponent p [-]" },
+  crm_nx: { ja: "各ホストセル内 CRM の x方向格子数", en: "Embedded CRM x-grid points per SCVT cell" },
+  crm_ny: { ja: "各ホストセル内 CRM の y方向格子数 (1=2.5Dカーテン)", en: "Embedded CRM y-grid points (1 = 2.5D curtain)" },
+  crm_dx: { ja: "CRM の水平格子間隔 [m]", en: "CRM horizontal grid spacing [m]" },
+  dt_host: { ja: "ホスト大気・結合ステップの時間刻み [s]", en: "Host coupling time step [s]" },
+  co2_ppmv: { ja: "大気 CO₂ 濃度 [ppmv]", en: "Atmospheric CO2 concentration [ppmv]" },
+  solar_constant: { ja: "太陽定数 S₀ [W m⁻²]", en: "Total solar irradiance S0 [W m^-2]" },
+  omega: { ja: "惑星自転角速度 Ω [rad s⁻¹] (地球標準: 7.292115e-5)", en: "Planetary rotation rate Omega [rad s^-1]" },
+  obliquity_deg: { ja: "地軸傾斜角 ε [deg]", en: "Axial obliquity [deg]" },
+  eccentricity: { ja: "公転軌道離心率 e [-]", en: "Orbital eccentricity [-]" },
+  enable_dynamic_icesheet: { ja: "動的 SIA + EMA 平衡加速氷床モデルを有効化", en: "Enable dynamic SIA + EMA equilibrium ice-sheet coupling" },
+  icesheet_ema_years: { ja: "年平均 SMB の指数移動平均時定数 τ_EMA [yr]", en: "EMA smoothing timescale for annual SMB [yr]" },
+  icesheet_accel_factor: { ja: "SIA 氷床力学の時間加速倍率 α [-]", en: "SIA ice-sheet dynamics time acceleration factor [-]" },
+  icesheet_accel_spinup_years: { ja: "加速率を 1 へ戻す指数減衰時定数 (0 で固定)", en: "Spinup e-folding decay timescale to alpha=1 [yr] (0=constant)" },
+  icesheet_isostasy_tau_yr: { ja: "アイソスタシー盤面緩和時定数 [yr]", en: "Lithospheric isostasy relaxation timescale [yr]" },
+  out_dir: { ja: "出力ルートディレクトリ (空で ~/aoba_outputs/glevel{g}_{y}yr)", en: "Output root directory (empty -> ~/aoba_outputs/glevel{g}_{y}yr)" },
+  years: { ja: "積分年数 [years]", en: "Integration duration [years]" },
+  zarr_dir_partition: { ja: "'yearly' (年別) または 'single' (単一Zarr)", en: "'yearly' (per-year subdirs) or 'single' Zarr store" },
+  monthly_mean_periods_per_year: { ja: "1年あたりの時間平均出力回数 (12=月平均)", en: "Time-averaged Zarr periods per year (12 = monthly)" },
+  snapshots_periods_per_year: { ja: "1年あたりの瞬時値スナップショット回数", en: "Instantaneous snapshot writes per year" },
+};
+
+function tKey(k) { return I18N[LANG]?.[k] ?? I18N.ja[k] ?? k; }
+
+function applyLanguage() {
+  document.documentElement.lang = LANG;
+  document.querySelectorAll("[data-i18n]").forEach(el => {
+    const k = el.getAttribute("data-i18n");
+    if (I18N[LANG]?.[k] !== undefined) el.innerHTML = I18N[LANG][k];
+  });
+  const totalEl = document.getElementById("param-total");
+  if (totalEl && STATE.param_count) totalEl.textContent = STATE.param_count;
+  const sb = document.getElementById("search-box");
+  if (sb) sb.placeholder = LANG === "ja" ? "パラメタ名で検索 (例: v_cmax, albedo, sia, mynn...)" : "Search parameter keys (e.g. v_cmax, albedo, sia, mynn...)";
+  renderAll();
+  if (document.getElementById("tab-docs")?.classList.contains("active")) loadDoc(CURRENT_DOC_BASE);
+}
+
+function toggleLang() {
+  LANG = LANG === "ja" ? "en" : "ja";
+  applyLanguage();
+  showToast(LANG === "ja" ? "表示言語を日本語に切り替えました" : "Switched UI language to English");
+}
+
+function showToast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.style.display = "block";
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(() => { t.style.display = "none"; }, 2800);
+}
+
+async function fetchInitial() {
+  const res = await fetch("/api/state");
+  STATE = await res.json();
+  document.getElementById("param-total").textContent = STATE.param_count;
+  document.getElementById("toml-path-input").value = STATE.toml_path;
+  renderAll();
+  fetchMonitorOnce();
+}
+
+function switchTab(id, btn) {
+  document.querySelectorAll(".tab-pane").forEach(p => p.classList.remove("active"));
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+  document.getElementById("tab-" + id).classList.add("active");
+  if (btn) btn.classList.add("active");
+  if (id === "grid") drawGridCanvas();
+  if (id === "forcing") drawIceCanvas();
+  if (id === "toml") refreshTomlPreview();
+  if (id === "output") updateOutputEstimates();
+  if (id === "monitor") fetchMonitorOnce();
+  if (id === "docs") loadDoc(CURRENT_DOC_BASE);
+}
+
+function isModified(sec, key) {
+  const def = STATE.defaults[sec]?.[key];
+  const cur = STATE.config[sec]?.[key];
+  if (typeof def === "number") return Math.abs(Number(cur) - def) > 1e-12 * Math.max(1, Math.abs(def));
+  return cur !== def;
+}
+
+function countModified() {
+  let n = 0;
+  for (const sec of Object.keys(STATE.defaults))
+    for (const k of Object.keys(STATE.defaults[sec])) if (isModified(sec, k)) n++;
+  return n;
+}
+
+function setKey(sec, key, val) {
+  const def = STATE.defaults[sec]?.[key];
+  if (typeof def === "boolean") val = Boolean(val);
+  else if (typeof def === "number") {
+    const intKeys = ["glevel","nz","crm_nx","crm_ny","n_host_dyn_substeps","n_crm_dyn_substeps","rad_stride","crm_col_chunk","rad_col_chunk","earth2014_stride","years","monthly_mean_periods_per_year","snapshots_periods_per_year","restart_interval_years"];
+    val = intKeys.includes(key) ? Math.round(Number(val)) : Number(val);
+    if (Number.isNaN(val)) val = def;
+  }
+  STATE.config[sec][key] = val;
+  updateBadgesAndDiagrams();
+}
+
+function buildFieldRow(sec, key, skipKeys = []) {
+  if (skipKeys.includes(key)) return "";
+  const cur = STATE.config[sec][key];
+  const def = STATE.defaults[sec][key];
+  const mod = isModified(sec, key);
+  const pd = PARAM_DOCS[key];
+  const desc = pd ? (pd[LANG] || pd.ja) : ("Default: " + String(def));
+  const modLbl = LANG === "ja" ? "変更" : "MOD";
+  let ctrl = "";
+  if (key === "zarr_dir_partition") {
+    ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
+      <option value="yearly" ${cur==="yearly"?"selected":""}>yearly (年別)</option>
+      <option value="single" ${cur==="single"?"selected":""}>single (単一Zarr)</option>
+    </select>`;
+  } else if (typeof def === "boolean") {
+    ctrl = `<label class="switch"><input type="checkbox" ${cur?"checked":""} onchange="setKey('${sec}','${key}',this.checked)" /> <span>${cur?"ON":"OFF"}</span></label>`;
+  } else if (typeof def === "number") {
+    ctrl = `<input type="number" step="any" value="${cur}" onchange="setKey('${sec}','${key}',parseFloat(this.value))" />`;
+  } else {
+    ctrl = `<input type="text" value="${String(cur).replace(/"/g,'&quot;')}" onchange="setKey('${sec}','${key}',this.value)" />`;
+  }
+  return `<div class="field-row">
+    <div><div class="field-label"><code>${key}</code> ${mod?`<span class="tag-mod">${modLbl}</span>`:''}</div><div class="field-desc">${desc}</div></div>
+    <div>${ctrl}</div>
+  </div>`;
+}
+
+function renderSectionContainer(sec, containerId, skipKeys = []) {
+  const el = document.getElementById(containerId);
+  if (el && STATE.config[sec]) el.innerHTML = Object.keys(STATE.config[sec]).map(k => buildFieldRow(sec, k, skipKeys)).join("");
+}
+
+function renderAll() {
+  const g = STATE.config.grid?.glevel ?? 3;
+  document.getElementById("rng-glevel").value = Math.min(Math.max(g, 0), 6);
+  document.getElementById("inp-grid-glevel").value = g;
+  renderSectionContainer("grid", "grid-fields", ["glevel"]);
+  renderSectionContainer("forcing", "forcing-fields");
+  renderSectionContainer("icesheet", "icesheet-fields");
+  renderSectionContainer("output", "output-fields");
+  renderSectionButtons();
+  renderRegistrySection();
+  updateBadgesAndDiagrams();
+}
+
+function updateBadgesAndDiagrams() {
+  const n = countModified();
+  document.getElementById("mod-count").textContent = n;
+  document.getElementById("mod-pill").classList.toggle("modified", n > 0);
+  const g = STATE.config.grid?.glevel ?? 3;
+  document.getElementById("rng-glevel").value = Math.min(Math.max(g, 0), 6);
+  document.getElementById("inp-grid-glevel").value = g;
+  drawGridCanvas();
+  drawIceCanvas();
+  updateOutputEstimates();
+  updateRunCmd();
+}
+
+function applyGridPreset(g, nx, ny, dx, nz, dt) {
+  Object.assign(STATE.config.grid, { glevel: g, crm_nx: nx, crm_ny: ny, crm_dx: dx, nz: nz, dt_host: dt });
+  renderAll();
+  showToast(`格子プリセット G${g} (${nx}×${ny}, dx=${dx}m) を適用`);
+}
+
+function applyForcingPreset(kind) {
+  const f = STATE.config.forcing, ic = STATE.config.icesheet;
+  if (kind === "present") { f.co2_ppmv = 400.0; f.omega = 7.292115e-5; f.obliquity_deg = 23.44; ic.enable_dynamic_icesheet = false; }
+  else if (kind === "half_omega") { f.co2_ppmv = 400.0; f.omega = 7.292115e-5 * 0.5; }
+  else if (kind === "slow_rot") { f.co2_ppmv = 400.0; f.omega = 7.292115e-5 * 0.25; }
+  else if (kind === "lgm") { f.co2_ppmv = 185.0; f.obliquity_deg = 22.95; f.eccentricity = 0.018994; ic.enable_dynamic_icesheet = true; ic.icesheet_accel_factor = 100.0; }
+  else if (kind === "4xco2") { f.co2_ppmv = 1600.0; ic.enable_dynamic_icesheet = true; ic.icesheet_accel_factor = 50.0; }
+  renderAll();
+  showToast("外力・氷床プリセットを適用しました");
+}
+
+/* --- TAB 1 CANVAS: GLEVEL SPHERE + CRM + VERTICAL --- */
+function drawGridCanvas() {
+  const canvas = document.getElementById("gridCanvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const cfgG = STATE.config.grid || {};
+  const g = Math.max(0, Math.min(7, Math.round(cfgG.glevel ?? 3)));
+  const nz = Math.max(4, Math.round(cfgG.nz ?? 32));
+  const zTop = Number(cfgG.z_top ?? 24000);
+  const dzMin = Number(cfgG.dz_min ?? 60);
+  const zSponge = Number(cfgG.z_sponge_base ?? 17500);
+  const crmNx = Math.max(1, Math.round(cfgG.crm_nx ?? 8));
+  const crmNy = Math.max(1, Math.round(cfgG.crm_ny ?? 1));
+  const crmDx = Number(cfgG.crm_dx ?? 8000);
+
+  const R_earth_km = 6371.0;
+  const nCell = 10 * Math.pow(4, g) + 2;
+  const dxHostKm = Math.sqrt((4 * Math.PI * R_earth_km * R_earth_km) / nCell);
+  const crmWKm = (crmNx * crmDx) / 1000.0, crmHKm = (crmNy * crmDx) / 1000.0;
+  const totalSubcols = nCell * crmNx * crmNy;
+
+  document.getElementById("kpi-ncell").textContent = nCell.toLocaleString();
+  document.getElementById("kpi-dx").textContent = dxHostKm.toFixed(0) + " km";
+  document.getElementById("kpi-crmw").textContent = `${crmWKm.toFixed(0)}×${crmHKm.toFixed(0)} km`;
+  document.getElementById("kpi-subcols").textContent = totalSubcols.toLocaleString();
+  document.getElementById("kpi-pts").textContent = (totalSubcols * nz).toLocaleString();
+
+  const cx = 185, cy = 220, rad = 148;
+  const grad = ctx.createRadialGradient(cx - 42, cy - 48, 25, cx, cy, rad);
+  grad.addColorStop(0, "#1d4ed8"); grad.addColorStop(0.6, "#0f2d6b"); grad.addColorStop(1, "#09142b");
+  ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.fillStyle = grad; ctx.fill();
+  ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 1.6; ctx.stroke();
+
+  const phi = (1 + Math.sqrt(5)) / 2;
+  let verts = [[-1,phi,0],[1,phi,0],[-1,-phi,0],[1,-phi,0],[0,-1,phi],[0,1,phi],[0,-1,-phi],[0,1,-phi],[phi,0,-1],[phi,0,1],[-phi,0,-1],[-phi,0,1]]
+    .map(v => { const L = Math.hypot(v[0],v[1],v[2]); return [v[0]/L, v[1]/L, v[2]/L]; });
+  let faces = [[0,11,5],[0,5,1],[0,1,7],[0,7,10],[0,10,11],[1,5,9],[5,11,4],[11,10,2],[10,7,6],[7,1,8],[3,9,4],[3,4,2],[3,2,6],[3,6,8],[3,8,9],[4,9,5],[2,4,11],[6,2,10],[8,6,7],[9,8,1]];
+  for (let s = 0; s < Math.min(g, 4); s++) {
+    const midCache = new Map();
+    const getMid = (a, b) => {
+      const k = a < b ? `${a}_${b}` : `${b}_${a}`;
+      if (midCache.has(k)) return midCache.get(k);
+      const va = verts[a], vb = verts[b];
+      const mx = va[0]+vb[0], my = va[1]+vb[1], mz = va[2]+vb[2], L = Math.hypot(mx,my,mz);
+      const idx = verts.length; verts.push([mx/L, my/L, mz/L]); midCache.set(k, idx); return idx;
+    };
+    const nf = [];
+    for (const [a,b,c] of faces) { const ab = getMid(a,b), bc = getMid(b,c), ca = getMid(c,a); nf.push([a,ab,ca],[b,bc,ab],[c,ca,bc],[ab,bc,ca]); }
+    faces = nf;
+  }
+  const cy1 = Math.cos(0.32), sy1 = Math.sin(0.32), cp = Math.cos(0.36), sp = Math.sin(0.36);
+  const rVerts = verts.map(v => { const x1 = v[0]*cy1+v[2]*sy1, z1 = -v[0]*sy1+v[2]*cy1, y1 = v[1]; return [x1, y1*cp-z1*sp, y1*sp+z1*cp]; });
+
+  ctx.strokeStyle = g <= 2 ? "rgba(56,189,248,0.65)" : (g <= 4 ? "rgba(56,189,248,0.34)" : "rgba(56,189,248,0.18)");
+  ctx.lineWidth = g <= 2 ? 1.2 : 0.7;
+  ctx.beginPath();
+  for (const [a,b,c] of faces) {
+    const va = rVerts[a], vb = rVerts[b], vc = rVerts[c];
+    if (va[2]+vb[2]+vc[2] <= -0.15) continue;
+    ctx.moveTo(cx+va[0]*rad, cy-va[1]*rad); ctx.lineTo(cx+vb[0]*rad, cy-vb[1]*rad);
+    ctx.lineTo(cx+vc[0]*rad, cy-vc[1]*rad); ctx.lineTo(cx+va[0]*rad, cy-va[1]*rad);
+  }
+  ctx.stroke();
+
+  if (g >= 5) {
+    ctx.strokeStyle = g === 5 ? "rgba(52,211,153,0.22)" : "rgba(52,211,153,0.32)";
+    const stepPx = g === 5 ? 9 : 4.8;
+    ctx.save(); ctx.beginPath(); ctx.arc(cx, cy, rad-1, 0, Math.PI*2); ctx.clip(); ctx.beginPath();
+    for (let y = cy-rad; y <= cy+rad; y += stepPx) { ctx.moveTo(cx-rad, y); ctx.lineTo(cx+rad, y); }
+    for (let x = cx-rad; x <= cx+rad; x += stepPx) { ctx.moveTo(x, cy-rad); ctx.lineTo(x, cy+rad); }
+    ctx.stroke(); ctx.restore();
+  }
+
+  const hx = cx + 18, hy = cy - 12, hRad = Math.max(10, Math.min(44, 62 / Math.pow(1.45, Math.min(g, 5))));
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const ang = (Math.PI/3)*i + Math.PI/6, px = hx+hRad*Math.cos(ang), py = hy+hRad*Math.sin(ang);
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath(); ctx.fillStyle = "rgba(251,191,36,0.3)"; ctx.fill(); ctx.strokeStyle = "#fbbf24"; ctx.lineWidth = 2; ctx.stroke();
+
+  ctx.fillStyle = "#e2e8f0"; ctx.font = "bold 13px sans-serif"; ctx.fillText(`SCVT 全球格子: Glevel-${g}`, 22, 28);
+  ctx.fillStyle = "#94a3b8"; ctx.font = "12px monospace"; ctx.fillText(`N_cell = ${nCell.toLocaleString()} (Δx ≈ ${dxHostKm.toFixed(0)} km)`, 22, 47);
+
+  ctx.strokeStyle = "rgba(251,191,36,0.7)"; ctx.lineWidth = 1.4; ctx.setLineDash([4,3]);
+  ctx.beginPath(); ctx.moveTo(hx+hRad, hy); ctx.lineTo(405, 115); ctx.stroke(); ctx.setLineDash([]);
+
+  const zcx = 495, zcy = 205, zRad = 88;
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const ang = (Math.PI/3)*i + Math.PI/6, px = zcx+zRad*Math.cos(ang), py = zcy+zRad*Math.sin(ang);
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath(); ctx.fillStyle = "rgba(16,185,129,0.12)"; ctx.fill(); ctx.strokeStyle = "#fbbf24"; ctx.lineWidth = 2; ctx.stroke();
+
+  const ratioX = Math.max(0.28, Math.min(0.88, crmWKm / Math.max(dxHostKm, 1)));
+  const ratioY = crmNy === 1 ? 0.16 : Math.max(0.24, Math.min(0.88, crmHKm / Math.max(dxHostKm, 1)));
+  const boxW = Math.round(zRad * 1.45 * ratioX), boxH = Math.round(zRad * 1.45 * ratioY);
+  const bx0 = zcx - boxW/2, by0 = zcy - boxH/2;
+  ctx.fillStyle = "rgba(56,189,248,0.22)"; ctx.fillRect(bx0, by0, boxW, boxH);
+  ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 1.6; ctx.strokeRect(bx0, by0, boxW, boxH);
+  ctx.strokeStyle = "rgba(56,189,248,0.5)"; ctx.lineWidth = 0.8; ctx.beginPath();
+  for (let i = 1; i < Math.min(crmNx, 16); i++) { const x = bx0 + boxW*i/Math.min(crmNx,16); ctx.moveTo(x,by0); ctx.lineTo(x,by0+boxH); }
+  for (let j = 1; j < Math.min(crmNy, 16); j++) { const y = by0 + boxH*j/Math.min(crmNy,16); ctx.moveTo(bx0,y); ctx.lineTo(bx0+boxW,y); }
+  ctx.stroke();
+
+  ctx.fillStyle = "#f8fafc"; ctx.font = "bold 13px sans-serif"; ctx.fillText(`埋め込み CRM (MAML+ICA)`, 400, 28);
+  ctx.fillStyle = "#38bdf8"; ctx.font = "12px monospace"; ctx.fillText(`${crmNx}×${crmNy} (dx=${(crmDx/1000).toFixed(1)} km)`, 400, 47);
+  ctx.fillStyle = "#cbd5e1"; ctx.font = "11.5px monospace";
+  ctx.fillText(`ホスト幅: ~${dxHostKm.toFixed(0)} km`, 415, 330);
+  ctx.fillText(`CRM 域: ${crmWKm.toFixed(0)}×${crmHKm.toFixed(0)} km`, 415, 348);
+
+  const vx = 640, vw = 85, vyTop = 62, vyBot = 380, vH = vyBot - vyTop;
+  const spRatio = Math.max(0, Math.min(1, 1.0 - zSponge / Math.max(zTop, 1)));
+  if (spRatio > 0) { ctx.fillStyle = "rgba(251,191,36,0.16)"; ctx.fillRect(vx, vyTop, vw, vH*spRatio); }
+  ctx.strokeStyle = "#475569"; ctx.lineWidth = 1.2; ctx.strokeRect(vx, vyTop, vw, vH);
+
+  let r = 1.08;
+  for (let it = 0; it < 30; it++) {
+    const f = dzMin * (Math.pow(r, nz) - 1)/(r - 1) - zTop;
+    const df = dzMin * ((nz*Math.pow(r, nz-1)*(r-1) - (Math.pow(r,nz)-1))/Math.pow(r-1,2));
+    r = Math.max(1.001, r - f/(df || 1));
+  }
+  ctx.strokeStyle = "#34d399"; ctx.lineWidth = 0.9; ctx.beginPath();
+  let cumZ = 0;
+  for (let k = 0; k <= nz; k++) {
+    const py = vyBot - (cumZ/zTop)*vH;
+    ctx.moveTo(vx, py); ctx.lineTo(vx+vw, py);
+    cumZ += dzMin * Math.pow(r, k);
+  }
+  ctx.stroke();
+  ctx.fillStyle = "#f8fafc"; ctx.font = "bold 13px sans-serif"; ctx.fillText(`鉛直層 nz=${nz}`, 636, 28);
+  ctx.fillStyle = "#94a3b8"; ctx.font = "11px monospace";
+  ctx.fillText(`top: ${(zTop/1000).toFixed(1)} km`, 636, 47);
+  ctx.fillText(`dz0: ${dzMin.toFixed(0)} m`, 636, 404);
+}
+
+function drawIceCanvas() {
+  const canvas = document.getElementById("iceCanvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d"), W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  const ic = STATE.config.icesheet || {};
+  const enabled = Boolean(ic.enable_dynamic_icesheet), alpha0 = Math.max(1, Number(ic.icesheet_accel_factor ?? 100));
+  const tauSpin = Math.max(0, Number(ic.icesheet_accel_spinup_years ?? 0)), emaYr = Math.max(1, Number(ic.icesheet_ema_years ?? 5));
+  const padL = 48, padR = 20, padT = 28, padB = 34, cw = W - padL - padR, ch = H - padT - padB;
+  ctx.strokeStyle = "#334155"; ctx.strokeRect(padL, padT, cw, ch);
+  if (!enabled) {
+    ctx.fillStyle = "#64748b"; ctx.font = "bold 14px sans-serif"; ctx.fillText("現在: 動的氷床 OFF (固定 Earth2014 氷床)", padL+85, padT+ch/2);
+    return;
+  }
+  const maxT = Math.max(30, tauSpin > 0 ? tauSpin*4 : 30);
+  ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 2.4; ctx.beginPath();
+  for (let i = 0; i <= 100; i++) {
+    const t = (i/100)*maxT, aEff = tauSpin > 0 ? (1+(alpha0-1)*Math.exp(-t/tauSpin)) : alpha0;
+    const x = padL+(i/100)*cw, y = padT+ch-((aEff-1)/Math.max(alpha0-1,1))*ch;
+    if (i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+  ctx.strokeStyle = "#34d399"; ctx.lineWidth = 2; ctx.setLineDash([5,4]); ctx.beginPath();
+  for (let i = 0; i <= 100; i++) {
+    const t = (i/100)*maxT, w = Math.exp(-t/emaYr), x = padL+(i/100)*cw, y = padT+ch-w*ch;
+    if (i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = "#e2e8f0"; ctx.font = "12px monospace"; ctx.fillText(`α_eff(t): ×${alpha0} -> ×1 (τ_spin=${tauSpin} yr)`, padL+8, padT+18);
+  ctx.fillStyle = "#34d399"; ctx.fillText(`EMA SMB 重み (τ_EMA=${emaYr} yr)`, padL+8, padT+36);
+}
+
+function updateOutputEstimates() {
+  const g = STATE.config.grid || {}, o = STATE.config.output || {};
+  const nCell = 10*Math.pow(4, g.glevel ?? 3)+2, nz = g.nz ?? 32, nx = g.crm_nx ?? 8, ny = g.crm_ny ?? 1, yrs = Math.max(1, o.years ?? 30);
+  const bytesRec = (inc2d, inc3d, incSg) => ((inc2d ? 13*nCell*4 : 0) + (inc3d ? 5*nz*nCell*4 : 0) + (incSg ? 17*nCell*ny*nx*4 : 0)) * 0.6;
+  const meanGb = o.monthly_mean_enabled ? (bytesRec(o.monthly_mean_include_2d, o.monthly_mean_include_3d, o.monthly_mean_include_subgrid_2d) * (o.monthly_mean_periods_per_year ?? 12))/1e9 : 0;
+  const snapGb = o.snapshots_enabled ? (bytesRec(o.snapshots_include_2d, o.snapshots_include_3d, o.snapshots_include_subgrid_2d) * (o.snapshots_periods_per_year ?? 12))/1e9 : 0;
+  const rstGb = ((7*nz*nCell + 6*nCell*nz*ny*nx + 18*nCell)*4)/1e9;
+  const totGb = (meanGb+snapGb)*yrs + rstGb*Math.ceil(yrs/Math.max(1, o.restart_interval_years ?? 1));
+  document.getElementById("est-mean-gb").textContent = (meanGb*1000).toFixed(1) + " MB";
+  document.getElementById("est-snap-gb").textContent = (snapGb*1000).toFixed(1) + " MB";
+  document.getElementById("est-rst-gb").textContent = (rstGb*1000).toFixed(1) + " MB";
+  document.getElementById("est-total-gb").textContent = totGb.toFixed(2) + " GB";
+  const root = o.out_dir ? o.out_dir : `~/aoba_outputs/glevel${g.glevel}_${yrs}yr`;
+  document.getElementById("output-tree").textContent = `${root}/\n├── live_preview.npz   (日次 T2 / OLR / LAI ライブプレビュー)\n├── mesh.zarr          (SCVT 格子・地形)\n└── ${o.zarr_dir_partition==="single"?"monthly.zarr & snapshots.zarr":"year_0001..year_"+String(yrs).padStart(4,"0")+"/{monthly.zarr, snapshots.zarr, daily_global.csv, restart.pt}"}`;
+}
+
+function renderSectionButtons() {
+  const el = document.getElementById("sec-buttons");
+  el.innerHTML = Object.keys(STATE.config).map(sec => {
+    const meta = STATE.section_meta[sec] || { ja: sec, en: sec };
+    const lbl = meta[LANG] || meta.ja || sec;
+    return `<button class="${sec===ACTIVE_REG_SEC?"active":""}" onclick="selectRegSec('${sec}')"><span>${lbl}</span><span style="font-size:11px;opacity:.75">${Object.keys(STATE.config[sec]||{}).length}</span></button>`;
+  }).join("");
+}
+function selectRegSec(sec) { ACTIVE_REG_SEC = sec; renderSectionButtons(); renderRegistrySection(); }
+function renderRegistrySection() {
+  const q = (document.getElementById("search-box").value || "").trim().toLowerCase();
+  const onlyMod = document.getElementById("filter-mod").checked;
+  const c = document.getElementById("reg-fields");
+  let rows = "";
+  if (q || onlyMod) {
+    document.getElementById("reg-sec-title").textContent = q
+      ? (LANG === "ja" ? `検索結果: "${q}"` : `Search: "${q}"`)
+      : (LANG === "ja" ? "変更済みパラメタ" : "Modified Parameters");
+    for (const sec of Object.keys(STATE.config))
+      for (const k of Object.keys(STATE.config[sec]))
+        if ((!q || k.toLowerCase().includes(q) || sec.toLowerCase().includes(q)) && (!onlyMod || isModified(sec, k)))
+          rows += buildFieldRow(sec, k);
+    c.innerHTML = rows || `<p style="color:var(--muted);">${LANG==="ja"?"一致する項目がありません。":"No matching parameters."}</p>`;
+  } else {
+    const meta = STATE.section_meta[ACTIVE_REG_SEC] || { ja: ACTIVE_REG_SEC, en: ACTIVE_REG_SEC };
+    const lbl = meta[LANG] || meta.ja || ACTIVE_REG_SEC;
+    document.getElementById("reg-sec-title").textContent = `${lbl} ([${ACTIVE_REG_SEC}])`;
+    c.innerHTML = Object.keys(STATE.config[ACTIVE_REG_SEC] || {}).map(k => buildFieldRow(ACTIVE_REG_SEC, k)).join("");
+  }
+}
+
+function getActiveTomlPath() { return (document.getElementById("toml-path-input").value || STATE.toml_path || "config/aoba_custom.toml").trim(); }
+function updateRunCmd() { document.getElementById("run-cmd-box").textContent = `PYTHONPATH=src /Users/andrew/miniforge/envs/myenv/bin/python -u scripts/run_g5_30yr.py --config "${getActiveTomlPath()}"`; }
+async function refreshTomlPreview() {
+  const res = await fetch("/api/toml", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({config:STATE.config}) });
+  document.getElementById("toml-preview").value = (await res.json()).toml_text; updateRunCmd();
+}
+async function saveTomlDirect() {
+  const res = await fetch("/api/save", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({config:STATE.config, save_path:getActiveTomlPath()}) });
+  const data = await res.json();
+  if (data.ok) { STATE.toml_path = data.path; document.getElementById("toml-path-input").value = data.path; showToast(`保存しました: ${data.path}`); }
+}
+function saveTomlPrompt() {
+  const next = window.prompt("保存先の TOML パスを入力:", getActiveTomlPath());
+  if (next && next.trim()) { document.getElementById("toml-path-input").value = next.trim(); saveTomlDirect(); }
+}
+async function downloadToml() {
+  const res = await fetch("/api/toml", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({config:STATE.config}) });
+  const blob = new Blob([(await res.json()).toml_text], { type:"text/plain;charset=utf-8" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "aoba_config.toml"; a.click();
+}
+async function resetAll() {
+  const res = await fetch("/api/reset", { method:"POST" });
+  STATE.config = (await res.json()).config; renderAll(); refreshTomlPreview(); showToast("全パラメタを工場出荷デフォルトに戻しました");
+}
+function copyRunCmd() { navigator.clipboard.writeText(document.getElementById("run-cmd-box").textContent); showToast("コマンドをコピーしました"); }
+
+/* --- EXECUTION & LIVE MONITORING --- */
+async function launchFromStudio() {
+  const dev = document.getElementById("launch-device").value;
+  const noRes = document.getElementById("launch-no-resume").checked;
+  const res = await fetch("/api/run/start", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ config: STATE.config, device: dev, no_resume: noRes }),
+  });
+  const data = await res.json();
+  if (!data.ok) { alert("実行エラー: " + data.error); return; }
+  MON.outDir = data.out_dir;
+  showToast(`ジョブを開始しました (PID ${data.pid}) -> ${data.out_dir}`);
+  const monBtn = document.querySelectorAll(".tab-btn")[4];
+  switchTab("monitor", monBtn);
+}
+
+async function stopManagedRun() {
+  if (!confirm("この GUI から起動したジョブを停止しますか？")) return;
+  const res = await fetch("/api/run/stop", { method: "POST" });
+  const data = await res.json();
+  if (data.ok) showToast(`PID ${data.pid} を停止しました`);
+  fetchMonitorOnce();
+}
+
+function onWatchDirSelect(v) {
+  MON.outDir = v;
+  document.getElementById("watch-frame").innerHTML = `<option value="-1">最新フレーム</option>`;
+  fetchMonitorOnce();
+}
+
+function b64ToUint8(b64) {
+  const bin = atob(b64), arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr;
+}
+
+async function fetchMonitorOnce() {
+  const src = document.getElementById("watch-source")?.value || "auto";
+  const frm = document.getElementById("watch-frame")?.value || "-1";
+  const qs = new URLSearchParams({ out_dir: MON.outDir || "", source: src, frame: frm });
+  try {
+    const res = await fetch("/api/monitor/snapshot?" + qs.toString());
+    const data = await res.json();
+    MON.outDir = data.out_dir || "";
+
+    // Update directory picker
+    const dirSel = document.getElementById("watch-dir-select");
+    const dirs = data.discovered_dirs || [];
+    if (MON.outDir && !dirs.includes(MON.outDir)) dirs.unshift(MON.outDir);
+    dirSel.innerHTML = dirs.length
+      ? dirs.map(d => `<option value="${d}" ${d===MON.outDir?"selected":""}>${d}</option>`).join("")
+      : `<option value="">(出力ディレクトリ未検出)</option>`;
+
+    // Active process badge
+    const mg = data.managed_run || {}, aps = data.active_processes || [];
+    const btnStop = document.getElementById("btn-stop-run");
+    const runBadge = document.getElementById("run-badge");
+    btnStop.style.display = mg.running ? "inline-block" : "none";
+    if (mg.running) {
+      document.getElementById("mon-proc").textContent = `GUI起動 PID ${mg.pid}`;
+      runBadge.textContent = `稼働中 PID ${mg.pid}`; runBadge.className = "pill live";
+    } else if (aps.length > 0) {
+      document.getElementById("mon-proc").textContent = `外部稼働 PID ${aps[0].pid} (${aps[0].cpu_pct}%)`;
+      runBadge.textContent = `外部監視中 PID ${aps[0].pid}`; runBadge.className = "pill live";
+    } else {
+      document.getElementById("mon-proc").textContent = "待機中 (静止閲覧)";
+      runBadge.textContent = "監視待機中"; runBadge.className = "pill";
+    }
+
+    // Update frames selector
+    const frmSel = document.getElementById("watch-frame");
+    const frames = data.frames || [];
+    if (frames.length > 0) {
+      const curVal = frmSel.value;
+      frmSel.innerHTML = `<option value="-1">最新 (${frames[frames.length-1].label})</option>` +
+        frames.map(f => `<option value="${f.global_idx}">${f.label}</option>`).join("");
+      if (Array.from(frmSel.options).some(o => o.value === curVal)) frmSel.value = curVal;
+    } else {
+      frmSel.innerHTML = `<option value="-1">Live / 最新</option>`;
+    }
+
+    // Metadata & KPIs
+    const meta = data.meta || {};
+    document.getElementById("mon-src").textContent = meta.source || "-";
+    document.getElementById("mon-time").textContent = meta.sim_days !== undefined ? `Day ${meta.sim_days}` : "-";
+    document.getElementById("mon-cpums").textContent = data.raster ? `${data.raster.cpu_regrid_ms} ms (CPU)` : "-";
+
+    // Update log & CSV chart
+    document.getElementById("run-log-box").textContent = data.log_tail || "ログファイルはまだありません。";
+    const logEl = document.getElementById("run-log-box"); logEl.scrollTop = logEl.scrollHeight;
+    drawTimeSeries(data.csv || {});
+
+    const csv = data.csv || {};
+    if (csv.ts_k && csv.ts_k.length > 0) {
+      const li = csv.ts_k.length - 1;
+      document.getElementById("mon-latest").textContent = `${(csv.ts_k[li]-273.15).toFixed(1)}°C / ${csv.olr_wm2[li].toFixed(0)} / ${csv.lai[li].toFixed(2)}`;
+    }
+
+    if (data.raster) {
+      MON.raster = data.raster;
+      MON.rawT2 = b64ToUint8(data.raster.t2_b64);
+      MON.rawOLR = b64ToUint8(data.raster.olr_b64);
+      MON.rawLAI = b64ToUint8(data.raster.lai_b64);
+      MON.rawSurf = b64ToUint8(data.raster.surf_b64);
+      MON.rawCoast = b64ToUint8(data.raster.coast_b64);
+    }
+  } catch (e) { /* keep polling calmly */ }
+}
+
+/* --- ROTATING ORTHOGRAPHIC 3 GLOBES ENGINE --- */
+function makeColorLUT(stops) {
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let s0 = stops[0], s1 = stops[stops.length - 1];
+    for (let k = 0; k < stops.length - 1; k++) {
+      if (t >= stops[k][0] && t <= stops[k+1][0]) { s0 = stops[k]; s1 = stops[k+1]; break; }
+    }
+    const f = (t - s0[0]) / Math.max(s1[0] - s0[0], 1e-6);
+    lut[i*3]   = Math.round(s0[1] + f * (s1[1] - s0[1]));
+    lut[i*3+1] = Math.round(s0[2] + f * (s1[2] - s0[2]));
+    lut[i*3+2] = Math.round(s0[3] + f * (s1[3] - s0[3]));
+  }
+  return lut;
+}
+const LUT_T2  = makeColorLUT([[0,[30,27,75]],[0.24,[29,78,216]],[0.44,[56,189,248]],[0.60,[253,224,71]],[0.80,[249,115,22]],[1,[185,28,28]]]);
+const LUT_OLR = makeColorLUT([[0,[15,23,42]],[0.28,[76,29,149]],[0.54,[190,24,93]],[0.78,[245,158,11]],[1,[254,240,138]]]);
+const LUT_LAI = makeColorLUT([[0,[146,112,74]],[0.20,[163,163,50]],[0.45,[77,158,56]],[0.72,[21,128,61]],[1,[6,78,59]]]);
+
+function buildOrthographicCache(lat0Deg) {
+  const size = 300, cx = 150, cy = 150, R = 132;
+  const lat0 = (lat0Deg * Math.PI) / 180, sinL0 = Math.sin(lat0), cosL0 = Math.cos(lat0);
+  const pixIdx = [], latRow = [], dlonDeg = [], shade = [], latVal = [];
+  for (let py = 0; py < size; py++) {
+    const Y = (cy - py) / R;
+    for (let px = 0; px < size; px++) {
+      const X = (px - cx) / R, r2 = X*X + Y*Y;
+      if (r2 > 1.0) continue;
+      const Z = Math.sqrt(Math.max(0, 1 - r2));
+      const sinLat = Math.max(-1, Math.min(1, Z*sinL0 + Y*cosL0));
+      const lat = Math.asin(sinLat) * (180 / Math.PI);
+      const dlon = Math.atan2(X, Z*cosL0 - Y*sinL0) * (180 / Math.PI);
+      const j = Math.max(0, Math.min(179, Math.floor(89.5 - lat + 0.5)));
+      const li = 0.58 + 0.42 * Math.max(0, 0.78*Z - 0.32*X + 0.38*Y); // subtle 3D sphere shading
+      pixIdx.push((py*size + px) * 4);
+      latRow.push(j);
+      dlonDeg.push(dlon);
+      shade.push(li);
+      latVal.push(lat);
+    }
+  }
+  return { size, R, cx, cy, count: pixIdx.length, pixIdx: new Int32Array(pixIdx), latRow: new Uint8Array(latRow), dlonDeg: new Float32Array(dlonDeg), shade: new Float32Array(shade), latVal: new Float32Array(latVal) };
+}
+
+function getOrthoGeo() {
+  if (GLOBE_VIEW.geoCache && Math.abs(GLOBE_VIEW.geoCacheLat - GLOBE_VIEW.lat0) < 0.05) return GLOBE_VIEW.geoCache;
+  GLOBE_VIEW.geoCacheLat = GLOBE_VIEW.lat0;
+  GLOBE_VIEW.geoCache = buildOrthographicCache(GLOBE_VIEW.lat0);
+  return GLOBE_VIEW.geoCache;
+}
+
+function renderOneGlobe(canvasId, kind, geo) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas || !MON.raster) return;
+  const ctx = canvas.getContext("2d");
+  const W = geo.size;
+  if (!canvas._imgData) {
+    canvas._imgData = ctx.createImageData(W, W);
+    // Atmospheric glow background once per resize
+  }
+  const img = canvas._imgData, buf = img.data;
+  // Clear transparent dark space
+  buf.fill(0);
+  const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
+  const lon0 = GLOBE_VIEW.lon0;
+  const srcVals = kind === "t2" ? MON.rawT2 : (kind === "olr" ? MON.rawOLR : MON.rawLAI);
+  const lut = kind === "t2" ? LUT_T2 : (kind === "olr" ? LUT_OLR : LUT_LAI);
+  const surf = MON.rawSurf, coast = MON.rawCoast;
+
+  for (let p = 0; p < geo.count; p++) {
+    const row = geo.latRow[p];
+    let lon = (lon0 + geo.dlonDeg[p]) % 360;
+    if (lon < -180) lon += 360; if (lon >= 180) lon -= 360;
+    const col = Math.max(0, Math.min(359, Math.floor(lon + 180)));
+    const gIdx = row * 360 + col;
+    const sh = geo.shade[p];
+
+    let r, g, b;
+    if (kind === "lai" && surf[gIdx] === 0) {
+      r = 12 * sh; g = 34 * sh; b = 74 * sh; // crisp ocean blue on LAI globe
+    } else if (kind === "lai" && surf[gIdx] === 2) {
+      r = 228 * sh; g = 242 * sh; b = 250 * sh; // ice sheets crisp white-cyan
+    } else {
+      const k3 = srcVals[gIdx] * 3;
+      r = lut[k3] * sh; g = lut[k3+1] * sh; b = lut[k3+2] * sh;
+    }
+
+    if (coast[gIdx] === 1) {
+      r = kind === "olr" ? r * 0.45 + 90 : 12;
+      g = kind === "olr" ? g * 0.45 + 100 : 18;
+      b = kind === "olr" ? b * 0.45 + 120 : 28;
+    }
+
+    if (drawGrid) {
+      const lat = geo.latVal[p];
+      if (Math.abs(lat % 30) < 0.85 || Math.abs(((lon + 360) % 30) - 0) < 0.85) {
+        r = r * 0.82 + 45; g = g * 0.82 + 65; b = b * 0.82 + 90;
+      }
+    }
+    const o = geo.pixIdx[p];
+    buf[o] = r; buf[o+1] = g; buf[o+2] = b; buf[o+3] = 255;
+  }
+  ctx.clearRect(0, 0, W, W);
+  // Subtle atmosphere limb halo
+  const halo = ctx.createRadialGradient(geo.cx, geo.cy, geo.R*0.92, geo.cx, geo.cy, geo.R*1.08);
+  halo.addColorStop(0, "rgba(56,189,248,0.22)"); halo.addColorStop(1, "rgba(56,189,248,0)");
+  ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(geo.cx, geo.cy, geo.R*1.08, 0, Math.PI*2); ctx.fill();
+  ctx.putImageData(img, 0, 0);
+}
+
+let _lastAnimTs = 0;
+function animateGlobes(ts) {
+  requestAnimationFrame(animateGlobes);
+  const monPane = document.getElementById("tab-monitor");
+  if (!monPane || !monPane.classList.contains("active")) { _lastAnimTs = ts; return; }
+  const dt = Math.min((ts - (_lastAnimTs || ts)) / 1000.0, 0.1);
+  _lastAnimTs = ts;
+
+  if ((document.getElementById("globe-spin")?.checked ?? true) && !GLOBE_VIEW.dragging && MON.raster) {
+    const spd = Number(document.getElementById("globe-speed")?.value ?? 12);
+    GLOBE_VIEW.lon0 = ((GLOBE_VIEW.lon0 + spd * dt + 180) % 360) - 180;
+  }
+  if (MON.raster) {
+    const geo = getOrthoGeo();
+    renderOneGlobe("globeT2", "t2", geo);
+    renderOneGlobe("globeOLR", "olr", geo);
+    renderOneGlobe("globeLAI", "lai", geo);
+    document.getElementById("view-angles").textContent =
+      `Center: lat ${GLOBE_VIEW.lat0>=0?"+":""}${GLOBE_VIEW.lat0.toFixed(1)}°, lon ${GLOBE_VIEW.lon0>=0?"+":""}${GLOBE_VIEW.lon0.toFixed(1)}°`;
+  }
+}
+
+function resetGlobeView() { GLOBE_VIEW.lat0 = 18.0; GLOBE_VIEW.lon0 = 140.0; }
+
+function bindGlobeInteractions() {
+  ["globeT2", "globeOLR", "globeLAI"].forEach(id => {
+    const cv = document.getElementById(id);
+    if (!cv) return;
+    cv.addEventListener("mousedown", e => { GLOBE_VIEW.dragging = true; GLOBE_VIEW.lastX = e.clientX; GLOBE_VIEW.lastY = e.clientY; });
+    cv.addEventListener("mousemove", e => {
+      if (GLOBE_VIEW.dragging) {
+        const dx = e.clientX - GLOBE_VIEW.lastX, dy = e.clientY - GLOBE_VIEW.lastY;
+        GLOBE_VIEW.lastX = e.clientX; GLOBE_VIEW.lastY = e.clientY;
+        GLOBE_VIEW.lon0 = ((GLOBE_VIEW.lon0 - dx * 0.55 + 180) % 360) - 180;
+        GLOBE_VIEW.lat0 = Math.max(-80, Math.min(80, GLOBE_VIEW.lat0 + dy * 0.55));
+      }
+      if (!MON.raster) return;
+      const rect = cv.getBoundingClientRect();
+      const X = ((e.clientX - rect.left) / rect.width * 300 - 150) / 132;
+      const Y = (150 - (e.clientY - rect.top) / rect.height * 300) / 132;
+      if (X*X + Y*Y > 1) return;
+      const Z = Math.sqrt(Math.max(0, 1 - X*X - Y*Y));
+      const lat0 = GLOBE_VIEW.lat0 * Math.PI / 180;
+      const lat = Math.asin(Math.max(-1, Math.min(1, Z*Math.sin(lat0) + Y*Math.cos(lat0)))) * 180 / Math.PI;
+      let lon = GLOBE_VIEW.lon0 + Math.atan2(X, Z*Math.cos(lat0) - Y*Math.sin(lat0)) * 180 / Math.PI;
+      lon = ((lon + 180) % 360 + 360) % 360 - 180;
+      const row = Math.max(0, Math.min(179, Math.floor(89.5 - lat + 0.5)));
+      const col = Math.max(0, Math.min(359, Math.floor(lon + 180)));
+      const idx = row * 360 + col;
+      const t2v = -45 + (MON.rawT2[idx]/255) * 85;
+      const olrv = 100 + (MON.rawOLR[idx]/255) * 240;
+      const laiv = (MON.rawLAI[idx]/255) * 7.0;
+      const stype = MON.rawSurf[idx] === 0 ? (LANG==="ja"?"海洋":"Ocean") : (MON.rawSurf[idx] === 2 ? (LANG==="ja"?"氷床":"IceSheet") : (LANG==="ja"?"陸域":"Land"));
+      const ptLbl = LANG === "ja" ? "地点" : "Point";
+      document.getElementById("hover-coords").textContent =
+        `${ptLbl} (${lat.toFixed(1)}°, ${lon.toFixed(1)}°, ${stype}) — T₂: ${t2v.toFixed(1)} °C (${(t2v+273.15).toFixed(1)} K) | OLR: ${olrv.toFixed(0)} W/m² | LAI: ${laiv.toFixed(2)} m²/m²`;
+    });
+  });
+  window.addEventListener("mouseup", () => { GLOBE_VIEW.dragging = false; });
+}
+
+/* --- OFFLINE MARKDOWN + LATEX DOCUMENTATION VIEWER --- */
+function escHtml(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+function renderLatexPretty(tex) {
+  let s = escHtml(tex.trim());
+  const greek = {
+    "\\\\alpha":"α","\\\\beta":"β","\\\\gamma":"γ","\\\\delta":"δ","\\\\epsilon":"ε","\\\\zeta":"ζ",
+    "\\\\eta":"η","\\\\theta":"θ","\\\\kappa":"κ","\\\\lambda":"λ","\\\\mu":"μ","\\\\nu":"ν",
+    "\\\\xi":"ξ","\\\\pi":"π","\\\\rho":"ρ","\\\\sigma":"σ","\\\\tau":"τ","\\\\phi":"φ",
+    "\\\\varphi":"φ","\\\\chi":"χ","\\\\psi":"ψ","\\\\omega":"ω",
+    "\\\\Gamma":"Γ","\\\\Delta":"Δ","\\\\Theta":"Θ","\\\\Lambda":"Λ","\\\\Pi":"Π","\\\\Sigma":"Σ","\\\\Omega":"Ω",
+    "\\\\nabla":"∇","\\\\partial":"∂","\\\\infty":"∞","\\\\cdot":"·","\\\\times":"×","\\\\pm":"±",
+    "\\\\le":"≤","\\\\ge":"≥","\\\\approx":"≈","\\\\ne":"≠","\\\\implies":"⇒","\\\\to":"→",
+    "\\\\leftarrow":"←","\\\\leftrightarrow":"↔","\\\\in":"∈","\\\\sum":"∑","\\\\int":"∫",
+    "\\\\exp":"exp","\\\\ln":"ln","\\\\log":"log","\\\\sin":"sin","\\\\cos":"cos","\\\\tanh":"tanh",
+    "\\\\max":"max","\\\\min":"min","\\\\sqrt":"√","\\\\mathrm":" ","\\\\mathbf":" ","\\\\boldsymbol":" ",
+    "\\\\text":" ","\\\\left":"","\\\\right":"","\\\\!":"","\\\\,":" ","\\\\;":" ","\\\\quad":"  ","\\\\qquad":"    ",
+    "\\\\begin\\{aligned\\}":"","\\\\end\\{aligned\\}":"","\\\\begin\\{cases\\}":"","\\\\end\\{cases\\}":"",
+    "\\\\tilde\\{([^}]+)\\}":"$1\u0303","\\\\bar\\{([^}]+)\\}":"$1\u0304","\\\\hat\\{([^}]+)\\}":"$1\u0302"
+  };
+  for (const [pat, rep] of Object.entries(greek)) s = s.replace(new RegExp(pat, "g"), rep);
+  // Render \frac{A}{B} (2 passes handles nested fractions)
+  for (let p = 0; p < 2; p++) {
+    s = s.replace(/\\d?frac\{([^{}]+)\}\{([^{}]+)\}/g, '<span class="math-frac"><span>$1</span><span>$2</span></span>');
+  }
+  s = s.replace(/\^\{([^{}]+)\}/g, "<sup>$1</sup>").replace(/\^([A-Za-z0-9*+-])/g, "<sup>$1</sup>");
+  s = s.replace(/_\{([^{}]+)\}/g, "<sub>$1</sub>").replace(/_([A-Za-z0-9])/g, "<sub>$1</sub>");
+  s = s.replace(/&amp;/g, "&nbsp;&nbsp;").replace(/\\\\/g, "<br/>").replace(/[{}]/g, "");
+  return s;
+}
+function renderInlineMd(line) {
+  const mathSlots = [];
+  let s = line.replace(/\$([^$\n]+?)\$/g, (_, m) => {
+    const idx = mathSlots.length;
+    mathSlots.push(`<span class="math-inline">${renderLatexPretty(m)}</span>`);
+    return `@@M${idx}@@`;
+  });
+  s = escHtml(s);
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, txt, href) =>
+    href.startsWith("#") ? `<a href="${href}" style="color:var(--accent)">${txt}</a>` : `<span style="color:var(--accent)">${txt}</span>`
+  );
+  s = s.replace(/@@M(\d+)@@/g, (_, idx) => mathSlots[Number(idx)]);
+  return s;
+}
+function renderMarkdownWithMath(md) {
+  const lines = md.replace(/\r\n/g, "\n").split("\n");
+  let html = "", inCode = false, inMath = false, mathBuf = [], inList = false, inTable = false, toc = [];
+  const flushList = () => { if (inList) { html += "</ul>"; inList = false; } };
+  const flushTable = () => { if (inTable) { html += "</tbody></table>"; inTable = false; } };
+
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (ln.trim().startsWith("```")) {
+      flushList(); flushTable();
+      if (!inCode) { html += "<pre><code>"; inCode = true; } else { html += "</code></pre>"; inCode = false; }
+      continue;
+    }
+    if (inCode) { html += escHtml(ln) + "\n"; continue; }
+
+    if (ln.trim() === "$$") {
+      flushList(); flushTable();
+      if (!inMath) { inMath = true; mathBuf = []; }
+      else { html += `<div class="math-block">${renderLatexPretty(mathBuf.join("\n"))}</div>`; inMath = false; }
+      continue;
+    }
+    if (inMath) { mathBuf.push(ln); continue; }
+    if (ln.trim().startsWith("$$") && ln.trim().endsWith("$$") && ln.trim().length > 4) {
+      flushList(); flushTable();
+      html += `<div class="math-block">${renderLatexPretty(ln.trim().slice(2, -2))}</div>`; continue;
+    }
+
+    const hm = ln.match(/^(#{1,4})\s+(.+)$/);
+    if (hm) {
+      flushList(); flushTable();
+      const lvl = hm[1].length, rawTitle = hm[2].replace(/`([^`]+)`/g, "$1");
+      const id = "sec-" + toc.length;
+      if (lvl === 2 || lvl === 3) toc.push({ id, lvl, text: rawTitle });
+      html += `<h${lvl} id="${id}">${renderInlineMd(hm[2])}</h${lvl}>`;
+      continue;
+    }
+    if (ln.trim() === "---") { flushList(); flushTable(); html += "<hr style='border:none;border-top:1px solid var(--border);margin:16px 0;'/>"; continue; }
+    if (ln.trim().startsWith("|") && ln.includes("|")) {
+      flushList();
+      const cells = ln.trim().slice(1, -1).split("|").map(c => c.trim());
+      if (cells.every(c => /^:?-{2,}:?$/.test(c))) continue;
+      if (!inTable) {
+        inTable = true;
+        html += "<table><thead><tr>" + cells.map(c => `<th>${renderInlineMd(c)}</th>`).join("") + "</tr></thead><tbody>";
+      } else {
+        html += "<tr>" + cells.map(c => `<td>${renderInlineMd(c)}</td>`).join("") + "</tr>";
+      }
+      continue;
+    } else { flushTable(); }
+
+    if (ln.trim().startsWith("> ")) { flushList(); html += `<blockquote>${renderInlineMd(ln.trim().slice(2))}</blockquote>`; continue; }
+    const lm = ln.match(/^\s*(?:[-*]|\d+\.)\s+(.+)$/);
+    if (lm) {
+      if (!inList) { html += "<ul style='padding-left:20px;margin:6px 0;'>"; inList = true; }
+      html += `<li>${renderInlineMd(lm[1])}</li>`;
+      continue;
+    } else { flushList(); }
+
+    if (ln.trim() === "") { html += "<div style='height:6px'></div>"; continue; }
+    html += `<p style='margin:6px 0;'>${renderInlineMd(ln)}</p>`;
+  }
+  flushList(); flushTable();
+  return { html, toc };
+}
+
+async function loadDoc(base) {
+  CURRENT_DOC_BASE = base || "formulation";
+  ["formulation","architecture","readme"].forEach(b => {
+    const btn = document.getElementById("docbtn-" + b);
+    if (btn) btn.className = b === CURRENT_DOC_BASE ? "primary" : "";
+  });
+  const docKey = `${CURRENT_DOC_BASE}_${LANG}`;
+  const res = await fetch("/api/docs?name=" + encodeURIComponent(docKey));
+  const data = await res.json();
+  if (!data.ok) { document.getElementById("doc-viewer").innerHTML = `<p>${data.error}</p>`; return; }
+  document.getElementById("doc-filename-badge").textContent = data.filename;
+  const rendered = renderMarkdownWithMath(data.markdown);
+  const viewer = document.getElementById("doc-viewer");
+  viewer.innerHTML = rendered.html;
+  viewer.scrollTop = 0;
+  document.getElementById("doc-toc").innerHTML = rendered.toc.map(t =>
+    `<a class="toc-link ${t.lvl===3?"h3":""}" onclick="document.getElementById('${t.id}')?.scrollIntoView({behavior:'smooth'})">${escHtml(t.text)}</a>`
+  ).join("");
+}
+
+/* --- LIVE TIME SERIES CHART --- */
+function drawTimeSeries(csv) {
+  const cv = document.getElementById("tsCanvas");
+  if (!cv) return;
+  const ctx = cv.getContext("2d"), W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  const days = csv.sim_days || [];
+  if (days.length < 2) {
+    ctx.fillStyle = "#64748b"; ctx.font = "13px sans-serif";
+    ctx.fillText(LANG === "ja" ? "日次統計 (daily_global.csv) 待機中..." : "Waiting for daily_global.csv...", 36, H/2); return;
+  }
+  const padL = 48, padR = 16, padT = 24, padB = 28, cw = W-padL-padR, ch = H-padT-padB;
+  ctx.strokeStyle = "#263347"; ctx.strokeRect(padL, padT, cw, ch);
+
+  const plotNorm = (arr, color, vmin, vmax) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 1.8; ctx.beginPath();
+    for (let i = 0; i < arr.length; i++) {
+      const x = padL + (i / (arr.length - 1)) * cw;
+      const y = padT + ch - Math.max(0, Math.min(1, (arr[i] - vmin) / (vmax - vmin))) * ch;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  };
+  plotNorm(csv.ts_k, "#f87171", 275, 295);       // Red: Ts 275..295 K
+  plotNorm(csv.olr_wm2, "#fbbf24", 210, 260);    // Amber: OLR 210..260 W/m2
+  plotNorm(csv.precip_mm_d, "#38bdf8", 1.0, 3.5);// Cyan: Precip 1..3.5 mm/d
+  plotNorm(csv.lai, "#34d399", 0.0, 2.5);        // Green: LAI 0..2.5
+
+  const li = days.length - 1;
+  ctx.font = "11.5px monospace";
+  ctx.fillStyle = "#f87171"; ctx.fillText(`Ts=${csv.ts_k[li].toFixed(2)}K [275-295]`, padL+6, 16);
+  ctx.fillStyle = "#fbbf24"; ctx.fillText(`OLR=${csv.olr_wm2[li].toFixed(1)} [210-260]`, padL+185, 16);
+  ctx.fillStyle = "#38bdf8"; ctx.fillText(`P=${csv.precip_mm_d[li].toFixed(2)}mm/d [1-3.5]`, padL+355, 16);
+  ctx.fillStyle = "#34d399"; ctx.fillText(`LAI=${csv.lai[li].toFixed(2)} [0-2.5]`, padL+530, 16);
+  ctx.fillStyle = "#94a3b8";
+  ctx.fillText(`Day ${days[0].toFixed(0)}`, padL, H - 8);
+  ctx.fillText(`Day ${days[li].toFixed(0)}`, W - 82, H - 8);
+}
+
+setInterval(() => {
+  const auto = document.getElementById("auto-poll")?.checked;
+  const active = document.getElementById("tab-monitor")?.classList.contains("active");
+  if (auto && active) fetchMonitorOnce();
+}, 5000);
+
+fetchInitial();
+bindGlobeInteractions();
+requestAnimationFrame(animateGlobes);
+</script>
+</body>
+</html>
+"""
+
+
+_DOC_FILES: dict[str, Path] = {
+    "formulation_ja": _REPO_ROOT / "docs" / "formulation_ja.md",
+    "formulation_en": _REPO_ROOT / "docs" / "formulation.md",
+    "architecture_ja": _REPO_ROOT / "docs" / "architecture_ja.md",
+    "architecture_en": _REPO_ROOT / "docs" / "architecture.md",
+    "readme_ja": _REPO_ROOT / "README_ja.md",
+    "readme_en": _REPO_ROOT / "README.md",
+}
+
+
+class ConfigGUIHandler(BaseHTTPRequestHandler):
+    """HTTP request handler serving the full AOBA Config + Run + Monitor + 3-Globe Preview UI."""
+
+    server_version = "AOBAStudio/2.0"
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        return
+
+    def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length > 0 else b"{}"
+        return json.loads(body.decode("utf-8"))
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/index.html"):
+            raw = _HTML_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+
+        if parsed.path == "/api/state":
+            defaults = default_config_dict()
+            cur = self.server.current_config  # type: ignore[attr-defined]
+            self._send_json({
+                "defaults": defaults,
+                "config": cur,
+                "section_meta": SECTION_META,
+                "toml_path": str(self.server.toml_path),  # type: ignore[attr-defined]
+                "param_count": sum(len(v) for v in defaults.values()),
+            })
+            return
+
+        if parsed.path == "/api/runs/discover":
+            rm: RunManager = self.server.run_manager  # type: ignore[attr-defined]
+            self._send_json({
+                "ok": True,
+                "discovered_dirs": _discover_output_dirs(rm.last_watch_dir),
+                "active_processes": _discover_active_processes(),
+                "managed_run": rm.get_managed_status(),
+            })
+            return
+
+        if parsed.path == "/api/monitor/snapshot":
+            qs = parse_qs(parsed.query)
+            out_dir = qs.get("out_dir", [""])[0]
+            source = qs.get("source", ["auto"])[0]
+            try:
+                frame = int(qs.get("frame", ["-1"])[0])
+            except ValueError:
+                frame = -1
+            rm = self.server.run_manager  # type: ignore[attr-defined]
+            self._send_json(rm.build_monitor_payload(out_dir, source=source, frame_req=frame))
+            return
+
+        if parsed.path == "/api/docs":
+            qs = parse_qs(parsed.query)
+            key = qs.get("name", ["formulation_ja"])[0]
+            doc_p = _DOC_FILES.get(key)
+            if doc_p is None or not doc_p.exists():
+                self._send_json({"ok": False, "error": f"Unknown or missing document: {key}"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._send_json({
+                "ok": True,
+                "key": key,
+                "filename": str(doc_p.relative_to(_REPO_ROOT)),
+                "markdown": doc_p.read_text(encoding="utf-8"),
+            })
+            return
+
+        self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        try:
+            payload = self._read_json()
+        except json.JSONDecodeError as exc:
+            self._send_json({"ok": False, "error": f"Invalid JSON: {exc}"}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        if parsed.path == "/api/toml":
+            cfg = sanitize_config_dict(payload.get("config", {}))
+            self._send_json({
+                "ok": True,
+                "toml_text": dump_aoba_toml(cfg),
+                "modified_count": count_modified_keys(cfg),
+            })
+            return
+
+        if parsed.path == "/api/save":
+            cfg = sanitize_config_dict(payload.get("config", {}))
+            save_path = Path(str(payload.get("save_path", self.server.toml_path))).expanduser()  # type: ignore[attr-defined]
+            if not save_path.is_absolute():
+                save_path = _REPO_ROOT / save_path
+            saved = save_aoba_toml(cfg, save_path)
+            self.server.current_config = cfg  # type: ignore[attr-defined]
+            self.server.toml_path = saved  # type: ignore[attr-defined]
+            self._send_json({
+                "ok": True,
+                "path": str(saved),
+                "toml_text": dump_aoba_toml(cfg),
+                "modified_count": count_modified_keys(cfg),
+            })
+            return
+
+        if parsed.path == "/api/load":
+            load_path = Path(str(payload.get("load_path", ""))).expanduser()
+            if not load_path.is_absolute():
+                load_path = _REPO_ROOT / load_path
+            if not load_path.exists():
+                self._send_json({"ok": False, "error": f"File not found: {load_path}"}, status=HTTPStatus.NOT_FOUND)
+                return
+            try:
+                cfg = load_aoba_toml(load_path)
+            except (OSError, tomllib.TOMLDecodeError) as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self.server.current_config = cfg  # type: ignore[attr-defined]
+            self.server.toml_path = load_path  # type: ignore[attr-defined]
+            self._send_json({"ok": True, "path": str(load_path), "config": cfg, "toml_text": dump_aoba_toml(cfg)})
+            return
+
+        if parsed.path == "/api/reset":
+            cfg = default_config_dict()
+            self.server.current_config = cfg  # type: ignore[attr-defined]
+            self._send_json({"ok": True, "config": cfg, "toml_text": dump_aoba_toml(cfg)})
+            return
+
+        if parsed.path == "/api/run/start":
+            rm: RunManager = self.server.run_manager  # type: ignore[attr-defined]
+            cfg = sanitize_config_dict(payload.get("config", self.server.current_config))  # type: ignore[attr-defined]
+            self.server.current_config = cfg  # type: ignore[attr-defined]
+            device = str(payload.get("device", "auto"))
+            no_resume = bool(payload.get("no_resume", False))
+            res = rm.start_run(cfg, device=device, no_resume=no_resume)
+            self._send_json(res, status=HTTPStatus.OK if res.get("ok") else HTTPStatus.CONFLICT)
+            return
+
+        if parsed.path == "/api/run/stop":
+            rm = self.server.run_manager  # type: ignore[attr-defined]
+            res = rm.stop_managed_run()
+            self._send_json(res, status=HTTPStatus.OK if res.get("ok") else HTTPStatus.BAD_REQUEST)
+            return
+
+        self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+
+
+def create_gui_server(
+    toml_path: str | Path | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+) -> ThreadingHTTPServer:
+    """Create and bind an interactive AOBA Studio HTTP server."""
+    target = Path(toml_path).expanduser() if toml_path else default_toml_path()
+    if not target.is_absolute():
+        target = _REPO_ROOT / target
+    cfg = load_aoba_toml(target) if target.exists() else default_config_dict()
+    server = ThreadingHTTPServer((host, port), ConfigGUIHandler)
+    server.toml_path = target  # type: ignore[attr-defined]
+    server.current_config = cfg  # type: ignore[attr-defined]
+    server.preview_engine = CPUGlobePreviewEngine()  # type: ignore[attr-defined]
+    server.run_manager = RunManager(server.preview_engine)  # type: ignore[attr-defined]
+    return server
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Launch AOBA Studio Web GUI (Config, Run, Monitor, Live 3-Globe Preview).")
+    parser.add_argument("--toml", type=str, default=str(default_toml_path()), help="TOML configuration file path")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--no-browser", action="store_true", help="Do not automatically open a web browser")
+    args = parser.parse_args()
+
+    server = create_gui_server(args.toml, host=args.host, port=args.port)
+    url = f"http://{server.server_address[0]}:{server.server_address[1]}/"
+    print(f"AOBA Studio running at {url}", flush=True)
+    print(f"Loaded TOML: {server.toml_path}", flush=True)  # type: ignore[attr-defined]
+    if not args.no_browser:
+        threading.Timer(0.3, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down AOBA Studio.", flush=True)
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

@@ -28,16 +28,12 @@ AOBA は以下の2つの根源的な問いを解くために設計された結�
 ### 2.2 変位追従型の実効空力基準面と最新粗度サブレイヤ（RSL）
 - **根拠文献**: Hirt & Rexer (2015); Kempes et al. (2011); Raupach (1994); Harman & Finnigan (2007); De Ridder (2010, *Boundary-Layer Meteorol.*, 134, 257–267); Bonan et al. (2018, *GMD*, 11, 1467–1496); Lee et al. (2020, *GMD*, 13, 521–536); Abolafia-Rosenzweig et al. (2021, *JAMES*, 13, e2021MS002665); Meier et al. (2022, *GMD*, 15, 2365–2393); Miller, Beljaars, & Palmer (1992, *J. Climate*, 5, 418–434).
 - **`Earth2014` 境界標高と厳密な海陸・氷床マスク**: 5分格子 `Earth2014`（`SUR2014`, `TBI2014`, `ICE2014`）からセル平均標高 $z_{\mathrm{topo}}$・サブグリッド標準偏差 $\sigma_{\mathrm{topo}}$ とともに、開水面（$\mathrm{SUR} - \mathrm{TBI} > 0$）、接地氷床（$\mathrm{ICE} > 0,\ \mathrm{SUR} = \mathrm{TBI}$）、および海面下内陸盆地を含む非氷河陸地を代数的に厳密分離する。
-- **実効空力基準面と解析的 RSL 相似則**: 維管束アロメトリと局所資源収支から最大樹冠高 $h_c$ を決定し（Kempes et al., 2011）、積雪深による雪埋没補正（MATSIRO6, 2021, Eqs. 2.1–2.3; Abolafia-Rosenzweig et al., 2021）を施したうえで、ゼロ面変位 $d(h_c, \mathrm{LAI})$・運動量粗度長 $z_{0m}(h_c, \mathrm{LAI})$（Raupach, 1994）および指数関数積分による閉形式 RSL 安定度補正 $\hat{\Psi}_{M,H}$（Harman & Finnigan, 2007; De Ridder, 2010; Bonan et al., 2018; Lee et al., 2020）を接続する。鉛直座標の下端原点を
-  $$
-  z_{\mathrm{datum}} = z_{\mathrm{topo}} + d
-  $$
-  に置くことで、最下層中心（$\tilde{z}_1 = 30\ \mathrm{m}$）において常に $\tilde{z}_1 > (h_c - d) > z_{0m}$ が成立する。開水面上の運動量・熱・水蒸気粗度長には弱風時の滑面粘性項＋Charnock 波浪項を用いる（Miller et al., 1992）。
+- **実効空力基準面と解析的 RSL 相似則**: 維管束アロメトリと局所資源収支から最大樹冠高 $h_c$ を決定し（Kempes et al., 2011）、積雪深による雪埋没補正（MATSIRO6, 2021, Eqs. 2.1–2.3; Abolafia-Rosenzweig et al., 2021）を施したうえで、ゼロ面変位 $d(h_c, \mathrm{LAI})$・運動量粗度長 $z_{0m}(h_c, \mathrm{LAI})$（Raupach, 1994）および指数関数積分による閉形式 RSL 安定度補正 $\hat{\Psi}_{M,H}$（Harman & Finnigan, 2007; De Ridder, 2010; Bonan et al., 2018; Lee et al., 2020）を接続する。大気格子の下端は固体地球・氷床表面 $z_{w,0} = z_{\mathrm{topo}}$ に固定しつつ、地表面交換参照高度を $\tilde{z}_{\mathrm{ref}} = \max(z_{c,0} - z_{w,0} - 0.65\, h_c,\ 5.0\ \mathrm{m})$ として樹高変位を整合反映する。開水面上の運動量・熱・水蒸気粗度長には弱風時の滑面粘性項＋Charnock 波浪項を用いる（Miller et al., 1992）。
 
-### 2.3 純粋 1:1 埋め込み 3D CRM・MYNN Level 2.5 境界層・3D SGS 乱流
-- **根拠文献**: Khairoutdinov & Randall (2003); Khairoutdinov, Randall, & DeMott (2005); Nakanishi & Niino (2009, *JMSJ*, 87, 895–912); Yamazaki & Miura (2024); Nishizawa, Tomita, & Team SCALE (2025, Sec. 8.1.2 & Sec. 8.2.1).
-- **純粋 1:1 スーパーパラメタリゼーション結合**: すべてのホストボロノイセルに1対1対応で水平二重周期 $32\ \mathrm{km} \times 32\ \mathrm{km}$ の直交正方形 Arakawa C-grid × 鉛直 Charney–Phillips 3D CRM（`[N_cells, nz = 32, ny = 8, nx = 8]`、$\Delta x = \Delta y = 4\ \mathrm{km}$、$\Delta t_{\mathrm{CRM}} = 12\text{--}15\ \mathrm{s}$）を埋め込み、ホストと同一の圧縮性非静力学 HEVI ソルバ・熱力学・FCT 移流で解き、3次元対流加熱・加湿・運動量輸送傾向項を返す。
-- **乱流クロージャ**: 各 CRM コラムの鉛直大気境界層・層積雲頂混合には浮力長と凝結水分散を含む陰的 **MYNN Level 2.5** TKE クロージャ（Nakanishi & Niino, 2009; Nishizawa et al., 2025, Sec. 8.2.1）を用い、$4\ \mathrm{km}$ 格子の3次元サブグリッド乱流には非等方 **Smagorinsky–Lilly** 渦拡散（Nishizawa et al., 2025, Sec. 8.1.2）を併用する。
+### 2.3 純粋 1:1 MAML+ICA 埋め込み CRM・MYNN Level 2.5 境界層・3D SGS 乱流
+- **根拠文献**: Khairoutdinov & Randall (2003); Khairoutdinov, Randall, & DeMott (2005); Lee & Khairoutdinov (2015); Lin et al. (2023); Nakanishi & Niino (2009, *JMSJ*, 87, 895–912); Yamazaki & Miura (2024); Nishizawa, Tomita, & Team SCALE (2025, Sec. 8.1.2 & Sec. 8.2.1).
+- **純粋 1:1 MAML + ICA スーパーパラメタリゼーション結合**: すべてのホストボロノイセルに1対1対応で水平二重周期の直交 Arakawa C-grid × 鉛直 Charney–Phillips CRM（既定 `[N_cells, nz = 32, ny = 1, nx = 8]`, $\Delta x = 8\ \mathrm{km}$、TOML で `8 × 8`, $\Delta x = 4\ \mathrm{km}$ 等へ任意設定可）を埋め込み、サブグリッド各列独立に4バンド放射（ICA）と地表面・植生状態（MAML）を保持・交換して3次元対流加熱・加湿・運動量輸送傾向項を返す。
+- **乱流クロージャ**: 各 CRM コラムの鉛直大気境界層・層積雲頂混合には浮力長と凝結水分散を含む陰的 **MYNN Level 2.5** TKE クロージャ（Nakanishi & Niino, 2009; Nishizawa et al., 2025, Sec. 8.2.1）を用い、CRM 内の3次元サブグリッド乱流には非等方 **Smagorinsky–Lilly** 渦拡散（Nishizawa et al., 2025, Sec. 8.1.2）を併用する。
 
 ---
 
@@ -73,3 +69,14 @@ AOBA は以下の2つの根源的な問いを解くために設計された結�
 ### 4.3 1.5層ボロノイ C-grid 風成エクマン海洋および部分海氷（リード）モデル
 - **根拠文献**: Semtner (1976); Briegleb et al. (1986); Miller, Beljaars, & Palmer (1992); Codron (2012); MIROC6 AGCM Document Writing Team (2021, Sec. 3.8); Nishizawa et al. (2025, Sec. 8.6).
 - **処方 $Q$ フラックス不要のエクマン海洋・部分海氷**: ホストと同一の SCVT ボロノイ C-grid 上（海岸線エッジで法線流量 $= 0$）で、海面風応力が駆動する表層混合層（$H_{\mathrm{ml}} = 50\ \mathrm{m}$）のエクマン熱輸送・沿岸／赤道湧昇・渦拡散を**処方 $Q$ フラックス完全ゼロ**で解き（Codron, 2012）、部分海氷被覆率 $f_i = \min(\sqrt{M_i/M_c}, 1)$・開水面／海氷別フラックス面積加重・降雪融解潜熱冷却・太陽天頂角依存海面アルベドを備えた熱力学海氷モデルと結合する（Semtner, 1976; Briegleb et al., 1986; MIROC6, 2021, Sec. 3.8; Nishizawa et al., 2025, Sec. 8.6）。
+
+---
+
+## 5. 動的／平衡加速 SIA 氷床モデルおよび単一 TOML 設定管理基盤
+
+### 5.1 動的・平衡加速 SIA 氷床モデルと大気鉛直座標の再配置 (`src/aoba/icesheet.py`)
+- **根拠文献**: Vialov (1958); Mahaffy (1976); Le Meur & Huybrechts (1996); Bueler et al. (2005); Cuffey & Paterson (2010); Pollard & DeConto (2012).
+- **結合アーキテクチャ**: `Earth2014.BED2014` および `ICE2014` から岩盤標高と初期氷厚を構築し、年次 EMA 平滑表面質量収支（SMB）と Glen 流動則 ($n=3$) による SCVT 上流有限体積 SIA 拡散、緩和型リソスタシー・アイソスタシー、およびスピンアップ加速率 $\alpha_{\mathrm{eff}}(t)$ を統合する。氷床厚変化による $|z_{\mathrm{topo}}^{\mathrm{new}} - z_{w,0}| \ge 0.05\ \mathrm{m}$ 発生時には Klemp STF 座標を再構築し、測高公式外挿＋対数気圧線形補間でホスト大気および全 CRM コラムを再補間しつつ `SURF_LAND <-> SURF_ICESHEET` 被覆遷移と開拓植生播種を自律実行する。
+
+### 5.2 単一 TOML パラメータ一元管理と対話型 GUI (`src/aoba/params.py`, `scripts/aoba_config_gui.py`)
+- **透明性・再現性基盤**: 全格子設定 (`glevel`, `nz`, CRM 格子数・間隔)・外力・動的氷床オプション・出力ファイル種別／時間間隔（時間平均・瞬時値・2D/3D/サブグリッド2D）・全物理定数（13セクション・188項目）を単一の [`config/aoba_default.toml`](../config/aoba_default.toml) で一元管理し、`scripts/aoba_config_gui.py` から対話型可視化図付きで編集・保存して `scripts/run_g5_30yr.py --config ...` へ直接投入できる。

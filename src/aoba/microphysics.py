@@ -177,6 +177,40 @@ _MP_METAL_CONSTS: list[float] = [
 ]
 
 
+def recompute_derived_constants() -> None:
+    """Refresh precomputed KR03 fall/accretion/ventilation coefficients and Metal constant buffer."""
+    global _FALL_PREF_R, _FALL_PREF_S, _FALL_PREF_G
+    global _ACCR_RC, _ACCR_SC, _ACCR_GC, _ACCR_RI, _ACCR_SI, _ACCR_GI
+    global _AEM_R, _BEM_R, _AEM_S, _BEM_S, _AEM_G, _BEM_G
+    _FALL_PREF_R = _precompute_fall_coeff(A_FALL_RAIN, B_FALL_RAIN, RHO_RAIN, N0_RAIN)
+    _FALL_PREF_S = _precompute_fall_coeff(A_FALL_SNOW, B_FALL_SNOW, RHO_SNOW, N0_SNOW)
+    _FALL_PREF_G = _precompute_fall_coeff(A_FALL_GRAUPEL, B_FALL_GRAUPEL, RHO_GRAUPEL, N0_GRAUPEL)
+    _ACCR_RC = _precompute_accr_coeff(A_FALL_RAIN, B_FALL_RAIN, RHO_RAIN, N0_RAIN, E_RC)
+    _ACCR_SC = _precompute_accr_coeff(A_FALL_SNOW, B_FALL_SNOW, RHO_SNOW, N0_SNOW, E_SC)
+    _ACCR_GC = _precompute_accr_coeff(A_FALL_GRAUPEL, B_FALL_GRAUPEL, RHO_GRAUPEL, N0_GRAUPEL, E_GC)
+    _ACCR_RI = _precompute_accr_coeff(A_FALL_RAIN, B_FALL_RAIN, RHO_RAIN, N0_RAIN, E_RI)
+    _ACCR_SI = _precompute_accr_coeff(A_FALL_SNOW, B_FALL_SNOW, RHO_SNOW, N0_SNOW, E_SI)
+    _ACCR_GI = _precompute_accr_coeff(A_FALL_GRAUPEL, B_FALL_GRAUPEL, RHO_GRAUPEL, N0_GRAUPEL, E_GI)
+    _AEM_R, _BEM_R = _precompute_evap_coeffs(A_FALL_RAIN, B_FALL_RAIN, RHO_RAIN, N0_RAIN, AF_RAIN, BF_RAIN)
+    _AEM_S, _BEM_S = _precompute_evap_coeffs(A_FALL_SNOW, B_FALL_SNOW, RHO_SNOW, N0_SNOW, AF_SNOW, BF_SNOW)
+    _AEM_G, _BEM_G = _precompute_evap_coeffs(A_FALL_GRAUPEL, B_FALL_GRAUPEL, RHO_GRAUPEL, N0_GRAUPEL, AF_GRAUPEL, BF_GRAUPEL)
+    _MP_METAL_CONSTS[:] = [
+        C.P_REF, C.R_D, C.R_V, C.CP_D, C.GAMMA_D, C.KAPPA_D,
+        C.RV_OVER_RD, C.EPS_WATER, C.L_V0, C.L_F0, C.L_S0,
+        C.E_TRIPLE, C.T_FREEZE, C.T_TRIPLE, C.T_ICE_ALL, C.T_LIQ_ALL,
+        QC_AUTOCONV_THRESH, QI_AGGREG_THRESH, RATE_AUTOCONV, RATE_ICE_AGGREG,
+        VT_CLOUD_ICE, T0_PRECIP, T00_PRECIP, T0_GRAUPEL, T00_GRAUPEL,
+        DIFF_VAPOR_0C, K_THERM_AIR_0C,
+        SHAPE_RAIN, SHAPE_SNOW, SHAPE_GRAUPEL,
+        N0_RAIN, N0_SNOW, N0_GRAUPEL,
+        B_FALL_RAIN, B_FALL_SNOW, B_FALL_GRAUPEL,
+        _FALL_PREF_R, _FALL_PREF_S, _FALL_PREF_G,
+        _ACCR_RC, _ACCR_SC, _ACCR_GC,
+        _ACCR_RI, _ACCR_SI, _ACCR_GI,
+        _AEM_R, _BEM_R, _AEM_S, _BEM_S, _AEM_G, _BEM_G,
+    ]
+
+
 @dataclass
 class MicrophysicsResult:
     """Updated moist state and surface precipitation diagnostics after one microphysics step."""

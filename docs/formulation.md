@@ -2,7 +2,24 @@
 
 > **Language**: English | [日本語 (formulation_ja.md)](formulation_ja.md)
 
-This document provides the complete mathematical formulation and numerical discretization of **AOBA**, written in the style of *Description of MIROC6 AGCM* (2021), *Description of MATSIRO6* (2021), and *Detailed formulation of SCALE-RM* (Nishizawa et al., 2025). Every equation corresponds to an implemented module in `src/aoba/` and cites its peer-reviewed source.
+This document presents the complete continuous equations, coordinate transformations, staggered spatial discretizations, time-integration schemes, closed-form physical/ecological/cryospheric/oceanic/ice-sheet closures, and unified TOML parameter registry of **AOBA**, written to the mathematical completeness standard of *Description of MIROC6 AGCM* (2021), *Description of MATSIRO6* (2021), and *Detailed formulation of SCALE-RM* (Nishizawa et al., 2025). Every equation, symbol, and default constant maps 1-to-1 onto `src/aoba/` and `config/aoba_default.toml`.
+
+---
+
+## Contents
+
+1. [Physical Constants and Orbital Solar Geometry (`constants.py`, `radiation.py`)](#1-physical-constants-and-orbital-solar-geometry)
+2. [Vertical Charney–Phillips Grid and Smoothed Terrain-Following Coordinate (`vertical_grid.py`)](#2-vertical-charneyphillips-grid-and-smoothed-terrain-following-coordinate)
+3. [Moist Compressible Thermodynamics and Mixed-Phase Saturation Adjustment (`thermodynamics.py`)](#3-moist-compressible-thermodynamics-and-mixed-phase-saturation-adjustment)
+4. [Four-Band Lookup-Table-Free Two-Stream Radiative Transfer (`radiation.py`, `kernels.py`)](#4-four-band-lookup-table-free-two-stream-radiative-transfer)
+5. [Mixed-Phase Single-Moment Cloud Microphysics and Sedimentation (`microphysics.py`)](#5-mixed-phase-single-moment-cloud-microphysics-and-sedimentation)
+6. [Roughness Sublayer (RSL), Implicit MYNN Level 2.5 PBL, and 3D SGS Turbulence (`turbulence.py`, `crm.py`)](#6-roughness-sublayer-rsl-implicit-mynn-level-25-pbl-and-3d-sgs-turbulence)
+7. [Two-Leaf Non-Rectangular-Hyperbola EEO Biosphere (`biosphere.py`)](#7-two-leaf-non-rectangular-hyperbola-eeo-biosphere)
+8. [Land Hydrology, Five-Layer Freeze–Thaw Soil, Snow, and Ocean/Sea-Ice (`surface.py`)](#8-land-hydrology-five-layer-freezethaw-soil-snow-and-oceansea-ice)
+9. [Embedded 3D Nonhydrostatic RK3–HEVI CRM and Zalesak FCT (`crm.py`)](#9-embedded-3d-nonhydrostatic-rk3hevi-crm-and-zalesak-fct)
+10. [Global SCVT C-Grid Core, Orographic Drag, Ekman Ocean, and MAML+ICA Coupling (`scvt_mesh.py`, `scvt_dynamics.py`, `orography.py`, `ocean_ekman.py`, `coupled_model.py`, `koppen.py`)](#10-global-scvt-c-grid-core-orographic-drag-ekman-ocean-and-mamlica-coupling)
+11. [Dynamic / Accelerated SIA Ice-Sheet Model and Conservative Barometric Remapping (`icesheet.py`)](#11-dynamic--accelerated-sia-ice-sheet-model-and-conservative-barometric-remapping)
+12. [Unified Single-File TOML Configuration, Output Cadence, GUI, and 188-Parameter Registry (`params.py`, `config/aoba_default.toml`, `scripts/aoba_config_gui.py`)](#12-unified-single-file-toml-configuration-output-cadence-gui-and-188-parameter-registry)
 
 ---
 
@@ -10,375 +27,310 @@ This document provides the complete mathematical formulation and numerical discr
 
 ### 1.1 Fundamental Physical Constants (`src/aoba/constants.py`)
 
-Table 1.1 lists the fundamental planetary, thermodynamic, radiative, and oceanic constants used across AOBA, following Wing et al. (2018, Table 1), Khairoutdinov & Randall (2003, Appendix A), MIROC6 AGCM Document Writing Team (2021, Section 1.3.2), and Semtner (1976).
+Table 1.1 lists the planetary, thermodynamic, radiative, and oceanic constants shared across AOBA (Wing et al., 2018, Table 1; Khairoutdinov & Randall, 2003, Appendix A; MIROC6 AGCM, 2021, Sec. 1.3.2; Semtner, 1976). Derived constants (`c_vd = c_pd - R_d`, `gamma_d = c_pd / c_vd`, `kappa_d = R_d / c_pd`, `eps_water = R_d / R_v`, `z_vir = R_v / R_d - 1`, `L_s0 = L_v0 + L_f0`) are automatically refreshed via `constants.recompute_derived_constants()` whenever TOML overrides are loaded.
 
-| Symbol | Description | Value | Units | Reference |
+| Symbol | Physical Quantity | Default Value | Units | Reference |
 | :--- | :--- | :--- | :--- | :--- |
 | $R_E$ | Mean Earth radius | $6.371 \times 10^6$ | $\mathrm{m}$ | Wing et al. (2018) |
 | $g$ | Mean surface gravity | $9.79764$ | $\mathrm{m\ s^{-2}}$ | Wing et al. (2018) |
 | $\Omega$ | Planetary rotation rate | $7.292115 \times 10^{-5}$ | $\mathrm{rad\ s^{-1}}$ | MIROC6 (2021) |
-| $S_0$ | Present-day total solar irradiance | $1361.0$ | $\mathrm{W\ m^{-2}}$ | Wing et al. (2018) |
+| $S_0$ | Total solar irradiance | $1361.0$ | $\mathrm{W\ m^{-2}}$ | Wing et al. (2018) |
 | $R_d$ | Dry-air gas constant | $287.04$ | $\mathrm{J\ kg^{-1}\ K^{-1}}$ | Wing et al. (2018) |
 | $c_{pd}$ | Dry-air isobaric specific heat | $1004.64$ | $\mathrm{J\ kg^{-1}\ K^{-1}}$ | Wing et al. (2018) |
 | $c_{vd}$ | Dry-air isochoric specific heat ($c_{pd} - R_d$) | $717.60$ | $\mathrm{J\ kg^{-1}\ K^{-1}}$ | Skamarock et al. (2012) |
 | $R_v$ | Water-vapor gas constant | $461.50$ | $\mathrm{J\ kg^{-1}\ K^{-1}}$ | Wing et al. (2018) |
 | $c_{pv}$ | Water-vapor isobaric specific heat | $1846.0$ | $\mathrm{J\ kg^{-1}\ K^{-1}}$ | Wing et al. (2018) |
-| $\epsilon$ | Molecular mass ratio $R_d / R_v$ | $0.62197$ | $-$ | Skamarock et al. (2012) |
+| $\epsilon$ | Molecular weight ratio $R_d / R_v$ | $0.621972$ | $-$ | Skamarock et al. (2012) |
+| $\delta_{\mathrm{vir}}$ | Virtual factor $R_v / R_d - 1$ | $0.607790$ | $-$ | Skamarock et al. (2012) |
 | $p_0$ | Reference surface pressure | $1.0 \times 10^5$ | $\mathrm{Pa}$ | Skamarock et al. (2012) |
+| $T_0$ | Freezing point temperature | $273.15$ | $\mathrm{K}$ | CODATA |
+| $T_{\mathrm{tp}}, e_{\mathrm{tp}}$ | Water triple-point temperature & saturation vapor pressure | $273.16\ \mathrm{K},\ 611.2\ \mathrm{Pa}$ | $-$ | Bolton (1980) |
 | $L_{v0}$ | Latent heat of vaporization at $0\ ^\circ\mathrm{C}$ | $2.501 \times 10^6$ | $\mathrm{J\ kg^{-1}}$ | Wing et al. (2018) |
 | $L_{f0}$ | Latent heat of fusion at $0\ ^\circ\mathrm{C}$ | $3.337 \times 10^5$ | $\mathrm{J\ kg^{-1}}$ | Wing et al. (2018) |
 | $L_{s0}$ | Latent heat of sublimation ($L_{v0} + L_{f0}$) | $2.8347 \times 10^6$ | $\mathrm{J\ kg^{-1}}$ | Wing et al. (2018) |
-| $\sigma$ | Stefan–Boltzmann constant | $5.670374 \times 10^{-8}$ | $\mathrm{W\ m^{-2}\ K^{-4}}$ | CODATA |
+| $\sigma$ | Stefan–Boltzmann constant | $5.670374419 \times 10^{-8}$ | $\mathrm{W\ m^{-2}\ K^{-4}}$ | CODATA |
+| $\kappa$ | von Kármán constant | $0.40$ | $-$ | Nakanishi & Niino (2009) |
+| $\rho_w, c_{pw}$ | Seawater density & specific heat | $1025.0\ \mathrm{kg\ m^{-3}},\ 3990.0\ \mathrm{J\ kg^{-1}\ K^{-1}}$ | $-$ | MIROC6 (2021) |
+| $T_{f,\mathrm{ocn}}$ | Ocean freezing temperature | $271.35$ | $\mathrm{K}$ | Semtner (1976) |
+| $\rho_i, k_i, k_s$ | Sea-ice density, ice conductivity, snow conductivity | $917.0\ \mathrm{kg\ m^{-3}},\ 2.034,\ 0.3096\ \mathrm{W\ m^{-1}\ K^{-1}}$ | $-$ | Semtner (1976) |
 
 ### 1.2 Orbital Insolation and Solar Zenith Angle (`src/aoba/radiation.py`)
 
-Following Berger (1978) and Davis et al. (2017, Equations 2–8), let $t$ be elapsed simulation time in seconds, $N_d = (t / 86400) \bmod 365.2425$ the fractional day of year, $e$ the orbital eccentricity, $\varepsilon$ the obliquity, and $\tilde{\omega}$ the heliocentric longitude of perihelion. Defining mean anomaly $\nu_m = \frac{2\pi}{365.2425}(N_d - 80.0) - \tilde{\omega}$, the true anomaly $\nu$ and true heliocentric longitude $\lambda_s$ are evaluated as:
+Following Berger (1978) and Davis et al. (2017, Eqs. 2–8), from elapsed simulation time $t\ [\mathrm{s}]$, fractional day of year $N_d = (t / T_{\mathrm{day}}) \bmod D_{\mathrm{yr}}$ ($T_{\mathrm{day}} = 86400\ \mathrm{s},\ D_{\mathrm{yr}} = 365.2425$), orbital eccentricity $e$, obliquity $\varepsilon$, and longitude of perihelion $\tilde{\omega}$, the mean anomaly relative to vernal equinox (day 80) $\nu_m = \frac{2\pi}{D_{\mathrm{yr}}}(N_d - 80.0) - \tilde{\omega}$, true anomaly $\nu$, and true heliocentric longitude $\lambda_s$ are:
 $$
 \begin{aligned}
 \nu &= \nu_m + \left(2e - \frac{1}{4}e^3\right)\sin\nu_m + \frac{5}{4}e^2 \sin(2\nu_m), \\
 \lambda_s &= \nu + \tilde{\omega}.
 \end{aligned}
 $$
-Solar declination $\delta_s$, instantaneous top-of-atmosphere (TOA) solar irradiance $S_{\mathrm{inst}}(t)$, and cosine of solar zenith angle $\mu_0(\varphi, \lambda, t)$ at latitude $\varphi$ and longitude $\lambda$ are given by:
+Solar declination $\delta_s$, instantaneous top-of-atmosphere (TOA) solar irradiance $S_{\mathrm{inst}}(t)$, local solar hour angle $H(t, \lambda)$, and cosine of solar zenith angle $\mu_0(\varphi, \lambda, t)$ are evaluated as:
 $$
 \begin{aligned}
 \sin\delta_s &= \sin\varepsilon \sin\lambda_s, \\
 S_{\mathrm{inst}}(t) &= S_0 \left(\frac{1 + e\cos\nu}{1 - e^2}\right)^2, \\
-\mu_0(\varphi, \lambda, t) &= \max\!\left[0,\ \sin\varphi \sin\delta_s + \cos\varphi \cos\delta_s \cos H(t, \lambda)\right],
+H(t, \lambda) &= 2\pi \left[\frac{t \bmod T_{\mathrm{day}}}{T_{\mathrm{day}}} - \frac{1}{2}\right] + \lambda, \\
+\mu_0(\varphi, \lambda, t) &= \max\!\left[0,\ \sin\varphi \sin\delta_s + \cos\varphi \cos\delta_s \cos H(t, \lambda)\right].
 \end{aligned}
 $$
-where $H(t, \lambda) = 2\pi \left[\frac{t \bmod 86400}{86400} - \frac{1}{2}\right] + \lambda$ is the local hour angle.
+Whenever $H(t, \lambda) < 0 \le H(t + \Delta t, \lambda)$ with $\Delta H < \pi$, local solar noon crossing is flagged to sample downward visible fluxes for plant photosynthetic acclimation.
 
 ---
 
-## 2. Vertical Charney–Phillips Grid and Smoothed Terrain-Following Coordinate (`src/aoba/vertical_grid.py`)
+## 2. Vertical Charney–Phillips Grid and Smoothed Terrain-Following Coordinate
 
-### 2.1 Stretched Nominal Coordinate and Charney–Phillips Variable Placement
+### 2.1 Stretched Vertical Levels, Rayleigh Sponge, and Charney–Phillips Staggering (`src/aoba/vertical_grid.py`)
 
-AOBA adopts $N_z = 32$ vertical layers extending from the lower aerodynamic datum ($\zeta = 0$) to $z_{\mathrm{top}} = 24,000\ \mathrm{m}$ following Charney–Phillips vertical staggering (Gassmann, 2013, Section 3):
-- **Half-level interfaces** ($k + \frac{1}{2}$ for $k = 0, \dots, N_z$, stored as array indices `0 .. nz`): vertical velocity $w$, moist potential temperature $\theta_m$, physical interface height $z_w$, and radiative fluxes $F^\uparrow, F^\downarrow$.
-- **Full-level layer centers** ($k \in \{0, \dots, N_z - 1\}$): dry-air density $\rho_d$, air pressure $p$, temperature $T$, horizontal velocity components, and moisture mixing ratios $(q_v, q_c, q_i, q_n, q_p)$.
+AOBA discretizes the atmosphere from $\zeta_0 = 0\ \mathrm{m}$ to model top $z_{\mathrm{top}} = 24,000\ \mathrm{m}$ (default `[grid]` value) across $N_z = 32$ layers with Charney–Phillips vertical staggering (Gassmann, 2013, Sec. 3):
+- **Half-level interfaces** ($k + \frac{1}{2}$ for $k = 0, \dots, N_z$): vertical velocity $w$, interface height $z_w$, and radiative fluxes $F^\uparrow, F^\downarrow$.
+- **Full-level centers** ($k \in \{0, \dots, N_z - 1\}$): dry-air density $\rho_d$, moist potential temperature $\theta_m$, pressure $p$, temperature $T$, horizontal winds, TKE $q^2$, and moisture mixing ratios $(q_v, q_c, q_i, q_n, q_p)$.
 
-Nominal layer thicknesses $\Delta \zeta_k = \zeta_{w, k+1} - \zeta_{w, k}$ stretch smoothly from $\Delta \zeta_0 = 60.0\ \mathrm{m}$ at the surface ($\sim 12$ levels below $2\ \mathrm{km}$ for boundary-layer resolution and $\sim 15$ levels across the free troposphere) to coarse buffer layers in the lower stratosphere ($17.5\text{--}24\ \mathrm{km}$), where a $\sin^2$ Rayleigh sponge profile damps upward-propagating gravity waves (Klemp et al., 2008; Skamarock et al., 2012):
+Nominal thicknesses $\Delta \zeta_k = \Delta \zeta_0 r^k$ stretch geometrically from $\Delta \zeta_0 = 60.0\ \mathrm{m}$ such that $\sum_{k=0}^{N_z-1}\Delta\zeta_k = z_{\mathrm{top}}$ ($r \approx 1.132$ solved via Newton–Raphson), placing $\sim 13$ levels below $2\ \mathrm{km}$. Above $z_{\mathrm{sp}} = 17,500\ \mathrm{m}$, a $\sin^2$ Rayleigh sponge damps gravity waves (Klemp et al., 2008; Skamarock et al., 2012) with default $\tau_{\mathrm{sp,min}} = 300.0\ \mathrm{s}$:
 $$
 \gamma_R(\zeta) = \frac{1}{\tau_{\mathrm{sp,min}}} \sin^2\!\left[\frac{\pi}{2}\,\mathrm{clip}\!\left(\frac{\zeta - z_{\mathrm{sp}}}{z_{\mathrm{top}} - z_{\mathrm{sp}}},\, 0,\, 1\right)\right].
 $$
 
-### 2.2 Displacement-Following Smoothed Terrain-Following (STF) Transformation
+### 2.2 Klemp (2011) Smoothed Terrain-Following Coordinate and Canopy Reference Height
 
-To eliminate Monin–Obukhov surface-layer singularities over tall forest canopies ($h_c \le 45\ \mathrm{m}$) and reduce pressure-gradient truncation errors over steep mountains, the lower coordinate boundary is placed at the effective aerodynamic datum $z_{\mathrm{datum}}(\mathbf{x}) = z_{\mathrm{topo}}(\mathbf{x}) + d(\mathbf{x})$, where $z_{\mathrm{topo}}$ is surface elevation and $d$ is zero-plane displacement (Harman & Finnigan, 2007). Following Klemp (2011, Equations 4–7), physical interface heights $z_{w, k}(\mathbf{x})$ are defined as:
+To suppress terrain-induced pressure-gradient truncation errors, physical interface heights follow Klemp (2011, Eqs. 4–7) with attenuation exponent `terrain_scale_exp` $= p = 1.5$ and progressively smoothed terrain surfaces $h_{s,k}(\mathbf{x})$ ($h_{s,0} = z_{\mathrm{topo}}$):
 $$
-z_{w, k}(\mathbf{x}) = \zeta_{w, k} + A(\zeta_{w, k})\, h_{s, k}(\mathbf{x}), \qquad A(\zeta) = \cos^{2p}\!\left(\frac{\pi \zeta}{2 z_{\mathrm{top}}}\right),
+z_{w, k}(\mathbf{x}) = \zeta_{w, k} + A(\zeta_{w, k})\, h_{s, k}(\mathbf{x}), \qquad A(\zeta) = \cos^{2p}\!\left(\frac{\pi \zeta}{2 z_{\mathrm{top}}}\right), \qquad \Delta z_{c, k} = z_{w, k+1} - z_{w, k} \ge 0.25\,\Delta \zeta_k.
 $$
-where $h_{s, 0}(\mathbf{x}) = z_{\mathrm{datum}}(\mathbf{x})$, higher coordinate surfaces $h_{s, k}$ undergo progressive horizontal Laplacian smoothing aloft, and minimum fractional vertical spacing $\Delta z_k \ge \gamma_{\min} \Delta \zeta_k$ ($\gamma_{\min} = 0.20$) is strictly enforced. Because $\Delta z_0 = 60\ \mathrm{m}$ yields first-layer relative height $\tilde{z}_0 = z_{c,0} - z_{\mathrm{datum}} = 30\ \mathrm{m}$, the geometric condition $\tilde{z}_0 > (h_c - d) > z_{0m}$ holds identically across all terrestrial biomes.
+The lower boundary of the atmospheric mesh remains anchored on the solid Earth / ice-sheet surface ($z_{w,0} = z_{\mathrm{topo}}$), while forest canopy displacement height enters surface-layer similarity directly through the aerodynamic reference height:
+$$
+\tilde{z}_{\mathrm{ref}} = \max\!\left(z_{c,0} - z_{w,0} - 0.65\, h_c,\ 5.0\ \mathrm{m}\right).
+$$
+This avoids daily coordinate remapping from growing vegetation while accurately triggering De Ridder (2010) RSL enhancement inside tall canopies ($h_c \le 40\ \mathrm{m}$). Conversely, whenever dynamic ice-sheet evolution changes solid surface elevation ($|z_{\mathrm{topo}}^{\mathrm{new}} - z_{w,0}| \ge 0.05\ \mathrm{m}$; Section 11), `compute_stf_heights` updates all layers and barometrically remaps host and CRM columns.
 
 ---
 
-## 3. Moist Compressible Thermodynamics and Mixed-Phase Saturation Adjustment (`src/aoba/thermodynamics.py`)
+## 3. Moist Compressible Thermodynamics and Mixed-Phase Saturation Adjustment
 
-### 3.1 Equation of State and Vapor-Buoyancy Density
+### 3.1 Equation of State and Vapor-Buoyancy Density (`src/aoba/thermodynamics.py`)
 
-Let $q_v$, $q_c$, and $q_i$ denote mixing ratios (per unit mass of dry air $\rho_d$) of water vapor, cloud liquid water, and cloud ice, with total non-precipitating water $q_n = q_v + q_c + q_i$ and total precipitating water $q_p = q_r + q_s$. Following Skamarock et al. (2012, Equations 5–6) and Seidel & Yang (2024), modified moist potential temperature $\theta_m$, full compressible air pressure $p$, Exner function $\Pi$, temperature $T$, and total moist density $\rho$ are related by:
+With dry-air mixing ratios $(q_v, q_c, q_i)$, non-precipitating water $q_n = q_v + q_c + q_i$, and precipitating water $q_p = q_r + q_s + q_g$, modified moist potential temperature $\theta_m$, compressible pressure $p$, Exner function $\Pi$, temperature $T$, and total moist density $\rho$ obey (Skamarock et al., 2012, Eqs. 5–6; Seidel & Yang, 2024):
 $$
 \begin{aligned}
-\theta_m &= \theta \left(1 + \frac{R_v}{R_d} q_v\right), \\
-p &= p_0 \left(\frac{R_d \rho_d \theta_m}{p_0}\right)^{c_{pd} / c_{vd}}, \\
-\Pi &= \left(\frac{p}{p_0}\right)^{R_d / c_{pd}}, \qquad T = \frac{\Pi \theta_m}{1 + (R_v / R_d) q_v}, \\
-\rho &= \rho_d \left(1 + q_n + q_p\right).
+\theta_m &= \theta \left(1 + \frac{R_v}{R_d} q_v\right), \qquad p = p_0 \left(\frac{R_d \rho_d \theta_m}{p_0}\right)^{c_{pd} / c_{vd}}, \\
+\Pi &= \left(\frac{p}{p_0}\right)^{R_d / c_{pd}}, \qquad T = \frac{\Pi \theta_m}{1 + (R_v / R_d) q_v}, \qquad \rho = \rho_d \left(1 + q_n + q_p\right).
 \end{aligned}
 $$
 
 ### 3.2 Diagnostic Mixed-Phase Partitioning and Newton–Raphson Saturation Adjustment
 
-Following Khairoutdinov & Randall (2003, Equations A8–A14), cloud condensate $q_{\mathrm{cond}} = q_c + q_i$ is partitioned diagnostically between liquid and ice via a linear temperature ramp $\omega_n(T)$ between $T_{00n} = 253.15\ \mathrm{K}$ and $T_{0n} = 273.16\ \mathrm{K}$:
+Condensate $q_{\mathrm{cond}} = q_c + q_i$ partitions linearly between $T_{00n} = 253.15\ \mathrm{K}$ and $T_{0n} = 273.16\ \mathrm{K}$ (Khairoutdinov & Randall, 2003, Eqs. A8–A14):
 $$
-\omega_n(T) = \max\!\left[0,\ \min\!\left(1,\ \frac{T - T_{00n}}{T_{0n} - T_{00n}}\right)\right], \qquad q_c = \omega_n(T) q_{\mathrm{cond}}, \qquad q_i = \left[1 - \omega_n(T)\right] q_{\mathrm{cond}}.
+\omega_n(T) = \mathrm{clip}\!\left(\frac{T - T_{00n}}{T_{0n} - T_{00n}},\ 0,\ 1\right), \qquad q_c = \omega_n(T)\, q_{\mathrm{cond}}, \qquad q_i = \left[1 - \omega_n(T)\right] q_{\mathrm{cond}}.
 $$
-Saturation vapor pressures over planar liquid water $e_{sw}(T)$ (Bolton, 1980, Equation 10) and hexagonal ice $e_{si}(T)$ (Murray, 1967) define the blended saturation mixing ratio:
-$$
-q_{\mathrm{sat}}(T, p) = \omega_n(T) \frac{\epsilon e_{sw}(T)}{p - e_{sw}(T)} + \left[1 - \omega_n(T)\right] \frac{\epsilon e_{si}(T)}{p - e_{si}(T)}.
-$$
-Given liquid–ice equivalent temperature $T_{li} = T - \left(L_{v0} q_c + L_{s0} q_i\right) / c_{pd}$ and total non-precipitating mixing ratio $q_n$ at pressure $p$, supersaturated parcels ($q_n > q_{\mathrm{sat}}(T_{li}, p)$) are adjusted to exact saturation via four damped Newton–Raphson iterations on the moist-enthalpy conservation residual:
-$$
-f(T) = T - T_{li} - \frac{L_{\mathrm{eff}}(T)}{c_{pd}} \left[q_n - q_{\mathrm{sat}}(T, p)\right] = 0, \qquad L_{\mathrm{eff}}(T) = \omega_n(T) L_{v0} + \left[1 - \omega_n(T)\right] L_{s0}.
-$$
-
----
-
-## 4. Four-Band Lookup-Table-Free Two-Stream Radiative Transfer (`src/aoba/radiation.py`, `src/aoba/kernels.py`)
-
-### 4.1 Unified Multi-Layer Two-Stream Tridiagonal Solver
-
-For each spectral band and atmospheric column divided into $N = N_z$ homogeneous layers indexed top-down ($n = 1$ at TOA, $n = N$ adjacent to the surface) with layer optical thickness $\tau_n$, single-scattering albedo $\omega_{0n}$, and asymmetry factor $g_n$, upward and downward diffuse fluxes $F_n^\pm(\tau)$ ($\tau \in [0, \tau_n]$) satisfy the general two-stream system (Toon et al., 1989, Equations 11–12):
+Liquid and hexagonal-ice saturation pressures (Bolton, 1980, Eq. 10; Murray, 1967) define the blended saturation mixing ratio $q_{\mathrm{sat}}(T, p)$:
 $$
 \begin{aligned}
-\frac{\partial F_n^+}{\partial \tau} &= \gamma_{1n} F_n^+ - \gamma_{2n} F_n^- - S_n^+(\tau), \\
-\frac{\partial F_n^-}{\partial \tau} &= \gamma_{2n} F_n^+ - \gamma_{1n} F_n^- + S_n^-(\tau).
+e_{sw}(T) &= e_{\mathrm{tp}} \exp\!\left[\frac{17.67\,(T - T_0)}{T - 29.65}\right], \qquad e_{si}(T) = e_{\mathrm{tp}} \exp\!\left[\frac{21.8745584\,(T - T_0)}{T - 7.66}\right], \\
+q_{\mathrm{sat}}(T, p) &= \omega_n(T) \frac{\epsilon e_{sw}(T)}{p - e_{sw}(T)} + \left[1 - \omega_n(T)\right] \frac{\epsilon e_{si}(T)}{p - e_{si}(T)}.
 \end{aligned}
 $$
-Following Table 1 and Table 2 of Toon et al. (1989):
-- **Shortwave bands (SW1, SW2)** apply Joseph, Wiscombe, & Weinman (1976) $\delta$-scaling ($f = g_n^2$, $\tau_n' = (1 - \omega_{0n} f)\tau_n$, $\omega_{0n}' = \frac{(1 - f)\omega_{0n}}{1 - \omega_{0n} f}$, $g_n' = \frac{g_n}{1 + g_n}$) combined with the **Quadrature** closure ($\mu_1 = 1/\sqrt{3}$):
-  $$
-  \gamma_1 = \frac{\sqrt{3}}{2}\left[2 - \omega_0'(1 + g')\right], \qquad \gamma_2 = \frac{\sqrt{3}}{2}\omega_0'(1 - g'), \qquad \gamma_3 = \frac{1}{2}\left(1 - \sqrt{3} g' \mu_0\right), \qquad \gamma_4 = 1 - \gamma_3.
-  $$
-- **Longwave bands (LW1, LW2)** apply the **Hemispheric Mean** closure ($\mu_1 = 1/2$, $\omega_0 = 0 \implies \gamma_1 = 2,\ \gamma_2 = 0$), which preserves exact blackbody unit emissivity as $\tau \to \infty$, with linear-in-$\tau$ Planck band flux $F_{B,n}(\tau) = F_{B,0n} + F_{B,1n}\tau$ ($F_{B,1n} = [F_B(T_{\mathrm{bot}, n}) - F_B(T_{\mathrm{top}, n})]/\tau_n$) yielding particular solutions (Toon et al., 1989, Equations 26–27):
-  $$
-  C_n^\pm(\tau) = F_{B,0n} + F_{B,1n}\left(\tau \pm \frac{1}{\gamma_{1n} + \gamma_{2n}}\right).
-  $$
-
-Defining $\lambda_n = \sqrt{\gamma_{1n}^2 - \gamma_{2n}^2}$, $\Gamma_n = \gamma_{2n} / (\gamma_{1n} + \lambda_n)$, and $e_{1n}, \dots, e_{4n}$ via Equations (44) of Toon et al. (1989), enforcing TOA, internal continuity, and surface albedo/emission boundary conditions reduces the $N$-layer problem to a $2N \times 2N$ tridiagonal linear system:
+Conserving liquid–ice equivalent temperature $T_{li} = T - (L_{v0} q_c + L_{s0} q_i)/c_{pd}$, supersaturated air undergoes four damped Newton–Raphson iterations on the moist-enthalpy residual:
 $$
-A_l Y_{l-1} + B_l Y_l + D_l Y_{l+1} = E_l \qquad (l = 1, \dots, 2N),
+f(T) = T - T_{li} - \frac{L_{\mathrm{eff}}(T)}{c_{pd}}\left[q_n - q_{\mathrm{sat}}(T, p)\right] = 0, \qquad L_{\mathrm{eff}}(T) = \omega_n(T) L_{v0} + \left[1 - \omega_n(T)\right] L_{s0}.
 $$
-which AOBA solves simultaneously across all atmospheric columns via the hardware-fused batched Thomas kernel (`solve_tridiagonal_batched` in `src/aoba/kernels.py`).
-
-### 4.2 Band Partitioning and Gaseous / Cloud Optical Depths
-
-1. **SW1 (UV + Visible / PAR, $0.25\text{--}0.69\ \mu\mathrm{m}$, solar fraction $w_{\mathrm{SW1}} = 0.459760$)**:
-   - Background ozone volume mixing ratio follows Wing et al. (2018, Equation 1):
-     $$
-     \mathrm{O}_3(p) = g_1 \, p_{\mathrm{hPa}}^{g_2} \exp\!\left(-\frac{p_{\mathrm{hPa}}}{g_3}\right) \times 10^{-6},
-     $$
-     with $g_1 = 3.6478$, $g_2 = 0.83209$, and $g_3 = 11.3515\ \mathrm{hPa}$. Cumulative slant ozone path $x = u_{\mathrm{O3}} M(\mu_0)$ with Rodgers magnification $M(\mu_0) = 35 / \sqrt{1224\mu_0^2 + 1}$ drives analytical UV + Chappuis absorption $A_{\mathrm{oz}}(x)$ (Lacis & Hansen, 1974, Equations 8–12), supplemented by Rayleigh molecular scattering ($\Delta \tau_{\mathrm{ray}} = 0.095 \Delta p / p_0$).
-   - Liquid and ice cloud single-scattering properties $(\tau, \omega_0, g)$ follow Slingo (1989, Table 1 Band 1) and Ebert & Curry (1992, Table 2 Band 1). Downward surface SW1 flux yields photosynthetic photon flux density $\mathrm{PPFD} = 4.57 \times 0.88 \, F_{\mathrm{SW1}}^\downarrow(z_{\mathrm{datum}})$ ($\mathrm{\mu mol\ m^{-2}\ s^{-1}}$).
-2. **SW2 (Near-Infrared, $0.69\text{--}4.00\ \mu\mathrm{m}$, solar fraction $w_{\mathrm{SW2}} = 0.540240$)**:
-   - Scaled precipitable water path $\Delta y = 0.1 \, q_v \Delta m_d (p/p_0)\sqrt{T_0/T}$ ($\mathrm{cm}$) drives Lacis & Hansen (1974, Equation 21) absorptance:
-     $$
-     A_{\mathrm{wv}}(y / \mu_0) = \frac{2.9 (y / \mu_0)}{\left[1 + 141.5 (y / \mu_0)\right]^{0.635} + 5.925 (y / \mu_0)},
-     $$
-     combined with solar-weighted NIR liquid/ice cloud scattering and absorption (Slingo, 1989, Equation 25 & Table 1 Bands 2–4; Ebert & Curry, 1992, Table 2 Bands 2–5).
-3. **LW1 ($\mathrm{H}_2\mathrm{O} + \mathrm{CO}_2$ Rotational–Vibrational Band, Planck fraction $1 - \beta = 0.680$)**:
-   - Combines pressure-scaled $\mathrm{H}_2\mathrm{O}$ line absorption and logarithmic $15\ \mu\mathrm{m}$ $\mathrm{CO}_2$ optical depth (Weaver & Ramanathan, 1995; Koll & Cronin, 2018; Sherwood et al., 2020) with liquid and ice cloud absorption (Stephens, 1978; Ebert & Curry, 1992, Table 3):
-     $$
-     \Delta \tau_{\mathrm{LW1}} = 0.30 \left(\frac{p}{p_0}\right)^{0.55} q_v \Delta m_d + \max\!\left[0.02,\ 0.85 + 0.22 \ln\!\left(\frac{c_a}{c_{a,0}}\right)\right] \frac{\Delta(p^2)}{p_0^2} + 0.020 \frac{\Delta p}{p_0} + \Delta \tau_{\mathrm{cld,LW1}}.
-     $$
-4. **LW2 ($8.0\text{--}12.5\ \mu\mathrm{m}$ Atmospheric Window, Planck fraction $\beta = 0.320$)**:
-   - Combines temperature-dependent $\mathrm{H}_2\mathrm{O}$ self-continuum absorption (Roberts et al., 1976; Koll & Cronin, 2018), weak foreign continuum, $\mathrm{CO}_2$ window-edge overlap, and cloud window absorption (Ebert & Curry, 1992, Table 3 Band 2):
-     $$
-     \Delta \tau_{\mathrm{LW2}} = \left[0.45 \frac{e_v}{p_0} \exp\!\left(\frac{1800}{T} - \frac{1800}{296}\right) + 0.0025 \frac{p}{p_0}\right] q_v \Delta m_d + \max\!\left[0,\ 0.015 + 0.024 \ln\!\left(\frac{c_a}{c_{a,0}}\right)\right] \frac{\Delta(p^2)}{p_0^2} + \Delta \tau_{\mathrm{cld,LW2}}.
-     $$
-
-### 4.3 Energy-Conserving Radiative Heating Rate
-
-Defining net upward flux at half-level interface $k + \frac{1}{2}$ as $F_{\mathrm{net}, k+1/2} = (F_{\mathrm{SW}, k+1/2}^\uparrow - F_{\mathrm{SW}, k+1/2}^\downarrow) + (F_{\mathrm{LW}, k+1/2}^\uparrow - F_{\mathrm{LW}, k+1/2}^\downarrow)$, the radiative temperature tendency of layer $k$ is:
-$$
-\left(\frac{\partial T}{\partial t}\right)_{\mathrm{rad}, k} = -\frac{F_{\mathrm{net}, k+1/2} - F_{\mathrm{net}, k-1/2}}{(c_{pd} + c_{pv} q_{v,k}) \rho_{d,k} \Delta z_k},
-$$
-which guarantees exact column-wise radiative energy conservation between TOA net irradiance and surface net radiative flux.
-
 
 ---
 
-## 5. Mixed-Phase Single-Moment Cloud Microphysics and Sedimentation (`src/aoba/microphysics.py`)
+## 4. Four-Band Lookup-Table-Free Two-Stream Radiative Transfer
 
-### 5.1 Prognostic Partitioning of Precipitating Hydrometeors
+### 4.1 Unified Multi-Layer Two-Stream Tridiagonal Solver (`src/aoba/radiation.py`, `src/aoba/kernels.py`)
 
-Following the System for Atmospheric Modeling (SAM; Khairoutdinov & Randall, 2003, Appendices A–B), AOBA prognoses two moist tracer variables: total non-precipitating water $q_n = q_v + q_c + q_i$ and total precipitating water $q_p = q_r + q_s + q_g$ (rain, snow, and graupel). While $(q_c, q_i)$ are partitioned via $\omega_n(T)$ in Equation (3.2), precipitating condensate $q_p$ is partitioned diagnostically into rain $q_r$, snow $q_s$, and graupel $q_g$ using linear temperature ramps $\omega_p(T)$ over $[268.15, 273.16]\ \mathrm{K}$ and $\omega_g(T)$ over $[223.15, 273.16]\ \mathrm{K}$ (Khairoutdinov & Randall, 2003, Equations A15–A17):
+For $N = N_z$ layers indexed top-down ($n = 0$ TOA to $n = N - 1$ surface), upward/downward diffuse fluxes $F_n^\pm(\tau)$ satisfy Toon et al. (1989, Eqs. 11–12):
 $$
-\begin{aligned}
-\omega_p(T) &= \mathrm{clip}\!\left(\frac{T - 268.15}{273.16 - 268.15},\ 0,\ 1\right), \qquad \omega_g(T) = \mathrm{clip}\!\left(\frac{T - 223.15}{273.16 - 223.15},\ 0,\ 1\right), \\
-q_r &= \omega_p q_p, \qquad q_s = (1 - \omega_p)(1 - \omega_g) q_p, \qquad q_g = (1 - \omega_p)\omega_g q_p.
-\end{aligned}
+\frac{\partial F_n^+}{\partial \tau} = \gamma_{1n} F_n^+ - \gamma_{2n} F_n^- - S_n^+(\tau), \qquad \frac{\partial F_n^-}{\partial \tau} = \gamma_{2n} F_n^+ - \gamma_{1n} F_n^- + S_n^-(\tau).
 $$
+- **Shortwave (SW1, SW2)**: Applies Joseph, Wiscombe, & Weinman (1976) $\delta$-scaling ($f = g_0^2$, $\tau' = (1-\omega_0 f)\tau_0$, $\omega' = (1-f)\omega_0/(1-\omega_0 f)$, $g' = (g_0-f)/(1-f)$) with **Quadrature** ($\mu_1 = 1/\sqrt{3}$; Toon et al., 1989, Table 1):
+  $$
+  \gamma_1 = \frac{\sqrt{3}}{2}\left[2 - \omega'(1 + g')\right], \quad \gamma_2 = \frac{\sqrt{3}}{2}\omega'(1 - g'), \quad \gamma_3 = \frac{1}{2}\left(1 - \sqrt{3} g' \mu_0\right), \quad \gamma_4 = 1 - \gamma_3,
+  $$
+  and solar direct-beam particular sources $C_n^\pm(\tau)$ driven by $F_{\mathrm{TOA}} e^{-(\tau_{c,n}+\tau)/\mu_0}$.
+- **Longwave (LW1, LW2)**: Applies **Hemispheric Mean** ($\mu_1 = 1/2, \omega_0 = 0 \implies \gamma_1 = 2, \gamma_2 = 0$) with linear-in-$\tau$ Planck emission $F_B(\tau) = F_{B,0n} + F_{B,1n}\tau$ yielding particular solutions $C_n^\pm(\tau) = F_{B,0n} + F_{B,1n}(\tau \pm (\gamma_{1n} + \gamma_{2n})^{-1})$.
 
-### 5.2 Conversion, Accretion, Evaporation/Sublimation, and Sub-Cycled Sedimentation
+Defining $\lambda_n = \sqrt{\gamma_{1n}^2 - \gamma_{2n}^2}$, $\Gamma_n = \gamma_{2n}/(\gamma_{1n} + \lambda_n)$, and $e_{1n}\dots e_{4n}$ (Toon et al., 1989, Eq. 44), TOA, interface continuity, and surface albedo/emission boundary conditions assemble a $2N \times 2N$ tridiagonal system $A_l Y_{l-1} + B_l Y_l + D_l Y_{l+1} = E_l$ solved simultaneously across all subcolumns via the fused Metal/CUDA Thomas kernel `solve_tridiagonal_batched`. Direct and diffuse downward shortwave fluxes are output separately at the surface.
 
-Marshall–Palmer exponential size distributions $N_x(D) = N_{0x} \exp(-\lambda_x D)$ with intercept parameters $(N_{0r}, N_{0s}, N_{0g}) = (8 \times 10^6,\ 3 \times 10^6,\ 4 \times 10^6)\ \mathrm{m^{-4}}$ and power-law fall speeds $V_x(D) = a_x D^{b_x} (\rho_0 / \rho_d)^{1/2}$ govern microphysical transfer rates (Kessler, 1969; Lin, Farley, & Orville, 1983; Khairoutdinov & Randall, 2003, Equations A18–A33):
-1. **Autoconversion** of cloud liquid ($q_c > q_{c0} = 10^{-3}\ \mathrm{kg\ kg^{-1}}$) and temperature-activated ice aggregation ($q_i > q_{i0} = 10^{-4}\ \mathrm{kg\ kg^{-1}}$):
-   $$
-   \left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{auto}} = \alpha_{\mathrm{liq}} \max(q_c - q_{c0},\ 0) + \beta_{\mathrm{ice}} \exp\!\left[0.025(T - 273.16)\right] \max(q_i - q_{i0},\ 0),
-   $$
-   with $\alpha_{\mathrm{liq}} = 10^{-3}\ \mathrm{s^{-1}}$ and $\beta_{\mathrm{ice}} = 10^{-3}\ \mathrm{s^{-1}}$.
-2. **Continuous accretion** of $(q_c, q_i)$ by falling rain, snow, and graupel via analytic Gamma-integral collection kernels $A_{xy} q_y \left(\rho_d q_x\right)^{(3 + b_x)/4}$ ($x \in \{r, s, g\},\ y \in \{c, i\}$; Khairoutdinov & Randall, 2003, Equations A21–A27).
-3. **Sub-saturated evaporation and sublimation** ($q_v < q_{\mathrm{sat}}$ and $q_c + q_i = 0$) including ventilation factors $(a_{vx} \lambda_x^{-2} + b_{vx} \mathrm{Sc}^{1/3} \sqrt{a_x / \nu} \Gamma((5 + b_x)/2) \lambda_x^{-(5 + b_x)/2})$ and psychrometric thermal-diffusion impedance (Khairoutdinov & Randall, 2003, Equations A29–A32).
-4. **Mass-weighted terminal velocity and monotone upwind sedimentation**: Bulk precipitation fall speed is evaluated as:
-   $$
-   V_p = \omega_p V_r + (1 - \omega_p)\left[(1 - \omega_g) V_s + \omega_g V_g\right], \qquad V_x = \frac{a_x \Gamma(4 + b_x)}{6 \lambda_x^{b_x}} \left(\frac{\rho_0}{\rho_d}\right)^{1/2}.
-   $$
-   Downward precipitation mass flux $P_z = \rho_d q_p V_p$ is integrated via CFL-subcycled ($\max(V_p \Delta t_{\mathrm{sed}} / \Delta z_k) \le 0.8$) 1st-order donor-cell upwind updates, conserving total water mass and moist static energy across phase changes:
-   $$
-   \Delta \theta_m = \frac{1 + (R_v / R_d) q_v}{\Pi c_{pd}} \left[\Delta(L_{\mathrm{eff},n} q_{\mathrm{cond}}) + \Delta(L_{\mathrm{eff},p} q_p)\right].
-   $$
+### 4.2 Band Parameterizations and Cloud Single-Scattering Optics
 
----
+With $\Delta m_{d,n} = \rho_{d,n}\Delta z_n$, $\mathrm{LWP} = 10^3 \rho_d q_c \Delta z$, $\mathrm{IWP} = 10^3 \rho_d q_i \Delta z$ ($\mathrm{g\ m^{-2}}$), and effective radii $(r_{e,l}, r_{e,i}) = (10, 50)\ \mu\mathrm{m}$:
 
-## 6. Surface Roughness Sublayer (RSL), MYNN Level 2.5 PBL, and 3D SGS Turbulence (`src/aoba/turbulence.py`)
-
-### 6.1 Canopy and Ocean Aerodynamic Roughness
-
-1. **Vegetated terrestrial surfaces (Raupach, 1994, Equations 8 & 10–11)**: Given prognostic canopy height $h_c$ and exposed leaf area index $L_c$ (frontal area index $\Lambda = L_c / 2$), zero-plane displacement $d$ and momentum roughness length $z_{0m}$ are determined without land-cover lookup tables:
+1. **SW1 ($0.25\text{--}0.69\ \mu\mathrm{m}$, solar weight $0.459760$)**: Background $\mathrm{O}_3(p) = 3.6478\, p_{\mathrm{hPa}}^{0.83209}\exp(-p_{\mathrm{hPa}}/11.3515)\times 10^{-6}$ (Wing et al., 2018), Rodgers slant airmass $M(\mu_0) = 35 / \sqrt{1224\mu_0^2 + 1}$, Lacis & Hansen (1974, Eqs. 8–10) UV+Chappuis absorption $A_{\mathrm{oz}}(x)$, Rayleigh optical depth $0.095\,\Delta p/p_0$, and Slingo (1989, Band 1) + Ebert & Curry (1992, Band 1) cloud optics:
    $$
    \begin{aligned}
-   \frac{d}{h_c} &= 1 - \frac{1 - \exp\!\left(-\sqrt{c_{d1} L_c}\right)}{\sqrt{c_{d1} L_c}}, \\
-   \frac{z_{0m}}{h_c} &= \left(1 - \frac{d}{h_c}\right) \exp\!\left(-\kappa \gamma_u + \psi_{h,\mathrm{cw}}\right), \qquad \gamma_u = \min\!\left[\left(C_S + C_R \frac{L_c}{2}\right)^{-1/2},\ \gamma_{\max}\right],
+   \tau_{l1} &= \mathrm{LWP}\left(2.817\times 10^{-2} + \frac{1.305}{r_{e,l}}\right), & \omega_{l1} &= 1 - (-5.62\times 10^{-8} + 1.63\times 10^{-7} r_{e,l}), & g_{l1} &= 0.829 + 2.482\times 10^{-3} r_{e,l}, \\
+   \tau_{i1} &= \mathrm{IWP}\left(3.448\times 10^{-3} + \frac{2.431}{r_{e,i}}\right), & \omega_{i1} &= 1 - 10^{-5}, & g_{i1} &= 0.7661 + 5.851\times 10^{-4} r_{e,i}.
    \end{aligned}
    $$
-   with $c_{d1} = 7.5$, $C_S = 0.003$, $C_R = 0.30$, $\psi_{h,\mathrm{cw}} = 0.193$, $\gamma_{\max} = 3.33$, and scalar Stanton relation $\ln(z_{0m}/z_{0h}) = k B^{-1} \approx 2.0$ (smoothly blending to bare-soil $z_{0m,\mathrm{soil}} = 0.01\ \mathrm{m}$ and snow $z_{0m,\mathrm{snow}} = 0.002\ \mathrm{m}$ as $L_c \to 0$).
-2. **Open ocean (Miller, Beljaars, & Palmer, 1992, Equations 3–5; Nishizawa et al., 2025, Equations 8.360–8.362)**: Combining smooth viscous sublayer resistance with Charnock capillary–gravity wave roughness ($\alpha_{\mathrm{Ch}} = 0.018$, $\nu_a = 1.5 \times 10^{-5}\ \mathrm{m^2\ s^{-1}}$):
-   $$
-   z_{0m} = 0.11 \frac{\nu_a}{u_*} + \frac{\alpha_{\mathrm{Ch}} u_*^2}{g}, \qquad z_{0h} = 0.40 \frac{\nu_a}{u_*} + 1.4 \times 10^{-5}, \qquad z_{0q} = 0.62 \frac{\nu_a}{u_*} + 1.3 \times 10^{-4}.
-   $$
-
-### 6.2 Monin–Obukhov Similarity with Analytical Roughness Sublayer (RSL) Enhancement
-
-Over tall forests where $\tilde{z}_1 = z_{c,0} - (z_{\mathrm{topo}} + d)$ lies inside the roughness sublayer ($z_* = \max(2 h_c - d,\ 0)$; Harman & Finnigan, 2007), standard Monin–Obukhov similarity underestimates turbulent exchange. AOBA incorporates the closed-form exponential-integral RSL correction $\hat{\psi}_{M,H}(\zeta, \tilde{z}_1 / z_*)$ of De Ridder (2010, Equations 6–7 & 22; Bonan et al., 2018; Lee et al., 2020):
-$$
-\begin{aligned}
-F_M &= \ln\!\left(\frac{\tilde{z}_1}{z_{0m}}\right) - \psi_M(\zeta) + \psi_M\!\left(\zeta \frac{z_{0m}}{\tilde{z}_1}\right) + \hat{\psi}_M\!\left(\zeta, \frac{\tilde{z}_1}{z_*}\right), \\
-\hat{\psi}_\alpha(\zeta, \eta) &= \phi_\alpha\!\left(\zeta \eta^{-1}(1 + \nu_{\mathrm{RSL}}/\mu_\alpha)\right) \left(1 - \frac{1}{c_{2\alpha}}\right) \exp(-\mu_\alpha \eta) \left[\ln(\mu_\alpha \eta) + E_1(\mu_\alpha \eta)\right],
-\end{aligned}
-$$
-solved iteratively for stability parameter $\zeta = \tilde{z}_1 / L_{\mathrm{MO}}$ from bulk Richardson number $\mathrm{Ri}_B$ using Businger–Dyer–Paulson ($\zeta < 0$) and Beljaars & Holtslag (1991; $\zeta \ge 0$) functions, yielding drag and scalar transfer coefficients $C_M = \kappa^2 / F_M^2$ and $C_{H,Q} = \kappa^2 / (F_M F_{H,Q})$.
-
-### 6.3 Implicit MYNN Level 2.5 Boundary-Layer Closure
-
-Vertical turbulent fluxes across all atmospheric columns follow the Mellor–Yamada–Nakanishi–Niino Level 2.5 closure (Nakanishi & Niino, 2009; Nishizawa et al., 2025, Section 8.2.1, Equations 8.96–8.176) prognostic in doubled turbulent kinetic energy $q^2 = 2e$:
-$$
-\frac{\partial (\rho_d q^2)}{\partial t} = \frac{\partial}{\partial z}\!\left(\rho_d K_q \frac{\partial q^2}{\partial z}\right) + 2 \rho_d \left(P_s + P_b - \frac{q^3}{B_1 L}\right),
-$$
-where $K_M = L q S_M$, $K_H = L q S_H$, $K_q = 3 L q S_M$, and the master length scale $L$ combines surface, turbulent-depth, and buoyancy length scales:
-$$
-\frac{1}{L} = \frac{1}{L_S} + \frac{1}{L_T} + \frac{1}{L_B}, \qquad L_T = 0.23 \frac{\int_0^\infty q \tilde{z} \, dz}{\int_0^\infty q \, dz}.
-$$
-Gaussian subgrid liquid-ice saturation fluctuations ($\sigma_s$, partial cloudiness $R$, subgrid condensate $Q_l$) determine moist buoyancy coefficients $(\beta_\theta, \beta_q)$ in $P_b$ and $N^2$, while Level 2.5 stability functions $(S_M, S_H)$ include the disequilibrium factor $\alpha_c = \min(q / q_{\mathrm{L2}},\ 1)$. Both the TKE equation and vertical scalar/momentum diffusion are integrated unconditionally stably via `solve_tridiagonal_batched`.
-
-### 6.4 Anisotropic 3D Smagorinsky–Lilly SGS Closure for the CRM
-
-Within the 3D CRM, horizontal subgrid-scale mixing follows the Richardson-dependent Smagorinsky–Lilly model (Lilly, 1962; Nishizawa et al., 2025, Section 8.1.2, Equations 8.25–8.40) corrected for pancake grid aspect ratio $a = \max(\Delta x, \Delta y) / \Delta z_k$ via Scotti, Meneveau, & Lilly (1993):
-$$
-\nu_{\mathrm{SGS}} = (C_s f(a) \Delta)^2 |\mathbf{S}| \sqrt{\max(0,\ 1 - \mathrm{Ri}/\mathrm{Ri}_c)}, \qquad \Delta = (\Delta x \Delta y \Delta z_k)^{1/3},
-$$
-with $C_s = 0.18$, $\mathrm{Ri}_c = 0.25$, and turbulent Prandtl number $\mathrm{Pr}_{\mathrm{SGS}}^{-1} = 3$ under unstable stratification.
-
----
-
-## 7. Two-Leaf Non-Rectangular-Hyperbola EEO Biosphere (`src/aoba/biosphere.py`)
-
-### 7.1 Least-Cost Optimal Stomatal Ratio and Non-Rectangular-Hyperbola Coordination
-
-AOBA predicts global photosynthetic biochemistry, stomatal conductance, C₃/C₄ dominance, leaf area index, root-zone storage capacity, and canopy height **entirely without prescribed PFT maps**.
-1. **C₃ Optimal $c_i / c_a$ and Non-Rectangular-Hyperbola Capacities (Prentice et al., 2014; Smith et al., 2019, Equations 1–20)**:
-   Minimizing combined maintenance costs of carboxylation and water transport ($\beta_{\mathrm{C3}} = 146$) yields optimal intercellular-to-ambient $\mathrm{CO}_2$ ratio $\chi_{\mathrm{C3}}$:
-   $$
-   \chi_{\mathrm{C3}} = \frac{\Gamma^*}{c_a} + \left(1 - \frac{\Gamma^*}{c_a}\right) \frac{\xi_{\mathrm{C3}}}{\xi_{\mathrm{C3}} + \sqrt{D}}, \qquad \xi_{\mathrm{C3}} = \sqrt{\frac{\beta_{\mathrm{C3}}(K_M + \Gamma^*)}{1.6 \eta^*(T_g)}}.
-   $$
-   Electron transport $J$ follows the Farquhar & Wong (1984) non-rectangular hyperbola with curvature $\theta = 0.85$:
-   $$
-   \theta J^2 - (\varphi_{\mathrm{PSII}} I_c + J_{\max}) J + \varphi_{\mathrm{PSII}} I_c J_{\max} = 0.
-   $$
-   Enforcing marginal electron-transport optimality $\partial A_j / \partial J_{\max} = c$ ($c = 0.05336251$) and biochemical coordination $A_c = A_j$ yields the exact signed continuous branch for $\omega = J_{\max,\mathrm{opt}} / (\varphi_{\mathrm{PSII}} I_c)$ across all $m > 4c$ ($m = (c_i - \Gamma^*)/(c_i + 2\Gamma^*)$):
+   Surface $\mathrm{PPFD} = 4.57 \times 0.88\, F_{\mathrm{SW1}}^\downarrow(z_{\mathrm{sfc}})$ ($\mu\mathrm{mol\ m^{-2}\ s^{-1}}$).
+2. **SW2 ($0.69\text{--}4.00\ \mu\mathrm{m}$, solar weight $0.540240$)**: Pressure–temperature scaled precipitable water $\Delta y = 0.1\, q_v \Delta m_d (p/p_0)\sqrt{T_0/T}$ drives Lacis & Hansen (1974, Eq. 21) $A_{\mathrm{wv}}(y/\mu_0)$, plus Slingo (1989, Bands 2–4) and Ebert & Curry (1992, Bands 2–5) cloud optics ($\tau_{l2}, \omega_{l2}, g_{l2}, \tau_{i2}, \omega_{i2}, g_{i2}$).
+3. **LW1 ($\mathrm{H}_2\mathrm{O} + \mathrm{CO}_2$, Planck fraction $0.680$)** and **LW2 ($8.0\text{--}12.5\ \mu\mathrm{m}$ window, fraction $0.320$)**:
    $$
    \begin{aligned}
-   \omega &= -(1 - 2\theta) + \mathrm{sgn}\!\left(1 - \frac{8\theta c}{m}\right) \sqrt{(1 - \theta)\left[\frac{1}{(4c/m)(1 - \theta \cdot 4c/m)} - 4\theta\right]}, \\
-   \omega^* &= 1 + \omega - \sqrt{(1 + \omega)^2 - 4\theta \omega}, \\
-   J_{\max,\mathrm{opt}} &= \varphi_{\mathrm{PSII}}(T_g)\, \tilde{I}_c \, \omega, \qquad V_{c\max,\mathrm{opt}} = \varphi_{\mathrm{PSII}}(T_g)\, \tilde{I}_c \, \frac{m}{m_c} \frac{\omega^*}{8\theta},
+   \Delta \tau_{\mathrm{LW1}} &= 0.30 \left(\frac{p}{p_0}\right)^{0.55} q_v \Delta m_d + \max\!\left[0.02,\ 0.85 + 0.22 \ln\!\left(\frac{c_a}{c_{a,0}}\right)\right] \frac{\Delta(p^2)}{p_0^2} + 0.020 \frac{\Delta p}{p_0} + 0.83 \left[0.090\,\mathrm{LWP} + \left(0.00324 + \frac{1.033}{r_{e,i}}\right)\mathrm{IWP}\right], \\
+   \Delta \tau_{\mathrm{LW2}} &= \left[0.45 \frac{e_v}{p_0} \exp\!\left(\frac{1800}{T} - \frac{1800}{296}\right) + 0.0025 \frac{p}{p_0}\right] q_v \Delta m_d + \max\!\left[0,\ 0.015 + 0.024 \ln\!\left(\frac{c_a}{c_{a,0}}\right)\right] \frac{\Delta(p^2)}{p_0^2} + 0.83 \left[0.090\,\mathrm{LWP} + \left(0.00160 + \frac{1.166}{r_{e,i}}\right)\mathrm{IWP}\right].
    \end{aligned}
    $$
-   where $m_c = (c_i - \Gamma^*)/(c_i + K_M)$, vanishing smoothly for $m \le 4c$. Reference $25\ ^\circ\mathrm{C}$ capacities $(V_{c\max 25}, J_{\max 25})$ are recovered via entropy-acclimated peaked Arrhenius functions (Kattge & Knorr, 2007; Smith et al., 2019, Equation 20).
-2. **C₄ Three-Enzyme Coordination (Scott & Smith, 2022, Equations 1–25; von Caemmerer & Furbank, 1999)**:
-   Mesophyll drawdown $\chi_{m,\mathrm{C4}} = \xi_{\mathrm{C4}} / (\xi_{\mathrm{C4}} + \sqrt{D})$ with $\xi_{\mathrm{C4}} = \sqrt{\beta_{\mathrm{C4}} K_p / (1.6 \eta^*)}$ ($\beta_{\mathrm{C4}} = 166$), bundle-sheath leakiness $\phi_L = 0.20$, bundle-sheath conductance $g_{bs} = 0.003 L_c\ \mathrm{mol\ m^{-2}\ s^{-1}}$, and 5-electron ATP stoichiometry ($k_e = 5\ \mathrm{mol(e^-)\ mol(CO_2)^{-1}}$) determine $(J_{\max,\mathrm{C4}}, V_{p\max,\mathrm{C4}}, V_{c\max,\mathrm{C4}})$ via two fixed-point iterations on bundle-sheath partial pressure $C_{bs} = C_m + (L / g_{bs}) p_{\mathrm{sfc}}$.
-3. **Universal EEO Leaf Dark Respiration (Heskel et al., 2016; Ren et al., 2024, 2025, Equation 13)**:
-   Nocturnal leaf respiration scales directly with optimal Rubisco capacity as $R_{\mathrm{leaf}}(T_{\mathrm{night}}) = b_{\mathrm{resp}} V_{c\max,\mathrm{opt}}$ ($b_{\mathrm{resp}} = 0.018$), mapped across sub-daily temperatures via macromolecular rate theory:
-   $$
-   f_R(T) = \exp\!\left[0.1012(T_C - 25) - 0.0005(T_C^2 - 25^2)\right].
-   $$
-
-### 7.2 Midday Incident Shortwave EMA and Closed-Form Two-Leaf Enzyme Allocation
-
-To capture nonlinear canopy light saturation without prescribing an empirical nitrogen extinction parameter $k_n$, AOBA executes a strict two-stage acclimation and sub-daily allocation scheme (de Pury & Farquhar, 1997; Hashimoto, 2026):
-1. **Local solar noon downward-shortwave EMA**: At each terrestrial column's local solar noon crossing ($H = 0$), incident downward direct-beam and diffuse visible shortwave fluxes $(\mathrm{VIS}_b, \mathrm{VIS}_d)$ and solar zenith cosine $\mu_0$ are smoothed via an exponential moving average ($\alpha_{\mathrm{EMA}} = 0.067$, $\sim 15$-day memory) into $(\widetilde{\mathrm{VIS}}_b, \widetilde{\mathrm{VIS}}_d, \tilde{\mu}_0)$.
-2. **Spherical-canopy two-stream light absorption**: Evaluating the de Pury & Farquhar (1997) spherical-leaf radiative transfer on $(\widetilde{\mathrm{VIS}}_b, \widetilde{\mathrm{VIS}}_d, \tilde{\mu}_0)$ at the **current** snow-exposed leaf area index $L_c$ yields whole-canopy acclimation irradiance $\tilde{I}_c = \tilde{I}_{cb} + \tilde{I}_{cd}$ and vertical profile $\tilde{I}_l(L) = \tilde{I}_{lb}(L) + \tilde{I}_{ld}(L)$ with attenuation rates $\tilde{k}_b' = 0.5\sqrt{1 - \sigma_P}/\tilde{\mu}_0$ and $k_d' = 0.719$.
-3. **Exact closed-form sunlit/shaded partitioning**: Assuming within-canopy photosynthetic protein distribution $X_l(L) = X (\tilde{I}_l(L) / \tilde{I}_c)$ tracks the acclimated absorbed light profile, integrating analytically against the **instantaneous** sunlit probability $\exp(-k_{db}(t) L)$ ($k_{db}(t) = 0.5 / \mu_0(t)$) allocates every canopy capacity pool $X \in \{V_{c\max 25}, J_{\max 25}, V_{p\max 25}, R_{25}\}$ conservatively into sunlit ($X_{\mathrm{sun}}$) and shaded ($X_{\mathrm{sh}}$) fractions:
-   $$
-   \begin{aligned}
-   X_{\mathrm{sun}} &= \frac{X}{\tilde{I}_c} \left[\tilde{I}_{b0}(1 - \tilde{\rho}_{cb})\tilde{k}_b' \frac{1 - \exp\!\left[-(\tilde{k}_b' + k_{db})L_c\right]}{\tilde{k}_b' + k_{db}} + \tilde{I}_{d0}(1 - \rho_{cd})k_d' \frac{1 - \exp\!\left[-(k_d' + k_{db})L_c\right]}{k_d' + k_{db}}\right], \\
-   X_{\mathrm{sh}} &= \max(10^{-6},\ X - X_{\mathrm{sun}}).
-   \end{aligned}
-   $$
-   Sub-daily gross assimilation, hyperbolic co-limitation, and optimal stomatal conductances $g_{sw,\mathrm{sun}}, g_{sw,\mathrm{sh}} = 1.6 A_n (R_{\mathrm{gas}} T_l / p_{\mathrm{sfc}}) / [c_a(1 - \chi)]$ ($\mathrm{m\ s^{-1}}$) are then evaluated separately on $(I_{\mathrm{sun}}, X_{\mathrm{sun}})$ and $(I_{\mathrm{sh}}, X_{\mathrm{sh}})$.
-
-### 7.3 Two-Stream Canopy Albedo, Autonomous $F_4$, and Lambert-$W_0$ Prognostic Structure
-
-1. **Map-free canopy–ground two-stream albedo**: Visible and near-infrared direct/diffuse surface albedos $(\alpha_{\mathrm{VIS,dir}}, \alpha_{\mathrm{VIS,dif}}, \alpha_{\mathrm{NIR,dir}}, \alpha_{\mathrm{NIR,dif}})$ are solved analytically from $(L_c, \mu_0)$ and underlying soil/snow reflectance via Sellers (1985) and Dai et al. (2004, Appendix A, Equations A1–A19).
-2. **Autonomous C₄ fraction $F_4$** (Scott & Smith, 2022, Equation 26; Luo et al., 2024; Lavergne et al., 2026): Driven by midday net assimilation advantage $\Delta A = (A_{n,\mathrm{C4}} - A_{n,\mathrm{C3}})/(|A_{n,\mathrm{C3}}| + 1)$ and overstory light openness $f_{\mathrm{open}}(L_c) = \mathrm{clip}(1.15 - 0.18 L_c,\ 0.02,\ 1)$.
-3. **Prognostic EEO LAI, root-zone storage $S_R$, and canopy height $h_c$**:
-   - Annual peak greenness $\mathrm{fAPAR}_{\max}$ combines energy limitation $1 - z/(k A_{0,\mathrm{yr}})$ ($z = 12.227\ \mathrm{mol\ C\ m^{-2}\ yr^{-1}}$, $k = 0.5$) and water limitation $f_0(\mathrm{AI}) P_{\mathrm{yr}} c_a (1 - \chi)/(1.6 D A_{0,\mathrm{yr}})$ via smooth log-sum-exp minimization ($K = 10$; Cai et al., 2025, Equation 12; Zhou et al., 2025, Equations 6 & 11).
-   - Daily steady-state leaf area index $L_s$ is obtained analytically via the principal branch of the Lambert $W$ function (Zhou et al., 2025, Equations 15–20):
-     $$
-     L_s = \min\!\left\{\mu + \frac{1}{k} W_0\!\left[-k\mu \exp(-k\mu)\right],\ \mathrm{LAI}_{\max}\right\}, \qquad \mu = \frac{\sigma_{\mathrm{Zhou}} \, \mathrm{GSL} \, \mathrm{LAI}_{\max}}{A_{0,\mathrm{yr}} \, \mathrm{fAPAR}_{\max}} A_{0,\mathrm{day}},
-     $$
-     updated with $\alpha_{\mathrm{EMA}} = 0.067$, while drought-bridging root capacity $S_R$ scales with cumulative seasonal water deficit (Gao et al., 2014) and potential canopy height $h_c$ scales with vascular moisture–productivity surplus (Kempes et al., 2011).
+Layer radiative heating rate $(\partial_t T)_{\mathrm{rad},k} = -(F_{\mathrm{net},k+1/2} - F_{\mathrm{net},k-1/2}) / [(c_{pd} + c_{pv} q_{v,k})\rho_{d,k}\Delta z_k]$ strictly conserves column radiative energy.
 
 ---
 
-## 8. Land Hydrology, Five-Layer Freeze–Thaw Permafrost Soil, Snow, and Sea Ice (`src/aoba/surface.py`)
+## 5. Mixed-Phase Single-Moment Cloud Microphysics and Sedimentation
 
-### 8.1 Three-Component Evapotranspiration and Linearized Skin Energy Balance
+### 5.1 Two Prognostic Moist Variables and Diagnostic Partitioning (`src/aoba/microphysics.py`)
 
-Total terrestrial upward water-vapor flux combines wet-canopy interception evaporation ($f_{\mathrm{wet}} = (W_c / W_{c,\max})^{2/3}$; MATSIRO6 Chapter 7), dry-canopy sunlit + shaded stomatal transpiration ($g_{sw,\mathrm{sun}} + g_{sw,\mathrm{sh}}$), snow sublimation over fractional snow cover $A_{\mathrm{sn}}$, and bare-soil evaporation regulated by a dry-surface vapor-diffusion resistance $r_{\mathrm{soil}} = (L_{\mathrm{dry}} / D_v)(\tau_{\mathrm{tort}} / \theta_{\mathrm{air}})$ (Sakaguchi & Zeng, 2009, Equations 7–10). Surface skin temperature $\Delta T_{\mathrm{skin}}$ is solved implicitly at every step from the linearized radiative–turbulent–conductive energy balance, clamping $T_{\mathrm{skin}} \le T_0 = 273.15\ \mathrm{K}$ when snow is present so excess energy drives snowmelt directly.
-
-### 8.2 Fractional Snow Cover, Snow-Burial Masking, Aging Albedo, and Glacier Calving
-
-1. **Subgrid snow fraction** $A_{\mathrm{sn}}$ accounts for Earth2014 subgrid topographic standard deviation $\sigma_{\mathrm{topo}}$ and hysteretic melt depletion curves (Swenson & Lawrence, 2012, Equations 3–6; Nitta et al., 2014).
-2. **Vegetation snow-burial masking** reduces exposed canopy height and LAI inside the snow-covered fraction via $h_{\mathrm{buried}} = \max(h_c - d_{\mathrm{snow}},\ 0)$ and $L_{\mathrm{buried}} = L_c (h_{\mathrm{buried}} / h_c)$ (MATSIRO6 Equations 2.1–2.3), reproducing bright snow-covered tundra alongside dark snow-shedding boreal taiga without PFT tables.
-3. **Prognostic snow aging** evolves nondimensional grain age $\tau_{\mathrm{sn}}$ thermally and resets upon fresh snowfall (Yang et al., 1997; MATSIRO6 Section 8.8.1), while permanent snow accumulation exceeding $W_{\mathrm{sn},\max} = 1000\ \mathrm{kg\ m^{-2}}$ calves into solid glacial runoff $R_{\mathrm{ice}}$ routed to coastal ocean cells (MATSIRO6 Equation 8.44).
-
-### 8.3 Five-Layer Implicit Soil Thermodynamics with Zero-Curtain Phase Change
-
-Across five soil layers ($\Delta z_s = [0.05, 0.15, 0.40, 0.80, 1.60]\ \mathrm{m}$; $3.0\ \mathrm{m}$ total depth), internal energy relative to $T_0 = 273.15\ \mathrm{K}$ is defined as $U_l = C_l (T_l - T_0) - L_{f0} M_{i,l}$, where $C_l = C_{\mathrm{dry}} + c_w M_{w,l} + c_i M_{i,l}$ (Nishizawa et al., 2025, Section 8.7.1, Equations 8.390–8.418; MATSIRO6 Chapter 10). Exact $0\ ^\circ\mathrm{C}$ liquid–ice phase partitioning $M_{i,l}^{\mathrm{new}} = \mathrm{clip}(-U_l / L_{f0},\ 0,\ M_{w,l} + M_{i,l})$ is followed by implicit Fourier heat conduction solved via `solve_tridiagonal_batched` in Celsius anomalies $(T_l - T_0)$ to preserve full single-precision accuracy on GPU.
-
-### 8.4 Solar-Zenith Ocean Albedo and Fractional-Lead Thermodynamic Sea Ice
-
-Open-ocean direct-beam albedo increases strongly at low sun angles via Briegleb et al. (1986):
+Following SAM (Khairoutdinov & Randall, 2003, Appendices A–B), AOBA integrates $q_n = q_v + q_c + q_i$ and $q_p = q_r + q_s + q_g$. Rain, snow, and graupel partition via temperature ramps $\omega_p(T)$ over $[268.16, 283.16]\ \mathrm{K}$ and $\omega_g(T)$ over $[223.16, 283.16]\ \mathrm{K}$:
 $$
-\alpha_{\mathrm{ocn,dir}}(\mu_0) = \frac{0.026}{\mu_0^{1.7} + 0.065} + 0.15(\mu_0 - 0.1)(\mu_0 - 0.5)(\mu_0 - 1.0),
+\omega_p(T) = \mathrm{clip}\!\left(\frac{T - T_{00p}}{T_{0p} - T_{00p}}, 0, 1\right), \quad \omega_g(T) = \mathrm{clip}\!\left(\frac{T - T_{00g}}{T_{0g} - T_{00g}}, 0, 1\right), \quad q_r = \omega_p q_p,\quad q_s = (1 - \omega_p)(1 - \omega_g)q_p,\quad q_g = (1 - \omega_p)\omega_g q_p.
 $$
-with diffuse albedo $\alpha_{\mathrm{ocn,dif}} = 0.06$. Sea-ice fractional area follows $f_i = \min(\sqrt{M_i / M_{i,\mathrm{crit}}},\ 1)$ ($M_{i,\mathrm{crit}} = 300\ \mathrm{kg\ m^{-2}}$; Nishizawa et al., 2025, Equation 8.342), solving separate turbulent and radiative budgets over open-water leads $(1 - f_i)$ and snow-covered ice $f_i$ (Semtner, 1976).
+
+### 5.2 Size Distributions, Microphysical Transfers, and Subcycled Sedimentation
+
+Marshall–Palmer size distributions $N_x(D) = N_{0x}\exp(-\lambda_x D)$ with slope $\lambda_x = (\pi \rho_x N_{0x} / (\rho_d q_x))^{1/4}$ and power-law fall speeds $V_x(D) = a_x D^{b_x}(\rho_0/\rho_d)^{1/2}$ yield:
+1. **Autoconversion**: $(\partial_t q_p)_{\mathrm{auto}} = \alpha_c \max(q_c - q_{c0}, 0) + \beta_i \exp[0.025(T - T_0)]\max(q_i - q_{i0}, 0)$.
+2. **Accretion**: $(\partial_t q_p)_{\mathrm{accr}} = \sum_{x \in \{r,s,g\}}\sum_{y \in \{c,i\}} \frac{\pi a_x N_{0x}\Gamma(3 + b_x)}{4} E_{xy}(\rho_0/\rho_d)^{1/2}(\rho_d q_x / (\pi \rho_x N_{0x}))^{(3+b_x)/4} q_y$.
+3. **Ventilated evaporation & sublimation** ($S = q_v / q_{\mathrm{sat}} < 1$):
+   $$
+   \left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{evap}} = \sum_{x \in \{r,s,g\}} \frac{2\pi N_{0x}(S - 1)\left[a_{vx}\lambda_x^{-2} + b_{vx}\mathrm{Sc}^{1/3}\sqrt{\frac{a_x}{\nu_a}\left(\frac{\rho_0}{\rho_d}\right)^{1/2}}\Gamma\!\left(\frac{5+b_x}{2}\right)\lambda_x^{-(5+b_x)/2}\right]}{\rho_d\left(\frac{L_{\mathrm{eff}}^2}{K_a R_v T^2} + \frac{R_v T}{D_v e_{\mathrm{sat}}(T)}\right)} \le 0.
+   $$
+4. **CFL-subcycled upwind sedimentation**: Mass-weighted fall speed $V_p = \omega_p V_r + (1 - \omega_p)[(1 - \omega_g)V_s + \omega_g V_g]$ with $V_x = \frac{a_x \Gamma(4+b_x)}{6\lambda_x^{b_x}}(\rho_0/\rho_d)^{1/2}$ is subcycled at $\max(V_p \Delta t_{\mathrm{sed}}/\Delta z_k) \le 0.8$ and updates moist potential temperature conservatively via $\Delta \theta_m = \frac{1 + (R_v/R_d)q_v}{\Pi c_{pd}}[\Delta(L_{\mathrm{eff},n}q_{\mathrm{cond}}) + \Delta(L_{\mathrm{eff},p}q_p)]$ (SCALE-RM Eq. 2.64).
 
 ---
 
-## 9. Embedded 3D Nonhydrostatic RK3–HEVI CRM and Zalesak 3D FCT (`src/aoba/crm.py`)
+## 6. Roughness Sublayer (RSL), Implicit MYNN Level 2.5 PBL, and 3D SGS Turbulence
 
-### 9.1 Flux-Form Compressible Nonhydrostatic Equations and Implicit HEVI Solver
+### 6.1 Canopy and Ocean Roughness (`src/aoba/turbulence.py`)
 
-Each host cell embeds a doubly periodic $N_x \times N_y = 8 \times 8$ ($\Delta x = \Delta y = 4\ \mathrm{km}$) Arakawa C-grid / Charney–Phillips 3D CRM solving the flux-form compressible moist Euler equations in $(\rho_d, u, v, w, \Theta_m = \rho_d \theta_m)$ (Skamarock et al., 2012, Equations 7–11; Nishizawa et al., 2025, Chapter 3):
+- **Terrestrial surfaces (Raupach, 1994, Eqs. 8, 10–11)**: Snow-exposed canopy height $h_{\mathrm{exp}}$ and LAI $L_{\mathrm{exp}}$ set $d/h_{\mathrm{exp}}$ and $z_{0m}/h_{\mathrm{exp}}$ continuously with bare soil $z_{0m,\mathrm{soil}} = 0.01\ \mathrm{m}$, snow $z_{0m,\mathrm{snow}} = 0.002\ \mathrm{m}$, and Stanton ratio $z_{0h} = z_{0q} = e^{-2} z_{0m}$.
+- **Open ocean (Miller, Beljaars, & Palmer, 1992, Eqs. 3–5)**:
+  $$
+  z_{0m} = 0.11\frac{\nu_a}{u_*} + \frac{\alpha_{\mathrm{Ch}} u_*^2}{g}, \qquad z_{0h} = 0.40\frac{\nu_a}{u_*} + 1.4\times 10^{-5}, \qquad z_{0q} = 0.62\frac{\nu_a}{u_*} + 1.3\times 10^{-4}.
+  $$
+
+### 6.2 Analytical Exponential-Integral RSL Surface-Layer Similarity (De Ridder, 2010)
+
+At reference height $z = \tilde{z}_{\mathrm{ref}}$ with gustiness-floored wind $U_{\mathrm{eff}} = \sqrt{u_1^2 + v_1^2 + 0.25}$, $\zeta = z / L_{\mathrm{MO}}$ is solved iteratively from $\mathrm{Ri}_B$ using Paulson ($\zeta < 0$) and Beljaars–Holtslag ($\zeta \ge 0$) functions supplemented inside canopy depth $z_* = \max(2h_{\mathrm{exp}} - d,\ 0)$ by De Ridder (2010, Eqs. 6–7, 22):
 $$
 \begin{aligned}
-\frac{\partial \rho_d}{\partial t} + \nabla_h \cdot (\rho_d \mathbf{u}_h) + \frac{\partial F_z}{\partial z} &= 0, \qquad F_z = \rho_{d,w} w, \\
-\frac{\partial \Theta_m}{\partial t} + \nabla_h \cdot (\Theta_m \mathbf{u}_h) + \frac{\partial (\theta_{m,w} F_z)}{\partial z} &= S_{\Theta_m}, \\
-\rho_{\mathrm{tot},w} \frac{\partial w}{\partial t} + \rho_{\mathrm{tot},w} (\mathbf{u} \cdot \nabla w) &= -\frac{\partial p}{\partial z} - \rho_{\mathrm{tot},w} g - \rho_{\mathrm{tot},w} \gamma_R(z_w) w + D_w.
+F_\alpha &= \ln\!\left(\frac{z}{z_{0\alpha}}\right) - \psi_\alpha(\zeta) + \psi_\alpha\!\left(\zeta \frac{z_{0\alpha}}{z}\right) - \left[\hat{\psi}_\alpha\!\left(\zeta \frac{z_{0\alpha}}{z}, \chi_{0\alpha}\right) - \hat{\psi}_\alpha(\zeta, \chi)\right], \\
+\hat{\psi}_\alpha(\zeta, \eta) &= \phi_\alpha\!\left(\zeta \frac{1 + \nu_{\mathrm{RSL}}/\mu_\alpha}{\eta}\right)\left(1 - \frac{1}{c_{2\alpha}}\right) e^{-\mu_\alpha \eta}\left[\ln(\mu_\alpha \eta) + E_1(\mu_\alpha \eta)\right],
 \end{aligned}
 $$
-Time integration employs the 3-stage Wicker & Skamarock (2002) Runge–Kutta scheme ($\Delta \tau \in \{\Delta t/3,\ \Delta t/2,\ \Delta t\}$) with off-centered ($\beta = 0.60$) Horizontally Explicit / Vertically Implicit (HEVI) coupling (Klemp, Skamarock, & Dudhia, 2007). Eliminating $(\delta \rho_d, \delta \Theta_m)$ in favor of $\delta F_z = F_z^{\mathrm{new}} - F_z^{\mathrm{old}}$ via $\partial p / \partial \Theta_m = \gamma p / \Theta_m$ yields a strictly diagonally dominant $(N_z - 1) \times (N_z - 1)$ tridiagonal Helmholtz system solved across all $N_{\mathrm{cells}} \times N_y \times N_x$ sub-columns via `solve_tridiagonal_batched`, conserving 3D dry mass and $\Theta_m$ to machine precision.
+yielding $C_M = \kappa^2 / F_M^2,\ C_H = \kappa^2 / (F_M F_H),\ C_Q = \kappa^2 / (F_M F_Q)$.
 
-### 9.2 Multidimensional Positive-Definite Zalesak FCT Tracer Transport
+### 6.3 Implicit MYNN Level 2.5 PBL and 3D Smagorinsky–Lilly SGS
 
-Moist tracers $(q_n, q_p)$ are advected using the stage-consistent mass fluxes $(F_x, F_y, F_z)$ via 3D Flux-Corrected Transport (Zalesak, 1979, Equations 1–17; Nishizawa et al., 2025, Appendix A.2, Equations A.20–A.35), blending 1st-order monotone donor-cell upwind fluxes $\mathbf{F}^L$ with 4th-order centered fluxes $\mathbf{F}^H$ via neighborhood anti-diffusive limiters $C \in [0, 1]$ so $q_n, q_p \ge 0$ and $\sum \rho_d q \Delta V$ is conserved identically.
+Doubled TKE $q^2 = 2e$ (Nakanishi & Niino, 2009; SCALE-RM Sec. 8.2.1 Eqs. 8.96–8.176) uses master length scale $L^{-1} = L_S^{-1} + L_T^{-1} + L_B^{-1}$ ($L_T = 0.23 \int q \tilde{z} dz / \int q dz$), Gaussian subgrid condensation variance $\sigma_s$ yielding partial cloudiness $R$ and moist buoyancy $\beta_\theta, \beta_q$, Level-2 equilibrium $q_{\mathrm{L2}}^2$ with disequilibrium factor $\alpha_c = \min(q/q_{\mathrm{L2}}, 1)$, and realizable stability functions $(S_M, S_H)$:
+$$
+S_M = \alpha_c A_1 \frac{\phi_3 - 3 C_1 \phi_4}{\phi_2 \phi_4 + \phi_5 \phi_3}, \qquad S_H = \alpha_c A_2 \frac{\phi_2 + 3 C_1 \phi_5}{\phi_2 \phi_4 + \phi_5 \phi_3}, \qquad \frac{\partial(\rho_d q^2)}{\partial t} = \frac{\partial}{\partial z}\!\left(\rho_d K_q \frac{\partial q^2}{\partial z}\right) + 2\rho_d\left(K_M S^2 - K_H N^2 - \frac{q^3}{B_1 L}\right),
+$$
+integrated implicitly with `solve_tridiagonal_batched`. Horizontal 3D CRM SGS mixing uses Richardson-stabilized Smagorinsky–Lilly with Scotti et al. (1993) grid aspect correction $f(a)$: $\nu_{\mathrm{SGS}} = (C_s f(a)\Delta)^2 |\mathbf{S}|\sqrt{\max(0, 1 - \mathrm{Ri}/\mathrm{Ri}_c)}$.
 
 ---
 
-## 10. Global SCVT Voronoi C-Grid Core, Orographic Drag, Voronoi Ekman Ocean, and 1:1 Coupling
+## 7. Two-Leaf Non-Rectangular-Hyperbola EEO Biosphere
 
-### 10.1 SCVT Voronoi Mesh, TRiSK Operators, and Earth2014 Aggregation (`src/aoba/scvt_mesh.py`, `scvt_dynamics.py`)
+### 7.1 Least-Cost C₃/C₄ Optimality and Universal Dark Respiration (`src/aoba/biosphere.py`)
 
-Recursive icosahedral subdivision ($N_{\mathrm{cells}} = 10 \cdot 4^g + 2$) and spherical Lloyd relaxation (Ringler, Ju, & Gunzburger, 2008) define spherical Voronoi cells of exact spherical excess area $A_i$ ($\sum_i A_i = 4\pi R_E^2$), geodesic cell distances $d_{c,e}$, Voronoi edge lengths $l_e$, and dual Delaunay triangle areas $A_v$. Horizontal dynamics follow the vector-invariant C-grid formulation of Thuburn et al. (2009) and Ringler et al. (2010, Equations 17–26):
+Without PFT tables, C₃ optimality (Prentice et al., 2014; Smith et al., 2019, Eqs. 1–20) sets $\chi_{\mathrm{C3}} = c_i/c_a$ from $\beta_{\mathrm{C3}} = 146$ and solves exact non-rectangular-hyperbola coordination ($\theta = 0.85, c = 0.05336251$) for $(J_{\max,\mathrm{opt}}, V_{c\max,\mathrm{opt}})$ and peaked Arrhenius $25\ ^\circ\mathrm{C}$ capacities (Kattge & Knorr, 2007). C₄ optimality (Scott & Smith, 2022, Eqs. 1–25) determines $\chi_{m,\mathrm{C4}}$ ($\beta_{\mathrm{C4}} = 166$) and iterates bundle-sheath pressure $C_{bs}$ under leakiness $\phi_L = 0.20$, $g_{bs} = 0.003 L_{\mathrm{exp}}$, and 5-electron ATP stoichiometry to yield $(J_{\max,\mathrm{C4}}, V_{p\max,\mathrm{C4}}, V_{c\max,\mathrm{C4}})$. Nighttime respiration scales as $R_{\mathrm{leaf}}(T_{\mathrm{night}}) = 0.018\, V_{c\max,\mathrm{opt}}$ with MMRT temperature function $f_R(T) = \exp[0.1012(T_C - 25) - 0.0005(T_C^2 - 25^2)]$ (Heskel et al., 2016; Ren et al., 2024, 2025).
+
+### 7.2 Midday Downward-SW EMA and Closed-Form Two-Leaf Allocation
+
+Local-solar-noon $(\mathrm{VIS}_b, \mathrm{VIS}_d, \mu_0)$ are EMA-smoothed ($\alpha_{\mathrm{EMA}} = 0.067$), routed through spherical-leaf canopy radiative transfer (de Pury & Farquhar, 1997) at current $L_{\mathrm{exp}}$ to obtain acclimated $\tilde{I}_c$, and analytically integrated against instantaneous sunlit probability $\exp(-k_{db}L)$ ($k_{db} = 0.5/\mu_0(t)$) to partition every capacity $X \in \{V_{c\max 25}, J_{\max 25}, V_{p\max 25}, R_{25}\}$ into $X_{\mathrm{sun}}$ and $X_{\mathrm{sh}} = \max(10^{-6}, X - X_{\mathrm{sun}})$. Sub-daily sunlit and shaded leaves independently evaluate assimilation, optimal stomatal conductances $g_{sw,\mathrm{sun}}, g_{sw,\mathrm{sh}}$, two-stream canopy albedos (Dai et al., 2004, App. A), autonomous C₄ dominance $F_4 \in [0, 1]$ (Luo et al., 2024), Lambert-$W_0$ prognostic LAI (Cai et al., 2025; Zhou et al., 2025), root-zone storage $S_R \in [50, 650]\ \mathrm{kg\ m^{-2}}$ (Gao et al., 2014), and vascular canopy height $h_c \in [0.05, 40]\ \mathrm{m}$ (Kempes et al., 2011).
+
+---
+
+## 8. Land Hydrology, Five-Layer Freeze–Thaw Soil, Snow, and Ocean/Sea-Ice
+
+### 8.1 ET Conductance Network, Skin Energy Balance, Snowpack, and 5-Layer Soil (`src/aoba/surface.py`)
+
+Land latent heat combines sunlit+shaded transpiration $g_{\mathrm{trans}} = (1 - f_{\mathrm{wet}}) g_b g_{s,\mathrm{can}}/(g_b + g_{s,\mathrm{can}})$, interception loss $g_{\mathrm{inter}} = f_{\mathrm{wet}} g_b$, soil evaporation $g_{\mathrm{soil}} = (1 - A_{\mathrm{sn}})/(r_{d,\mathrm{uc}} + r_{\mathrm{soil}} + g_a^{-1})$ (MATSIRO6 Eqs. 5.34–5.35; Sakaguchi & Zeng, 2009), and snow sublimation $g_{\mathrm{snow}} = A_{\mathrm{sn}} / (r_{d,\mathrm{uc}} f_{\mathrm{veg}} + g_a^{-1})$ in series with aerodynamic conductance $g_a$. Linearized surface skin energy balance solves $\Delta T_{\mathrm{skin}}$ implicitly, clamping snow-covered surfaces at $T_0$ to drive melt $M_{\mathrm{snow}}$ (MATSIRO6 Sec. 6.3.3). Subgrid topographic snow fraction $A_{\mathrm{sn}}$ (Swenson & Lawrence, 2012; Nitta et al., 2014), snow-burial masking $h_{\mathrm{exp}} = \max(h_c - d_{\mathrm{sn}}, 0)$ (MATSIRO6 Eqs. 2.1–2.3), two-band snow aging albedo (Yang et al., 1997), and glacier runoff calving ($S_{n,\max} = 1000\ \mathrm{kg\ m^{-2}}$) couple with 5-layer ($\Delta z_s = [0.05, 0.15, 0.40, 0.80, 1.60]\ \mathrm{m}$) internal-energy $U_l = C_l(T_l - T_0) - L_{f0} M_{i,l}$ freeze–thaw heat conduction (`solve_tridiagonal_batched`). Open water uses Briegleb et al. (1986) direct albedo, and fractional sea ice $f_i = \min(\sqrt{M_i/300}, 1)$ solves area-weighted Semtner (1976) lead/ice thermodynamics.
+
+---
+
+## 9. Embedded 3D Nonhydrostatic RK3–HEVI CRM and Zalesak FCT
+
+### 9.1 Compressible RK3–HEVI Solver and 3D FCT (`src/aoba/crm.py`)
+
+Each SCVT cell embeds a doubly periodic orthogonal C-grid / Charney–Phillips 3D CRM (default `[Nz=32, Ny=1, Nx=8], dx=8000 m`, configurable via TOML `[grid]`) integrating flux-form $(\rho_d, u, v, w, \Theta_m = \rho_d \theta_m)$ via 3-stage Wicker & Skamarock (2002) RK3, 3rd-order upwind-biased horizontal momentum advection, and off-centered ($\beta_{\mathrm{HEVI}} = 0.60$) Horizontally Explicit / Vertically Implicit acoustic substeps solving a $(N_z - 1)\times (N_z - 1)$ tridiagonal Helmholtz equation for $\delta F_z$ via `solve_tridiagonal_batched`. Moist scalars $(q_n, q_p)$ are transported identically by stage-consistent mass fluxes $(F_x, F_y, F_z)$ using positive-definite Zalesak (1979) 3D FCT.
+
+---
+
+## 10. Global SCVT C-Grid Core, Orographic Drag, Ekman Ocean, and MAML+ICA Coupling
+
+### 10.1 SCVT TRiSK Host Dynamics, Lott–Miller Drag, Ekman Ocean, and MAML+ICA Cycle
+
+The global host solves compressible nonhydrostatic equations on a Sphere Centroidal Voronoi C-grid ($N_{\mathrm{cells}} = 10\cdot 4^g + 2$; Ringler et al., 2008, 2010; Thuburn et al., 2009) using skew-symmetric TRiSK Coriolis reconstruction ($A_e w_{e,e'} + A_{e'} w_{e',e} = 0$), Klemp STF metric terms, HEVI vertical coupling, and SCVT Zalesak FCT, coupled to `Earth2014` subgrid Lott & Miller (1997) blocked-flow + Lindzen gravity-wave drag (`src/aoba/orography.py`) and a zero-$Q$-flux 1.5-layer Voronoi Ekman ocean ($H_2 = 200\ \mathrm{m}$, coastal zero normal transport, conservative glacial runoff latent-heat absorption; `src/aoba/ocean_ekman.py`, Codron, 2012). Under the **MAML + ICA** coupling architecture (`src/aoba/coupled_model.py`), every `[Ny, Nx]` CRM subcolumn maintains its own full 1-to-1 land/biosphere/soil/ocean column state `sfc_sub`, receives independent 4-band ICA radiation fluxes (`rad_stride = 5` steps), advances `step_surface` locally, synchronizes ocean heat/ice increments with the SCVT Ekman ocean, injects large-scale host tendencies into `step_crm_physics_and_dynamics`, and feeds back domain-mean thermodynamic/momentum tendencies while diagnosing online 30-class Köppen–Geiger biomes (Beck et al., 2018, 2023).
+
+---
+
+## 11. Dynamic / Accelerated SIA Ice-Sheet Model and Conservative Barometric Remapping
+
+Enabled via `enable_dynamic_icesheet = true` (`src/aoba/icesheet.py`), AOBA prognoses continental ice thickness $H(\mathbf{x})$ and bedrock elevation $b(\mathbf{x})$ initialized from `Earth2014.BED2014` and `ICE2014`.
+
+### 11.1 Climatic Surface Mass Balance (SMB) and EMA Filtering
+
+Over terrestrial/ice-sheet cells, subgrid net ice mass flux $\mathrm{SMB}\ [\mathrm{kg\ m^{-2}\ s^{-1}}]$ (snowfall minus sublimation, snowmelt, and bare-ice surface melt potential at $T_{\mathrm{skin}} > T_0$) is accumulated each climate year into $\overline{\mathrm{SMB}}_y$ and smoothed with exponential moving average memory $\tau_{\mathrm{EMA}}$ (default `5.0 yr`):
 $$
-\frac{\partial u_e}{\partial t} = \sum_{e' \in \mathrm{EC}(e)} w_{e,e'} \frac{\eta_e + \eta_{e'}}{2} u_{e'} - \frac{K_{c_1} - K_{c_0}}{d_{c,e}} - \frac{1}{\rho_{\mathrm{tot},e}} \left[\left(\frac{\partial p}{\partial n}\right)_\zeta - \frac{\partial p}{\partial z}\left(\frac{\partial z}{\partial n}\right)_\zeta\right] + D_{u,e},
+\widetilde{\mathrm{SMB}}_y = (1 - \alpha_{\mathrm{EMA}})\,\widetilde{\mathrm{SMB}}_{y-1} + \alpha_{\mathrm{EMA}}\,\overline{\mathrm{SMB}}_y, \qquad \alpha_{\mathrm{EMA}} = 1 - \exp\!\left(-\frac{\Delta t_{\mathrm{clim,yr}}}{\tau_{\mathrm{EMA}}}\right), \qquad b_{\mathrm{ice}} = \frac{\widetilde{\mathrm{SMB}}_y}{\rho_{\mathrm{ice}}}.
 $$
-where $\eta_v = \zeta_v + f_v$ is absolute vorticity and TRiSK weights $w_{e,e'}$ satisfy the exact skew-symmetry identity $A_e w_{e,e'} + A_{e'} w_{e',e} = 0$ ($A_e = \frac{1}{2} d_{c,e} l_e$), ensuring zero spurious Coriolis/rotational kinetic-energy generation, stabilized by divergence damping and $\nabla^4$ hyperdiffusion (Skamarock et al., 2012, Section 3d). Five-arc-minute `Earth2014` grids (`SUR2014`, `ICE2014`, `TBI2014`; Hirt & Rexer, 2015) are aggregated onto each Voronoi cell to yield cell-mean $z_{\mathrm{topo}}$, surface masks (`Ocean`, `Land`, `IceSheet`), and subgrid gradient covariance invariants $(\mu, \sigma, \gamma, \psi)$.
 
-### 10.2 Lott & Miller (1997) Subgrid Orographic Drag (`src/aoba/orography.py`)
+### 11.2 Glen Flow Law ($n=3$) Upstream Finite-Volume SIA and Time Acceleration
 
-When inverse Froude number $H_n = \bar{N}_L (2\mu) / |\mathbf{U}_L|$ exceeds $H_{nc} = 0.50$, flow below $Z_b = 2\mu(1 - H_{nc}/H_n)$ experiences directional elliptic bluff-body wake drag, while residual mountain height $h_{\mathrm{eff}} = 2\mu - Z_b$ launches upward-propagating internal gravity waves attenuated via the Lindzen saturation stress $\tau_{\mathrm{sat}}(z) \propto \rho U_{\mathrm{proj}}^3 / (N H_{nc}^2)$ (Lott & Miller, 1997, Equations 7–18).
-
-### 10.3 Zero-$Q$-Flux 1.5-Layer Voronoi Ekman Ocean (`src/aoba/ocean_ekman.py`)
-
-Following Codron (2012, Equations 1–10), wind stress $\boldsymbol{\tau}_{\mathrm{ocn}}$ drives mixed-layer ($H_1 = 50\ \mathrm{m}$, temperature $T_1$) Ekman mass transport across interior ocean–ocean Voronoi edges ($r_E = (2\ \mathrm{days})^{-1}$, zero normal flux at all coastal edges):
+Using isothermal Glen's flow law ($n = 3, A_{\mathrm{Glen}} = 1.0\times 10^{-16}\ \mathrm{Pa^{-3}\ yr^{-1}}, \rho_{\mathrm{ice}} = 917\ \mathrm{kg\ m^{-3}}$) and ice surface $s = b + H$, 2D Shallow Ice Approximation flow obeys:
 $$
-M_{E,x} = \frac{r_E \tau_{x,\mathrm{ocn}} + f \tau_{y,\mathrm{ocn}}}{f^2 + r_E^2}, \qquad M_{E,y} = \frac{r_E \tau_{y,\mathrm{ocn}} - f \tau_{x,\mathrm{ocn}}}{f^2 + r_E^2},
+\frac{\partial H}{\partial t_{\mathrm{ice}}} = \nabla_{\mathrm{SCVT}} \cdot \left(D_{\mathrm{SIA}}\nabla s\right) + b_{\mathrm{ice}}, \qquad D_{\mathrm{SIA}} = \Gamma_{\mathrm{SIA}}\, H^5 |\nabla s|^2, \qquad \Gamma_{\mathrm{SIA}} = 0.4 A_{\mathrm{Glen}} (\rho_{\mathrm{ice}} g)^3.
 $$
-balanced by an equal and opposite return flow $-\mathbf{M}_E$ in a thermocline layer ($H_2 = 200\ \mathrm{m}$, temperature $T_2$) and vertical Ekman upwelling $W_E = \nabla_{\mathrm{SCVT}} \cdot \mathbf{M}_E$, conserving global ocean enthalpy to machine precision without prescribed $Q$-flux maps while absorbing latent heat of fusion from routed coastal glacial runoff (MIROC6 Section 4.1.2).
+On each SCVT edge $e = (c_0 \to c_1)$, upstream Type-I diffusivity evaluation (Mahaffy, 1976; Bueler et al., 2005) selects upwind ice thickness $H_{\mathrm{up}, e}$ along descending surface slope $(s_{c_1} - s_{c_0})/d_{c,e}$ and updates $H \in [0, 6000\ \mathrm{m}]$ via CFL-subcycled (`D * dt_sub / dx_min^2 <= 0.12`) finite-volume divergence `compute_scvt_divergence`, calving ice discharged onto ocean cells. Asynchronous ice integration proceeds for $\Delta t_{\mathrm{ice}} = \alpha_{\mathrm{eff}}(t)\Delta t_{\mathrm{clim}}$:
+$$
+\alpha_{\mathrm{eff}}(t) = \begin{cases} \alpha_0 & (\tau_{\mathrm{spin}} \le 0), \\ 1 + (\alpha_0 - 1)\exp\!\left(-t_{\mathrm{clim}} / \tau_{\mathrm{spin}}\right) & (\tau_{\mathrm{spin}} > 0). \end{cases}
+$$
 
-### 10.4 1:1 Superparameterization Coupling and Emergent Köppen–Geiger Diagnostics (`src/aoba/coupled_model.py`, `src/aoba/koppen.py`)
+### 11.3 Relaxed Bedrock Isostasy, Mask Transitions, and Barometric Vertical Remapping
 
-Every SCVT Voronoi cell couples 1:1 to its embedded $8 \times 8 \times 32$ 3D CRM at interval $\Delta t_{\mathrm{host}}$ (Khairoutdinov et al., 2005; Yamazaki & Miura, 2024): host dynamical tendencies $(\partial_t \theta_m, \partial_t q_n)_{\mathrm{LS}}$ and cell-center winds force the CRM sub-columns alongside radiative heating and surface fluxes, and horizontal-mean CRM states and momentum tendencies feed back directly onto the host SCVT state. Accumulated monthly surface air temperature $T_m$ and precipitation $P_m$ classify all terrestrial cells into the exact 30-class Köppen–Geiger system (`Af`–`EF`; Beck et al., 2018, 2023, Table 1), enabling direct quantitative evaluation of emergent present-day biomes and elevated-$\mathrm{CO}_2$ climate-zone shifts.
+Subglacial bedrock relaxes toward mantle equilibrium ($\rho_m = 3300\ \mathrm{kg\ m^{-3}}$) over timescale $\tau_{\mathrm{iso}}$ (default `1000 yr`):
+$$
+b_{\mathrm{eq}} = b_0 - \frac{\rho_{\mathrm{ice}}}{\rho_m} H, \qquad b^{\mathrm{new}} = b + \left[1 - \exp\!\left(-\frac{\Delta t_{\mathrm{ice}}}{\tau_{\mathrm{iso}}}\right)\right](b_{\mathrm{eq}} - b), \qquad z_{\mathrm{topo}}^{\mathrm{new}} = b^{\mathrm{new}} + H,
+$$
+followed by 2-pass Klemp conservative neighbor Laplacian smoothing ($z \leftarrow 0.75 z + 0.25 \bar{z}_{\mathrm{nb}}$). Crossings of $H_{\mathrm{crit}} = 5.0\ \mathrm{m}$ trigger dynamic `SURF_LAND <-> SURF_ICESHEET` mask transitions and seed pioneer vegetation ($\mathrm{LAI} = 0.25, h_c = 0.3\ \mathrm{m}$) onto newly deglaciated land. Whenever $\max |z_{\mathrm{topo,smooth}}^{\mathrm{new}} - z_{w,0}^{\mathrm{old}}| \ge 0.05\ \mathrm{m}$, `remap_atmosphere_and_crm_vertical` rebuilds $z_w^{\mathrm{new}}, z_c^{\mathrm{new}}$ via `compute_stf_heights`, interpolates $(\ln p, \theta_m, q_n, q_p, q_v, q_c, q_i, u, v, w, q^2)$ onto $z_c^{\mathrm{new}}$ with hydrostatic barometric extrapolation below old surface elevation:
+$$
+p(z_c^{\mathrm{new}}) = p_0^{\mathrm{old}} \left[1 - \frac{g (z_c^{\mathrm{new}} - z_{c,0}^{\mathrm{old}})}{c_{pd}\theta_{m,0}^{\mathrm{old}}\Pi_0^{\mathrm{old}}}\right]^{c_{pd}/R_d},
+$$
+and consistently re-diagnoses compressible density $\rho_d^{\mathrm{new}} = p^{\mathrm{new}} / (R_d \theta_m^{\mathrm{new}} \Pi^{\mathrm{new}})$ across both host and all CRM columns.
+
+---
+
+## 12. Unified Single-File TOML Configuration, Output Cadence, GUI, and 188-Parameter Registry
+
+### 12.1 TOML Architecture & Interactive Configurator (`src/aoba/params.py`, `scripts/aoba_config_gui.py`)
+
+All grid parameters, orbital/planetary forcings, dynamic ice-sheet controls, output streams/cadences, and module physical constants (**13 TOML sections, 188 parameters**) are centralized in [`config/aoba_default.toml`](../config/aoba_default.toml). Loading a custom TOML via `scripts/run_g5_30yr.py --config custom.toml` binds `(AOBAConfig, OutputConfig)` and synchronizes all `src/aoba/*` module globals and Metal kernel constant arrays (`recompute_derived_constants()`), while omitting `--config` preserves exact factory defaults.
+
+`scripts/aoba_config_gui.py` provides a zero-dependency local Web workbench (**AOBA Studio**, via `http.server`) spanning configuration, run launching, live monitoring, and CPU real-time visualization: live 3D icosahedral SCVT + CRM + vertical-levels diagrams updating dynamically with `glevel`, planetary/paleoclimate presets (`0.5×Ω`, LGM, `4×CO2`), output storage estimators, a 188-parameter searchable TOML editor, subprocess run launch/monitoring (`daily_global.csv` trajectories and `run.log`), and an idle-CPU spherical regridder rendering **three synchronized, slowly rotating Orthographic Earth globes for `T2` ($0.35 T_{\mathrm{sfc}} + 0.65 T_{a,z_1}$), `OLR`, and `LAI`** from `live_preview.npz`, `snapshots.zarr`, or `monthly.zarr`.
+
+### 12.2 Output Files & Temporal Averaging vs Instantaneous Specifications (`[output]`)
+
+- `mesh.zarr`: Static SCVT coordinates, cell areas, topography (`z_topo`, `z_bed`, `sigma_topo`), surface masks.
+- `daily_global.csv` (`daily_csv_enabled`, `daily_csv_interval_days`): Global-mean time-averaged daily time series.
+- `monthly.zarr` (`monthly_mean_enabled`, `monthly_mean_periods_per_year = 12`, `monthly_mean_sample_hours = 6.0`, `monthly_mean_include_{2d,3d,subgrid_2d}`): Time-averaged 2D, 3D (`temp`, `pres`, `q_v`, `u_zonal`, `v_merid`), and CRM subgrid 2D (`lwp_sub`, `iwp_sub`, `w_max_sub`, `precip_mm_day_sub`, `sw_dn_sub`, `lw_dn_sub`, `olr_sub`, `shf_sub`, `evap_mm_day_sub`, `gpp_sub`, `t_sfc_sub`, `m_seaice_sub`, `swe_land_sub`, `w_root_sub`, `lai_sub`) climate fields.
+- `snapshots.zarr` (`snapshots_enabled`, `snapshots_periods_per_year = 12`, `snapshots_include_{2d,3d,subgrid_2d}`): Instantaneous state snapshots (`export_aoba_snapshot_xarray`) partitioned per year (`zarr_dir_partition = "yearly"`) or concatenated (`"single"`).
+- `restart.pt`: Atomic restart checkpoints written every `restart_interval_years`.
+
+### 12.3 Complete 188-Parameter Registry (`config/aoba_default.toml`)
+
+| Section (# keys) | Keys = Default Values |
+| :--- | :--- |
+| `[grid]` (16) | `glevel = 3`, `nz = 32`, `z_top = 24000.0`, `dz_min = 60.0`, `z_sponge_base = 17500.0`, `tau_sponge_min = 300.0`, `terrain_scale_exp = 1.5`, `crm_nx = 8`, `crm_ny = 1`, `crm_dx = 8000.0`, `dt_host = 720.0`, `n_host_dyn_substeps = 1`, `n_crm_dyn_substeps = 12`, `rad_stride = 5`, `crm_col_chunk = 16384`, `rad_col_chunk = 32768` |
+| `[forcing]` (13) | `co2_ppmv = 400.0`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 50.0` |
+| `[icesheet]` (5) | `enable_dynamic_icesheet = false`, `icesheet_ema_years = 5.0`, `icesheet_accel_factor = 100.0`, `icesheet_accel_spinup_years = 0.0`, `icesheet_isostasy_tau_yr = 1000.0` |
+| `[output]` (18) | `out_dir = ""`, `years = 30`, `days_per_year = 365.2425`, `zarr_dir_partition = "yearly"`, `daily_csv_enabled = true`, `daily_csv_interval_days = 1.0`, `monthly_mean_enabled = true`, `monthly_mean_periods_per_year = 12`, `monthly_mean_sample_hours = 6.0`, `monthly_mean_include_2d = true`, `monthly_mean_include_3d = true`, `monthly_mean_include_subgrid_2d = true`, `snapshots_enabled = true`, `snapshots_periods_per_year = 12`, `snapshots_include_2d = true`, `snapshots_include_3d = true`, `snapshots_include_subgrid_2d = true`, `restart_interval_years = 1` |
+| `[constants]` (26) | `earth_radius = 6.371e6`, `gravity = 9.79764`, `omega_earth = 7.292115e-5`, `seconds_per_day = 86400.0`, `days_per_year = 365.2425`, `r_d = 287.04`, `cp_d = 1004.64`, `r_v = 461.5`, `cp_v = 1846.0`, `p_ref = 1e5`, `t_freeze = 273.15`, `t_triple = 273.16`, `e_triple = 611.2`, `l_v0 = 2.501e6`, `l_f0 = 3.337e5`, `t_ice_all = 253.15`, `t_liq_all = 273.16`, `stefan_boltzmann = 5.670374419e-8`, `von_karman = 0.4`, `rho_seawater = 1025.0`, `cp_seawater = 3990.0`, `t_freeze_ocean = 271.35`, `rho_seaice = 917.0`, `k_therm_seaice = 2.034`, `k_therm_snow = 0.3096`, `o2_mixing_ratio = 0.20946` |
+| `[radiation]` (7) | `solar_frac_sw1 = 0.45976`, `lw_window_frac = 0.32`, `o3_g1 = 3.6478`, `o3_g2 = 0.83209`, `o3_g3 = 11.3515`, `par_frac_of_sw1 = 0.88`, `umol_per_joule_par = 4.57` |
+| `[microphysics]` (27) | `rho_rain = 1000.0`, `rho_snow = 100.0`, `rho_graupel = 400.0`, `n0_rain = 8e6`, `n0_snow = 3e6`, `n0_graupel = 4e6`, `a_fall_rain = 842.0`, `b_fall_rain = 0.8`, `a_fall_snow = 4.84`, `b_fall_snow = 0.25`, `a_fall_graupel = 94.5`, `b_fall_graupel = 0.5`, `e_rc = 1.0`, `e_sc = 1.0`, `e_gc = 1.0`, `e_ri = 1.0`, `e_si = 0.1`, `e_gi = 0.1`, `qc_autoconv_thresh = 0.001`, `qi_aggreg_thresh = 1e-4`, `rate_autoconv = 0.001`, `rate_ice_aggreg = 0.001`, `vt_cloud_ice = 0.4`, `t0_precip = 283.16`, `t00_precip = 268.16`, `t0_graupel = 283.16`, `t00_graupel = 223.16` |
+| `[turbulence]` (13) | `mynn_b1 = 24.0`, `mynn_b2 = 15.0`, `mynn_c2 = 0.75`, `mynn_c3 = 0.352`, `mynn_c5 = 0.2`, `mynn_gamma1 = 0.235`, `mynn_pr_n = 0.74`, `tke_min = 1e-4`, `rsl_mu_m = 2.59`, `rsl_mu_h = 0.95`, `rsl_nu = 0.5`, `rsl_lambda = 1.5`, `kinematic_visc_air = 1.5e-5` |
+| `[surface]` (18) | `cs_dry_soil = 1.26e6`, `kappa_dry_soil = 0.3`, `soil_porosity = 0.43`, `psi_sat_soil = -0.2`, `b_clapp_soil = 5.39`, `wc_max_per_lai = 0.2`, `rho_snowpack = 250.0`, `swe_glacier_max = 1000.0`, `tau_snow_age = 1e6`, `alb_snow_vis_new = 0.9`, `alb_snow_nir_new = 0.7`, `alb_snow_vis_old = 0.65`, `alb_snow_nir_old = 0.35`, `emissivity_land = 0.98`, `emissivity_ocean = 0.985`, `mc_seaice_crit = 300.0`, `alb_seaice_vis = 0.72`, `alb_seaice_nir = 0.42` |
+| `[biosphere]` (33) | `theta_nrh = 0.85`, `cost_c_smith = 0.05336251`, `phi_psii_ref_c3 = 0.257`, `beta_c3 = 146.0`, `beta_c4 = 166.0`, `gamma_star25_c3 = 4.332`, `kc25_c3 = 41.03`, `ko25_c3 = 28210.0`, `dha_gamma = 37830.0`, `dha_kc_c3 = 79430.0`, `dha_ko_c3 = 36380.0`, `gamma_star25_c4 = 2.6`, `kp25_umol_c4 = 60.5`, `dha_kp_c4 = 27200.0`, `kc25_c4 = 121.0`, `dha_kc_c4 = 64200.0`, `ko25_c4 = 29200.0`, `dha_ko_c4 = 10500.0`, `phi_leak_c4 = 0.2`, `gbs_c4 = 0.003`, `ha_vcmax = 71513.0`, `ha_jmax = 49884.0`, `ha_vpmax = 55000.0`, `hd_enzyme = 2e5`, `b_resp_ren = 0.018`, `leaf_scat_vis = 0.15`, `leaf_scat_nir = 0.8`, `kd_prime_par = 0.719`, `rho_cd_par = 0.036`, `z_foliage_cost = 12.227`, `k_beer_lai = 0.5`, `sigma_zhou = 0.771`, `alpha_ema_acclim = 0.067` |
+| `[ocean_ekman]` (4) | `h_thermocline = 200.0`, `r_ekman_damp_days = 2.0`, `kappa_ocn_horiz = 2000.0`, `kappa_ocn_vert = 2e-5` |
+| `[orography]` (3) | `hn_crit = 0.5`, `cd_block = 1.0`, `g_wave = 0.8` |
+| `[icesheet_physics]` (5) | `rho_ice = 917.0`, `rho_mantle = 3300.0`, `a_glen_per_year = 1e-16`, `h_ice_threshold_m = 5.0`, `h_ice_max_m = 6000.0` |

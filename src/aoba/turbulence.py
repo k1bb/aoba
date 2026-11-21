@@ -76,6 +76,32 @@ _MYNN_METAL_CONSTS: list[float] = [
     MYNN_F1, MYNN_F2, MYNN_RF1, MYNN_RF2, MYNN_RFC,
 ]
 
+
+def recompute_derived_constants() -> None:
+    """Refresh derived MYNN closure ratios and Metal constant buffer."""
+    global MYNN_A1, MYNN_A2, MYNN_C1, MYNN_GAMMA2, MYNN_F1, MYNN_F2, MYNN_RF1, MYNN_RF2, MYNN_RFC
+    MYNN_A1 = MYNN_B1 * (1.0 - 3.0 * MYNN_GAMMA1) / 6.0
+    MYNN_A2 = 1.0 / (3.0 * MYNN_GAMMA1 * (MYNN_B1 ** (1.0 / 3.0)) * MYNN_PR_N)
+    MYNN_C1 = MYNN_GAMMA1 - 1.0 / (3.0 * MYNN_A1 * (MYNN_B1 ** (1.0 / 3.0)))
+    MYNN_GAMMA2 = (2.0 * MYNN_A1 * (3.0 - 2.0 * MYNN_C2) + MYNN_B2 * (1.0 - MYNN_C3)) / MYNN_B1
+    MYNN_F1 = (
+        MYNN_B1 * (MYNN_GAMMA1 - MYNN_C1)
+        + 2.0 * MYNN_A1 * (3.0 - 2.0 * MYNN_C2)
+        + 3.0 * MYNN_A2 * (1.0 - MYNN_C2) * (1.0 - MYNN_C5)
+    )
+    MYNN_F2 = MYNN_B1 * (MYNN_GAMMA1 + MYNN_GAMMA2) - 3.0 * MYNN_A1 * (1.0 - MYNN_C2)
+    MYNN_RF1 = MYNN_B1 * (MYNN_GAMMA1 - MYNN_C1) / MYNN_F1
+    MYNN_RF2 = MYNN_B1 * MYNN_GAMMA1 / MYNN_F2
+    MYNN_RFC = MYNN_GAMMA1 / (MYNN_GAMMA1 + MYNN_GAMMA2)
+    _MYNN_METAL_CONSTS[:] = [
+        C.P_REF, C.R_D, C.CP_D, C.CP_V, C.GAMMA_D, C.KAPPA_D,
+        C.RV_OVER_RD, C.EPS_WATER, C.ZVIR, C.GRAVITY, C.VON_KARMAN,
+        C.L_V0, C.L_S0, C.E_TRIPLE, C.T_FREEZE, C.T_ICE_ALL, C.T_LIQ_ALL,
+        TKE_MIN, MYNN_B1, MYNN_B2, MYNN_C1, MYNN_C2, MYNN_C3, MYNN_C5,
+        MYNN_A1, MYNN_A2, MYNN_GAMMA1, MYNN_GAMMA2,
+        MYNN_F1, MYNN_F2, MYNN_RF1, MYNN_RF2, MYNN_RFC,
+    ]
+
 # De Ridder (2010, Eq. 22) analytical RSL parameters
 RSL_MU_M: float = 2.59
 RSL_MU_H: float = 0.95

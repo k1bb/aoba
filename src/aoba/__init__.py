@@ -32,12 +32,31 @@ from aoba.crm import (
     step_crm_physics_and_dynamics,
     step_crm_rk3_hevi,
 )
+from aoba.icesheet import (
+    H_ICE_THRESHOLD_M,
+    IceSheetState,
+    init_icesheet_state,
+    remap_atmosphere_and_crm_vertical,
+    step_sia_icesheet_scvt,
+)
 from aoba.io_zarr import append_zarr, export_aoba_snapshot_xarray, load_zarr, save_zarr
 from aoba.kernels import solve_tridiagonal_batched
 from aoba.koppen import KOPPEN_NAMES, classify_koppen_geiger
 from aoba.microphysics import MicrophysicsResult, step_microphysics
 from aoba.ocean_ekman import EkmanOceanState, init_ekman_ocean_state, step_ekman_ocean_voronoi
 from aoba.orography import compute_orographic_drag_lott_miller
+from aoba.params import (
+    OutputConfig,
+    SECTION_META,
+    apply_module_parameters,
+    build_configs_from_dict,
+    default_config_dict,
+    default_toml_path,
+    dump_aoba_toml,
+    load_aoba_toml,
+    reset_default_parameters,
+    save_aoba_toml,
+)
 from aoba.radiation import RadiationOutput, compute_four_band_radiation, compute_solar_zenith
 from aoba.runtime import get_data_dir, get_device, get_output_dir
 from aoba.scvt_dynamics import (
@@ -158,8 +177,23 @@ __all__ = [
     "init_aoba_model",
     "step_aoba_model",
     "diagnose_model_koppen_geiger",
+    "IceSheetState",
+    "init_icesheet_state",
+    "step_sia_icesheet_scvt",
+    "remap_atmosphere_and_crm_vertical",
+    "H_ICE_THRESHOLD_M",
     "save_zarr",
     "append_zarr",
     "load_zarr",
     "export_aoba_snapshot_xarray",
+    "OutputConfig",
+    "SECTION_META",
+    "default_toml_path",
+    "default_config_dict",
+    "load_aoba_toml",
+    "dump_aoba_toml",
+    "save_aoba_toml",
+    "apply_module_parameters",
+    "reset_default_parameters",
+    "build_configs_from_dict",
 ]

@@ -25,6 +25,13 @@ import torch
 from aoba import constants as C
 from aoba.biosphere import update_daily_acclimation_smith, update_daily_lai_root_height
 from aoba.crm import CRMState, SPTendencies, step_crm_physics_and_dynamics
+from aoba.icesheet import (
+    H_ICE_THRESHOLD_M,
+    IceSheetState,
+    init_icesheet_state,
+    remap_atmosphere_and_crm_vertical,
+    step_sia_icesheet_scvt,
+)
 from aoba.koppen import classify_koppen_geiger
 from aoba.ocean_ekman import EkmanOceanState, init_ekman_ocean_state, step_ekman_ocean_voronoi
 from aoba.orography import compute_orographic_drag_lott_miller
@@ -44,8 +51,10 @@ from aoba.scvt_mesh import (
 from aoba.surface import (
     EMISSIVITY_LAND,
     EMISSIVITY_OCEAN,
+    SURF_ICESHEET,
     SURF_LAND,
     SURF_OCEAN,
+    SWE_GLACIER_MAX,
     SurfaceFluxDiagnostics,
     SurfaceState,
     compute_surface_albedos,
@@ -63,6 +72,14 @@ class AOBAConfig:
 
     glevel: int = 3                          # SCVT mesh level (3 -> 642 cells; 4 -> 2562; 5 -> 10242)
     nz: int = 32                             # Shared Charney-Phillips vertical levels
+    z_top: float = 24000.0                   # Model top height [m]
+    dz_min: float = 60.0                     # Lowest layer thickness [m]
+    z_sponge_base: float = 17500.0           # Rayleigh sponge base height [m]
+    tau_sponge_min: float = 300.0            # Minimum sponge damping timescale [s]
+    terrain_scale_exp: float = 1.5           # Klemp STF attenuation exponent p [-]
+    h_ml_ocean: float = 50.0                 # Ocean mixed-layer depth [m]
+    re_liq_um: float = 10.0                  # Cloud liquid droplet effective radius [um]
+    re_ice_um: float = 50.0                  # Cloud ice crystal effective radius [um]
     crm_nx: int = 8                          # Embedded CRM x-grid points per SCVT cell (default 2D 8x1 = 64 km curtain)
     crm_ny: int = 1                          # Embedded CRM y-grid points (1 = SP-CAM 2.5D curtain for Mac climate runs)
     crm_dx: float = 8000.0                   # Embedded CRM horizontal spacing [m] (permits 60 s CFL substeps)
@@ -82,6 +99,11 @@ class AOBAConfig:
     earth2014_dir: str = "data/boundary/earth2014_5min"
     earth2014_stride: int = 2
     enable_superparam: bool = True           # 1:1 embedded 3D CRM in every SCVT cell
+    enable_dynamic_icesheet: bool = False    # Opt-in SIA + EMA-accelerated ice sheet & vertical grid update
+    icesheet_ema_years: float = 5.0          # EMA smoothing timescale for annual SMB [years]
+    icesheet_accel_factor: float = 100.0     # Initial ice-sheet spinup acceleration multiplier [-]
+    icesheet_accel_spinup_years: float = 0.0 # Optional e-folding climate timescale for accel decay to 1.0 [yr] (0=const)
+    icesheet_isostasy_tau_yr: float = 1000.0 # Lithospheric isostasy relaxation timescale in ice-years [yr] (0=instant)
 
 
 @dataclass
@@ -118,6 +140,7 @@ class AOBAState:
     clim: ClimateAccumulator
     sfc_sub: SurfaceState | None = None
     clim_sub: ClimateAccumulator | None = None
+    icesheet: IceSheetState | None = None
     sim_time_sec: float = 0.0
     step_count: int = 0
     rad_cache: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -190,6 +213,8 @@ def _compute_four_band_radiation_chunked(
     albedo_vis_dif: torch.Tensor,
     albedo_nir_dif: torch.Tensor,
     col_chunk: int,
+    re_liq_um: float = 10.0,
+    re_ice_um: float = 50.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Evaluate 1D ICA 4-band radiative transfer across `[nz, m_sub]`, chunking when `m_sub > col_chunk`."""
     nz, m_sub = pres_c.shape
@@ -212,6 +237,8 @@ def _compute_four_band_radiation_chunked(
             s_toa=s_toa,
             co2_ppmv=co2_ppmv,
             emiss_sfc=emiss_sfc,
+            re_liq_um=re_liq_um,
+            re_ice_um=re_ice_um,
             albedo_vis_dif=albedo_vis_dif,
             albedo_nir_dif=albedo_nir_dif,
         )
@@ -256,6 +283,8 @@ def _compute_four_band_radiation_chunked(
             s_toa=s_toa[sl],
             co2_ppmv=co2_ppmv,
             emiss_sfc=emiss_sfc[sl],
+            re_liq_um=re_liq_um,
+            re_ice_um=re_ice_um,
             albedo_vis_dif=albedo_vis_dif[sl],
             albedo_nir_dif=albedo_nir_dif[sl],
         )
@@ -345,7 +374,16 @@ def init_aoba_model(
         device=dev,
         dtype=dtype,
     )
-    vgrid = build_vertical_grid(nz=cfg.nz, device=dev, dtype=dtype)
+    vgrid = build_vertical_grid(
+        nz=cfg.nz,
+        z_top=cfg.z_top,
+        dz_min=cfg.dz_min,
+        z_sponge_base=cfg.z_sponge_base,
+        tau_sponge_min=cfg.tau_sponge_min,
+        terrain_scale_exp=cfg.terrain_scale_exp,
+        device=dev,
+        dtype=dtype,
+    )
     atmos = init_global_hydrostatic_atmosphere(mesh, vgrid, moist=True, baroclinic_pert=True)
 
     nz = cfg.nz
@@ -357,7 +395,9 @@ def init_aoba_model(
 
     # Initialize host-mean surface summary `[nc]` & subgrid MAML surface `[nc * ny * nx]`
     t_sfc_lat = 301.0 - 40.0 * (torch.sin(mesh.lat_cell) ** 2) - 0.0065 * torch.clamp(mesh.z_topo, min=0.0)
-    sfc = init_surface_state(mesh.surf_type, z_topo=mesh.z_topo, t_init=293.15, sigma_topo=mesh.sigma_topo)
+    sfc = init_surface_state(
+        mesh.surf_type, z_topo=mesh.z_topo, t_init=293.15, sigma_topo=mesh.sigma_topo, h_ml_ocean=cfg.h_ml_ocean,
+    )
     sfc.t_ocean_ml = torch.where(
         mesh.surf_type == SURF_OCEAN,
         torch.clamp(301.0 - 34.0 * (torch.sin(mesh.lat_cell) ** 2), min=C.T_FREEZE_OCEAN + 0.2),
@@ -375,6 +415,7 @@ def init_aoba_model(
         z_topo=_cell_to_sub(mesh.z_topo, nc, n_sub),
         sigma_topo=_cell_to_sub(mesh.sigma_topo, nc, n_sub),
         t_init=293.15,
+        h_ml_ocean=cfg.h_ml_ocean,
     )
 
     # Initialize 1:1 embedded 3D CRM state `[Nz, N_cells, Ny, Nx]` synchronized to host columns
@@ -441,9 +482,81 @@ def init_aoba_model(
         clim=_make_clim(nc, include_monthly=True),
         sfc_sub=sfc_sub,
         clim_sub=_make_clim(m_sub, include_monthly=False),
+        icesheet=init_icesheet_state(mesh) if cfg.enable_dynamic_icesheet else None,
     )
     broadcast_host_surface_to_subgrid(model)
     return model
+
+
+def _apply_dynamic_icesheet_update(model: AOBAState) -> None:
+    """Advance 2D SIA ice sheet using annual EMA SMB, flip Land<->IceSheet masks, and remap vertical grid."""
+    ice = model.icesheet
+    sfc_sub = model.sfc_sub
+    assert ice is not None and sfc_sub is not None
+    cfg = model.cfg
+    mesh = model.mesh
+    nc = mesh.n_cells
+    n_sub = cfg.crm_ny * cfg.crm_nx
+
+    sim_yr = model.sim_time_sec / (C.DAYS_PER_YEAR * C.SECONDS_PER_DAY)
+    if cfg.icesheet_accel_spinup_years > 0.0:
+        accel_eff = 1.0 + (cfg.icesheet_accel_factor - 1.0) * math.exp(-sim_yr / cfg.icesheet_accel_spinup_years)
+    else:
+        accel_eff = cfg.icesheet_accel_factor
+
+    ice_diag = step_sia_icesheet_scvt(
+        ice=ice,
+        mesh=mesh,
+        ema_years=cfg.icesheet_ema_years,
+        accel_factor=accel_eff,
+        isostasy_tau_yr=cfg.icesheet_isostasy_tau_yr,
+    )
+
+    is_ocean = mesh.ocean_frac >= 0.5
+    new_surf_type = torch.where(
+        is_ocean,
+        torch.zeros_like(mesh.surf_type),
+        torch.where(
+            ice.h_ice >= H_ICE_THRESHOLD_M,
+            torch.full_like(mesh.surf_type, SURF_ICESHEET),
+            torch.full_like(mesh.surf_type, SURF_LAND),
+        ),
+    )
+    newly_glaciated_cell = (mesh.surf_type != SURF_ICESHEET) & (new_surf_type == SURF_ICESHEET)
+    newly_deglaciated_cell = (mesh.surf_type == SURF_ICESHEET) & (new_surf_type == SURF_LAND)
+
+    mesh.surf_type = new_surf_type
+    mesh.z_topo = ice_diag["z_topo_new"]
+    mesh.z_topo_smooth = ice_diag["z_topo_smooth_new"]
+    model.sfc.surf_type = new_surf_type
+    model.sfc.z_topo = mesh.z_topo
+
+    new_surf_sub = _cell_to_sub(new_surf_type, nc, n_sub)
+    sfc_sub.surf_type = new_surf_sub
+    sfc_sub.z_topo = _cell_to_sub(mesh.z_topo, nc, n_sub)
+
+    if newly_glaciated_cell.any():
+        gl_sub = _cell_to_sub(newly_glaciated_cell, nc, n_sub)
+        sfc_sub.swe_land = torch.where(gl_sub, torch.full_like(sfc_sub.swe_land, SWE_GLACIER_MAX), sfc_sub.swe_land)
+        sfc_sub.swe_max_season = torch.where(gl_sub, torch.full_like(sfc_sub.swe_max_season, SWE_GLACIER_MAX), sfc_sub.swe_max_season)
+        sfc_sub.bio.lai = torch.where(gl_sub, torch.zeros_like(sfc_sub.bio.lai), sfc_sub.bio.lai)
+        sfc_sub.bio.h_canopy = torch.where(gl_sub, torch.zeros_like(sfc_sub.bio.h_canopy), sfc_sub.bio.h_canopy)
+
+    if newly_deglaciated_cell.any():
+        dg_sub = _cell_to_sub(newly_deglaciated_cell, nc, n_sub)
+        sfc_sub.swe_land = torch.where(dg_sub, torch.zeros_like(sfc_sub.swe_land), sfc_sub.swe_land)
+        sfc_sub.swe_max_season = torch.where(dg_sub, torch.full_like(sfc_sub.swe_max_season, 10.0), sfc_sub.swe_max_season)
+        sfc_sub.w_root = torch.where(dg_sub, 0.5 * sfc_sub.bio.s_root_cap, sfc_sub.w_root)
+        sfc_sub.bio.lai = torch.where(dg_sub, torch.full_like(sfc_sub.bio.lai, 0.25), sfc_sub.bio.lai)
+        sfc_sub.bio.h_canopy = torch.where(dg_sub, torch.full_like(sfc_sub.bio.h_canopy, 0.5), sfc_sub.bio.h_canopy)
+
+    # Keep active ice-sheet cells replenished to glacier cap since net mass change was transferred to ice.h_ice
+    is_ice_sub = new_surf_sub == SURF_ICESHEET
+    if is_ice_sub.any():
+        sfc_sub.swe_land = torch.where(is_ice_sub, torch.full_like(sfc_sub.swe_land, SWE_GLACIER_MAX), sfc_sub.swe_land)
+        sfc_sub.swe_max_season = torch.where(is_ice_sub, torch.full_like(sfc_sub.swe_max_season, SWE_GLACIER_MAX), sfc_sub.swe_max_season)
+
+    remap_atmosphere_and_crm_vertical(model.atmos, model.crm, mesh, model.vgrid, mesh.z_topo_smooth)
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +673,8 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
                 albedo_vis_dif=alb_vf,
                 albedo_nir_dif=alb_nf,
                 col_chunk=cfg.rad_col_chunk,
+                re_liq_um=cfg.re_liq_um,
+                re_ice_um=cfg.re_ice_um,
             )
         )
         model.rad_cache["q_rad_sub"] = q_rad_sub
@@ -910,6 +1025,14 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
 
     model.sim_time_sec += dt
     model.step_count += 1
+
+    # Dynamic / EMA-accelerated 2D SIA continental ice sheet & conservative vertical coordinate update
+    if model.icesheet is not None and sfc_diag_sub.smb_ice_flux is not None:
+        model.icesheet.smb_year_accum_kgm2 = model.icesheet.smb_year_accum_kgm2 + _sub_to_cell(sfc_diag_sub.smb_ice_flux, nc, n_sub) * dt
+        model.icesheet.year_elapsed_sec += dt
+        if model.icesheet.year_elapsed_sec >= C.DAYS_PER_YEAR * C.SECONDS_PER_DAY - 0.5 * dt:
+            _apply_dynamic_icesheet_update(model)
+            _sync_host_surface_from_subgrid(sfc, sfc_sub, nc, n_sub)
 
     # Compute area-weighted global diagnostics
     area = mesh.area_cell

@@ -27,9 +27,16 @@ from aoba.surface import SURF_OCEAN, SurfaceState
 
 # Codron (2012, Sec. 2a) standard physical parameters
 H_THERMOCLINE: float = 200.0        # Sub-mixed-layer return-flow thickness H_2 [m]
-R_EKMAN_DAMP: float = 1.0 / (2.0 * C.SECONDS_PER_DAY)  # Equatorial Rayleigh friction r_s ~ (2 days)^-1 [s^-1]
+R_EKMAN_DAMP_DAYS: float = 2.0      # Equatorial Rayleigh friction timescale [days]
+R_EKMAN_DAMP: float = 1.0 / (R_EKMAN_DAMP_DAYS * C.SECONDS_PER_DAY)  # Equatorial Rayleigh friction [s^-1]
 KAPPA_OCN_HORIZ: float = 2.0e3      # Horizontal mesoscale eddy diffusivity kappa_h [m^2 s^-1]
 KAPPA_OCN_VERT: float = 2.0e-5      # Weak diapycnal exchange velocity [m s^-1]
+
+
+def recompute_derived_constants() -> None:
+    """Refresh Rayleigh Ekman friction rate from damping timescale."""
+    global R_EKMAN_DAMP
+    R_EKMAN_DAMP = 1.0 / (R_EKMAN_DAMP_DAYS * C.SECONDS_PER_DAY)
 
 
 @dataclass

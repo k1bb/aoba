@@ -9,6 +9,7 @@ import torch
 
 from aoba import constants as C
 from aoba.coupled_model import AOBAConfig, init_aoba_model, step_aoba_model
+from aoba.icesheet import IceSheetState, init_icesheet_state, step_sia_icesheet_scvt
 from aoba.io_zarr import append_zarr, export_aoba_snapshot_xarray, load_zarr
 from aoba.koppen import KOPPEN_NAMES, classify_koppen_geiger
 from aoba.ocean_ekman import init_ekman_ocean_state, step_ekman_ocean_voronoi
@@ -252,6 +253,78 @@ def test_full_global_coupled_aoba_and_zarr_v3_io(device: str) -> None:
         assert "sw1_dir_sub" in ds_reloaded.data_vars
 
 
+def test_dynamic_sia_icesheet_and_vertical_remap(device: str) -> None:
+    """Verify SIA ice volume conservation, EMA SMB + accelerated transition, and vertical remapping."""
+    cfg = AOBAConfig(
+        glevel=2,
+        crm_nx=4,
+        crm_ny=1,
+        crm_dx=16000.0,
+        dt_host=120.0,
+        n_host_dyn_substeps=2,
+        n_crm_dyn_substeps=2,
+        rad_stride=2,
+        earth2014_stride=8,
+        enable_dynamic_icesheet=True,
+        icesheet_ema_years=2.0,
+        icesheet_accel_factor=200.0,
+        icesheet_accel_spinup_years=10.0,
+        icesheet_isostasy_tau_yr=500.0,
+    )
+    model = init_aoba_model(cfg, device=device)
+    assert model.icesheet is not None
+    assert model.mesh.z_bed is not None and model.mesh.h_ice_init is not None
+
+    # 1. Closed-sphere SIA flow conservation test (zero ocean calving, zero SMB)
+    dry_mesh = model.mesh.to(device)
+    dry_mesh.ocean_frac = torch.zeros_like(dry_mesh.ocean_frac)
+    dry_ice = IceSheetState(
+        h_ice=2500.0 * torch.exp(-((0.5 * math.pi - dry_mesh.lat_cell) / 0.4) ** 2),
+        z_bed=torch.zeros_like(dry_mesh.z_topo),
+        z_bed_unloaded=torch.zeros_like(dry_mesh.z_topo),
+        smb_ema_kgm2_s=torch.zeros_like(dry_mesh.z_topo),
+        smb_year_accum_kgm2=torch.zeros_like(dry_mesh.z_topo),
+        year_elapsed_sec=C.DAYS_PER_YEAR * C.SECONDS_PER_DAY,
+    )
+    vol_0 = float((dry_mesh.area_cell * dry_ice.h_ice).sum().item())
+    peak_0 = float(dry_ice.h_ice.max().item())
+    step_sia_icesheet_scvt(dry_ice, dry_mesh, ema_years=1.0, accel_factor=500.0, isostasy_tau_yr=0.0)
+    vol_1 = float((dry_mesh.area_cell * dry_ice.h_ice).sum().item())
+    assert abs(vol_1 - vol_0) / max(vol_0, 1.0) < 1.0e-5
+    assert (dry_ice.h_ice >= 0.0).all()
+    assert float(dry_ice.h_ice.max().item()) < peak_0
+
+    # 2. Full coupled melt/growth transition + Klemp STF height update + barometric remap stability
+    ice_cells = torch.where(model.mesh.surf_type == SURF_ICESHEET)[0]
+    land_cells = torch.where((model.mesh.surf_type == 1) & (model.mesh.ocean_frac < 0.5))[0]
+    assert ice_cells.numel() > 0 and land_cells.numel() > 0
+    melt_idx = int(ice_cells[0].item())
+    grow_idx = int(land_cells[0].item())
+
+    yr_sec = C.DAYS_PER_YEAR * C.SECONDS_PER_DAY
+    model.icesheet.year_elapsed_sec = yr_sec - cfg.dt_host
+    # Impose strong cumulative ablation at melt_idx and accumulation at grow_idx
+    model.icesheet.smb_year_accum_kgm2[melt_idx] = -2.0e6
+    model.icesheet.smb_year_accum_kgm2[grow_idx] = 2.0e5
+    z_w0_before = model.atmos.z_w[0].clone()
+
+    diag = step_aoba_model(model)
+    assert model.icesheet.n_updates == 1
+    assert int(model.mesh.surf_type[melt_idx].item()) == 1  # Deglaciated -> Land!
+    assert int(model.mesh.surf_type[grow_idx].item()) == SURF_ICESHEET  # Glaciated -> IceSheet!
+    assert torch.allclose(model.atmos.z_w[0], model.mesh.z_topo_smooth, atol=1.0e-4)
+    assert float((model.atmos.z_w[0] - z_w0_before).abs().max().item()) > 1.0
+
+    # Continue stepping coupled physics/dynamics after remapping and verify Zarr snapshot export
+    for _ in range(2):
+        diag = step_aoba_model(model)
+    assert not torch.isnan(model.atmos.theta_m).any()
+    assert not torch.isnan(model.crm.theta_m).any()
+    assert 270.0 < diag.global_mean_t_sfc_k < 310.0
+    ds_ice = export_aoba_snapshot_xarray(model)
+    assert "h_ice" in ds_ice.data_vars and "z_topo_dyn" in ds_ice.data_vars
+
+
 if __name__ == "__main__":
     for dev in _available_devices():
         print(f"Running Phase 2 & Phase 3 Global AOBA tests on device={dev}...")
@@ -260,4 +333,5 @@ if __name__ == "__main__":
         test_ekman_ocean_upwelling_and_heat_conservation(dev)
         test_koppen_geiger_beck_2018_table1(dev)
         test_full_global_coupled_aoba_and_zarr_v3_io(dev)
+        test_dynamic_sia_icesheet_and_vertical_remap(dev)
     print("ALL PHASE 2 & PHASE 3 GLOBAL AOBA TESTS PASSED!")

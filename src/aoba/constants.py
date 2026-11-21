@@ -91,3 +91,17 @@ K_THERM_SNOW: float = 0.3096           # Thermal conductivity of snow on ice [W 
 
 R_GAS_UNIVERSAL: float = 8.314462618   # Universal gas constant R [J mol^-1 K^-1] (Stocker et al., 2020)
 PI: float = math.pi
+
+
+def recompute_derived_constants() -> None:
+    """Recompute derived thermodynamic/radiative constants after any primary constant update."""
+    global CV_D, KAPPA_D, GAMMA_D, EPS_WATER, RV_OVER_RD, ZVIR, L_S0, LW_NONWIN_FRAC, SOLAR_FRAC_SW2
+    CV_D = CP_D - R_D
+    KAPPA_D = R_D / CP_D
+    GAMMA_D = CP_D / CV_D
+    EPS_WATER = R_D / R_V
+    RV_OVER_RD = R_V / R_D
+    ZVIR = RV_OVER_RD - 1.0
+    L_S0 = L_V0 + L_F0
+    SOLAR_FRAC_SW2 = 1.0 - SOLAR_FRAC_SW1
+    LW_NONWIN_FRAC = 1.0 - LW_WINDOW_FRAC

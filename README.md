@@ -14,7 +14,10 @@
    - **Complete Land Hydrology, Albedo, & Permafrost Thermodynamics**: Partitions evapotranspiration into sunlit/shaded transpiration, wet-canopy interception loss, and stability-corrected bare-soil evaporation (Dai et al., 2004; Sakaguchi & Zeng, 2009; Lee & Khairoutdinov, 2015; MATSIRO6, 2021), paired with drought-bridging root-zone storage $S_R$ (Gao et al., 2014; Davis et al., 2017), prognostic EEO $\mathrm{LAI}$ (Cai et al., 2025; Zhou et al., 2025), moisture-dependent bare-soil VIS/NIR albedo (Oleson et al., 2013), multi-layer implicit soil heat conduction with freeze–thaw phase change (SCALE-RM, 2025; MATSIRO6, 2021), and fractional snow cover with snow-burial canopy masking, aging albedo, and ocean-conserving runoff (Yang et al., 1997; Swenson & Lawrence, 2012; Nitta et al., 2014; Abolafia-Rosenzweig et al., 2021).
 3. **Displacement-Following Smoothed Terrain Datum & Modern Roughness Sublayer (RSL)**: Canopy height $h_c$ scales with local resource limits (Kempes et al., 2011), determining zero-plane displacement $d$, roughness length $z_{0m}$, and analytical RSL stability corrections (Raupach, 1994; Harman & Finnigan, 2007; De Ridder, 2010; Bonan et al., 2018; Lee et al., 2020; Meier et al., 2022) above the smoothed terrain datum $z_{\mathrm{datum}} = z_{\mathrm{topo}} + d$ (Klemp, 2011).
 4. **Analytical Four-Band Two-Stream Radiation & 1.5-Layer Voronoi Ekman Ocean + Fractional Sea Ice**: A lookup-table-free four-band two-stream radiative solver (Lacis & Hansen, 1974; Toon et al., 1989; Slingo, 1989; Ebert & Curry, 1992; Weaver & Ramanathan, 1995; Koll & Cronin, 2018) couples clouds, water vapor, $\mathrm{CO}_2$, and surface PAR/albedo over a zero-$Q$-flux 1.5-layer wind-driven Ekman slab ocean (Codron, 2012), fractional-lead thermodynamic sea ice (Semtner, 1976; SCALE-RM, 2025), solar-zenith-dependent sea-surface albedo (Briegleb et al., 1986), and viscous-Charnock ocean roughness (Miller et al., 1992).
-5. **Single-Codebase GPU Portability (`Float32` PyTorch + Fused Metal/CUDA Vertical HEVI)**: Runs natively on Apple Silicon GPUs (`mps` Unified Memory, ~1–1.5 GB RAM) at ~8–11 simulated years per day on a Mac mini (`M4 Pro`), and scales without model changes to NVIDIA GPUs (`cuda`).
+5. **Dynamic / Accelerated SIA Ice-Sheet & Single-File TOML + Interactive GUI**:
+   - **Dynamic SIA + EMA Ice-Sheet Coupling**: Prognoses continental ice thickness on the SCVT grid using Glen's flow law ($n=3$), EMA-filtered annual SMB, relaxed lithospheric isostasy, spinup acceleration, dynamic `SURF_LAND <-> SURF_ICESHEET` masking, and conservative barometric vertical coordinate remapping (`src/aoba/icesheet.py`).
+   - **Full Transparency & Web Workbench (`AOBA Studio`)**: Centralizes all 188 grid, forcing, dynamic ice-sheet, output cadence (mean vs instantaneous; 2D/3D/subgrid 2D), and physical constants in [`config/aoba_default.toml`](config/aoba_default.toml), editable via the zero-dependency Web UI ([`scripts/aoba_config_gui.py`](scripts/aoba_config_gui.py)) for end-to-end visual configuration, run launching/monitoring, and idle-CPU rotating 3-globe orthographic previews (`T2`, `OLR`, `LAI`).
+6. **Single-Codebase GPU Portability (`Float32` PyTorch + Fused Metal/CUDA Vertical HEVI)**: Runs natively on Apple Silicon GPUs (`mps` Unified Memory) and scales without model changes to NVIDIA GPUs (`cuda`).
 
 ## Repository Structure
 
@@ -49,6 +52,10 @@ PYTHONPATH=src python tests/test_phase2_phase3_global.py
 PYTHONPATH=src python scripts/run_rce.py --surface land --days 2.0
 PYTHONPATH=src python scripts/run_held_suarez.py --glevel 3 --days 5.0
 PYTHONPATH=src python scripts/run_global_aoba.py --glevel 3 --co2-ppmv 400 --days 5.0
+
+# Launch interactive TOML/Grid GUI configurator & run multi-year integration
+PYTHONPATH=src python scripts/aoba_config_gui.py --toml config/aoba_default.toml
+PYTHONPATH=src python -u scripts/run_g5_30yr.py --config config/aoba_default.toml
 ```
 
 ## Storage & Git Protection Policy

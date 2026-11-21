@@ -158,6 +158,7 @@ class SurfaceFluxDiagnostics:
     gpp: torch.Tensor             # Ecosystem gross primary production [umol CO2 m^-2 s^-1]
     f_seaice: torch.Tensor        # Diagnosed fractional sea-ice area `f_i` [-]
     f_snow_land: torch.Tensor     # Diagnosed fractional snow cover on land `A_sn` [-]
+    smb_ice_flux: torch.Tensor | None = None  # Climatic snow/ice surface mass balance flux [kg m^-2 s^-1]
 
 
 def init_surface_state(
@@ -655,6 +656,16 @@ def step_surface(
     # Glacier calving/runoff cap at 1000 kg m^-2 (MATSIRO6 Sec. 8.6 Eq. 8.44)
     glacier_runoff = torch.clamp(swe_after_melt - SWE_GLACIER_MAX, min=0.0) / dt
     swe_next = swe_after_melt - glacier_runoff * dt
+    bare_ice_melt_pot = torch.where(
+        (~has_snow) & (t_skin_new > C.T_FREEZE),
+        (t_skin_new - C.T_FREEZE) * denom_eb / C.L_F0,
+        torch.zeros_like(t_skin_new),
+    )
+    smb_ice_land = torch.where(
+        is_terrestrial,
+        snow_thru - e_snow - melt_tot - bare_ice_melt_pot,
+        torch.zeros_like(snow_thru),
+    )
 
     # Seasonal peak SWE hysteresis update (Swenson & Lawrence, 2012)
     swe_max_next = torch.where(
@@ -860,4 +871,5 @@ def step_surface(
         gpp=gpp_out,
         f_seaice=f_ice,
         f_snow_land=torch.where(is_terrestrial, a_sn, torch.zeros_like(a_sn)),
+        smb_ice_flux=smb_ice_land,
     )

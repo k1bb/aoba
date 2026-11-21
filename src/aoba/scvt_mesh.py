@@ -91,6 +91,8 @@ class SCVTMesh:
     aniso_topo: torch.Tensor        # Subgrid anisotropy gamma in [0, 1] [-] (Lott & Miller, 1997)
     angle_topo: torch.Tensor        # Subgrid ridge orientation psi [rad] (Lott & Miller, 1997)
     coastal_ocean_idx: torch.Tensor # [n_cells] int64 nearest ocean cell index for river/glacier runoff
+    z_bed: torch.Tensor | None = None       # Cell-mean subglacial bedrock/bathymetry elevation [m] (Earth2014 BED2014)
+    h_ice_init: torch.Tensor | None = None  # Cell-mean initial ice-sheet thickness [m] (Earth2014 ICE2014)
 
     def to(self, device: torch.device | str, dtype: torch.dtype = torch.float32) -> "SCVTMesh":
         """Move all mesh tensors to target compute device (`cpu` or `mps`) and float `dtype`."""
@@ -484,10 +486,15 @@ def _aggregate_earth2014_to_scvt(
     sur_path = earth2014_dir / "Earth2014.SUR2014.5min.geod.bin"
     ice_path = earth2014_dir / "Earth2014.ICE2014.5min.geod.bin"
     tbi_path = earth2014_dir / "Earth2014.TBI2014.5min.geod.bin"
+    bed_path = earth2014_dir / "Earth2014.BED2014.5min.geod.bin"
 
     sur_full = np.fromfile(sur_path, dtype=">i2").reshape(2160, 4320)[::stride, ::stride].astype(np.float32)
     ice_full = np.fromfile(ice_path, dtype=">i2").reshape(2160, 4320)[::stride, ::stride].astype(np.float32)
     tbi_full = np.fromfile(tbi_path, dtype=">i2").reshape(2160, 4320)[::stride, ::stride].astype(np.float32)
+    if bed_path.exists():
+        bed_full = np.fromfile(bed_path, dtype=">i2").reshape(2160, 4320)[::stride, ::stride].astype(np.float32)
+    else:
+        bed_full = sur_full - np.maximum(ice_full, 0.0)
 
     ny, nx = sur_full.shape
     dlat_rad = math.pi / ny
@@ -512,6 +519,8 @@ def _aggregate_earth2014_to_scvt(
     w_tot = np.zeros(n_cells, dtype=np.float64)
     sum_ocn = np.zeros(n_cells, dtype=np.float64)
     sum_ice = np.zeros(n_cells, dtype=np.float64)
+    sum_ice_h = np.zeros(n_cells, dtype=np.float64)
+    sum_bed = np.zeros(n_cells, dtype=np.float64)
     sum_h = np.zeros(n_cells, dtype=np.float64)
     sum_h2 = np.zeros(n_cells, dtype=np.float64)
     sum_hx2 = np.zeros(n_cells, dtype=np.float64)
@@ -541,6 +550,8 @@ def _aggregate_earth2014_to_scvt(
         np.add.at(w_tot, cid, w_px)
         np.add.at(sum_ocn, cid, w_px * is_ocean_px[j0:j1].ravel())
         np.add.at(sum_ice, cid, w_px * is_ice_px[j0:j1].ravel())
+        np.add.at(sum_ice_h, cid, w_px * (is_ice_px[j0:j1] * np.maximum(ice_full[j0:j1], 0.0)).ravel())
+        np.add.at(sum_bed, cid, w_px * bed_full[j0:j1].ravel())
         np.add.at(sum_h, cid, w_px * h_c)
         np.add.at(sum_h2, cid, w_px * h_c * h_c)
         np.add.at(sum_hx2, cid, w_px * hx_c * hx_c)
@@ -558,6 +569,8 @@ def _aggregate_earth2014_to_scvt(
     z_topo = sum_h / w_safe
     # Zero mean surface elevation over open-ocean cells
     z_topo = np.where(surf_type == 0, 0.0, z_topo)
+    h_ice_init = np.where(surf_type == 0, 0.0, np.maximum(sum_ice_h / w_safe, 0.0))
+    z_bed = sum_bed / w_safe
 
     var_h = np.maximum(sum_h2 / w_safe - (sum_h / w_safe) ** 2, 0.0)
     sigma_topo = np.where(surf_type == 0, 0.0, np.sqrt(var_h))
@@ -614,6 +627,8 @@ def _aggregate_earth2014_to_scvt(
         "aniso_topo": aniso_topo,
         "angle_topo": angle_topo,
         "coastal_ocean_idx": coastal_ocean_idx,
+        "z_bed": z_bed,
+        "h_ice_init": h_ice_init,
     }
 
 
@@ -660,6 +675,8 @@ def build_scvt_mesh(
             "aniso_topo": np.ones(n_cells, dtype=np.float64),
             "angle_topo": np.zeros(n_cells, dtype=np.float64),
             "coastal_ocean_idx": np.arange(n_cells, dtype=np.int64),
+            "z_bed": np.full(n_cells, -4000.0, dtype=np.float64),
+            "h_ice_init": np.zeros(n_cells, dtype=np.float64),
         }
 
     dev = torch.device(device)
@@ -712,6 +729,8 @@ def build_scvt_mesh(
         aniso_topo=_tf(bndry["aniso_topo"]),
         angle_topo=_tf(bndry["angle_topo"]),
         coastal_ocean_idx=_ti(bndry["coastal_ocean_idx"]),
+        z_bed=_tf(bndry["z_bed"]),
+        h_ice_init=_tf(bndry["h_ice_init"]),
     )
 
 
