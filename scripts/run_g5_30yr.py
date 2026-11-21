@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import is_dataclass
+import math
 import os
 from pathlib import Path
 import sys
@@ -21,6 +22,7 @@ import torch
 import xarray as xr
 
 from aoba import constants as C
+from aoba.calendar import days_in_year
 from aoba.coupled_model import (
     AOBAConfig,
     AOBAState,
@@ -238,6 +240,7 @@ def _write_live_preview_atomic(
     lai = model.sfc.bio.lai
     h_ice = model.icesheet.h_ice if model.icesheet is not None else torch.zeros_like(t_sfc)
 
+    date_str = model.calendar.date_at(model.sim_time_sec).iso_date
     tmp_path = out_path.with_name(f".{out_path.name}.tmp.npz")
     np.savez(
         tmp_path,
@@ -252,6 +255,7 @@ def _write_live_preview_atomic(
         day_in_yr=np.float32(day_in_yr),
         sim_days=np.float64(sim_days),
         wall_s_per_day=np.float32(wall_s_per_day),
+        date_str=np.array(date_str),
     )
     os.replace(tmp_path, out_path)
 
@@ -344,11 +348,12 @@ def main() -> None:
     )
 
     steps_per_day = max(int(round(C.SECONDS_PER_DAY / cfg.dt_host)), 1)
-    steps_per_year = max(int(round(days_per_year * C.SECONDS_PER_DAY / cfg.dt_host)), 12)
-    n_mean_periods = max(int(out_cfg.monthly_mean_periods_per_year), 1)
-    mean_bounds = [int(round(m * steps_per_year / float(n_mean_periods))) for m in range(n_mean_periods + 1)]
-    n_snap_periods = max(int(out_cfg.snapshots_periods_per_year), 1)
-    snap_steps = {int(round(s * steps_per_year / float(n_snap_periods))) for s in range(1, n_snap_periods + 1)}
+    end_days_limit = model.calendar.days_until(getattr(out_cfg, "end_date", ""))
+    max_total_steps = (end_days_limit * steps_per_day) if (end_days_limit is not None and args.years is None) else None
+    if end_days_limit is not None and args.years is None:
+        # Ensure enough outer year iterations to cover end_date
+        years = max(years, int(math.ceil(end_days_limit / 360.0)) + 1)
+
     sample_stride = max(int(round(out_cfg.monthly_mean_sample_hours * 3600.0 / cfg.dt_host)), 1)
     csv_stride_steps = max(int(out_cfg.daily_csv_interval_days) * steps_per_day, 1)
 
@@ -360,7 +365,16 @@ def main() -> None:
             if p.exists():
                 shutil.rmtree(p)
 
+    stop_by_end_date = False
     for year in range(start_year, years + 1):
+        cal_yr_days = days_in_year(model.calendar.start_year + year - 1, model.calendar.calendar_type)
+        eff_days_per_year = float(args.days_per_year) if args.days_per_year is not None else float(cal_yr_days)
+        steps_per_year = max(int(round(eff_days_per_year * C.SECONDS_PER_DAY / cfg.dt_host)), 12)
+        n_mean_periods = max(int(out_cfg.monthly_mean_periods_per_year), 1)
+        mean_bounds = [int(round(m * steps_per_year / float(n_mean_periods))) for m in range(n_mean_periods + 1)]
+        n_snap_periods = max(int(out_cfg.snapshots_periods_per_year), 1)
+        snap_steps = {int(round(s * steps_per_year / float(n_snap_periods))) for s in range(1, n_snap_periods + 1)}
+
         y_dir = out_root / f"year_{year:04d}"
         y_dir.mkdir(parents=True, exist_ok=True)
         monthly_zarr = (out_root / "monthly.zarr") if single_partition else (y_dir / "monthly.zarr")
@@ -376,7 +390,7 @@ def main() -> None:
         if out_cfg.daily_csv_enabled:
             with open(csv_path, "w", newline="") as f_csv:
                 csv.writer(f_csv).writerow([
-                    "year", "day_in_yr", "sim_days", "ts_k", "olr_wm2", "asr_wm2",
+                    "year", "date", "day_in_yr", "sim_days", "ts_k", "olr_wm2", "asr_wm2",
                     "net_toa_wm2", "precip_mm_d", "gpp_umol", "lai", "seaice_mkm2", "wall_s_per_day",
                 ])
 
@@ -460,14 +474,14 @@ def main() -> None:
                 if out_cfg.daily_csv_enabled:
                     with open(csv_path, "a", newline="") as f_csv:
                         csv.writer(f_csv).writerow([
-                            year, f"{day_num:.2f}", f"{diag.sim_time_days:.2f}",
+                            year, diag.date_str, f"{day_num:.2f}", f"{diag.sim_time_days:.2f}",
                             f"{ts_m:.3f}", f"{olr_m:.2f}", f"{asr_m:.2f}", f"{asr_m - olr_m:.2f}",
                             f"{day_accum['p'] * inv_d:.3f}", f"{day_accum['gpp'] * inv_d:.3f}",
                             f"{day_accum['lai'] * inv_d:.3f}", f"{day_accum['ice'] * inv_d:.3f}", f"{wall_day:.2f}",
                         ])
                 if int(round(day_num)) % 10 == 0 or step_in_yr == steps_per_year:
                     print(
-                        f"[Y{year:02d} D{day_num:5.1f}] Ts={ts_m:6.2f} K | NetTOA={asr_m - olr_m:+5.2f} | "
+                        f"[{diag.date_str} | Y{year:02d} D{day_num:5.1f}] Ts={ts_m:6.2f} K | NetTOA={asr_m - olr_m:+5.2f} | "
                         f"P={day_accum['p'] * inv_d:4.2f} mm/d | LAI={day_accum['lai'] * inv_d:4.2f} | "
                         f"Ice={day_accum['ice'] * inv_d:5.2f} Mkm2 | {wall_day:5.1f} s/d",
                         flush=True,
@@ -516,10 +530,17 @@ def main() -> None:
                         snap_zarr,
                     )
 
-        if year % max(int(out_cfg.restart_interval_years), 1) == 0 or year == years:
+            if max_total_steps is not None and model.step_count >= max_total_steps:
+                stop_by_end_date = True
+                break
+
+        if year % max(int(out_cfg.restart_interval_years), 1) == 0 or year == years or stop_by_end_date:
             _save_restart_atomic(model, y_dir / "restart.pt")
             (y_dir / "_COMPLETE").touch()
         print(f"=== Completed Year {year:04d} / {years:04d} -> {y_dir} ===", flush=True)
+        if stop_by_end_date:
+            print(f"Reached target end_date ({out_cfg.end_date}) at {model.calendar.date_at(model.sim_time_sec).iso_date}.", flush=True)
+            break
 
 
 if __name__ == "__main__":

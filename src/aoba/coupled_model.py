@@ -23,6 +23,7 @@ from pathlib import Path
 import torch
 
 from aoba import constants as C
+from aoba.calendar import AobaCalendar
 from aoba.biosphere import update_daily_acclimation_smith, update_daily_lai_root_height
 from aoba.crm import CRMState, SPTendencies, step_crm_physics_and_dynamics
 from aoba.icesheet import (
@@ -95,6 +96,11 @@ class AOBAConfig:
     obliquity_deg: float = C.OBLIQUITY_DEG   # Axial tilt [deg]
     eccentricity: float = C.ECCENTRICITY     # Orbital eccentricity [-]
     perihelion_deg: float = C.PERIHELION_LON_DEG
+    start_date: str = "2000-01-01"           # Calendar start date (YYYY-MM-DD)
+    calendar_type: str = "gregorian"         # "gregorian" (leap years), "noleap" (365d), or "360_day"
+    insolation_mode: str = "seasonal"        # "seasonal" or "perpetual_date"
+    fixed_insolation_date: str = "2000-03-20"  # Fixed orbital date for perpetual insolation experiments
+    diurnal_cycle: bool = True               # True: diurnal solar cycle; False: daily-mean insolation
     use_earth2014: bool = True
     earth2014_dir: str = "data/boundary/earth2014_5min"
     earth2014_stride: int = 2
@@ -144,6 +150,7 @@ class AOBAState:
     sim_time_sec: float = 0.0
     step_count: int = 0
     rad_cache: dict[str, torch.Tensor] = field(default_factory=dict)
+    calendar: AobaCalendar = field(default_factory=AobaCalendar)
 
 
 def _cell_to_sub(x: torch.Tensor, nc: int, n_sub: int) -> torch.Tensor:
@@ -311,6 +318,8 @@ def compute_orbital_insolation(
     obliquity_deg: float = C.OBLIQUITY_DEG,
     eccentricity: float = C.ECCENTRICITY,
     perihelion_deg: float = C.PERIHELION_LON_DEG,
+    t_diurnal_sec: float | None = None,
+    diurnal_cycle: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute instantaneous `(cos_zenith, s_toa_eff, hour_angle_rad)` from orbital elements.
 
@@ -341,12 +350,20 @@ def compute_orbital_insolation(
     cos_dec = math.sqrt(max(1.0 - sin_dec * sin_dec, 0.0))
 
     # Local solar hour angle h in [-pi, pi]: h == 0 at local solar noon!
-    frac_day = (t_sec % C.SECONDS_PER_DAY) / C.SECONDS_PER_DAY
+    t_diur = t_sec if t_diurnal_sec is None else t_diurnal_sec
+    frac_day = (t_diur % C.SECONDS_PER_DAY) / C.SECONDS_PER_DAY
     h_raw = 2.0 * math.pi * frac_day + lon_rad - math.pi
     hour_angle = torch.atan2(torch.sin(h_raw), torch.cos(h_raw))
 
-    mu0_raw = torch.sin(lat_rad) * sin_dec + torch.cos(lat_rad) * cos_dec * torch.cos(hour_angle)
-    mu0 = torch.clamp(mu0_raw, min=0.0)
+    if diurnal_cycle:
+        mu0_raw = torch.sin(lat_rad) * sin_dec + torch.cos(lat_rad) * cos_dec * torch.cos(hour_angle)
+        mu0 = torch.clamp(mu0_raw, min=0.0)
+    else:
+        tan_lat = torch.tan(torch.clamp(lat_rad, -1.55, 1.55))
+        tan_dec = sin_dec / max(cos_dec, 1.0e-6)
+        h0 = torch.acos(torch.clamp(-tan_lat * tan_dec, -1.0, 1.0))
+        mu0_mean = (h0 * torch.sin(lat_rad) * sin_dec + torch.cos(lat_rad) * cos_dec * torch.sin(h0)) / math.pi
+        mu0 = torch.clamp(mu0_mean, min=0.0)
     s_toa = torch.full_like(mu0, solar_constant * dist_fac)
     return mu0, s_toa, hour_angle
 
@@ -483,6 +500,14 @@ def init_aoba_model(
         sfc_sub=sfc_sub,
         clim_sub=_make_clim(m_sub, include_monthly=False),
         icesheet=init_icesheet_state(mesh) if cfg.enable_dynamic_icesheet else None,
+        calendar=AobaCalendar(
+            start_date=cfg.start_date,
+            calendar_type=cfg.calendar_type,
+            insolation_mode=cfg.insolation_mode,
+            fixed_insolation_date=cfg.fixed_insolation_date,
+            diurnal_cycle=cfg.diurnal_cycle,
+            seconds_per_day=C.SECONDS_PER_DAY,
+        ),
     )
     broadcast_host_surface_to_subgrid(model)
     return model
@@ -574,6 +599,7 @@ class GlobalStepDiagnostics:
     land_mean_gpp_umol: float
     land_mean_lai: float
     seaice_area_million_km2: float
+    date_str: str = ""
 
 
 _ACCLIM_BIO_ATTRS: tuple[str, ...] = (
@@ -602,13 +628,18 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
     m_sub = nc * n_sub
 
     # 1. Orbital solar geometry & local solar noon crossings
+    yr_sec_trop = C.DAYS_PER_YEAR * C.SECONDS_PER_DAY
+    t_seas_prev, t_diur_prev = model.calendar.orbital_times_sec(model.sim_time_sec, yr_sec_trop)
+    t_seas_next, t_diur_next = model.calendar.orbital_times_sec(model.sim_time_sec + dt, yr_sec_trop)
     _, _, h_prev = compute_orbital_insolation(
-        model.sim_time_sec, mesh.lat_cell, mesh.lon_cell,
+        t_seas_prev, mesh.lat_cell, mesh.lon_cell,
         cfg.solar_constant, cfg.obliquity_deg, cfg.eccentricity, cfg.perihelion_deg,
+        t_diurnal_sec=t_diur_prev, diurnal_cycle=cfg.diurnal_cycle,
     )
     mu0, s_toa, h_next = compute_orbital_insolation(
-        model.sim_time_sec + dt, mesh.lat_cell, mesh.lon_cell,
+        t_seas_next, mesh.lat_cell, mesh.lon_cell,
         cfg.solar_constant, cfg.obliquity_deg, cfg.eccentricity, cfg.perihelion_deg,
+        t_diurnal_sec=t_diur_next, diurnal_cycle=cfg.diurnal_cycle,
     )
     # Local solar noon crossed when h_prev < 0 <= h_next (excluding midnight wrap around +/-pi)
     crossed_noon = (h_prev < 0.0) & (h_next >= 0.0) & ((h_next - h_prev) < math.pi)
@@ -992,11 +1023,10 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
     clim_sub.day_t_min = torch.minimum(clim_sub.day_t_min, t_air_sub)
     clim_sub.day_steps += 1
 
-    # Host monthly Köppen-Geiger accumulators (calendar month index 0..11 within tropical year)
+    # Host monthly Köppen-Geiger accumulators (calendar month index 0..11)
     precip_tot = rain_new + snow_new
     t_air = _sub_to_cell(t_air_sub, nc, n_sub)
-    yr_sec = C.DAYS_PER_YEAR * C.SECONDS_PER_DAY
-    month_idx = min(int(((model.sim_time_sec % yr_sec) / yr_sec) * 12.0), 11)
+    month_idx = model.calendar.date_at(model.sim_time_sec).month - 1
     clim.month_temp_sum_c[month_idx] += (t_air - C.T_FREEZE)
     clim.month_precip_mm[month_idx] += precip_tot * dt
     clim.month_steps[month_idx] += 1.0
@@ -1061,6 +1091,7 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
         land_mean_gpp_umol=gpp_land,
         land_mean_lai=lai_land,
         seaice_area_million_km2=seaice_mkm2,
+        date_str=model.calendar.date_at(model.sim_time_sec).iso_date,
     )
 
 

@@ -40,6 +40,7 @@ _SRC_DIR = _REPO_ROOT / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+from aoba.calendar import AobaCalendar  # noqa: E402
 from aoba.params import (  # noqa: E402
     SECTION_META,
     build_configs_from_dict,
@@ -543,6 +544,16 @@ class RunManager:
                         day_yr = float(zf["day_in_yr"])
                         sim_days = float(zf["sim_days"])
                         wall_spd = float(zf["wall_s_per_day"])
+                        date_str = str(zf["date_str"]) if "date_str" in zf else ""
+                    if not date_str:
+                        run_toml_p = out_root / "run_config.toml"
+                        rc = load_aoba_toml(run_toml_p) if run_toml_p.exists() else {}
+                        fc = rc.get("forcing", {})
+                        cal = AobaCalendar(
+                            start_date=str(fc.get("start_date", "2000-01-01")),
+                            calendar_type=str(fc.get("calendar_type", "gregorian")),
+                        )
+                        date_str = cal.date_at(sim_days * 86400.0).iso_date
                     raster = self.engine.regrid_fields(lat_deg, lon_deg, t2_c, olr, lai, surf_type)
                     meta = {
                         "source": "live_preview.npz",
@@ -550,6 +561,7 @@ class RunManager:
                         "day_in_yr": round(day_yr, 2),
                         "sim_days": round(sim_days, 2),
                         "wall_s_per_day": round(wall_spd, 2),
+                        "date_str": date_str,
                         "n_cells": int(lat_deg.size),
                     }
                     cached = {"raster": raster, "meta": meta}
@@ -577,9 +589,18 @@ class RunManager:
                         out_root, finfo, kind_used
                     )
                     raster = self.engine.regrid_fields(lat_deg, lon_deg, t2_c, olr, lai, surf_type)
+                    sim_d = float(finfo["sim_days"])
+                    run_toml_p = out_root / "run_config.toml"
+                    rc = load_aoba_toml(run_toml_p) if run_toml_p.exists() else {}
+                    fc = rc.get("forcing", {})
+                    cal = AobaCalendar(
+                        start_date=str(fc.get("start_date", "2000-01-01")),
+                        calendar_type=str(fc.get("calendar_type", "gregorian")),
+                    )
                     meta = {
                         "source": src_lbl,
-                        "sim_days": round(float(finfo["sim_days"]), 2),
+                        "sim_days": round(sim_d, 2),
+                        "date_str": cal.date_at(sim_d * 86400.0).iso_date,
                         "n_cells": int(lat_deg.size),
                     }
                     cached = {"raster": raster, "meta": meta}
@@ -988,6 +1009,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
         </div>
         <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
           <label class="switch" style="font-size:12.5px;"><input type="checkbox" id="globe-spin" checked /> <span data-i18n="lbl_spin">自動回転</span></label>
+          <label class="switch" style="font-size:12.5px;" title="計算中の1モデル日あたり所要時間に合わせて1周します"><input type="checkbox" id="globe-sync-day" checked /> <span id="lbl-sync-day">1日/周</span></label>
           <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted);">
             <span data-i18n="lbl_speed">速度</span>
             <input type="range" id="globe-speed" min="2" max="45" value="12" style="width:95px;" />
@@ -1281,6 +1303,12 @@ const PARAM_DOCS = {
   crm_dx: { ja: "CRM の水平格子間隔 [m]", en: "CRM horizontal grid spacing [m]" },
   dt_host: { ja: "ホスト大気・結合ステップの時間刻み [s]", en: "Host coupling time step [s]" },
   co2_ppmv: { ja: "大気 CO₂ 濃度 [ppmv]", en: "Atmospheric CO2 concentration [ppmv]" },
+  start_date: { ja: "シミュレーション開始年月日 (YYYY-MM-DD)", en: "Simulation start date (YYYY-MM-DD)" },
+  end_date: { ja: "終了年月日 (YYYY-MM-DD、空欄なら years を使用)", en: "Optional end date (YYYY-MM-DD; blank uses years)" },
+  calendar_type: { ja: "暦の種類 (gregorian: 閏年あり / noleap: 365日 / 360_day)", en: "Calendar type (gregorian / noleap / 360_day)" },
+  insolation_mode: { ja: "日射モード (seasonal: 季節変化 / perpetual_date: 固定日射)", en: "Insolation mode (seasonal / perpetual_date)" },
+  fixed_insolation_date: { ja: "固定日射実験の基準日 (例: 2000-03-20 春分, 2000-06-21 夏至)", en: "Fixed orbital date for perpetual insolation experiments" },
+  diurnal_cycle: { ja: "日変化あり (OFF にすると日平均日射を一定に保つ)", en: "Enable diurnal solar cycle (OFF = daily-mean insolation)" },
   solar_constant: { ja: "太陽定数 S₀ [W m⁻²]", en: "Total solar irradiance S0 [W m^-2]" },
   omega: { ja: "惑星自転角速度 Ω [rad s⁻¹] (地球標準: 7.292115e-5)", en: "Planetary rotation rate Omega [rad s^-1]" },
   obliquity_deg: { ja: "地軸傾斜角 ε [deg]", en: "Axial obliquity [deg]" },
@@ -1410,6 +1438,19 @@ function buildFieldRow(sec, key, skipKeys = []) {
       <option value="yearly" ${cur==="yearly"?"selected":""}>yearly (年別)</option>
       <option value="single" ${cur==="single"?"selected":""}>single (単一Zarr)</option>
     </select>`;
+  } else if (key === "calendar_type") {
+    ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
+      <option value="gregorian" ${cur==="gregorian"?"selected":""}>gregorian (グレゴリオ暦・閏年あり)</option>
+      <option value="noleap" ${cur==="noleap"?"selected":""}>noleap (365日固定・閏年なし)</option>
+      <option value="360_day" ${cur==="360_day"?"selected":""}>360_day (360日理想暦・毎月30日)</option>
+    </select>`;
+  } else if (key === "insolation_mode") {
+    ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
+      <option value="seasonal" ${cur==="seasonal"?"selected":""}>seasonal (通常の季節変化)</option>
+      <option value="perpetual_date" ${cur==="perpetual_date"?"selected":""}>perpetual_date (日付固定日射実験)</option>
+    </select>`;
+  } else if (key === "start_date" || key === "end_date" || key === "fixed_insolation_date") {
+    ctrl = `<input type="date" value="${String(cur||"")}" onchange="setKey('${sec}','${key}',this.value)" />`;
   } else if (typeof def === "boolean") {
     ctrl = `<label class="switch"><input type="checkbox" ${cur?"checked":""} onchange="setKey('${sec}','${key}',this.checked)" /> <span>${cur?"ON":"OFF"}</span></label>`;
   } else if (typeof def === "number") {
@@ -1910,8 +1951,16 @@ async function fetchMonitorOnce() {
 
     // Metadata & KPIs
     const meta = data.meta || {};
+    MON.wallSPerDay = Number(meta.wall_s_per_day || 0);
     document.getElementById("mon-src").textContent = meta.source || "-";
-    document.getElementById("mon-time").textContent = meta.sim_days !== undefined ? `Day ${meta.sim_days}` : "-";
+    document.getElementById("mon-time").textContent =
+      meta.sim_days !== undefined
+        ? (meta.date_str ? `${meta.date_str} (Day ${meta.sim_days})` : `Day ${meta.sim_days}`)
+        : "-";
+    const syncLbl = document.getElementById("lbl-sync-day");
+    if (syncLbl) {
+      syncLbl.textContent = MON.wallSPerDay > 0 ? `1日/周 (${MON.wallSPerDay.toFixed(1)}s)` : "1日/周";
+    }
     document.getElementById("mon-cpums").textContent = data.raster ? `${data.raster.cpu_regrid_ms} ms (CPU)` : "-";
 
     // Update log & CSV chart
@@ -2110,7 +2159,11 @@ function animateGlobes(ts) {
   _lastAnimTs = ts;
 
   if ((document.getElementById("globe-spin")?.checked ?? true) && !GLOBE_VIEW.dragging) {
-    const spd = Number(document.getElementById("globe-speed")?.value ?? 12);
+    const syncDay = document.getElementById("globe-sync-day")?.checked ?? true;
+    let spd = Number(document.getElementById("globe-speed")?.value ?? 12);
+    if (syncDay && MON.wallSPerDay > 0) {
+      spd = 360.0 / Math.max(MON.wallSPerDay, 0.25);
+    }
     GLOBE_VIEW.lon0 = wrapLonDeg(GLOBE_VIEW.lon0 + spd * dt);
   }
   const geo = getOrthoGeo();

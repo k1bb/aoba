@@ -34,6 +34,7 @@ class OutputConfig:
 
     out_dir: str = ""
     years: int = 30
+    end_date: str = ""                          # Optional end date (YYYY-MM-DD); empty uses `years`
     days_per_year: float = C.DAYS_PER_YEAR
     zarr_dir_partition: str = "yearly"          # "yearly" (`year_XXXX/`) or "single"
     daily_csv_enabled: bool = True
@@ -219,6 +220,7 @@ _GRID_KEYS: tuple[str, ...] = (
 )
 _FORCING_KEYS: tuple[str, ...] = (
     "co2_ppmv", "solar_constant", "omega", "obliquity_deg", "eccentricity", "perihelion_deg",
+    "start_date", "calendar_type", "insolation_mode", "fixed_insolation_date", "diurnal_cycle",
     "use_earth2014", "earth2014_dir", "earth2014_stride", "enable_superparam",
     "h_ml_ocean", "re_liq_um", "re_ice_um",
 )
