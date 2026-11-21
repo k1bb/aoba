@@ -84,6 +84,9 @@ WC_MAX_PER_LAI: float = 0.10       # Maximum liquid canopy storage per unit LAI 
 ALPHA_INTERCEPT_LIQ: float = 1.0   # Fraction of a leaf collecting rain alpha_liq in f_pi = alpha tanh(L) (CLM5 Eq. 7.4)
 F_WET_MAX: float = 1.0             # Upper bound on wetted canopy fraction f_wet (CLM5 Eq. 7.23 caps at 1)
 
+# Land skin energy-balance solver: number of fixed Newton passes (1 = single linearized pass; CLM5 Sec. 5.3 iterates to convergence)
+LAND_EB_ITERATIONS: int = 1
+
 # Dry-surface-layer (DSL) bare-soil evaporation resistance (Swenson & Lawrence, 2014; CLM5 Eqs. 5.72-5.81)
 DSL_DMAX_MM: float = 15.0          # Maximum DSL thickness D_max [mm] (CLM5 Eq. 5.77)
 DSL_THETA_INIT_FRAC: float = 0.8   # DSL initiation moisture theta_init as a fraction of porosity [-] (secondary-source value)
@@ -574,13 +577,7 @@ def step_surface(
     # Surface wetness s_1 from liquid + ice (CLM5 Eq. 5.75) and Philip (1957) soil-air humidity factor (Eq. 5.73)
     sat_top = torch.clamp((sfc.w_liq_soil[0] + sfc.w_ice_soil[0]) / SOIL_POROSITY, 0.01, 1.0)
     psi_top = PSI_SAT_SOIL * torch.pow(sat_top, -B_CLAPP_SOIL)  # Matric head [m]
-    h_soil = torch.exp(torch.clamp(psi_top * C.GRAVITY / (C.R_V * t_gnd), -10.0, 0.0))
-    # CLM5 Sec. 5.2: do not condense atmospheric vapor into very dry soil (q_soil = q_atm when q_soil < q_atm < q_sat)
-    h_soil = torch.where(
-        (qsat_skin_l > qv_1) & (qv_1 > h_soil * qsat_skin_l),
-        qv_1 / torch.clamp(qsat_skin_l, min=1.0e-8),
-        h_soil,
-    )
+    h_soil_base = torch.exp(torch.clamp(psi_top * C.GRAVITY / (C.R_V * t_gnd), -10.0, 0.0))
 
     # Dry-surface-layer thickness D_SL, air-dry moisture theta_air, tortuosity tau, and vapor diffusivity D_v (Eqs. 5.77-5.81)
     theta_liq_top = torch.clamp(sfc.w_liq_soil[0], min=0.0, max=SOIL_POROSITY)
@@ -594,81 +591,107 @@ def step_surface(
     d_vap = 2.12e-5 * torch.pow(t_gnd / C.T_FREEZE, 1.75)
     r_soil = d_sl / (d_vap * tau_soil)  # [s m^-1]
 
-    # Under-canopy stability-corrected aerodynamic resistance r_d (Sakaguchi & Zeng, 2009; SLM Eqs. A10-A14)
-    stab_uc = C.GRAVITY * h_exp * (sfc.t_canopy - t_gnd) / (t_gnd * (tr_land.u_star ** 2 + 1.0e-3))
-    c_dense = torch.where(stab_uc > 0.0, 0.004 / (1.0 + 0.5 * torch.clamp(stab_uc, max=10.0)), torch.full_like(stab_uc, 0.004))
-    c_bare = C.VON_KARMAN / (0.13 * torch.pow(torch.clamp(tr_land.u_star * z0m_terr / 1.5e-5, min=1.0), 0.45))
-    c_uv = (1.0 - f_veg_rad) * c_bare + f_veg_rad * c_dense
-    r_d_uc = 1.0 / torch.clamp(c_uv * tr_land.u_star, min=1.0e-3)
+    # Fixed-count Newton iteration of the composite-skin energy balance (CLM5 Sec. 5.3 iterates to convergence):
+    # transfer coefficients, leaf/under-canopy conductances and the linearized balance are re-evaluated at each iterate.
+    # Stomatal conductance (the two-leaf solve above) stays at its start-of-step value.
+    # LAND_EB_ITERATIONS = 1 reproduces a single linearized pass about the previous-step skin temperature.
+    n_eb_iter = max(int(LAND_EB_ITERATIONS), 1)
+    for _eb_it in range(n_eb_iter):
+        if _eb_it > 0:
+            qsat_skin_l, dqsat_dT_l = qsat_mixed(t_skin_land, pres_sfc)
+            theta_vsfc_l = (t_skin_land / exner_s) * (1.0 + C.ZVIR * qsat_skin_l)
+            tr_land = compute_surface_transfer(
+                u_1, v_1, theta_v1, theta_vsfc_l, z_ref_rel,
+                z0m_terr, z0h_terr, z0h_terr, rsl_depth=rsl_depth,
+            )
+            ga_land = tr_land.c_h * tr_land.wind_eff
+            gb_leaf = torch.clamp(0.01 * torch.sqrt(tr_land.u_star / 0.04) * torch.clamp(lai_exp, min=0.1), min=1.0e-3)
 
-    # Conductances for the 3 ET pathways [m s^-1]:
-    # CLM5 Eqs. 5.109-5.113: transpiration acts on the dry foliage fraction (1 - f_wet), while the wet-canopy term
-    # is limited by available canopy water, f_wet' = min(f_wet, W_can / (dt * E_pot)); dew (E_pot <= 0) wets the whole leaf.
-    qleaf_sat, _ = qsat_mixed(sfc.t_canopy, pres_sfc)
-    e_pot_wet = rho_sfc * gb_leaf * (qleaf_sat - qv_1)  # Potential flux of a fully wetted canopy [kg m^-2 s^-1]
-    dew_on_leaf = (e_pot_wet <= 0.0) & (lai_exp >= 0.01)
-    f_wet_eff = torch.where(
-        e_pot_wet > 1.0e-12,
-        torch.minimum(f_wet, torch.clamp(sfc.w_canopy, min=0.0) / (dt * torch.clamp(e_pot_wet, min=1.0e-12))),
-        f_wet,
-    )
-    f_wet_eff = torch.where(dew_on_leaf, torch.ones_like(f_wet_eff), f_wet_eff)
+        # CLM5 Sec. 5.2: do not condense atmospheric vapor into very dry soil (q_soil = q_atm when q_soil < q_atm < q_sat)
+        h_soil = torch.where(
+            (qsat_skin_l > qv_1) & (qv_1 > h_soil_base * qsat_skin_l),
+            qv_1 / torch.clamp(qsat_skin_l, min=1.0e-8),
+            h_soil_base,
+        )
 
-    # 1. Stomatal transpiration: series of gb_leaf and gs_canopy on dry foliage (1 - f_wet); none while dew wets the leaf
-    g_trans = torch.where(
-        dew_on_leaf,
-        torch.zeros_like(f_wet),
-        (1.0 - f_wet) * (gb_leaf * gs_canopy) / torch.clamp(gb_leaf + gs_canopy, min=1.0e-6),
-    )
-    # 2. Wet-canopy interception evaporation: boundary conductance gb_leaf on the water-limited wet fraction
-    g_inter = f_wet_eff * gb_leaf
-    # 3. Ground evaporation (snow-free soil + snow sublimation on A_sn)
-    g_soil_snowfree = (1.0 - a_sn) / (r_d_uc + r_soil + 1.0 / torch.clamp(ga_land, min=1.0e-4))
-    g_snow_subl = a_sn / (r_d_uc * f_veg_rad + 1.0 / torch.clamp(ga_land, min=1.0e-4))
+        # Under-canopy stability-corrected aerodynamic resistance r_d (Sakaguchi & Zeng, 2009; SLM Eqs. A10-A14)
+        stab_uc = C.GRAVITY * h_exp * (sfc.t_canopy - t_gnd) / (t_gnd * (tr_land.u_star ** 2 + 1.0e-3))
+        c_dense = torch.where(stab_uc > 0.0, 0.004 / (1.0 + 0.5 * torch.clamp(stab_uc, max=10.0)), torch.full_like(stab_uc, 0.004))
+        c_bare = C.VON_KARMAN / (0.13 * torch.pow(torch.clamp(tr_land.u_star * z0m_terr / 1.5e-5, min=1.0), 0.45))
+        c_uv = (1.0 - f_veg_rad) * c_bare + f_veg_rad * c_dense
+        r_d_uc = 1.0 / torch.clamp(c_uv * tr_land.u_star, min=1.0e-3)
 
-    g_surf_vap = g_trans + g_inter + g_soil_snowfree + g_snow_subl
-    # Total series conductance with atmospheric reference layer r_a
-    g_evap_eff = (ga_land * g_surf_vap) / torch.clamp(ga_land + g_surf_vap, min=1.0e-6)
-    h_eff_sfc = torch.where(
-        g_surf_vap > 1.0e-6,
-        (g_trans + g_inter + g_snow_subl + g_soil_snowfree * h_soil) / torch.clamp(g_surf_vap, min=1.0e-6),
-        h_soil,
-    )
+        # Conductances for the 3 ET pathways [m s^-1]:
+        # CLM5 Eqs. 5.109-5.113: transpiration acts on the dry foliage fraction (1 - f_wet), while the wet-canopy term
+        # is limited by available canopy water, f_wet' = min(f_wet, W_can / (dt * E_pot)); dew (E_pot <= 0) wets the whole leaf.
+        qleaf_sat, _ = qsat_mixed(sfc.t_canopy, pres_sfc)
+        e_pot_wet = rho_sfc * gb_leaf * (qleaf_sat - qv_1)  # Potential flux of a fully wetted canopy [kg m^-2 s^-1]
+        dew_on_leaf = (e_pot_wet <= 0.0) & (lai_exp >= 0.01)
+        f_wet_eff = torch.where(
+            e_pot_wet > 1.0e-12,
+            torch.minimum(f_wet, torch.clamp(sfc.w_canopy, min=0.0) / (dt * torch.clamp(e_pot_wet, min=1.0e-12))),
+            f_wet,
+        )
+        f_wet_eff = torch.where(dew_on_leaf, torch.ones_like(f_wet_eff), f_wet_eff)
 
-    l_vap_land = torch.where((a_sn > 0.5) | (t_skin_land < C.T_FREEZE), C.L_S0, C.L_V0)
+        # 1. Stomatal transpiration: series of gb_leaf and gs_canopy on dry foliage (1 - f_wet); none while dew wets the leaf
+        g_trans = torch.where(
+            dew_on_leaf,
+            torch.zeros_like(f_wet),
+            (1.0 - f_wet) * (gb_leaf * gs_canopy) / torch.clamp(gb_leaf + gs_canopy, min=1.0e-6),
+        )
+        # 2. Wet-canopy interception evaporation: boundary conductance gb_leaf on the water-limited wet fraction
+        g_inter = f_wet_eff * gb_leaf
+        # 3. Ground evaporation (snow-free soil + snow sublimation on A_sn)
+        g_soil_snowfree = (1.0 - a_sn) / (r_d_uc + r_soil + 1.0 / torch.clamp(ga_land, min=1.0e-4))
+        g_snow_subl = a_sn / (r_d_uc * f_veg_rad + 1.0 / torch.clamp(ga_land, min=1.0e-4))
 
-    # Implicit linearized surface energy balance for Delta_T_skin (MATSIRO6 Sec. 6.3)
-    # R_n(T + dT) - H(T + dT) - L * E(T + dT) - G_cond(T + dT) = 0
-    lw_net0 = EMISSIVITY_LAND * (lw_down - C.STEFAN_BOLTZMANN * (t_skin_land ** 4))
-    rn0 = sw_abs + lw_net0
-    shf0_l = rho_sfc * cp_air * ga_land * (t_skin_land - theta_1 * exner_s)
-    evap0_l = rho_sfc * g_evap_eff * (h_eff_sfc * qsat_skin_l - qv_1)
-    # Bound upward evaporation by available water stores
-    evap0_l = torch.maximum(evap0_l, -rho_sfc * ga_land * qv_1)
+        g_surf_vap = g_trans + g_inter + g_soil_snowfree + g_snow_subl
+        # Total series conductance with atmospheric reference layer r_a
+        g_evap_eff = (ga_land * g_surf_vap) / torch.clamp(ga_land + g_surf_vap, min=1.0e-6)
+        h_eff_sfc = torch.where(
+            g_surf_vap > 1.0e-6,
+            (g_trans + g_inter + g_snow_subl + g_soil_snowfree * h_soil) / torch.clamp(g_surf_vap, min=1.0e-6),
+            h_soil,
+        )
 
-    dz_top_half = 0.5 * SOIL_LAYER_DEPTHS[0]
-    k_top = KAPPA_DRY_SOIL * (1.0 + 5.5 * torch.tanh((sfc.w_liq_soil[0] + sfc.w_ice_soil[0]) / 0.25))
-    # Thermal resistance of snowpack above topsoil when A_sn > 0 (units: m^2 K W^-1)
-    snow_depth = sfc.swe_land / RHO_SNOWPACK
-    r_snow_therm = a_sn * (0.5 * torch.clamp(snow_depth, max=1.0) / C.K_THERM_SNOW)
-    g_cond_coeff = 1.0 / (dz_top_half / k_top + r_snow_therm)
-    g0_down = g_cond_coeff * (t_skin_land - sfc.t_soil[0])
+        l_vap_land = torch.where((a_sn > 0.5) | (t_skin_land < C.T_FREEZE), C.L_S0, C.L_V0)
 
-    drn_dT = -4.0 * EMISSIVITY_LAND * C.STEFAN_BOLTZMANN * (t_skin_land ** 3)
-    dshf_dT = rho_sfc * cp_air * ga_land
-    dlhf_dT = l_vap_land * rho_sfc * g_evap_eff * h_eff_sfc * dqsat_dT_l
-    dg_dT = g_cond_coeff
+        # Implicit linearized surface energy balance for Delta_T_skin (MATSIRO6 Sec. 6.3)
+        # R_n(T + dT) - H(T + dT) - L * E(T + dT) - G_cond(T + dT) = 0
+        lw_net0 = EMISSIVITY_LAND * (lw_down - C.STEFAN_BOLTZMANN * (t_skin_land ** 4))
+        rn0 = sw_abs + lw_net0
+        shf0_l = rho_sfc * cp_air * ga_land * (t_skin_land - theta_1 * exner_s)
+        evap0_l = rho_sfc * g_evap_eff * (h_eff_sfc * qsat_skin_l - qv_1)
+        # Bound upward evaporation by available water stores
+        evap0_l = torch.maximum(evap0_l, -rho_sfc * ga_land * qv_1)
 
-    denom_eb = dshf_dT + dlhf_dT + dg_dT - drn_dT
-    dt_skin = torch.clamp((rn0 - shf0_l - l_vap_land * evap0_l - g0_down) / torch.clamp(denom_eb, min=1.0), -10.0, 10.0)
-    t_skin_new = t_skin_land + dt_skin
+        dz_top_half = 0.5 * SOIL_LAYER_DEPTHS[0]
+        k_top = KAPPA_DRY_SOIL * (1.0 + 5.5 * torch.tanh((sfc.w_liq_soil[0] + sfc.w_ice_soil[0]) / 0.25))
+        # Thermal resistance of snowpack above topsoil when A_sn > 0 (units: m^2 K W^-1)
+        snow_depth = sfc.swe_land / RHO_SNOWPACK
+        r_snow_therm = a_sn * (0.5 * torch.clamp(snow_depth, max=1.0) / C.K_THERM_SNOW)
+        g_cond_coeff = 1.0 / (dz_top_half / k_top + r_snow_therm)
+        g0_down = g_cond_coeff * (t_skin_land - sfc.t_soil[0])
 
-    # Snowmelt cap at T_FREEZE when snow is present (MATSIRO6 Sec. 6.3.3)
-    has_snow = sfc.swe_land > 1.0e-3
-    melt_excess_t = torch.where(has_snow & (t_skin_new > C.T_FREEZE), t_skin_new - C.T_FREEZE, torch.zeros_like(t_skin_new))
-    t_skin_final = t_skin_new - melt_excess_t
-    dt_final = t_skin_final - t_skin_land
-    q_melt_avail = melt_excess_t * denom_eb  # Energy [W m^-2] available to melt snow
+        drn_dT = -4.0 * EMISSIVITY_LAND * C.STEFAN_BOLTZMANN * (t_skin_land ** 3)
+        dshf_dT = rho_sfc * cp_air * ga_land
+        dlhf_dT = l_vap_land * rho_sfc * g_evap_eff * h_eff_sfc * dqsat_dT_l
+        dg_dT = g_cond_coeff
+
+        denom_eb = dshf_dT + dlhf_dT + dg_dT - drn_dT
+        dt_skin = torch.clamp((rn0 - shf0_l - l_vap_land * evap0_l - g0_down) / torch.clamp(denom_eb, min=1.0), -10.0, 10.0)
+        t_skin_new = t_skin_land + dt_skin
+
+        # Snowmelt cap at T_FREEZE when snow is present (MATSIRO6 Sec. 6.3.3)
+        has_snow = sfc.swe_land > 1.0e-3
+        melt_excess_t = torch.where(has_snow & (t_skin_new > C.T_FREEZE), t_skin_new - C.T_FREEZE, torch.zeros_like(t_skin_new))
+        t_skin_final = t_skin_new - melt_excess_t
+        dt_final = t_skin_final - t_skin_land
+        q_melt_avail = melt_excess_t * denom_eb  # Energy [W m^-2] available to melt snow
+
+        if _eb_it < n_eb_iter - 1:
+            t_skin_land = t_skin_final  # Next Newton iterate
 
     shf_l = shf0_l + dshf_dT * dt_final
     evap_raw_l = evap0_l + rho_sfc * g_evap_eff * h_eff_sfc * dqsat_dT_l * dt_final

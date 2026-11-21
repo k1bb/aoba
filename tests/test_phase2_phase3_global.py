@@ -453,6 +453,49 @@ def test_clm5_canopy_hydrology_and_dsl_soil_resistance(device: str) -> None:
     assert float(e[0].item()) > 3.0 * float(e[2].item())  # DSL strongly throttles very dry soil
 
 
+def test_land_energy_balance_newton_iterations(device: str) -> None:
+    """Fixed-count Newton passes must stay finite, converge toward the 40-pass fixed point, and default to one pass."""
+    import aoba.surface as surface_mod
+    from aoba.surface import SURF_LAND, init_surface_state, step_surface
+
+    assert surface_mod.LAND_EB_ITERATIONS == 1  # Default keeps the single linearized pass
+    dev = torch.device(device)
+    n = 400
+
+    def _case():
+        g = torch.Generator().manual_seed(11)  # Identical forcing for every pass count
+        r = lambda lo, hi: (lo + (hi - lo) * torch.rand(n, generator=g)).to(dev)
+        sfc = init_surface_state(torch.full((n,), SURF_LAND, device=dev), t_init=290.0)
+        t_air = r(270.0, 305.0)
+        sfc.t_soil = (t_air + r(-6.0, 6.0)).unsqueeze(0).repeat(5, 1)
+        sfc.t_canopy = sfc.t_soil[0] + r(-2.0, 2.0)
+        sfc.w_liq_soil[0] = r(0.05, 0.40)
+        sfc.bio.lai = r(0.0, 5.0)
+        ones = torch.ones(n, device=dev)
+        sw = r(0.0, 700.0)
+        return sfc, dict(
+            u_1=r(0.5, 10.0), v_1=0.0 * ones, temp_1=t_air, qv_1=r(0.004, 0.008),
+            pres_1=0.99e5 * ones, pres_sfc=1.0e5 * ones, z_ref_rel=30.0 * ones,
+            sw1_dir_down=0.45 * sw, sw1_dif_down=0.1 * sw, sw2_dir_down=0.4 * sw, sw2_dif_down=0.08 * sw,
+            lw_down=330.0 * ones, precip_rain=0.0 * ones, precip_snow=0.0 * ones, mu0=r(0.1, 0.9),
+            co2_ppmv=400.0, dt=720.0,
+        )
+
+    out = {}
+    try:
+        for k in (1, 3, 10, 40):
+            surface_mod.LAND_EB_ITERATIONS = k
+            sfc, kw = _case()
+            diag = step_surface(sfc, **kw)
+            assert torch.isfinite(diag.shf).all() and torch.isfinite(diag.lhf).all()
+            out[k] = diag
+    finally:
+        surface_mod.LAND_EB_ITERATIONS = 1
+    err = {k: float((out[k].shf - out[40].shf).abs().mean().item()) for k in (1, 3, 10)}
+    assert err[3] < 0.1 * err[1]  # Three passes remove >90% of the single-pass error
+    assert err[10] < err[3] and err[10] < 1.0  # W m^-2 mean error vs the 40-pass fixed point
+
+
 if __name__ == "__main__":
     for dev in _available_devices():
         print(f"Running Phase 2 & Phase 3 Global AOBA tests on device={dev}...")
@@ -464,4 +507,5 @@ if __name__ == "__main__":
         test_dynamic_sia_icesheet_and_vertical_remap(dev)
         test_mineral_dust_emission_transport_and_radiation(dev)
         test_clm5_canopy_hydrology_and_dsl_soil_resistance(dev)
+        test_land_energy_balance_newton_iterations(dev)
     print("ALL PHASE 2 & PHASE 3 GLOBAL AOBA TESTS PASSED!")
