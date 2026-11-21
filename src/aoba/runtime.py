@@ -9,6 +9,10 @@ References
 from __future__ import annotations
 
 import os
+import platform
+import re
+from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path
 import shutil
 import subprocess
@@ -123,3 +127,179 @@ def ensure_earth2014_data(
         if verbose:
             print(f"[AOBA Setup] Saved {dst}", flush=True)
     return target_dir
+
+
+@dataclass(frozen=True)
+class HardwareProfile:
+    """Detected host CPU/GPU/memory specification for runtime auto-tuning."""
+
+    chip_name: str
+    backend: str
+    gpu_cores: int
+    perf_cores: int
+    total_cores: int
+    total_ram_gb: float
+    device_mem_gb: float
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _sysctl_str(key: str) -> str:
+    try:
+        return subprocess.check_output(["sysctl", "-n", key], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return ""
+
+
+def _sysctl_int(key: str, default: int = 0) -> int:
+    s = _sysctl_str(key)
+    try:
+        return int(s) if s else default
+    except ValueError:
+        return default
+
+
+def _detect_apple_gpu_cores() -> tuple[str, int]:
+    try:
+        out = subprocess.check_output(
+            ["ioreg", "-r", "-d", "1", "-w", "0", "-c", "AGXAccelerator"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+        )
+        m_model = re.search(r'"model"\s*=\s*"([^"]+)"', out)
+        m_cores = re.search(r'"gpu-core-count"\s*=\s*(\d+)', out)
+        model = m_model.group(1) if m_model else ""
+        cores = int(m_cores.group(1)) if m_cores else 0
+        return model, cores
+    except Exception:
+        return "", 0
+
+
+@lru_cache(maxsize=1)
+def detect_hardware_profile() -> HardwareProfile:
+    """Detect CPU, GPU, and memory capacity on macOS (Apple Silicon), CUDA, or generic CPU."""
+    total_cores = os.cpu_count() or 1
+    perf_cores = total_cores
+    total_ram_gb = 8.0
+    chip_name = platform.processor() or "CPU"
+    gpu_cores = 0
+
+    if platform.system() == "Darwin":
+        brand = _sysctl_str("machdep.cpu.brand_string")
+        if brand:
+            chip_name = brand
+        p0 = _sysctl_int("hw.perflevel0.physicalcpu", 0)
+        if p0 > 0:
+            perf_cores = p0
+        mem_bytes = _sysctl_int("hw.memsize", 0)
+        if mem_bytes > 0:
+            total_ram_gb = mem_bytes / (1024.0 ** 3)
+        agx_name, agx_cores = _detect_apple_gpu_cores()
+        if agx_name and chip_name in ("arm", "CPU", ""):
+            chip_name = agx_name
+        gpu_cores = agx_cores
+    else:
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        kb = int(line.split()[1])
+                        total_ram_gb = kb / (1024.0 ** 2)
+                        break
+        except Exception:
+            pass
+
+    if torch.cuda.is_available():
+        backend = "cuda"
+        props = torch.cuda.get_device_properties(0)
+        chip_name = props.name
+        gpu_cores = int(props.multi_processor_count)
+        device_mem_gb = props.total_memory / (1024.0 ** 3)
+    elif torch.backends.mps.is_available():
+        backend = "mps"
+        try:
+            rec = torch.mps.recommended_max_memory()
+            device_mem_gb = rec / (1024.0 ** 3) if rec > 0 else total_ram_gb * 0.70
+        except Exception:
+            device_mem_gb = total_ram_gb * 0.70
+    else:
+        backend = "cpu"
+        device_mem_gb = total_ram_gb * 0.70
+
+    return HardwareProfile(
+        chip_name=chip_name,
+        backend=backend,
+        gpu_cores=gpu_cores,
+        perf_cores=perf_cores,
+        total_cores=total_cores,
+        total_ram_gb=round(total_ram_gb, 1),
+        device_mem_gb=round(device_mem_gb, 1),
+    )
+
+
+def compute_optimal_chunks(
+    glevel: int,
+    nz: int,
+    crm_nx: int,
+    crm_ny: int,
+    hw: HardwareProfile | None = None,
+) -> dict[str, int | bool]:
+    """Compute fastest memory-safe `crm_col_chunk` and `rad_col_chunk` for any grid resolution."""
+    if hw is None:
+        hw = detect_hardware_profile()
+
+    n_cells = 10 * (4 ** max(int(glevel), 0)) + 2
+    n_sub = max(int(crm_nx), 1) * max(int(crm_ny), 1)
+    m_sub = n_cells * n_sub
+    nz_safe = max(int(nz), 1)
+
+    # Keep peak working buffers within ~45% of available device memory to prevent Unified Memory swap
+    budget_bytes = max(hw.device_mem_gb * 0.45, 1.0) * (1024.0 ** 3)
+
+    # Approximate Float32 working memory: ~180 * nz * n_sub bytes/host-cell for CRM, ~240 * nz bytes/subcol for radiation
+    crm_bytes_per_cell = 180.0 * nz_safe * n_sub
+    rad_bytes_per_col = 240.0 * nz_safe
+
+    max_crm = max(512, int(budget_bytes / crm_bytes_per_cell))
+    max_rad = max(2048, int(budget_bytes / rad_bytes_per_col))
+
+    def _round_down_1024(v: int, lo: int) -> int:
+        return max(lo, (v // 1024) * 1024)
+
+    if max_crm >= n_cells:
+        crm_chunk = max(16384, ((n_cells + 1023) // 1024) * 1024)
+        crm_single_pass = True
+    else:
+        crm_chunk = _round_down_1024(max_crm, 512)
+        crm_single_pass = False
+
+    if max_rad >= m_sub:
+        rad_chunk = max(32768, ((m_sub + 1023) // 1024) * 1024)
+        rad_single_pass = True
+    else:
+        rad_chunk = _round_down_1024(max_rad, 2048)
+        rad_single_pass = False
+
+    return {
+        "crm_col_chunk": int(crm_chunk),
+        "rad_col_chunk": int(rad_chunk),
+        "crm_single_pass": crm_single_pass,
+        "rad_single_pass": rad_single_pass,
+        "n_cells": int(n_cells),
+        "m_sub": int(m_sub),
+    }
+
+
+def apply_runtime_tuning(device: torch.device | str | None = None) -> HardwareProfile:
+    """Apply thread-count and backend tuning matched to the host hardware."""
+    hw = detect_hardware_profile()
+    # Pin CPU intra-op threads to performance cores (avoids E-core straggler slowdown on Apple Silicon)
+    try:
+        torch.set_num_threads(max(hw.perf_cores, 1))
+    except Exception:
+        pass
+    if str(device or hw.backend) == "cuda" and torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+    return hw

@@ -777,7 +777,11 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
     thm_before_dyn = atmos.theta_m.clone()
     qn_before_dyn = atmos.q_n.clone()
 
-    dt_adv_host = min(900.0, 0.40 * float(mesh.dc_edge.min().item()) / 80.0)
+    dc_min = getattr(mesh, "_dc_edge_min_m", None)
+    if dc_min is None:
+        dc_min = float(mesh.dc_edge.min().item())
+        setattr(mesh, "_dc_edge_min_m", dc_min)
+    dt_adv_host = min(900.0, 0.40 * dc_min / 80.0)
     n_hdyn = max(cfg.n_host_dyn_substeps, int(math.ceil(dt / max(dt_adv_host, 1.0))))
     dt_hdyn = dt / float(n_hdyn)
 

@@ -50,7 +50,7 @@ from aoba.params import (  # noqa: E402
     merge_config_dicts,
     save_aoba_toml,
 )
-from aoba.runtime import get_output_dir  # noqa: E402
+from aoba.runtime import compute_optimal_chunks, detect_hardware_profile, get_output_dir  # noqa: E402
 
 
 def _coerce_like_default(val: Any, default_val: Any) -> Any:
@@ -847,6 +847,8 @@ _HTML_PAGE = r"""<!DOCTYPE html>
           <button onclick="applyGridPreset(4, 8, 1, 8000, 32, 720)" data-i18n="pre_g4">長期気候 (G4, 8×1)</button>
           <button onclick="applyGridPreset(5, 8, 1, 8000, 32, 720)" data-i18n="pre_g5">高解像度 (G5, 8×1)</button>
           <button onclick="applyGridPreset(4, 8, 8, 4000, 32, 600)" data-i18n="pre_3dcrm">3D CRM (G4, 8×8, 4km)</button>
+          <button onclick="autoTuneChunks()" style="border-color:var(--accent); color:var(--accent);">⚡ マシン最適チャンク (解像度維持)</button>
+          <span id="hw-badge" class="pill" style="font-size:11px;"></span>
         </div>
         <div class="field-row">
           <div>
@@ -1329,8 +1331,30 @@ async function fetchInitial() {
   STATE = await res.json();
   document.getElementById("param-total").textContent = STATE.param_count;
   document.getElementById("toml-path-input").value = STATE.toml_path;
+  if (STATE.hardware) {
+    const h = STATE.hardware;
+    const gpuTxt = h.gpu_cores > 0 ? `${h.gpu_cores} GPUc` : h.backend.toUpperCase();
+    const el = document.getElementById("hw-badge");
+    if (el) el.textContent = `${h.chip_name} · ${gpuTxt} · ${h.total_ram_gb} GB · ${h.perf_cores} P-cores`;
+  }
   renderAll();
   fetchMonitorOnce();
+}
+
+async function autoTuneChunks() {
+  const g = STATE.config.grid || {};
+  const qs = new URLSearchParams({
+    glevel: g.glevel ?? 3, nz: g.nz ?? 32, crm_nx: g.crm_nx ?? 8, crm_ny: g.crm_ny ?? 1,
+  });
+  const res = await fetch("/api/hardware/tune?" + qs.toString());
+  const data = await res.json();
+  if (data.ok && data.chunks) {
+    STATE.config.grid.crm_col_chunk = data.chunks.crm_col_chunk;
+    STATE.config.grid.rad_col_chunk = data.chunks.rad_col_chunk;
+    renderAll();
+    const passMsg = (data.chunks.crm_single_pass && data.chunks.rad_single_pass) ? "1パス最速処理" : "メモリ安全分割";
+    showToast(`最適チャンク適用 (${passMsg}): CRM=${data.chunks.crm_col_chunk}, RAD=${data.chunks.rad_col_chunk}`);
+  }
 }
 
 function switchTab(id, btn) {
@@ -2634,6 +2658,7 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
                 "section_meta": SECTION_META,
                 "toml_path": str(self.server.toml_path),  # type: ignore[attr-defined]
                 "param_count": sum(len(v) for v in defaults.values()),
+                "hardware": detect_hardware_profile().to_dict(),
             })
             return
 
@@ -2666,6 +2691,17 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
             except ValueError:
                 g = 3
             self._send_json(get_scvt_preview_payload(g))
+            return
+
+        if parsed.path == "/api/hardware/tune":
+            qs = parse_qs(parsed.query)
+            glevel = int(qs.get("glevel", ["3"])[0])
+            nz = int(qs.get("nz", ["32"])[0])
+            crm_nx = int(qs.get("crm_nx", ["8"])[0])
+            crm_ny = int(qs.get("crm_ny", ["1"])[0])
+            hw = detect_hardware_profile()
+            chunks = compute_optimal_chunks(glevel, nz, crm_nx, crm_ny, hw=hw)
+            self._send_json({"ok": True, "hardware": hw.to_dict(), "chunks": chunks})
             return
 
         if parsed.path == "/assets/aoba_icon.png":

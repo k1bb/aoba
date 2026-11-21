@@ -42,7 +42,7 @@ from aoba.params import (
     load_aoba_toml,
 )
 from aoba.radiation import compute_four_band_radiation
-from aoba.runtime import get_device, get_output_dir
+from aoba.runtime import apply_runtime_tuning, compute_optimal_chunks, get_device, get_output_dir
 from aoba.scvt_mesh import reconstruct_cell_winds
 from aoba.surface import SURF_LAND, SURF_OCEAN, compute_surface_albedos
 from aoba.thermodynamics import diagnose_pressure_temperature
@@ -300,12 +300,26 @@ def main() -> None:
     out_dir_str = args.out_dir if args.out_dir else out_cfg.out_dir
 
     dev = torch.device(args.device) if args.device else get_device()
+    hw = apply_runtime_tuning(dev)
+    opt = compute_optimal_chunks(cfg.glevel, cfg.nz, cfg.crm_nx, cfg.crm_ny, hw=hw)
+    # Use at least the hardware-optimal single-pass chunk, and cap if host memory is tighter
+    if opt["crm_single_pass"]:
+        cfg.crm_col_chunk = max(cfg.crm_col_chunk, int(opt["crm_col_chunk"]))
+    else:
+        cfg.crm_col_chunk = min(cfg.crm_col_chunk, int(opt["crm_col_chunk"]))
+    if opt["rad_single_pass"]:
+        cfg.rad_col_chunk = max(cfg.rad_col_chunk, int(opt["rad_col_chunk"]))
+    else:
+        cfg.rad_col_chunk = min(cfg.rad_col_chunk, int(opt["rad_col_chunk"]))
+
     out_root = Path(out_dir_str).expanduser() if out_dir_str else get_output_dir(f"glevel{cfg.glevel}_{years}yr")
     out_root.mkdir(parents=True, exist_ok=True)
 
     print(
         f"Initializing AOBA Glevel-{cfg.glevel} ({cfg.crm_nx}x{cfg.crm_ny}, dx={cfg.crm_dx:.0f} m, "
-        f"nz={cfg.nz}, dt={cfg.dt_host:.0f} s) on {dev}...",
+        f"nz={cfg.nz}, dt={cfg.dt_host:.0f} s) on {dev} "
+        f"[{hw.chip_name}, {hw.gpu_cores} GPUc, {hw.perf_cores} P-cores, {hw.total_ram_gb:.0f}GB RAM | "
+        f"chunks crm={cfg.crm_col_chunk} rad={cfg.rad_col_chunk}]...",
         flush=True,
     )
     model = init_aoba_model(cfg, device=dev)
