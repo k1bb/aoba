@@ -643,9 +643,10 @@ def step_surface(
         )
         # 2. Wet-canopy interception evaporation: boundary conductance gb_leaf on the water-limited wet fraction
         g_inter = f_wet_eff * gb_leaf
-        # 3. Ground evaporation (snow-free soil + snow sublimation on A_sn)
-        g_soil_snowfree = (1.0 - a_sn) / (r_d_uc + r_soil + 1.0 / torch.clamp(ga_land, min=1.0e-4))
-        g_snow_subl = a_sn / (r_d_uc * f_veg_rad + 1.0 / torch.clamp(ga_land, min=1.0e-4))
+        # 3. Ground evaporation (snow-free soil + snow sublimation on A_sn; CLM5 Eq. 5.110).
+        # Atmospheric resistance 1/g_a is applied once below in series with g_surf_vap.
+        g_soil_snowfree = (1.0 - a_sn) / torch.clamp(r_d_uc + r_soil, min=1.0e-4)
+        g_snow_subl = a_sn / torch.clamp(r_d_uc, min=1.0e-4)
 
         g_surf_vap = g_trans + g_inter + g_soil_snowfree + g_snow_subl
         # Total series conductance with atmospheric reference layer r_a

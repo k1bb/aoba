@@ -468,6 +468,50 @@ def test_clm5_canopy_hydrology_and_dsl_soil_resistance(device: str) -> None:
     assert float(e[0].item()) > float(e[1].item()) > float(e[2].item())  # wetter soil evaporates more
     assert float(e[0].item()) > 3.0 * float(e[2].item())  # DSL strongly throttles very dry soil
 
+    # C. No double-counted 1/g_a on bare wet soil or bare snow: check exact effective resistance r_tot = 1/g_a + r_d
+    # Use neutral isothermal bare wet soil (w_liq >= theta_init => r_soil = 0) and bare snow (a_sn = 1, LAI = 0).
+    from aoba.turbulence import canopy_roughness_raupach, compute_surface_transfer
+    from aoba.thermodynamics import qsat_mixed
+    from aoba import constants as C_const
+    sfc_c = init_surface_state(torch.full((n,), SURF_LAND, device=dev), t_init=290.0)
+    sfc_c.bio.lai = torch.zeros(n, device=dev)
+    sfc_c.bio.h_canopy = torch.zeros(n, device=dev)
+    sfc_c.w_liq_soil[:] = 0.40  # Saturated wet bare soil -> r_soil = 0, h_soil = 1
+    sfc_c.swe_land = torch.tensor([0.0, 0.0, 200.0], device=dev)
+    sfc_c.swe_max_season = sfc_c.swe_land.clone()
+    sfc_c.t_soil[:, 2] = 268.0
+    sfc_c.t_canopy[2] = 268.0
+    t_air_c = torch.tensor([290.0, 290.0, 268.0], device=dev)
+    qv_c = torch.tensor([0.006, 0.006, 0.001], device=dev)
+    u_c = torch.tensor([1.0, 5.0, 4.0], device=dev)
+    kw_c = _forcing(sfc_c, rain=0.0, qv=0.006, temp=290.0, sw=0.0)
+    kw_c.update(
+        u_1=u_c, temp_1=t_air_c, qv_1=qv_c, pres_1=kw_c["pres_sfc"],
+        lw_down=C_const.STEFAN_BOLTZMANN * t_air_c ** 4,
+    )
+    diag_c = step_surface(**kw_c)
+    assert torch.isfinite(diag_c.evap).all() and (diag_c.evap > 0.0).all()
+    # Direct resistance check on bare wet soil (cols 0, 1) and bare snow (col 2): E ~ rho*(qsat - qv)/(1/g_a + r_d)
+    rho_c = kw_c["pres_sfc"] / (C_const.R_D * t_air_c * (1.0 + C_const.ZVIR * qv_c))
+    qsat_fin, _ = qsat_mixed(sfc_c.t_canopy, kw_c["pres_sfc"])
+    r_eff_meas = rho_c * (qsat_fin - qv_c) / torch.clamp(diag_c.evap, min=1.0e-12)
+    theta_v1_c = t_air_c * (1.0 + C_const.ZVIR * qv_c)
+    theta_vs_c = sfc_c.t_canopy * (1.0 + C_const.ZVIR * qsat_fin)
+    _, z0m_c, _ = canopy_roughness_raupach(torch.zeros(n, device=dev), torch.zeros(n, device=dev), z0_soil=0.01)
+    z0m_c = torch.where(sfc_c.swe_land > 1.0, torch.full_like(z0m_c, 0.002), z0m_c)
+    z0h_c = 0.135335 * z0m_c
+    tr_c = compute_surface_transfer(
+        u_c, torch.zeros(n, device=dev), theta_v1_c, theta_vs_c, kw_c["z_ref_rel"], z0m_c, z0h_c, z0h_c
+    )
+    ga_c = tr_c.c_h * tr_c.wind_eff
+    c_bare_c = C_const.VON_KARMAN / (0.13 * torch.pow(torch.clamp(tr_c.u_star * z0m_c / 1.5e-5, min=1.0), 0.45))
+    r_d_c = 1.0 / torch.clamp(c_bare_c * tr_c.u_star, min=1.0e-3)
+    r_expected = 1.0 / ga_c + r_d_c
+    # Must match 1/g_a + r_d within ~10% (not ~1.8-2.0x from double-counted 1/g_a)
+    for idx in (0, 1, 2):
+        ratio = float((r_eff_meas[idx] / r_expected[idx]).item())
+        assert 0.90 < ratio < 1.10, f"col {idx} resistance ratio={ratio:.3f} (expected ~1.0, not ~1.8)"
+
 
 def test_land_energy_balance_newton_iterations(device: str) -> None:
     """Fixed-count Newton passes must stay finite, converge toward the 40-pass fixed point, and default to one pass."""
