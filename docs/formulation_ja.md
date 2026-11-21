@@ -74,6 +74,12 @@ H(t, \lambda) &= 2\pi \left[\frac{t \bmod T_{\mathrm{day}}}{T_{\mathrm{day}}} - 
 $$
 時刻 $t \to t + \Delta t$ のステップ間で $H(t, \lambda) < 0 \le H(t + \Delta t, \lambda)$ かつ $\Delta H < \pi$ が成立するとき、そのコラムは地方太陽正午を通過したと判定され、植物順化用の正午下向き短波放射が抽出される。
 
+#### 1.2.1 カレンダー管理・固定日射実験・日平均日射 (`src/aoba/calendar.py`)
+`AobaCalendar` は開始年月日 `start_date`（既定 `"2000-03-20"`、春分）および暦種別 `calendar_type`（`gregorian`: 4/100/400年規則の閏年あり 365/366 日、`noleap`: 365日固定、`360_day`: 毎月30日・年360日）を管理し、経過秒数 $t$ を暦年月日と春分点基準の年割合 $f_{\mathrm{yr}} \in [0, 1)$ へ写像する（`gregorian`/`noleap` は3月20日、`360_day` は3月21日を春分基準 $f_{\mathrm{yr}} = 0$ とする）。`insolation_mode = "perpetual_date"` の場合は季節 $f_{\mathrm{yr}}$ を `fixed_insolation_date` の正午に固定し、さらに `diurnal_cycle = false` の場合は日変化を止めた解析的日平均太陽天頂角余弦を用いる：
+$$
+H_0(\varphi, \delta_s) = \arccos\!\left[\mathrm{clip}\!\left(-\tan\varphi \tan\delta_s,\ -1,\ 1\right)\right], \qquad \overline{\mu}_0(\varphi, \delta_s) = \max\!\left[0,\ \frac{H_0 \sin\varphi \sin\delta_s + \cos\varphi \cos\delta_s \sin H_0}{\pi}\right].
+$$
+
 ---
 
 ## 2. 鉛直 Charney–Phillips 格子と平滑化地形追従座標
@@ -349,7 +355,15 @@ AOBA は PFT 分類・経験的パラメータ表を一切使わず、植物の�
    J_{\max,\mathrm{opt}} &= \varphi_{\mathrm{PSII}}(T_g)\, \tilde{I}_c\, \omega, \qquad V_{c\max,\mathrm{opt}} = \varphi_{\mathrm{PSII}}(T_g)\, \tilde{I}_c\, \frac{m}{m_c}\frac{\omega^*}{8\theta}.
    \end{aligned}
    $$
-   ここで $\varphi_{\mathrm{PSII}}(T_g)$ は温度依存量子収率であり、$25\ ^\circ\mathrm{C}$ 基準容量 $(V_{c\max 25}, J_{\max 25})$ は Kattge & Knorr (2007) のエントロピー順化ピーク型アレニウス関数で換算する。
+   ここで $\varphi_{\mathrm{PSII}}(T_g)$ は Bernacchi et al. (2003) の二次温度応答を Smith et al. (2019) の $20\ ^\circ\mathrm{C}$ 基準値 $0.257$ で正規化した量子収率、$f_P(T, T_g, H_a)$ は Kattge & Knorr (2007) の成長温度 $T_{g,C} = \mathrm{clip}(T_g - 273.15,\ 0,\ 40)\ [^\circ\mathrm{C}]$ に伴うエントロピー順化ピーク型アレニウス関数（$H_d = 200{,}000\ \mathrm{J\ mol^{-1}},\ T_0 = 298.15\ \mathrm{K}$）、$\eta^*(T)$ は水の相対粘性率である：
+   $$
+   \begin{aligned}
+   \varphi_{\mathrm{PSII}}(T_C) &= 0.257 \cdot \frac{\max\!\left(0.352 + 0.022 T_C - 3.4\times 10^{-4} T_C^2,\ 0.02\right)}{0.656}, \qquad T_C = \mathrm{clip}(T - 273.15,\ -5,\ 50), \\
+   f_P(T, T_g, H_a) &= \exp\!\left[\frac{H_a (T - T_0)}{R_{\mathrm{gas}} T_0 T}\right]\frac{1 + \exp\!\left(\dfrac{T_0 \Delta S - H_d}{R_{\mathrm{gas}} T_0}\right)}{1 + \exp\!\left(\dfrac{T \Delta S - H_d}{R_{\mathrm{gas}} T}\right)}, \qquad \Delta S = \begin{cases} 668.39 - 1.07\, T_{g,C} & (V_{c\max}, V_{p\max}), \\ 659.70 - 0.75\, T_{g,C} & (J_{\max}), \end{cases} \\
+   \eta^*(T) &= \exp\!\left[\frac{580}{T - 138} - \frac{580}{T_0 - 138}\right], \qquad f_{\mathrm{Arrh}}(T, \Delta H_a) = \exp\!\left[\frac{\Delta H_a (T - T_0)}{R_{\mathrm{gas}} T_0 T}\right].
+   \end{aligned}
+   $$
+   また $25\ ^\circ\mathrm{C}$ 基準容量は $V_{c\max 25} = V_{c\max,\mathrm{opt}} / \max(f_P(T_g, T_g, H_{a,V}),\, 0.05)$ および $J_{\max 25} = J_{\max,\mathrm{opt}} / \max(f_P(T_g, T_g, H_{a,J}),\, 0.05)$ で換算される。
 
 2. **C₄ 三酵素協調最適性 (Scott & Smith, 2022, Eqs. 1–25; von Caemmerer & Furbank, 1999)**:
    葉肉 CO₂ ドローダウン比 $\chi_{m,\mathrm{C4}} = \xi_{\mathrm{C4}} / (\xi_{\mathrm{C4}} + \sqrt{D})$（$\xi_{\mathrm{C4}} = \sqrt{\beta_{\mathrm{C4}} K_p / (1.6 \eta^*)},\ \beta_{\mathrm{C4}} = 166$）、維管束鞘漏出率 $\phi_L = 0.20$、維管束鞘コンダクタンス $g_{bs} = 0.003 L_{\mathrm{exp}}\ \mathrm{mol\ m^{-2}\ s^{-1}}$、および ATP 追加消費を含む5電子化学量論係数（$4/5 = 0.80$）のもとで、維管束鞘分圧 $C_{bs} = C_m + (L / g_{bs}) p_{\mathrm{sfc}}$ を2回固定点反復し、C₄ の三酵素容量 $(J_{\max,\mathrm{C4}}, V_{p\max,\mathrm{C4}}, V_{c\max,\mathrm{C4}})$ を同時に導く。
@@ -374,13 +388,25 @@ AOBA は PFT 分類・経験的パラメータ表を一切使わず、植物の�
 
 ### 7.3 二ストリーム樹冠アルベド・自律的 C₄ 比率 $F_4$・Lambert-$W_0$ 予報植生構造
 
-1. **地図不要の2ストリーム樹冠アルベド (Sellers, 1985; Dai et al., 2004, App. A)**: 露出 $L_{\mathrm{exp}}$・太陽天頂角 $\mu_0$・葉散乱係数（$\sigma_{\mathrm{VIS}} = 0.15,\ \sigma_{\mathrm{NIR}} = 0.80$）および背景土壌・積雪アルベドから特異点回避の閉形式 4成分アルベド $(\alpha_{\mathrm{VIS,dir}}, \alpha_{\mathrm{VIS,dif}}, \alpha_{\mathrm{NIR,dir}}, \alpha_{\mathrm{NIR,dif}})$ を算出する。
+1. **地図不要の2ストリーム樹冠アルベド (Sellers, 1985; Dai et al., 2004, App. A)**: 球面葉分布（$G = 0.5,\ \bar{\mu} = 1.0,\ K = 0.5/\max(\mu_0, 0.02),\ \beta = 0.5$）と葉散乱係数 $\omega \in \{\sigma_{\mathrm{VIS}} = 0.15,\ \sigma_{\mathrm{NIR}} = 0.80\}$ に対し、単一散乱アルベド・後方散乱比を次式で求め、$\sigma_{\mathrm{raw}} = (\bar{\mu} K)^2 - (b^2 - c^2) \to 0$ 近傍では $|\sigma_{\mathrm{raw}}| < 10^{-4}$ 時に $K_{\mathrm{reg}} = K + 2\times 10^{-4}$ として特異点を滑らかに回避した閉形式アルベド $(\alpha_{\mathrm{dir}}, \alpha_{\mathrm{dif}})$ を算出する：
+   $$
+   \begin{aligned}
+   a_s &= \frac{\omega}{2}\frac{0.5}{0.5 + \mu_s}\left[1 - \frac{\mu_s}{0.5 + \mu_s}\ln\!\left(\frac{0.5 + \mu_s}{\mu_s}\right)\right], \qquad \beta_0 = \mathrm{clip}\!\left(\frac{(1 + \bar{\mu}K)a_s}{\omega \bar{\mu} K},\ 0.05,\ 0.95\right), \\
+   b &= 1 - (1 - \beta)\omega, \qquad c = \omega\beta, \qquad h = \frac{\sqrt{b^2 - c^2}}{\bar{\mu}}, \qquad p_{1,2} = b \pm \bar{\mu} h.
+   \end{aligned}
+   $$
 2. **自律的 C₄ 優占率 $F_4 \in [0, 1]$ (Scott & Smith, 2022; Luo et al., 2024; Lavergne et al., 2026)**: 正午純光合成優位性 $\Delta A_{\mathrm{adv}} = (A_{n,\mathrm{C4}} - A_{n,\mathrm{C3}}) / (|A_{n,\mathrm{C3}}| + 1)$ と森林閉鎖による被陰効果 $f_{\mathrm{open}} = \mathrm{clip}(1.15 - 0.18\, \mathrm{LAI},\ 0.02,\ 1.0)$ を結合した目標値 $f_{\mathrm{open}} \sigma(8\,\Delta A_{\mathrm{adv}})$ へ約60日時定数（$0.25\,\alpha_{\mathrm{EMA}}$）で緩和する。
-3. **予報 EEO $\mathrm{LAI}$・根圏貯水容量 $S_R$・樹冠高 $h_c$**: 年次指数平滑水文統計から乾燥度指数 $\mathrm{AI} = \mathrm{PET}_{\mathrm{yr}} / P_{\mathrm{yr}}$ を求め、Zhou et al. (2025, Eq. 6) の $f_0(\mathrm{AI}) = 0.65 \exp\!\left[-0.604169 \left(\ln \max(\mathrm{AI}, 1.9)/1.9\right)^2\right]$ を介してエネルギー制限・水制限上限 $\mathrm{fAPAR}_c, \mathrm{fAPAR}_w$ の対数和指数（$K = 10$; Cai et al., 2025, Eq. 12）平滑最小値 $\mathrm{fAPAR}_{\max}$ と $\mathrm{LAI}_{\max} = -\ln(1 - \mathrm{fAPAR}_{\max})/k$（$k=0.5,\ z=12.227\ \mathrm{mol\ C\ m^{-2}\ yr^{-1}}$）を決定する。日々の平衡葉面積指数 $L_s$ は Lambert $W$ 関数の主枝 $W_0$（Halley 3次反復5回；Zhou et al., 2025, Eqs. 15–20）により：
+3. **予報 EEO $\mathrm{LAI}$・根圏貯水容量 $S_R$・樹冠高 $h_c$**: 年次指数平滑水文統計（$\alpha_{\mathrm{yr}} = 1/365.2425$）から乾燥度指数 $\mathrm{AI} = \mathrm{PET}_{\mathrm{yr}} / \max(P_{\mathrm{yr}}, 10)$ を求め、Zhou et al. (2025, Eq. 6) の $f_0(\mathrm{AI}) = 0.65 \exp\!\left[-0.604169 \left(\ln \max(\mathrm{AI}, 1.9)/1.9\right)^2\right]$ を介してエネルギー制限・水制限上限 $\mathrm{fAPAR}_c = 1 - z/(k A_{0,\mathrm{yr}})$、$\mathrm{fAPAR}_w = f_0 P_{\mathrm{mol,yr}} c_a (1 - \chi_{\mathrm{C3}})/(1.6 D_s A_{0,\mathrm{yr}})$ の対数和指数（$K = 10$; Cai et al., 2025, Eq. 12）平滑最小値 $\mathrm{fAPAR}_{\max}$ と $\mathrm{LAI}_{\max} = -\ln(1 - \mathrm{fAPAR}_{\max})/k$（$k=0.5,\ z=12.227\ \mathrm{mol\ C\ m^{-2}\ yr^{-1}}$）を決定する。日々の平衡葉面積指数 $L_s$ は Lambert $W$ 関数の主枝 $W_0$（Halley 3次反復5回；Zhou et al., 2025, Eqs. 15–20）により：
    $$
    L_s = \min\!\left[\mu + \frac{1}{k} W_0\!\left(-k\mu e^{-k\mu}\right),\ \mathrm{LAI}_{\max}\right], \qquad \mu = \frac{\sigma_{\mathrm{Zhou}}\, \mathrm{GSL}\, \mathrm{LAI}_{\max}}{A_{0,\mathrm{yr}}\, \mathrm{fAPAR}_{\max}} A_{0,\mathrm{day}} \qquad (\sigma_{\mathrm{Zhou}} = 0.771)
    $$
-   と求まり、$\alpha_{\mathrm{EMA}} = 0.067$ で予報更新する。また根圏最大貯水容量 $S_R \in [50, 650]\ \mathrm{kg\ m^{-2}}$ は季節累積水欠損（Gao et al., 2014）に応じ、最大樹高 $h_c \in [0.05, 40]\ \mathrm{m}$ は水・光合成余剰スケーリング（Kempes et al., 2011）に従い自律進化する。
+   と求まり、$\alpha_{\mathrm{EMA}} = 0.067$ で予報更新する。さらに根圏最大貯水容量 $S_R \in [50, 650]\ \mathrm{kg\ m^{-2}}$（Gao et al., 2014）と最大樹高 $h_c \in [0.05, 40]\ \mathrm{m}$（Kempes et al., 2011）は日積算水欠損 $D_{\mathrm{cum}}$ と水・光合成余剰スケーリングにより次式で自律進化する（乾燥側の $S_R$ 増加は $10\,\alpha_{\mathrm{yr}}$ で速く追従し、湿潤側の縮小は $\alpha_{\mathrm{yr}}$ で緩やかに戻る）：
+   $$
+   \begin{aligned}
+   D_{\mathrm{cum}}^{(d)} &= \mathrm{clip}\!\left(D_{\mathrm{cum}}^{(d-1)} + (\mathrm{fAPAR}_{\max} E_{\mathrm{pot}} - P),\ 0,\ 800\right), \qquad S_{R,\mathrm{target}} = \mathrm{clip}\!\left(50 + 1.35\, D_{\mathrm{cum}}^{(d)},\ 50,\ 650\right), \\
+   h_{c,\mathrm{target}} &= \mathrm{clip}\!\left[32.0 \left(\mathrm{clip}\!\left(\frac{P_{\mathrm{yr}}}{\max(E_{\mathrm{pot,yr}}, 50)},\ 0,\ 2.5\right)\right)^{0.85} \left(\mathrm{clip}\!\left(\frac{\mathrm{fAPAR}_{\max} A_{0,\mathrm{yr}}}{180},\ 0,\ 2.0\right)\right)^{0.75},\ 0.05,\ 40.0\right].
+   \end{aligned}
+   $$
 
 ---
 
@@ -454,11 +480,11 @@ $$
 
 ### 10.3 処方 $Q$ フラックス不要 1.5層ボロノイエクマン海洋 (`src/aoba/ocean_ekman.py`)
 
-Codron (2012, Eqs. 1–10) に従い、SCVT ボロノイ C-grid の海洋・海洋辺（海陸境界辺では法線質量輸送ゼロ）上で表層混合層（厚 $H_1$・水温 $T_1$）と内部補償温度躍層（厚 $H_2 = 200\ \mathrm{m}$・水温 $T_2$）の 1.5層熱輸送を解く。海面風応力 $(\tau_{x,\mathrm{ocn}}, \tau_{y,\mathrm{ocn}})$ とダンピング率 $r_E = (2\ \mathrm{days})^{-1}$ からエクマン質量輸送：
+Codron (2012, Eqs. 1–10) に従い、SCVT ボロノイ C-grid の海洋・海洋辺（海陸境界辺では法線質量輸送ゼロ）上で表層混合層（厚 $H_1$・水温 $T_1$）と内部補償温度躍層（厚 $H_2 = 200\ \mathrm{m}$・水温 $T_2$）の 1.5層熱輸送を解く。海氷被覆率 $f_{\mathrm{ice}}$ による応力減衰 $\boldsymbol{\tau}_{\mathrm{ocn}} = -(1 - 0.5 f_{\mathrm{ice}})\boldsymbol{\tau}_{\mathrm{sfc}}$ とダンピング率 $r_E = (2\ \mathrm{days})^{-1}$ からエクマン質量輸送：
 $$
 M_{E,x} = \frac{r_E \tau_{x,\mathrm{ocn}} + f \tau_{y,\mathrm{ocn}}}{f^2 + r_E^2}, \qquad M_{E,y} = \frac{r_E \tau_{y,\mathrm{ocn}} - f \tau_{x,\mathrm{ocn}}}{f^2 + r_E^2},
 $$
-および湧昇速度 $W_E = \nabla_{\mathrm{SCVT}} \cdot \mathbf{M}_E$ を求め、混合層・躍層間の風上鉛直熱交換、水平渦拡散（$\kappa_h = 2000\ \mathrm{m^2\ s^{-1}}$）、躍層鉛直拡散（$\kappa_v = 2\times 10^{-5}\ \mathrm{m^2\ s^{-1}}$）を積分する。さらに全陸域からの河川液体流出・氷山流出の総和を海洋セルへ還元し、氷融解に伴う潜熱冷却を海洋エンタルピーから厳密差し引きして全球水・エネルギー収支を完結させる（MIROC6, Sec. 4.1.2）。
+および湧昇速度 $W_E = \nabla_{\mathrm{SCVT}} \cdot \mathbf{M}_E$ を求め、混合層・躍層間の風上鉛直熱交換、水平渦拡散（$\kappa_h = 2000\ \mathrm{m^2\ s^{-1}}$）、躍層鉛直拡散（$\kappa_v = 2\times 10^{-5}\ \mathrm{m\ s^{-1}}$）を積分する。さらに全陸域からの河川液体流出・氷山流出の総和を海洋セルへ還元し、氷融解に伴う潜熱冷却を海洋エンタルピーから厳密差し引きして全球水・エネルギー収支を完結させる（MIROC6, Sec. 4.1.2）。なお Apple Silicon MPS GPU 等の単精度（`float32`）環境において熱容量の大きい海洋温度（$~280\ \mathrm{K}$）へ微小フラックス $\Delta T$ を連続加算する際の丸め消滅（swamping）を防ぐため、`ocean_ekman.py` の $T_1, T_2$ 更新および `surface.py` の大気・海氷熱収支による $T_1$ 更新には **Kahan/Neumaier 補償加算**（$y = \Delta T + c,\ T' = T + y,\ c' = (T - T') + y$）を組み込み、実質倍精度相当の長期エネルギー保存性を維持している。
 
 ### 10.4 MAML + ICA サブグリッド 1:1 結合とケッペン・ガイガー診断 (`src/aoba/coupled_model.py`, `src/aoba/koppen.py`)
 
@@ -519,13 +545,13 @@ $$
 
 ### 12.1 一元テキスト管理アーキテクチャと実行・GUI ツール (`src/aoba/params.py`, `scripts/aoba_config_gui.py`)
 
-モデルの再現性と透明性を保証するため、すべての格子設定・強制外力・動的氷床設定・出力ストリーム・物理定数（**13セクション・全188項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。
-- **ランタイム同期メカニズム (`src/aoba/params.py`)**: `load_aoba_toml()` で読み込んだ設定辞書に対し `build_configs_from_dict(cfg_dict, apply_modules=True)` を呼ぶと、`(AOBAConfig, OutputConfig)` インスタンスを生成すると同時に、`_MODULE_PARAM_MAP` に登録された `src/aoba/*` モジュールの全定数をライブ更新し、各モジュールの `recompute_derived_constants()`（`microphysics`, `turbulence`, `ocean_ekman`, `icesheet` 内の Metal 定数配列や導出係数を含む）を再計算する。`scripts/run_g5_30yr.py --config path/to/custom.toml` でカスタム設定を直接実行でき、`--config` なしの場合は従来の工場出荷デフォルト値が維持され完全な後方互換性を保つ。
+モデルの再現性と透明性を保証するため、すべての格子設定・強制外力・動的氷床設定・出力ストリーム・物理定数（**13セクション・全195項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。
+- **ランタイム同期・ハードウェア自動チューニング (`src/aoba/params.py`, `src/aoba/runtime.py`)**: `load_aoba_toml()` で読み込んだ設定辞書に対し `build_configs_from_dict(cfg_dict, apply_modules=True)` を呼ぶと、`(AOBAConfig, OutputConfig)` インスタンスを生成すると同時に、`_MODULE_PARAM_MAP` に登録された `src/aoba/*` モジュールの全定数をライブ更新し、各モジュールの `recompute_derived_constants()`（`microphysics`, `turbulence`, `ocean_ekman`, `icesheet` 内の Metal 定数配列や導出係数を含む）を再計算する。さらに `detect_hardware_profile()` / `compute_optimal_chunks()` / `apply_runtime_tuning()` により実行マシンの GPU コア数・利用可能メモリ・P-core 数を自動検出し、メモリ予算 $B = 0.45\, M_{\mathrm{dev}}$ の範囲内で解像度を変えずに最速 1 パス／安全分割となる `crm_col_chunk`・`rad_col_chunk` と CPU スレッド数を自動適用する。
 - **Web GUI 統合ワークベンチ (`scripts/aoba_config_gui.py` / AOBA Studio)**: 標準ライブラリ（`http.server`）のみで動作するゼロ依存ローカル Web アプリ（`python scripts/aoba_config_gui.py --port 8765`）を備え、モデル設定から実行起動、プロセス監視、CPU リアルタイム可視化まで一気通貫で提供する：
   1. `glevel`（0〜6）の変更に連動してリアルタイム描画される**正二十面体 SCVT Voronoi 球面メッシュ可視化図 ＋ 1ホストセル対埋め込み CRM 領域スケール比較図 ＋ ストレッチ鉛直層・スポンジ層図**。
-  2. 自転半減実験 (`0.5×Ω`)・LGM・`4×CO₂` プリセットおよび**氷床加速率 $\alpha_{\mathrm{eff}}(t)$／EMA 重み減衰曲線**プレビュー。
-  3. 出力ファイル種別・間隔設定、予想年間 Zarr/リスタート容量試算、および188パラメータ横断検索・TOML 保存。
-  4. **実行コントロール・ライブ監視・CPU リアルタイム 3地球プレビュー**: GUI 上からの計算実行・停止、稼働中外部ジョブ（`run.log` / `daily_global.csv`）の監視に加え、GPU 計算を一切阻害しない待機 CPU 上の `cKDTree` 球面再格子化エンジンにより **`T2`（地表付近気温 $0.35 T_{\mathrm{sfc}} + 0.65 T_{a,z_1}$）・`OLR`・`LAI`** の3つの正射図法地球儀を同期・ゆっくり自動回転させながらリアルタイム可視化する（`live_preview.npz` または `snapshots.zarr` / `monthly.zarr` に対応）。
+  2. 自転半減実験 (`0.5×Ω`)・LGM・`4×CO₂` プリセット、**カレンダー／固定日射設定**、および**氷床加速率 $\alpha_{\mathrm{eff}}(t)$／EMA 重み減衰曲線**プレビュー。
+  3. 出力ファイル種別・間隔設定、予想年間 Zarr/リスタート容量試算、および195パラメータ横断検索・TOML 保存。
+  4. **実行コントロール・ライブ監視・CPU リアルタイム日平均 3地球プレビュー**: GUI 上からの計算実行・停止、稼働中外部ジョブ（`run.log` / `daily_global.csv` / カレンダー日付 `YYYY-MM-DD`）の監視に加え、GPU 計算を一切阻害しない待機 CPU 上の `cKDTree` 球面再格子化エンジンにより、**日平均 `T2`（地表付近気温 $0.35 T_{\mathrm{sfc}} + 0.65 T_{a,z_1}$）・日平均降水量 `Precip [mm/d]`・`LAI`** の3つの正射図法地球儀を「1モデル日＝1周（$360^\circ / T_{\mathrm{wall,day}}$）」の実時間同期自転または任意速度でリアルタイム可視化する（`live_preview.npz`, `snapshots.zarr`, `monthly.zarr` に対応）。
 
 ### 12.2 出力ファイル種別・平均値 vs 瞬時値仕様 (`OutputConfig`, `src/aoba/io_zarr.py`)
 
@@ -537,11 +563,11 @@ $$
 | `daily_global.csv` | **時間平均** (全球日別) | `daily_csv_enabled`, `daily_csv_interval_days` (既定 `1.0` 日) | $T_s$, $\mathrm{OLR}$, $\mathrm{ASR}$, $\mathrm{NetTOA}$, 降水, $\mathrm{GPP}$, $\mathrm{LAI}$, 海氷面積, 計算速度 |
 | `monthly.zarr` | **時間平均** (月/季節/年) | `monthly_mean_enabled`, `monthly_mean_periods_per_year` (既定 `12`), `monthly_mean_sample_hours` (既定 `6.0` h), `monthly_mean_include_{2d,3d,subgrid_2d}` | **2D**: `t_ocean_ml`, `t_canopy`, `m_seaice`, `swe_land`, `w_root`, `lai`, `precip_mm_day`, `olr`, `asr`, `evap_mm_day`, `gpp`, (`h_ice`, `z_topo_dyn`), `koppen_code/major` / **3D**: `temp`, `pres`, `q_v`, `u_zonal`, `v_merid` / **SG2D**: `lwp_sub`, `iwp_sub`, `w_max_sub`, `precip_mm_day_sub`, `sw_dn_sub`, `lw_dn_sub`, `olr_sub`, `shf_sub`, `evap_mm_day_sub`, `gpp_sub`, `t_sfc_sub`, `m_seaice_sub`, `swe_land_sub`, `w_root_sub`, `lai_sub` |
 | `snapshots.zarr` | **瞬時値** (スナップショット) | `snapshots_enabled`, `snapshots_periods_per_year` (既定 `12`), `snapshots_include_{2d,3d,subgrid_2d}` | 上記2D (`h_canopy`, `vcmax25_c3`, `f_c4` を含む)・3D変数 (`temp`, `pres`, `q_v`, `u_zonal`, `v_merid`) および上記サブグリッド2D瞬時場 (`*_sub`) |
-| `restart.pt` | チェックポイント | `restart_interval_years` (既定 `1` 年), `zarr_dir_partition` (`"yearly"`/`"single"`) | 完全な `GlobalAtmosState`, `CRMState`, `SurfaceState` (`sfc` & `sfc_sub`), `EkmanOceanState`, `IceSheetState`, `ClimateAccumulator`, 乱数状態なし・決定論的再開可能 |
+| `restart.pt` / `restart_mid.pt` | チェックポイント | `restart_interval_years` (既定 `1` 年), `restart_monthly` (既定 `true`), `zarr_dir_partition` | 完全な `GlobalAtmosState`, `CRMState`, `SurfaceState` (`sfc` & `sfc_sub`), `EkmanOceanState`, `IceSheetState`, `ClimateAccumulator`。`restart_monthly=true` 時は毎月末に `restart_mid.pt` を自動保存し、年内途中から Zarr/CSV 欠損なく決定論的再開可能 |
 
-### 12.3 全モデル設定・物理パラメータレジストリ（全13セクション・188項目）
+### 12.3 全モデル設定・物理パラメータレジストリ（全13セクション・195項目）
 
-表 12.1 に [`config/aoba_default.toml`](../config/aoba_default.toml) に定義された全188パラメータのセクション別完全リストを示す。
+表 12.1 に [`config/aoba_default.toml`](../config/aoba_default.toml) に定義された全195パラメータのセクション別完全リストを示す。
 
 #### `[grid]` — 水平・鉛直・サブグリッド CRM 格子設定（16項目）
 | TOML キー | 標準値 | 説明・単位 |
@@ -559,12 +585,12 @@ $$
 | `rad_stride` | `5` | 放射計算の呼出し間隔（ステップ数） |
 | `crm_col_chunk`, `rad_col_chunk` | `16384`, `32768` | GPU/CPU メモリ制御用バッチチャンクサイズ [columns] |
 
-#### `[forcing]`・`[icesheet]`・`[output]` — 外力・氷床制御・出力管理（36項目）
+#### `[forcing]`・`[icesheet]`・`[output]` — 外力・氷床制御・出力管理（43項目）
 | セクション | キー ＝ 標準値 |
 | :--- | :--- |
-| `[forcing]` (13) | `co2_ppmv = 400.0`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 50.0` |
+| `[forcing]` (18) | `co2_ppmv = 400.0`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `start_date = "2000-03-20"`, `calendar_type = "gregorian"`, `insolation_mode = "seasonal"`, `fixed_insolation_date = "2000-03-20"`, `diurnal_cycle = true`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 50.0` |
 | `[icesheet]` (5) | `enable_dynamic_icesheet = false`, `icesheet_ema_years = 5.0`, `icesheet_accel_factor = 100.0`, `icesheet_accel_spinup_years = 0.0`, `icesheet_isostasy_tau_yr = 1000.0` |
-| `[output]` (18) | `out_dir = ""`, `years = 30`, `days_per_year = 365.2425`, `zarr_dir_partition = "yearly"`, `daily_csv_enabled = true`, `daily_csv_interval_days = 1.0`, `monthly_mean_enabled = true`, `monthly_mean_periods_per_year = 12`, `monthly_mean_sample_hours = 6.0`, `monthly_mean_include_2d = true`, `monthly_mean_include_3d = true`, `monthly_mean_include_subgrid_2d = true`, `snapshots_enabled = true`, `snapshots_periods_per_year = 12`, `snapshots_include_2d = true`, `snapshots_include_3d = true`, `snapshots_include_subgrid_2d = true`, `restart_interval_years = 1` |
+| `[output]` (20) | `out_dir = ""`, `years = 30`, `end_date = ""`, `days_per_year = 365.2425`, `zarr_dir_partition = "yearly"`, `daily_csv_enabled = true`, `daily_csv_interval_days = 1.0`, `monthly_mean_enabled = true`, `monthly_mean_periods_per_year = 12`, `monthly_mean_sample_hours = 6.0`, `monthly_mean_include_2d = true`, `monthly_mean_include_3d = true`, `monthly_mean_include_subgrid_2d = true`, `snapshots_enabled = true`, `snapshots_periods_per_year = 12`, `snapshots_include_2d = true`, `snapshots_include_3d = true`, `snapshots_include_subgrid_2d = true`, `restart_interval_years = 1`, `restart_monthly = true` |
 
 #### `[constants]` 〜 `[icesheet_physics]` — 全物理・生態系・雪氷・海洋定数レジストリ（136項目）
 | セクション | 項目数 | 登録キー ＝ 標準値（`src/aoba/` 対応モジュール名） |

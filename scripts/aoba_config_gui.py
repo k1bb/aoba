@@ -2235,30 +2235,93 @@ function bindGlobeInteractions() {
 function escHtml(s) {
   return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
+function _extractBracedArg(str, startIdx) {
+  if (startIdx >= str.length || str[startIdx] !== "{") return null;
+  let depth = 0;
+  for (let i = startIdx; i < str.length; i++) {
+    if (str[i] === "{") depth++;
+    else if (str[i] === "}") {
+      depth--;
+      if (depth === 0) return { content: str.slice(startIdx + 1, i), nextIdx: i + 1 };
+    }
+  }
+  return null;
+}
+function _replaceLatexFracs(str) {
+  let out = "", i = 0;
+  while (i < str.length) {
+    const rest = str.slice(i);
+    const m = rest.match(/^\\(?:d|t)?frac\s*\{/);
+    if (m) {
+      const arg1Start = i + m[0].length - 1;
+      const a1 = _extractBracedArg(str, arg1Start);
+      if (a1) {
+        let j = a1.nextIdx;
+        while (j < str.length && /\s/.test(str[j])) j++;
+        const a2 = _extractBracedArg(str, j);
+        if (a2) {
+          const num = _replaceLatexFracs(a1.content);
+          const den = _replaceLatexFracs(a2.content);
+          out += `<span class="math-frac"><span>${num}</span><span>${den}</span></span>`;
+          i = a2.nextIdx;
+          continue;
+        }
+      }
+    }
+    out += str[i];
+    i++;
+  }
+  return out;
+}
+function _replaceSupSub(str) {
+  let out = "", i = 0;
+  while (i < str.length) {
+    const ch = str[i];
+    if ((ch === "^" || ch === "_") && i + 1 < str.length) {
+      const tag = ch === "^" ? "sup" : "sub";
+      if (str[i + 1] === "{") {
+        const a = _extractBracedArg(str, i + 1);
+        if (a) {
+          out += `<${tag}>${_replaceSupSub(a.content)}</${tag}>`;
+          i = a.nextIdx;
+          continue;
+        }
+      } else if (/[A-Za-z0-9*+\-]/.test(str[i + 1])) {
+        out += `<${tag}>${str[i + 1]}</${tag}>`;
+        i += 2;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
 function renderLatexPretty(tex) {
   let s = escHtml(tex.trim());
+  for (let p = 0; p < 3; p++) {
+    s = s.replace(/\\(?:mathrm|mathbf|boldsymbol|text)\{([^{}]*)\}/g, "$1");
+  }
+  s = _replaceLatexFracs(s);
   const greek = {
-    "\\\\alpha":"α","\\\\beta":"β","\\\\gamma":"γ","\\\\delta":"δ","\\\\epsilon":"ε","\\\\zeta":"ζ",
+    "\\\\alpha":"α","\\\\beta":"β","\\\\gamma":"γ","\\\\delta":"δ","\\\\varepsilon":"ε","\\\\epsilon":"ε","\\\\zeta":"ζ",
     "\\\\eta":"η","\\\\theta":"θ","\\\\kappa":"κ","\\\\lambda":"λ","\\\\mu":"μ","\\\\nu":"ν",
     "\\\\xi":"ξ","\\\\pi":"π","\\\\rho":"ρ","\\\\sigma":"σ","\\\\tau":"τ","\\\\phi":"φ",
     "\\\\varphi":"φ","\\\\chi":"χ","\\\\psi":"ψ","\\\\omega":"ω",
     "\\\\Gamma":"Γ","\\\\Delta":"Δ","\\\\Theta":"Θ","\\\\Lambda":"Λ","\\\\Pi":"Π","\\\\Sigma":"Σ","\\\\Omega":"Ω",
-    "\\\\nabla":"∇","\\\\partial":"∂","\\\\infty":"∞","\\\\cdot":"·","\\\\times":"×","\\\\pm":"±",
-    "\\\\le":"≤","\\\\ge":"≥","\\\\approx":"≈","\\\\ne":"≠","\\\\implies":"⇒","\\\\to":"→",
-    "\\\\leftarrow":"←","\\\\leftrightarrow":"↔","\\\\in":"∈","\\\\sum":"∑","\\\\int":"∫",
-    "\\\\exp":"exp","\\\\ln":"ln","\\\\log":"log","\\\\sin":"sin","\\\\cos":"cos","\\\\tanh":"tanh",
-    "\\\\max":"max","\\\\min":"min","\\\\sqrt":"√","\\\\mathrm":" ","\\\\mathbf":" ","\\\\boldsymbol":" ",
-    "\\\\text":" ","\\\\left":"","\\\\right":"","\\\\!":"","\\\\,":" ","\\\\;":" ","\\\\quad":"  ","\\\\qquad":"    ",
+    "\\\\nabla":"∇","\\\\partial":"∂","\\\\infty":"∞","\\\\cdot":"·","\\\\times":"×","\\\\pm":"±","\\\\circ":"°",
+    "\\\\le":"≤","\\\\ge":"≥","\\\\approx":"≈","\\\\ne":"≠","\\\\propto":"∝","\\\\implies":"⇒","\\\\to":"→",
+    "\\\\leftarrow":"←","\\\\leftrightarrow":"↔","\\\\uparrow":"↑","\\\\downarrow":"↓","\\\\in":"∈","\\\\sum":"∑","\\\\int":"∫",
+    "\\\\dots":"…","\\\\bmod":"mod","\\\\exp":"exp","\\\\ln":"ln","\\\\log":"log","\\\\sin":"sin","\\\\cos":"cos","\\\\tanh":"tanh",
+    "\\\\max":"max","\\\\min":"min","\\\\sqrt":"√","\\\\mathrm":"","\\\\mathbf":"","\\\\boldsymbol":"",
+    "\\\\text":"","\\\\left":"","\\\\right":"","\\\\!":"","\\\\,":" ","\\\\;":" ","\\\\quad":"  ","\\\\qquad":"    ",
     "\\\\begin\\{aligned\\}":"","\\\\end\\{aligned\\}":"","\\\\begin\\{cases\\}":"","\\\\end\\{cases\\}":"",
-    "\\\\tilde\\{([^}]+)\\}":"$1\u0303","\\\\bar\\{([^}]+)\\}":"$1\u0304","\\\\hat\\{([^}]+)\\}":"$1\u0302"
+    "\\\\widetilde\\{([^{}]+)\\}":"$1\u0303","\\\\tilde\\{([^{}]+)\\}":"$1\u0303",
+    "\\\\overline\\{([^{}]+)\\}":"$1\u0304","\\\\bar\\{([^{}]+)\\}":"$1\u0304",
+    "\\\\hat\\{([^{}]+)\\}":"$1\u0302","\\\\dot\\{([^{}]+)\\}":"$1\u0307"
   };
   for (const [pat, rep] of Object.entries(greek)) s = s.replace(new RegExp(pat, "g"), rep);
-  // Render \frac{A}{B} (2 passes handles nested fractions)
-  for (let p = 0; p < 2; p++) {
-    s = s.replace(/\\d?frac\{([^{}]+)\}\{([^{}]+)\}/g, '<span class="math-frac"><span>$1</span><span>$2</span></span>');
-  }
-  s = s.replace(/\^\{([^{}]+)\}/g, "<sup>$1</sup>").replace(/\^([A-Za-z0-9*+-])/g, "<sup>$1</sup>");
-  s = s.replace(/_\{([^{}]+)\}/g, "<sub>$1</sub>").replace(/_([A-Za-z0-9])/g, "<sub>$1</sub>");
+  s = _replaceSupSub(s);
   s = s.replace(/&amp;/g, "&nbsp;&nbsp;").replace(/\\\\/g, "<br/>").replace(/[{}]/g, "");
   return s;
 }
