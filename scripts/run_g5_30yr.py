@@ -234,7 +234,7 @@ def _write_live_preview_atomic(
     )
     t_sfc = torch.where(mesh.surf_type == SURF_OCEAN, model.sfc.t_ocean_ml, model.sfc.t_canopy)
     t2_k = 0.35 * t_sfc + 0.65 * temp0[0]
-    olr = model.rad_cache.get("olr", torch.zeros_like(t_sfc))
+    olr = model.rad_cache.get("olr", 0.85 * C.STEFAN_BOLTZMANN * torch.clamp(t_sfc, min=150.0) ** 4)
     lai = model.sfc.bio.lai
     h_ice = model.icesheet.h_ice if model.icesheet is not None else torch.zeros_like(t_sfc)
 
@@ -323,6 +323,11 @@ def main() -> None:
                 _load_restart_into_model(model, y_dir / "restart.pt", dev)
                 start_year = y + 1
                 break
+
+    # Expose initial T2 / OLR / LAI + Earth2014 continents immediately for Tab 5 live globes
+    _write_live_preview_atomic(
+        model, out_root / "live_preview.npz", start_year, 0.0, float((start_year - 1) * days_per_year), 0.0
+    )
 
     steps_per_day = max(int(round(C.SECONDS_PER_DAY / cfg.dt_host)), 1)
     steps_per_year = max(int(round(days_per_year * C.SECONDS_PER_DAY / cfg.dt_host)), 12)

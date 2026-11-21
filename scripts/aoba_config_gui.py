@@ -1461,7 +1461,7 @@ async function ensureSCVTPreviewMesh(g) {
   try {
     const res = await fetch(`/api/scvt_mesh?glevel=${g}`);
     const data = await res.json();
-    if (data.ok) {
+    if (data && data.ok) {
       GRID_VIEW.cache[g] = {
         glevel: data.glevel,
         nCells: data.n_cells,
@@ -1476,6 +1476,8 @@ async function ensureSCVTPreviewMesh(g) {
       };
       drawGridCanvas();
     }
+  } catch (e) {
+    /* keep shaded ocean gradient fallback */
   } finally {
     delete GRID_VIEW.inflight[g];
   }
@@ -1774,7 +1776,7 @@ function renderRegistrySection() {
 }
 
 function getActiveTomlPath() { return (document.getElementById("toml-path-input").value || STATE.toml_path || "config/aoba_custom.toml").trim(); }
-function updateRunCmd() { document.getElementById("run-cmd-box").textContent = `PYTHONPATH=src /Users/andrew/miniforge/envs/myenv/bin/python -u scripts/run_g5_30yr.py --config "${getActiveTomlPath()}"`; }
+function updateRunCmd() { document.getElementById("run-cmd-box").textContent = `PYTHONPATH=src python -u scripts/run_g5_30yr.py --config "${getActiveTomlPath()}"`; }
 async function refreshTomlPreview() {
   const res = await fetch("/api/toml", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({config:STATE.config}) });
   document.getElementById("toml-preview").value = (await res.json()).toml_text; updateRunCmd();
@@ -1960,17 +1962,72 @@ function getOrthoGeo() {
   return GLOBE_VIEW.geoCache;
 }
 
-function renderOneGlobe(canvasId, kind, geo) {
+function wrapLonDeg(lon) {
+  return ((((lon + 180) % 360) + 360) % 360) - 180;
+}
+
+function renderIdleGlobe(canvasId, kind, geo) {
   const canvas = document.getElementById(canvasId);
-  if (!canvas || !MON.raster) return;
+  if (!canvas) return;
   const ctx = canvas.getContext("2d");
   const W = geo.size;
-  if (!canvas._imgData) {
-    canvas._imgData = ctx.createImageData(W, W);
-    // Atmospheric glow background once per resize
+  if (!canvas._offCv) {
+    canvas._offCv = document.createElement("canvas");
+    canvas._offCv.width = W; canvas._offCv.height = W;
+    canvas._imgData = canvas._offCv.getContext("2d").createImageData(W, W);
   }
+  const offCtx = canvas._offCv.getContext("2d");
   const img = canvas._imgData, buf = img.data;
-  // Clear transparent dark space
+  buf.fill(0);
+  const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
+  const lon0 = GLOBE_VIEW.lon0;
+  const baseCol = kind === "t2" ? [24, 62, 130] : (kind === "olr" ? [46, 36, 108] : [18, 76, 86]);
+
+  for (let p = 0; p < geo.count; p++) {
+    const lon = wrapLonDeg(lon0 + geo.dlonDeg[p]);
+    const sh = geo.shade[p];
+    let r = baseCol[0] * sh, g = baseCol[1] * sh, b = baseCol[2] * sh;
+    if (drawGrid) {
+      const lat = geo.latVal[p];
+      if (Math.abs(lat % 30) < 0.9 || Math.abs(((lon + 360) % 30)) < 0.9) {
+        r = r * 0.72 + 56; g = g * 0.72 + 95; b = b * 0.72 + 135;
+      }
+    }
+    const o = geo.pixIdx[p];
+    buf[o] = r; buf[o + 1] = g; buf[o + 2] = b; buf[o + 3] = 255;
+  }
+  offCtx.putImageData(img, 0, 0);
+
+  ctx.clearRect(0, 0, W, W);
+  const halo = ctx.createRadialGradient(geo.cx, geo.cy, geo.R * 0.90, geo.cx, geo.cy, geo.R * 1.10);
+  halo.addColorStop(0, "rgba(56,189,248,0.28)"); halo.addColorStop(1, "rgba(56,189,248,0)");
+  ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(geo.cx, geo.cy, geo.R * 1.10, 0, Math.PI * 2); ctx.fill();
+  ctx.drawImage(canvas._offCv, 0, 0);
+  ctx.beginPath(); ctx.arc(geo.cx, geo.cy, geo.R, 0, Math.PI * 2);
+  ctx.strokeStyle = "rgba(56,189,248,0.65)"; ctx.lineWidth = 1.4; ctx.stroke();
+
+  ctx.fillStyle = "rgba(15,23,42,0.72)";
+  ctx.fillRect(geo.cx - 86, geo.cy - 13, 172, 26);
+  ctx.strokeStyle = "rgba(56,189,248,0.45)";
+  ctx.strokeRect(geo.cx - 86, geo.cy - 13, 172, 26);
+  ctx.fillStyle = "#bae6fd"; ctx.font = "11.5px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(LANG === "ja" ? "出力待機中 (▶実行で描画)" : "Waiting for model output...", geo.cx, geo.cy + 4);
+  ctx.textAlign = "left";
+}
+
+function renderOneGlobe(canvasId, kind, geo) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  if (!MON.raster) { renderIdleGlobe(canvasId, kind, geo); return; }
+  const ctx = canvas.getContext("2d");
+  const W = geo.size;
+  if (!canvas._offCv) {
+    canvas._offCv = document.createElement("canvas");
+    canvas._offCv.width = W; canvas._offCv.height = W;
+    canvas._imgData = canvas._offCv.getContext("2d").createImageData(W, W);
+  }
+  const offCtx = canvas._offCv.getContext("2d");
+  const img = canvas._imgData, buf = img.data;
   buf.fill(0);
   const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
   const lon0 = GLOBE_VIEW.lon0;
@@ -1980,8 +2037,7 @@ function renderOneGlobe(canvasId, kind, geo) {
 
   for (let p = 0; p < geo.count; p++) {
     const row = geo.latRow[p];
-    let lon = (lon0 + geo.dlonDeg[p]) % 360;
-    if (lon < -180) lon += 360; if (lon >= 180) lon -= 360;
+    const lon = wrapLonDeg(lon0 + geo.dlonDeg[p]);
     const col = Math.max(0, Math.min(359, Math.floor(lon + 180)));
     const gIdx = row * 360 + col;
     const sh = geo.shade[p];
@@ -2011,12 +2067,12 @@ function renderOneGlobe(canvasId, kind, geo) {
     const o = geo.pixIdx[p];
     buf[o] = r; buf[o+1] = g; buf[o+2] = b; buf[o+3] = 255;
   }
+  offCtx.putImageData(img, 0, 0);
   ctx.clearRect(0, 0, W, W);
-  // Subtle atmosphere limb halo
   const halo = ctx.createRadialGradient(geo.cx, geo.cy, geo.R*0.92, geo.cx, geo.cy, geo.R*1.08);
-  halo.addColorStop(0, "rgba(56,189,248,0.22)"); halo.addColorStop(1, "rgba(56,189,248,0)");
+  halo.addColorStop(0, "rgba(56,189,248,0.28)"); halo.addColorStop(1, "rgba(56,189,248,0)");
   ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(geo.cx, geo.cy, geo.R*1.08, 0, Math.PI*2); ctx.fill();
-  ctx.putImageData(img, 0, 0);
+  ctx.drawImage(canvas._offCv, 0, 0);
 }
 
 let _lastAnimTs = 0;
@@ -2027,18 +2083,16 @@ function animateGlobes(ts) {
   const dt = Math.min((ts - (_lastAnimTs || ts)) / 1000.0, 0.1);
   _lastAnimTs = ts;
 
-  if ((document.getElementById("globe-spin")?.checked ?? true) && !GLOBE_VIEW.dragging && MON.raster) {
+  if ((document.getElementById("globe-spin")?.checked ?? true) && !GLOBE_VIEW.dragging) {
     const spd = Number(document.getElementById("globe-speed")?.value ?? 12);
-    GLOBE_VIEW.lon0 = ((GLOBE_VIEW.lon0 + spd * dt + 180) % 360) - 180;
+    GLOBE_VIEW.lon0 = wrapLonDeg(GLOBE_VIEW.lon0 + spd * dt);
   }
-  if (MON.raster) {
-    const geo = getOrthoGeo();
-    renderOneGlobe("globeT2", "t2", geo);
-    renderOneGlobe("globeOLR", "olr", geo);
-    renderOneGlobe("globeLAI", "lai", geo);
-    document.getElementById("view-angles").textContent =
-      `Center: lat ${GLOBE_VIEW.lat0>=0?"+":""}${GLOBE_VIEW.lat0.toFixed(1)}°, lon ${GLOBE_VIEW.lon0>=0?"+":""}${GLOBE_VIEW.lon0.toFixed(1)}°`;
-  }
+  const geo = getOrthoGeo();
+  renderOneGlobe("globeT2", "t2", geo);
+  renderOneGlobe("globeOLR", "olr", geo);
+  renderOneGlobe("globeLAI", "lai", geo);
+  document.getElementById("view-angles").textContent =
+    `Center: lat ${GLOBE_VIEW.lat0>=0?"+":""}${GLOBE_VIEW.lat0.toFixed(1)}°, lon ${GLOBE_VIEW.lon0>=0?"+":""}${GLOBE_VIEW.lon0.toFixed(1)}°`;
 }
 
 function resetGlobeView() { GLOBE_VIEW.lat0 = 18.0; GLOBE_VIEW.lon0 = 140.0; }
@@ -2314,10 +2368,15 @@ function drawOthelloIconFrame(nowMs) {
   const S = W / 512.0;
   ctx.clearRect(0, 0, W, H);
 
-  // Rounded dark icon badge
+  // Rounded dark icon badge (portable across all Safari / Chrome / Firefox versions)
   const pad = 14 * S, bw = 484 * S, r = 110 * S;
   ctx.beginPath();
-  ctx.roundRect(pad, pad, bw, bw, r);
+  ctx.moveTo(pad + r, pad);
+  ctx.arcTo(pad + bw, pad, pad + bw, pad + bw, r);
+  ctx.arcTo(pad + bw, pad + bw, pad, pad + bw, r);
+  ctx.arcTo(pad, pad + bw, pad, pad, r);
+  ctx.arcTo(pad, pad, pad + bw, pad, r);
+  ctx.closePath();
   ctx.fillStyle = "#0b1322";
   ctx.fill();
   ctx.lineWidth = 3.0 * S;
@@ -2485,9 +2544,17 @@ def get_scvt_preview_payload(glevel: int) -> dict[str, Any]:
     if raw is None:
         if str(_REPO_ROOT / "scripts") not in sys.path:
             sys.path.insert(0, str(_REPO_ROOT / "scripts"))
-        from build_scvt_preview_cache import _extract_voronoi_preview_level  # type: ignore
+        from build_scvt_preview_cache import (  # type: ignore
+            _extract_voronoi_preview_level,
+            load_earth2014_mask_tree,
+        )
 
-        d = _extract_voronoi_preview_level(g)
+        if not hasattr(get_scvt_preview_payload, "_earth_mask"):
+            get_scvt_preview_payload._earth_mask = load_earth2014_mask_tree(stride=3)  # type: ignore[attr-defined]
+        e_tree, e_ocn, e_ice = get_scvt_preview_payload._earth_mask  # type: ignore[attr-defined]
+        d = _extract_voronoi_preview_level(
+            g, earth_tree=e_tree, earth_is_ocn=e_ocn, earth_is_ice=e_ice
+        )
         raw = {
             "xyz_cell": d[f"g{g}_xyz_cell"],
             "xyz_vert": d[f"g{g}_xyz_vert"],

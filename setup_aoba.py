@@ -106,6 +106,16 @@ def fetch_earth2014(*, prefer_wget: bool = False, include_ret: bool = False) -> 
     for layer in layers:
         fp = target_dir / f"Earth2014.{layer}.5min.geod.bin"
         print(f"  [OK] {fp.name} ({fp.stat().st_size:,} bytes)", flush=True)
+
+    scvt_cache = _REPO_ROOT / "config" / "scvt_preview_meshes.npz"
+    if not scvt_cache.exists():
+        scripts_dir = _REPO_ROOT / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from build_scvt_preview_cache import build_preview_archive
+
+        print("Precomputing SCVT G0..G6 GUI preview cache...", flush=True)
+        build_preview_archive(scvt_cache, max_glevel=6)
     return target_dir
 
 

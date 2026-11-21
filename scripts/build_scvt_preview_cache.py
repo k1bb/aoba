@@ -102,22 +102,14 @@ def _extract_voronoi_preview_level(
     }
 
 
-def build_preview_archive(out_path: Path | None = None, max_glevel: int = 6) -> Path:
-    """Build and save compressed `config/scvt_preview_meshes.npz` covering `G0..G{max_glevel}`."""
-    target = out_path or (_REPO_ROOT / "config" / "scvt_preview_meshes.npz")
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    # Load Earth2014 at stride=3 (15-arc-min = 720x1440 = 1.03M pts, ultra-fast <0.1s per level)
-    earth_tree = None
-    earth_ocn = None
-    earth_ice = None
+def load_earth2014_mask_tree(stride: int = 3) -> tuple[cKDTree | None, np.ndarray | None, np.ndarray | None]:
+    """Load Earth2014 5-arc-min land/ocean/ice mask KD-tree on CPU if binaries are present."""
     try:
         e_dir = ensure_earth2014_data(None, auto_download=False)
         sur_p = e_dir / "Earth2014.SUR2014.5min.geod.bin"
         ice_p = e_dir / "Earth2014.ICE2014.5min.geod.bin"
         tbi_p = e_dir / "Earth2014.TBI2014.5min.geod.bin"
         if sur_p.exists() and ice_p.exists() and tbi_p.exists():
-            stride = 3
             sur = np.fromfile(sur_p, dtype=">i2").reshape(2160, 4320)[::stride, ::stride].astype(np.float32)
             ice = np.fromfile(ice_p, dtype=">i2").reshape(2160, 4320)[::stride, ::stride].astype(np.float32)
             tbi = np.fromfile(tbi_p, dtype=">i2").reshape(2160, 4320)[::stride, ::stride].astype(np.float32)
@@ -132,8 +124,19 @@ def build_preview_archive(out_path: Path | None = None, max_glevel: int = 6) -> 
             earth_tree = cKDTree(xyz_e)
             earth_ocn = ((sur == 0.0) & (tbi < 0.0) & (ice == 0.0)).ravel().astype(np.float64)
             earth_ice = ((ice > 0.0) & (sur > 0.0)).ravel().astype(np.float64)
+            return earth_tree, earth_ocn, earth_ice
     except Exception:
         pass
+    return None, None, None
+
+
+def build_preview_archive(out_path: Path | None = None, max_glevel: int = 6) -> Path:
+    """Build and save compressed `config/scvt_preview_meshes.npz` covering `G0..G{max_glevel}`."""
+    target = out_path or (_REPO_ROOT / "config" / "scvt_preview_meshes.npz")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load Earth2014 at stride=3 (15-arc-min = 720x1440 = 1.03M pts, ultra-fast <0.1s per level)
+    earth_tree, earth_ocn, earth_ice = load_earth2014_mask_tree(stride=3)
 
     arrays: dict[str, np.ndarray] = {}
     t0 = time.perf_counter()

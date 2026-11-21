@@ -101,6 +101,7 @@ def test_gui_server_endpoints() -> None:
         base = f"http://127.0.0.1:{port}"
         html = urllib.request.urlopen(f"{base}/").read().decode("utf-8")
         assert "gridCanvas" in html and "globeT2" in html and "globeOLR" in html and "globeLAI" in html
+        assert "renderIdleGlobe" in html
         assert "lang-btn" in html and "toggleLang" in html and "tab-docs" in html and "renderMarkdownWithMath" in html
         assert "/assets/aoba_icon.png" in html and "aoba-header-icon" in html
         icon_bytes = urllib.request.urlopen(f"{base}/assets/aoba_icon.png").read()
