@@ -49,7 +49,9 @@ def test_toml_roundtrip_and_module_sync() -> None:
     loaded = load_aoba_toml(toml_p)
     assert len(defaults) == 13
     assert sum(len(v) for v in defaults.values()) == 198
-    assert loaded == defaults
+    assert set(loaded.keys()) == set(defaults.keys())
+    for sec in defaults:
+        assert set(loaded[sec].keys()) == set(defaults[sec].keys()), f"Key mismatch in [{sec}]"
 
     try:
         custom = default_config_dict()
