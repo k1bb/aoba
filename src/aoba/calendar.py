@@ -121,7 +121,7 @@ def _add_days(year: int, month: int, day: int, delta_days: int, calendar_type: s
 class AobaCalendar:
     """Calendar state & orbital-time mapper for an AOBA simulation."""
 
-    start_date: str = "2000-01-01"
+    start_date: str = "2000-03-20"
     calendar_type: str = "gregorian"
     insolation_mode: str = "seasonal"
     fixed_insolation_date: str = "2000-03-20"

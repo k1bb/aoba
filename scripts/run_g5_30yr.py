@@ -368,7 +368,12 @@ def main() -> None:
     stop_by_end_date = False
     for year in range(start_year, years + 1):
         cal_yr_days = days_in_year(model.calendar.start_year + year - 1, model.calendar.calendar_type)
-        eff_days_per_year = float(args.days_per_year) if args.days_per_year is not None else float(cal_yr_days)
+        if args.days_per_year is not None:
+            eff_days_per_year = float(args.days_per_year)
+        elif abs(float(out_cfg.days_per_year) - C.DAYS_PER_YEAR) > 1.0e-3:
+            eff_days_per_year = float(out_cfg.days_per_year)
+        else:
+            eff_days_per_year = float(cal_yr_days)
         steps_per_year = max(int(round(eff_days_per_year * C.SECONDS_PER_DAY / cfg.dt_host)), 12)
         n_mean_periods = max(int(out_cfg.monthly_mean_periods_per_year), 1)
         mean_bounds = [int(round(m * steps_per_year / float(n_mean_periods))) for m in range(n_mean_periods + 1)]

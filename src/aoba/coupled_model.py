@@ -96,7 +96,7 @@ class AOBAConfig:
     obliquity_deg: float = C.OBLIQUITY_DEG   # Axial tilt [deg]
     eccentricity: float = C.ECCENTRICITY     # Orbital eccentricity [-]
     perihelion_deg: float = C.PERIHELION_LON_DEG
-    start_date: str = "2000-01-01"           # Calendar start date (YYYY-MM-DD)
+    start_date: str = "2000-03-20"           # Calendar start date (YYYY-MM-DD; default Vernal Equinox)
     calendar_type: str = "gregorian"         # "gregorian" (leap years), "noleap" (365d), or "360_day"
     insolation_mode: str = "seasonal"        # "seasonal" or "perpetual_date"
     fixed_insolation_date: str = "2000-03-20"  # Fixed orbital date for perpetual insolation experiments
