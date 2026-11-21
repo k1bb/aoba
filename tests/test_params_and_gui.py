@@ -102,9 +102,14 @@ def test_gui_server_endpoints() -> None:
         html = urllib.request.urlopen(f"{base}/").read().decode("utf-8")
         assert "gridCanvas" in html and "globeT2" in html and "globeOLR" in html and "globeLAI" in html
         assert "lang-btn" in html and "toggleLang" in html and "tab-docs" in html and "renderMarkdownWithMath" in html
-        assert "/assets/aoba_icon.png" in html
+        assert "/assets/aoba_icon.png" in html and "aoba-header-icon" in html
         icon_bytes = urllib.request.urlopen(f"{base}/assets/aoba_icon.png").read()
         assert icon_bytes[:4] == b"\x89PNG"
+        svg_txt = urllib.request.urlopen(f"{base}/assets/aoba_icon.svg").read().decode("utf-8")
+        assert "<svg" in svg_txt and "othello-tile" in svg_txt
+        icon_json = json.loads(urllib.request.urlopen(f"{base}/assets/aoba_icon.json").read().decode("utf-8"))
+        assert icon_json["ok"] and len(icon_json["cells"]) == 354
+        assert sum(c[2] for c in icon_json["cells"]) == 39
 
         for doc_k in ("formulation_ja", "formulation_en", "architecture_ja", "architecture_en", "readme_ja", "readme_en"):
             doc_resp = json.loads(urllib.request.urlopen(f"{base}/api/docs?name={doc_k}").read().decode("utf-8"))

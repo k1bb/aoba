@@ -795,7 +795,10 @@ _HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 <header>
   <div class="brand">
-    <img src="/assets/aoba_icon.png" alt="AOBA Icon" style="width:40px;height:40px;border-radius:10px;display:block;" />
+    <canvas id="aoba-header-icon" width="96" height="96"
+            onclick="triggerOthelloFlip()"
+            title="AOBA Othello Grid — Click to flip / クリックでオセロ反転"
+            style="width:46px;height:46px;border-radius:11px;display:block;cursor:pointer;flex-shrink:0;"></canvas>
     <div>
       <h1>AOBA Studio</h1>
       <p data-i18n="brand_sub">設定 (TOML <span id="param-total">188</span>項目) → 実行 → 監視 → CPU リアルタイム 3地球可視化</p>
@@ -2268,9 +2271,165 @@ setInterval(() => {
   if (auto && active) fetchMonitorOnce();
 }, 5000);
 
+/* --- HEADER OTHELLO VORONOI 'A' ICON ANIMATION --- */
+let OTHELLO_CELLS = null;
+let othelloTargetInverted = false;
+let othelloFlipStartMs = -1;
+let othelloNextAutoMs = performance.now() + 3400;
+let othelloDirty = true;
+
+function triggerOthelloFlip() {
+  if (!OTHELLO_CELLS) return;
+  const now = performance.now();
+  othelloTargetInverted = !othelloTargetInverted;
+  othelloFlipStartMs = now;
+  othelloNextAutoMs = now + (othelloTargetInverted ? 4200 : 5400);
+  othelloDirty = true;
+}
+
+function drawOthelloIconFrame(nowMs) {
+  const cv = document.getElementById("aoba-header-icon");
+  if (!cv) return;
+
+  if (OTHELLO_CELLS && othelloFlipStartMs < 0 && nowMs >= othelloNextAutoMs) {
+    othelloTargetInverted = !othelloTargetInverted;
+    othelloFlipStartMs = nowMs;
+    othelloNextAutoMs = nowMs + (othelloTargetInverted ? 4200 : 5400);
+    othelloDirty = true;
+  }
+
+  const waveDur = 1550;
+  const tileFlipDur = 420;
+  const totalDur = waveDur + tileFlipDur;
+  const isFlipping = othelloFlipStartMs >= 0 && (nowMs - othelloFlipStartMs) <= totalDur;
+  if (othelloFlipStartMs >= 0 && !isFlipping) {
+    othelloFlipStartMs = -1;
+    othelloDirty = true;
+  }
+  if (!othelloDirty && !isFlipping) return;
+  othelloDirty = isFlipping;
+
+  const ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+  const S = W / 512.0;
+  ctx.clearRect(0, 0, W, H);
+
+  // Rounded dark icon badge
+  const pad = 14 * S, bw = 484 * S, r = 110 * S;
+  ctx.beginPath();
+  ctx.roundRect(pad, pad, bw, bw, r);
+  ctx.fillStyle = "#0b1322";
+  ctx.fill();
+  ctx.lineWidth = 3.0 * S;
+  ctx.strokeStyle = "#1e293b";
+  ctx.stroke();
+
+  if (!OTHELLO_CELLS) {
+    // Crisp fallback A before JSON arrives
+    ctx.beginPath();
+    ctx.arc(256 * S, 256 * S, 200 * S, 0, Math.PI * 2);
+    ctx.fillStyle = "#1d4ed8";
+    ctx.fill();
+    ctx.strokeStyle = "#38bdf8";
+    ctx.lineWidth = 2.5 * S;
+    ctx.stroke();
+    return;
+  }
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(256 * S, 256 * S, 200 * S, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.fillStyle = "#0b1322";
+  ctx.fillRect(0, 0, W, H);
+
+  const bluePal = ["#2563eb", "#1d4ed8", "#1e3a8a"];
+  const greenPal = ["#22c55e", "#16a34a", "#15803d"];
+  const flipAxis = -0.5585; // -32 deg diagonal Othello flip axis
+
+  for (let i = 0; i < OTHELLO_CELLS.length; i++) {
+    const cell = OTHELLO_CELLS[i]; // [cx, cy, isA, shade, wave, pts]
+    const cx = cell[0] * S, cy = cell[1] * S;
+    const isA = cell[2] === 1;
+    const shade = cell[3];
+    const wave = cell[4];
+    const pts = cell[5];
+
+    let showInv = othelloTargetInverted;
+    let flipScale = 1.0;
+    let rimEdge = false;
+
+    if (isFlipping) {
+      const elapsed = nowMs - othelloFlipStartMs;
+      const delay = (othelloTargetInverted ? wave : (1.0 - wave)) * waveDur;
+      const u = (elapsed - delay) / tileFlipDur;
+      if (u <= 0) {
+        showInv = !othelloTargetInverted;
+      } else if (u >= 1) {
+        showInv = othelloTargetInverted;
+      } else {
+        const th = Math.PI * (0.5 - 0.5 * Math.cos(Math.PI * u));
+        const sc = Math.cos(th);
+        showInv = sc < 0 ? othelloTargetInverted : !othelloTargetInverted;
+        flipScale = Math.max(0.08, Math.abs(sc));
+        rimEdge = Math.abs(sc) < 0.18;
+      }
+    }
+
+    const useGreen = showInv ? !isA : isA;
+    ctx.fillStyle = rimEdge ? "#94a3b8" : (useGreen ? greenPal[shade] : bluePal[shade]);
+
+    ctx.save();
+    if (flipScale < 0.999) {
+      ctx.translate(cx, cy);
+      ctx.rotate(flipAxis);
+      ctx.scale(flipScale, 1.0);
+      ctx.rotate(-flipAxis);
+      ctx.translate(-cx, -cy);
+    }
+    ctx.beginPath();
+    ctx.moveTo(pts[0] * S, pts[1] * S);
+    for (let k = 2; k < pts.length; k += 2) {
+      ctx.lineTo(pts[k] * S, pts[k + 1] * S);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.lineWidth = 2.0 * S;
+    ctx.strokeStyle = "#0b1322";
+    ctx.lineJoin = "round";
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();
+
+  ctx.beginPath();
+  ctx.arc(256 * S, 256 * S, 200 * S, 0, Math.PI * 2);
+  ctx.strokeStyle = "#38bdf8";
+  ctx.lineWidth = 2.4 * S;
+  ctx.stroke();
+}
+
+async function initOthelloIcon() {
+  try {
+    const res = await fetch("/assets/aoba_icon.json");
+    const data = await res.json();
+    if (data.ok && Array.isArray(data.cells)) {
+      OTHELLO_CELLS = data.cells;
+      othelloDirty = true;
+    }
+  } catch (e) { /* keep static fallback */ }
+}
+
+function animateHeaderIcon(now) {
+  drawOthelloIconFrame(now);
+  requestAnimationFrame(animateHeaderIcon);
+}
+
 fetchInitial();
+initOthelloIcon();
 bindGlobeInteractions();
 requestAnimationFrame(animateGlobes);
+requestAnimationFrame(animateHeaderIcon);
 </script>
 </body>
 </html>
@@ -2279,6 +2438,26 @@ requestAnimationFrame(animateGlobes);
 
 _SCVT_PREVIEW_MEM: dict[int, dict[str, Any]] = {}
 _SCVT_NPZ_PATH = _REPO_ROOT / "config" / "scvt_preview_meshes.npz"
+_OTHELLO_ICON_MEM: dict[str, Any] | None = None
+
+
+def get_othello_icon_payload() -> dict[str, Any]:
+    """Return compact SCVT G3 Voronoi 'A' icon cells for live Othello header animation."""
+    global _OTHELLO_ICON_MEM
+    if _OTHELLO_ICON_MEM is not None:
+        return _OTHELLO_ICON_MEM
+    if str(_REPO_ROOT / "scripts") not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+    from build_aoba_icon import build_voronoi_a_geometry  # type: ignore
+
+    cells = build_voronoi_a_geometry(glevel=3)
+    compact = [
+        [c["cx"], c["cy"], 1 if c["is_a"] else 0, c["shade"], c["wave"],
+         [coord for pt in c["pts"] for coord in pt]]
+        for c in cells
+    ]
+    _OTHELLO_ICON_MEM = {"ok": True, "cells": compact}
+    return _OTHELLO_ICON_MEM
 
 
 def get_scvt_preview_payload(glevel: int) -> dict[str, Any]:
@@ -2431,6 +2610,23 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
+            return
+
+        if parsed.path == "/assets/aoba_icon.svg":
+            svg_p = _REPO_ROOT / "docs" / "assets" / "aoba_icon.svg"
+            if not svg_p.exists():
+                self._send_json({"error": "SVG icon not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            raw = svg_p.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+
+        if parsed.path == "/assets/aoba_icon.json":
+            self._send_json(get_othello_icon_payload())
             return
 
         if parsed.path == "/api/docs":
