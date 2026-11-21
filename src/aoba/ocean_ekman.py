@@ -22,7 +22,7 @@ import torch
 from aoba import constants as C
 from aoba.scvt_dynamics import compute_scvt_divergence
 from aoba.scvt_mesh import SCVTMesh
-from aoba.surface import SURF_OCEAN, SurfaceState
+from aoba.surface import SURF_OCEAN, SurfaceState, _kahan_add
 
 
 # Codron (2012, Sec. 2a) standard physical parameters
@@ -48,14 +48,6 @@ class EkmanOceanState:
     h_sub_ml: float = H_THERMOCLINE
     t1_comp: torch.Tensor | None = None  # Kahan float32 rounding compensation for Layer-1 T_1 [K]
     t2_comp: torch.Tensor | None = None  # Kahan float32 rounding compensation for Layer-2 T_2 [K]
-
-
-def _kahan_add(val: torch.Tensor, delta: torch.Tensor, comp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Accumulate small `delta` onto `val` (~280 K) in float32 without swamping loss."""
-    y = delta + comp
-    t = val + y
-    new_comp = torch.where(val.abs() >= y.abs(), (val - t) + y, (y - t) + val)
-    return t, new_comp
 
 
 def init_ekman_ocean_state(

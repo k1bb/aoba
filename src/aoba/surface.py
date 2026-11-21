@@ -130,6 +130,15 @@ class SurfaceState:
 
     # Embedded EEO biosphere state
     bio: BiosphereState
+    t_ocean_ml_comp: torch.Tensor | None = None  # Kahan float32 rounding compensation for T_ml [K]
+
+
+def _kahan_add(val: torch.Tensor, delta: torch.Tensor, comp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accumulate small `delta` onto `val` (~280 K) in float32 without swamping loss."""
+    y = delta + comp
+    t = val + y
+    new_comp = torch.where(val.abs() >= y.abs(), (val - t) + y, (y - t) + val)
+    return t, new_comp
 
 
 @dataclass
@@ -216,6 +225,7 @@ def init_surface_state(
         t_seaice=torch.full(shape, C.T_FREEZE_OCEAN, device=dev, dtype=f_dtype),
         swe_seaice=torch.zeros(shape, device=dev, dtype=f_dtype),
         bio=bio,
+        t_ocean_ml_comp=torch.zeros(shape, device=dev, dtype=f_dtype),
     )
 
 
@@ -784,7 +794,9 @@ def step_surface(
 
     # Update ocean mixed-layer temperature T_ocean_ml before basal freeze/melt check
     cw_ml = C.RHO_SEAWATER * C.CP_SEAWATER * sfc.h_ocean_ml
-    t_ml_prov = sfc.t_ocean_ml + (dt / cw_ml) * ((1.0 - f_ice) * g_down_ow - f_ice * g_oi_up)
+    dt_ml_flux = (dt / cw_ml) * ((1.0 - f_ice) * g_down_ow - f_ice * g_oi_up)
+    comp0 = sfc.t_ocean_ml_comp if sfc.t_ocean_ml_comp is not None else torch.zeros_like(sfc.t_ocean_ml)
+    t_ml_prov, comp1 = _kahan_add(sfc.t_ocean_ml, dt_ml_flux, comp0)
 
     # If T_ml_prov < T_FREEZE_OCEAN: form new sea ice; if T_ml_prov > T_FREEZE_OCEAN and M_i > 0: basal melt
     e_freeze = cw_ml * torch.clamp(C.T_FREEZE_OCEAN - t_ml_prov, min=0.0)
@@ -794,7 +806,9 @@ def step_surface(
 
     m_si_next = torch.clamp(sfc.m_seaice + m_freeze - m_melt, min=0.0)
     # Net enthalpy adjustment on mixed layer after freeze/melt
-    t_ml_next = t_ml_prov + (C.L_F0 * m_freeze - C.L_F0 * torch.minimum(e_basal_melt / C.L_F0, sfc.m_seaice)) / cw_ml
+    dt_ml_lat = (C.L_F0 * m_freeze - C.L_F0 * torch.minimum(e_basal_melt / C.L_F0, sfc.m_seaice)) / cw_ml
+    t_ml_next, comp2 = _kahan_add(t_ml_prov, dt_ml_lat, comp1)
+    comp_final = torch.where((e_freeze > 0.0) | (m_melt > 0.0), torch.zeros_like(comp2), comp2)
 
     shf_o = (1.0 - f_ice) * shf_ow + f_ice * shf_si
     evap_o = (1.0 - f_ice) * evap_ow + f_ice * subl_si
@@ -817,6 +831,7 @@ def step_surface(
     sfc.snow_age = torch.where(is_terrestrial, snow_age_next, torch.zeros_like(snow_age_next))
 
     sfc.t_ocean_ml = torch.where(is_ocean, t_ml_next, sfc.t_ocean_ml)
+    sfc.t_ocean_ml_comp = torch.where(is_ocean, comp_final, comp0)
     sfc.u_star_ocean = torch.where(is_ocean, tr_ocn.u_star, sfc.u_star_ocean)
     sfc.m_seaice = torch.where(is_ocean, m_si_next, torch.zeros_like(m_si_next))
     sfc.t_seaice = torch.where(is_ocean, t_si_new, sfc.t_seaice)
