@@ -226,6 +226,7 @@ _FORCING_KEYS: tuple[str, ...] = (
     "co2_ppmv", "solar_constant", "omega", "obliquity_deg", "eccentricity", "perihelion_deg",
     "start_date", "calendar_type", "insolation_mode", "fixed_insolation_date", "diurnal_cycle",
     "use_earth2014", "earth2014_dir", "earth2014_stride", "enable_superparam",
+    "enable_dust", "c_dust_emiss",
     "h_ml_ocean", "re_liq_um", "re_ice_um",
 )
 _ICESHEET_CFG_KEYS: tuple[str, ...] = (

@@ -30,6 +30,7 @@ from aoba.biosphere import (
     update_daily_lai_root_height,
 )
 from aoba.crm import CRMState, SPTendencies, step_crm_physics_and_dynamics
+from aoba.dust import compute_dust_emission_sub, step_dust_column
 from aoba.icesheet import (
     H_ICE_THRESHOLD_M,
     IceSheetState,
@@ -109,6 +110,8 @@ class AOBAConfig:
     earth2014_dir: str = "data/boundary/earth2014_5min"
     earth2014_stride: int = 2
     enable_superparam: bool = True           # 1:1 embedded 3D CRM in every SCVT cell
+    enable_dust: bool = True                 # Map-free global-parameter mineral dust aerosol + radiative coupling
+    c_dust_emiss: float = 1.5e-9             # Single global dust emission scaling constant [kg s^2 m^-5]
     enable_dynamic_icesheet: bool = False    # Opt-in SIA + EMA-accelerated ice sheet & vertical grid update
     icesheet_ema_years: float = 5.0          # EMA smoothing timescale for annual SMB [years]
     icesheet_accel_factor: float = 100.0     # Initial ice-sheet spinup acceleration multiplier [-]
@@ -226,6 +229,7 @@ def _compute_four_band_radiation_chunked(
     col_chunk: int,
     re_liq_um: float = 10.0,
     re_ice_um: float = 50.0,
+    q_dust_c: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Evaluate 1D ICA 4-band radiative transfer across `[nz, m_sub]`, chunking when `m_sub > col_chunk`."""
     nz, m_sub = pres_c.shape
@@ -252,6 +256,7 @@ def _compute_four_band_radiation_chunked(
             re_ice_um=re_ice_um,
             albedo_vis_dif=albedo_vis_dif,
             albedo_nir_dif=albedo_nir_dif,
+            q_dust_c=q_dust_c,
         )
         return (
             rad.q_rad_net,
@@ -298,6 +303,7 @@ def _compute_four_band_radiation_chunked(
             re_ice_um=re_ice_um,
             albedo_vis_dif=albedo_vis_dif[sl],
             albedo_nir_dif=albedo_nir_dif[sl],
+            q_dust_c=q_dust_c[:, sl] if q_dust_c is not None else None,
         )
         q_rad[:, sl] = rad.q_rad_net
         sw1_dir[sl] = rad.sfc_sw1_dir_dn
@@ -406,6 +412,8 @@ def init_aoba_model(
         dtype=dtype,
     )
     atmos = init_global_hydrostatic_atmosphere(mesh, vgrid, moist=True, baroclinic_pert=True)
+    if cfg.enable_dust:
+        atmos.q_dust = torch.zeros_like(atmos.q_n)
 
     nz = cfg.nz
     nc = mesh.n_cells
@@ -687,6 +695,9 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
         temp_w_sub[1:-1] = 0.5 * (temp_sub[:-1] + temp_sub[1:])
         temp_w_sub[-1] = temp_sub[-1]
 
+        if cfg.enable_dust and atmos.q_dust is None:
+            atmos.q_dust = torch.zeros_like(atmos.q_n)
+        q_dust_rad = _cell_to_sub(atmos.q_dust, nc, n_sub) if (cfg.enable_dust and atmos.q_dust is not None) else None
         q_rad_sub, sw1_dir_sub, sw1_dif_sub, sw2_dir_sub, sw2_dif_sub, lw_dn_sub, olr_sub, asr_sub = (
             _compute_four_band_radiation_chunked(
                 pres_c=pres_sub,
@@ -710,6 +721,7 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
                 col_chunk=cfg.rad_col_chunk,
                 re_liq_um=cfg.re_liq_um,
                 re_ice_um=cfg.re_ice_um,
+                q_dust_c=q_dust_rad,
             )
         )
         model.rad_cache["q_rad_sub"] = q_rad_sub
@@ -838,6 +850,8 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
     m_new_host = atmos.rho_d * atmos.dz_c
     atmos.q_n = fct_advect_scvt(mesh, atmos.q_n, m_old_host, m_new_host, uh_acc * inv_nh, om_acc * inv_nh, dt)
     atmos.q_p = fct_advect_scvt(mesh, atmos.q_p, m_old_host, m_new_host, uh_acc * inv_nh, om_acc * inv_nh, dt)
+    if cfg.enable_dust and atmos.q_dust is not None:
+        atmos.q_dust = fct_advect_scvt(mesh, atmos.q_dust, m_old_host, m_new_host, uh_acc * inv_nh, om_acc * inv_nh, dt)
 
     dthm_ls = (atmos.theta_m - thm_before_dyn) / dt
     dqn_ls = (atmos.q_n - qn_before_dyn) / dt
@@ -971,6 +985,27 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
 
     rain_new = _sub_to_cell(rain_new_sub, nc, n_sub)
     snow_new = _sub_to_cell(snow_new_sub, nc, n_sub)
+    if cfg.enable_dust:
+        if atmos.q_dust is None:
+            atmos.q_dust = torch.zeros_like(atmos.q_n)
+        f_dust_sub = compute_dust_emission_sub(
+            surf_type=sfc_sub.surf_type,
+            lai=sfc_sub.bio.lai,
+            swe_land=sfc_sub.swe_land,
+            w_liq_soil_top=sfc_sub.w_liq_soil[0],
+            u_star=sfc_diag_sub.u_star,
+            c_dust_emiss=cfg.c_dust_emiss,
+        )
+        atmos.q_dust = step_dust_column(
+            q_dust=atmos.q_dust,
+            rho_d=atmos.rho_d,
+            dz_c=atmos.dz_c,
+            z_c=atmos.z_c,
+            f_dust_emit=_sub_to_cell(f_dust_sub, nc, n_sub),
+            precip_rate=rain_new + snow_new,
+            u_star_cell=_sub_to_cell(sfc_diag_sub.u_star, nc, n_sub),
+            dt=dt,
+        )
     evap_cell = _sub_to_cell(sfc_diag_sub.evap, nc, n_sub)
     shf_cell = _sub_to_cell(sfc_diag_sub.shf, nc, n_sub)
     gpp_cell = _sub_to_cell(sfc_diag_sub.gpp, nc, n_sub)

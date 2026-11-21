@@ -344,6 +344,57 @@ def test_dynamic_sia_icesheet_and_vertical_remap(device: str) -> None:
     assert "h_ice" in ds_ice.data_vars and "z_topo_dyn" in ds_ice.data_vars
 
 
+def test_mineral_dust_emission_transport_and_radiation(device: str) -> None:
+    """Verify map-free mineral dust emission, PBL/settling/washout, and 4-band radiative impact."""
+    from aoba.dust import compute_dust_emission_sub, step_dust_column
+    from aoba.radiation import compute_four_band_radiation
+    from aoba.surface import SURF_LAND, SURF_OCEAN
+
+    dev = torch.device(device)
+    # 4 columns: [bare dry windy land, vegetated dry windy land, snowy dry land, ocean]
+    surf = torch.tensor([SURF_LAND, SURF_LAND, SURF_LAND, SURF_OCEAN], device=dev)
+    lai = torch.tensor([0.0, 4.0, 0.0, 0.0], device=dev)
+    swe = torch.tensor([0.0, 0.0, 10.0, 0.0], device=dev)
+    w_liq = torch.tensor([0.5, 0.5, 0.5, 0.5], device=dev)
+    u_star = torch.tensor([0.6, 0.6, 0.6, 0.6], device=dev)
+
+    f_emit = compute_dust_emission_sub(surf, lai, swe, w_liq, u_star, c_dust_emiss=1.5e-9)
+    assert float(f_emit[0].item()) > 0.0
+    assert float(f_emit[1].item()) < float(f_emit[0].item()) * 0.2  # LAI suppresses emission
+    assert float(f_emit[2].item()) == 0.0  # Snow suppresses emission
+    assert float(f_emit[3].item()) == 0.0  # Ocean emits 0
+
+    nz = 16
+    q_dust = torch.zeros((nz, 4), device=dev)
+    rho_d = torch.full((nz, 4), 1.1, device=dev)
+    dz_c = torch.full((nz, 4), 500.0, device=dev)
+    z_c = (torch.arange(nz, device=dev, dtype=torch.float32) + 0.5).unsqueeze(1) * 500.0
+    precip = torch.tensor([0.0, 0.0, 0.0, 1.0e-3], device=dev)
+    q_next = step_dust_column(q_dust, rho_d, dz_c, z_c, f_emit, precip, u_star, dt=720.0)
+    assert (q_next >= 0.0).all()
+    assert float(q_next[0, 0].item()) > 0.0 and float(q_next[1, 0].item()) > 0.0
+
+    # Check radiative cooling / diffuse scattering from dust column
+    p_c = torch.linspace(95000.0, 5000.0, nz, device=dev).unsqueeze(1)
+    p_w = torch.linspace(100000.0, 2000.0, nz + 1, device=dev).unsqueeze(1)
+    t_c = torch.linspace(295.0, 210.0, nz, device=dev).unsqueeze(1)
+    t_w = torch.linspace(298.0, 208.0, nz + 1, device=dev).unsqueeze(1)
+    zeros = torch.zeros((nz, 1), device=dev)
+    q_d_col = torch.full((nz, 1), 5.0e-8, device=dev)
+    alb = torch.tensor([0.25], device=dev)
+    mu0 = torch.tensor([0.8], device=dev)
+    s0 = torch.tensor([1361.0], device=dev)
+
+    rad_clean = compute_four_band_radiation(
+        p_c, p_w, t_c, t_w, dz_c[:, :1], rho_d[:, :1], zeros, zeros, zeros, t_w[0], alb, alb, mu0, s0
+    )
+    rad_dust = compute_four_band_radiation(
+        p_c, p_w, t_c, t_w, dz_c[:, :1], rho_d[:, :1], zeros, zeros, zeros, t_w[0], alb, alb, mu0, s0, q_dust_c=q_d_col
+    )
+    assert float(rad_dust.sfc_sw1_dir_dn.item()) < float(rad_clean.sfc_sw1_dir_dn.item())
+    assert float(rad_dust.sfc_sw1_dif_dn.item()) > float(rad_clean.sfc_sw1_dif_dn.item())
+
+
 if __name__ == "__main__":
     for dev in _available_devices():
         print(f"Running Phase 2 & Phase 3 Global AOBA tests on device={dev}...")
@@ -353,4 +404,5 @@ if __name__ == "__main__":
         test_koppen_geiger_beck_2018_table1(dev)
         test_full_global_coupled_aoba_and_zarr_v3_io(dev)
         test_dynamic_sia_icesheet_and_vertical_remap(dev)
+        test_mineral_dust_emission_transport_and_radiation(dev)
     print("ALL PHASE 2 & PHASE 3 GLOBAL AOBA TESTS PASSED!")

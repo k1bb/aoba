@@ -517,6 +517,7 @@ def compute_four_band_radiation(
     re_ice_um: float = 50.0,
     albedo_vis_dif: torch.Tensor | None = None,
     albedo_nir_dif: torch.Tensor | None = None,
+    q_dust_c: torch.Tensor | None = None,
 ) -> RadiationOutput:
     """Evaluate 4-band (SW1, SW2, LW1, LW2) radiative fluxes and heating rates.
 
@@ -534,6 +535,7 @@ def compute_four_band_radiation(
     qv = torch.clamp(torch.flip(qv_c, dims=[0]), min=0.0)
     qc = torch.clamp(torch.flip(qc_c, dims=[0]), min=0.0)
     qi = torch.clamp(torch.flip(qi_c, dims=[0]), min=0.0)
+    q_dust = torch.clamp(torch.flip(q_dust_c, dims=[0]), min=0.0) if q_dust_c is not None else None
 
     N = p_c.shape[0]
     col_shape = t_sfc.shape
@@ -587,13 +589,37 @@ def compute_four_band_radiation(
 
     tau_sw1 = dtau_o3 + dtau_ray + tau_c1
     scat_sw1 = dtau_ray + tau_c1 * om_c1
-    om_sw1 = scat_sw1 / torch.clamp(tau_sw1, min=1.0e-8)
-    g_sw1 = (tau_c1 * om_c1 * g_c1) / torch.clamp(scat_sw1, min=1.0e-8)
+    asym_scat_sw1 = tau_c1 * om_c1 * g_c1
 
     tau_sw2 = dtau_wv_sw2 + tau_c2
     scat_sw2 = tau_c2 * om_c2
+    asym_scat_sw2 = tau_c2 * om_c2 * g_c2
+
+    if q_dust is not None:
+        from aoba.dust import (
+            DUST_ASYM_SW1,
+            DUST_ASYM_SW2,
+            DUST_K_EXT_SW1,
+            DUST_K_EXT_SW2,
+            DUST_SSA_SW1,
+            DUST_SSA_SW2,
+        )
+
+        dm_dust = q_dust * dm_dry
+        tau_d1 = DUST_K_EXT_SW1 * dm_dust
+        tau_d2 = DUST_K_EXT_SW2 * dm_dust
+        tau_sw1 = tau_sw1 + tau_d1
+        scat_sw1 = scat_sw1 + tau_d1 * DUST_SSA_SW1
+        asym_scat_sw1 = asym_scat_sw1 + tau_d1 * DUST_SSA_SW1 * DUST_ASYM_SW1
+        tau_sw2 = tau_sw2 + tau_d2
+        scat_sw2 = scat_sw2 + tau_d2 * DUST_SSA_SW2
+        asym_scat_sw2 = asym_scat_sw2 + tau_d2 * DUST_SSA_SW2 * DUST_ASYM_SW2
+
+    om_sw1 = scat_sw1 / torch.clamp(tau_sw1, min=1.0e-8)
+    g_sw1 = asym_scat_sw1 / torch.clamp(scat_sw1, min=1.0e-8)
+
     om_sw2 = scat_sw2 / torch.clamp(tau_sw2, min=1.0e-8)
-    g_sw2 = g_c2
+    g_sw2 = asym_scat_sw2 / torch.clamp(scat_sw2, min=1.0e-8)
 
     sw1_up, sw1_dn, sfc_sw1_dir, sfc_sw1_dif = toon_two_stream_sw(
         tau_sw1,
@@ -644,6 +670,12 @@ def compute_four_band_radiation(
 
     tau_lw1 = dtau_wv_lw1 + dtau_co2_lw1 + tau_cld_lw1
     tau_lw2 = dtau_wv_lw2 + dtau_co2_lw2 + tau_cld_lw2
+    if q_dust is not None:
+        from aoba.dust import DUST_K_ABS_LW1, DUST_K_ABS_LW2
+
+        dm_dust = q_dust * dm_dry
+        tau_lw1 = tau_lw1 + DUST_K_ABS_LW1 * dm_dust
+        tau_lw2 = tau_lw2 + DUST_K_ABS_LW2 * dm_dust
 
     eb_int = C.STEFAN_BOLTZMANN * (torch.clamp(t_w, min=100.0) ** 4)
     eb_sfc = C.STEFAN_BOLTZMANN * (torch.clamp(t_sfc, min=100.0) ** 4)
