@@ -136,7 +136,10 @@ def step_ekman_ocean_voronoi(
 
     h1_e = 0.5 * (sfc.h_ocean_ml[c0] + sfc.h_ocean_ml[c1])
     if ENABLE_SHALLOW_WATER_OCN:
-        h_sw = ocn.h_sw
+        # Enforce minimum Layer-2 thickness of 20 m (h_sw >= h_1 + 20 m) for well-conditioned enthalpy
+        h_sw_min = sfc.h_ocean_ml + 20.0
+        h_sw = torch.where(is_ocean, torch.clamp(torch.maximum(ocn.h_sw, h_sw_min), max=800.0), torch.zeros_like(ocn.h_sw))
+        h2_old = torch.where(is_ocean, torch.clamp(h_sw - sfc.h_ocean_ml, min=20.0), torch.full_like(h_sw, ocn.h_sub_ml))
         u_sw = ocn.u_sw_edge * mask_edge
         tau_n_e = (tx_e * mesh.east_normal_edge + ty_e * mesh.north_normal_edge) * mask_edge
 
@@ -155,7 +158,7 @@ def step_ekman_ocean_voronoi(
         ep_idx = mesh.trisk_edges
         w_trisk = mesh.trisk_weights
 
-        def _sw_rhs(u_cur: torch.Tensor, h_cur: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        def _sw_rhs(u_cur: torch.Tensor, h_cur: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             zeta_v = compute_scvt_vorticity(mesh, u_cur)
             eta_v = zeta_v + mesh.f_vert
             eta_e = 0.5 * (eta_v[v0_e] + eta_v[v1_e])
@@ -169,50 +172,61 @@ def step_ekman_ocean_voronoi(
 
             du = (cor_sw + pgf_sw + wind_acc + a_h * lap_u_sw - R_SW_DRAG * u_cur) * mask_edge
             h_up = torch.where(u_cur >= 0.0, h_cur[c0], h_cur[c1])
-            dh = -compute_scvt_divergence(mesh, h_up * u_cur * mask_edge) * is_ocean_f
-            return du, dh
+            v_flux = h_up * u_cur * mask_edge
+            dh = -compute_scvt_divergence(mesh, v_flux) * is_ocean_f
+            return du, dh, v_flux
 
         # Wicker & Skamarock (2002) 3-stage RK3 ensures strict stability for high-latitude inertial oscillations
+        v_sw_acc = torch.zeros_like(u_sw)
         for _ in range(n_sw):
             u0_sw, h0_sw = u_sw, h_sw
+            v_stage = torch.zeros_like(u_sw)
             for rk_dt in (dt_sw / 3.0, 0.5 * dt_sw, dt_sw):
-                du_k, dh_k = _sw_rhs(u_sw, h_sw)
+                du_k, dh_k, v_stage = _sw_rhs(u_sw, h_sw)
                 u_sw = torch.clamp((u0_sw + rk_dt * du_k) * mask_edge, -5.0, 5.0)
                 h_sw = torch.where(
                     is_ocean,
-                    torch.clamp(h0_sw + rk_dt * dh_k, min=20.0, max=800.0),
+                    torch.clamp(torch.maximum(h0_sw + rk_dt * dh_k, h_sw_min), max=800.0),
                     torch.zeros_like(h0_sw),
                 )
+            v_sw_acc = v_sw_acc + v_stage
 
+        v_sw_eff = v_sw_acc / float(n_sw)
         ocn.u_sw_edge = u_sw
         ocn.h_sw = h_sw
+        h2_new = torch.where(is_ocean, torch.clamp(h_sw - sfc.h_ocean_ml, min=20.0), torch.full_like(h_sw, ocn.h_sub_ml))
 
         # Decompose geostrophic/gyre velocity u_g = u_sw - M_E / (rho_w * H_sw) to avoid double-counting Ekman
         h_sw_e = torch.clamp(0.5 * (h_sw[c0] + h_sw[c1]), min=20.0)
         u_g_e = (u_sw - mn_ek / (C.RHO_SEAWATER * h_sw_e)) * mask_edge
         m1_edge = mn_ek + C.RHO_SEAWATER * h1_e * u_g_e
+        # Exact Layer-2 return mass flux balancing total upper-layer transport rho_w * v_sw_eff
+        m2_edge = (C.RHO_SEAWATER * v_sw_eff - m1_edge) * mask_edge
+        h2_edge = 0.5 * (h2_old[c0] + h2_old[c1])
     else:
+        h2_old = torch.full_like(sfc.t_ocean_ml, ocn.h_sub_ml)
+        h2_new = h2_old
         m1_edge = mn_ek
+        m2_edge = -mn_ek
+        h2_edge = torch.full_like(mn_ek, ocn.h_sub_ml)
 
     # Exact mass-conserving vertical upwelling flux W_12 = div_SCVT(M_1) [kg m^-2 s^-1]
     w_ek = compute_scvt_divergence(mesh, m1_edge) * is_ocean_f
     ocn.w_ekman = w_ek
 
-    # 2. Flux-form upwind heat transport for Layer 1 (+m1_edge) and Layer 2 (-m1_edge)
+    # 2. Flux-form upwind heat transport for Layer 1 (+m1_edge) and variable-thickness Layer 2 (+m2_edge)
     t1 = sfc.t_ocean_ml
     t2 = ocn.t_sub_ml
 
     f1_adv = torch.clamp(m1_edge, min=0.0) * t1[c0] + torch.clamp(m1_edge, max=0.0) * t1[c1]
-    # Layer 2 return transport is m2_edge = -m1_edge:
-    mn_ret = -m1_edge
-    f2_adv = torch.clamp(mn_ret, min=0.0) * t2[c0] + torch.clamp(mn_ret, max=0.0) * t2[c1]
+    f2_adv = torch.clamp(m2_edge, min=0.0) * t2[c0] + torch.clamp(m2_edge, max=0.0) * t2[c1]
 
     # Vertical upwind temperature across base of mixed layer: T_2 if upwelling (W_E > 0), T_1 if downwelling
     t_vert = torch.where(w_ek >= 0.0, t2, t1)
 
     # 3. Horizontal mesoscale eddy diffusion with zero-flux coastal Neumann boundary condition
     f1_diff = -C.RHO_SEAWATER * h1_e * KAPPA_OCN_HORIZ * ((t1[c1] - t1[c0]) / mesh.dc_edge) * mask_edge
-    f2_diff = -C.RHO_SEAWATER * ocn.h_sub_ml * KAPPA_OCN_HORIZ * ((t2[c1] - t2[c0]) / mesh.dc_edge) * mask_edge
+    f2_diff = -C.RHO_SEAWATER * h2_edge * KAPPA_OCN_HORIZ * ((t2[c1] - t2[c0]) / mesh.dc_edge) * mask_edge
 
     div_q1 = C.CP_SEAWATER * (compute_scvt_divergence(mesh, f1_adv + f1_diff) - w_ek * t_vert)
     div_q2 = C.CP_SEAWATER * (compute_scvt_divergence(mesh, f2_adv + f2_diff) + w_ek * t_vert)
@@ -229,7 +243,7 @@ def step_ekman_ocean_voronoi(
         q_calve = q_calve / mesh.area_cell  # [W m^-2] over receiving coastal ocean cell
 
     c1_cap = C.CP_SEAWATER * C.RHO_SEAWATER * sfc.h_ocean_ml
-    c2_cap = C.CP_SEAWATER * C.RHO_SEAWATER * ocn.h_sub_ml
+    c2_cap_new = C.CP_SEAWATER * C.RHO_SEAWATER * h2_new
 
     if ocn.t1_comp is None:
         ocn.t1_comp = torch.zeros_like(t1)
@@ -237,7 +251,8 @@ def step_ekman_ocean_voronoi(
         ocn.t2_comp = torch.zeros_like(t2)
 
     dt1 = (dt / c1_cap) * (-div_q1 + q_diap - q_calve)
-    dt2 = (dt / c2_cap) * (-div_q2 - q_diap)
+    # Variable-thickness Layer-2 enthalpy update: h2_new * T2_new = h2_old * T2_old + dt * RHS_2 / (rho_w * c_p)
+    dt2 = ((h2_old - h2_new) * t2 + (dt / (C.CP_SEAWATER * C.RHO_SEAWATER)) * (-div_q2 - q_diap)) / h2_new
     t1_next, comp1 = _kahan_add(t1, dt1, ocn.t1_comp)
     t2_next, comp2 = _kahan_add(t2, dt2, ocn.t2_comp)
 

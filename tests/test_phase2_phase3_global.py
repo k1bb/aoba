@@ -125,10 +125,11 @@ def test_ekman_ocean_upwelling_and_heat_conservation(device: str) -> None:
 
     is_ocn = (mesh.surf_type == SURF_OCEAN).to(mesh.area_cell.dtype)
     c1 = C.CP_SEAWATER * C.RHO_SEAWATER * sfc.h_ocean_ml
-    c2 = C.CP_SEAWATER * C.RHO_SEAWATER * ocn.h_sub_ml
 
-    # Measure enthalpy relative to T_FREEZE_OCEAN for float32 precision
+    # Measure enthalpy relative to T_FREEZE_OCEAN for float32 precision (with variable Layer-2 thickness)
     def _ocean_heat() -> torch.Tensor:
+        h2 = torch.clamp(ocn.h_sw - sfc.h_ocean_ml, min=20.0) if ocn.h_sw is not None else ocn.h_sub_ml
+        c2 = C.CP_SEAWATER * C.RHO_SEAWATER * h2
         e_cell = c1 * (sfc.t_ocean_ml - C.T_FREEZE_OCEAN) + c2 * (ocn.t_sub_ml - C.T_FREEZE_OCEAN)
         return (mesh.area_cell * is_ocn * e_cell).sum()
 
