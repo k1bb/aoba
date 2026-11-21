@@ -458,15 +458,20 @@ def test_clm5_canopy_hydrology_and_dsl_soil_resistance(device: str) -> None:
     assert not torch.isnan(wc).any()
 
     # B. Dry-surface-layer: bare soil (LAI = 0) evaporates less when the top soil layer is drier
+    # Use moistures above air-dry theta_air (~0.058) so all 3 columns evaporate positively, and check hyper-arid 0.04 >= 0
     surf_b = torch.full((n,), SURF_LAND, device=dev)
     sfc_b = init_surface_state(surf_b, t_init=300.0)
     sfc_b.bio.lai = torch.zeros(n, device=dev)
-    sfc_b.w_liq_soil[0] = torch.tensor([0.34, 0.20, 0.04], device=dev)
+    sfc_b.w_liq_soil[0] = torch.tensor([0.34, 0.20, 0.08], device=dev)
     diag = step_surface(**_forcing(sfc_b, rain=0.0, qv=0.004, temp=300.0, sw=300.0))
     e = diag.evap
     assert (e > 0.0).all()
     assert float(e[0].item()) > float(e[1].item()) > float(e[2].item())  # wetter soil evaporates more
     assert float(e[0].item()) > 3.0 * float(e[2].item())  # DSL strongly throttles very dry soil
+    # Hyper-arid soil below air-dry threshold must not draw spurious condensation from unsaturated air (CLM5 Sec. 5.2)
+    sfc_b.w_liq_soil[0] = torch.full((n,), 0.04, device=dev)
+    diag_dry = step_surface(**_forcing(sfc_b, rain=0.0, qv=0.004, temp=300.0, sw=300.0))
+    assert (diag_dry.evap >= -1.0e-12).all()
 
     # C. No double-counted 1/g_a on bare wet soil or bare snow: check exact effective resistance r_tot = 1/g_a + r_d
     # Use neutral isothermal bare wet soil (w_liq >= theta_init => r_soil = 0) and bare snow (a_sn = 1, LAI = 0).
@@ -626,6 +631,77 @@ def test_multilayer_richards_hydrology_and_dynamic_roots(device: str) -> None:
     assert float(beta[1].item()) > float(beta[0].item()) + 0.3
 
 
+def test_three_source_leaf_energy_balance_rsl_and_pmodel_coupling(device: str) -> None:
+    """Verify independent sunlit/shaded leaf EB, iterative stomatal equilibrium, and leaf-surface (c_s, D_s) P-model."""
+    from aoba.biosphere import compute_two_leaf_gas_exchange
+    from aoba.surface import SURF_LAND, init_surface_state, step_surface
+
+    dev = torch.device(device)
+    # 2 forested columns: [0: well-watered forest, 1: drought-stressed forest with closed stomata]
+    n = 2
+    sfc = init_surface_state(torch.full((n,), SURF_LAND, device=dev), t_init=298.0)
+    sfc.bio.lai = torch.tensor([4.0, 4.0], device=dev)
+    sfc.bio.h_canopy = torch.tensor([20.0, 20.0], device=dev)
+    sfc.w_liq_soil[:, 0] = 0.30
+    sfc.w_liq_soil[:, 1] = 0.13  # Near wilting point -> strong stomatal closure
+    # Also verify restart backward-compatibility when 3-source warm-start fields are None
+    sfc.t_leaf_sun = None
+    sfc.t_leaf_sh = None
+    sfc.t_gnd_skin = None
+
+    ones = torch.ones(n, device=dev)
+    kw = dict(
+        u_1=2.0 * ones,
+        v_1=0.0 * ones,
+        temp_1=298.0 * ones,
+        qv_1=0.008 * ones,
+        pres_1=0.99e5 * ones,
+        pres_sfc=1.0e5 * ones,
+        z_ref_rel=30.0 * ones,
+        sw1_dir_down=360.0 * ones,
+        sw1_dif_down=60.0 * ones,
+        sw2_dir_down=320.0 * ones,
+        sw2_dif_down=50.0 * ones,
+        lw_down=360.0 * ones,
+        precip_rain=0.0 * ones,
+        precip_snow=0.0 * ones,
+        mu0=0.85 * ones,
+        co2_ppmv=400.0,
+        dt=720.0,
+    )
+    diag = step_surface(sfc, **kw)
+    assert torch.isfinite(diag.shf).all() and torch.isfinite(diag.lhf).all()
+    assert sfc.t_leaf_sun is not None and sfc.t_leaf_sh is not None and sfc.t_gnd_skin is not None
+    # 1. Sunlit leaves must warm significantly above shaded leaves from independent radiative/convective EB
+    assert float(sfc.t_leaf_sun[0].item()) > float(sfc.t_leaf_sh[0].item()) + 0.5
+    assert float(sfc.t_leaf_sun[1].item()) > float(sfc.t_leaf_sh[1].item()) + 1.0
+    # 2. Stomatal closure under drought heats sunlit leaves higher and raises sensible heat vs well-watered forest
+    assert float(sfc.t_leaf_sun[1].item()) > float(sfc.t_leaf_sun[0].item()) + 0.5
+    assert float(diag.lhf[0].item()) > float(diag.lhf[1].item()) + 40.0
+    assert float(diag.shf[1].item()) > float(diag.shf[0].item()) + 20.0
+
+    # 3. Leaf-surface (c_s, D_s) P-model coupling converges cleanly to standard P-model as g_bw -> infinity
+    t_l = torch.tensor([300.0, 300.0], device=dev)
+    vpd = torch.tensor([1800.0, 1800.0], device=dev)
+    p_s = torch.tensor([1.0e5, 1.0e5], device=dev)
+    ws = torch.ones(n, device=dev)
+    res_inf = compute_two_leaf_gas_exchange(
+        sfc.bio, 300.0 * ones, 50.0 * ones, 0.85 * ones, t_l, t_l, vpd, vpd, p_s, 400.0, sfc.bio.lai, ws
+    )
+    res_hi_gb = compute_two_leaf_gas_exchange(
+        sfc.bio, 300.0 * ones, 50.0 * ones, 0.85 * ones, t_l, t_l, vpd, vpd, p_s, 400.0, sfc.bio.lai, ws,
+        gbw_sun=torch.full((n,), 10.0, device=dev), gbw_sh=torch.full((n,), 10.0, device=dev),
+    )
+    res_lo_gb = compute_two_leaf_gas_exchange(
+        sfc.bio, 300.0 * ones, 50.0 * ones, 0.85 * ones, t_l, t_l, vpd, vpd, p_s, 400.0, sfc.bio.lai, ws,
+        gbw_sun=torch.full((n,), 0.015, device=dev), gbw_sh=torch.full((n,), 0.015, device=dev),
+    )
+    assert torch.allclose(res_hi_gb.gsw_sun, res_inf.gsw_sun, rtol=2.0e-2)
+    # Finite low boundary-layer conductance lowers leaf-surface D_s (humidification) & c_s, shifting gsw cleanly
+    assert torch.isfinite(res_lo_gb.gsw_sun).all() and (res_lo_gb.gsw_sun > 0.0).all()
+    assert float(res_lo_gb.gpp[0].item()) < float(res_inf.gpp[0].item())
+
+
 if __name__ == "__main__":
     for dev in _available_devices():
         print(f"Running Phase 2 & Phase 3 Global AOBA tests on device={dev}...")
@@ -639,4 +715,5 @@ if __name__ == "__main__":
         test_clm5_canopy_hydrology_and_dsl_soil_resistance(dev)
         test_land_energy_balance_newton_iterations(dev)
         test_multilayer_richards_hydrology_and_dynamic_roots(dev)
+        test_three_source_leaf_energy_balance_rsl_and_pmodel_coupling(dev)
     print("ALL PHASE 2 & PHASE 3 GLOBAL AOBA TESTS PASSED!")

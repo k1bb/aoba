@@ -49,10 +49,14 @@ import torch
 from aoba import constants as C
 from aoba.biosphere import (
     BiosphereState,
+    LEAF_SCAT_NIR,
+    LEAF_SCAT_VIS,
+    canopy_sunlit_sw_fraction,
     canopy_two_stream_albedo_dai,
     compute_optimal_soil_water_beta,
     compute_two_leaf_gas_exchange,
     init_biosphere_state,
+    prepare_two_leaf_allocation,
 )
 from aoba.kernels import solve_tridiagonal_batched
 from aoba.thermodynamics import esat_ice, esat_liquid, qsat_mixed
@@ -150,6 +154,10 @@ class SurfaceState:
     # Embedded EEO biosphere state
     bio: BiosphereState
     t_ocean_ml_comp: torch.Tensor | None = None  # Kahan float32 rounding compensation for T_ml [K]
+    # Optional 3-source warm-start temperatures (backward-compatible with older restart checkpoints)
+    t_leaf_sun: torch.Tensor | None = None       # Sunlit leaf equilibrium temperature [K]
+    t_leaf_sh: torch.Tensor | None = None        # Shaded leaf equilibrium temperature [K]
+    t_gnd_skin: torch.Tensor | None = None       # Ground/snow skin temperature under canopy [K]
 
 
 def _kahan_add(val: torch.Tensor, delta: torch.Tensor, comp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -246,7 +254,44 @@ def init_surface_state(
         swe_seaice=torch.zeros(shape, device=dev, dtype=f_dtype),
         bio=bio,
         t_ocean_ml_comp=torch.zeros(shape, device=dev, dtype=f_dtype),
+        t_leaf_sun=t_land0.clone(),
+        t_leaf_sh=t_land0.clone(),
+        t_gnd_skin=t_land0.clone(),
     )
+
+
+def _solve_3x3_batched(
+    a00: torch.Tensor,
+    a01: torch.Tensor,
+    a02: torch.Tensor,
+    a10: torch.Tensor,
+    a11: torch.Tensor,
+    a12: torch.Tensor,
+    a20: torch.Tensor,
+    a21: torch.Tensor,
+    a22: torch.Tensor,
+    b0: torch.Tensor,
+    b1: torch.Tensor,
+    b2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Closed-form batched 3x3 linear solve via cofactors for the 3-source land energy-balance Jacobian."""
+    c00 = a11 * a22 - a12 * a21
+    c01 = a12 * a20 - a10 * a22
+    c02 = a10 * a21 - a11 * a20
+    det = a00 * c00 + a01 * c01 + a02 * c02
+    inv_det = 1.0 / torch.where(det.abs() < 1.0e-12, torch.full_like(det, 1.0e-12), det)
+
+    c10 = a02 * a21 - a01 * a22
+    c11 = a00 * a22 - a02 * a20
+    c12 = a01 * a20 - a00 * a21
+    c20 = a01 * a12 - a02 * a11
+    c21 = a02 * a10 - a00 * a12
+    c22 = a00 * a11 - a01 * a10
+
+    x0 = (c00 * b0 + c10 * b1 + c20 * b2) * inv_det
+    x1 = (c01 * b0 + c11 * b1 + c21 * b2) * inv_det
+    x2 = (c02 * b0 + c12 * b1 + c22 * b2) * inv_det
+    return x0, x1, x2
 
 
 # ---------------------------------------------------------------------------
@@ -718,54 +763,91 @@ def step_surface(
     cp_air = C.CP_D + C.CP_V * qv_1
 
     # =========================================================================
-    # PART A: TERRESTRIAL TILES (Vegetated/Bare Land & Grounded Ice Sheets)
+    # PART A: TERRESTRIAL TILES (3-Source Sunlit/Shaded/Ground + RSL + P-Model)
     # =========================================================================
-    d_land, z0m_land, z0h_land = canopy_roughness_raupach(h_exp, lai_exp, z0_soil=0.01)
+    d_land, z0m_land, _ = canopy_roughness_raupach(h_exp, lai_exp, z0_soil=0.01)
     # Smooth snow roughness when snow-covered and canopy buried
     z0m_snow = torch.full_like(z0m_land, 0.002)
     z0m_terr = torch.where(lai_exp < 0.05, (1.0 - a_sn) * z0m_land + a_sn * z0m_snow, z0m_land)
-    z0h_terr = 0.135335 * z0m_terr
-    rsl_depth = torch.clamp(2.0 * h_exp - d_land, min=0.0)
 
-    # Effective composite land skin temperature prior to step
-    f_veg_rad = 1.0 - torch.exp(-lai_exp)
-    t_gnd = sfc.t_soil[0]
-    t_skin_land = f_veg_rad * sfc.t_canopy + (1.0 - f_veg_rad) * t_gnd
-    qsat_skin_l, dqsat_dT_l = qsat_mixed(t_skin_land, pres_sfc)
-    theta_vsfc_l = (t_skin_land / exner_s) * (1.0 + C.ZVIR * qsat_skin_l)
-
-    tr_land = compute_surface_transfer(
-        u_1, v_1, theta_v1, theta_vsfc_l, z_ref_rel,
-        z0m_terr, z0h_terr, z0h_terr, rsl_depth=rsl_depth,
+    has_veg = lai_exp >= 0.01
+    f_veg_rad = torch.where(has_veg, 1.0 - torch.exp(-lai_exp), torch.zeros_like(lai_exp))
+    # Avoid kB^-1 double-counting of leaf laminar boundary layer when r_b is explicit on vegetated canopies
+    # (CLM5 Sec. 5.3; Oleson et al., 2013 p. 95; Bonan et al., 2018): z_0h = z_0m for canopy, 0.135335 z_0m bare.
+    z0h_terr = torch.where(
+        has_veg,
+        (1.0 - f_veg_rad) * (0.135335 * z0m_terr) + f_veg_rad * z0m_terr,
+        0.135335 * z0m_terr,
     )
-    ga_land = tr_land.c_h * tr_land.wind_eff  # Aerodynamic conductance 1 / r_a [m s^-1]
+    rsl_depth = torch.clamp(2.0 * h_exp - d_land, min=0.0)
 
     # Vertically integrated root-zone plant-available liquid water & optimal stress beta (Holtzman et al., 2024; Gao et al., 2014)
     w_avail_root, _, _ = compute_root_zone_weights_and_water(sfc.w_liq_soil, sfc.bio.s_root_cap)
     water_stress = compute_optimal_soil_water_beta(w_avail_root, sfc.bio)
 
-    # Sunlit/shaded leaf temperatures: sunlit leaves are slightly warmer under strong direct beam (Dai et al., 2004)
-    gb_leaf = torch.clamp(0.01 * torch.sqrt(tr_land.u_star / 0.04) * torch.clamp(lai_exp, min=0.1), min=1.0e-3)
-    dt_sun_est = torch.clamp(0.35 * sw1_dir_down / (rho_sfc * cp_air * (gb_leaf + ga_land) + 20.0), 0.0, 5.0)
-    t_sun = sfc.t_canopy + 0.5 * dt_sun_est
-    t_sh = sfc.t_canopy - 0.2 * dt_sun_est
-
-    ea_pa = qv_1 * pres_sfc / (C.EPS_WATER + (1.0 - C.EPS_WATER) * qv_1)
-    vpd_sun = torch.clamp(esat_liquid(t_sun) - ea_pa, min=20.0)
-    vpd_sh = torch.clamp(esat_liquid(t_sh) - ea_pa, min=20.0)
-
+    # Precompute temperature-independent sunlit/shaded PAR & enzyme allocation once before Newton iterations
     vis_beam = C.PAR_FRAC_OF_SW1 * sw1_dir_down
     vis_diff = C.PAR_FRAC_OF_SW1 * sw1_dif_down
-    two_leaf = compute_two_leaf_gas_exchange(
-        sfc.bio, vis_beam, vis_diff, mu0, t_sun, t_sh, vpd_sun, vpd_sh,
-        pres_sfc, co2_ppmv, lai_exp, water_stress,
+    alloc_2l = prepare_two_leaf_allocation(sfc.bio, vis_beam, vis_diff, mu0, lai_exp)
+    l_sun = alloc_2l.inst_rad.l_sun
+    l_sh = alloc_2l.inst_rad.l_sh
+    k_db_inst = alloc_2l.inst_rad.k_db
+    has_sun = has_veg & (l_sun > 1.0e-4)
+    has_sh = has_veg & (l_sh > 1.0e-4)
+    f_sun_area = torch.where(has_veg, torch.clamp(l_sun / torch.clamp(lai_exp, min=1.0e-4), 0.0, 1.0), torch.zeros_like(lai_exp))
+    f_sh_area = torch.where(has_veg, 1.0 - f_sun_area, torch.zeros_like(lai_exp))
+
+    # Conservative 3-source shortwave partitioning: S_sun + S_sh + S_gnd == sw_abs (de Pury & Farquhar, 1997; Dai et al., 2004)
+    sw_tot_vis = sw1_dir_down * (1.0 - alb_vis_dir) + sw1_dif_down * (1.0 - alb_vis_dif)
+    sw_tot_nir = sw2_dir_down * (1.0 - alb_nir_dir) + sw2_dif_down * (1.0 - alb_nir_dif)
+    sn_vis_d, sn_vis_f, sn_nir_d, sn_nir_f = compute_snow_albedo_yang(sfc.snow_age, mu0)
+    soil_v, soil_n = compute_bare_soil_albedo_moisture(sfc.w_liq_soil[0])
+    ag_vis_d = (1.0 - a_sn) * soil_v + a_sn * sn_vis_d
+    ag_vis_f = (1.0 - a_sn) * soil_v + a_sn * sn_vis_f
+    ag_nir_d = (1.0 - a_sn) * soil_n + a_sn * sn_nir_d
+    ag_nir_f = (1.0 - a_sn) * soil_n + a_sn * sn_nir_f
+
+    kb_vis_p = k_db_inst * math.sqrt(1.0 - LEAF_SCAT_VIS)
+    kd_vis_p = 0.78 * math.sqrt(1.0 - LEAF_SCAT_VIS)
+    kb_nir_p = k_db_inst * math.sqrt(1.0 - LEAF_SCAT_NIR)
+    kd_nir_p = 0.78 * math.sqrt(1.0 - LEAF_SCAT_NIR)
+    tr_vis_d = torch.exp(-torch.clamp(kb_vis_p * lai_exp, max=40.0))
+    tr_vis_f = torch.exp(-torch.clamp(kd_vis_p * lai_exp, max=40.0))
+    tr_nir_d = torch.exp(-torch.clamp(kb_nir_p * lai_exp, max=40.0))
+    tr_nir_f = torch.exp(-torch.clamp(kd_nir_p * lai_exp, max=40.0))
+
+    sw_gnd_vis = torch.minimum(
+        sw_tot_vis,
+        tr_vis_d * sw1_dir_down * (1.0 - ag_vis_d) + tr_vis_f * sw1_dif_down * (1.0 - ag_vis_f),
     )
-    gs_canopy = two_leaf.gsw_sun + two_leaf.gsw_sh  # Canopy stomatal conductance [m s^-1]
+    sw_gnd_nir = torch.minimum(
+        sw_tot_nir,
+        tr_nir_d * sw2_dir_down * (1.0 - ag_nir_d) + tr_nir_f * sw2_dif_down * (1.0 - ag_nir_f),
+    )
+    sw_can_vis = torch.where(has_veg, torch.clamp(sw_tot_vis - sw_gnd_vis, min=0.0), torch.zeros_like(sw_tot_vis))
+    sw_can_nir = torch.where(has_veg, torch.clamp(sw_tot_nir - sw_gnd_nir, min=0.0), torch.zeros_like(sw_tot_nir))
+    f_sun_vis = canopy_sunlit_sw_fraction(sw1_dir_down, sw1_dif_down, mu0, lai_exp, LEAF_SCAT_VIS)
+    f_sun_nir = canopy_sunlit_sw_fraction(sw2_dir_down, sw2_dif_down, mu0, lai_exp, LEAF_SCAT_NIR)
+
+    sw_abs_sun = torch.where(has_sun, f_sun_vis * sw_can_vis + f_sun_nir * sw_can_nir, torch.zeros_like(sw_abs))
+    sw_abs_sh = torch.where(
+        has_sh,
+        (sw_can_vis + sw_can_nir) - sw_abs_sun,
+        torch.zeros_like(sw_abs),
+    )
+    sw_abs_gnd = sw_abs - sw_abs_sun - sw_abs_sh
+
+    # Warm-start sunlit leaf, shaded leaf, and ground skin temperatures (backward-compatible with older restarts)
+    t_gnd_cur = sfc.t_gnd_skin.clone() if sfc.t_gnd_skin is not None else sfc.t_soil[0].clone()
+    t_sun_cur = sfc.t_leaf_sun.clone() if sfc.t_leaf_sun is not None else sfc.t_canopy.clone()
+    t_sh_cur = sfc.t_leaf_sh.clone() if sfc.t_leaf_sh is not None else sfc.t_canopy.clone()
+    # Keep bare-ground tiles initialized at their skin/soil temperature
+    t_gnd_cur = torch.where(has_veg, t_gnd_cur, sfc.t_canopy)
 
     # Wetted canopy fraction f_wet = [W_can / (p_liq L)]^(2/3) <= f_wet_max (CLM5 Eq. 7.23; Dickinson et al., 1993)
     wc_cap = WC_MAX_PER_LAI * lai_exp
     f_wet = torch.where(
-        lai_exp >= 0.01,
+        has_veg,
         torch.clamp(
             torch.pow(torch.clamp(sfc.w_canopy, min=0.0) / torch.clamp(wc_cap, min=1.0e-4), 2.0 / 3.0),
             0.0,
@@ -775,12 +857,11 @@ def step_surface(
     )
 
     # Bare-soil evaporation resistance via the CLM5 dry-surface-layer scheme (Swenson & Lawrence, 2014)
-    # Surface wetness s_1 from liquid + ice (CLM5 Eq. 5.75) and Philip (1957) soil-air humidity factor (Eq. 5.73)
     sat_top = torch.clamp((sfc.w_liq_soil[0] + sfc.w_ice_soil[0]) / SOIL_POROSITY, 0.01, 1.0)
     psi_top = PSI_SAT_SOIL * torch.pow(sat_top, -B_CLAPP_SOIL)  # Matric head [m]
-    h_soil_base = torch.exp(torch.clamp(psi_top * C.GRAVITY / (C.R_V * t_gnd), -10.0, 0.0))
+    t_soil0 = sfc.t_soil[0]
+    h_soil_base = torch.exp(torch.clamp(psi_top * C.GRAVITY / (C.R_V * t_soil0), -10.0, 0.0))
 
-    # Dry-surface-layer thickness D_SL, air-dry moisture theta_air, tortuosity tau, and vapor diffusivity D_v (Eqs. 5.77-5.81)
     theta_liq_top = torch.clamp(sfc.w_liq_soil[0], min=0.0, max=SOIL_POROSITY)
     theta_air = SOIL_POROSITY * (abs(PSI_SAT_SOIL) * 1.0e3 / PSI_AIR_MM) ** (1.0 / B_CLAPP_SOIL)
     theta_init = DSL_THETA_INIT_FRAC * SOIL_POROSITY
@@ -789,45 +870,102 @@ def step_surface(
     )
     phi_air = max(SOIL_POROSITY - theta_air, 1.0e-3)
     tau_soil = (phi_air ** 2) * (phi_air / SOIL_POROSITY) ** (3.0 / B_CLAPP_SOIL)
-    d_vap = 2.12e-5 * torch.pow(t_gnd / C.T_FREEZE, 1.75)
+    d_vap = 2.12e-5 * torch.pow(t_soil0 / C.T_FREEZE, 1.75)
     r_soil = d_sl / (d_vap * tau_soil)  # [s m^-1]
 
-    # Fixed-count Newton iteration of the composite-skin energy balance (CLM5 Sec. 5.3 iterates to convergence):
-    # transfer coefficients, leaf/under-canopy conductances and the linearized balance are re-evaluated at each iterate.
-    # Stomatal conductance (the two-leaf solve above) stays at its start-of-step value.
-    # LAND_EB_ITERATIONS = 1 reproduces a single linearized pass about the previous-step skin temperature (default 3).
-    n_eb_iter = max(int(LAND_EB_ITERATIONS), 1)
-    for _eb_it in range(n_eb_iter):
-        if _eb_it > 0:
-            qsat_skin_l, dqsat_dT_l = qsat_mixed(t_skin_land, pres_sfc)
-            theta_vsfc_l = (t_skin_land / exner_s) * (1.0 + C.ZVIR * qsat_skin_l)
-            tr_land = compute_surface_transfer(
-                u_1, v_1, theta_v1, theta_vsfc_l, z_ref_rel,
-                z0m_terr, z0h_terr, z0h_terr, rsl_depth=rsl_depth,
-            )
-            ga_land = tr_land.c_h * tr_land.wind_eff
-            gb_leaf = torch.clamp(0.01 * torch.sqrt(tr_land.u_star / 0.04) * torch.clamp(lai_exp, min=0.1), min=1.0e-3)
+    # Top-layer soil + snowpack thermal conductance to soil node 0
+    dz_top_half = 0.5 * SOIL_LAYER_DEPTHS[0]
+    k_top = KAPPA_DRY_SOIL * (1.0 + 5.5 * torch.tanh((sfc.w_liq_soil[0] + sfc.w_ice_soil[0]) / 0.25))
+    snow_depth = sfc.swe_land / RHO_SNOWPACK
+    r_snow_therm = a_sn * (0.5 * torch.clamp(snow_depth, max=1.0) / C.K_THERM_SNOW)
+    g_cond_coeff = 1.0 / (dz_top_half / k_top + r_snow_therm)
 
-        # CLM5 Sec. 5.2: do not condense atmospheric vapor into very dry soil (q_soil = q_atm when q_soil < q_atm < q_sat)
-        h_soil = torch.where(
-            (qsat_skin_l > qv_1) & (qv_1 > h_soil_base * qsat_skin_l),
-            qv_1 / torch.clamp(qsat_skin_l, min=1.0e-8),
-            h_soil_base,
+    # RSL within-canopy wind attenuation parameter alpha_u = c_d / (2 beta^2) (Harman & Finnigan, 2007; Bonan et al., 2018)
+    beta_rsl = torch.clamp(torch.sqrt(0.003 + 0.15 * torch.clamp(lai_exp, min=1.0e-4)), 0.12, 0.30)
+    alpha_u_half = 0.5 * torch.clamp(0.20 / (2.0 * beta_rsl * beta_rsl), 0.30, 1.20)
+    t_air_sfc = theta_1 * exner_s
+    has_snow = sfc.swe_land > 1.0e-3
+    eps_g = EMISSIVITY_LAND
+    lw_refl_c = 1.0 + (1.0 - f_veg_rad) * (1.0 - eps_g)  # Exact 1-bounce canopy-ground LW factor (CLM5 Sec. 4.2)
+    lw_emit_c_coef = 2.0 - f_veg_rad * (1.0 - eps_g)
+
+    # Coupled 3-source (sunlit leaf, shaded leaf, ground) + canopy-air + stomatal Newton iteration
+    # (Dai et al., 2004, Sec. 2b-c; Bonan et al., 2018, Eqs. 8-13, 21-24; CLM5 Sec. 5.2-5.3)
+    n_eb_iter = max(int(LAND_EB_ITERATIONS), 1)
+    prev_dt_sun = torch.zeros_like(t_sun_cur)
+    prev_dt_sh = torch.zeros_like(t_sh_cur)
+    prev_dt_gnd = torch.zeros_like(t_gnd_cur)
+
+    for _eb_it in range(n_eb_iter):
+        # 1. Surface-layer RSL aerodynamic transfer g_a evaluated at composite radiative/canopy-air temperature
+        t_eff_mo = torch.where(
+            has_veg,
+            f_veg_rad * (f_sun_area * t_sun_cur + f_sh_area * t_sh_cur) + (1.0 - f_veg_rad) * t_gnd_cur,
+            t_gnd_cur,
+        )
+        qsat_mo, _ = qsat_mixed(t_eff_mo, pres_sfc)
+        theta_vsfc_l = (t_eff_mo / exner_s) * (1.0 + C.ZVIR * qsat_mo)
+        tr_land = compute_surface_transfer(
+            u_1, v_1, theta_v1, theta_vsfc_l, z_ref_rel,
+            z0m_terr, z0h_terr, z0h_terr, rsl_depth=rsl_depth,
+        )
+        ga_land = tr_land.c_h * tr_land.wind_eff  # [m s^-1]
+
+        # 2. Analytic RSL-consistent sunlit & shaded leaf boundary-layer conductances (Bonan et al., 2018, Eq. 21; CLM5 Eq. 5.122)
+        u_can_top = torch.minimum(torch.clamp(tr_land.u_star / beta_rsl, min=0.10), tr_land.wind_eff)
+        gb_top = 0.01 * torch.sqrt(u_can_top / 0.04)  # Per-unit-LAI top-of-canopy boundary conductance [m s^-1]
+        gb_tot_can = gb_top * (1.0 - torch.exp(-torch.clamp(alpha_u_half * lai_exp, max=30.0))) / alpha_u_half
+        gb_sun = torch.where(
+            has_sun,
+            torch.clamp(
+                gb_top * (1.0 - torch.exp(-torch.clamp((k_db_inst + alpha_u_half) * lai_exp, max=30.0)))
+                / (k_db_inst + alpha_u_half),
+                min=1.0e-4,
+            ),
+            torch.zeros_like(lai_exp),
+        )
+        gb_sh = torch.where(
+            has_sh,
+            torch.clamp(gb_tot_can - gb_sun, min=1.0e-4),
+            torch.zeros_like(lai_exp),
         )
 
-        # Under-canopy stability-corrected aerodynamic resistance r_d (Sakaguchi & Zeng, 2009; SLM Eqs. A10-A14)
-        stab_uc = C.GRAVITY * h_exp * (sfc.t_canopy - t_gnd) / (t_gnd * (tr_land.u_star ** 2 + 1.0e-3))
+        # 3. Under-canopy stability-corrected aerodynamic resistance r_d (Sakaguchi & Zeng, 2009; CLM5 Eqs. 5.113-5.119)
+        t_fol_avg = torch.where(has_veg, f_sun_area * t_sun_cur + f_sh_area * t_sh_cur, t_gnd_cur)
+        stab_uc = C.GRAVITY * h_exp * (t_fol_avg - t_gnd_cur) / (torch.clamp(t_gnd_cur, min=180.0) * (tr_land.u_star ** 2 + 1.0e-3))
         c_dense = torch.where(stab_uc > 0.0, 0.004 / (1.0 + 0.5 * torch.clamp(stab_uc, max=10.0)), torch.full_like(stab_uc, 0.004))
         c_bare = C.VON_KARMAN / (0.13 * torch.pow(torch.clamp(tr_land.u_star * z0m_terr / 1.5e-5, min=1.0), 0.45))
         c_uv = (1.0 - f_veg_rad) * c_bare + f_veg_rad * c_dense
         r_d_uc = 1.0 / torch.clamp(c_uv * tr_land.u_star, min=1.0e-3)
 
-        # Conductances for the 3 ET pathways [m s^-1]:
-        # CLM5 Eqs. 5.109-5.113: transpiration acts on the dry foliage fraction (1 - f_wet), while the wet-canopy term
-        # is limited by available canopy water, f_wet' = min(f_wet, W_can / (dt * E_pot)); dew (E_pot <= 0) wets the whole leaf.
-        qleaf_sat, _ = qsat_mixed(sfc.t_canopy, pres_sfc)
-        e_pot_wet = rho_sfc * gb_leaf * (qleaf_sat - qv_1)  # Potential flux of a fully wetted canopy [kg m^-2 s^-1]
-        dew_on_leaf = (e_pot_wet <= 0.0) & (lai_exp >= 0.01)
+        # 4. Saturation humidities & slopes at all 3 nodes
+        qsat_sun, dq_sun = qsat_mixed(t_sun_cur, pres_sfc)
+        qsat_sh, dq_sh = qsat_mixed(t_sh_cur, pres_sfc)
+        qsat_gnd, dq_gnd = qsat_mixed(t_gnd_cur, pres_sfc)
+
+        # Provisional canopy-air humidity q_af for leaf-surface VPD (updated consistently inside the loop)
+        if _eb_it == 0:
+            q_af_vpd = qv_1
+        else:
+            q_af_vpd = torch.clamp(q_af, min=1.0e-7)
+        e_af_pa = q_af_vpd * pres_sfc / (C.EPS_WATER + (1.0 - C.EPS_WATER) * q_af_vpd)
+        vpd_sun_af = torch.clamp(esat_liquid(t_sun_cur) - e_af_pa, min=20.0)
+        vpd_sh_af = torch.clamp(esat_liquid(t_sh_cur) - e_af_pa, min=20.0)
+
+        # 5. Iterative leaf-surface (c_s, D_s) P-model photosynthesis & stomatal conductance
+        two_leaf = compute_two_leaf_gas_exchange(
+            sfc.bio, vis_beam, vis_diff, mu0, t_sun_cur, t_sh_cur, vpd_sun_af, vpd_sh_af,
+            pres_sfc, co2_ppmv, lai_exp, water_stress,
+            gbw_sun=torch.clamp(gb_sun, min=1.0e-4),
+            gbw_sh=torch.clamp(gb_sh, min=1.0e-4),
+            precomputed_alloc=alloc_2l,
+        )
+
+        # 6. CLM5 wet-canopy water limitation & 3-source vapor conductances (CLM5 Eqs. 5.109-5.113)
+        e_pot_wet = rho_sfc * (
+            gb_sun * (qsat_sun - q_af_vpd) + gb_sh * (qsat_sh - q_af_vpd)
+        )
+        dew_on_leaf = (e_pot_wet <= 0.0) & has_veg
         f_wet_eff = torch.where(
             e_pot_wet > 1.0e-12,
             torch.minimum(f_wet, torch.clamp(sfc.w_canopy, min=0.0) / (dt * torch.clamp(e_pot_wet, min=1.0e-12))),
@@ -835,97 +973,242 @@ def step_surface(
         )
         f_wet_eff = torch.where(dew_on_leaf, torch.ones_like(f_wet_eff), f_wet_eff)
 
-        # 1. Stomatal transpiration: series of gb_leaf and gs_canopy on dry foliage (1 - f_wet); none while dew wets the leaf
-        g_trans = torch.where(
-            dew_on_leaf,
+        g_trans_sun = torch.where(
+            dew_on_leaf | (~has_sun),
             torch.zeros_like(f_wet),
-            (1.0 - f_wet) * (gb_leaf * gs_canopy) / torch.clamp(gb_leaf + gs_canopy, min=1.0e-6),
+            (1.0 - f_wet) * (gb_sun * two_leaf.gsw_sun) / torch.clamp(gb_sun + two_leaf.gsw_sun, min=1.0e-6),
         )
-        # 2. Wet-canopy interception evaporation: boundary conductance gb_leaf on the water-limited wet fraction
-        g_inter = f_wet_eff * gb_leaf
-        # 3. Ground evaporation (snow-free soil + snow sublimation on A_sn; CLM5 Eq. 5.110).
-        # Atmospheric resistance 1/g_a is applied once below in series with g_surf_vap.
+        g_trans_sh = torch.where(
+            dew_on_leaf | (~has_sh),
+            torch.zeros_like(f_wet),
+            (1.0 - f_wet) * (gb_sh * two_leaf.gsw_sh) / torch.clamp(gb_sh + two_leaf.gsw_sh, min=1.0e-6),
+        )
+        g_inter_sun = torch.where(has_sun, f_wet_eff * gb_sun, torch.zeros_like(f_wet))
+        g_inter_sh = torch.where(has_sh, f_wet_eff * gb_sh, torch.zeros_like(f_wet))
+
+        gw_0 = g_trans_sun + g_inter_sun
+        gw_1 = g_trans_sh + g_inter_sh
+
+        # CLM5 Sec. 5.2: do not condense atmospheric vapor into very dry soil when q_soil < q_af < q_sat
+        q_soil_ref = torch.where(has_veg, q_af_vpd, qv_1)
+        dry_soil_cap = (qsat_gnd > q_soil_ref) & (q_soil_ref > h_soil_base * qsat_gnd)
+        h_soil = torch.where(
+            dry_soil_cap,
+            q_soil_ref / torch.clamp(qsat_gnd, min=1.0e-8),
+            h_soil_base,
+        )
         g_soil_snowfree = (1.0 - a_sn) / torch.clamp(r_d_uc + r_soil, min=1.0e-4)
         g_snow_subl = a_sn / torch.clamp(r_d_uc, min=1.0e-4)
-
-        g_surf_vap = g_trans + g_inter + g_soil_snowfree + g_snow_subl
-        # Total series conductance with atmospheric reference layer r_a
-        g_evap_eff = (ga_land * g_surf_vap) / torch.clamp(ga_land + g_surf_vap, min=1.0e-6)
-        h_eff_sfc = torch.where(
-            g_surf_vap > 1.0e-6,
-            (g_trans + g_inter + g_snow_subl + g_soil_snowfree * h_soil) / torch.clamp(g_surf_vap, min=1.0e-6),
+        gw_2 = g_soil_snowfree + g_snow_subl
+        h_gnd = torch.where(
+            gw_2 > 1.0e-8,
+            (g_snow_subl + g_soil_snowfree * h_soil) / torch.clamp(gw_2, min=1.0e-8),
             h_soil,
         )
+        # Effective slope dhq/dT on ground node vanishes on dry-soil-capped fraction (q_soil pinned to q_af)
+        dhq_gnd_dT = torch.where(
+            gw_2 > 1.0e-8,
+            (g_snow_subl + torch.where(dry_soil_cap, torch.zeros_like(g_soil_snowfree), g_soil_snowfree * h_soil))
+            / torch.clamp(gw_2, min=1.0e-8),
+            torch.where(dry_soil_cap, torch.zeros_like(h_soil), h_soil),
+        ) * dq_gnd
 
-        l_vap_land = torch.where((a_sn > 0.5) | (t_skin_land < C.T_FREEZE), C.L_S0, C.L_V0)
+        # Sensible heat conductances [m s^-1]: two-sided leaf 2*gb_j (Dai et al., 2004, Eq. 6; Bonan et al., 2018, Eq. 10)
+        gh_0 = 2.0 * gb_sun
+        gh_1 = 2.0 * gb_sh
+        gh_2 = 1.0 / r_d_uc
 
-        # Implicit linearized surface energy balance for Delta_T_skin (MATSIRO6 Sec. 6.3)
-        # R_n(T + dT) - H(T + dT) - L * E(T + dT) - G_cond(T + dT) = 0
-        lw_net0 = EMISSIVITY_LAND * (lw_down - C.STEFAN_BOLTZMANN * (t_skin_land ** 4))
-        rn0 = sw_abs + lw_net0
-        shf0_l = rho_sfc * cp_air * ga_land * (t_skin_land - theta_1 * exner_s)
-        evap0_l = rho_sfc * g_evap_eff * (h_eff_sfc * qsat_skin_l - qv_1)
-        # Bound upward evaporation by available water stores
-        evap0_l = torch.maximum(evap0_l, -rho_sfc * ga_land * qv_1)
+        # Canopy-air node (T_af, q_af) for vegetated columns; bare ground reduces directly to (T_gnd, q_af)
+        gh_sum = ga_land + gh_0 + gh_1 + gh_2
+        t_af = torch.where(
+            has_veg,
+            (ga_land * t_air_sfc + gh_0 * t_sun_cur + gh_1 * t_sh_cur + gh_2 * t_gnd_cur) / gh_sum,
+            t_gnd_cur,
+        )
+        gw_sum = ga_land + gw_0 + gw_1 + gw_2
+        q_af = (ga_land * qv_1 + gw_0 * qsat_sun + gw_1 * qsat_sh + gw_2 * h_gnd * qsat_gnd) / gw_sum
 
-        dz_top_half = 0.5 * SOIL_LAYER_DEPTHS[0]
-        k_top = KAPPA_DRY_SOIL * (1.0 + 5.5 * torch.tanh((sfc.w_liq_soil[0] + sfc.w_ice_soil[0]) / 0.25))
-        # Thermal resistance of snowpack above topsoil when A_sn > 0 (units: m^2 K W^-1)
-        snow_depth = sfc.swe_land / RHO_SNOWPACK
-        r_snow_therm = a_sn * (0.5 * torch.clamp(snow_depth, max=1.0) / C.K_THERM_SNOW)
-        g_cond_coeff = 1.0 / (dz_top_half / k_top + r_snow_therm)
-        g0_down = g_cond_coeff * (t_skin_land - sfc.t_soil[0])
+        wh_0 = torch.where(has_veg, gh_0 / gh_sum, torch.zeros_like(gh_0))
+        wh_1 = torch.where(has_veg, gh_1 / gh_sum, torch.zeros_like(gh_1))
+        wh_2 = torch.where(has_veg, gh_2 / gh_sum, torch.ones_like(gh_2))
+        ww_0 = gw_0 / gw_sum
+        ww_1 = gw_1 / gw_sum
+        ww_2 = gw_2 / gw_sum
 
-        drn_dT = -4.0 * EMISSIVITY_LAND * C.STEFAN_BOLTZMANN * (t_skin_land ** 3)
-        dshf_dT = rho_sfc * cp_air * ga_land
-        dlhf_dT = l_vap_land * rho_sfc * g_evap_eff * h_eff_sfc * dqsat_dT_l
-        dg_dT = g_cond_coeff
+        l_vap_sun = torch.where(t_sun_cur < C.T_FREEZE, C.L_S0, C.L_V0)
+        l_vap_sh = torch.where(t_sh_cur < C.T_FREEZE, C.L_S0, C.L_V0)
+        l_vap_gnd = torch.where((a_sn > 0.5) | (t_gnd_cur < C.T_FREEZE), C.L_S0, C.L_V0)
 
-        denom_eb = dshf_dT + dlhf_dT + dg_dT - drn_dT
-        dt_skin = torch.clamp((rn0 - shf0_l - l_vap_land * evap0_l - g0_down) / torch.clamp(denom_eb, min=1.0), -10.0, 10.0)
-        t_skin_new = t_skin_land + dt_skin
+        # 7. Exact 3-source net radiation, sensible/latent fluxes, and 3x3 Jacobian J * dT = b
+        sig = C.STEFAN_BOLTZMANN
+        t0_3 = t_sun_cur ** 3
+        t1_3 = t_sh_cur ** 3
+        t2_3 = t_gnd_cur ** 3
+        t0_4 = t0_3 * t_sun_cur
+        t1_4 = t1_3 * t_sh_cur
+        t2_4 = t2_3 * t_gnd_cur
 
-        # Snowmelt cap at T_FREEZE when snow is present (MATSIRO6 Sec. 6.3.3)
-        has_snow = sfc.swe_land > 1.0e-3
-        melt_excess_t = torch.where(has_snow & (t_skin_new > C.T_FREEZE), t_skin_new - C.T_FREEZE, torch.zeros_like(t_skin_new))
-        t_skin_final = t_skin_new - melt_excess_t
-        dt_final = t_skin_final - t_skin_land
-        q_melt_avail = melt_excess_t * denom_eb  # Energy [W m^-2] available to melt snow
+        dc_sun = f_veg_rad * f_sun_area
+        dc_sh = f_veg_rad * f_sh_area
+        r_lw_0 = dc_sun * (lw_refl_c * lw_down + eps_g * sig * t2_4 - lw_emit_c_coef * sig * t0_4)
+        r_lw_1 = dc_sh * (lw_refl_c * lw_down + eps_g * sig * t2_4 - lw_emit_c_coef * sig * t1_4)
+        r_lw_2 = eps_g * (1.0 - f_veg_rad) * lw_down + eps_g * sig * (dc_sun * t0_4 + dc_sh * t1_4) - eps_g * sig * t2_4
+
+        rho_cp = rho_sfc * cp_air
+        h_0 = rho_cp * gh_0 * (t_sun_cur - t_af)
+        h_1 = rho_cp * gh_1 * (t_sh_cur - t_af)
+        # Bare ground uses direct aerodynamic conductance g_a; vegetated ground exchanges through canopy air via gh_2
+        h_2 = torch.where(has_veg, rho_cp * gh_2 * (t_gnd_cur - t_af), rho_cp * ga_land * (t_gnd_cur - t_air_sfc))
+
+        e_0 = rho_sfc * gw_0 * (qsat_sun - q_af)
+        e_1 = rho_sfc * gw_1 * (qsat_sh - q_af)
+        e_2 = rho_sfc * gw_2 * (h_gnd * qsat_gnd - q_af)
+        # Bound negative dew flux over bare ground by atmospheric humidity store
+        e_2 = torch.maximum(e_2, -rho_sfc * ga_land * qv_1)
+
+        g0_down = g_cond_coeff * (t_gnd_cur - t_soil0)
+
+        b0 = sw_abs_sun + r_lw_0 - h_0 - l_vap_sun * e_0
+        b1 = sw_abs_sh + r_lw_1 - h_1 - l_vap_sh * e_1
+        b2 = sw_abs_gnd + r_lw_2 - h_2 - l_vap_gnd * e_2 - g0_down
+
+        # Jacobian entries J_ij = dH_i/dT_j + d(LE_i)/dT_j + delta_i2*delta_j2*g_cond - dR_lw_i/dT_j
+        k_lw_0 = 4.0 * dc_sun * sig
+        k_lw_1 = 4.0 * dc_sh * sig
+        lw_g_3 = 4.0 * eps_g * sig * t2_3
+
+        j00 = rho_cp * gh_0 * (1.0 - wh_0) + l_vap_sun * rho_sfc * gw_0 * dq_sun * (1.0 - ww_0) + k_lw_0 * lw_emit_c_coef * t0_3
+        j01 = -rho_cp * gh_0 * wh_1 - l_vap_sun * rho_sfc * gw_0 * ww_1 * dq_sh
+        j02 = -rho_cp * gh_0 * wh_2 - l_vap_sun * rho_sfc * gw_0 * ww_2 * dhq_gnd_dT - dc_sun * lw_g_3
+
+        j10 = -rho_cp * gh_1 * wh_0 - l_vap_sh * rho_sfc * gw_1 * ww_0 * dq_sun
+        j11 = rho_cp * gh_1 * (1.0 - wh_1) + l_vap_sh * rho_sfc * gw_1 * dq_sh * (1.0 - ww_1) + k_lw_1 * lw_emit_c_coef * t1_3
+        j12 = -rho_cp * gh_1 * wh_2 - l_vap_sh * rho_sfc * gw_1 * ww_2 * dhq_gnd_dT - dc_sh * lw_g_3
+
+        dh2_dt2 = torch.where(has_veg, rho_cp * gh_2 * (1.0 - wh_2), rho_cp * ga_land)
+        j20 = torch.where(has_veg, -rho_cp * gh_2 * wh_0 - l_vap_gnd * rho_sfc * gw_2 * ww_0 * dq_sun - eps_g * k_lw_0 * t0_3, torch.zeros_like(j00))
+        j21 = torch.where(has_veg, -rho_cp * gh_2 * wh_1 - l_vap_gnd * rho_sfc * gw_2 * ww_1 * dq_sh - eps_g * k_lw_1 * t1_3, torch.zeros_like(j00))
+        j22 = dh2_dt2 + l_vap_gnd * rho_sfc * gw_2 * dhq_gnd_dT * (1.0 - ww_2) + g_cond_coeff + lw_g_3
+
+        # Non-singular identity pinning for inactive leaf nodes (nighttime L_sun = 0 or bare ground)
+        one_t = torch.ones_like(j00)
+        zero_t = torch.zeros_like(j00)
+        t_pin_sun = torch.where(has_sh, t_sh_cur, t_gnd_cur)
+        t_pin_sh = torch.where(has_sun, t_sun_cur, t_gnd_cur)
+
+        j00_s = torch.where(has_sun, torch.clamp(j00, min=1.0), one_t)
+        j01_s = torch.where(has_sun, j01, zero_t)
+        j02_s = torch.where(has_sun, j02, zero_t)
+        b0_s = torch.where(has_sun, b0, t_pin_sun - t_sun_cur)
+
+        j10_s = torch.where(has_sh, j10, zero_t)
+        j11_s = torch.where(has_sh, torch.clamp(j11, min=1.0), one_t)
+        j12_s = torch.where(has_sh, j12, zero_t)
+        b1_s = torch.where(has_sh, b1, t_pin_sh - t_sh_cur)
+
+        j22_s = torch.clamp(j22, min=1.0)
+        dt0_raw, dt1_raw, dt2_raw = _solve_3x3_batched(
+            j00_s, j01_s, j02_s, j10_s, j11_s, j12_s, j20, j21, j22_s, b0_s, b1_s, b2
+        )
+        dt0 = torch.clamp(dt0_raw, -10.0, 10.0)
+        dt1 = torch.clamp(dt1_raw, -10.0, 10.0)
+        dt2 = torch.clamp(dt2_raw, -10.0, 10.0)
+
+        # Under-relax oscillatory sign reversals from positive leaf-heating / stomatal-closure feedback
+        if _eb_it > 0:
+            dt0 = torch.where(dt0 * prev_dt_sun < 0.0, 0.5 * dt0, dt0)
+            dt1 = torch.where(dt1 * prev_dt_sh < 0.0, 0.5 * dt1, dt1)
+            dt2 = torch.where(dt2 * prev_dt_gnd < 0.0, 0.5 * dt2, dt2)
+        prev_dt_sun, prev_dt_sh, prev_dt_gnd = dt0, dt1, dt2
+
+        t_sun_new = t_sun_cur + dt0
+        t_sh_new = t_sh_cur + dt1
+        t_gnd_new = t_gnd_cur + dt2
+
+        # Snowmelt cap at T_FREEZE on the ground/snow node (MATSIRO6 Sec. 6.3.3); elevated evergreen foliage may exceed 0 C
+        melt_excess_t = torch.where(has_snow & (t_gnd_new > C.T_FREEZE), t_gnd_new - C.T_FREEZE, zero_t)
+        t_gnd_final = t_gnd_new - melt_excess_t
+        dt2_fin = t_gnd_final - t_gnd_cur
+        q_melt_avail = melt_excess_t * j22_s  # Ground energy [W m^-2] available to melt snow
 
         if _eb_it < n_eb_iter - 1:
-            t_skin_land = t_skin_final  # Next Newton iterate
+            t_sun_cur = torch.where(has_sun, t_sun_new, torch.where(has_sh, t_sh_new, t_gnd_final))
+            t_sh_cur = torch.where(has_sh, t_sh_new, torch.where(has_sun, t_sun_new, t_gnd_final))
+            t_gnd_cur = t_gnd_final
 
-    shf_l = shf0_l + dshf_dT * dt_final
-    evap_raw_l = evap0_l + rho_sfc * g_evap_eff * h_eff_sfc * dqsat_dT_l * dt_final
+    # Final converged 3-source temperatures and exact linearized atmosphere-exchange fluxes
+    t_sun_final = torch.where(has_sun, t_sun_new, torch.where(has_sh, t_sh_new, t_gnd_final))
+    t_sh_final = torch.where(has_sh, t_sh_new, torch.where(has_sun, t_sun_new, t_gnd_final))
+    dt0_fin = t_sun_final - t_sun_cur
+    dt1_fin = t_sh_final - t_sh_cur
 
-    # Partition total upward terrestrial water flux across interception, transpiration, snow, and soil
-    w_tot_g = torch.clamp(g_surf_vap, min=1.0e-8)
-    evap_pos = torch.clamp(evap_raw_l, min=0.0)
-    dew_neg = torch.clamp(evap_raw_l, max=0.0)
+    dt_af_fin = wh_0 * dt0_fin + wh_1 * dt1_fin + wh_2 * dt2_fin
+    dq_af_fin = ww_0 * dq_sun * dt0_fin + ww_1 * dq_sh * dt1_fin + ww_2 * dhq_gnd_dT * dt2_fin
 
-    # Cap wet-canopy evaporation by W_can / dt and transpiration by SPLASH supply S_w (Davis et al., 2017);
-    # the latent-heat shortfall of the wet-canopy cap is returned as sensible heat (CLM5 Eq. 5.139)
-    e_inter_raw = evap_pos * (g_inter / w_tot_g)
-    e_inter = torch.minimum(e_inter_raw, torch.where(is_terrestrial, sfc.w_canopy / dt, evap_pos))
-    shf_l = shf_l + l_vap_land * (e_inter_raw - e_inter)
+    shf_0 = h_0 + rho_cp * gh_0 * (dt0_fin - dt_af_fin)
+    shf_1 = h_1 + rho_cp * gh_1 * (dt1_fin - dt_af_fin)
+    shf_2 = torch.where(
+        has_veg,
+        h_2 + rho_cp * gh_2 * (dt2_fin - dt_af_fin),
+        h_2 + rho_cp * ga_land * dt2_fin,
+    )
+    shf_l = shf_0 + shf_1 + shf_2
+
+    dq0_fin = (qsat_sun + dq_sun * dt0_fin) - (q_af + dq_af_fin)
+    dq1_fin = (qsat_sh + dq_sh * dt1_fin) - (q_af + dq_af_fin)
+    dq2_soil_fin = torch.where(
+        dry_soil_cap,
+        torch.zeros_like(qsat_gnd),
+        h_soil * (qsat_gnd + dq_gnd * dt2_fin) - (q_af + dq_af_fin),
+    )
+    dq2_snow_fin = (qsat_gnd + dq_gnd * dt2_fin) - (q_af + dq_af_fin)
+
+    e_trans_raw = rho_sfc * (g_trans_sun * dq0_fin + g_trans_sh * dq1_fin)
+    e_inter_raw_signed = rho_sfc * (g_inter_sun * dq0_fin + g_inter_sh * dq1_fin)
+    e_soil_raw_signed = rho_sfc * g_soil_snowfree * dq2_soil_fin
+    e_snow_raw_signed = rho_sfc * g_snow_subl * dq2_snow_fin
+
+    # Separate positive evaporation from negative dew/frost condensation per pathway
+    e_inter_pos = torch.clamp(e_inter_raw_signed, min=0.0)
+    e_trans_pos = torch.clamp(e_trans_raw, min=0.0)
+    e_soil_pos = torch.clamp(e_soil_raw_signed, min=0.0)
+    e_snow_pos = torch.clamp(e_snow_raw_signed, min=0.0)
+    dew_leaf_neg = torch.clamp(e_inter_raw_signed, max=0.0) + torch.clamp(e_trans_raw, max=0.0)
+    dew_gnd_neg = torch.clamp(e_soil_raw_signed, max=0.0) + torch.clamp(e_snow_raw_signed, max=0.0)
+    dew_neg = torch.maximum(dew_leaf_neg + dew_gnd_neg, -rho_sfc * ga_land * qv_1)
+
+    # Cap wet-canopy evaporation by W_can / dt (shortfall returns as sensible heat; CLM5 Eq. 5.139),
+    # transpiration by root supply S_w & W_avail / dt, snow sublimation by SWE / dt, soil evap by top layer
+    l_vap_land = torch.where((a_sn > 0.5) | (t_gnd_final < C.T_FREEZE), C.L_S0, C.L_V0)
+    e_inter = torch.minimum(e_inter_pos, torch.where(is_terrestrial, sfc.w_canopy / dt, e_inter_pos))
+    shf_l = shf_l + l_vap_land * (e_inter_pos - e_inter)
     sw_max_rate = (1.05 / 3600.0) * water_stress * (sfc.bio.s_root_cap / 150.0)  # Max supply ~1.05 mm/hr [kg m^-2 s^-1]
     e_trans = torch.minimum(
-        torch.minimum(evap_pos * (g_trans / w_tot_g), sw_max_rate),
-        torch.where(is_terrestrial, w_avail_root / dt, evap_pos),
+        torch.minimum(e_trans_pos, sw_max_rate),
+        torch.where(is_terrestrial, w_avail_root / dt, e_trans_pos),
     )
-    e_snow = torch.minimum(evap_pos * (g_snow_subl / w_tot_g), torch.where(is_terrestrial, sfc.swe_land / dt, evap_pos))
+    e_snow = torch.minimum(e_snow_pos, torch.where(is_terrestrial, sfc.swe_land / dt, e_snow_pos))
     max_soil_evap = RHO_WATER * SOIL_LAYER_DEPTHS[0] * torch.clamp(sfc.w_liq_soil[0] - 0.02, min=0.0) / dt
-    e_soil = torch.minimum(evap_pos * (g_soil_snowfree / w_tot_g), torch.where(is_terrestrial, max_soil_evap, evap_pos))
+    e_soil = torch.minimum(e_soil_pos, torch.where(is_terrestrial, max_soil_evap, e_soil_pos))
 
     evap_l = e_inter + e_trans + e_snow + e_soil + dew_neg
     lhf_l = l_vap_land * evap_l
-    lw_up_l = EMISSIVITY_LAND * C.STEFAN_BOLTZMANN * (t_skin_final ** 4) + (1.0 - EMISSIVITY_LAND) * lw_down
+
+    # Exact 1-bounce upward LW to atmosphere (conserves R_lw_sun + R_lw_sh + R_lw_gnd == lw_down - lw_up_l)
+    lw_emit_tot_l = (
+        (1.0 - f_veg_rad) * eps_g * sig * (t_gnd_final ** 4)
+        + f_veg_rad * lw_refl_c * sig * (f_sun_area * (t_sun_final ** 4) + f_sh_area * (t_sh_final ** 4))
+    )
+    lw_up_l = ((1.0 - f_veg_rad) ** 2) * (1.0 - eps_g) * lw_down + lw_emit_tot_l
+    t_skin_final = torch.pow(torch.clamp(lw_emit_tot_l / (eps_g * sig), min=1.0e4), 0.25)
+    t_skin_new = t_gnd_new
+    denom_eb = j22_s
     g_into_soil = sw_abs + lw_down - lw_up_l - shf_l - lhf_l - q_melt_avail
 
     # Canopy water balance: liquid interception f_pi = alpha_liq * tanh(L), throughfall, and drip (CLM5 Eqs. 7.2-7.10, 7.17)
     # Snowfall is not stored in the canopy (no canopy-snow reservoir) and falls directly onto the snowpack.
     f_int = torch.clamp(ALPHA_INTERCEPT_LIQ * torch.tanh(lai_exp), 0.0, 1.0)
-    wc_mid = sfc.w_canopy + dt * (f_int * precip_rain - e_inter - torch.where(f_veg_rad > 0.1, 0.5 * dew_neg, torch.zeros_like(dew_neg)))
+    wc_mid = sfc.w_canopy + dt * (f_int * precip_rain - e_inter - dew_leaf_neg)
     drip = torch.clamp(wc_mid - wc_cap, min=0.0) / dt
     wc_next = torch.clamp(wc_mid - drip * dt, min=0.0)
     rain_thru = (1.0 - f_int) * precip_rain + drip
@@ -974,7 +1257,7 @@ def step_surface(
 
     # Advance 5-layer implicit Richards soil hydrology with dynamic rooting depth z_root(S_R)
     # (Clapp & Hornberger, 1978; Swenson et al., 2012; CLM5 Sec. 7.3-7.5; Holtzman et al., 2024)
-    dew_ground = -(1.0 - 0.5 * (f_veg_rad > 0.1).to(dt_final.dtype)) * dew_neg  # Positive downward dew [kg m^-2 s^-1]
+    dew_ground = -dew_gnd_neg  # Positive downward dew/frost directly onto ground/soil [kg m^-2 s^-1]
     w_liq_hydro, sfc_runoff, sub_runoff = step_multilayer_soil_hydrology(
         sfc.w_liq_soil, sfc.w_ice_soil, rain_thru, melt_tot, e_soil, e_trans, dew_ground,
         sfc.bio.s_root_cap, is_ice, dt,
@@ -1094,6 +1377,9 @@ def step_surface(
     sfc.w_root = torch.where(is_land, w_root_next, sfc.w_root)
     sfc.w_canopy = torch.where(is_land, wc_next, torch.zeros_like(wc_next))
     sfc.t_canopy = torch.where(is_terrestrial, t_skin_final, sfc.t_canopy)
+    sfc.t_leaf_sun = torch.where(is_terrestrial, t_sun_final, sfc.t_canopy)
+    sfc.t_leaf_sh = torch.where(is_terrestrial, t_sh_final, sfc.t_canopy)
+    sfc.t_gnd_skin = torch.where(is_terrestrial, t_gnd_final, sfc.t_canopy)
     sfc.swe_land = torch.where(is_terrestrial, swe_next, torch.zeros_like(swe_next))
     sfc.swe_max_season = torch.where(is_terrestrial, swe_max_next, torch.zeros_like(swe_max_next))
     sfc.snow_age = torch.where(is_terrestrial, snow_age_next, torch.zeros_like(snow_age_next))

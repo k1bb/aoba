@@ -303,6 +303,57 @@ def canopy_light_absorption_depury(
     )
 
 
+def canopy_sunlit_sw_fraction(
+    sw_beam_wm2: torch.Tensor,
+    sw_diff_wm2: torch.Tensor,
+    mu0: torch.Tensor,
+    lai: torch.Tensor,
+    leaf_scat: float,
+) -> torch.Tensor:
+    """Fraction of canopy-absorbed broadband SW absorbed by sunlit foliage (de Pury & Farquhar, 1997).
+
+    Applies the exact analytic beam + scattered-beam + diffuse two-stream integrals for arbitrary
+    leaf scattering coefficient `leaf_scat` (VIS = 0.15, NIR = 0.80) so that sunlit/shaded shortwave
+    absorption partitions total canopy absorption conservatively across both SW1 and SW2.
+    """
+    lc = torch.clamp(lai, min=0.0)
+    k_db = 0.5 / torch.clamp(mu0, min=0.01)
+    sqrt_1ms = math.sqrt(max(1.0 - leaf_scat, 1.0e-4))
+    k_b_prime = k_db * sqrt_1ms
+    k_d_prime = (KD_PRIME_PAR / math.sqrt(1.0 - LEAF_SCAT_VIS)) * sqrt_1ms
+    rho_h = (1.0 - sqrt_1ms) / (1.0 + sqrt_1ms)
+    rho_cb = 2.0 * rho_h * k_db / (1.0 + k_db)
+    rho_cd = 2.0 * rho_h * 0.78 / 1.78
+
+    ib = torch.clamp(sw_beam_wm2, min=0.0)
+    id_ = torch.clamp(sw_diff_wm2, min=0.0)
+    k_lc = k_db * lc
+
+    q_cb = (1.0 - rho_cb) * ib * (1.0 - torch.exp(-torch.clamp(k_b_prime * lc, max=50.0)))
+    q_cd = (1.0 - rho_cd) * id_ * (1.0 - torch.exp(-torch.clamp(k_d_prime * lc, max=50.0)))
+    q_c = q_cb + q_cd
+
+    q_sun_db = ib * (1.0 - leaf_scat) * (1.0 - torch.exp(-torch.clamp(k_lc, max=50.0)))
+    q_sun_sb = ib * torch.clamp(
+        (1.0 - rho_cb) * k_b_prime * (1.0 - torch.exp(-torch.clamp((k_b_prime + k_db) * lc, max=50.0)))
+        / (k_b_prime + k_db)
+        - 0.5 * (1.0 - leaf_scat) * (1.0 - torch.exp(-torch.clamp(2.0 * k_lc, max=50.0))),
+        min=0.0,
+    )
+    q_sun_d = (
+        id_ * (1.0 - rho_cd) * k_d_prime
+        * (1.0 - torch.exp(-torch.clamp((k_d_prime + k_db) * lc, max=50.0)))
+        / (k_d_prime + k_db)
+    )
+    q_sun = torch.minimum(q_sun_db + q_sun_sb + q_sun_d, q_c)
+    f_sun_area = torch.where(
+        k_lc < 1.0e-4,
+        torch.ones_like(lc),
+        (1.0 - torch.exp(-torch.clamp(k_lc, max=50.0))) / torch.clamp(k_lc, min=1.0e-4),
+    )
+    return torch.where(q_c > 1.0e-4, torch.clamp(q_sun / torch.clamp(q_c, min=1.0e-4), 0.0, 1.0), f_sun_area)
+
+
 def allocate_two_leaf_capacity(
     x_total: torch.Tensor,
     acclim_rad: CanopyRadiationProfile,
@@ -693,6 +744,70 @@ def update_daily_acclimation_smith(
 
 
 @dataclass
+class TwoLeafAllocation:
+    """Temperature-independent sunlit/shaded radiative & biochemical capacity allocation."""
+
+    inst_rad: CanopyRadiationProfile
+    vc25_c3_sun: torch.Tensor
+    vc25_c3_sh: torch.Tensor
+    jm25_c3_sun: torch.Tensor
+    jm25_c3_sh: torch.Tensor
+    r25_c3_sun: torch.Tensor
+    r25_c3_sh: torch.Tensor
+    vc25_c4_sun: torch.Tensor
+    vc25_c4_sh: torch.Tensor
+    jm25_c4_sun: torch.Tensor
+    jm25_c4_sh: torch.Tensor
+    vp25_c4_sun: torch.Tensor
+    vp25_c4_sh: torch.Tensor
+    r25_c4_sun: torch.Tensor
+    r25_c4_sh: torch.Tensor
+
+
+def prepare_two_leaf_allocation(
+    bio: BiosphereState,
+    vis_beam_wm2: torch.Tensor,
+    vis_diff_wm2: torch.Tensor,
+    mu0: torch.Tensor,
+    lai_exposed: torch.Tensor,
+) -> TwoLeafAllocation:
+    """Precompute sunlit/shaded PAR profiles and enzyme capacities once per timestep before EB iterations."""
+    acclim_rad = canopy_light_absorption_depury(
+        bio.ema_vis_beam, bio.ema_vis_diff, bio.ema_mu0_mid, lai_exposed
+    )
+    inst_rad = canopy_light_absorption_depury(vis_beam_wm2, vis_diff_wm2, mu0, lai_exposed)
+    k_db = inst_rad.k_db
+    l_sun = inst_rad.l_sun
+
+    vc25_c3_sun, vc25_c3_sh = allocate_two_leaf_capacity(bio.vcmax25_c3, acclim_rad, k_db, l_sun, lai_exposed)
+    jm25_c3_sun, jm25_c3_sh = allocate_two_leaf_capacity(bio.jmax25_c3, acclim_rad, k_db, l_sun, lai_exposed)
+    r25_c3_sun, r25_c3_sh = allocate_two_leaf_capacity(bio.r25_c3, acclim_rad, k_db, l_sun, lai_exposed)
+
+    vc25_c4_sun, vc25_c4_sh = allocate_two_leaf_capacity(bio.vcmax25_c4, acclim_rad, k_db, l_sun, lai_exposed)
+    jm25_c4_sun, jm25_c4_sh = allocate_two_leaf_capacity(bio.jmax25_c4, acclim_rad, k_db, l_sun, lai_exposed)
+    vp25_c4_sun, vp25_c4_sh = allocate_two_leaf_capacity(bio.vpmax25_c4, acclim_rad, k_db, l_sun, lai_exposed)
+    r25_c4_sun, r25_c4_sh = allocate_two_leaf_capacity(bio.r25_c4, acclim_rad, k_db, l_sun, lai_exposed)
+
+    return TwoLeafAllocation(
+        inst_rad=inst_rad,
+        vc25_c3_sun=vc25_c3_sun,
+        vc25_c3_sh=vc25_c3_sh,
+        jm25_c3_sun=jm25_c3_sun,
+        jm25_c3_sh=jm25_c3_sh,
+        r25_c3_sun=r25_c3_sun,
+        r25_c3_sh=r25_c3_sh,
+        vc25_c4_sun=vc25_c4_sun,
+        vc25_c4_sh=vc25_c4_sh,
+        jm25_c4_sun=jm25_c4_sun,
+        jm25_c4_sh=jm25_c4_sh,
+        vp25_c4_sun=vp25_c4_sun,
+        vp25_c4_sh=vp25_c4_sh,
+        r25_c4_sun=r25_c4_sun,
+        r25_c4_sh=r25_c4_sh,
+    )
+
+
+@dataclass
 class TwoLeafFluxResult:
     """Instantaneous Two-Leaf carbon assimilation and stomatal conductances."""
 
@@ -718,42 +833,39 @@ def compute_two_leaf_gas_exchange(
     co2_ppmv: float,
     lai_exposed: torch.Tensor,
     water_stress_beta: torch.Tensor,
+    gbw_sun: torch.Tensor | None = None,
+    gbw_sh: torch.Tensor | None = None,
+    precomputed_alloc: TwoLeafAllocation | None = None,
 ) -> TwoLeafFluxResult:
     """Evaluate sub-daily sunlit and shaded C3/C4 photosynthesis and stomatal conductance.
 
-    1. Recomputes the acclimation light profile `acclim_rad` from `bio.ema_vis_beam,
-       bio.ema_vis_diff, bio.ema_mu0_mid` at `lai_exposed`.
-    2. Allocates `V_cmax25, J_max25, V_pmax25, R_25` to sunlit and shaded pools via
-       Eqs. (A1.24)-(A1.25) of Hashimoto (2026, ATAMI).
-    3. Evaluates non-rectangular-hyperbola `J` (Smith et al., 2019, Eq. 9), hyperbolic
+    1. Uses `precomputed_alloc` (or computes `prepare_two_leaf_allocation`) for sunlit/shaded
+       PAR absorption and enzyme pools (Hashimoto, 2026, ATAMI, Eqs. A1.24-A1.25).
+    2. Evaluates non-rectangular-hyperbola `J` (Smith et al., 2019, Eq. 9), hyperbolic
        co-limitation, MMRT respiration (Heskel et al., 2016), and Medlyn/Prentice/Scott-Smith
        optimal stomatal conductance in kinematic units [m s^-1] (Dai et al., 2004, Eq. 45).
+    3. When finite leaf boundary-layer conductances `gbw_sun, gbw_sh` [m s^-1] are provided,
+       couples the P-model to the leaf-surface microclimate `(c_s, D_s)` via 2 fixed-point passes:
+         c_s = c_af - A_n * P / g_bc   (g_bc = g_bw / 1.37; Dai et al., 2004, Eq. 11),
+         D_s = [g_bw / (g_bw + g_sw)] * D_leaf_af  (Bonan et al., 2018; Wang et al., 2017),
+       so the returned `gsw_sun, gsw_sh` are exact stomatal conductances consistent with
+       series `(g_b^-1 + g_s^-1)^-1` in the leaf energy balance without double-counting.
     """
-    acclim_rad = canopy_light_absorption_depury(
-        bio.ema_vis_beam, bio.ema_vis_diff, bio.ema_mu0_mid, lai_exposed
+    alloc = (
+        precomputed_alloc
+        if precomputed_alloc is not None
+        else prepare_two_leaf_allocation(bio, vis_beam_wm2, vis_diff_wm2, mu0, lai_exposed)
     )
-    inst_rad = canopy_light_absorption_depury(vis_beam_wm2, vis_diff_wm2, mu0, lai_exposed)
-
-    k_db = inst_rad.k_db
+    inst_rad = alloc.inst_rad
     l_sun = inst_rad.l_sun
     l_sh = inst_rad.l_sh
     has_veg = lai_exposed >= 0.01
 
-    # Allocate C3 and C4 enzyme pools into sunlit and shaded leaves
-    vc25_c3_sun, vc25_c3_sh = allocate_two_leaf_capacity(bio.vcmax25_c3, acclim_rad, k_db, l_sun, lai_exposed)
-    jm25_c3_sun, jm25_c3_sh = allocate_two_leaf_capacity(bio.jmax25_c3, acclim_rad, k_db, l_sun, lai_exposed)
-    r25_c3_sun, r25_c3_sh = allocate_two_leaf_capacity(bio.r25_c3, acclim_rad, k_db, l_sun, lai_exposed)
-
-    vc25_c4_sun, vc25_c4_sh = allocate_two_leaf_capacity(bio.vcmax25_c4, acclim_rad, k_db, l_sun, lai_exposed)
-    jm25_c4_sun, jm25_c4_sh = allocate_two_leaf_capacity(bio.jmax25_c4, acclim_rad, k_db, l_sun, lai_exposed)
-    vp25_c4_sun, vp25_c4_sh = allocate_two_leaf_capacity(bio.vpmax25_c4, acclim_rad, k_db, l_sun, lai_exposed)
-    r25_c4_sun, r25_c4_sh = allocate_two_leaf_capacity(bio.r25_c4, acclim_rad, k_db, l_sun, lai_exposed)
-
     ca_pa = (co2_ppmv * 1.0e-6) * pres_sfc
-    ca_mol = co2_ppmv * 1.0e-6
     oi_pa = C.O2_MIXING_RATIO * pres_sfc
     tg = bio.ema_temp_mid
     ws = torch.clamp(water_stress_beta, 0.0, 1.0)
+    f4 = bio.f_c4
 
     def _eval_fraction(
         i_par: torch.Tensor,
@@ -766,8 +878,9 @@ def compute_two_leaf_gas_exchange(
         jm25_4: torch.Tensor,
         vp25_4: torch.Tensor,
         r25_4: torch.Tensor,
+        gbw_ms: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        d_s = torch.clamp(d_pa, min=50.0)
+        d_af = torch.clamp(d_pa, min=20.0)
         eta_s = water_viscosity_rel(tl)
         phi_t = phi_psii_temperature(tl)
         fv = peaked_arrhenius(tl, tg, HA_VCMAX, is_jmax=False)
@@ -775,82 +888,103 @@ def compute_two_leaf_gas_exchange(
         fp = peaked_arrhenius(tl, tg, HA_VPMAX, is_jmax=False)
         fr = heskel_respiration_scale(tl)
 
-        # --- C3 leaf fraction ---
+        # Temperature-only kinetic and electron-transport terms (invariant across (c_s, D_s) passes)
         gamma3 = _arrhenius(GAMMA_STAR25_C3, DHA_GAMMA, tl) * (pres_sfc / 101325.0)
         km3 = _arrhenius(KC25_C3, DHA_KC_C3, tl) * (1.0 + oi_pa / _arrhenius(KO25_C3, DHA_KO_C3, tl))
         xi3 = torch.sqrt(BETA_C3 * (km3 + gamma3) / (1.6 * eta_s))
-        chi3 = torch.clamp(gamma3 / ca_pa + (1.0 - gamma3 / ca_pa) * (xi3 / (xi3 + torch.sqrt(d_s))), 0.05, 0.95)
-        ci3 = chi3 * ca_pa
-
         vc3 = ws * vc25_3 * fv
         jm3 = ws * jm25_3 * fj
         j_3 = non_rectangular_hyperbola(phi_t * i_par, jm3, THETA_NRH)
-        ac3 = vc3 * torch.clamp((ci3 - gamma3) / (ci3 + km3), min=0.0)
-        aj3 = 0.25 * j_3 * torch.clamp((ci3 - gamma3) / (ci3 + 2.0 * gamma3), min=0.0)
-        # Smooth hyperbolic co-limitation (theta_cj = 0.98)
-        b_cj3 = ac3 + aj3
-        gpp3 = (b_cj3 - torch.sqrt(torch.clamp(b_cj3 * b_cj3 - 4.0 * 0.98 * ac3 * aj3, min=0.0))) / (2.0 * 0.98)
         rd3 = r25_3 * fr
-        an3_pos = torch.clamp(gpp3 - rd3, min=0.0)
-        # Optimal stomatal conductance [mol m^-2 s^-1]: g_sw = 1.6 * A_n / (c_a_mol * (1 - chi))
-        # (Prentice et al., 2014; Medlyn et al., 2011; Scott & Smith, 2022)
-        gsw3_mol = 1.6 * (an3_pos * 1.0e-6) / torch.clamp(ca_mol * (1.0 - chi3), min=1.0e-6)
 
-        # --- C4 leaf fraction ---
-        gamma4 = _arrhenius(GAMMA_STAR25_C4, DHA_GAMMA, tl) * (pres_sfc / 101325.0)
         kp4 = _arrhenius(KP25_UMOL_C4 * 1.0e-6, DHA_KP_C4, tl) * pres_sfc
-        km4 = _arrhenius(KC25_C4, DHA_KC_C4, tl) * (1.0 + oi_pa / _arrhenius(KO25_C4, DHA_KO_C4, tl))
         xi4 = torch.sqrt(BETA_C4 * kp4 / (1.6 * eta_s))
-        chi4 = torch.clamp(xi4 / (xi4 + torch.sqrt(d_s)), 0.05, 0.92)
-        cm4 = chi4 * ca_pa
-
         vc4 = ws * vc25_4 * fv
         jm4 = ws * jm25_4 * fj
         vp4 = ws * vp25_4 * fp
         j_4 = non_rectangular_hyperbola(phi_t * i_par, jm4, THETA_NRH)
         al4 = 0.20 * j_4 * torch.sigmoid(0.35 * ((tl - C.T_FREEZE) - 12.0))  # 5 mol e^- / mol CO2 (von Caemmerer, 2000)
-        ap4 = (1.0 - PHI_LEAK_C4) * vp4 * cm4 / torch.clamp(cm4 + kp4, min=0.5)
         ac4 = vc4  # Bundle-sheath CO2-saturated Rubisco limit
         b_cj4 = ac4 + al4
         acj4 = (b_cj4 - torch.sqrt(torch.clamp(b_cj4 * b_cj4 - 4.0 * 0.85 * ac4 * al4, min=0.0))) / (2.0 * 0.85)
-        b_p4 = acj4 + ap4
-        gpp4 = (b_p4 - torch.sqrt(torch.clamp(b_p4 * b_p4 - 4.0 * 0.85 * acj4 * ap4, min=0.0))) / (2.0 * 0.85)
         rd4 = r25_4 * fr
-        an4_pos = torch.clamp(gpp4 - rd4, min=0.0)
-        gsw4_mol = 1.6 * (an4_pos * 1.0e-6) / torch.clamp(ca_mol * (1.0 - chi4), min=1.0e-6)
 
-        # Weighted by autonomous C4 fraction F_4
-        f4 = bio.f_c4
-        gpp_mix = (1.0 - f4) * gpp3 + f4 * gpp4
+        g0_mol = 0.002 * ws * (l_sun + l_sh > 0.01).to(tl.dtype)
+        molar_vol = C.R_GAS_UNIVERSAL * tl / pres_sfc  # [m^3 mol^-1]
+        if gbw_ms is not None:
+            gbw_mol = torch.clamp(gbw_ms / molar_vol, min=1.0e-4)
+            gbc_mol = gbw_mol / 1.37  # Diffusivity ratio (D_H2O/D_CO2)^(2/3) = 1.37 (Dai et al., 2004, Eq. 11)
+            n_bl_passes = 2
+        else:
+            gbw_mol = None
+            gbc_mol = None
+            n_bl_passes = 1
+
+        cs_pa = ca_pa
+        d_s = torch.clamp(d_af, min=50.0)
+        gpp_mix = torch.zeros_like(tl)
         rd_mix = (1.0 - f4) * rd3 + f4 * rd4
-        gsw_mol = (1.0 - f4) * gsw3_mol + f4 * gsw4_mol + 0.002 * ws * (l_sun + l_sh > 0.01).to(tl.dtype)
+        gsw_mol = g0_mol
+
+        for _bl in range(n_bl_passes):
+            cs_mol = torch.clamp(cs_pa / pres_sfc, min=1.0e-5)
+
+            # --- C3 leaf fraction at leaf surface (c_s, D_s) ---
+            chi3 = torch.clamp(gamma3 / cs_pa + (1.0 - gamma3 / cs_pa) * (xi3 / (xi3 + torch.sqrt(d_s))), 0.05, 0.95)
+            ci3 = chi3 * cs_pa
+            ac3 = vc3 * torch.clamp((ci3 - gamma3) / (ci3 + km3), min=0.0)
+            aj3 = 0.25 * j_3 * torch.clamp((ci3 - gamma3) / (ci3 + 2.0 * gamma3), min=0.0)
+            b_cj3 = ac3 + aj3
+            gpp3 = (b_cj3 - torch.sqrt(torch.clamp(b_cj3 * b_cj3 - 4.0 * 0.98 * ac3 * aj3, min=0.0))) / (2.0 * 0.98)
+            an3_pos = torch.clamp(gpp3 - rd3, min=0.0)
+            gsw3_mol = 1.6 * (an3_pos * 1.0e-6) / torch.clamp(cs_mol * (1.0 - chi3), min=1.0e-6)
+
+            # --- C4 leaf fraction at leaf surface (c_s, D_s) ---
+            chi4 = torch.clamp(xi4 / (xi4 + torch.sqrt(d_s)), 0.05, 0.92)
+            cm4 = chi4 * cs_pa
+            ap4 = (1.0 - PHI_LEAK_C4) * vp4 * cm4 / torch.clamp(cm4 + kp4, min=0.5)
+            b_p4 = acj4 + ap4
+            gpp4 = (b_p4 - torch.sqrt(torch.clamp(b_p4 * b_p4 - 4.0 * 0.85 * acj4 * ap4, min=0.0))) / (2.0 * 0.85)
+            an4_pos = torch.clamp(gpp4 - rd4, min=0.0)
+            gsw4_mol = 1.6 * (an4_pos * 1.0e-6) / torch.clamp(cs_mol * (1.0 - chi4), min=1.0e-6)
+
+            gpp_mix = (1.0 - f4) * gpp3 + f4 * gpp4
+            gsw_mol = (1.0 - f4) * gsw3_mol + f4 * gsw4_mol + g0_mol
+
+            if gbw_mol is not None and _bl < n_bl_passes - 1:
+                an_mix_mol = torch.clamp(gpp_mix - rd_mix, min=0.0) * 1.0e-6
+                cs_pa = torch.clamp(ca_pa - (an_mix_mol / gbc_mol) * pres_sfc, min=0.35 * ca_pa, max=ca_pa)
+                d_s = torch.clamp((gbw_mol / (gbw_mol + gsw_mol)) * d_af, min=20.0)
+
         # Convert mol m^-2 s^-1 to kinematic m s^-1 via ideal gas molar volume R * T / P (Dai et al., 2004, Eq. 45)
-        gsw_ms = gsw_mol * (C.R_GAS_UNIVERSAL * tl / pres_sfc)
+        gsw_ms = gsw_mol * molar_vol
         return gpp_mix, rd_mix, gsw_ms
 
     gpp_sun, rd_sun, gsw_sun_raw = _eval_fraction(
         inst_rad.i_sun,
         temp_sun,
         vpd_sun,
-        vc25_c3_sun,
-        jm25_c3_sun,
-        r25_c3_sun,
-        vc25_c4_sun,
-        jm25_c4_sun,
-        vp25_c4_sun,
-        r25_c4_sun,
+        alloc.vc25_c3_sun,
+        alloc.jm25_c3_sun,
+        alloc.r25_c3_sun,
+        alloc.vc25_c4_sun,
+        alloc.jm25_c4_sun,
+        alloc.vp25_c4_sun,
+        alloc.r25_c4_sun,
+        gbw_sun,
     )
     gpp_sh, rd_sh, gsw_sh_raw = _eval_fraction(
         inst_rad.i_sh,
         temp_sh,
         vpd_sh,
-        vc25_c3_sh,
-        jm25_c3_sh,
-        r25_c3_sh,
-        vc25_c4_sh,
-        jm25_c4_sh,
-        vp25_c4_sh,
-        r25_c4_sh,
+        alloc.vc25_c3_sh,
+        alloc.jm25_c3_sh,
+        alloc.r25_c3_sh,
+        alloc.vc25_c4_sh,
+        alloc.jm25_c4_sh,
+        alloc.vp25_c4_sh,
+        alloc.r25_c4_sh,
+        gbw_sh,
     )
 
     zero = torch.zeros_like(lai_exposed)

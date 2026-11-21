@@ -83,6 +83,13 @@ def _restore_surface(sfc_target, payload: dict, device: torch.device) -> None:
                 setattr(sfc_target.bio, bk, bv.to(device=device) if isinstance(bv, torch.Tensor) else bv)
         else:
             setattr(sfc_target, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+    # Backward-compatible warm-start when resuming from pre-3-source restart checkpoints
+    if "t_leaf_sun" not in payload or sfc_target.t_leaf_sun is None:
+        sfc_target.t_leaf_sun = sfc_target.t_canopy.clone()
+    if "t_leaf_sh" not in payload or sfc_target.t_leaf_sh is None:
+        sfc_target.t_leaf_sh = sfc_target.t_canopy.clone()
+    if "t_gnd_skin" not in payload or sfc_target.t_gnd_skin is None:
+        sfc_target.t_gnd_skin = sfc_target.t_soil[0].clone()
 
 
 def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] | None = None) -> None:
