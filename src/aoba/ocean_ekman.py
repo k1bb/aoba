@@ -16,7 +16,7 @@ References
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import torch
 
 from aoba import constants as C
@@ -46,6 +46,16 @@ class EkmanOceanState:
     t_sub_ml: torch.Tensor       # Layer-2 return-flow temperature T_2 [N_cells] [K]
     w_ekman: torch.Tensor        # Diagnostic Ekman upwelling mass flux div(M_E) [N_cells] [kg m^-2 s^-1]
     h_sub_ml: float = H_THERMOCLINE
+    t1_comp: torch.Tensor | None = None  # Kahan float32 rounding compensation for Layer-1 T_1 [K]
+    t2_comp: torch.Tensor | None = None  # Kahan float32 rounding compensation for Layer-2 T_2 [K]
+
+
+def _kahan_add(val: torch.Tensor, delta: torch.Tensor, comp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accumulate small `delta` onto `val` (~280 K) in float32 without swamping loss."""
+    y = delta + comp
+    t = val + y
+    new_comp = torch.where(val.abs() >= y.abs(), (val - t) + y, (y - t) + val)
+    return t, new_comp
 
 
 def init_ekman_ocean_state(
@@ -57,6 +67,8 @@ def init_ekman_ocean_state(
     return EkmanOceanState(
         t_sub_ml=t2,
         w_ekman=torch.zeros_like(t2),
+        t1_comp=torch.zeros_like(t2),
+        t2_comp=torch.zeros_like(t2),
     )
 
 
@@ -141,8 +153,15 @@ def step_ekman_ocean_voronoi(
     c1_cap = C.CP_SEAWATER * C.RHO_SEAWATER * sfc.h_ocean_ml
     c2_cap = C.CP_SEAWATER * C.RHO_SEAWATER * ocn.h_sub_ml
 
-    t1_next = t1 + (dt / c1_cap) * (-div_q1 + q_diap - q_calve)
-    t2_next = t2 + (dt / c2_cap) * (-div_q2 - q_diap)
+    if ocn.t1_comp is None:
+        ocn.t1_comp = torch.zeros_like(t1)
+    if ocn.t2_comp is None:
+        ocn.t2_comp = torch.zeros_like(t2)
+
+    dt1 = (dt / c1_cap) * (-div_q1 + q_diap - q_calve)
+    dt2 = (dt / c2_cap) * (-div_q2 - q_diap)
+    t1_next, comp1 = _kahan_add(t1, dt1, ocn.t1_comp)
+    t2_next, comp2 = _kahan_add(t2, dt2, ocn.t2_comp)
 
     # If dynamic advection cools mixed layer below seawater freezing point, form sea ice conservatively!
     freeze_excess = torch.where(is_ocean, torch.clamp(C.T_FREEZE_OCEAN - t1_next, min=0.0), torch.zeros_like(t1))
@@ -150,6 +169,8 @@ def step_ekman_ocean_voronoi(
     t1_final = t1_next + freeze_excess
     t2_final = torch.clamp(t2_next, min=C.T_FREEZE_OCEAN)
 
+    ocn.t1_comp = torch.where(is_ocean & (freeze_excess == 0.0), comp1, torch.zeros_like(comp1))
+    ocn.t2_comp = torch.where(is_ocean & (t2_next >= C.T_FREEZE_OCEAN), comp2, torch.zeros_like(comp2))
     sfc.t_ocean_ml = torch.where(is_ocean, t1_final, sfc.t_ocean_ml)
     sfc.m_seaice = torch.where(is_ocean, sfc.m_seaice + dm_ice, sfc.m_seaice)
     ocn.t_sub_ml = torch.where(is_ocean, t2_final, ocn.t_sub_ml)
