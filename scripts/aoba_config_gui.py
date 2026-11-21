@@ -604,6 +604,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="icon" type="image/png" href="/assets/aoba_icon.png" />
 <title>AOBA Studio — 設定・実行・監視・3地球リアルタイム可視化</title>
 <style>
   :root {
@@ -794,7 +795,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 <header>
   <div class="brand">
-    <div class="logo-badge">AO</div>
+    <img src="/assets/aoba_icon.png" alt="AOBA Icon" style="width:40px;height:40px;border-radius:10px;display:block;" />
     <div>
       <h1>AOBA Studio</h1>
       <p data-i18n="brand_sub">設定 (TOML <span id="param-total">188</span>項目) → 実行 → 監視 → CPU リアルタイム 3地球可視化</p>
@@ -1085,6 +1086,7 @@ let CURRENT_DOC_BASE = "formulation";
 let ACTIVE_REG_SEC = "constants";
 let MON = { raster: null, rawT2: null, rawOLR: null, rawLAI: null, rawSurf: null, rawCoast: null, outDir: "" };
 let GLOBE_VIEW = { lat0: 18.0, lon0: 140.0, dragging: false, lastX: 0, lastY: 0, geoCacheLat: null, geoCache: null };
+let GRID_VIEW = { lon0: 138.0, lat0: 24.0, dragging: false, lastX: 0, lastY: 0, cache: {}, inflight: {} };
 
 const I18N = {
   ja: {
@@ -1442,7 +1444,40 @@ function applyForcingPreset(kind) {
   showToast("外力・氷床プリセットを適用しました");
 }
 
-/* --- TAB 1 CANVAS: GLEVEL SPHERE + CRM + VERTICAL --- */
+/* --- TAB 1 CANVAS: REAL SCVT VORONOI MESH + CRM + VERTICAL --- */
+function b64ToTyped(b64, TypedArr) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TypedArr(bytes.buffer);
+}
+
+async function ensureSCVTPreviewMesh(g) {
+  if (GRID_VIEW.cache[g] || GRID_VIEW.inflight[g]) return;
+  GRID_VIEW.inflight[g] = true;
+  try {
+    const res = await fetch(`/api/scvt_mesh?glevel=${g}`);
+    const data = await res.json();
+    if (data.ok) {
+      GRID_VIEW.cache[g] = {
+        glevel: data.glevel,
+        nCells: data.n_cells,
+        nVerts: data.n_verts,
+        nEdges: data.n_edges,
+        xyzCell: b64ToTyped(data.xyz_cell_b64, Int16Array),
+        xyzVert: b64ToTyped(data.xyz_vert_b64, Int16Array),
+        vertsOnCell: b64ToTyped(data.verts_on_cell_b64, Int32Array),
+        nVertsOnCell: b64ToTyped(data.n_verts_on_cell_b64, Uint8Array),
+        vertsOnEdge: b64ToTyped(data.verts_on_edge_b64, Int32Array),
+        surfType: b64ToTyped(data.surf_type_b64, Uint8Array),
+      };
+      drawGridCanvas();
+    }
+  } finally {
+    delete GRID_VIEW.inflight[g];
+  }
+}
+
 function drawGridCanvas() {
   const canvas = document.getElementById("gridCanvas");
   if (!canvas) return;
@@ -1451,7 +1486,7 @@ function drawGridCanvas() {
   ctx.clearRect(0, 0, W, H);
 
   const cfgG = STATE.config.grid || {};
-  const g = Math.max(0, Math.min(7, Math.round(cfgG.glevel ?? 3)));
+  const g = Math.max(0, Math.min(6, Math.round(cfgG.glevel ?? 3)));
   const nz = Math.max(4, Math.round(cfgG.nz ?? 32));
   const zTop = Number(cfgG.z_top ?? 24000);
   const dzMin = Number(cfgG.dz_min ?? 60);
@@ -1472,73 +1507,146 @@ function drawGridCanvas() {
   document.getElementById("kpi-subcols").textContent = totalSubcols.toLocaleString();
   document.getElementById("kpi-pts").textContent = (totalSubcols * nz).toLocaleString();
 
-  const cx = 185, cy = 220, rad = 148;
+  const cx = 185, cy = 224, rad = 148;
+  // Ocean background sphere with limb gradient
   const grad = ctx.createRadialGradient(cx - 42, cy - 48, 25, cx, cy, rad);
-  grad.addColorStop(0, "#1d4ed8"); grad.addColorStop(0.6, "#0f2d6b"); grad.addColorStop(1, "#09142b");
+  grad.addColorStop(0, "#173c7a"); grad.addColorStop(0.65, "#0d2554"); grad.addColorStop(1, "#071128");
   ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.fillStyle = grad; ctx.fill();
+
+  const mesh = GRID_VIEW.cache[g];
+  let hlScreenX = cx + 18, hlScreenY = cy - 12, hlPoly = null;
+
+  if (!mesh) {
+    ensureSCVTPreviewMesh(g);
+    ctx.fillStyle = "#94a3b8"; ctx.font = "12px sans-serif";
+    ctx.fillText(`Loading real SCVT Glevel-${g}...`, cx - 72, cy);
+  } else {
+    const lonRad = (GRID_VIEW.lon0 * Math.PI) / 180.0;
+    const latRad = (GRID_VIEW.lat0 * Math.PI) / 180.0;
+    const cl = Math.cos(lonRad), sl = Math.sin(lonRad), cp = Math.cos(latRad), sp = Math.sin(latRad);
+    const invS = 1.0 / 32767.0;
+
+    // Project all Voronoi vertices once
+    const nV = mesh.nVerts;
+    const vx = new Float32Array(nV), vy = new Float32Array(nV), vz = new Float32Array(nV);
+    const xyzV = mesh.xyzVert;
+    for (let v = 0; v < nV; v++) {
+      const x0 = xyzV[v * 3] * invS, y0 = xyzV[v * 3 + 1] * invS, z0 = xyzV[v * 3 + 2] * invS;
+      // Rotate around z by -lon0 (bring lon0 to +x), then around y so +x points at viewer (z_cam)
+      const xr = cl * x0 + sl * y0;
+      const yr = -sl * x0 + cl * y0;
+      const zr = z0;
+      // Camera right = yr (east), camera up = z*cp - xr*sp (north), camera forward = xr*cp + z*sp
+      vx[v] = yr;
+      vy[v] = zr * cp - xr * sp;
+      vz[v] = xr * cp + zr * sp;
+    }
+
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.clip();
+
+    // Draw real filled Voronoi polygons colored by Earth2014 surface mask (Ocean/Land/Ice)
+    const nC = mesh.nCells, xyzC = mesh.xyzCell, voc = mesh.vertsOnCell, nvoc = mesh.nVertsOnCell, st = mesh.surfType;
+    let bestLandScore = -1e9, bestIdx = 0;
+    for (let c = 0; c < nC; c++) {
+      const x0 = xyzC[c * 3] * invS, y0 = xyzC[c * 3 + 1] * invS, z0 = xyzC[c * 3 + 2] * invS;
+      const xr = cl * x0 + sl * y0, yr = -sl * x0 + cl * y0, zr = z0;
+      const cx_cam = yr, cy_cam = zr * cp - xr * sp, cz_cam = xr * cp + zr * sp;
+      if (cz_cam < -0.08) continue;
+
+      // Pick a prominent mid-latitude land/host cell near front-right to zoom into CRM
+      const landBonus = st[c] === 1 ? 0.5 : 0.0;
+      const score = cz_cam + landBonus - 1.2 * Math.hypot(cx_cam - 0.16, cy_cam - 0.08);
+      if (score > bestLandScore && nvoc[c] === 6 && cz_cam > 0.45) {
+        bestLandScore = score; bestIdx = c;
+      }
+
+      const deg = nvoc[c];
+      const base = c * 6;
+      const shade = 0.55 + 0.45 * Math.max(0.0, cz_cam);
+      const sType = st[c];
+      let rC, gC, bC;
+      if (sType === 0) { rC = 20 * shade; gC = 64 * shade; bC = 132 * shade; }
+      else if (sType === 2) { rC = 225 * shade; gC = 240 * shade; bC = 250 * shade; }
+      else { rC = 54 * shade; gC = 122 * shade; bC = 76 * shade; }
+      // Highlight the 12 icosahedral pentagons subtly with warm gold tint on border/fill
+      if (deg === 5) { rC = Math.min(255, rC + 28); gC = Math.min(255, gC + 18); }
+
+      ctx.fillStyle = `rgb(${rC | 0},${gC | 0},${bC | 0})`;
+      ctx.beginPath();
+      for (let k = 0; k < deg; k++) {
+        const vid = voc[base + k];
+        const px = cx + vx[vid] * rad, py = cy - vy[vid] * rad;
+        if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // Stroke true Voronoi edges across the visible hemisphere
+    const voe = mesh.vertsOnEdge, nE = mesh.nEdges;
+    ctx.strokeStyle = g <= 2 ? "rgba(56,189,248,0.85)" : (g <= 4 ? "rgba(56,189,248,0.52)" : (g === 5 ? "rgba(125,211,252,0.34)" : "rgba(125,211,252,0.22)"));
+    ctx.lineWidth = g <= 2 ? 1.5 : (g <= 4 ? 0.9 : 0.55);
+    ctx.beginPath();
+    for (let e = 0; e < nE; e++) {
+      const a = voe[e * 2], b = voe[e * 2 + 1];
+      if (vz[a] < -0.02 && vz[b] < -0.02) continue;
+      ctx.moveTo(cx + vx[a] * rad, cy - vy[a] * rad);
+      ctx.lineTo(cx + vx[b] * rad, cy - vy[b] * rad);
+    }
+    ctx.stroke();
+
+    // Highlight selected host hexagon + collect its true vertex offsets for zoomed panel
+    const degH = nvoc[bestIdx], baseH = bestIdx * 6;
+    const xh0 = xyzC[bestIdx*3]*invS, yh0 = xyzC[bestIdx*3+1]*invS, zh0 = xyzC[bestIdx*3+2]*invS;
+    const xrh = cl*xh0 + sl*yh0, yrh = -sl*xh0 + cl*yh0, zrh = zh0;
+    hlScreenX = cx + yrh * rad;
+    hlScreenY = cy - (zrh * cp - xrh * sp) * rad;
+    hlPoly = [];
+    ctx.beginPath();
+    let maxR = 1e-6;
+    for (let k = 0; k < degH; k++) {
+      const vid = voc[baseH + k];
+      const px = cx + vx[vid] * rad, py = cy - vy[vid] * rad;
+      if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      const dxp = px - hlScreenX, dyp = py - hlScreenY;
+      maxR = Math.max(maxR, Math.hypot(dxp, dyp));
+      hlPoly.push([dxp, dyp]);
+    }
+    ctx.closePath();
+    ctx.fillStyle = "rgba(251,191,36,0.42)"; ctx.fill();
+    ctx.strokeStyle = "#fbbf24"; ctx.lineWidth = 2.0; ctx.stroke();
+    hlPoly = hlPoly.map(([dxp, dyp]) => [dxp / maxR, dyp / maxR]);
+    ctx.restore();
+  }
+
+  // Globe crisp outer rim
+  ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2);
   ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 1.6; ctx.stroke();
 
-  const phi = (1 + Math.sqrt(5)) / 2;
-  let verts = [[-1,phi,0],[1,phi,0],[-1,-phi,0],[1,-phi,0],[0,-1,phi],[0,1,phi],[0,-1,-phi],[0,1,-phi],[phi,0,-1],[phi,0,1],[-phi,0,-1],[-phi,0,1]]
-    .map(v => { const L = Math.hypot(v[0],v[1],v[2]); return [v[0]/L, v[1]/L, v[2]/L]; });
-  let faces = [[0,11,5],[0,5,1],[0,1,7],[0,7,10],[0,10,11],[1,5,9],[5,11,4],[11,10,2],[10,7,6],[7,1,8],[3,9,4],[3,4,2],[3,2,6],[3,6,8],[3,8,9],[4,9,5],[2,4,11],[6,2,10],[8,6,7],[9,8,1]];
-  for (let s = 0; s < Math.min(g, 4); s++) {
-    const midCache = new Map();
-    const getMid = (a, b) => {
-      const k = a < b ? `${a}_${b}` : `${b}_${a}`;
-      if (midCache.has(k)) return midCache.get(k);
-      const va = verts[a], vb = verts[b];
-      const mx = va[0]+vb[0], my = va[1]+vb[1], mz = va[2]+vb[2], L = Math.hypot(mx,my,mz);
-      const idx = verts.length; verts.push([mx/L, my/L, mz/L]); midCache.set(k, idx); return idx;
-    };
-    const nf = [];
-    for (const [a,b,c] of faces) { const ab = getMid(a,b), bc = getMid(b,c), ca = getMid(c,a); nf.push([a,ab,ca],[b,bc,ab],[c,ca,bc],[ab,bc,ca]); }
-    faces = nf;
-  }
-  const cy1 = Math.cos(0.32), sy1 = Math.sin(0.32), cp = Math.cos(0.36), sp = Math.sin(0.36);
-  const rVerts = verts.map(v => { const x1 = v[0]*cy1+v[2]*sy1, z1 = -v[0]*sy1+v[2]*cy1, y1 = v[1]; return [x1, y1*cp-z1*sp, y1*sp+z1*cp]; });
+  ctx.fillStyle = "#e2e8f0"; ctx.font = "bold 13px sans-serif";
+  ctx.fillText(LANG === "ja" ? `実 SCVT Voronoi 格子: Glevel-${g}` : `Real SCVT Voronoi Mesh: Glevel-${g}`, 18, 26);
+  ctx.fillStyle = "#94a3b8"; ctx.font = "11.5px monospace";
+  ctx.fillText(`N_cell=${nCell.toLocaleString()} (Δx≈${dxHostKm.toFixed(0)}km) · ドラッグ回転可`, 18, 45);
 
-  ctx.strokeStyle = g <= 2 ? "rgba(56,189,248,0.65)" : (g <= 4 ? "rgba(56,189,248,0.34)" : "rgba(56,189,248,0.18)");
-  ctx.lineWidth = g <= 2 ? 1.2 : 0.7;
-  ctx.beginPath();
-  for (const [a,b,c] of faces) {
-    const va = rVerts[a], vb = rVerts[b], vc = rVerts[c];
-    if (va[2]+vb[2]+vc[2] <= -0.15) continue;
-    ctx.moveTo(cx+va[0]*rad, cy-va[1]*rad); ctx.lineTo(cx+vb[0]*rad, cy-vb[1]*rad);
-    ctx.lineTo(cx+vc[0]*rad, cy-vc[1]*rad); ctx.lineTo(cx+va[0]*rad, cy-va[1]*rad);
-  }
-  ctx.stroke();
-
-  if (g >= 5) {
-    ctx.strokeStyle = g === 5 ? "rgba(52,211,153,0.22)" : "rgba(52,211,153,0.32)";
-    const stepPx = g === 5 ? 9 : 4.8;
-    ctx.save(); ctx.beginPath(); ctx.arc(cx, cy, rad-1, 0, Math.PI*2); ctx.clip(); ctx.beginPath();
-    for (let y = cy-rad; y <= cy+rad; y += stepPx) { ctx.moveTo(cx-rad, y); ctx.lineTo(cx+rad, y); }
-    for (let x = cx-rad; x <= cx+rad; x += stepPx) { ctx.moveTo(x, cy-rad); ctx.lineTo(x, cy+rad); }
-    ctx.stroke(); ctx.restore();
-  }
-
-  const hx = cx + 18, hy = cy - 12, hRad = Math.max(10, Math.min(44, 62 / Math.pow(1.45, Math.min(g, 5))));
-  ctx.beginPath();
-  for (let i = 0; i < 6; i++) {
-    const ang = (Math.PI/3)*i + Math.PI/6, px = hx+hRad*Math.cos(ang), py = hy+hRad*Math.sin(ang);
-    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-  }
-  ctx.closePath(); ctx.fillStyle = "rgba(251,191,36,0.3)"; ctx.fill(); ctx.strokeStyle = "#fbbf24"; ctx.lineWidth = 2; ctx.stroke();
-
-  ctx.fillStyle = "#e2e8f0"; ctx.font = "bold 13px sans-serif"; ctx.fillText(`SCVT 全球格子: Glevel-${g}`, 22, 28);
-  ctx.fillStyle = "#94a3b8"; ctx.font = "12px monospace"; ctx.fillText(`N_cell = ${nCell.toLocaleString()} (Δx ≈ ${dxHostKm.toFixed(0)} km)`, 22, 47);
-
-  ctx.strokeStyle = "rgba(251,191,36,0.7)"; ctx.lineWidth = 1.4; ctx.setLineDash([4,3]);
-  ctx.beginPath(); ctx.moveTo(hx+hRad, hy); ctx.lineTo(405, 115); ctx.stroke(); ctx.setLineDash([]);
-
+  // Connector to Zoomed Host Voronoi Cell + Nested CRM
   const zcx = 495, zcy = 205, zRad = 88;
+  ctx.strokeStyle = "rgba(251,191,36,0.75)"; ctx.lineWidth = 1.5; ctx.setLineDash([4,3]);
+  ctx.beginPath(); ctx.moveTo(hlScreenX, hlScreenY); ctx.lineTo(zcx - zRad * 0.85, zcy - 18); ctx.stroke(); ctx.setLineDash([]);
+
   ctx.beginPath();
-  for (let i = 0; i < 6; i++) {
-    const ang = (Math.PI/3)*i + Math.PI/6, px = zcx+zRad*Math.cos(ang), py = zcy+zRad*Math.sin(ang);
-    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  if (hlPoly && hlPoly.length >= 5) {
+    hlPoly.forEach(([ux, uy], i) => {
+      const px = zcx + ux * zRad, py = zcy + uy * zRad;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    });
+  } else {
+    for (let i = 0; i < 6; i++) {
+      const ang = (Math.PI/3)*i + Math.PI/6, px = zcx+zRad*Math.cos(ang), py = zcy+zRad*Math.sin(ang);
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
   }
-  ctx.closePath(); ctx.fillStyle = "rgba(16,185,129,0.12)"; ctx.fill(); ctx.strokeStyle = "#fbbf24"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.closePath(); ctx.fillStyle = "rgba(16,185,129,0.14)"; ctx.fill(); ctx.strokeStyle = "#fbbf24"; ctx.lineWidth = 2; ctx.stroke();
 
   const ratioX = Math.max(0.28, Math.min(0.88, crmWKm / Math.max(dxHostKm, 1)));
   const ratioY = crmNy === 1 ? 0.16 : Math.max(0.24, Math.min(0.88, crmHKm / Math.max(dxHostKm, 1)));
@@ -1551,11 +1659,12 @@ function drawGridCanvas() {
   for (let j = 1; j < Math.min(crmNy, 16); j++) { const y = by0 + boxH*j/Math.min(crmNy,16); ctx.moveTo(bx0,y); ctx.lineTo(bx0+boxW,y); }
   ctx.stroke();
 
-  ctx.fillStyle = "#f8fafc"; ctx.font = "bold 13px sans-serif"; ctx.fillText(`埋め込み CRM (MAML+ICA)`, 400, 28);
-  ctx.fillStyle = "#38bdf8"; ctx.font = "12px monospace"; ctx.fillText(`${crmNx}×${crmNy} (dx=${(crmDx/1000).toFixed(1)} km)`, 400, 47);
+  ctx.fillStyle = "#f8fafc"; ctx.font = "bold 13px sans-serif";
+  ctx.fillText(LANG === "ja" ? "埋め込み CRM (MAML+ICA)" : "Embedded CRM (MAML+ICA)", 400, 26);
+  ctx.fillStyle = "#38bdf8"; ctx.font = "12px monospace"; ctx.fillText(`${crmNx}×${crmNy} (dx=${(crmDx/1000).toFixed(1)} km)`, 400, 45);
   ctx.fillStyle = "#cbd5e1"; ctx.font = "11.5px monospace";
-  ctx.fillText(`ホスト幅: ~${dxHostKm.toFixed(0)} km`, 415, 330);
-  ctx.fillText(`CRM 域: ${crmWKm.toFixed(0)}×${crmHKm.toFixed(0)} km`, 415, 348);
+  ctx.fillText(`${LANG==="ja"?"ホスト幅":"Host"}: ~${dxHostKm.toFixed(0)} km`, 415, 330);
+  ctx.fillText(`${LANG==="ja"?"CRM 域":"CRM"}: ${crmWKm.toFixed(0)}×${crmHKm.toFixed(0)} km`, 415, 348);
 
   const vx = 640, vw = 85, vyTop = 62, vyBot = 380, vH = vyBot - vyTop;
   const spRatio = Math.max(0, Math.min(1, 1.0 - zSponge / Math.max(zTop, 1)));
@@ -1576,9 +1685,9 @@ function drawGridCanvas() {
     cumZ += dzMin * Math.pow(r, k);
   }
   ctx.stroke();
-  ctx.fillStyle = "#f8fafc"; ctx.font = "bold 13px sans-serif"; ctx.fillText(`鉛直層 nz=${nz}`, 636, 28);
+  ctx.fillStyle = "#f8fafc"; ctx.font = "bold 13px sans-serif"; ctx.fillText(LANG==="ja"?`鉛直層 nz=${nz}`:`Levels nz=${nz}`, 636, 26);
   ctx.fillStyle = "#94a3b8"; ctx.font = "11px monospace";
-  ctx.fillText(`top: ${(zTop/1000).toFixed(1)} km`, 636, 47);
+  ctx.fillText(`top: ${(zTop/1000).toFixed(1)} km`, 636, 45);
   ctx.fillText(`dz0: ${dzMin.toFixed(0)} m`, 636, 404);
 }
 
@@ -1965,7 +2074,20 @@ function bindGlobeInteractions() {
         `${ptLbl} (${lat.toFixed(1)}°, ${lon.toFixed(1)}°, ${stype}) — T₂: ${t2v.toFixed(1)} °C (${(t2v+273.15).toFixed(1)} K) | OLR: ${olrv.toFixed(0)} W/m² | LAI: ${laiv.toFixed(2)} m²/m²`;
     });
   });
-  window.addEventListener("mouseup", () => { GLOBE_VIEW.dragging = false; });
+  window.addEventListener("mouseup", () => { GLOBE_VIEW.dragging = false; GRID_VIEW.dragging = false; });
+  const gcv = document.getElementById("gridCanvas");
+  if (gcv) {
+    gcv.style.cursor = "grab";
+    gcv.addEventListener("mousedown", e => { GRID_VIEW.dragging = true; GRID_VIEW.lastX = e.clientX; GRID_VIEW.lastY = e.clientY; });
+    gcv.addEventListener("mousemove", e => {
+      if (!GRID_VIEW.dragging) return;
+      const dx = e.clientX - GRID_VIEW.lastX, dy = e.clientY - GRID_VIEW.lastY;
+      GRID_VIEW.lastX = e.clientX; GRID_VIEW.lastY = e.clientY;
+      GRID_VIEW.lon0 = ((GRID_VIEW.lon0 - dx * 0.5 + 180) % 360) - 180;
+      GRID_VIEW.lat0 = Math.max(-80, Math.min(80, GRID_VIEW.lat0 + dy * 0.5));
+      drawGridCanvas();
+    });
+  }
 }
 
 /* --- OFFLINE MARKDOWN + LATEX DOCUMENTATION VIEWER --- */
@@ -2155,6 +2277,64 @@ requestAnimationFrame(animateGlobes);
 """
 
 
+_SCVT_PREVIEW_MEM: dict[int, dict[str, Any]] = {}
+_SCVT_NPZ_PATH = _REPO_ROOT / "config" / "scvt_preview_meshes.npz"
+
+
+def get_scvt_preview_payload(glevel: int) -> dict[str, Any]:
+    """Return real precomputed SCVT Voronoi polygon mesh for `glevel` (`0..6`), with dynamic fallback."""
+    g = max(0, min(6, int(glevel)))
+    if g in _SCVT_PREVIEW_MEM:
+        return _SCVT_PREVIEW_MEM[g]
+
+    if _SCVT_NPZ_PATH.exists():
+        with np.load(_SCVT_NPZ_PATH) as zf:
+            if f"g{g}_xyz_cell" in zf:
+                raw = {
+                    "xyz_cell": zf[f"g{g}_xyz_cell"],
+                    "xyz_vert": zf[f"g{g}_xyz_vert"],
+                    "verts_on_cell": zf[f"g{g}_verts_on_cell"],
+                    "n_verts_on_cell": zf[f"g{g}_n_verts_on_cell"],
+                    "verts_on_edge": zf[f"g{g}_verts_on_edge"],
+                    "surf_type": zf[f"g{g}_surf_type"],
+                }
+            else:
+                raw = None
+    else:
+        raw = None
+
+    if raw is None:
+        if str(_REPO_ROOT / "scripts") not in sys.path:
+            sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+        from build_scvt_preview_cache import _extract_voronoi_preview_level  # type: ignore
+
+        d = _extract_voronoi_preview_level(g)
+        raw = {
+            "xyz_cell": d[f"g{g}_xyz_cell"],
+            "xyz_vert": d[f"g{g}_xyz_vert"],
+            "verts_on_cell": d[f"g{g}_verts_on_cell"],
+            "n_verts_on_cell": d[f"g{g}_n_verts_on_cell"],
+            "verts_on_edge": d[f"g{g}_verts_on_edge"],
+            "surf_type": d[f"g{g}_surf_type"],
+        }
+
+    payload = {
+        "ok": True,
+        "glevel": g,
+        "n_cells": int(raw["xyz_cell"].shape[0]),
+        "n_verts": int(raw["xyz_vert"].shape[0]),
+        "n_edges": int(raw["verts_on_edge"].shape[0]),
+        "xyz_cell_b64": base64.b64encode(np.ascontiguousarray(raw["xyz_cell"], dtype=np.int16).tobytes()).decode("ascii"),
+        "xyz_vert_b64": base64.b64encode(np.ascontiguousarray(raw["xyz_vert"], dtype=np.int16).tobytes()).decode("ascii"),
+        "verts_on_cell_b64": base64.b64encode(np.ascontiguousarray(raw["verts_on_cell"], dtype=np.int32).tobytes()).decode("ascii"),
+        "n_verts_on_cell_b64": base64.b64encode(np.ascontiguousarray(raw["n_verts_on_cell"], dtype=np.uint8).tobytes()).decode("ascii"),
+        "verts_on_edge_b64": base64.b64encode(np.ascontiguousarray(raw["verts_on_edge"], dtype=np.int32).tobytes()).decode("ascii"),
+        "surf_type_b64": base64.b64encode(np.ascontiguousarray(raw["surf_type"], dtype=np.uint8).tobytes()).decode("ascii"),
+    }
+    _SCVT_PREVIEW_MEM[g] = payload
+    return payload
+
+
 _DOC_FILES: dict[str, Path] = {
     "formulation_ja": _REPO_ROOT / "docs" / "formulation_ja.md",
     "formulation_en": _REPO_ROOT / "docs" / "formulation.md",
@@ -2229,6 +2409,28 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
                 frame = -1
             rm = self.server.run_manager  # type: ignore[attr-defined]
             self._send_json(rm.build_monitor_payload(out_dir, source=source, frame_req=frame))
+            return
+
+        if parsed.path == "/api/scvt_mesh":
+            qs = parse_qs(parsed.query)
+            try:
+                g = int(qs.get("glevel", ["3"])[0])
+            except ValueError:
+                g = 3
+            self._send_json(get_scvt_preview_payload(g))
+            return
+
+        if parsed.path == "/assets/aoba_icon.png":
+            icon_p = _REPO_ROOT / "docs" / "assets" / "aoba_icon.png"
+            if not icon_p.exists():
+                self._send_json({"error": "Icon not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            raw = icon_p.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
             return
 
         if parsed.path == "/api/docs":

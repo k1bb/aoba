@@ -672,7 +672,6 @@ def _get_metal_lib():
     return _METAL_SHADER_LIB
 
 
-@torch.jit.script
 def solve_tridiagonal_pytorch(
     dl: torch.Tensor,
     d: torch.Tensor,

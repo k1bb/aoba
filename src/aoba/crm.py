@@ -490,7 +490,6 @@ def _upwind_vertical_advect(
     return out
 
 
-@torch.jit.script
 def _crm_fast_acoustic_hevi_torch(
     n_ac: int,
     dt_ac: float,

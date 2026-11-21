@@ -337,7 +337,6 @@ def fct_advect_scvt(
 # ---------------------------------------------------------------------------
 # 4. Global Nonhydrostatic RK3-HEVI Step on SCVT Voronoi C-Grid
 # ---------------------------------------------------------------------------
-@torch.jit.script
 def _scvt_fast_acoustic_hevi_cpu_gpu(
     n_ac: int,
     dt_ac: float,

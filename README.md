@@ -1,3 +1,5 @@
+<img src="docs/assets/aoba_icon.png" width="96" align="right" alt="AOBA Icon" />
+
 # AOBA (Autonomous Optimality Biosphere–Atmosphere)
 
 > **Language**: English | [日本語 (README_ja.md)](README_ja.md)

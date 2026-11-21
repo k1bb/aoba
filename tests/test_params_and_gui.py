@@ -102,10 +102,18 @@ def test_gui_server_endpoints() -> None:
         html = urllib.request.urlopen(f"{base}/").read().decode("utf-8")
         assert "gridCanvas" in html and "globeT2" in html and "globeOLR" in html and "globeLAI" in html
         assert "lang-btn" in html and "toggleLang" in html and "tab-docs" in html and "renderMarkdownWithMath" in html
+        assert "/assets/aoba_icon.png" in html
+        icon_bytes = urllib.request.urlopen(f"{base}/assets/aoba_icon.png").read()
+        assert icon_bytes[:4] == b"\x89PNG"
 
         for doc_k in ("formulation_ja", "formulation_en", "architecture_ja", "architecture_en", "readme_ja", "readme_en"):
             doc_resp = json.loads(urllib.request.urlopen(f"{base}/api/docs?name={doc_k}").read().decode("utf-8"))
             assert doc_resp["ok"] and len(doc_resp["markdown"]) > 200
+
+        for g_lvl, exp_cells, exp_edges in ((0, 12, 30), (3, 642, 1920), (5, 10242, 30720)):
+            m_resp = json.loads(urllib.request.urlopen(f"{base}/api/scvt_mesh?glevel={g_lvl}").read().decode("utf-8"))
+            assert m_resp["ok"] and m_resp["n_cells"] == exp_cells and m_resp["n_edges"] == exp_edges
+            assert len(m_resp["verts_on_cell_b64"]) > 0 and len(m_resp["surf_type_b64"]) > 0
 
         state = json.loads(urllib.request.urlopen(f"{base}/api/state").read().decode("utf-8"))
         assert state["param_count"] == 188
@@ -245,12 +253,12 @@ def test_runner_cli_with_custom_toml_cpu() -> None:
         assert (out_dir / "year_0001" / "_COMPLETE").exists()
         assert (out_dir / "year_0001" / "restart.pt").exists()
 
-        ds_m = xr.open_zarr(out_dir / "monthly.zarr")
+        ds_m = xr.open_zarr(out_dir / "monthly.zarr", consolidated=False)
         assert ds_m.sizes["time"] == 2
         assert "t_canopy" in ds_m and "lai_sub" in ds_m and "h_ice" in ds_m
         assert "temp" not in ds_m
 
-        ds_s = xr.open_zarr(out_dir / "snapshots.zarr")
+        ds_s = xr.open_zarr(out_dir / "snapshots.zarr", consolidated=False)
         assert ds_s.sizes["time"] == 2
         assert "temp" in ds_s and "h_ice" in ds_s
         assert "lai_sub" not in ds_s
