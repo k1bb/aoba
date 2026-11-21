@@ -85,11 +85,12 @@ E_RI: float = 1.0                  # Collection efficiency of rain for cloud ice
 E_SI: float = 0.1                  # Collection efficiency of snow for cloud ice [-]
 E_GI: float = 0.1                  # Collection efficiency of graupel for cloud ice [-]
 
-QC_AUTOCONV_THRESH: float = 1.0e-3 # Threshold cloud liquid water q_co [kg kg^-1]
+QC_AUTOCONV_THRESH: float = 1.0e-3 # KR03 fallback threshold cloud liquid water q_co [kg kg^-1] (used if N_d <= 0)
 QI_AGGREG_THRESH: float = 1.0e-4   # Threshold cloud ice q_io [kg kg^-1]
-RATE_AUTOCONV: float = 1.0e-3      # Autoconversion rate alpha [s^-1]
+RATE_AUTOCONV: float = 1.0e-3      # KR03 fallback autoconversion rate alpha [s^-1]
 RATE_ICE_AGGREG: float = 1.0e-3    # Ice aggregation rate beta [s^-1]
-VT_CLOUD_ICE: float = 0.40         # Cloud-ice terminal fall velocity V_TI [m s^-1]
+VT_CLOUD_ICE: float = 0.18         # Cloud-ice terminal fall velocity V_TI [m s^-1]
+CLOUD_DROPLET_CONC_CM3: float = 60.0 # Cloud droplet number conc. N_d [cm^-3] (Tomita 2008 / Berry 1968; <=0 -> KR03)
 
 # Precipitating phase-partition temperature thresholds (KR03 Appendix B, p. 624)
 T0_PRECIP: float = 283.16          # T_0p above which precip is 100% rain [K]
@@ -174,6 +175,7 @@ _MP_METAL_CONSTS: list[float] = [
     _ACCR_RC, _ACCR_SC, _ACCR_GC,
     _ACCR_RI, _ACCR_SI, _ACCR_GI,
     _AEM_R, _BEM_R, _AEM_S, _BEM_S, _AEM_G, _BEM_G,
+    CLOUD_DROPLET_CONC_CM3,
 ]
 
 
@@ -208,6 +210,7 @@ def recompute_derived_constants() -> None:
         _ACCR_RC, _ACCR_SC, _ACCR_GC,
         _ACCR_RI, _ACCR_SI, _ACCR_GI,
         _AEM_R, _BEM_R, _AEM_S, _BEM_S, _AEM_G, _BEM_G,
+        CLOUD_DROPLET_CONC_CM3,
     ]
 
 
@@ -301,9 +304,18 @@ def step_microphysics(
     temp, q_v, q_c, q_i = saturation_adjustment(t_li, pres, qn)
     q_r, q_s, q_g, omega_p_old = partition_precipitating_hydrometeors(temp, qp)
 
-    # 2. Autoconversion (KR03 Eq. A30) & Ice Aggregation (KR03 Eq. A31)
+    # 2. Autoconversion (Berry 1968 / Tomita 2008, SCALE-RM Eqs. 8.221-8.222 when N_d > 0;
+    #    KR03 Eq. A30 threshold fallback when N_d <= 0) & Ice Aggregation (KR03 Eq. A31)
     ice_temp_fac = torch.exp(0.025 * (temp - C.T_TRIPLE))
-    dq_auto = RATE_AUTOCONV * torch.clamp(q_c - QC_AUTOCONV_THRESH, min=0.0)
+    if CLOUD_DROPLET_CONC_CM3 > 0.0:
+        n_drop = CLOUD_DROPLET_CONC_CM3
+        d_drop = max(0.146 - 5.964e-2 * math.log(max(n_drop, 1.0) / 2000.0), 0.05)
+        rho_qc = rho_d * q_c
+        dq_auto = (16.7 * d_drop * (rho_qc * rho_qc) * q_c) / (
+            5.0 * d_drop * rho_qc + 3.6e-5 * n_drop
+        )
+    else:
+        dq_auto = RATE_AUTOCONV * torch.clamp(q_c - QC_AUTOCONV_THRESH, min=0.0)
     dq_aggr = RATE_ICE_AGGREG * ice_temp_fac * torch.clamp(q_i - QI_AGGREG_THRESH, min=0.0)
 
     # 3. Continuous Accretion of Cloud Water and Cloud Ice (KR03 Eqs. A28-A29)

@@ -762,6 +762,8 @@ kernel void crm_microphysics_col(
     float bem_s     = mp[49];
     float aem_g     = mp[50];
     float bem_g     = mp[51];
+    float n_drop    = mp[52];
+    float d_drop    = (n_drop > 0.0f) ? max(0.146f - 0.05964f * log(max(n_drop, 1.0f) / 2000.0f), 0.05f) : 0.0f;
 
     float eps_small = 1.0e-15f;
     float exp_r = 0.25f * (3.0f + b_r);
@@ -820,7 +822,13 @@ kernel void crm_microphysics_col(
         float qg = (1.0f - om_p_old) * om_g_old * qp;
 
         float ice_tfac = exp(0.025f * (temp - t_tri));
-        float dq_auto = r_auto * max(qc - qc_thresh, 0.0f);
+        float dq_auto;
+        if (n_drop > 0.0f) {
+            float rho_qc = rd * qc;
+            dq_auto = (16.7f * d_drop * rho_qc * rho_qc * qc) / (5.0f * d_drop * rho_qc + 3.6e-5f * n_drop);
+        } else {
+            dq_auto = r_auto * max(qc - qc_thresh, 0.0f);
+        }
         float dq_aggr = r_aggr * ice_tfac * max(qi - qi_thresh, 0.0f);
 
         float qr_pow = pow(max(rd * qr, 0.0f) + eps_small, exp_r) - eps_acc_r;

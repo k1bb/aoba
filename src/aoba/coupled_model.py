@@ -85,13 +85,14 @@ class AOBAConfig:
     terrain_scale_exp: float = 1.5           # Klemp STF attenuation exponent p [-]
     h_ml_ocean: float = 50.0                 # Ocean mixed-layer depth [m]
     re_liq_um: float = 10.0                  # Cloud liquid droplet effective radius [um]
-    re_ice_um: float = 50.0                  # Cloud ice crystal effective radius [um]
-    crm_nx: int = 8                          # Embedded CRM x-grid points per SCVT cell (default 2D 8x1 = 64 km curtain)
+    re_ice_um: float = 38.0                  # Cloud ice crystal effective radius [um]
+    cloud_sw_inhomog: float = 0.85           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
+    crm_nx: int = 8                          # Embedded CRM x-grid points per SCVT cell (default 2D 8x1 = 32 km curtain)
     crm_ny: int = 1                          # Embedded CRM y-grid points (1 = SP-CAM 2.5D curtain for Mac climate runs)
-    crm_dx: float = 8000.0                   # Embedded CRM horizontal spacing [m] (permits 60 s CFL substeps)
+    crm_dx: float = 4000.0                   # Embedded CRM horizontal spacing [m] (4 km resolves convective cores cleanly)
     dt_host: float = 720.0                   # Coupled host / physics / SP time step [s] (12 min climate coupling)
     n_host_dyn_substeps: int = 1             # Minimum host RK3-HEVI substeps per dt_host (auto-increased if CFL requires)
-    n_crm_dyn_substeps: int = 12             # Embedded CRM RK3-HEVI substeps per dt_host (12 x 60 s = 720 s)
+    n_crm_dyn_substeps: int = 18             # Embedded CRM RK3-HEVI substeps per dt_host (18 x 40 s = 720 s at dx=4 km)
     rad_stride: int = 5                      # Radiation evaluation stride (steps; 5 x 720 s = 3600 s = 1 hr)
     crm_col_chunk: int = 16384               # Column batch chunk size for CRM evaluation (Unified Memory single-pass)
     rad_col_chunk: int = 32768               # Subcolumn chunk size for ICA radiative transfer (caps MPS peak buffer)
@@ -111,7 +112,7 @@ class AOBAConfig:
     earth2014_stride: int = 2
     enable_superparam: bool = True           # 1:1 embedded 3D CRM in every SCVT cell
     enable_dust: bool = True                 # Map-free global-parameter mineral dust aerosol + radiative coupling
-    dust_emis_factor: float = 5.0e-4         # Global dust emission tuning factor T (CLM5 Tech. Note Eq. 31.1) [-]
+    dust_emis_factor: float = 1.5e-5         # Global dust emission tuning factor T (map-free S=1 CLM5 Eq. 31.1) [-]
     enable_dynamic_icesheet: bool = False    # Opt-in SIA + EMA-accelerated ice sheet & vertical grid update
     icesheet_ema_years: float = 5.0          # EMA smoothing timescale for annual SMB [years]
     icesheet_accel_factor: float = 100.0     # Initial ice-sheet spinup acceleration multiplier [-]
@@ -228,7 +229,8 @@ def _compute_four_band_radiation_chunked(
     albedo_nir_dif: torch.Tensor,
     col_chunk: int,
     re_liq_um: float = 10.0,
-    re_ice_um: float = 50.0,
+    re_ice_um: float = 38.0,
+    cloud_sw_inhomog: float = 0.85,
     q_dust_c: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Evaluate 1D ICA 4-band radiative transfer across `[nz, m_sub]`, chunking when `m_sub > col_chunk`."""
@@ -254,6 +256,7 @@ def _compute_four_band_radiation_chunked(
             emiss_sfc=emiss_sfc,
             re_liq_um=re_liq_um,
             re_ice_um=re_ice_um,
+            cloud_sw_inhomog=cloud_sw_inhomog,
             albedo_vis_dif=albedo_vis_dif,
             albedo_nir_dif=albedo_nir_dif,
             q_dust_c=q_dust_c,
@@ -301,6 +304,7 @@ def _compute_four_band_radiation_chunked(
             emiss_sfc=emiss_sfc[sl],
             re_liq_um=re_liq_um,
             re_ice_um=re_ice_um,
+            cloud_sw_inhomog=cloud_sw_inhomog,
             albedo_vis_dif=albedo_vis_dif[sl],
             albedo_nir_dif=albedo_nir_dif[sl],
             q_dust_c=q_dust_c[:, sl] if q_dust_c is not None else None,
@@ -725,6 +729,7 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
                 col_chunk=cfg.rad_col_chunk,
                 re_liq_um=cfg.re_liq_um,
                 re_ice_um=cfg.re_ice_um,
+                cloud_sw_inhomog=cfg.cloud_sw_inhomog,
                 q_dust_c=q_dust_rad,
             )
         )

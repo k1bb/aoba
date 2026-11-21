@@ -40,11 +40,11 @@ AOBA investigates two fundamental questions:
 ## 3. Cloud Microphysics and Four-Band Analytical Two-Stream Radiation
 
 ### 3.1 Two-Variable Diagnostic-Phase Cloud Microphysics
-- **Primary Reference**: Khairoutdinov & Randall (2003, *J. Atmos. Sci.*, 60, App. A–B).
-- **Formulation**: Prognostic non-precipitating water $q_n = q_v + q_c + q_i$ and precipitating water $q_p = q_r + q_s$ partition condensate $\max(0, q_n - q^*(T, p))$ and precipitation diagnostically between liquid and ice via $\omega(T) \in [0, 1]$ over $[253.15, 273.16]\ \mathrm{K}$, resolving autoconversion, accretion, sedimentation, evaporation/sublimation, fusion latent heat, and cirrus radiative effects.
+- **Primary References**: Khairoutdinov & Randall (2003, *J. Atmos. Sci.*, 60, App. A–B); Berry (1968); Tomita (2008); Nishizawa et al. (2025, Sec. 8.4.2).
+- **Formulation**: Prognostic non-precipitating water $q_n = q_v + q_c + q_i$ and precipitating water $q_p = q_r + q_s$ partition condensate $\max(0, q_n - q^*(T, p))$ and precipitation diagnostically between liquid and ice via $\omega(T) \in [0, 1]$ over $[253.15, 273.16]\ \mathrm{K}$, resolving continuous warm-rain autoconversion (Berry, 1968 / Tomita, 2008), accretion, sedimentation, evaporation/sublimation, fusion latent heat, and cirrus radiative effects.
 
 ### 3.2 Lookup-Table-Free Four-Band Two-Stream Radiation
-- **Primary References**: Toon et al. (1989); Lacis & Hansen (1974); Slingo (1989); Ebert & Curry (1992); Weaver & Ramanathan (1995); Koll & Cronin (2018); Wing et al. (2018); Sherwood et al. (2020).
+- **Primary References**: Toon et al. (1989); Lacis & Hansen (1974); Slingo (1989); Ebert & Curry (1992); Cahalan et al. (1994); Weaver & Ramanathan (1995); Koll & Cronin (2018); Wing et al. (2018); Sherwood et al. (2020).
 - **Solver Architecture**: Unified tridiagonal two-stream solver (Toon et al., 1989) evaluated every $\Delta t_{\mathrm{rad}} = 900\ \mathrm{s}$ across all columns with instantaneous solar-zenith scaling $\mu_0(t)$, returning direct-beam and diffuse downward shortwave fluxes separately in SW1 (UV + Visible/PAR) and SW2 (NIR) alongside LW1 ($\mathrm{H}_2\mathrm{O} + \mathrm{CO}_2$) and LW2 ($8\text{--}12\ \mu\mathrm{m}$ window) longwave fluxes.
 
 ---
@@ -79,4 +79,4 @@ Each of the 64 CRM columns per host cell couples 1-to-1 to an underlying surface
 - **Coupling Architecture**: Initializes bedrock and ice thickness from `Earth2014.BED2014` and `ICE2014`, drives Glen's flow law ($n = 3$) upstream finite-volume SIA diffusion on the SCVT mesh using EMA-filtered annual SMB and relaxed lithospheric isostasy under configurable spinup acceleration $\alpha_{\mathrm{eff}}(t)$, updates Klemp STF vertical levels conservatively with barometric below-surface extrapolation and log-pressure remapping across host and CRM columns, and handles dynamic `SURF_LAND <-> SURF_ICESHEET` mask transitions with pioneer vegetation seeding upon deglaciation.
 
 ### 5.2 Single-File TOML Registry & Interactive Configurator (`src/aoba/params.py`, `scripts/aoba_config_gui.py`)
-- **Model Transparency**: Centralizes all grid resolutions (`glevel`, `nz`, CRM subgrid dimensions), orbital/planetary forcings, dynamic ice-sheet controls, output streams/cadences (mean vs instantaneous, 2D/3D/subgrid 2D), and physical constants (13 sections, 206 parameters) in [`config/aoba_default.toml`](../config/aoba_default.toml), paired with a zero-dependency interactive Web GUI (`scripts/aoba_config_gui.py`) featuring live SCVT/CRM/vertical visualizations and direct execution via `scripts/run_g5_30yr.py --config ...`.
+- **Model Transparency**: Centralizes all grid resolutions (`glevel`, `nz`, CRM subgrid dimensions), orbital/planetary forcings, dynamic ice-sheet controls, output streams/cadences (mean vs instantaneous, 2D/3D/subgrid 2D), and physical constants (13 sections, 208 parameters) in [`config/aoba_default.toml`](../config/aoba_default.toml), paired with a zero-dependency interactive Web GUI (`scripts/aoba_config_gui.py`) featuring live SCVT/CRM/vertical visualizations and direct execution via `scripts/run_g5_30yr.py --config ...`.

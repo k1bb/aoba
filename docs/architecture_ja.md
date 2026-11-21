@@ -40,11 +40,11 @@ AOBA は以下の2つの根源的な問いを解くために設計された結�
 ## 3. 雲微物理および4バンド解析的2ストリーム放射
 
 ### 3.1 2変数・診断氷相分配型 1モーメント雲微物理
-- **根拠文献**: Khairoutdinov & Randall (2003, *J. Atmos. Sci.*, 60, App. A–B).
-- **定式化**: 非降水総水分比湿 $q_n = q_v + q_c + q_i$ と降水総水分比湿 $q_p = q_r + q_s$ を予報し、$253.15\text{--}273.16\ \mathrm{K}$ の線形ランプ関数 $\omega(T) \in [0, 1]$ で液相・氷相を診断配分して自動変換・捕捉成長・落下・蒸発／昇華・凍結潜熱・氷雲放射効果を表現する。
+- **根拠文献**: Khairoutdinov & Randall (2003, *J. Atmos. Sci.*, 60, App. A–B); Berry (1968); Tomita (2008); Nishizawa et al. (2025, Sec. 8.4.2).
+- **定式化**: 非降水総水分比湿 $q_n = q_v + q_c + q_i$ と降水総水分比湿 $q_p = q_r + q_s$ を予報し、$253.15\text{--}273.16\ \mathrm{K}$ の線形ランプ関数 $\omega(T) \in [0, 1]$ で液相・氷相を診断配分して連続的暖雨自動変換（Berry, 1968 / Tomita, 2008）・捕捉成長・落下・蒸発／昇華・凍結潜熱・氷雲放射効果を表現する。
 
 ### 3.2 ルックアップテーブル不要の4バンド解析的2ストリーム放射
-- **根拠文献**: Toon et al. (1989); Lacis & Hansen (1974); Slingo (1989); Ebert & Curry (1992); Weaver & Ramanathan (1995); Koll & Cronin (2018); Wing et al. (2018); Sherwood et al. (2020).
+- **根拠文献**: Toon et al. (1989); Lacis & Hansen (1974); Slingo (1989); Ebert & Curry (1992); Cahalan et al. (1994); Weaver & Ramanathan (1995); Koll & Cronin (2018); Wing et al. (2018); Sherwood et al. (2020).
 - **ソルバ構成**: Toon et al. (1989) の統一三重対角2ストリームソルバを $\Delta t_{\mathrm{rad}} = 900\ \mathrm{s}$ ごとに全コラム一括評価し（サブステップでは瞬時太陽天頂角余弦 $\mu_0(t)$ でスケーリング）、SW1（UV・可視光／PAR）と SW2（近赤外）のそれぞれで**地表到達の直達光・散乱光を分離出力**するとともに、LW1（水蒸気＋$\mathrm{CO}_2$ 吸収帯）と LW2（$8\text{--}12\ \mu\mathrm{m}$ 大気の窓領域）の長波放射伝達を解く。
 
 ---
@@ -79,4 +79,4 @@ AOBA は以下の2つの根源的な問いを解くために設計された結�
 - **結合アーキテクチャ**: `Earth2014.BED2014` および `ICE2014` から岩盤標高と初期氷厚を構築し、年次 EMA 平滑表面質量収支（SMB）と Glen 流動則 ($n=3$) による SCVT 上流有限体積 SIA 拡散、緩和型リソスタシー・アイソスタシー、およびスピンアップ加速率 $\alpha_{\mathrm{eff}}(t)$ を統合する。氷床厚変化による $|z_{\mathrm{topo}}^{\mathrm{new}} - z_{w,0}| \ge 0.05\ \mathrm{m}$ 発生時には Klemp STF 座標を再構築し、測高公式外挿＋対数気圧線形補間でホスト大気および全 CRM コラムを再補間しつつ `SURF_LAND <-> SURF_ICESHEET` 被覆遷移と開拓植生播種を自律実行する。
 
 ### 5.2 単一 TOML パラメータ一元管理と対話型 GUI (`src/aoba/params.py`, `scripts/aoba_config_gui.py`)
-- **透明性・再現性基盤**: 全格子設定 (`glevel`, `nz`, CRM 格子数・間隔)・外力・動的氷床オプション・出力ファイル種別／時間間隔（時間平均・瞬時値・2D/3D/サブグリッド2D）・全物理定数（13セクション・206項目）を単一の [`config/aoba_default.toml`](../config/aoba_default.toml) で一元管理し、`scripts/aoba_config_gui.py` から対話型可視化図付きで編集・保存して `scripts/run_g5_30yr.py --config ...` へ直接投入できる。
+- **透明性・再現性基盤**: 全格子設定 (`glevel`, `nz`, CRM 格子数・間隔)・外力・動的氷床オプション・出力ファイル種別／時間間隔（時間平均・瞬時値・2D/3D/サブグリッド2D）・全物理定数（13セクション・208項目）を単一の [`config/aoba_default.toml`](../config/aoba_default.toml) で一元管理し、`scripts/aoba_config_gui.py` から対話型可視化図付きで編集・保存して `scripts/run_g5_30yr.py --config ...` へ直接投入できる。

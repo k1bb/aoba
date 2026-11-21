@@ -3,8 +3,9 @@
 Dust mobilization follows the CLM5 dust scheme (Lawrence et al., 2020, CLM5 Tech. Note, Ch. 31;
 Mahowald et al., 2006), itself based on the DEAD model of Zender et al. (2003). It is driven only by
 the autonomous land-surface state (exposed LAI, fractional snow cover, top-layer liquid/ice soil water,
-and friction velocity) with one global tuning factor `dust_emis_factor` (CLM5 `T = 5e-4`), and no
-regional source-erodibility maps (CLM5 also sets the erodibility `S = 1`).
+and friction velocity) with one global tuning factor `dust_emis_factor` (default `1.5e-5`, scaled from
+CLM5's `T = 5e-4` for map-free global `S = 1`), and no regional source-erodibility maps (CLM5 also
+sets the erodibility `S = 1`).
 
 References
 ----------
@@ -67,8 +68,8 @@ def _dry_threshold_coefficient() -> float:
 
 
 V_SETTLE_DUST: float = 4.0e-3       # Effective Stokes settling velocity (~1.5 um radius) [m s^-1]
-V_DEP_DUST: float = 2.0e-3          # Surface dry deposition velocity [m s^-1]
-ALPHA_WET_SCAV: float = 0.10        # Precipitation washout coefficient [m^2 kg^-1]
+V_DEP_DUST: float = 6.0e-3          # Surface dry deposition velocity (>= v_settle, aerodynamic+settling) [m s^-1]
+ALPHA_WET_SCAV: float = 0.50        # Precipitation washout coefficient (Zender et al., 2003; Croft et al., 2010) [m^2 kg^-1]
 
 # Broadband optical properties (Balkanski et al., 2007)
 DUST_K_EXT_SW1: float = 600.0       # VIS mass extinction efficiency [m^2 kg^-1]
@@ -91,7 +92,7 @@ def compute_dust_emission_sub(
     rho_atm: torch.Tensor,
     z0m: torch.Tensor,
     d_disp: torch.Tensor | None = None,
-    dust_emis_factor: float = 5.0e-4,
+    dust_emis_factor: float = 1.5e-5,
 ) -> torch.Tensor:
     """Compute subcolumn mineral dust vertical emission flux `[kg m^-2 s^-1]` (CLM5 Eq. 31.1).
 

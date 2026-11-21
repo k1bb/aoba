@@ -868,9 +868,9 @@ _HTML_PAGE = r"""<!DOCTYPE html>
       <div class="card">
         <h2 data-i18n="g_ctrl_title">水平解像度 (SCVT) &amp; 子領域 CRM 設定</h2>
         <div class="preset-bar">
-          <button onclick="applyGridPreset(3, 8, 1, 8000, 32, 720)" data-i18n="pre_g3">標準軽量 (G3, 8×1)</button>
-          <button onclick="applyGridPreset(4, 8, 1, 8000, 32, 720)" data-i18n="pre_g4">長期気候 (G4, 8×1)</button>
-          <button onclick="applyGridPreset(5, 8, 1, 8000, 32, 720)" data-i18n="pre_g5">高解像度 (G5, 8×1)</button>
+          <button onclick="applyGridPreset(3, 8, 1, 4000, 32, 720)" data-i18n="pre_g3">標準軽量 (G3, 8×1)</button>
+          <button onclick="applyGridPreset(4, 8, 1, 4000, 32, 720)" data-i18n="pre_g4">長期気候 (G4, 8×1)</button>
+          <button onclick="applyGridPreset(5, 8, 1, 4000, 32, 720)" data-i18n="pre_g5">高解像度 (G5, 8×1)</button>
           <button onclick="applyGridPreset(4, 8, 8, 4000, 32, 600)" data-i18n="pre_3dcrm">3D CRM (G4, 8×8, 4km)</button>
           <button onclick="autoTuneChunks()" style="border-color:var(--accent); color:var(--accent);">⚡ マシン最適チャンク (解像度維持)</button>
           <span id="hw-badge" class="pill" style="font-size:11px;"></span>
@@ -1568,7 +1568,7 @@ function drawGridCanvas() {
   const zSponge = Number(cfgG.z_sponge_base ?? 17500);
   const crmNx = Math.max(1, Math.round(cfgG.crm_nx ?? 8));
   const crmNy = Math.max(1, Math.round(cfgG.crm_ny ?? 1));
-  const crmDx = Number(cfgG.crm_dx ?? 8000);
+  const crmDx = Number(cfgG.crm_dx ?? 4000);
 
   const R_earth_km = 6371.0;
   const nCell = 10 * Math.pow(4, g) + 2;

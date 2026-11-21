@@ -118,6 +118,7 @@ _MODULE_PARAM_MAP: dict[str, dict[str, tuple[Any, str]]] = {
         "rate_autoconv": (_mp, "RATE_AUTOCONV"),
         "rate_ice_aggreg": (_mp, "RATE_ICE_AGGREG"),
         "vt_cloud_ice": (_mp, "VT_CLOUD_ICE"),
+        "cloud_droplet_conc_cm3": (_mp, "CLOUD_DROPLET_CONC_CM3"),
         "t0_precip": (_mp, "T0_PRECIP"),
         "t00_precip": (_mp, "T00_PRECIP"),
         "t0_graupel": (_mp, "T0_GRAUPEL"),
@@ -233,7 +234,7 @@ _FORCING_KEYS: tuple[str, ...] = (
     "start_date", "calendar_type", "insolation_mode", "fixed_insolation_date", "diurnal_cycle",
     "use_earth2014", "earth2014_dir", "earth2014_stride", "enable_superparam",
     "enable_dust", "dust_emis_factor",
-    "h_ml_ocean", "re_liq_um", "re_ice_um",
+    "h_ml_ocean", "re_liq_um", "re_ice_um", "cloud_sw_inhomog",
 )
 _ICESHEET_CFG_KEYS: tuple[str, ...] = (
     "enable_dynamic_icesheet", "icesheet_ema_years", "icesheet_accel_factor",

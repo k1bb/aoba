@@ -48,7 +48,7 @@ def test_toml_roundtrip_and_module_sync() -> None:
     defaults = default_config_dict()
     loaded = load_aoba_toml(toml_p)
     assert len(defaults) == 13
-    assert sum(len(v) for v in defaults.values()) == 206
+    assert sum(len(v) for v in defaults.values()) == 208
     assert set(loaded.keys()) == set(defaults.keys())
     for sec in defaults:
         assert set(loaded[sec].keys()) == set(defaults[sec].keys()), f"Key mismatch in [{sec}]"
@@ -58,6 +58,8 @@ def test_toml_roundtrip_and_module_sync() -> None:
         custom["constants"]["cp_d"] = 1010.0
         custom["turbulence"]["tke_min"] = 2.5e-4
         custom["microphysics"]["qc_autoconv_thresh"] = 2.0e-3
+        custom["microphysics"]["cloud_droplet_conc_cm3"] = 80.0
+        custom["forcing"]["cloud_sw_inhomog"] = 0.78
         custom["icesheet_physics"]["rho_ice"] = 900.0
         custom["forcing"]["omega"] = C.OMEGA_EARTH * 0.5
 
@@ -65,12 +67,15 @@ def test_toml_roundtrip_and_module_sync() -> None:
         assert isinstance(cfg, AOBAConfig)
         assert isinstance(out_cfg, OutputConfig)
         assert abs(cfg.omega - C.OMEGA_EARTH * 0.5) < 1e-12
+        assert abs(cfg.cloud_sw_inhomog - 0.78) < 1e-12
         assert abs(C.CP_D - 1010.0) < 1e-9
         assert abs(C.CV_D - (1010.0 - C.R_D)) < 1e-9
         assert abs(_turb.TKE_MIN - 2.5e-4) < 1e-12
         assert abs(_turb._MYNN_METAL_CONSTS[17] - 2.5e-4) < 1e-12
         assert abs(_mp.QC_AUTOCONV_THRESH - 2.0e-3) < 1e-12
         assert abs(_mp._MP_METAL_CONSTS[16] - 2.0e-3) < 1e-12
+        assert abs(_mp.CLOUD_DROPLET_CONC_CM3 - 80.0) < 1e-9
+        assert abs(_mp._MP_METAL_CONSTS[51] - 80.0) < 1e-9
         assert abs(_ice.RHO_ICE - 900.0) < 1e-9
         assert abs(_ice.ISOSTASY_RATIO - 900.0 / _ice.RHO_MANTLE) < 1e-9
     finally:
@@ -124,7 +129,7 @@ def test_gui_server_endpoints() -> None:
             assert len(m_resp["verts_on_cell_b64"]) > 0 and len(m_resp["surf_type_b64"]) > 0
 
         state = json.loads(urllib.request.urlopen(f"{base}/api/state").read().decode("utf-8"))
-        assert state["param_count"] == 206
+        assert state["param_count"] == 208
         assert "grid" in state["config"]
 
         disc = json.loads(urllib.request.urlopen(f"{base}/api/runs/discover").read().decode("utf-8"))

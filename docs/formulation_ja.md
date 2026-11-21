@@ -195,11 +195,11 @@ $$
      A_{\mathrm{oz}}(x) = \frac{1.082\, x}{(1 + 138.6 x)^{0.805}} + \frac{0.0658\, x}{1 + (103.6 x)^3} + \frac{0.02118\, x}{1 + 0.042 x + 0.000323 x^2},
      $$
      およびレイリー散乱光学的厚さ $\Delta \tau_{\mathrm{ray}} = 0.095\, \Delta p / p_0$ を与える。
-   - **雲光学特性**（Slingo, 1989, Band 1; Ebert & Curry, 1992, Band 1）：
+   - **雲光学特性**（Slingo, 1989, Band 1; Ebert & Curry, 1992, Band 1; Cahalan et al., 1994 平面平行アルベド補正係数 $\chi_{\mathrm{SW}} = \text{cloud\_sw\_inhomog} = 0.85$、既定有効半径 $r_{e,l} = 10.0\ \mu\mathrm{m},\ r_{e,i} = 38.0\ \mu\mathrm{m}$）：
      $$
      \begin{aligned}
-     \tau_{l1} &= \mathrm{LWP}\left(2.817\times 10^{-2} + \frac{1.305}{r_{e,l}}\right), & \omega_{l1} &= 1 - (-5.62\times 10^{-8} + 1.63\times 10^{-7} r_{e,l}), & g_{l1} &= 0.829 + 2.482\times 10^{-3} r_{e,l}, \\
-     \tau_{i1} &= \mathrm{IWP}\left(3.448\times 10^{-3} + \frac{2.431}{r_{e,i}}\right), & \omega_{i1} &= 1 - 10^{-5}, & g_{i1} &= 0.7661 + 5.851\times 10^{-4} r_{e,i}.
+     \tau_{l1} &= \chi_{\mathrm{SW}}\,\mathrm{LWP}\left(2.817\times 10^{-2} + \frac{1.305}{r_{e,l}}\right), & \omega_{l1} &= 1 - (-5.62\times 10^{-8} + 1.63\times 10^{-7} r_{e,l}), & g_{l1} &= 0.829 + 2.482\times 10^{-3} r_{e,l}, \\
+     \tau_{i1} &= \chi_{\mathrm{SW}}\,\mathrm{IWP}\left(3.448\times 10^{-3} + \frac{2.431}{r_{e,i}}\right), & \omega_{i1} &= 1 - 10^{-5}, & g_{i1} &= 0.7661 + 5.851\times 10^{-4} r_{e,i}.
      \end{aligned}
      $$
    - 地表下向き SW1 フラックスから生態系へ渡す光合成有効光量子束密度 $\mathrm{PPFD}$ は $\mathrm{PPFD} = 4.57 \times 0.88\, F_{\mathrm{SW1}}^\downarrow(z_{\mathrm{sfc}})\ [\mu\mathrm{mol\ m^{-2}\ s^{-1}}]$ で算出する。
@@ -209,11 +209,11 @@ $$
      $$
      A_{\mathrm{wv}}(y / \mu_0) = \frac{2.9\, (y / \mu_0)}{\left[1 + 141.5\, (y / \mu_0)\right]^{0.635} + 5.925\, (y / \mu_0)}
      $$
-     により各層の吸収光学的厚さを抽出し、Slingo (1989, Bands 2–4 平均) および Ebert & Curry (1992, Bands 2–5 平均) の雲光学特性を合成する：
+     により各層の吸収光学的厚さを抽出し、Slingo (1989, Bands 2–4 平均)・Ebert & Curry (1992, Bands 2–5 平均) に Cahalan et al. (1994) 非一様係数 $\chi_{\mathrm{SW}}$ を乗じて合成する：
      $$
      \begin{aligned}
-     \tau_{l2} &= \mathrm{LWP}\left(2.456\times 10^{-2} + \frac{1.400}{r_{e,l}}\right), & \omega_{l2} &= 1 - (0.01260 + 9.01\times 10^{-4} r_{e,l}), & g_{l2} &= 0.783 + 5.01\times 10^{-3} r_{e,l}, \\
-     \tau_{i2} &= \mathrm{IWP}\left(3.448\times 10^{-3} + \frac{2.431}{r_{e,i}}\right), & \omega_{i2} &= 1 - (0.02437 + 2.52\times 10^{-4} r_{e,i}), & g_{i2} &= 0.7867 + 5.90\times 10^{-4} r_{e,i}.
+     \tau_{l2} &= \chi_{\mathrm{SW}}\,\mathrm{LWP}\left(2.456\times 10^{-2} + \frac{1.400}{r_{e,l}}\right), & \omega_{l2} &= 1 - (0.01260 + 9.01\times 10^{-4} r_{e,l}), & g_{l2} &= 0.783 + 5.01\times 10^{-3} r_{e,l}, \\
+     \tau_{i2} &= \chi_{\mathrm{SW}}\,\mathrm{IWP}\left(3.448\times 10^{-3} + \frac{2.431}{r_{e,i}}\right), & \omega_{i2} &= 1 - (0.02437 + 2.52\times 10^{-4} r_{e,i}), & g_{i2} &= 0.7867 + 5.90\times 10^{-4} r_{e,i}.
      \end{aligned}
      $$
 
@@ -264,9 +264,9 @@ $$
 \lambda_x = \left(\frac{\pi \rho_x N_{0x}}{\rho_d q_x}\right)^{1/4}
 $$
 と与えられる。Khairoutdinov & Randall (2003, Eqs. A18–A33) の各素過程は以下の閉形式で定式化される：
-1. **自動変換 (Autoconversion)**（閾値 $q_{c0} = 10^{-3}\ \mathrm{kg\ kg^{-1}},\ q_{i0} = 10^{-4}\ \mathrm{kg\ kg^{-1}}$、係数 $\alpha_c = \beta_i = 10^{-3}\ \mathrm{s^{-1}}$）：
+1. **自動変換 (Autoconversion)**（暖雨過程は Berry, 1968 / Tomita, 2008; SCALE-RM Eqs. 8.221–8.222, 雲粒数濃度 $N_d = 60\ \mathrm{cm^{-3}}$, $D_d = \max[0.146 - 5.964\times 10^{-2}\ln(N_d / 2000),\, 0.05]$、$N_d \le 0$ 時は KR03 閾値式 $\alpha_c \max(q_c - q_{c0}, 0)$ へフォールバック；氷晶凝集は $q_{i0} = 10^{-4}\ \mathrm{kg\ kg^{-1}}, \beta_i = 10^{-3}\ \mathrm{s^{-1}}, V_{TI} = 0.18\ \mathrm{m\ s^{-1}}$）：
    $$
-   \left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{auto}} = \alpha_c \max(q_c - q_{c0},\ 0) + \beta_i \exp\!\left[0.025(T - T_0)\right] \max(q_i - q_{i0},\ 0).
+   \left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{auto}} = \frac{16.7\, D_d\, \rho_d^2\, q_c^3}{5.0\, D_d\, \rho_d\, q_c + 3.6\times 10^{-5} N_d} + \beta_i \exp\!\left[0.025(T - T_0)\right] \max(q_i - q_{i0},\ 0).
    $$
 2. **捕捉成長 (Accretion)**（捕捉効率 $E_{rc}=E_{sc}=E_{gc}=E_{ri}=1.0,\ E_{si}=E_{gi}=0.1$）：
    $$
@@ -449,11 +449,11 @@ $$
 
 ### 8.5 地図不要の鉱物ダスト放出・鉛直輸送・放射結合 (`src/aoba/dust.py`)
 
-鉱物ダスト放出は CLM5 DEAD スキーム（Lawrence et al., 2020, Ch. 31, Eqs. 31.1–31.14; Oleson et al., 2013, Ch. 24; Zender et al., 2003; Mahowald et al., 2006）に準拠し、地域放出源マップを用いず（$S = 1$）、単一の全球調整係数 $T = \text{dust\_emis\_factor} = 5\times 10^{-4}$ で鉛直放出フラックスを与える：
+鉱物ダスト放出は CLM5 DEAD スキーム（Lawrence et al., 2020, Ch. 31, Eqs. 31.1–31.14; Oleson et al., 2013, Ch. 24; Zender et al., 2003; Mahowald et al., 2006）に準拠し、地域放出源マップを用いず（$S = 1$）、地図不要設定（$S = 1, M_{\mathrm{clay}} = 0.20$）向けに校正した単一の全球調整係数 $T = \text{dust\_emis\_factor} = 1.5\times 10^{-5}$ で鉛直放出フラックスを与える：
 $$
 F_{\mathrm{dust}} = T\, f_m\, \alpha\, Q_s \sum_{i=1}^{3} M_i, \qquad f_m = (1 - A_{\mathrm{sn}})(1 - f_v)\frac{w_{\mathrm{liq},1}}{w_{\mathrm{liq},1} + w_{\mathrm{ice},1}}, \qquad f_v = \mathrm{clip}\!\left(\frac{L_{\mathrm{exp}}}{0.3},\,0,\,1\right).
 $$
-単一ローム土壌の粘土質量分率 $M_{\mathrm{clay}} = 0.20$ に対するサンドブラスティング効率 $\alpha = 100\exp[(13.4 M_{\mathrm{clay}} - 6.0)\ln 10]\ \mathrm{m^{-1}}$（Marticorena & Bergametti, 1995）、最適跳躍粒径 $D_{\mathrm{osp}} = 75\ \mu\mathrm{m}$（$\rho_{\mathrm{osp}} = 2650\ \mathrm{kg\ m^{-3}}$）の Iversen & White (1982) 乾燥しきい摩擦速度に、Fécan et al. (1999) の土壌水分係数 $f_w = \sqrt{1 + 1.21 [100(w - w_t)]^{0.68}}$（重量含水率 $w = 1000(w_{\mathrm{liq},1}+w_{\mathrm{ice},1}) / [(1 - \phi_{\mathrm{soil}})\rho_{\mathrm{solid}}] > w_t = 0.17 + 0.14 M_{\mathrm{clay}}$、CLM 調整係数 $a = M_{\mathrm{clay}}^{-1}$ を適用）を乗じて $u_{*t}$ を求める。さらに Owen (1964) 効果 $u_{*s} = u_* + 0.003(U_{10} - U_{10,t})^2$（$U_{10} \ge U_{10,t}$）を反映した White (1979) 水平跳躍フラックス $Q_s = c_s (\rho_{\mathrm{atm}} u_{*s}^3 / g)(1 - r)(1 + r)^2$（$r = u_{*t}/u_{*s} < 1$, $c_s = 2.61$）に輸送粒径帯（$0.1\text{–}10\ \mu\mathrm{m}$）の質量分率和 $\sum M_i = 0.871$ を乗じる。大気柱ダスト混合比 $q_{\mathrm{dust}}$ は PBL 鉛直混合・陰的重力沈降・乾性沈着・降水洗浄を受け、Balkanski et al. (2007) の広帯域短波・長波光学特性で放射結合する。
+単一ローム土壌の粘土質量分率 $M_{\mathrm{clay}} = 0.20$ に対するサンドブラスティング効率 $\alpha = 100\exp[(13.4 M_{\mathrm{clay}} - 6.0)\ln 10]\ \mathrm{m^{-1}}$（Marticorena & Bergametti, 1995）、最適跳躍粒径 $D_{\mathrm{osp}} = 75\ \mu\mathrm{m}$（$\rho_{\mathrm{osp}} = 2650\ \mathrm{kg\ m^{-3}}$）の Iversen & White (1982) 乾燥しきい摩擦速度に、Fécan et al. (1999) の土壌水分係数 $f_w = \sqrt{1 + 1.21 [100(w - w_t)]^{0.68}}$（重量含水率 $w = 1000(w_{\mathrm{liq},1}+w_{\mathrm{ice},1}) / [(1 - \phi_{\mathrm{soil}})\rho_{\mathrm{solid}}] > w_t = 0.17 + 0.14 M_{\mathrm{clay}}$、CLM 調整係数 $a = M_{\mathrm{clay}}^{-1}$ を適用）を乗じて $u_{*t}$ を求める。さらに Owen (1964) 効果 $u_{*s} = u_* + 0.003(U_{10} - U_{10,t})^2$（$U_{10} \ge U_{10,t}$）を反映した White (1979) 水平跳躍フラックス $Q_s = c_s (\rho_{\mathrm{atm}} u_{*s}^3 / g)(1 - r)(1 + r)^2$（$r = u_{*t}/u_{*s} < 1$, $c_s = 2.61$）に輸送粒径帯（$0.1\text{–}10\ \mu\mathrm{m}$）の質量分率和 $\sum M_i = 0.871$ を乗じる。大気柱ダスト混合比 $q_{\mathrm{dust}}$ は PBL 鉛直混合・陰的重力沈降（$v_{\mathrm{settle}} = 4\times 10^{-3}\ \mathrm{m\ s^{-1}}$）・乾性沈着（$v_{\mathrm{dep}} = 6\times 10^{-3}\ \mathrm{m\ s^{-1}}$）・降水洗浄（$\alpha_{\mathrm{scav}} = 0.50\ \mathrm{m^2\ kg^{-1}}$）を受け、Balkanski et al. (2007) の広帯域短波・長波光学特性で放射結合する。
 
 ---
 
@@ -461,7 +461,7 @@ $$
 
 ### 9.1 3段 Runge–Kutta + 水平陽的・鉛直陰的 (HEVI) 圧縮性流体ソルバ (`src/aoba/crm.py`)
 
-各 SCVT ホストセルには水平二重周期の直交 Arakawa C-grid / Charney–Phillips 3D CRM（既定 `[Nz=32, Ny=1, Nx=8], dx=8000 m` または 3D `[8, 8], dx=4000 m`）が埋め込まれ、乾燥空気密度 $\rho_d$、風速 $(u, v, w)$、湿潤温位フラックス変数 $\Theta_m = \rho_d \theta_m$ に対する完全圧縮性フラックス形式方程式を解く（Skamarock et al., 2012, Eqs. 7–11; SCALE-RM Ch. 3）：
+各 SCVT ホストセルには水平二重周期の直交 Arakawa C-grid / Charney–Phillips 3D CRM（既定 `[Nz=32, Ny=1, Nx=8], dx=4000 m` または 3D `[8, 8], dx=4000 m`）が埋め込まれ、乾燥空気密度 $\rho_d$、風速 $(u, v, w)$、湿潤温位フラックス変数 $\Theta_m = \rho_d \theta_m$ に対する完全圧縮性フラックス形式方程式を解く（Skamarock et al., 2012, Eqs. 7–11; SCALE-RM Ch. 3）：
 $$
 \begin{aligned}
 \frac{\partial \rho_d}{\partial t} + \nabla_h \cdot (\rho_d \mathbf{u}_h) + \frac{\partial F_z}{\partial z} &= 0, \qquad F_z = \rho_{d,w} w, \\
@@ -562,12 +562,12 @@ $$
 
 ### 12.1 一元テキスト管理アーキテクチャと実行・GUI ツール (`src/aoba/params.py`, `scripts/aoba_config_gui.py`)
 
-モデルの再現性と透明性を保証するため、すべての格子設定・強制外力・動的氷床設定・出力ストリーム・物理定数（**13セクション・全206項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。
+モデルの再現性と透明性を保証するため、すべての格子設定・強制外力・動的氷床設定・出力ストリーム・物理定数（**13セクション・全208項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。
 - **ランタイム同期・ハードウェア自動チューニング (`src/aoba/params.py`, `src/aoba/runtime.py`)**: `load_aoba_toml()` で読み込んだ設定辞書に対し `build_configs_from_dict(cfg_dict, apply_modules=True)` を呼ぶと、`(AOBAConfig, OutputConfig)` インスタンスを生成すると同時に、`_MODULE_PARAM_MAP` に登録された `src/aoba/*` モジュールの全定数をライブ更新し、各モジュールの `recompute_derived_constants()`（`microphysics`, `turbulence`, `ocean_ekman`, `icesheet` 内の Metal 定数配列や導出係数を含む）を再計算する。さらに `detect_hardware_profile()` / `compute_optimal_chunks()` / `apply_runtime_tuning()` により実行マシンの GPU コア数・利用可能メモリ・P-core 数を自動検出し、メモリ予算 $B = 0.45\, M_{\mathrm{dev}}$ の範囲内で解像度を変えずに最速 1 パス／安全分割となる `crm_col_chunk`・`rad_col_chunk` と CPU スレッド数を自動適用する。
 - **Web GUI 統合ワークベンチ (`scripts/aoba_config_gui.py` / AOBA Studio)**: 標準ライブラリ（`http.server`）のみで動作するゼロ依存ローカル Web アプリ（`python scripts/aoba_config_gui.py --port 8765`）を備え、モデル設定から実行起動、プロセス監視、CPU リアルタイム可視化まで一気通貫で提供する：
   1. `glevel`（0〜6）の変更に連動してリアルタイム描画される**正二十面体 SCVT Voronoi 球面メッシュ可視化図 ＋ 1ホストセル対埋め込み CRM 領域スケール比較図 ＋ ストレッチ鉛直層・スポンジ層図**。
   2. 自転半減実験 (`0.5×Ω`)・LGM・`4×CO₂` プリセット、**カレンダー／固定日射設定**、および**氷床加速率 $\alpha_{\mathrm{eff}}(t)$／EMA 重み減衰曲線**プレビュー。
-  3. 出力ファイル種別・間隔設定、予想年間 Zarr/リスタート容量試算、および206パラメータ横断検索・TOML 保存。
+  3. 出力ファイル種別・間隔設定、予想年間 Zarr/リスタート容量試算、および208パラメータ横断検索・TOML 保存。
   4. **実行コントロール・ライブ監視・CPU リアルタイム日平均 3地球プレビュー**: GUI 上からの計算実行・停止、稼働中外部ジョブ（`run.log` / `daily_global.csv` / カレンダー日付 `YYYY-MM-DD`）の監視に加え、GPU 計算を一切阻害しない待機 CPU 上の `cKDTree` 球面再格子化エンジンにより、**日平均 `T2`（地表付近気温 $0.35 T_{\mathrm{sfc}} + 0.65 T_{a,z_1}$）・日平均降水量 `Precip [mm/d]`・`LAI`** の3つの正射図法地球儀を「1モデル日＝1周（$360^\circ / T_{\mathrm{wall,day}}$）」の実時間同期自転または任意速度でリアルタイム可視化する（`live_preview.npz`, `snapshots.zarr`, `monthly.zarr` に対応）。
 
 ### 12.2 出力ファイル種別・平均値 vs 瞬時値仕様 (`OutputConfig`, `src/aoba/io_zarr.py`)
@@ -582,9 +582,9 @@ $$
 | `snapshots.zarr` | **瞬時値** (スナップショット) | `snapshots_enabled`, `snapshots_periods_per_year` (既定 `12`), `snapshots_include_{2d,3d,subgrid_2d}` | 上記2D (`h_canopy`, `vcmax25_c3`, `f_c4` を含む)・3D変数 (`temp`, `pres`, `q_v`, `u_zonal`, `v_merid`) および上記サブグリッド2D瞬時場 (`*_sub`) |
 | `restart.pt` / `restart_mid.pt` | チェックポイント | `restart_interval_years` (既定 `1` 年), `restart_monthly` (既定 `true`), `zarr_dir_partition` | 完全な `GlobalAtmosState`, `CRMState`, `SurfaceState` (`sfc` & `sfc_sub`), `EkmanOceanState`, `IceSheetState`, `ClimateAccumulator`。`restart_monthly=true` 時は毎月末に `restart_mid.pt` を自動保存し、年内途中から Zarr/CSV 欠損なく決定論的再開可能 |
 
-### 12.3 全モデル設定・物理パラメータレジストリ（全13セクション・206項目）
+### 12.3 全モデル設定・物理パラメータレジストリ（全13セクション・208項目）
 
-表 12.1 に [`config/aoba_default.toml`](../config/aoba_default.toml) に定義された全206パラメータのセクション別完全リストを示す。
+表 12.1 に [`config/aoba_default.toml`](../config/aoba_default.toml) に定義された全208パラメータのセクション別完全リストを示す。
 
 #### `[grid]` — 水平・鉛直・サブグリッド CRM 格子設定（16項目）
 | TOML キー | 標準値 | 説明・単位 |
@@ -596,25 +596,25 @@ $$
 | `z_sponge_base` | `17500.0` | レイリー減衰スポンジ層底面高度 [m] |
 | `tau_sponge_min` | `300.0` | モデル上端最小スポンジ減衰時定数 [s] |
 | `terrain_scale_exp` | `1.5` | Klemp STF 減衰指数 $p$ [-] |
-| `crm_nx`, `crm_ny`, `crm_dx` | `8`, `1`, `8000.0` | 埋め込み CRM の $x, y$ 格子数および水平格子幅 [m] |
+| `crm_nx`, `crm_ny`, `crm_dx` | `8`, `1`, `4000.0` | 埋め込み CRM の $x, y$ 格子数および水平格子幅 [m] |
 | `dt_host` | `720.0` | ホスト大気・物理結合時間刻み [s] |
-| `n_host_dyn_substeps`, `n_crm_dyn_substeps` | `1`, `12` | ホストおよび CRM の1結合ステップあたり音響・力学サブステップ数 |
+| `n_host_dyn_substeps`, `n_crm_dyn_substeps` | `1`, `18` | ホストおよび CRM の1結合ステップあたり音響・力学サブステップ数 |
 | `rad_stride` | `5` | 放射計算の呼出し間隔（ステップ数） |
 | `crm_col_chunk`, `rad_col_chunk` | `16384`, `32768` | GPU/CPU メモリ制御用バッチチャンクサイズ [columns] |
 
-#### `[forcing]`・`[icesheet]`・`[output]` — 外力・氷床制御・出力管理（45項目）
+#### `[forcing]`・`[icesheet]`・`[output]` — 外力・氷床制御・出力管理（46項目）
 | セクション | キー ＝ 標準値 |
 | :--- | :--- |
-| `[forcing]` (20) | `co2_ppmv = 400.0`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `start_date = "2000-03-20"`, `calendar_type = "gregorian"`, `insolation_mode = "seasonal"`, `fixed_insolation_date = "2000-03-20"`, `diurnal_cycle = true`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `enable_dust = true`, `dust_emis_factor = 5e-4`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 50.0` |
+| `[forcing]` (21) | `co2_ppmv = 400.0`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `start_date = "2000-03-20"`, `calendar_type = "gregorian"`, `insolation_mode = "seasonal"`, `fixed_insolation_date = "2000-03-20"`, `diurnal_cycle = true`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `enable_dust = true`, `dust_emis_factor = 1.5e-5`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 38.0`, `cloud_sw_inhomog = 0.85` |
 | `[icesheet]` (5) | `enable_dynamic_icesheet = false`, `icesheet_ema_years = 5.0`, `icesheet_accel_factor = 100.0`, `icesheet_accel_spinup_years = 0.0`, `icesheet_isostasy_tau_yr = 1000.0` |
 | `[output]` (20) | `out_dir = ""`, `years = 30`, `end_date = ""`, `days_per_year = 365.2425`, `zarr_dir_partition = "yearly"`, `daily_csv_enabled = true`, `daily_csv_interval_days = 1.0`, `monthly_mean_enabled = true`, `monthly_mean_periods_per_year = 12`, `monthly_mean_sample_hours = 6.0`, `monthly_mean_include_2d = true`, `monthly_mean_include_3d = true`, `monthly_mean_include_subgrid_2d = true`, `snapshots_enabled = true`, `snapshots_periods_per_year = 12`, `snapshots_include_2d = true`, `snapshots_include_3d = true`, `snapshots_include_subgrid_2d = true`, `restart_interval_years = 1`, `restart_monthly = true` |
 
-#### `[constants]` 〜 `[icesheet_physics]` — 全物理・生態系・雪氷・海洋定数レジストリ（145項目）
+#### `[constants]` 〜 `[icesheet_physics]` — 全物理・生態系・雪氷・海洋定数レジストリ（146項目）
 | セクション | 項目数 | 登録キー ＝ 標準値（`src/aoba/` 対応モジュール名） |
 | :--- | :--- | :--- |
 | `[constants]` | 26 | `earth_radius = 6.371e6`, `gravity = 9.79764`, `omega_earth = 7.292115e-5`, `seconds_per_day = 86400.0`, `days_per_year = 365.2425`, `r_d = 287.04`, `cp_d = 1004.64`, `r_v = 461.5`, `cp_v = 1846.0`, `p_ref = 1e5`, `t_freeze = 273.15`, `t_triple = 273.16`, `e_triple = 611.2`, `l_v0 = 2.501e6`, `l_f0 = 3.337e5`, `t_ice_all = 253.15`, `t_liq_all = 273.16`, `stefan_boltzmann = 5.670374419e-8`, `von_karman = 0.4`, `rho_seawater = 1025.0`, `cp_seawater = 3990.0`, `t_freeze_ocean = 271.35`, `rho_seaice = 917.0`, `k_therm_seaice = 2.034`, `k_therm_snow = 0.3096`, `o2_mixing_ratio = 0.20946` (`constants.py`) |
 | `[radiation]` | 7 | `solar_frac_sw1 = 0.45976`, `lw_window_frac = 0.32`, `o3_g1 = 3.6478`, `o3_g2 = 0.83209`, `o3_g3 = 11.3515`, `par_frac_of_sw1 = 0.88`, `umol_per_joule_par = 4.57` (`constants.py` / `radiation.py`) |
-| `[microphysics]` | 27 | `rho_rain = 1000.0`, `rho_snow = 100.0`, `rho_graupel = 400.0`, `n0_rain = 8e6`, `n0_snow = 3e6`, `n0_graupel = 4e6`, `a_fall_rain = 842.0`, `b_fall_rain = 0.8`, `a_fall_snow = 4.84`, `b_fall_snow = 0.25`, `a_fall_graupel = 94.5`, `b_fall_graupel = 0.5`, `e_rc = 1.0`, `e_sc = 1.0`, `e_gc = 1.0`, `e_ri = 1.0`, `e_si = 0.1`, `e_gi = 0.1`, `qc_autoconv_thresh = 0.001`, `qi_aggreg_thresh = 1e-4`, `rate_autoconv = 0.001`, `rate_ice_aggreg = 0.001`, `vt_cloud_ice = 0.4`, `t0_precip = 283.16`, `t00_precip = 268.16`, `t0_graupel = 283.16`, `t00_graupel = 223.16` (`microphysics.py`) |
+| `[microphysics]` | 28 | `rho_rain = 1000.0`, `rho_snow = 100.0`, `rho_graupel = 400.0`, `n0_rain = 8e6`, `n0_snow = 3e6`, `n0_graupel = 4e6`, `a_fall_rain = 842.0`, `b_fall_rain = 0.8`, `a_fall_snow = 4.84`, `b_fall_snow = 0.25`, `a_fall_graupel = 94.5`, `b_fall_graupel = 0.5`, `e_rc = 1.0`, `e_sc = 1.0`, `e_gc = 1.0`, `e_ri = 1.0`, `e_si = 0.1`, `e_gi = 0.1`, `qc_autoconv_thresh = 0.001`, `qi_aggreg_thresh = 1e-4`, `rate_autoconv = 0.001`, `rate_ice_aggreg = 0.001`, `vt_cloud_ice = 0.18`, `cloud_droplet_conc_cm3 = 60.0`, `t0_precip = 283.16`, `t00_precip = 268.16`, `t0_graupel = 283.16`, `t00_graupel = 223.16` (`microphysics.py`) |
 | `[turbulence]` | 13 | `mynn_b1 = 24.0`, `mynn_b2 = 15.0`, `mynn_c2 = 0.75`, `mynn_c3 = 0.352`, `mynn_c5 = 0.2`, `mynn_gamma1 = 0.235`, `mynn_pr_n = 0.74`, `tke_min = 1e-4`, `rsl_mu_m = 2.59`, `rsl_mu_h = 0.95`, `rsl_nu = 0.5`, `rsl_lambda = 1.5`, `kinematic_visc_air = 1.5e-5` (`turbulence.py`) |
 | `[surface]` | 24 | `cs_dry_soil = 1.26e6`, `kappa_dry_soil = 0.3`, `soil_porosity = 0.43`, `psi_sat_soil = -0.2`, `b_clapp_soil = 5.39`, `k_sat_soil = 7e-6`, `ice_impedance_omega = 6.0`, `wc_max_per_lai = 0.1`, `alpha_intercept_liq = 1.0`, `f_wet_max = 1.0`, `dsl_dmax_mm = 15.0`, `land_eb_iterations = 3`, `rho_snowpack = 250.0`, `swe_glacier_max = 1000.0`, `tau_snow_age = 1e6`, `alb_snow_vis_new = 0.9`, `alb_snow_nir_new = 0.7`, `alb_snow_vis_old = 0.65`, `alb_snow_nir_old = 0.35`, `emissivity_land = 0.98`, `emissivity_ocean = 0.985`, `mc_seaice_crit = 300.0`, `alb_seaice_vis = 0.72`, `alb_seaice_nir = 0.42` (`surface.py`) |
 | `[biosphere]` | 33 | `theta_nrh = 0.85`, `cost_c_smith = 0.05336251`, `phi_psii_ref_c3 = 0.257`, `beta_c3 = 146.0`, `beta_c4 = 166.0`, `gamma_star25_c3 = 4.332`, `kc25_c3 = 41.03`, `ko25_c3 = 28210.0`, `dha_gamma = 37830.0`, `dha_kc_c3 = 79430.0`, `dha_ko_c3 = 36380.0`, `gamma_star25_c4 = 2.6`, `kp25_umol_c4 = 60.5`, `dha_kp_c4 = 27200.0`, `kc25_c4 = 121.0`, `dha_kc_c4 = 64200.0`, `ko25_c4 = 29200.0`, `dha_ko_c4 = 10500.0`, `phi_leak_c4 = 0.2`, `gbs_c4 = 0.003`, `ha_vcmax = 71513.0`, `ha_jmax = 49884.0`, `ha_vpmax = 55000.0`, `hd_enzyme = 2e5`, `b_resp_ren = 0.018`, `leaf_scat_vis = 0.15`, `leaf_scat_nir = 0.8`, `kd_prime_par = 0.719`, `rho_cd_par = 0.036`, `z_foliage_cost = 12.227`, `k_beer_lai = 0.5`, `sigma_zhou = 0.771`, `alpha_ema_acclim = 0.067` (`biosphere.py`) |

@@ -14,10 +14,10 @@ tau_sponge_min = 300.0
 terrain_scale_exp = 1.5
 crm_nx = 8
 crm_ny = 1
-crm_dx = 8000.0
+crm_dx = 4000.0
 dt_host = 720.0
 n_host_dyn_substeps = 1
-n_crm_dyn_substeps = 12
+n_crm_dyn_substeps = 18
 rad_stride = 5
 crm_col_chunk = 16384
 rad_col_chunk = 32768
@@ -40,10 +40,11 @@ earth2014_dir = "data/boundary/earth2014_5min"
 earth2014_stride = 2
 enable_superparam = true
 enable_dust = true
-dust_emis_factor = 0.0005
+dust_emis_factor = 1.5e-05
 h_ml_ocean = 50.0
 re_liq_um = 10.0
-re_ice_um = 50.0
+re_ice_um = 38.0
+cloud_sw_inhomog = 0.85
 
 # --- Dynamic Equilibrium / Accelerated SIA Ice-Sheet Options ---
 [icesheet]
@@ -139,7 +140,8 @@ qc_autoconv_thresh = 0.001
 qi_aggreg_thresh = 0.0001
 rate_autoconv = 0.001
 rate_ice_aggreg = 0.001
-vt_cloud_ice = 0.4
+vt_cloud_ice = 0.18
+cloud_droplet_conc_cm3 = 60.0
 t0_precip = 283.16
 t00_precip = 268.16
 t0_graupel = 283.16

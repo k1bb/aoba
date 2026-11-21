@@ -156,7 +156,8 @@ def cloud_optical_sw(
     lwp_gm2: torch.Tensor,
     iwp_gm2: torch.Tensor,
     re_liq_um: float = 10.0,
-    re_ice_um: float = 50.0,
+    re_ice_um: float = 38.0,
+    cloud_sw_inhomog: float = 0.85,
 ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Compute liquid + ice cloud optical properties (tau, omega0, g) for SW1 and SW2.
 
@@ -172,16 +173,19 @@ def cloud_optical_sw(
         ai = 3.448e-3, bi = 2.431, ci = 1.0e-5, di = 0.0, ei = 0.7661, fi = 5.851e-4
       Bands 2-5 solar-weighted average (SW2, 0.70-3.50 um, weight 0.5314):
         ai = 3.448e-3, bi = 2.431, ci = 0.02437, di = 2.52e-4, ei = 0.7867, fi = 5.90e-4
+    - Cahalan et al. (1994, J. Atmos. Sci., 51, 2434-2455): Subgrid cloud optical inhomogeneity
+      scaling factor `cloud_sw_inhomog` (chi_SW, typically 0.70-0.78) reducing plane-parallel albedo bias.
     """
     lwp = torch.clamp(lwp_gm2, min=0.0)
     iwp = torch.clamp(iwp_gm2, min=0.0)
+    chi = float(cloud_sw_inhomog)
 
     # SW1 liquid + ice
-    tau_l1 = lwp * (2.817e-2 + 1.305 / re_liq_um)
+    tau_l1 = chi * lwp * (2.817e-2 + 1.305 / re_liq_um)
     om_l1 = min(1.0 - (-5.62e-8 + 1.63e-7 * re_liq_um), 0.999999)
     g_l1 = 0.829 + 2.482e-3 * re_liq_um
 
-    tau_i1 = iwp * (3.448e-3 + 2.431 / re_ice_um)
+    tau_i1 = chi * iwp * (3.448e-3 + 2.431 / re_ice_um)
     om_i1 = min(1.0 - (1.0e-5 + 0.0 * re_ice_um), 0.999999)
     g_i1 = 0.7661 + 5.851e-4 * re_ice_um
 
@@ -195,11 +199,11 @@ def cloud_optical_sw(
     )
 
     # SW2 liquid + ice
-    tau_l2 = lwp * (2.456e-2 + 1.400 / re_liq_um)
+    tau_l2 = chi * lwp * (2.456e-2 + 1.400 / re_liq_um)
     om_l2 = max(min(1.0 - (0.01260 + 9.01e-4 * re_liq_um), 0.999999), 0.0)
     g_l2 = 0.783 + 5.01e-3 * re_liq_um
 
-    tau_i2 = iwp * (3.448e-3 + 2.431 / re_ice_um)
+    tau_i2 = chi * iwp * (3.448e-3 + 2.431 / re_ice_um)
     om_i2 = max(min(1.0 - (0.02437 + 2.52e-4 * re_ice_um), 0.999999), 0.0)
     g_i2 = 0.7867 + 5.90e-4 * re_ice_um
 
@@ -218,7 +222,7 @@ def cloud_optical_sw(
 def cloud_optical_lw(
     lwp_gm2: torch.Tensor,
     iwp_gm2: torch.Tensor,
-    re_ice_um: float = 50.0,
+    re_ice_um: float = 38.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute cloud absorption optical depths (zenith) for LW1 (non-window) and LW2 (window).
 
@@ -514,7 +518,8 @@ def compute_four_band_radiation(
     co2_ppmv: float = C.CO2_RCEMIP_PPMV,
     emiss_sfc: float | torch.Tensor = 0.98,
     re_liq_um: float = 10.0,
-    re_ice_um: float = 50.0,
+    re_ice_um: float = 38.0,
+    cloud_sw_inhomog: float = 0.85,
     albedo_vis_dif: torch.Tensor | None = None,
     albedo_nir_dif: torch.Tensor | None = None,
     q_dust_c: torch.Tensor | None = None,
@@ -583,7 +588,9 @@ def compute_four_band_radiation(
     dtau_wv_sw2 = -mu0_safe.unsqueeze(0) * torch.log(torch.clamp(trans_wv_ratio, min=1.0e-5, max=1.0))
 
     # Combine gas + Rayleigh + cloud optical properties in SW1 and SW2
-    cld_sw = cloud_optical_sw(lwp_gm2, iwp_gm2, re_liq_um=re_liq_um, re_ice_um=re_ice_um)
+    cld_sw = cloud_optical_sw(
+        lwp_gm2, iwp_gm2, re_liq_um=re_liq_um, re_ice_um=re_ice_um, cloud_sw_inhomog=cloud_sw_inhomog
+    )
     tau_c1, om_c1, g_c1 = cld_sw["sw1"]
     tau_c2, om_c2, g_c2 = cld_sw["sw2"]
 

@@ -90,6 +90,11 @@ def _restore_surface(sfc_target, payload: dict, device: torch.device) -> None:
         sfc_target.t_leaf_sh = sfc_target.t_canopy.clone()
     if "t_gnd_skin" not in payload or sfc_target.t_gnd_skin is None:
         sfc_target.t_gnd_skin = sfc_target.t_soil[0].clone()
+    # Sanitize any legacy pre-fix restarts where soil ice exceeded available pore space
+    from aoba.surface import SOIL_POROSITY
+
+    w_ice_cap = torch.clamp(SOIL_POROSITY - sfc_target.w_liq_soil, min=0.0)
+    sfc_target.w_ice_soil = torch.clamp(sfc_target.w_ice_soil, min=0.0).minimum(w_ice_cap)
 
 
 def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] | None = None) -> None:
@@ -143,6 +148,9 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         setattr(model.atmos, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     for k, v in ckpt["crm"].__dict__.items():
         setattr(model.crm, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+    # Honor active run_config grid spacing (`crm_dx`) when switching spacing on resume
+    model.crm.dx = float(model.cfg.crm_dx)
+    model.crm.dy = float(model.cfg.crm_dx)
     _restore_surface(model.sfc, ckpt["sfc"], device)
     if ckpt.get("sfc_sub") is not None and model.sfc_sub is not None:
         _restore_surface(model.sfc_sub, ckpt["sfc_sub"], device)
