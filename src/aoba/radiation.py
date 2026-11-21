@@ -156,7 +156,7 @@ def cloud_optical_sw(
     lwp_gm2: torch.Tensor,
     iwp_gm2: torch.Tensor,
     re_liq_um: float = 10.0,
-    re_ice_um: float = 38.0,
+    re_ice_um: float = 48.0,
     cloud_sw_inhomog: float = 0.85,
 ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Compute liquid + ice cloud optical properties (tau, omega0, g) for SW1 and SW2.
@@ -222,7 +222,7 @@ def cloud_optical_sw(
 def cloud_optical_lw(
     lwp_gm2: torch.Tensor,
     iwp_gm2: torch.Tensor,
-    re_ice_um: float = 38.0,
+    re_ice_um: float = 48.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute cloud absorption optical depths (zenith) for LW1 (non-window) and LW2 (window).
 
@@ -518,7 +518,7 @@ def compute_four_band_radiation(
     co2_ppmv: float = C.CO2_RCEMIP_PPMV,
     emiss_sfc: float | torch.Tensor = 0.98,
     re_liq_um: float = 10.0,
-    re_ice_um: float = 38.0,
+    re_ice_um: float = 48.0,
     cloud_sw_inhomog: float = 0.85,
     albedo_vis_dif: torch.Tensor | None = None,
     albedo_nir_dif: torch.Tensor | None = None,

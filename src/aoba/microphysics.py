@@ -89,7 +89,7 @@ QC_AUTOCONV_THRESH: float = 1.0e-3 # KR03 fallback threshold cloud liquid water 
 QI_AGGREG_THRESH: float = 1.0e-4   # Threshold cloud ice q_io [kg kg^-1]
 RATE_AUTOCONV: float = 1.0e-3      # KR03 fallback autoconversion rate alpha [s^-1]
 RATE_ICE_AGGREG: float = 1.0e-3    # Ice aggregation rate beta [s^-1]
-VT_CLOUD_ICE: float = 0.18         # Cloud-ice terminal fall velocity V_TI [m s^-1]
+VT_CLOUD_ICE: float = 0.40         # Cloud-ice terminal fall velocity V_TI [m s^-1]
 CLOUD_DROPLET_CONC_CM3: float = 60.0 # Cloud droplet number conc. N_d [cm^-3] (Tomita 2008 / Berry 1968; <=0 -> KR03)
 
 # Precipitating phase-partition temperature thresholds (KR03 Appendix B, p. 624)

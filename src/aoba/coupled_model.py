@@ -85,7 +85,7 @@ class AOBAConfig:
     terrain_scale_exp: float = 1.5           # Klemp STF attenuation exponent p [-]
     h_ml_ocean: float = 50.0                 # Ocean mixed-layer depth [m]
     re_liq_um: float = 10.0                  # Cloud liquid droplet effective radius [um]
-    re_ice_um: float = 38.0                  # Cloud ice crystal effective radius [um]
+    re_ice_um: float = 48.0                  # Cloud ice crystal effective radius [um]
     cloud_sw_inhomog: float = 0.85           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
     crm_nx: int = 8                          # Embedded CRM x-grid points per SCVT cell (default 2D 8x1 = 32 km curtain)
     crm_ny: int = 1                          # Embedded CRM y-grid points (1 = SP-CAM 2.5D curtain for Mac climate runs)
@@ -229,7 +229,7 @@ def _compute_four_band_radiation_chunked(
     albedo_nir_dif: torch.Tensor,
     col_chunk: int,
     re_liq_um: float = 10.0,
-    re_ice_um: float = 38.0,
+    re_ice_um: float = 48.0,
     cloud_sw_inhomog: float = 0.85,
     q_dust_c: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
