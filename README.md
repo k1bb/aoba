@@ -42,7 +42,10 @@ aoba/
 ## Quick Start
 
 ```bash
-# Optional editable install (tests and scripts also auto-resolve `src/` without it)
+# 1. One-command bootstrap on a fresh clone (checks libraries, downloads Earth2014 grids, runs tests & smoke run)
+python setup_aoba.py
+
+# Optional editable install (tests/scripts also auto-resolve `src/` & auto-download Earth2014 on first run)
 pip install --no-build-isolation --no-deps -e .
 
 # Run the full verification suite on CPU + Apple Silicon MPS GPU

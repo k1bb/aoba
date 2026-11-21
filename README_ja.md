@@ -42,7 +42,10 @@ aoba/
 ## クイックスタート
 
 ```bash
-# （任意）editable インストール（不要でも全テスト・スクリプトは自動パス解決されます）
+# 1. 別端末への clone 直後の一括セットアップ（ライブラリ確認・Earth2014 地形自動DL・全テスト・スモークラン）
+python setup_aoba.py
+
+# （任意）editable インストール（不要でも全テスト・スクリプトは自動パス解決＆初回地形自動DLされます）
 pip install --no-build-isolation --no-deps -e .
 
 # 全検証テストスイートの実行（CPU および Apple Silicon MPS GPU 両対応）

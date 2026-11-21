@@ -58,7 +58,7 @@ from aoba.params import (
     save_aoba_toml,
 )
 from aoba.radiation import RadiationOutput, compute_four_band_radiation, compute_solar_zenith
-from aoba.runtime import get_data_dir, get_device, get_output_dir
+from aoba.runtime import ensure_earth2014_data, get_data_dir, get_device, get_output_dir
 from aoba.scvt_dynamics import (
     GlobalAtmosState,
     compute_held_suarez_forcing,
@@ -105,6 +105,7 @@ __all__ = [
     "get_device",
     "get_output_dir",
     "get_data_dir",
+    "ensure_earth2014_data",
     "VerticalGrid",
     "build_vertical_grid",
     "compute_stf_heights",

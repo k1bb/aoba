@@ -35,6 +35,7 @@ from scipy.spatial import ConvexHull, cKDTree
 import torch
 
 from aoba import constants as C
+from aoba.runtime import ensure_earth2014_data
 
 
 @dataclass
@@ -652,7 +653,15 @@ def build_scvt_mesh(
     n_edges = topo["dc_edge"].shape[0]
     n_verts = topo["area_vert"].shape[0]
 
-    e_dir = Path(earth2014_dir)
+    if use_earth2014:
+        try:
+            e_dir = ensure_earth2014_data(earth2014_dir, auto_download=True)
+        except Exception as exc:
+            print(f"[AOBA Warning] Failed to auto-download Earth2014 ({exc}); falling back if cached.", flush=True)
+            e_dir = Path(earth2014_dir)
+    else:
+        e_dir = Path(earth2014_dir)
+
     if use_earth2014 and (e_dir / "Earth2014.SUR2014.5min.geod.bin").exists():
         bndry = _aggregate_earth2014_to_scvt(
             xyz_cell,
