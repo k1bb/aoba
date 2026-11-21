@@ -111,7 +111,7 @@ class AOBAConfig:
     earth2014_stride: int = 2
     enable_superparam: bool = True           # 1:1 embedded 3D CRM in every SCVT cell
     enable_dust: bool = True                 # Map-free global-parameter mineral dust aerosol + radiative coupling
-    c_dust_emiss: float = 1.5e-9             # Single global dust emission scaling constant [kg s^2 m^-5]
+    dust_emis_factor: float = 5.0e-4         # Global dust emission tuning factor T (CLM5 Tech. Note Eq. 31.1) [-]
     enable_dynamic_icesheet: bool = False    # Opt-in SIA + EMA-accelerated ice sheet & vertical grid update
     icesheet_ema_years: float = 5.0          # EMA smoothing timescale for annual SMB [years]
     icesheet_accel_factor: float = 100.0     # Initial ice-sheet spinup acceleration multiplier [-]
@@ -990,11 +990,15 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
             atmos.q_dust = torch.zeros_like(atmos.q_n)
         f_dust_sub = compute_dust_emission_sub(
             surf_type=sfc_sub.surf_type,
-            lai=sfc_sub.bio.lai,
-            swe_land=sfc_sub.swe_land,
+            lai=lai_exp_sub,
+            f_snow=sfc_diag_sub.f_snow_land,
             w_liq_soil_top=sfc_sub.w_liq_soil[0],
+            w_ice_soil_top=sfc_sub.w_ice_soil[0],
             u_star=sfc_diag_sub.u_star,
-            c_dust_emiss=cfg.c_dust_emiss,
+            rho_atm=rho_sub[0] * (1.0 + qv_sub[0]),
+            z0m=sfc_diag_sub.z0m,
+            d_disp=sfc_diag_sub.d_disp,
+            dust_emis_factor=cfg.dust_emis_factor,
         )
         atmos.q_dust = step_dust_column(
             q_dust=atmos.q_dust,

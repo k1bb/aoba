@@ -352,21 +352,37 @@ def test_mineral_dust_emission_transport_and_radiation(device: str) -> None:
     from aoba.surface import SURF_LAND, SURF_OCEAN
 
     dev = torch.device(device)
-    # 4 columns: [bare dry windy land, vegetated dry windy land, snowy dry land, ocean]
-    surf = torch.tensor([SURF_LAND, SURF_LAND, SURF_LAND, SURF_OCEAN], device=dev)
-    lai = torch.tensor([0.0, 4.0, 0.0, 0.0], device=dev)
-    swe = torch.tensor([0.0, 0.0, 10.0, 0.0], device=dev)
-    w_liq = torch.tensor([0.03, 0.03, 0.03, 0.03], device=dev)  # Dry top-soil volumetric moisture [m^3 m^-3]
-    u_star = torch.tensor([0.6, 0.6, 0.6, 0.6], device=dev)
+    # 5 columns: [bare dry windy land, sparse (LAI 0.15) land, dense (LAI 4) land, fully snow-covered land, ocean]
+    surf = torch.tensor([SURF_LAND, SURF_LAND, SURF_LAND, SURF_LAND, SURF_OCEAN], device=dev)
+    lai = torch.tensor([0.0, 0.15, 4.0, 0.0, 0.0], device=dev)
+    f_snow = torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0], device=dev)
+    w_liq = torch.full((5,), 0.03, device=dev)  # Dry top-soil volumetric moisture [m^3 m^-3]
+    w_ice = torch.zeros(5, device=dev)
+    u_star = torch.full((5,), 0.6, device=dev)
+    rho = torch.full((5,), 1.15, device=dev)
+    z0m = torch.full((5,), 0.01, device=dev)
 
-    f_emit = compute_dust_emission_sub(surf, lai, swe, w_liq, u_star, c_dust_emiss=1.5e-9)
+    def _emit(w_l, w_i, us):
+        return compute_dust_emission_sub(surf, lai, f_snow, w_l, w_i, us, rho, z0m, dust_emis_factor=5.0e-4)
+
+    f_emit = _emit(w_liq, w_ice, u_star)
     assert float(f_emit[0].item()) > 0.0
-    assert float(f_emit[1].item()) < float(f_emit[0].item()) * 0.2  # LAI suppresses emission
-    assert float(f_emit[2].item()) == 0.0  # Snow suppresses emission
-    assert float(f_emit[3].item()) == 0.0  # Ocean emits 0
-    # Moist top soil (volumetric moisture above the 0.20 inhibition threshold) must shut emission off
-    f_moist = compute_dust_emission_sub(surf, lai, swe, torch.full_like(w_liq, 0.35), u_star, c_dust_emiss=1.5e-9)
-    assert float(f_moist[0].item()) == 0.0
+    assert abs(float(f_emit[1].item()) - 0.5 * float(f_emit[0].item())) < 1.0e-3 * float(f_emit[0].item())  # f_v = L/0.3
+    assert float(f_emit[2].item()) == 0.0  # LAI >= 0.3 shuts mobilization off (CLM5 Eq. 31.3)
+    assert float(f_emit[3].item()) == 0.0  # Snow cover suppresses emission
+    assert float(f_emit[4].item()) == 0.0  # Ocean emits 0
+    # Dry threshold ~0.21 m/s: weak wind below threshold emits nothing
+    assert float(_emit(w_liq, w_ice, torch.full_like(u_star, 0.15))[0].item()) == 0.0
+    # Moist soil raises the threshold (Fecan et al., 1999): at u* = 0.35 m/s dry soil emits, moist soil does not
+    u_mid = torch.full_like(u_star, 0.35)
+    assert float(_emit(w_liq, w_ice, u_mid)[0].item()) > 0.0
+    assert float(_emit(torch.full_like(w_liq, 0.35), w_ice, u_mid)[0].item()) == 0.0
+    # Frozen top soil (all ice) cannot be mobilized
+    assert float(_emit(torch.zeros_like(w_liq), torch.full_like(w_liq, 0.03), u_star)[0].item()) == 0.0
+    # Magnitude check against CLM5 Eqs. 31.1-31.5 for bare dry soil at u* = 0.6 m/s (order 1e-6 kg m^-2 s^-1)
+    assert 1.0e-7 < float(f_emit[0].item()) < 1.0e-5
+    f_emit = f_emit[:4]
+    u_star = u_star[:4]
 
     nz = 16
     q_dust = torch.zeros((nz, 4), device=dev)

@@ -444,6 +444,14 @@ $$
 $$
 海氷被覆率（リード補数）は $f_i = \mathrm{clip}(\sqrt{M_i / M_{i,\mathrm{crit}}},\ 0,\ 1)$（$M_{i,\mathrm{crit}} = 300\ \mathrm{kg\ m^{-2}}$; SCALE-RM Eq. 8.342）とし、開水面 $(1 - f_i)$ と積雪載荷海氷面 $f_i$（Semtner, 1976 型熱伝導と凍結・融解収支）を個別に解いて面積加重平均フラックスを与える。
 
+### 8.5 地図不要の鉱物ダスト放出・鉛直輸送・放射結合 (`src/aoba/dust.py`)
+
+鉱物ダスト放出は CLM5 DEAD スキーム（Lawrence et al., 2020, Ch. 31, Eqs. 31.1–31.14; Oleson et al., 2013, Ch. 24; Zender et al., 2003; Mahowald et al., 2006）に準拠し、地域放出源マップを用いず（$S = 1$）、単一の全球調整係数 $T = \text{dust\_emis\_factor} = 5\times 10^{-4}$ で鉛直放出フラックスを与える：
+$$
+F_{\mathrm{dust}} = T\, f_m\, \alpha\, Q_s \sum_{i=1}^{3} M_i, \qquad f_m = (1 - A_{\mathrm{sn}})(1 - f_v)\frac{w_{\mathrm{liq},1}}{w_{\mathrm{liq},1} + w_{\mathrm{ice},1}}, \qquad f_v = \mathrm{clip}\!\left(\frac{L_{\mathrm{exp}}}{0.3},\,0,\,1\right).
+$$
+単一ローム土壌の粘土質量分率 $M_{\mathrm{clay}} = 0.20$ に対するサンドブラスティング効率 $\alpha = 100\exp[(13.4 M_{\mathrm{clay}} - 6.0)\ln 10]\ \mathrm{m^{-1}}$（Marticorena & Bergametti, 1995）、最適跳躍粒径 $D_{\mathrm{osp}} = 75\ \mu\mathrm{m}$（$\rho_{\mathrm{osp}} = 2650\ \mathrm{kg\ m^{-3}}$）の Iversen & White (1982) 乾燥しきい摩擦速度に、Fécan et al. (1999) の土壌水分係数 $f_w = \sqrt{1 + 1.21 [100(w - w_t)]^{0.68}}$（重量含水率 $w = 1000(w_{\mathrm{liq},1}+w_{\mathrm{ice},1}) / [(1 - \phi_{\mathrm{soil}})\rho_{\mathrm{solid}}] > w_t = 0.17 + 0.14 M_{\mathrm{clay}}$、CLM 調整係数 $a = M_{\mathrm{clay}}^{-1}$ を適用）を乗じて $u_{*t}$ を求める。さらに Owen (1964) 効果 $u_{*s} = u_* + 0.003(U_{10} - U_{10,t})^2$（$U_{10} \ge U_{10,t}$）を反映した White (1979) 水平跳躍フラックス $Q_s = c_s (\rho_{\mathrm{atm}} u_{*s}^3 / g)(1 - r)(1 + r)^2$（$r = u_{*t}/u_{*s} < 1$, $c_s = 2.61$）に輸送粒径帯（$0.1\text{–}10\ \mu\mathrm{m}$）の質量分率和 $\sum M_i = 0.871$ を乗じる。大気柱ダスト混合比 $q_{\mathrm{dust}}$ は PBL 鉛直混合・陰的重力沈降・乾性沈着・降水洗浄を受け、Balkanski et al. (2007) の広帯域短波・長波光学特性で放射結合する。
+
 ---
 
 ## 9. 埋め込み 3D 非静力学 RK3–HEVI CRM と Zalesak FCT
@@ -591,14 +599,14 @@ $$
 | `rad_stride` | `5` | 放射計算の呼出し間隔（ステップ数） |
 | `crm_col_chunk`, `rad_col_chunk` | `16384`, `32768` | GPU/CPU メモリ制御用バッチチャンクサイズ [columns] |
 
-#### `[forcing]`・`[icesheet]`・`[output]` — 外力・氷床制御・出力管理（43項目）
+#### `[forcing]`・`[icesheet]`・`[output]` — 外力・氷床制御・出力管理（45項目）
 | セクション | キー ＝ 標準値 |
 | :--- | :--- |
-| `[forcing]` (18) | `co2_ppmv = 400.0`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `start_date = "2000-03-20"`, `calendar_type = "gregorian"`, `insolation_mode = "seasonal"`, `fixed_insolation_date = "2000-03-20"`, `diurnal_cycle = true`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 50.0` |
+| `[forcing]` (20) | `co2_ppmv = 400.0`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `start_date = "2000-03-20"`, `calendar_type = "gregorian"`, `insolation_mode = "seasonal"`, `fixed_insolation_date = "2000-03-20"`, `diurnal_cycle = true`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `enable_dust = true`, `dust_emis_factor = 5e-4`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 50.0` |
 | `[icesheet]` (5) | `enable_dynamic_icesheet = false`, `icesheet_ema_years = 5.0`, `icesheet_accel_factor = 100.0`, `icesheet_accel_spinup_years = 0.0`, `icesheet_isostasy_tau_yr = 1000.0` |
 | `[output]` (20) | `out_dir = ""`, `years = 30`, `end_date = ""`, `days_per_year = 365.2425`, `zarr_dir_partition = "yearly"`, `daily_csv_enabled = true`, `daily_csv_interval_days = 1.0`, `monthly_mean_enabled = true`, `monthly_mean_periods_per_year = 12`, `monthly_mean_sample_hours = 6.0`, `monthly_mean_include_2d = true`, `monthly_mean_include_3d = true`, `monthly_mean_include_subgrid_2d = true`, `snapshots_enabled = true`, `snapshots_periods_per_year = 12`, `snapshots_include_2d = true`, `snapshots_include_3d = true`, `snapshots_include_subgrid_2d = true`, `restart_interval_years = 1`, `restart_monthly = true` |
 
-#### `[constants]` 〜 `[icesheet_physics]` — 全物理・生態系・雪氷・海洋定数レジストリ（136項目）
+#### `[constants]` 〜 `[icesheet_physics]` — 全物理・生態系・雪氷・海洋定数レジストリ（143項目）
 | セクション | 項目数 | 登録キー ＝ 標準値（`src/aoba/` 対応モジュール名） |
 | :--- | :--- | :--- |
 | `[constants]` | 26 | `earth_radius = 6.371e6`, `gravity = 9.79764`, `omega_earth = 7.292115e-5`, `seconds_per_day = 86400.0`, `days_per_year = 365.2425`, `r_d = 287.04`, `cp_d = 1004.64`, `r_v = 461.5`, `cp_v = 1846.0`, `p_ref = 1e5`, `t_freeze = 273.15`, `t_triple = 273.16`, `e_triple = 611.2`, `l_v0 = 2.501e6`, `l_f0 = 3.337e5`, `t_ice_all = 253.15`, `t_liq_all = 273.16`, `stefan_boltzmann = 5.670374419e-8`, `von_karman = 0.4`, `rho_seawater = 1025.0`, `cp_seawater = 3990.0`, `t_freeze_ocean = 271.35`, `rho_seaice = 917.0`, `k_therm_seaice = 2.034`, `k_therm_snow = 0.3096`, `o2_mixing_ratio = 0.20946` (`constants.py`) |
