@@ -991,7 +991,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
         </div>
         <div style="display:flex; gap:8px; align-items:center;">
           <button onclick="fetchMonitorOnce()" style="flex:1;" data-i18n="btn_refresh">⟳ 今すぐ更新</button>
-          <label class="switch" style="font-size:12px;"><input type="checkbox" id="auto-poll" checked /> <span data-i18n="lbl_autopoll">5秒自動</span></label>
+          <label class="switch" style="font-size:12px;"><input type="checkbox" id="auto-poll" checked /> <span data-i18n="lbl_autopoll">2秒自動</span></label>
         </div>
       </div>
 
@@ -1008,12 +1008,12 @@ _HTML_PAGE = r"""<!DOCTYPE html>
     <div class="card">
       <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px;">
         <div>
-          <h2 style="margin:0;" data-i18n="globes_title">3地球 日平均リアルタイム正射図法プレビュー (T<sub>2</sub> ・ 降水量 ・ LAI)</h2>
+          <h2 style="margin:0;" data-i18n="globes_title">3地球 1時間リアルタイム正射図法プレビュー (T<sub>2</sub> ・ 降水量 ・ LAI)</h2>
           <p class="sub" style="margin:2px 0 0;" data-i18n="globes_sub">ドラッグで任意の緯度経度へ傾け・回転できます。3つの地球儀が同期してゆっくり自転します。</p>
         </div>
         <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
           <label class="switch" style="font-size:12.5px;"><input type="checkbox" id="globe-spin" checked /> <span data-i18n="lbl_spin">自動回転</span></label>
-          <label class="switch" style="font-size:12.5px;" title="計算中の1モデル日あたり所要時間に合わせて1周します"><input type="checkbox" id="globe-sync-day" checked /> <span id="lbl-sync-day">1日/周</span></label>
+          <label class="switch" style="font-size:12.5px;" title="太陽直下点（昼半球）に追従して1モデル日あたり1周します"><input type="checkbox" id="globe-sync-day" checked /> <span id="lbl-sync-day">昼半球同期</span></label>
           <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted);">
             <span data-i18n="lbl_speed">速度</span>
             <input type="range" id="globe-speed" min="2" max="45" value="12" style="width:95px;" />
@@ -1037,7 +1037,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
           <div class="cbar-labels"><span>-45°C</span><span>-10°C</span><span>+15°C</span><span>+40°C</span></div>
         </div>
         <div class="globe-card">
-          <h3 data-i18n="g_olr_title">日平均降水量 Precip [mm d⁻¹]</h3>
+          <h3 data-i18n="g_olr_title">降水量 Precip [mm d⁻¹]</h3>
           <div class="g-sub" data-i18n="g_olr_sub">ITCZ・モンスーン・前線帯のトレーサ</div>
           <canvas id="globeOLR" class="globe-canvas" width="300" height="300"></canvas>
           <div class="cbar" style="background:linear-gradient(90deg, #0f172a, #1e3a8a, #0ea5e9, #34d399, #facc15, #f97316, #ec4899);"></div>
@@ -1116,7 +1116,7 @@ let LANG = "ja";
 let CURRENT_DOC_BASE = "formulation";
 let ACTIVE_REG_SEC = "constants";
 let MON = { raster: null, rawT2: null, rawOLR: null, rawLAI: null, rawSurf: null, rawCoast: null, outDir: "" };
-let GLOBE_VIEW = { lat0: 18.0, lon0: 140.0, dragging: false, lastX: 0, lastY: 0, geoCacheLat: null, geoCache: null };
+let GLOBE_VIEW = { lat0: 18.0, lon0: 140.0, dragging: false, lastX: 0, lastY: 0, geoCacheLat: null, geoCache: null, manualOverride: false, subsolarLon: null };
 let GRID_VIEW = { lon0: 138.0, lat0: 24.0, dragging: false, lastX: 0, lastY: 0, cache: {}, inflight: {} };
 
 const I18N = {
@@ -1174,13 +1174,13 @@ const I18N = {
     opt_mon: "Monthly Zarr (月平均)",
     lbl_watch_frame: "履歴フレーム選択 (Zarr閲覧時)",
     btn_refresh: "⟳ 今すぐ更新",
-    lbl_autopoll: "5秒自動",
+    lbl_autopoll: "2秒自動",
     mkpi_proc: "稼働プロセス",
     mkpi_time: "表示データ時刻",
     mkpi_src: "データソース",
     mkpi_cpu: "CPU 投影処理時間",
     mkpi_latest: "最新全球 T<sub>s</sub> / OLR / LAI",
-    globes_title: "3地球 日平均リアルタイム正射図法プレビュー (T<sub>2</sub> ・ 降水量 ・ LAI)",
+    globes_title: "3地球 1時間リアルタイム正射図法プレビュー (T<sub>2</sub> ・ 降水量 ・ LAI)",
     globes_sub: "ドラッグで任意の緯度経度へ傾け・回転できます。3つの地球儀が同期してゆっくり自転します。",
     lbl_spin: "自動回転",
     lbl_speed: "速度",
@@ -1188,7 +1188,7 @@ const I18N = {
     btn_reset_view: "視点リセット",
     hover_hint: "地球儀の上にマウスを置くと、その地点の緯度経度・T₂・降水量・LAI が表示されます",
     g_t2_title: "地表付近気温 T<sub>2</sub> [°C]",
-    g_olr_title: "日平均降水量 Precip [mm d⁻¹]",
+    g_olr_title: "降水量 Precip [mm d⁻¹]",
     g_olr_sub: "ITCZ・モンスーン・前線帯のトレーサ",
     g_lai_title: "葉面積指数 LAI [m² m⁻²]",
     g_lai_sub: "自律 EEO バイオーム分布（海＝濃紺・氷床＝白）",
@@ -1266,7 +1266,7 @@ const I18N = {
     mkpi_src: "Active Source",
     mkpi_cpu: "CPU Regrid Time",
     mkpi_latest: "Global Mean T<sub>s</sub> / OLR / LAI",
-    globes_title: "Live Daily-Mean 3-Globe Preview (T<sub>2</sub> · Precip · LAI)",
+    globes_title: "Live Hourly 3-Globe Preview (T<sub>2</sub> · Precip · LAI)",
     globes_sub: "Drag any globe to tilt or spin synchronously across latitude and longitude.",
     lbl_spin: "Auto Spin",
     lbl_speed: "Speed",
@@ -1274,7 +1274,7 @@ const I18N = {
     btn_reset_view: "Reset View",
     hover_hint: "Hover over any globe to inspect latitude, longitude, surface type, T₂, Precip, and LAI",
     g_t2_title: "Surface Air Temperature T<sub>2</sub> [°C]",
-    g_olr_title: "Daily-Mean Precipitation [mm d⁻¹]",
+    g_olr_title: "Precipitation [mm d⁻¹]",
     g_olr_sub: "ITCZ, monsoon & storm-track tracer",
     g_lai_title: "Leaf Area Index LAI [m² m⁻²]",
     g_lai_sub: "Autonomous EEO biomes (Ocean=Navy, Ice=White)",
@@ -1957,6 +1957,15 @@ async function fetchMonitorOnce() {
     // Metadata & KPIs
     const meta = data.meta || {};
     MON.wallSPerDay = Number(meta.wall_s_per_day || 0);
+    if (meta.sim_days !== undefined && meta.sim_days !== null && !Number.isNaN(Number(meta.sim_days))) {
+      const fracDay = ((Number(meta.sim_days) % 1.0) + 1.0) % 1.0;
+      GLOBE_VIEW.subsolarLon = wrapLonDeg(180.0 - 360.0 * fracDay);
+      const syncDay = document.getElementById("globe-sync-day")?.checked ?? true;
+      const spinOn = document.getElementById("globe-spin")?.checked ?? true;
+      if (!GLOBE_VIEW.manualOverride && syncDay && spinOn && !GLOBE_VIEW.dragging) {
+        GLOBE_VIEW.lon0 = GLOBE_VIEW.subsolarLon;
+      }
+    }
     document.getElementById("mon-src").textContent = meta.source || "-";
     document.getElementById("mon-time").textContent =
       meta.sim_days !== undefined
@@ -1964,7 +1973,7 @@ async function fetchMonitorOnce() {
         : "-";
     const syncLbl = document.getElementById("lbl-sync-day");
     if (syncLbl) {
-      syncLbl.textContent = MON.wallSPerDay > 0 ? `1日/周 (${MON.wallSPerDay.toFixed(1)}s)` : "1日/周";
+      syncLbl.textContent = MON.wallSPerDay > 0 ? `昼半球同期 (${MON.wallSPerDay.toFixed(1)}s/日)` : "昼半球同期";
     }
     document.getElementById("mon-cpums").textContent = data.raster ? `${data.raster.cpu_regrid_ms} ms (CPU)` : "-";
 
@@ -2167,7 +2176,7 @@ function animateGlobes(ts) {
     const syncDay = document.getElementById("globe-sync-day")?.checked ?? true;
     let spd = Number(document.getElementById("globe-speed")?.value ?? 12);
     if (syncDay && MON.wallSPerDay > 0) {
-      spd = 360.0 / Math.max(MON.wallSPerDay, 0.25);
+      spd = -360.0 / Math.max(MON.wallSPerDay, 0.25);
     }
     GLOBE_VIEW.lon0 = wrapLonDeg(GLOBE_VIEW.lon0 + spd * dt);
   }
@@ -2179,13 +2188,17 @@ function animateGlobes(ts) {
     `Center: lat ${GLOBE_VIEW.lat0>=0?"+":""}${GLOBE_VIEW.lat0.toFixed(1)}°, lon ${GLOBE_VIEW.lon0>=0?"+":""}${GLOBE_VIEW.lon0.toFixed(1)}°`;
 }
 
-function resetGlobeView() { GLOBE_VIEW.lat0 = 18.0; GLOBE_VIEW.lon0 = 140.0; }
+function resetGlobeView() {
+  GLOBE_VIEW.lat0 = 18.0;
+  GLOBE_VIEW.manualOverride = false;
+  GLOBE_VIEW.lon0 = GLOBE_VIEW.subsolarLon !== null ? GLOBE_VIEW.subsolarLon : 140.0;
+}
 
 function bindGlobeInteractions() {
   ["globeT2", "globeOLR", "globeLAI"].forEach(id => {
     const cv = document.getElementById(id);
     if (!cv) return;
-    cv.addEventListener("mousedown", e => { GLOBE_VIEW.dragging = true; GLOBE_VIEW.lastX = e.clientX; GLOBE_VIEW.lastY = e.clientY; });
+    cv.addEventListener("mousedown", e => { GLOBE_VIEW.dragging = true; GLOBE_VIEW.manualOverride = true; GLOBE_VIEW.lastX = e.clientX; GLOBE_VIEW.lastY = e.clientY; });
     cv.addEventListener("mousemove", e => {
       if (GLOBE_VIEW.dragging) {
         const dx = e.clientX - GLOBE_VIEW.lastX, dy = e.clientY - GLOBE_VIEW.lastY;
@@ -2470,7 +2483,7 @@ setInterval(() => {
   const auto = document.getElementById("auto-poll")?.checked;
   const active = document.getElementById("tab-monitor")?.classList.contains("active");
   if (auto && active) fetchMonitorOnce();
-}, 5000);
+}, 2000);
 
 /* --- HEADER OTHELLO VORONOI 'A' ICON ANIMATION --- */
 let OTHELLO_CELLS = null;

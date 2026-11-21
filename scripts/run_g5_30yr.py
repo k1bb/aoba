@@ -259,7 +259,7 @@ def _write_live_preview_atomic(
     lai = model.sfc.bio.lai
     h_ice = model.icesheet.h_ice if model.icesheet is not None else torch.zeros_like(t2_k)
 
-    date_str = model.calendar.date_at(model.sim_time_sec).iso_date
+    date_str = model.calendar.date_at(model.sim_time_sec).iso_datetime[:16]
     tmp_path = out_path.with_name(f".{out_path.name}.tmp.npz")
     np.savez(
         tmp_path,
@@ -390,6 +390,7 @@ def main() -> None:
 
     sample_stride = max(int(round(out_cfg.monthly_mean_sample_hours * 3600.0 / cfg.dt_host)), 1)
     csv_stride_steps = max(int(out_cfg.daily_csv_interval_days) * steps_per_day, 1)
+    preview_stride_steps = max(int(round(3600.0 / cfg.dt_host)), 1)
 
     import shutil
 
@@ -437,9 +438,11 @@ def main() -> None:
 
         day_accum = {"ts": 0.0, "olr": 0.0, "asr": 0.0, "p": 0.0, "gpp": 0.0, "lai": 0.0, "ice": 0.0}
         day_cnt = 0
-        day_t2_sum: torch.Tensor | None = None
-        day_precip_sum: torch.Tensor | None = None
-        day_olr_sum: torch.Tensor | None = None
+        hr_t2_sum: torch.Tensor | None = None
+        hr_precip_sum: torch.Tensor | None = None
+        hr_olr_sum: torch.Tensor | None = None
+        hr_cnt = 0
+        t_hr0 = time.perf_counter()
         m_idx = resume_m_idx if is_mid_resume else 0
         m_sums: dict[str, torch.Tensor] = resume_m_sums if is_mid_resume else {}
         m_cnt = resume_m_cnt if is_mid_resume else 0
@@ -463,7 +466,7 @@ def main() -> None:
             day_accum["ice"] += diag.seaice_area_million_km2
             day_cnt += 1
 
-            # Accumulate daily-mean 2D preview fields on device
+            # Accumulate 1-hour-mean 2D preview fields on device
             _, _, temp0_p = diagnose_pressure_temperature(
                 model.atmos.rho_d[0:1], model.atmos.theta_m[0:1], model.atmos.q_v[0:1]
             )
@@ -473,14 +476,34 @@ def main() -> None:
             snow_p = model.rad_cache.get("snow", torch.zeros_like(t2_inst))
             precip_inst = (rain_p + snow_p) * C.SECONDS_PER_DAY
             olr_inst = model.rad_cache.get("olr", 0.85 * C.STEFAN_BOLTZMANN * torch.clamp(t_sfc_p, min=150.0) ** 4)
-            if day_t2_sum is None:
-                day_t2_sum = t2_inst.clone()
-                day_precip_sum = precip_inst.clone()
-                day_olr_sum = olr_inst.clone()
+            if hr_t2_sum is None:
+                hr_t2_sum = t2_inst.clone()
+                hr_precip_sum = precip_inst.clone()
+                hr_olr_sum = olr_inst.clone()
             else:
-                day_t2_sum += t2_inst
-                day_precip_sum += precip_inst
-                day_olr_sum += olr_inst
+                hr_t2_sum += t2_inst
+                hr_precip_sum += precip_inst
+                hr_olr_sum += olr_inst
+            hr_cnt += 1
+
+            if step_in_yr % preview_stride_steps == 0 and hr_cnt > 0:
+                wall_hr = time.perf_counter() - t_hr0
+                t_hr0 = time.perf_counter()
+                _write_live_preview_atomic(
+                    model,
+                    out_root / "live_preview.npz",
+                    year,
+                    float(step_in_yr) / float(steps_per_day),
+                    model.sim_time_sec / C.SECONDS_PER_DAY,
+                    wall_hr * 24.0,
+                    t2_k_override=hr_t2_sum / float(hr_cnt),
+                    precip_mm_day_override=hr_precip_sum / float(hr_cnt),
+                    olr_override=hr_olr_sum / float(hr_cnt),
+                )
+                hr_t2_sum = None
+                hr_precip_sum = None
+                hr_olr_sum = None
+                hr_cnt = 0
 
             if out_cfg.monthly_mean_enabled and (
                 step_in_yr % sample_stride == 0
@@ -557,21 +580,7 @@ def main() -> None:
                     )
                 for k in day_accum:
                     day_accum[k] = 0.0
-                _write_live_preview_atomic(
-                    model,
-                    out_root / "live_preview.npz",
-                    year,
-                    day_num,
-                    diag.sim_time_days,
-                    wall_day,
-                    t2_k_override=(day_t2_sum * inv_d) if day_t2_sum is not None else None,
-                    precip_mm_day_override=(day_precip_sum * inv_d) if day_precip_sum is not None else None,
-                    olr_override=(day_olr_sum * inv_d) if day_olr_sum is not None else None,
-                )
                 day_cnt = 0
-                day_t2_sum = None
-                day_precip_sum = None
-                day_olr_sum = None
 
             if out_cfg.monthly_mean_enabled and m_idx + 1 < len(mean_bounds) and step_in_yr >= mean_bounds[m_idx + 1]:
                 if m_cnt > 0 and (
