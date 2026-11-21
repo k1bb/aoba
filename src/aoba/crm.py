@@ -674,6 +674,16 @@ def step_crm_rk3_hevi(
         rho0, u0, v0, w0, crm.theta_m, dx, dy, dz_c, dz_w_int
     )
 
+    # Dimension-aware Coriolis handling for embedded periodic CRMs (Khairoutdinov et al., 2005; Yamazaki & Miura, 2024):
+    # - 1D (1x1) & 2D (nx==1 or ny==1): disable CRM Coriolis (no cross-plane background PGF; host handles rotation).
+    # - 3D (nx>1 and ny>1): perturbation-only Coriolis on u' = u - u_mean so mean geostrophic flow is never distorted.
+    if nx > 1 and ny > 1 and crm.f_coriolis is not None:
+        f_col = crm.f_coriolis.view(1, -1, 1, 1)
+        u_pert = u0 - u0.mean(dim=(-2, -1), keepdim=True)
+        v_pert = v0 - v0.mean(dim=(-2, -1), keepdim=True)
+        du_sgs = du_sgs + f_col * v_pert
+        dv_sgs = dv_sgs - f_col * u_pert
+
     dt_ac_max = 0.45 * min(dx, dy) / 350.0 if (ny > 1 or nx > 1) else dt_dyn
     if can_use_crm_metal(rho0):
         rho_s, Thm_s, u_s, v_s, w_s, fx_final, fy_final, fz_final = run_crm_rk3_hevi_metal(
@@ -681,7 +691,7 @@ def step_crm_rk3_hevi(
             C.P_REF, C.R_D, C.GAMMA_D, C.GRAVITY, dx, dy,
             rho0, Thm0, u0, v0, w0, q_load,
             du_sgs, dv_sgs, dw_sgs, dThm_sgs,
-            dz_c, dz_w_int, sponge_c, sponge_w, crm.f_coriolis,
+            dz_c, dz_w_int, sponge_c, sponge_w, None,
         )
         crm.rho_d = rho_s
         crm.u = u_s
@@ -703,7 +713,7 @@ def step_crm_rk3_hevi(
     fz_final = torch.zeros_like(w0)
 
     gamma = C.GAMMA_D
-    f_cor = crm.f_coriolis.view(1, -1, 1, 1) if crm.f_coriolis is not None else None
+    f_cor = None  # Handled above via dimension-aware 1D/2D=0 or 3D perturbation-only Coriolis
 
     for stage_idx, dtau in enumerate(rk_taus):
         thm_s = Thm_s / torch.clamp(rho_s, min=1.0e-5)
