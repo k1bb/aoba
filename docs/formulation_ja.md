@@ -384,7 +384,11 @@ AOBA は PFT 分類・経験的パラメータ表を一切使わず、植物の�
    $$
    X_{\mathrm{sun}} = \frac{X}{\tilde{I}_c}\left[\tilde{I}_{b0}(1 - \tilde{\rho}_{cb})\tilde{k}_b'\frac{1 - e^{-(\tilde{k}_b' + k_{db})L_{\mathrm{exp}}}}{\tilde{k}_b' + k_{db}} + \tilde{I}_{d0}(1 - \rho_{cd})k_d'\frac{1 - e^{-(k_d' + k_{db})L_{\mathrm{exp}}}}{k_d' + k_{db}}\right], \qquad X_{\mathrm{sh}} = \max(10^{-6},\ X - X_{\mathrm{sun}}).
    $$
-   各サブステップで陽葉 $(I_{\mathrm{sun}}, X_{\mathrm{sun}}, T_{\mathrm{sun}}, D_{\mathrm{sun}})$ と陰葉 $(I_{\mathrm{sh}}, X_{\mathrm{sh}}, T_{\mathrm{sh}}, D_{\mathrm{sh}})$ ごとに光合成速度（C₃/C₄ の双曲線最小協調 $A_n = \min_{\theta_{\mathrm{col}}}(A_c, A_j) - R_d$ に根圏水分ストレス $\beta_w$ を乗じる）と気孔コンダクタンス $g_{sw,\mathrm{sun}}, g_{sw,\mathrm{sh}} = 1.6 A_n (R_{\mathrm{gas}} T_l / p_{\mathrm{sfc}}) / [c_a (1 - \chi)]\ [\mathrm{m\ s^{-1}}]$ を計算する。
+   各サブステップで陽葉 $(I_{\mathrm{sun}}, X_{\mathrm{sun}}, T_{\mathrm{sun}}, D_{\mathrm{sun}})$ と陰葉 $(I_{\mathrm{sh}}, X_{\mathrm{sh}}, T_{\mathrm{sh}}, D_{\mathrm{sh}})$ ごとに光合成速度（C₃/C₄ の双曲線最小協調 $A_n = \min_{\theta_{\mathrm{col}}}(A_c, A_j) - R_d$ に土壌水分ストレス係数 $\beta_{\mathrm{opt}}$ を乗じる）と気孔コンダクタンス $g_{sw,\mathrm{sun}}, g_{sw,\mathrm{sh}} = 1.6 A_n (R_{\mathrm{gas}} T_l / p_{\mathrm{sfc}}) / [c_a (1 - \chi)]\ [\mathrm{m\ s^{-1}}]$ を計算する。ここで $\beta_{\mathrm{opt}}$ は経験的な線形関数や PFT テーブルを用いず、Lu, Duursma, & Medlyn (2016) および Holtzman et al. (2024, Eqs. 2, 7 & Fig. 4) の時間積分最適気孔理論に基づき、生育期（$T > 0\ ^\circ\mathrm{C}$）の年最大連続無降水日数（$P < 0.5\ \mathrm{mm\ d^{-1}}$）の気候値 $D_{\max}$ から決まる節水タイムスケール $\tau$ を介して次式で算出する：
+   $$
+   \tau = 0.85\, D_{\max} + 6.59\ [\mathrm{days}], \qquad \beta_{\mathrm{opt}} = \mathrm{clip}\!\left(\sqrt{\frac{\max(W_{\mathrm{eff}} - 0.05\, S_R,\, 0)}{\max(\tau\, E_{\mathrm{pot,EMA}},\, 0.10\, S_R)}},\ 0,\ 1\right),
+   $$
+   ここで $W_{\mathrm{eff}} = f_{\mathrm{unfrozen}} W_{\mathrm{root}}$ は未凍結有効根圏水分、$E_{\mathrm{pot,EMA}}$ は15日移動平均ポテンシャル蒸発要求である。なお、日次予報 LAI の潜在光合成 $A_{0,\mathrm{day}}$ にはこの $\beta_{\mathrm{opt}}$ を重複乗算せず、長期水制限は $\mathrm{fAPAR}_w$ と $f_0(\mathrm{AI})$ のみで評価する。
 
 ### 7.3 二ストリーム樹冠アルベド・自律的 C₄ 比率 $F_4$・Lambert-$W_0$ 予報植生構造
 
@@ -454,7 +458,7 @@ $$
 \rho_{\mathrm{tot}, w}\frac{\partial w}{\partial t} &= -\frac{\partial p}{\partial z} - \rho_{\mathrm{tot}, w} g - \rho_{\mathrm{tot}, w} \gamma_R(z_w) w + \text{Adv}_w + D_w.
 \end{aligned}
 $$
-時間積分は Wicker & Skamarock (2002) の3段 RK3 法（部分時間刻み $\Delta\tau \in \{\Delta t/3, \Delta t/2, \Delta t\}$）で行い、遅い移流（水平運動量は3次風上 Wicker–Skamarock 差分化、鉛直は1次風上）・コリオリ力・ホスト大規模強制・SGS 粘性を外力傾向として保持しつつ、速い音波・重力波を複数音響サブステップで積分する。各音響サブステップでは Klemp, Skamarock, & Dudhia (2007) のオフセンタ HEVI 陰的結合パラメータ $\beta_{\mathrm{HEVI}} = 0.60$ を導入し、線型化状態方程式 $\delta p = (\gamma p / \Theta_m) \delta \Theta_m$ を鉛直方向へ連立消去して鉛直質量フラックス増分 $\delta F_z$ に関する狭義対角優位な $(N_z - 1) \times (N_z - 1)$ 三重対角 Helmholtz 系を全 CRM コラム一括で `solve_tridiagonal_batched` により求解し、3次元乾燥空気質量と $\Theta_m$ を計算機イプシロン精度で厳密保存する。
+時間積分は Wicker & Skamarock (2002) の3段 RK3 法（部分時間刻み $\Delta\tau \in \{\Delta t/3, \Delta t/2, \Delta t\}$）で行い、遅い移流（水平運動量は3次風上 Wicker–Skamarock 差分化、鉛直は1次風上）・ホスト大規模強制・SGS 粘性を外力傾向として保持しつつ、速い音波・重力波を複数音響サブステップで積分する。埋め込み周期境界 CRM 内のコリオリ力については、ホスト大規模気圧傾度力との二重評価を防ぐため次元に応じて自動切り替えを行い（Khairoutdinov et al., 2005; Yamazaki & Miura, 2024）、1D (`1×1`) および 2D (`nx==1` または `ny==1`) ではコリオリ項を無効（$f=0$）、3D (`nx>1` かつ `ny>1`) では背景平均風を差し引いた擾乱風 $\mathbf{u}' = \mathbf{u} - \overline{\mathbf{u}}$ にのみコリオリ力（$+f v',\, -f u'$）を作用させる。各音響サブステップでは Klemp, Skamarock, & Dudhia (2007) のオフセンタ HEVI 陰的結合パラメータ $\beta_{\mathrm{HEVI}} = 0.60$ を導入し、線型化状態方程式 $\delta p = (\gamma p / \Theta_m) \delta \Theta_m$ を鉛直方向へ連立消去して鉛直質量フラックス増分 $\delta F_z$ に関する狭義対角優位な $(N_z - 1) \times (N_z - 1)$ 三重対角 Helmholtz 系を全 CRM コラム一括で `solve_tridiagonal_batched` により求解し、3次元乾燥空気質量と $\Theta_m$ を計算機イプシロン精度で厳密保存する。
 
 ### 9.2 多次元正値保存 Zalesak 3D FCT スカラー移流
 
