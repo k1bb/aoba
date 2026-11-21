@@ -356,7 +356,7 @@ def test_mineral_dust_emission_transport_and_radiation(device: str) -> None:
     surf = torch.tensor([SURF_LAND, SURF_LAND, SURF_LAND, SURF_OCEAN], device=dev)
     lai = torch.tensor([0.0, 4.0, 0.0, 0.0], device=dev)
     swe = torch.tensor([0.0, 0.0, 10.0, 0.0], device=dev)
-    w_liq = torch.tensor([0.5, 0.5, 0.5, 0.5], device=dev)
+    w_liq = torch.tensor([0.03, 0.03, 0.03, 0.03], device=dev)  # Dry top-soil volumetric moisture [m^3 m^-3]
     u_star = torch.tensor([0.6, 0.6, 0.6, 0.6], device=dev)
 
     f_emit = compute_dust_emission_sub(surf, lai, swe, w_liq, u_star, c_dust_emiss=1.5e-9)
@@ -364,6 +364,9 @@ def test_mineral_dust_emission_transport_and_radiation(device: str) -> None:
     assert float(f_emit[1].item()) < float(f_emit[0].item()) * 0.2  # LAI suppresses emission
     assert float(f_emit[2].item()) == 0.0  # Snow suppresses emission
     assert float(f_emit[3].item()) == 0.0  # Ocean emits 0
+    # Moist top soil (volumetric moisture above the 0.20 inhibition threshold) must shut emission off
+    f_moist = compute_dust_emission_sub(surf, lai, swe, torch.full_like(w_liq, 0.35), u_star, c_dust_emiss=1.5e-9)
+    assert float(f_moist[0].item()) == 0.0
 
     nz = 16
     q_dust = torch.zeros((nz, 4), device=dev)
@@ -396,6 +399,60 @@ def test_mineral_dust_emission_transport_and_radiation(device: str) -> None:
     assert float(rad_dust.sfc_sw1_dif_dn.item()) > float(rad_clean.sfc_sw1_dif_dn.item())
 
 
+def test_clm5_canopy_hydrology_and_dsl_soil_resistance(device: str) -> None:
+    """Verify CLM5 liquid interception (tanh, p_liq = 0.1 L), canopy storage cap, and DSL bare-soil resistance."""
+    from aoba.surface import SURF_LAND, WC_MAX_PER_LAI, init_surface_state, step_surface
+
+    dev = torch.device(device)
+    n = 3
+
+    def _forcing(sfc, rain: float, qv: float, temp: float, sw: float):
+        ones = torch.ones(n, device=dev)
+        return dict(
+            sfc=sfc,
+            u_1=3.0 * ones,
+            v_1=0.0 * ones,
+            temp_1=temp * ones,
+            qv_1=qv * ones,
+            pres_1=0.99e5 * ones,
+            pres_sfc=1.0e5 * ones,
+            z_ref_rel=10.0 * ones,
+            sw1_dir_down=sw * ones,
+            sw1_dif_down=0.2 * sw * ones,
+            sw2_dir_down=sw * ones,
+            sw2_dif_down=0.2 * sw * ones,
+            lw_down=340.0 * ones,
+            precip_rain=rain * ones,
+            precip_snow=0.0 * ones,
+            mu0=0.8 * ones,
+            co2_ppmv=400.0,
+            dt=720.0,
+        )
+
+    # A. Interception: LAI = [0, 2, 5] under heavy rain in near-saturated air (negligible evaporation)
+    surf = torch.full((n,), SURF_LAND, device=dev)
+    sfc = init_surface_state(surf, t_init=290.0)
+    sfc.bio.lai = torch.tensor([0.0, 2.0, 5.0], device=dev)
+    step_surface(**_forcing(sfc, rain=1.0e-3, qv=0.0125, temp=290.0, sw=0.0))
+    wc = sfc.w_canopy
+    assert float(wc[0].item()) == 0.0  # No leaves, no interception
+    assert 0.0 < float(wc[1].item()) <= WC_MAX_PER_LAI * 2.0 + 1.0e-4
+    assert 0.0 < float(wc[2].item()) <= WC_MAX_PER_LAI * 5.0 + 1.0e-4
+    assert float(wc[2].item()) > float(wc[1].item())  # Denser canopy stores more water
+    assert not torch.isnan(wc).any()
+
+    # B. Dry-surface-layer: bare soil (LAI = 0) evaporates less when the top soil layer is drier
+    surf_b = torch.full((n,), SURF_LAND, device=dev)
+    sfc_b = init_surface_state(surf_b, t_init=300.0)
+    sfc_b.bio.lai = torch.zeros(n, device=dev)
+    sfc_b.w_liq_soil[0] = torch.tensor([0.34, 0.20, 0.04], device=dev)
+    diag = step_surface(**_forcing(sfc_b, rain=0.0, qv=0.004, temp=300.0, sw=300.0))
+    e = diag.evap
+    assert (e > 0.0).all()
+    assert float(e[0].item()) > float(e[1].item()) > float(e[2].item())  # wetter soil evaporates more
+    assert float(e[0].item()) > 3.0 * float(e[2].item())  # DSL strongly throttles very dry soil
+
+
 if __name__ == "__main__":
     for dev in _available_devices():
         print(f"Running Phase 2 & Phase 3 Global AOBA tests on device={dev}...")
@@ -406,4 +463,5 @@ if __name__ == "__main__":
         test_full_global_coupled_aoba_and_zarr_v3_io(dev)
         test_dynamic_sia_icesheet_and_vertical_remap(dev)
         test_mineral_dust_emission_transport_and_radiation(dev)
+        test_clm5_canopy_hydrology_and_dsl_soil_resistance(dev)
     print("ALL PHASE 2 & PHASE 3 GLOBAL AOBA TESTS PASSED!")

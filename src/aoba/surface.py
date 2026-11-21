@@ -23,6 +23,9 @@ with zero external PFT, soil-texture, or albedo lookup maps:
      SLM Eqs. 5-16, 24-28 & App. A Eqs. A8-A14), & MATSIRO6 (2021, Sec. 5.4 & Ch. 7):
      Partitioning of evapotranspiration into sunlit/shaded transpiration, wet-canopy
      interception evaporation/sublimation, and stability-corrected bare-soil evaporation.
+    - Lawrence et al. (2020, CLM5 Tech. Note, Eqs. 5.72-5.81, 5.109-5.113, 5.139, 7.2-7.23) &
+      Swenson & Lawrence (2014): liquid-only tanh canopy interception, (W_can/W_max)^(2/3) wetted
+      fraction, water-limited wet-canopy conductance, and dry-surface-layer soil resistance.
 3. Five-Layer Soil Heat Conduction & Freeze-Thaw Permafrost Phase Change:
    - Nishizawa, Tomita, & Team SCALE (2025, SCALE-RM v5.5.5, Sec. 8.7.1 Eqs. 8.384-8.418),
      MATSIRO6 (2021, Ch. 10 Eqs. 10.1-10.27), & Clapp & Hornberger (1978, WRR, 14, 601-604):
@@ -76,8 +79,17 @@ SOIL_POROSITY: float = 0.43        # Volumetric saturation porosity w_sat [m^3 m
 PSI_SAT_SOIL: float = -0.20        # Saturated matric head psi_s [m] (Clapp & Hornberger, 1978)
 B_CLAPP_SOIL: float = 5.39         # Clapp & Hornberger (1978) retention exponent b [-]
 
-# Canopy interception & snow constants (MATSIRO6 Ch. 7 & Ch. 8; Yang et al., 1997)
-WC_MAX_PER_LAI: float = 0.20       # Canopy interception capacity per unit LAI [kg m^-2] (MATSIRO6 Eq. 7.23)
+# Canopy hydrology (CLM5 Tech. Note Sec. 7.1, Eqs. 7.4, 7.12, 7.23; Dickinson et al., 1993)
+WC_MAX_PER_LAI: float = 0.10       # Maximum liquid canopy storage per unit LAI p_liq [kg m^-2] (CLM5 Eq. 7.12)
+ALPHA_INTERCEPT_LIQ: float = 1.0   # Fraction of a leaf collecting rain alpha_liq in f_pi = alpha tanh(L) (CLM5 Eq. 7.4)
+F_WET_MAX: float = 1.0             # Upper bound on wetted canopy fraction f_wet (CLM5 Eq. 7.23 caps at 1)
+
+# Dry-surface-layer (DSL) bare-soil evaporation resistance (Swenson & Lawrence, 2014; CLM5 Eqs. 5.72-5.81)
+DSL_DMAX_MM: float = 15.0          # Maximum DSL thickness D_max [mm] (CLM5 Eq. 5.77)
+DSL_THETA_INIT_FRAC: float = 0.8   # DSL initiation moisture theta_init as a fraction of porosity [-] (secondary-source value)
+PSI_AIR_MM: float = 1.0e7          # Air-dry matric potential Psi_air [mm] (CLM5 Eq. 5.78)
+
+# Snow & albedo constants (MATSIRO6 Ch. 8; Yang et al., 1997)
 RHO_SNOWPACK: float = 250.0        # Representative bulk snowpack density [kg m^-3]
 SWE_GLACIER_MAX: float = 1000.0    # Maximum SWE before glacier calving/runoff [kg m^-2] (MATSIRO6 Eq. 8.44)
 TAU_SNOW_AGE: float = 1.0e6        # Snow aging timescale tau_age [s] (Yang et al., 1997; MATSIRO6 Eq. 8.60)
@@ -546,19 +558,41 @@ def step_surface(
     )
     gs_canopy = two_leaf.gsw_sun + two_leaf.gsw_sh  # Canopy stomatal conductance [m s^-1]
 
-    # Wet-canopy fraction f_wet (Sellers et al., 1986; Lee & Khairoutdinov, 2015, Eq. 12)
+    # Wetted canopy fraction f_wet = [W_can / (p_liq L)]^(2/3) <= f_wet_max (CLM5 Eq. 7.23; Dickinson et al., 1993)
     wc_cap = WC_MAX_PER_LAI * lai_exp
     f_wet = torch.where(
         lai_exp >= 0.01,
-        torch.clamp(sfc.w_canopy / torch.clamp(wc_cap, min=1.0e-4), 0.0, 1.0),
+        torch.clamp(
+            torch.pow(torch.clamp(sfc.w_canopy, min=0.0) / torch.clamp(wc_cap, min=1.0e-4), 2.0 / 3.0),
+            0.0,
+            F_WET_MAX,
+        ),
         torch.zeros_like(lai_exp),
     )
 
-    # Bare-soil / under-canopy resistance r_soil + r_d (Sakaguchi & Zeng, 2009; MATSIRO6 Eqs. 5.34-5.35)
-    sat_top = torch.clamp(sfc.w_liq_soil[0] / SOIL_POROSITY, 0.01, 1.0)
-    r_soil = 800.0 * (1.0 - sat_top) / (0.20 + sat_top)  # MATSIRO6 Eq. (5.34) [s m^-1]
+    # Bare-soil evaporation resistance via the CLM5 dry-surface-layer scheme (Swenson & Lawrence, 2014)
+    # Surface wetness s_1 from liquid + ice (CLM5 Eq. 5.75) and Philip (1957) soil-air humidity factor (Eq. 5.73)
+    sat_top = torch.clamp((sfc.w_liq_soil[0] + sfc.w_ice_soil[0]) / SOIL_POROSITY, 0.01, 1.0)
     psi_top = PSI_SAT_SOIL * torch.pow(sat_top, -B_CLAPP_SOIL)  # Matric head [m]
-    h_soil = torch.exp(torch.clamp(psi_top * C.GRAVITY / (C.R_V * t_gnd), -10.0, 0.0))  # Kelvin Eq. (5.35)
+    h_soil = torch.exp(torch.clamp(psi_top * C.GRAVITY / (C.R_V * t_gnd), -10.0, 0.0))
+    # CLM5 Sec. 5.2: do not condense atmospheric vapor into very dry soil (q_soil = q_atm when q_soil < q_atm < q_sat)
+    h_soil = torch.where(
+        (qsat_skin_l > qv_1) & (qv_1 > h_soil * qsat_skin_l),
+        qv_1 / torch.clamp(qsat_skin_l, min=1.0e-8),
+        h_soil,
+    )
+
+    # Dry-surface-layer thickness D_SL, air-dry moisture theta_air, tortuosity tau, and vapor diffusivity D_v (Eqs. 5.77-5.81)
+    theta_liq_top = torch.clamp(sfc.w_liq_soil[0], min=0.0, max=SOIL_POROSITY)
+    theta_air = SOIL_POROSITY * (abs(PSI_SAT_SOIL) * 1.0e3 / PSI_AIR_MM) ** (1.0 / B_CLAPP_SOIL)
+    theta_init = DSL_THETA_INIT_FRAC * SOIL_POROSITY
+    d_sl = DSL_DMAX_MM * 1.0e-3 * torch.clamp(
+        (theta_init - theta_liq_top) / max(theta_init - theta_air, 1.0e-3), min=0.0, max=13.0
+    )
+    phi_air = max(SOIL_POROSITY - theta_air, 1.0e-3)
+    tau_soil = (phi_air ** 2) * (phi_air / SOIL_POROSITY) ** (3.0 / B_CLAPP_SOIL)
+    d_vap = 2.12e-5 * torch.pow(t_gnd / C.T_FREEZE, 1.75)
+    r_soil = d_sl / (d_vap * tau_soil)  # [s m^-1]
 
     # Under-canopy stability-corrected aerodynamic resistance r_d (Sakaguchi & Zeng, 2009; SLM Eqs. A10-A14)
     stab_uc = C.GRAVITY * h_exp * (sfc.t_canopy - t_gnd) / (t_gnd * (tr_land.u_star ** 2 + 1.0e-3))
@@ -568,10 +602,26 @@ def step_surface(
     r_d_uc = 1.0 / torch.clamp(c_uv * tr_land.u_star, min=1.0e-3)
 
     # Conductances for the 3 ET pathways [m s^-1]:
-    # 1. Stomatal transpiration: series of gb_leaf and gs_canopy on dry foliage (1 - f_wet)
-    g_trans = (1.0 - f_wet) * (gb_leaf * gs_canopy) / torch.clamp(gb_leaf + gs_canopy, min=1.0e-6)
-    # 2. Wet-canopy interception evaporation: boundary conductance gb_leaf on f_wet
-    g_inter = f_wet * gb_leaf
+    # CLM5 Eqs. 5.109-5.113: transpiration acts on the dry foliage fraction (1 - f_wet), while the wet-canopy term
+    # is limited by available canopy water, f_wet' = min(f_wet, W_can / (dt * E_pot)); dew (E_pot <= 0) wets the whole leaf.
+    qleaf_sat, _ = qsat_mixed(sfc.t_canopy, pres_sfc)
+    e_pot_wet = rho_sfc * gb_leaf * (qleaf_sat - qv_1)  # Potential flux of a fully wetted canopy [kg m^-2 s^-1]
+    dew_on_leaf = (e_pot_wet <= 0.0) & (lai_exp >= 0.01)
+    f_wet_eff = torch.where(
+        e_pot_wet > 1.0e-12,
+        torch.minimum(f_wet, torch.clamp(sfc.w_canopy, min=0.0) / (dt * torch.clamp(e_pot_wet, min=1.0e-12))),
+        f_wet,
+    )
+    f_wet_eff = torch.where(dew_on_leaf, torch.ones_like(f_wet_eff), f_wet_eff)
+
+    # 1. Stomatal transpiration: series of gb_leaf and gs_canopy on dry foliage (1 - f_wet); none while dew wets the leaf
+    g_trans = torch.where(
+        dew_on_leaf,
+        torch.zeros_like(f_wet),
+        (1.0 - f_wet) * (gb_leaf * gs_canopy) / torch.clamp(gb_leaf + gs_canopy, min=1.0e-6),
+    )
+    # 2. Wet-canopy interception evaporation: boundary conductance gb_leaf on the water-limited wet fraction
+    g_inter = f_wet_eff * gb_leaf
     # 3. Ground evaporation (snow-free soil + snow sublimation on A_sn)
     g_soil_snowfree = (1.0 - a_sn) / (r_d_uc + r_soil + 1.0 / torch.clamp(ga_land, min=1.0e-4))
     g_snow_subl = a_sn / (r_d_uc * f_veg_rad + 1.0 / torch.clamp(ga_land, min=1.0e-4))
@@ -628,8 +678,11 @@ def step_surface(
     evap_pos = torch.clamp(evap_raw_l, min=0.0)
     dew_neg = torch.clamp(evap_raw_l, max=0.0)
 
-    # Cap canopy interception loss by W_c / dt and transpiration by SPLASH supply S_w (Davis et al., 2017)
-    e_inter = torch.minimum(evap_pos * (g_inter / w_tot_g), torch.where(is_terrestrial, sfc.w_canopy / dt, evap_pos))
+    # Cap wet-canopy evaporation by W_can / dt and transpiration by SPLASH supply S_w (Davis et al., 2017);
+    # the latent-heat shortfall of the wet-canopy cap is returned as sensible heat (CLM5 Eq. 5.139)
+    e_inter_raw = evap_pos * (g_inter / w_tot_g)
+    e_inter = torch.minimum(e_inter_raw, torch.where(is_terrestrial, sfc.w_canopy / dt, evap_pos))
+    shf_l = shf_l + l_vap_land * (e_inter_raw - e_inter)
     sw_max_rate = (1.05 / 3600.0) * water_stress * (sfc.bio.s_root_cap / 150.0)  # Max supply ~1.05 mm/hr [kg m^-2 s^-1]
     e_trans = torch.minimum(
         torch.minimum(evap_pos * (g_trans / w_tot_g), sw_max_rate),
@@ -644,14 +697,14 @@ def step_surface(
     lw_up_l = EMISSIVITY_LAND * C.STEFAN_BOLTZMANN * (t_skin_final ** 4) + (1.0 - EMISSIVITY_LAND) * lw_down
     g_into_soil = sw_abs + lw_down - lw_up_l - shf_l - lhf_l - q_melt_avail
 
-    # Update canopy water W_c & throughfall/drip (MATSIRO6 Ch. 7 Eqs. 7.14-7.23; SLM Eqs. 24-28)
-    f_int = torch.clamp(1.0 - torch.exp(-0.5 * lai_exp), 0.0, 1.0)
-    p_tot = precip_rain + precip_snow
-    wc_mid = sfc.w_canopy + dt * (f_int * p_tot - e_inter - torch.where(f_veg_rad > 0.1, 0.5 * dew_neg, torch.zeros_like(dew_neg)))
+    # Canopy water balance: liquid interception f_pi = alpha_liq * tanh(L), throughfall, and drip (CLM5 Eqs. 7.2-7.10, 7.17)
+    # Snowfall is not stored in the canopy (no canopy-snow reservoir) and falls directly onto the snowpack.
+    f_int = torch.clamp(ALPHA_INTERCEPT_LIQ * torch.tanh(lai_exp), 0.0, 1.0)
+    wc_mid = sfc.w_canopy + dt * (f_int * precip_rain - e_inter - torch.where(f_veg_rad > 0.1, 0.5 * dew_neg, torch.zeros_like(dew_neg)))
     drip = torch.clamp(wc_mid - wc_cap, min=0.0) / dt
     wc_next = torch.clamp(wc_mid - drip * dt, min=0.0)
-    rain_thru = (1.0 - f_int) * precip_rain + drip * (precip_rain / torch.clamp(p_tot, min=1.0e-12))
-    snow_thru = (1.0 - f_int) * precip_snow + drip * (precip_snow / torch.clamp(p_tot, min=1.0e-12))
+    rain_thru = (1.0 - f_int) * precip_rain + drip
+    snow_thru = precip_snow
 
     # Update snowpack SWE, melt, snow aging, and glacier calving cap (MATSIRO6 Ch. 8)
     swe_mid = torch.clamp(sfc.swe_land + dt * (snow_thru - e_snow), min=0.0)

@@ -48,13 +48,15 @@ def compute_dust_emission_sub(
     u_star: torch.Tensor,
     c_dust_emiss: float = 1.5e-9,
     k_beer_lai: float = 0.5,
-    dz_soil_top: float = 0.05,
 ) -> torch.Tensor:
-    """Compute subcolumn mineral dust vertical emission flux `[kg m^-2 s^-1]` without source maps."""
+    """Compute subcolumn mineral dust vertical emission flux `[kg m^-2 s^-1]` without source maps.
+
+    `w_liq_soil_top` is the top-layer *volumetric* liquid soil moisture `[m^3 m^-3]`.
+    """
     is_land = (surf_type == SURF_LAND).to(u_star.dtype)
     f_bare = torch.exp(-k_beer_lai * torch.clamp(lai, min=0.0))
     snow_free = (swe_land < 1.0).to(u_star.dtype)
-    theta_top = torch.clamp(w_liq_soil_top / (1000.0 * dz_soil_top), min=0.0)
+    theta_top = torch.clamp(w_liq_soil_top, min=0.0)
     dry_fac = torch.clamp(1.0 - theta_top / THETA_MOIST_INHIB, min=0.0, max=1.0)
 
     u_safe = torch.clamp(u_star, min=U_STAR_THRESH_DUST)
