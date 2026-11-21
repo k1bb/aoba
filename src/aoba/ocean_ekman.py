@@ -155,24 +155,34 @@ def step_ekman_ocean_voronoi(
         ep_idx = mesh.trisk_edges
         w_trisk = mesh.trisk_weights
 
-        for _ in range(n_sw):
-            zeta_v = compute_scvt_vorticity(mesh, u_sw)
+        def _sw_rhs(u_cur: torch.Tensor, h_cur: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            zeta_v = compute_scvt_vorticity(mesh, u_cur)
             eta_v = zeta_v + mesh.f_vert
             eta_e = 0.5 * (eta_v[v0_e] + eta_v[v1_e])
             eta_pair = 0.5 * (eta_e.unsqueeze(-1) + eta_e[ep_idx])
-            cor_sw = (w_trisk * eta_pair * u_sw[ep_idx]).sum(dim=-1)
+            cor_sw = (w_trisk * eta_pair * u_cur[ep_idx]).sum(dim=-1)
 
-            h_e = torch.clamp(0.5 * (h_sw[c0] + h_sw[c1]), min=20.0)
-            pgf_sw = -G_PRIME_OCN * ((h_sw[c1] - h_sw[c0]) / mesh.dc_edge)
+            h_e = torch.clamp(0.5 * (h_cur[c0] + h_cur[c1]), min=20.0)
+            pgf_sw = -G_PRIME_OCN * ((h_cur[c1] - h_cur[c0]) / mesh.dc_edge)
             wind_acc = tau_n_e / (C.RHO_SEAWATER * h_e)
-            lap_u_sw, _ = compute_vector_laplacian_edge(mesh, u_sw)
+            lap_u_sw, _ = compute_vector_laplacian_edge(mesh, u_cur)
 
-            u_sw = (u_sw + dt_sw * (cor_sw + pgf_sw + wind_acc + a_h * lap_u_sw - R_SW_DRAG * u_sw)) * mask_edge
+            du = (cor_sw + pgf_sw + wind_acc + a_h * lap_u_sw - R_SW_DRAG * u_cur) * mask_edge
+            h_up = torch.where(u_cur >= 0.0, h_cur[c0], h_cur[c1])
+            dh = -compute_scvt_divergence(mesh, h_up * u_cur * mask_edge) * is_ocean_f
+            return du, dh
 
-            # Upwind layer thickness flux guarantees positive thickness & exact coastal volume conservation
-            h_up = torch.where(u_sw >= 0.0, h_sw[c0], h_sw[c1])
-            div_hu = compute_scvt_divergence(mesh, h_up * u_sw * mask_edge) * is_ocean_f
-            h_sw = torch.where(is_ocean, torch.clamp(h_sw - dt_sw * div_hu, min=20.0, max=800.0), torch.zeros_like(h_sw))
+        # Wicker & Skamarock (2002) 3-stage RK3 ensures strict stability for high-latitude inertial oscillations
+        for _ in range(n_sw):
+            u0_sw, h0_sw = u_sw, h_sw
+            for rk_dt in (dt_sw / 3.0, 0.5 * dt_sw, dt_sw):
+                du_k, dh_k = _sw_rhs(u_sw, h_sw)
+                u_sw = torch.clamp((u0_sw + rk_dt * du_k) * mask_edge, -5.0, 5.0)
+                h_sw = torch.where(
+                    is_ocean,
+                    torch.clamp(h0_sw + rk_dt * dh_k, min=20.0, max=800.0),
+                    torch.zeros_like(h0_sw),
+                )
 
         ocn.u_sw_edge = u_sw
         ocn.h_sw = h_sw
