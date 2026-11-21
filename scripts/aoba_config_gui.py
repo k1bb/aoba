@@ -939,8 +939,8 @@ _HTML_PAGE = r"""<!DOCTYPE html>
             <option value="cpu">CPU</option>
           </select>
           <label class="switch" style="font-size:12px;"><input type="checkbox" id="launch-no-resume" /> <span data-i18n="lbl_no_resume">最初から (--no-resume)</span></label>
-          <button class="primary" onclick="launchFromStudio()" data-i18n="btn_run_new">▶ この設定で新規実行</button>
-          <button class="danger" id="btn-stop-run" onclick="stopManagedRun()" style="display:none;" data-i18n="btn_stop">■ 起動ジョブを停止</button>
+          <button class="primary" id="btn-start-run" onclick="launchFromStudio()" data-i18n="btn_run_new">▶ この設定で新規実行</button>
+          <button class="danger" id="btn-stop-run" onclick="stopManagedRun()" style="display:none;" data-i18n="btn_stop">■ ジョブを停止</button>
         </div>
       </div>
 
@@ -1137,7 +1137,7 @@ const I18N = {
     mon_ctrl_sub: "MPS GPU 上で稼働中の計算（既存の外部ジョブやこの画面から起動した実験）を邪魔せず、CPU バックグラウンド処理でリアルタイムプレビューを生成します。",
     lbl_no_resume: "最初から (--no-resume)",
     btn_run_new: "▶ この設定で新規実行",
-    btn_stop: "■ 起動ジョブを停止",
+    btn_stop: "■ ジョブを停止",
     lbl_watch_dir: "監視対象の出力ディレクトリ (既存実験を選択)",
     lbl_watch_src: "表示ソース",
     opt_auto: "自動 (Live優先 / Zarr)",
@@ -1856,8 +1856,10 @@ async function fetchMonitorOnce() {
 
     // Active process badge
     const mg = data.managed_run || {}, aps = data.active_processes || [];
+    const btnStart = document.getElementById("btn-start-run");
     const btnStop = document.getElementById("btn-stop-run");
     const runBadge = document.getElementById("run-badge");
+    if (btnStart) btnStart.style.display = mg.running ? "none" : "inline-block";
     btnStop.style.display = mg.running ? "inline-block" : "none";
     if (mg.running) {
       document.getElementById("mon-proc").textContent = `GUI起動 PID ${mg.pid}`;
@@ -1920,9 +1922,9 @@ function makeColorLUT(stops) {
       if (t >= stops[k][0] && t <= stops[k+1][0]) { s0 = stops[k]; s1 = stops[k+1]; break; }
     }
     const f = (t - s0[0]) / Math.max(s1[0] - s0[0], 1e-6);
-    lut[i*3]   = Math.round(s0[1] + f * (s1[1] - s0[1]));
-    lut[i*3+1] = Math.round(s0[2] + f * (s1[2] - s0[2]));
-    lut[i*3+2] = Math.round(s0[3] + f * (s1[3] - s0[3]));
+    lut[i*3]   = Math.round(s0[1][0] + f * (s1[1][0] - s0[1][0]));
+    lut[i*3+1] = Math.round(s0[1][1] + f * (s1[1][1] - s0[1][1]));
+    lut[i*3+2] = Math.round(s0[1][2] + f * (s1[1][2] - s0[1][2]));
   }
   return lut;
 }
