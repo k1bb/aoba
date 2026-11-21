@@ -24,7 +24,11 @@ import torch
 
 from aoba import constants as C
 from aoba.calendar import AobaCalendar
-from aoba.biosphere import update_daily_acclimation_smith, update_daily_lai_root_height
+from aoba.biosphere import (
+    compute_optimal_soil_water_beta,
+    update_daily_acclimation_smith,
+    update_daily_lai_root_height,
+)
 from aoba.crm import CRMState, SPTendencies, step_crm_physics_and_dynamics
 from aoba.icesheet import (
     H_ICE_THRESHOLD_M,
@@ -1034,7 +1038,7 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
 
     steps_per_day = max(int(round(C.SECONDS_PER_DAY / dt)), 1)
     if clim_sub.day_steps >= steps_per_day:
-        ws_beta_sub = torch.clamp(sfc_sub.w_root / (0.5 * torch.clamp(sfc_sub.bio.s_root_cap, min=20.0)), 0.0, 1.0)
+        ws_beta_sub = compute_optimal_soil_water_beta(sfc_sub.w_root, sfc_sub.bio)
         update_daily_lai_root_height(
             bio=sfc_sub.bio,
             daily_precip_mm=clim_sub.day_precip_mm,

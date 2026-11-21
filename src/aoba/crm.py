@@ -32,7 +32,11 @@ import math
 import torch
 
 from aoba import constants as C
-from aoba.biosphere import update_daily_acclimation_smith, update_daily_lai_root_height
+from aoba.biosphere import (
+    compute_optimal_soil_water_beta,
+    update_daily_acclimation_smith,
+    update_daily_lai_root_height,
+)
 from aoba.kernels import (
     can_use_crm_metal,
     dispatch_crm_fct_advect_metal,
@@ -1237,7 +1241,7 @@ def step_coupled_crm_rce(
         precip_mm_day = (rain_next_in + snow_next_in) * C.SECONDS_PER_DAY
         pet_mm_day = torch.clamp((sw1_dir + sw1_dif + sw2_dir + sw2_dif) * C.SECONDS_PER_DAY / C.L_V0, min=0.1)
         ppfd_mol_day = (4.57 * sw1_dir + 4.24 * sw1_dif) * 1.0e-6 * C.SECONDS_PER_DAY
-        ws_beta = torch.clamp(sfc.w_root / (0.5 * torch.clamp(sfc.bio.s_root_cap, min=20.0)), 0.0, 1.0)
+        ws_beta = compute_optimal_soil_water_beta(sfc.w_root, sfc.bio)
         update_daily_lai_root_height(
             bio=sfc.bio,
             daily_precip_mm=precip_mm_day,

@@ -488,6 +488,10 @@ class BiosphereState:
     ema_ann_a0: torch.Tensor     # Running mean annual potential GPP A_0 [mol C m^-2 yr^-1]
     ema_gsl_frac: torch.Tensor   # Running fraction of year with T > 0 degC [-]
     cum_deficit: torch.Tensor    # Running seasonal water deficit tracker [kg m^-2]
+    dry_spell_days: torch.Tensor | None = None    # Consecutive growing-season dry days (< 0.5 mm/d) [days]
+    ann_max_dry_days: torch.Tensor | None = None  # Running annual maximum drydown duration [days]
+    ema_dmax_days: torch.Tensor | None = None     # Climatological growing-season D_max (Holtzman et al., 2024) [days]
+    ema_pet_day: torch.Tensor | None = None       # 15-day EMA daily potential ET [mm d^-1]
 
 
 def init_biosphere_state(
@@ -526,7 +530,35 @@ def init_biosphere_state(
         ema_ann_a0=_f(180.0),
         ema_gsl_frac=_f(0.65),
         cum_deficit=_f(0.0),
+        dry_spell_days=_f(0.0),
+        ann_max_dry_days=_f(15.0),
+        ema_dmax_days=_f(20.0),
+        ema_pet_day=_f(3.0),
     )
+
+
+def compute_optimal_soil_water_beta(
+    w_root: torch.Tensor,
+    bio: BiosphereState,
+    unfrozen_frac: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Non-empirical time-integrated stomatal soil-moisture stress `beta_opt` in `[0, 1]`.
+
+    Combines Holtzman et al. (2024, Eqs. 2, 7 & Fig. 4) and Lu, Duursma, & Medlyn (2016):
+        tau = 0.85 * D_max + 6.59  [days],
+        beta_opt = clip(sqrt(max(w_eff - w_c, 0) / max(tau * E_pot, 0.1 * S_R)), 0, 1).
+    """
+    s_cap = torch.clamp(bio.s_root_cap, min=20.0)
+    w_eff = w_root * unfrozen_frac if unfrozen_frac is not None else w_root
+    w_c = 0.05 * s_cap
+    dmax = bio.ema_dmax_days if bio.ema_dmax_days is not None else torch.full_like(w_root, 20.0)
+    tau_days = 0.85 * torch.clamp(dmax, min=1.0, max=200.0) + 6.59
+    pet_d = torch.clamp(
+        bio.ema_pet_day if bio.ema_pet_day is not None else torch.full_like(w_root, 3.0),
+        min=0.2,
+    )
+    w_demand = torch.maximum(tau_days * pet_d, 0.10 * s_cap)
+    return torch.clamp(torch.sqrt(torch.clamp(w_eff - w_c, min=0.0) / w_demand), 0.0, 1.0)
 
 
 def update_daily_acclimation_smith(
@@ -878,8 +910,8 @@ def update_daily_lai_root_height(
     daily_vpd_pa: torch.Tensor,
     pres_sfc: torch.Tensor,
     co2_ppmv: float,
-    water_stress_beta: torch.Tensor,
-    is_vegetated_land: torch.Tensor,
+    water_stress_beta: torch.Tensor | None = None,
+    is_vegetated_land: torch.Tensor | None = None,
 ) -> None:
     """Update prognostic EEO LAI, root-zone storage `S_R`, and canopy height `h_c` once per day.
 
@@ -894,7 +926,7 @@ def update_daily_lai_root_height(
     - Kempes et al. (2011, PLoS ONE, 6, e20551, Eqs. 2-5):
       Allometric vascular balance between available water flow `Q_p` and evaporative/metabolic scaling.
     """
-    veg = is_vegetated_land
+    veg = is_vegetated_land if is_vegetated_land is not None else torch.ones_like(daily_temp_k, dtype=torch.bool)
     alpha_yr = 1.0 / 365.2425  # 1-year e-folding memory for annual hydroclimatic totals
 
     # 1. Potential daily GPP A_0 [mol C m^-2 d^-1] if fAPAR = 1 (Smith et al., 2019; Zhou et al., 2025, Eq. 1)
@@ -913,9 +945,31 @@ def update_daily_lai_root_height(
     _, omega_star3 = smith_omega(m_c3)
 
     lue_c3 = phi_psii_temperature(daily_temp_k) * m_c3 * omega_star3 / (8.0 * THETA_NRH)
-    # Apply thermal growing-season gate below 0 degC and root-zone water supply constraint
+    # Potential daily GPP A_0 (water limitation is handled analytically via fAPAR_w & f_0(AI))
     cold_gate = torch.sigmoid(0.5 * (daily_temp_k - C.T_FREEZE))
-    a0_day = lue_c3 * torch.clamp(daily_ppfd_mol_m2, min=0.0) * cold_gate * torch.clamp(water_stress_beta, 0.05, 1.0)
+    a0_day = lue_c3 * torch.clamp(daily_ppfd_mol_m2, min=0.0) * cold_gate
+
+    # Update growing-season drydown length D_max & daily PET for Holtzman et al. (2024) tau
+    is_dry = (daily_precip_mm < 0.5) & (daily_temp_k > C.T_FREEZE)
+    dry_cur = bio.dry_spell_days if bio.dry_spell_days is not None else torch.zeros_like(daily_precip_mm)
+    ann_max = bio.ann_max_dry_days if bio.ann_max_dry_days is not None else torch.full_like(daily_precip_mm, 15.0)
+    ema_dmax = bio.ema_dmax_days if bio.ema_dmax_days is not None else torch.full_like(daily_precip_mm, 20.0)
+    ema_pet = bio.ema_pet_day if bio.ema_pet_day is not None else torch.full_like(daily_precip_mm, 3.0)
+
+    dry_next = torch.where(is_dry, dry_cur + 1.0, torch.zeros_like(dry_cur))
+    ann_max_next = torch.maximum(ann_max * (1.0 - alpha_yr), dry_next)
+    bio.dry_spell_days = torch.where(veg, dry_next, torch.zeros_like(dry_next))
+    bio.ann_max_dry_days = torch.where(veg, ann_max_next, torch.zeros_like(ann_max_next))
+    bio.ema_dmax_days = torch.where(
+        veg,
+        (1.0 - alpha_yr) * ema_dmax + alpha_yr * torch.clamp(ann_max_next, min=1.0, max=200.0),
+        torch.full_like(ema_dmax, 20.0),
+    )
+    bio.ema_pet_day = torch.where(
+        veg,
+        (1.0 - ALPHA_EMA_ACCLIM) * ema_pet + ALPHA_EMA_ACCLIM * torch.clamp(daily_pet_mm, min=0.1, max=20.0),
+        torch.full_like(ema_pet, 3.0),
+    )
 
     # Update annual running accumulators
     bio.ema_ann_precip = (1.0 - alpha_yr) * bio.ema_ann_precip + alpha_yr * (daily_precip_mm * 365.2425)

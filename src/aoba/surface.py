@@ -47,6 +47,7 @@ from aoba import constants as C
 from aoba.biosphere import (
     BiosphereState,
     canopy_two_stream_albedo_dai,
+    compute_optimal_soil_water_beta,
     compute_two_leaf_gas_exchange,
     init_biosphere_state,
 )
@@ -525,9 +526,7 @@ def step_surface(
     unfrozen_frac = sfc.w_liq_soil[1:4].sum(dim=0) / torch.clamp(
         (sfc.w_liq_soil[1:4] + sfc.w_ice_soil[1:4]).sum(dim=0), min=1.0e-4
     )
-    beta_soil = torch.clamp((sfc.w_root / torch.clamp(sfc.bio.s_root_cap, min=20.0)) * unfrozen_frac, 0.0, 1.0)
-    # Smooth beta response (full supply above 50% root capacity)
-    water_stress = torch.clamp(beta_soil / 0.50, 0.0, 1.0)
+    water_stress = compute_optimal_soil_water_beta(sfc.w_root, sfc.bio, unfrozen_frac=unfrozen_frac)
 
     # Sunlit/shaded leaf temperatures: sunlit leaves are slightly warmer under strong direct beam (Dai et al., 2004)
     gb_leaf = torch.clamp(0.01 * torch.sqrt(tr_land.u_star / 0.04) * torch.clamp(lai_exp, min=0.1), min=1.0e-3)
