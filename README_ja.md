@@ -42,20 +42,24 @@ aoba/
 ## クイックスタート
 
 ```bash
+# （任意）editable インストール（不要でも全テスト・スクリプトは自動パス解決されます）
+pip install --no-build-isolation --no-deps -e .
+
 # 全検証テストスイートの実行（CPU および Apple Silicon MPS GPU 両対応）
-PYTHONPATH=src python tests/test_phase1_foundation.py
-PYTHONPATH=src python tests/test_phase1_physics_biosphere.py
-PYTHONPATH=src python tests/test_phase1_crm_rce.py
-PYTHONPATH=src python tests/test_phase2_phase3_global.py
+python tests/test_phase1_foundation.py
+python tests/test_phase1_physics_biosphere.py
+python tests/test_phase1_crm_rce.py
+python tests/test_phase2_phase3_global.py
+python tests/test_params_and_gui.py
 
 # 3D RCE・Held-Suarez・全球 1:1 超パラメータ化 AOBA の実行（CF/UGRID Zarr v3 出力）
-PYTHONPATH=src python scripts/run_rce.py --surface land --days 2.0
-PYTHONPATH=src python scripts/run_held_suarez.py --glevel 3 --days 5.0
-PYTHONPATH=src python scripts/run_global_aoba.py --glevel 3 --co2-ppmv 400 --days 5.0
+python scripts/run_rce.py --surface land --days 2.0
+python scripts/run_held_suarez.py --glevel 3 --days 5.0
+python scripts/run_global_aoba.py --glevel 3 --co2-ppmv 400 --days 5.0
 
-# 統合 TOML 設定・GUI コンフィギュレータの起動とマルチ年実行
-PYTHONPATH=src python scripts/aoba_config_gui.py --toml config/aoba_default.toml
-PYTHONPATH=src python -u scripts/run_g5_30yr.py --config config/aoba_default.toml
+# 統合 TOML 設定・GUI コンフィギュレータ (AOBA Studio) の起動とマルチ年実行
+python scripts/aoba_config_gui.py --toml config/aoba_default.toml
+python -u scripts/run_g5_30yr.py --config config/aoba_default.toml
 ```
 
 ## 出力ファイルとローカルディレクトリの保護方針

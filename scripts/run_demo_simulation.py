@@ -29,8 +29,15 @@ from __future__ import annotations
 
 import argparse
 import math
+from pathlib import Path
 import shutil
+import sys
 import time
+
+_SRC_DIR = str(Path(__file__).resolve().parents[1] / "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
 import torch
 
 from aoba import constants as C
