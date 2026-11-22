@@ -320,6 +320,8 @@ def main() -> None:
     parser.add_argument("--years", type=int, default=None)
     parser.add_argument("--days-per-year", type=float, default=None)
     parser.add_argument("--co2-ppmv", type=float, default=None)
+    parser.add_argument("--co2-mode", type=str, default=None, help="constant, scenario, or csv")
+    parser.add_argument("--co2-scenario", type=str, default=None, help="CO2 scenario key (e.g. obs_historical_noaa, cmip6_ssp245)")
     parser.add_argument("--out-dir", type=str, default="")
     parser.add_argument("--device", type=str, default="")
     parser.add_argument("--no-resume", action="store_true")
@@ -341,6 +343,12 @@ def main() -> None:
         cfg.glevel = args.glevel
     if args.co2_ppmv is not None:
         cfg.co2_ppmv = args.co2_ppmv
+        if args.co2_mode is None:
+            cfg.co2_mode = "constant"
+    if args.co2_mode is not None:
+        cfg.co2_mode = args.co2_mode
+    if args.co2_scenario is not None:
+        cfg.co2_scenario = args.co2_scenario
     if args.dynamic_icesheet is not None:
         cfg.enable_dynamic_icesheet = bool(args.dynamic_icesheet)
     if args.icesheet_ema_years is not None:
@@ -374,7 +382,7 @@ def main() -> None:
 
     print(
         f"Initializing AOBA Glevel-{cfg.glevel} ({cfg.crm_nx}x{cfg.crm_ny}, dx={cfg.crm_dx:.0f} m, "
-        f"nz={cfg.nz}, dt={cfg.dt_host:.0f} s) on {dev} "
+        f"nz={cfg.nz}, dt={cfg.dt_host:.0f} s, CO2={cfg.co2_mode}:{cfg.co2_scenario if cfg.co2_mode == 'scenario' else cfg.co2_ppmv}) on {dev} "
         f"[{hw.chip_name}, {hw.gpu_cores} GPUc, {hw.perf_cores} P-cores, {hw.total_ram_gb:.0f}GB RAM | "
         f"chunks crm={cfg.crm_col_chunk} rad={cfg.rad_col_chunk}]...",
         flush=True,

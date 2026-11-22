@@ -41,6 +41,7 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 from aoba.calendar import AobaCalendar  # noqa: E402
+from aoba.co2_forcing import fetch_latest_co2_sources, get_co2_catalog_summary  # noqa: E402
 from aoba.params import (  # noqa: E402
     SECTION_META,
     build_configs_from_dict,
@@ -917,6 +918,17 @@ _HTML_PAGE = r"""<!DOCTYPE html>
       </div>
       <div>
         <div class="card">
+          <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:space-between; margin-bottom:8px;">
+            <h2 style="margin:0;">大気 CO₂ 強制シナリオ ＆ 外部ソース更新</h2>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+              <button class="btn-secondary" style="padding:5px 10px; font-size:12px;" onclick="fetchLatestCO2(false)">🌐 NOAA最新取得</button>
+              <button class="btn-secondary" style="padding:5px 10px; font-size:12px;" onclick="fetchLatestCO2(true)">🔄 全ソース再同期</button>
+            </div>
+          </div>
+          <div id="co2-status-lbl" class="sub" style="margin-bottom:8px;">Loading CO2 catalog...</div>
+          <canvas id="co2Canvas" width="600" height="180"></canvas>
+        </div>
+        <div class="card">
           <h2 data-i18n="ice_title">平衡/加速 SIA 氷床モデル設定 (Dynamic Ice Sheet)</h2>
           <div id="icesheet-fields"></div>
         </div>
@@ -1320,7 +1332,10 @@ const PARAM_DOCS = {
   crm_ny: { ja: "各ホストセル内 CRM の y方向格子数 (1=2.5Dカーテン)", en: "Embedded CRM y-grid points (1 = 2.5D curtain)" },
   crm_dx: { ja: "CRM の水平格子間隔 [m]", en: "CRM horizontal grid spacing [m]" },
   dt_host: { ja: "ホスト大気・結合ステップの時間刻み [s]", en: "Host coupling time step [s]" },
-  co2_ppmv: { ja: "大気 CO₂ 濃度 [ppmv]", en: "Atmospheric CO2 concentration [ppmv]" },
+  co2_ppmv: { ja: "大気 CO₂ 濃度 [ppmv] (co2_mode='constant' 時)", en: "Atmospheric CO2 concentration [ppmv] (used when co2_mode='constant')" },
+  co2_mode: { ja: "CO₂ 強制モード (constant: 固定値 / scenario: CMIP・観測・古気候 / csv: 独自CSV)", en: "CO2 forcing mode (constant / scenario / csv)" },
+  co2_scenario: { ja: "CO₂ シナリオ名 (NOAA観測 / CMIP5 RCP / CMIP6 SSP / 80万年氷床コア)", en: "CO2 scenario key (NOAA Obs / CMIP5 RCP / CMIP6 SSP / 800ka Ice Core)" },
+  co2_csv_path: { ja: "独自 CO₂ 時系列 CSV パス (year, co2_ppmv 列; co2_mode='csv' 時)", en: "Custom (year, co2_ppmv) CSV path when co2_mode='csv'" },
   start_date: { ja: "シミュレーション開始年月日 (YYYY-MM-DD)", en: "Simulation start date (YYYY-MM-DD)" },
   end_date: { ja: "終了年月日 (YYYY-MM-DD、空欄なら years を使用)", en: "Optional end date (YYYY-MM-DD; blank uses years)" },
   calendar_type: { ja: "暦の種類 (gregorian: 閏年あり / noleap: 365日 / 360_day)", en: "Calendar type (gregorian / noleap / 360_day)" },
@@ -1373,6 +1388,104 @@ function showToast(msg) {
   window._toastTimer = setTimeout(() => { t.style.display = "none"; }, 2800);
 }
 
+let CO2_CATALOG = { active_source: "bundled", scenarios: [], status: {} };
+
+async function fetchCO2Catalog() {
+  try {
+    const res = await fetch("/api/co2_catalog");
+    CO2_CATALOG = await res.json();
+    updateCO2StatusLabel();
+    renderSectionContainer("forcing", "forcing-fields");
+    drawCO2Canvas();
+  } catch (e) { console.warn("CO2 catalog load failed:", e); }
+}
+
+async function fetchLatestCO2(fullSync) {
+  const lbl = document.getElementById("co2-status-lbl");
+  if (lbl) lbl.textContent = fullSync ? "Fetching RCMIP (CMIP5/6) + NCEI Paleo + NOAA GML..." : "Fetching latest NOAA GML observations...";
+  try {
+    const res = await fetch("/api/co2_fetch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ include_rcmip: Boolean(fullSync), include_paleo: Boolean(fullSync) }),
+    });
+    const data = await res.json();
+    if (data.ok && data.catalog) {
+      CO2_CATALOG = data.catalog;
+      updateCO2StatusLabel();
+      renderSectionContainer("forcing", "forcing-fields");
+      drawCO2Canvas();
+      const gl = data.status?.sources?.noaa_gml_global;
+      showToast(gl ? `最新CO₂更新完了: NOAA ${gl.latest_year}年 = ${gl.latest_ppmv} ppmv` : "CO₂データを更新しました");
+    } else {
+      showToast("CO₂取得エラー: " + (data.error || "unknown"));
+    }
+  } catch (e) {
+    showToast("CO₂取得に失敗しました: " + e);
+  }
+}
+
+function updateCO2StatusLabel() {
+  const lbl = document.getElementById("co2-status-lbl");
+  if (!lbl) return;
+  const src = CO2_CATALOG.active_source === "local_cache" ? "ローカル最新キャッシュ (data/forcing/co2)" : "同梱ベースライン (src/aoba/assets)";
+  const gl = CO2_CATALOG.status?.sources?.noaa_gml_global;
+  const obsTxt = gl ? ` | NOAA最新: ${gl.latest_year}年 = ${gl.latest_ppmv} ppmv` : "";
+  lbl.textContent = `ソース: ${src} (${(CO2_CATALOG.scenarios||[]).length} シナリオ)${obsTxt}`;
+}
+
+function drawCO2Canvas() {
+  const cv = document.getElementById("co2Canvas");
+  if (!cv) return;
+  const ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#080f1c";
+  ctx.fillRect(0, 0, W, H);
+  const f = STATE.config?.forcing || {};
+  const mode = f.co2_mode || "constant";
+  const padL = 48, padR = 16, padT = 18, padB = 28;
+  const pw = W - padL - padR, ph = H - padT - padB;
+  if (mode === "constant") {
+    const val = Number(f.co2_ppmv || 400);
+    ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(padL, padT + ph * 0.5); ctx.lineTo(W - padR, padT + ph * 0.5); ctx.stroke();
+    ctx.fillStyle = "#e2e8f0"; ctx.font = "13px system-ui";
+    ctx.fillText(`Constant Mode: ${val.toFixed(1)} ppmv`, padL + 12, padT + ph * 0.5 - 10);
+    return;
+  }
+  const scn = (CO2_CATALOG.scenarios || []).find(s => s.key === f.co2_scenario);
+  if (!scn || !scn.preview_years || scn.preview_years.length < 2) {
+    ctx.fillStyle = "#94a3b8"; ctx.font = "12px system-ui";
+    ctx.fillText(`Scenario: ${f.co2_scenario || "-"} (no preview data)`, padL, padT + 20);
+    return;
+  }
+  const xs = scn.preview_years, ys = scn.preview_ppmv;
+  const xMin = xs[0], xMax = xs[xs.length - 1];
+  const yMin = Math.min(...ys) * 0.92, yMax = Math.max(...ys) * 1.05;
+  ctx.strokeStyle = "#1e293b"; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const yy = padT + (ph * i) / 4;
+    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(W - padR, yy); ctx.stroke();
+    const v = yMax - ((yMax - yMin) * i) / 4;
+    ctx.fillStyle = "#94a3b8"; ctx.font = "10px monospace";
+    ctx.fillText(v.toFixed(0), 6, yy + 3);
+  }
+  ctx.strokeStyle = "#34d399"; ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i < xs.length; i++) {
+    const px = padL + ((xs[i] - xMin) / Math.max(xMax - xMin, 1)) * pw;
+    const py = padT + (1 - (ys[i] - yMin) / Math.max(yMax - yMin, 1)) * ph;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+  ctx.fillStyle = "#cbd5e1"; ctx.font = "11px system-ui";
+  ctx.fillText(`${scn.key} (${xMin.toFixed(0)}..${xMax.toFixed(0)})`, padL + 6, padT + 12);
+  ctx.fillStyle = "#94a3b8"; ctx.font = "10px monospace";
+  ctx.fillText(xMin.toFixed(0), padL, H - 8);
+  ctx.fillText(xMax.toFixed(0), W - padR - 36, H - 8);
+}
+
 async function fetchInitial() {
   const res = await fetch("/api/state");
   STATE = await res.json();
@@ -1385,6 +1498,7 @@ async function fetchInitial() {
     if (el) el.textContent = `${h.chip_name} · ${gpuTxt} · ${h.total_ram_gb} GB · ${h.perf_cores} P-cores`;
   }
   renderAll();
+  fetchCO2Catalog();
   const urlTab = new URLSearchParams(window.location.search).get("tab") || window.location.hash.replace(/^#/, "");
   if (urlTab && document.getElementById("tab-" + urlTab)) {
     const tabBtn = document.querySelector(`.tab-btn[onclick*="'${urlTab}'"]`);
@@ -1415,7 +1529,7 @@ function switchTab(id, btn) {
   document.getElementById("tab-" + id).classList.add("active");
   if (btn) btn.classList.add("active");
   if (id === "grid") drawGridCanvas();
-  if (id === "forcing") drawIceCanvas();
+  if (id === "forcing") { drawIceCanvas(); drawCO2Canvas(); }
   if (id === "toml") refreshTomlPreview();
   if (id === "output") updateOutputEstimates();
   if (id === "monitor") fetchMonitorOnce();
@@ -1468,6 +1582,20 @@ function buildFieldRow(sec, key, skipKeys = []) {
       <option value="noleap" ${cur==="noleap"?"selected":""}>noleap (365日固定・閏年なし)</option>
       <option value="360_day" ${cur==="360_day"?"selected":""}>360_day (360日理想暦・毎月30日)</option>
     </select>`;
+  } else if (key === "co2_mode") {
+    ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
+      <option value="constant" ${cur==="constant"?"selected":""}>constant (固定数値 ppmv)</option>
+      <option value="scenario" ${cur==="scenario"?"selected":""}>scenario (CMIP・NOAA観測・古気候)</option>
+      <option value="csv" ${cur==="csv"?"selected":""}>csv (独自 CSV ファイル)</option>
+    </select>`;
+  } else if (key === "co2_scenario") {
+    const scns = CO2_CATALOG.scenarios || [];
+    if (scns.length > 0) {
+      const opts = scns.map(s => `<option value="${s.key}" ${cur===s.key?"selected":""}>[${s.group}] ${LANG==="ja"?s.label_ja:s.label_en}</option>`).join("");
+      ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">${opts}</select>`;
+    } else {
+      ctrl = `<input type="text" value="${String(cur).replace(/"/g,'&quot;')}" onchange="setKey('${sec}','${key}',this.value)" />`;
+    }
   } else if (key === "insolation_mode") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
       <option value="seasonal" ${cur==="seasonal"?"selected":""}>seasonal (通常の季節変化)</option>
@@ -1515,6 +1643,7 @@ function updateBadgesAndDiagrams() {
   document.getElementById("inp-grid-glevel").value = g;
   drawGridCanvas();
   drawIceCanvas();
+  drawCO2Canvas();
   updateOutputEstimates();
   updateRunCmd();
 }
@@ -1527,6 +1656,7 @@ function applyGridPreset(g, nx, ny, dx, nz, dt) {
 
 function applyForcingPreset(kind) {
   const f = STATE.config.forcing, ic = STATE.config.icesheet;
+  f.co2_mode = "constant";
   if (kind === "present") { f.co2_ppmv = 400.0; f.omega = 7.292115e-5; f.obliquity_deg = 23.44; ic.enable_dynamic_icesheet = false; }
   else if (kind === "half_omega") { f.co2_ppmv = 400.0; f.omega = 7.292115e-5 * 0.5; }
   else if (kind === "slow_rot") { f.co2_ppmv = 400.0; f.omega = 7.292115e-5 * 0.25; }
@@ -2839,6 +2969,10 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
             self._send_json(rm.build_monitor_payload(out_dir, source=source, frame_req=frame))
             return
 
+        if parsed.path == "/api/co2_catalog":
+            self._send_json(get_co2_catalog_summary(prefer_cache=True))
+            return
+
         if parsed.path == "/api/scvt_mesh":
             qs = parse_qs(parsed.query)
             try:
@@ -2960,6 +3094,16 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
             cfg = default_config_dict()
             self.server.current_config = cfg  # type: ignore[attr-defined]
             self._send_json({"ok": True, "config": cfg, "toml_text": dump_aoba_toml(cfg)})
+            return
+
+        if parsed.path == "/api/co2_fetch":
+            try:
+                inc_rcmip = bool(payload.get("include_rcmip", False))
+                inc_paleo = bool(payload.get("include_paleo", False))
+                st = fetch_latest_co2_sources(include_rcmip=inc_rcmip, include_paleo=inc_paleo, write_bundled=False)
+                self._send_json({"ok": True, "status": st, "catalog": get_co2_catalog_summary(prefer_cache=True)})
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         if parsed.path == "/api/run/start":

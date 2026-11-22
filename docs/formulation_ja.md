@@ -570,14 +570,14 @@ $$
 
 ## 12. 単一 TOML 設定管理・出力仕様・GUI コンフィギュレータ・全パラメータ一覧
 
-### 12.1 一元テキスト管理アーキテクチャと実行・GUI ツール (`src/aoba/params.py`, `scripts/aoba_config_gui.py`)
+### 12.1 一元テキスト管理アーキテクチャと実行・GUI ツール (`src/aoba/params.py`, `src/aoba/co2_forcing.py`, `scripts/aoba_config_gui.py`)
 
-モデルの再現性と透明性を保証するため、すべての格子設定・強制外力・動的氷床設定・出力ストリーム・物理定数（**13セクション・全216項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。
+モデルの再現性と透明性を保証するため、すべての格子設定・強制外力・動的氷床設定・出力ストリーム・物理定数（**13セクション・全219項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。大気 $\mathrm{CO_2}$ 濃度は `co2_mode` により **固定値 (`constant`)・シナリオ補間 (`scenario`)・独自 CSV (`csv`)** の3通りを選択でき、`scenario` 時はモデルの連続暦年（負の BCE 年を含む）に応じて同梱テーブル `src/aoba/assets/co2_scenarios.csv`（CMIP5 RCP・CMIP6 historical/SSP・南極氷床コア80万年復元・NOAA GML 接続）または `scripts/fetch_co2_data.py`／AOBA Studio から随時更新した最新キャッシュ `data/forcing/co2/co2_latest.csv` を線形補間する。
 - **ランタイム同期・ハードウェア自動チューニング (`src/aoba/params.py`, `src/aoba/runtime.py`)**: `load_aoba_toml()` で読み込んだ設定辞書に対し `build_configs_from_dict(cfg_dict, apply_modules=True)` を呼ぶと、`(AOBAConfig, OutputConfig)` インスタンスを生成すると同時に、`_MODULE_PARAM_MAP` に登録された `src/aoba/*` モジュールの全定数をライブ更新し、各モジュールの `recompute_derived_constants()`（`microphysics`, `turbulence`, `ocean_ekman`, `icesheet` 内の Metal 定数配列や導出係数を含む）を再計算する。さらに `detect_hardware_profile()` / `compute_optimal_chunks()` / `apply_runtime_tuning()` により実行マシンの GPU コア数・利用可能メモリ・P-core 数を自動検出し、メモリ予算 $B = 0.45\, M_{\mathrm{dev}}$ の範囲内で解像度を変えずに最速 1 パス／安全分割となる `crm_col_chunk`・`rad_col_chunk` と CPU スレッド数を自動適用する。
 - **Web GUI 統合ワークベンチ (`scripts/aoba_config_gui.py` / AOBA Studio)**: 標準ライブラリ（`http.server`）のみで動作するゼロ依存ローカル Web アプリ（`python scripts/aoba_config_gui.py --port 8765`）を備え、モデル設定から実行起動、プロセス監視、CPU リアルタイム可視化まで一気通貫で提供する：
   1. `glevel`（0〜6）の変更に連動してリアルタイム描画される**正二十面体 SCVT Voronoi 球面メッシュ可視化図 ＋ 1ホストセル対埋め込み CRM 領域スケール比較図 ＋ ストレッチ鉛直層・スポンジ層図**。
-  2. 自転半減実験 (`0.5×Ω`)・LGM・`4×CO₂` プリセット、**カレンダー／固定日射設定**、および**氷床加速率 $\alpha_{\mathrm{eff}}(t)$／EMA 重み減衰曲線**プレビュー。
-  3. 出力ファイル種別・間隔設定、予想年間 Zarr/リスタート容量試算、および216パラメータ横断検索・TOML 保存。
+  2. 自転半減実験 (`0.5×Ω`)・LGM・`4×CO₂` プリセット、**CO₂ シナリオ選択・推移グラフ・NOAA/NCEI/RCMIP 最新データ取得ボタン**、**カレンダー／固定日射設定**、および**氷床加速率 $\alpha_{\mathrm{eff}}(t)$／EMA 重み減衰曲線**プレビュー。
+  3. 出力ファイル種別・間隔設定、予想年間 Zarr/リスタート容量試算、および219パラメータ横断検索・TOML 保存。
   4. **実行コントロール・ライブ監視・CPU リアルタイム日平均 3地球プレビュー**: GUI 上からの計算実行・停止、稼働中外部ジョブ（`run.log` / `daily_global.csv` / カレンダー日付 `YYYY-MM-DD`）の監視に加え、GPU 計算を一切阻害しない待機 CPU 上の `cKDTree` 球面再格子化エンジンにより、**日平均 `T2`（地表付近気温 $0.35 T_{\mathrm{sfc}} + 0.65 T_{a,z_1}$）・日平均降水量 `Precip [mm/d]`・`LAI`** の3つの正射図法地球儀を「1モデル日＝1周（$360^\circ / T_{\mathrm{wall,day}}$）」の実時間同期自転または任意速度でリアルタイム可視化する（`live_preview.npz`, `snapshots.zarr`, `monthly.zarr` に対応）。
 
 ### 12.2 出力ファイル種別・平均値 vs 瞬時値仕様 (`OutputConfig`, `src/aoba/io_zarr.py`)
@@ -592,9 +592,9 @@ $$
 | `snapshots.zarr` | **瞬時値** (スナップショット) | `snapshots_enabled`, `snapshots_periods_per_year` (既定 `12`), `snapshots_include_{2d,3d,subgrid_2d}` | 上記2D (`h_canopy`, `vcmax25_c3`, `f_c4`, `f_evg` を含む)・3D変数 (`temp`, `pres`, `q_v`, `u_zonal`, `v_merid`) および上記サブグリッド2D瞬時場 (`*_sub`) |
 | `restart.pt` / `restart_mid.pt` | チェックポイント | `restart_interval_years` (既定 `1` 年), `restart_monthly` (既定 `true`), `zarr_dir_partition` | 完全な `GlobalAtmosState`, `CRMState`, `SurfaceState` (`sfc` & `sfc_sub`), `EkmanOceanState`, `IceSheetState`, `ClimateAccumulator`。`restart_monthly=true` 時は毎月末に `restart_mid.pt` を自動保存し、年内途中から Zarr/CSV 欠損なく決定論的再開可能 |
 
-### 12.3 全モデル設定・物理パラメータレジストリ（全13セクション・216項目）
+### 12.3 全モデル設定・物理パラメータレジストリ（全13セクション・219項目）
 
-表 12.1 に [`config/aoba_default.toml`](../config/aoba_default.toml) に定義された全216パラメータのセクション別完全リストを示す。
+表 12.1 に [`config/aoba_default.toml`](../config/aoba_default.toml) に定義された全219パラメータのセクション別完全リストを示す。
 
 #### `[grid]` — 水平・鉛直・サブグリッド CRM 格子設定（16項目）
 | TOML キー | 標準値 | 説明・単位 |
@@ -612,10 +612,10 @@ $$
 | `rad_stride` | `5` | 放射計算の呼出し間隔（ステップ数） |
 | `crm_col_chunk`, `rad_col_chunk` | `16384`, `32768` | GPU/CPU メモリ制御用バッチチャンクサイズ [columns] |
 
-#### `[forcing]`・`[icesheet]`・`[output]` — 外力・氷床制御・出力管理（46項目）
+#### `[forcing]`・`[icesheet]`・`[output]` — 外力・氷床制御・出力管理（49項目）
 | セクション | キー ＝ 標準値 |
 | :--- | :--- |
-| `[forcing]` (21) | `co2_ppmv = 400.0`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `start_date = "2000-03-20"`, `calendar_type = "gregorian"`, `insolation_mode = "seasonal"`, `fixed_insolation_date = "2000-03-20"`, `diurnal_cycle = true`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `enable_dust = true`, `dust_emis_factor = 1.5e-5`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 48.0`, `cloud_sw_inhomog = 0.85` |
+| `[forcing]` (24) | `co2_ppmv = 400.0`, `co2_mode = "constant"`, `co2_scenario = "obs_historical_noaa"`, `co2_csv_path = ""`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `start_date = "2000-03-20"`, `calendar_type = "gregorian"`, `insolation_mode = "seasonal"`, `fixed_insolation_date = "2000-03-20"`, `diurnal_cycle = true`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `enable_dust = true`, `dust_emis_factor = 1.5e-5`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 48.0`, `cloud_sw_inhomog = 0.85` |
 | `[icesheet]` (5) | `enable_dynamic_icesheet = false`, `icesheet_ema_years = 5.0`, `icesheet_accel_factor = 100.0`, `icesheet_accel_spinup_years = 0.0`, `icesheet_isostasy_tau_yr = 1000.0` |
 | `[output]` (20) | `out_dir = ""`, `years = 30`, `end_date = ""`, `days_per_year = 365.2425`, `zarr_dir_partition = "yearly"`, `daily_csv_enabled = true`, `daily_csv_interval_days = 1.0`, `monthly_mean_enabled = true`, `monthly_mean_periods_per_year = 12`, `monthly_mean_sample_hours = 6.0`, `monthly_mean_include_2d = true`, `monthly_mean_include_3d = true`, `monthly_mean_include_subgrid_2d = true`, `snapshots_enabled = true`, `snapshots_periods_per_year = 12`, `snapshots_include_2d = true`, `snapshots_include_3d = true`, `snapshots_include_subgrid_2d = true`, `restart_interval_years = 1`, `restart_monthly = true` |
 

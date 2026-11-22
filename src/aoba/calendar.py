@@ -45,15 +45,17 @@ class CalendarDate:
 
 
 def parse_ymd(date_str: str, fallback: tuple[int, int, int] = (2000, 1, 1)) -> tuple[int, int, int]:
-    """Parse ``YYYY-MM-DD`` safely, returning ``fallback`` if empty or malformed."""
+    """Parse ``YYYY-MM-DD`` (including negative BCE years like ``-19050-03-20``) safely."""
     s = str(date_str or "").strip()
     if not s:
         return fallback
-    parts = s.split("-")
+    sign = -1 if s.startswith("-") else 1
+    body = s[1:] if sign < 0 else s
+    parts = body.split("-")
     if len(parts) != 3:
         return fallback
     try:
-        y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+        y, m, d = sign * int(parts[0]), int(parts[1]), int(parts[2])
         m = max(1, min(12, m))
         d = max(1, min(31, d))
         return (y, m, d)
@@ -170,6 +172,13 @@ class AobaCalendar:
             doy=doy,
             days_in_year=days_in_year(y, self.calendar_type),
             )
+
+    def decimal_year_at(self, sim_time_sec: float) -> float:
+        """Return continuous decimal calendar year (e.g. ``2025.50``) at ``sim_time_sec``."""
+        cd = self.date_at(sim_time_sec)
+        spd = max(float(self.seconds_per_day), 1.0)
+        frac_day = (cd.hour * 3600.0 + cd.minute * 60.0 + cd.second) / spd
+        return float(cd.year) + (float(cd.doy - 1) + frac_day) / float(max(cd.days_in_year, 1))
 
     def days_for_years(self, years: int) -> int:
         """Return exact number of calendar days for ``years`` starting from ``start_date``."""

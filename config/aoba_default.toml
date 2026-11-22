@@ -25,6 +25,9 @@ rad_col_chunk = 32768
 # --- Planetary Boundary, Orbital & Atmospheric Forcing ---
 [forcing]
 co2_ppmv = 400.0
+co2_mode = "constant"
+co2_scenario = "obs_historical_noaa"
+co2_csv_path = ""
 solar_constant = 1361.0
 omega = 7.292115e-05
 obliquity_deg = 23.44

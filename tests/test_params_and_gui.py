@@ -48,7 +48,7 @@ def test_toml_roundtrip_and_module_sync() -> None:
     defaults = default_config_dict()
     loaded = load_aoba_toml(toml_p)
     assert len(defaults) == 13
-    assert sum(len(v) for v in defaults.values()) == 216
+    assert sum(len(v) for v in defaults.values()) == 219
     assert set(loaded.keys()) == set(defaults.keys())
     for sec in defaults:
         assert set(loaded[sec].keys()) == set(defaults[sec].keys()), f"Key mismatch in [{sec}]"
@@ -129,8 +129,11 @@ def test_gui_server_endpoints() -> None:
             assert len(m_resp["verts_on_cell_b64"]) > 0 and len(m_resp["surf_type_b64"]) > 0
 
         state = json.loads(urllib.request.urlopen(f"{base}/api/state").read().decode("utf-8"))
-        assert state["param_count"] == 216
+        assert state["param_count"] == 219
         assert "grid" in state["config"]
+
+        co2_cat = json.loads(urllib.request.urlopen(f"{base}/api/co2_catalog").read().decode("utf-8"))
+        assert len(co2_cat["scenarios"]) >= 20
 
         disc = json.loads(urllib.request.urlopen(f"{base}/api/runs/discover").read().decode("utf-8"))
         assert disc["ok"]
@@ -277,9 +280,53 @@ def test_runner_cli_with_custom_toml_cpu() -> None:
         assert "lai_sub" not in ds_s
 
 
+def test_co2_forcing_modes_and_calendar() -> None:
+    from aoba.calendar import AobaCalendar
+    from aoba.co2_forcing import resolve_co2_series
+
+    # 1. Constant mode
+    s_const = resolve_co2_series(co2_mode="constant", co2_ppmv=315.0)
+    assert not s_const.is_time_varying
+    assert abs(s_const.evaluate(2025.0) - 315.0) < 1e-9
+
+    # 2. Bundled/cached scenarios: CMIP5, CMIP6, NOAA Obs, and 800ka Paleo
+    s_ssp = resolve_co2_series(co2_mode="scenario", co2_scenario="cmip6_ssp585")
+    assert s_ssp.is_time_varying
+    assert abs(s_ssp.evaluate(1850.0) - 284.317) < 0.05
+    assert s_ssp.evaluate(2100.0) > 1100.0
+
+    s_rcp = resolve_co2_series(co2_mode="scenario", co2_scenario="cmip5_rcp45")
+    assert abs(s_rcp.evaluate(2050.0) - 486.5) < 1.0
+
+    s_obs = resolve_co2_series(co2_mode="scenario", co2_scenario="obs_historical_noaa")
+    assert s_obs.evaluate(2025.0) > 420.0
+
+    s_paleo = resolve_co2_series(co2_mode="scenario", co2_scenario="paleo_antarctica_800ka")
+    assert 170.0 < s_paleo.evaluate(-19050.0) < 220.0
+
+    # 3. Negative BCE calendar parsing + decimal year + coupled model integration
+    cal = AobaCalendar(start_date="-19050-03-20", calendar_type="noleap")
+    assert cal.start_year == -19050 and abs(cal.decimal_year_at(0.0) - (-19050.0 + 78.0 / 365.0)) < 1e-3
+
+    cfg = AOBAConfig(
+        glevel=1, nz=8, crm_nx=2, crm_ny=1, use_earth2014=False,
+        co2_mode="scenario", co2_scenario="cmip6_ssp585", start_date="2050-01-01",
+    )
+    model = init_aoba_model(cfg, device="cpu")
+    assert abs(model.current_co2_ppmv() - s_ssp.evaluate(2050.0)) < 0.1
+
+    # 4. Custom CSV mode
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cpath = Path(tmpdir) / "custom_co2.csv"
+        cpath.write_text("year,co2_ppmv\n2000,370.0\n2010,390.0\n", encoding="utf-8")
+        s_csv = resolve_co2_series(co2_mode="csv", co2_csv_path=str(cpath))
+        assert abs(s_csv.evaluate(2005.0) - 380.0) < 1e-9
+
+
 if __name__ == "__main__":
     test_toml_roundtrip_and_module_sync()
     test_snapshot_variable_filtering()
     test_gui_server_endpoints()
+    test_co2_forcing_modes_and_calendar()
     test_runner_cli_with_custom_toml_cpu()
     print("ALL PARAMS, OUTPUT & GUI TESTS PASSED.")

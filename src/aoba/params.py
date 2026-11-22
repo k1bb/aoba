@@ -238,7 +238,8 @@ _GRID_KEYS: tuple[str, ...] = (
     "rad_stride", "crm_col_chunk", "rad_col_chunk",
 )
 _FORCING_KEYS: tuple[str, ...] = (
-    "co2_ppmv", "solar_constant", "omega", "obliquity_deg", "eccentricity", "perihelion_deg",
+    "co2_ppmv", "co2_mode", "co2_scenario", "co2_csv_path",
+    "solar_constant", "omega", "obliquity_deg", "eccentricity", "perihelion_deg",
     "start_date", "calendar_type", "insolation_mode", "fixed_insolation_date", "diurnal_cycle",
     "use_earth2014", "earth2014_dir", "earth2014_stride", "enable_superparam",
     "enable_dust", "dust_emis_factor",

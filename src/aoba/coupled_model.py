@@ -24,6 +24,7 @@ import torch
 
 from aoba import constants as C
 from aoba.calendar import AobaCalendar
+from aoba.co2_forcing import CO2ForcingSeries, resolve_co2_series
 from aoba.biosphere import (
     compute_optimal_soil_water_beta,
     update_daily_acclimation_smith,
@@ -96,7 +97,10 @@ class AOBAConfig:
     rad_stride: int = 5                      # Radiation evaluation stride (steps; 5 x 720 s = 3600 s = 1 hr)
     crm_col_chunk: int = 16384               # Column batch chunk size for CRM evaluation (Unified Memory single-pass)
     rad_col_chunk: int = 32768               # Subcolumn chunk size for ICA radiative transfer (caps MPS peak buffer)
-    co2_ppmv: float = 400.0                  # Well-mixed atmospheric CO2 concentration [ppmv]
+    co2_ppmv: float = 400.0                  # Well-mixed atmospheric CO2 concentration [ppmv] (used when co2_mode="constant")
+    co2_mode: str = "constant"               # "constant", "scenario", or "csv"
+    co2_scenario: str = "obs_historical_noaa"  # Scenario key when co2_mode="scenario"
+    co2_csv_path: str = ""                   # Custom (year, co2_ppmv) CSV path when co2_mode="csv"
     solar_constant: float = C.SOLAR_CONSTANT # Total solar irradiance S_0 [W m^-2]
     omega: float = C.OMEGA_EARTH             # Planetary rotation rate [rad s^-1]
     obliquity_deg: float = C.OBLIQUITY_DEG   # Axial tilt [deg]
@@ -159,6 +163,14 @@ class AOBAState:
     step_count: int = 0
     rad_cache: dict[str, torch.Tensor] = field(default_factory=dict)
     calendar: AobaCalendar = field(default_factory=AobaCalendar)
+    co2_series: CO2ForcingSeries | None = None
+
+    def current_co2_ppmv(self, sim_time_sec: float | None = None) -> float:
+        """Return active atmospheric CO2 [ppmv] at ``sim_time_sec`` (or ``self.sim_time_sec``)."""
+        if self.co2_series is None or not self.co2_series.is_time_varying:
+            return float(self.cfg.co2_ppmv)
+        t_sec = self.sim_time_sec if sim_time_sec is None else float(sim_time_sec)
+        return self.co2_series.evaluate(self.calendar.decimal_year_at(t_sec))
 
 
 def _cell_to_sub(x: torch.Tensor, nc: int, n_sub: int) -> torch.Tensor:
@@ -524,6 +536,12 @@ def init_aoba_model(
             diurnal_cycle=cfg.diurnal_cycle,
             seconds_per_day=C.SECONDS_PER_DAY,
         ),
+        co2_series=resolve_co2_series(
+            co2_mode=cfg.co2_mode,
+            co2_ppmv=cfg.co2_ppmv,
+            co2_scenario=cfg.co2_scenario,
+            co2_csv_path=cfg.co2_csv_path,
+        ),
     )
     broadcast_host_surface_to_subgrid(model)
     return model
@@ -734,7 +752,7 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
                 albedo_nir=alb_nd,
                 mu0=mu0_sub,
                 s_toa=s_toa_sub,
-                co2_ppmv=cfg.co2_ppmv,
+                co2_ppmv=model.current_co2_ppmv(),
                 emiss_sfc=emiss_in,
                 albedo_vis_dif=alb_vf,
                 albedo_nir_dif=alb_nf,
@@ -792,7 +810,7 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
         precip_rain=rain_prev_sub,
         precip_snow=snow_prev_sub,
         mu0=mu0_sub,
-        co2_ppmv=cfg.co2_ppmv,
+        co2_ppmv=model.current_co2_ppmv(),
         dt=dt,
     )
 
@@ -1071,7 +1089,7 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
             midday_vpd=vpd_sub,
             night_temp=torch.minimum(clim_sub.day_t_min, t_air_sub - 2.0),
             pres_sfc=pres_sfc_post_sub,
-            co2_ppmv=cfg.co2_ppmv,
+            co2_ppmv=model.current_co2_ppmv(),
             lai_exposed=lai_exp_sub,
             is_vegetated_land=(sfc_sub.surf_type == SURF_LAND),
         )
@@ -1123,7 +1141,7 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
             daily_temp_k=daily_t_mean_sub,
             daily_vpd_pa=clim_sub.day_vpd_sum / float(clim_sub.day_steps),
             pres_sfc=pres_sfc_post_sub,
-            co2_ppmv=cfg.co2_ppmv,
+            co2_ppmv=model.current_co2_ppmv(),
             water_stress_beta=ws_beta_sub,
             is_vegetated_land=(sfc_sub.surf_type == SURF_LAND),
             daily_t_min_k=daily_t_min_sub,
