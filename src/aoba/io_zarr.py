@@ -35,9 +35,12 @@ def append_zarr(dataset: xr.Dataset, store_path: str | Path, append_dim: str = "
     path = Path(store_path).expanduser()
     if not path.exists():
         return save_zarr(dataset, path, overwrite=True)
-    existing_attrs = dict(xr.open_zarr(path, consolidated=False).attrs)
+    existing_ds = xr.open_zarr(path, consolidated=False)
+    existing_attrs = dict(existing_ds.attrs)
     drop_vars = [c for c in dataset.coords if c != append_dim and append_dim not in dataset[c].dims]
-    ds_step = dataset.drop_vars(drop_vars, errors="ignore").copy(deep=False)
+    # Keep schema compatibility when appending into an older Zarr store lacking newly added variables
+    extra_vars = [v for v in dataset.data_vars if v not in existing_ds.data_vars]
+    ds_step = dataset.drop_vars(drop_vars + extra_vars, errors="ignore").copy(deep=False)
     merged_attrs = {**existing_attrs, **ds_step.attrs}
     merged_attrs.setdefault("Conventions", "CF-1.11 UGRID-1.0")
     ds_step.attrs = merged_attrs
@@ -172,6 +175,7 @@ def export_aoba_snapshot_xarray(
             "h_canopy": (("time", "n_cell"), _c1(sfc.bio.h_canopy), {"units": "m"}),
             "vcmax25_c3": (("time", "n_cell"), _c1(sfc.bio.vcmax25_c3), {"units": "umol m-2 s-1"}),
             "f_c4": (("time", "n_cell"), _c1(sfc.bio.f_c4), {"units": "1"}),
+            "f_evg": (("time", "n_cell"), _c1(sfc.bio.f_evg if sfc.bio.f_evg is not None else sfc.bio.f_c4 * 0.0), {"units": "1"}),
             "koppen_code": (("time", "n_cell"), _c1(kg30), {"long_name": "Beck et al. (2018) 1..30 class"}),
             "koppen_major": (("time", "n_cell"), _c1(kg5), {"long_name": "1=A, 2=B, 3=C, 4=D, 5=E"}),
         })

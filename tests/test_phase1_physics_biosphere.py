@@ -243,6 +243,56 @@ def test_smith_nrh_pmodel_and_two_leaf_allocation(device: str) -> None:
     assert float(bio_clim.h_canopy[0].item()) > 15.0
     assert float(bio_clim.h_canopy[1].item()) < 2.0
 
+    # 5. Autonomous evergreen vs. deciduous leaf-habit emergence across 5 seasonal climate regimes
+    #    (Kikuzawa, 1991; Sakai & Larcher, 1987; Givnish, 2002; Wang et al., 2023):
+    #    [0: Humid Tropics, 1: Tropical Dry/Savanna, 2: Cool Temperate, 3: Boreal Taiga, 4: East Siberia Larix]
+    veg5 = torch.ones(5, dtype=torch.bool, device=device)
+    p5 = torch.full((5,), 101325.0, device=device)
+    bio_evg = init_biosphere_state((5,), veg5, device=device)
+    t_mean_c = torch.tensor([25.0, 26.0, 9.0, -4.0, -14.0], device=device)
+    t_amp_c = torch.tensor([1.5, 4.0, 14.0, 19.0, 31.0], device=device)
+    ppfd_mean = torch.tensor([42.0, 44.0, 26.0, 18.0, 17.0], device=device)
+    ppfd_amp = torch.tensor([4.0, 8.0, 16.0, 16.0, 16.0], device=device)
+    p_ann_mm = torch.tensor([2200.0, 950.0, 900.0, 520.0, 380.0], device=device)
+    pet_ann_mm = torch.tensor([1350.0, 1450.0, 720.0, 420.0, 360.0], device=device)
+    lai_winter = None
+    lai_summer = None
+    for day in range(5 * 365):
+        doy = day % 365
+        # Peak summer at doy=182, mid-winter at doy=0
+        c_seas = -math.cos(2.0 * math.pi * doy / 365.0)
+        t_day = C.T_FREEZE + t_mean_c + t_amp_c * c_seas
+        t_min_day = t_day - torch.tensor([3.0, 5.0, 6.0, 6.0, 6.0], device=device)
+        ppfd_day = torch.clamp(ppfd_mean + ppfd_amp * c_seas, min=0.5)
+        # Tropical dry savanna (col 1) has a 5-month warm dry season when c_seas < -0.1
+        is_dry_sav = (c_seas < -0.1)
+        p_day = p_ann_mm / 365.0
+        p_day = p_day.clone()
+        p_day[1] = 0.2 if is_dry_sav else (p_ann_mm[1] / 210.0)
+        pet_day = torch.clamp((pet_ann_mm / 365.0) * (1.0 + 0.6 * c_seas), min=0.05)
+        vpd_day = torch.tensor([700.0, 2400.0 if is_dry_sav else 900.0, 800.0, 500.0, 500.0], device=device)
+        beta_day = torch.tensor([1.0, 0.12 if is_dry_sav else 0.95, 0.90, 0.90, 0.85], device=device)
+        update_daily_lai_root_height(
+            bio_evg, p_day, pet_day, ppfd_day, t_day, vpd_day, p5, 400.0,
+            water_stress_beta=beta_day, is_vegetated_land=veg5, daily_t_min_k=t_min_day,
+        )
+        if day == 4 * 365 + 15:
+            lai_winter = bio_evg.lai.clone()
+        elif day == 4 * 365 + 185:
+            lai_summer = bio_evg.lai.clone()
+
+    fe = bio_evg.f_evg
+    assert fe is not None and lai_winter is not None and lai_summer is not None
+    # Humid Tropics -> evergreen broadleaf; Boreal Taiga -> evergreen needleleaf with winter needles retained!
+    assert float(fe[0].item()) > 0.70 and float(lai_winter[0].item()) > 3.0
+    assert float(fe[3].item()) > 0.55 and float(lai_winter[3].item()) > 1.2
+    # Tropical Dry Savanna & Cool Temperate -> lower evergreen share than Humid Tropics & Boreal Taiga
+    assert float(fe[1].item()) < float(fe[0].item()) - 0.15
+    assert float(fe[2].item()) < float(fe[3].item()) - 0.10
+    # Extreme East Siberia (-51 C winter min < -40 C frost threshold) -> deciduous larch sheds needles in winter
+    assert float(fe[4].item()) < 0.20 and float(lai_winter[4].item()) < 0.50
+    assert float(lai_summer[4].item()) > float(lai_winter[4].item()) + 0.50
+
 
 def test_surface_soil_permafrost_snow_burial_and_seaice(device: str) -> None:
     """Verify 5-layer soil freeze-thaw enthalpy conservation, snow burial, and fractional sea ice."""

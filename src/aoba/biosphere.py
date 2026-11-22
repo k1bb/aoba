@@ -93,10 +93,21 @@ KD_PRIME_PAR: float = 0.719        # Diffuse PAR attenuation coefficient k_d' [-
 RHO_CD_PAR: float = 0.036          # Diffuse canopy-top PAR reflectance rho_cd [-] (de Pury & Farquhar, 1997)
 
 # Prognostic EEO LAI constants (Cai et al., 2025, Eq. 12; Zhou et al., 2025, Eqs. 6, 10, 15-20)
-Z_FOLIAGE_COST: float = 12.227     # Canopy foliage carbon cost z [mol C m^-2 yr^-1] (Zhou et al., 2025, Eq. 10)
+Z_FOLIAGE_COST: float = 12.227     # Deciduous annual foliage carbon cost z [mol C m^-2 yr^-1] (Zhou et al., 2025, Eq. 10)
 K_BEER_LAI: float = 0.50           # Canopy extinction coefficient k [-] (Cai et al., 2025; Zhou et al., 2025)
 SIGMA_ZHOU: float = 0.771          # Seasonal LAI-GPP shape factor sigma [-] (Zhou et al., 2025, Eq. 20)
 ALPHA_EMA_ACCLIM: float = 0.067    # Daily EMA weight (~15-day e-folding memory) [-] (Mengoli et al., 2022; Zhou et al., 2025)
+
+# Evergreen vs. Deciduous leaf-habit EEO constants (Kikuzawa, 1991, Eqs. 1-5; Givnish, 2002;
+# Sakai & Larcher, 1987; Wang et al., 2023, Science Advances, 9, eadd5667)
+EVG_COST_RATIO_BASE: float = 1.35  # Warm evergreen broadleaf construction-cost ratio C_evg/C_dec [-]
+EVG_COST_RATIO_COLD: float = 0.55  # Additional frost-hardening LMA construction-cost ratio below 0 degC [-]
+EVG_COLD_EFF_PENALTY: float = 0.14 # Photosynthetic efficiency penalty for cold-hardened evergreen needles [-]
+LEAF_AGING_B_YR: float = 15.0      # Kikuzawa (1991) hypothetical zero-gain evergreen leaf age b [yr]
+DECID_FLUSH_DAYS: float = 25.0     # Deciduous seasonal canopy-flush photosynthetic lag [days]
+EVG_OFFSEASON_RESP25: float = 32.0 # Evergreen off-season maintenance/stress cost at 25 degC [mol C m^-2 yr^-1]
+EVG_FROST_CRIT_K: float = 233.15   # Deep supercooling winter frost-damage threshold (-40 degC) [K]
+EVG_FROST_COST: float = 18.0       # Winter frost-damage carbon penalty below T_frost [mol C m^-2 yr^-1]
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +554,14 @@ class BiosphereState:
     ann_max_dry_days: torch.Tensor | None = None  # Running annual maximum drydown duration [days]
     ema_dmax_days: torch.Tensor | None = None     # Climatological growing-season D_max (Holtzman et al., 2024) [days]
     ema_pet_day: torch.Tensor | None = None       # 15-day EMA daily potential ET [mm d^-1]
+    # Evergreen vs. deciduous leaf-habit optimality state (Kikuzawa, 1991; Givnish, 2002; Wang et al., 2023)
+    f_evg: torch.Tensor | None = None             # Autonomous evergreen foliage fraction in [0, 1] [-]
+    lai_evg: torch.Tensor | None = None           # Evergreen physical leaf area component [m^2 m^-2]
+    lai_dec: torch.Tensor | None = None           # Deciduous physical leaf area component [m^2 m^-2]
+    ema_offseason_temp: torch.Tensor | None = None # Running mean off-season temperature T_off [K]
+    ann_min_temp_k: torch.Tensor | None = None    # Running annual minimum daily temperature [K]
+    ema_tmin_k: torch.Tensor | None = None        # Climatological annual minimum temperature T_min,yr [K]
+    ema_ann_a0_fav: torch.Tensor | None = None    # Moisture-gated annual potential GPP for leaf-habit profit [mol C m^-2 yr^-1]
 
 
 def init_biosphere_state(
@@ -585,6 +604,13 @@ def init_biosphere_state(
         ann_max_dry_days=_f(15.0),
         ema_dmax_days=_f(20.0),
         ema_pet_day=_f(3.0),
+        f_evg=_f(0.5) * veg,
+        lai_evg=_f(1.0) * veg,
+        lai_dec=_f(1.0) * veg,
+        ema_offseason_temp=_f(280.15),
+        ann_min_temp_k=_f(278.15),
+        ema_tmin_k=_f(278.15),
+        ema_ann_a0_fav=_f(180.0),
     )
 
 
@@ -1046,8 +1072,9 @@ def update_daily_lai_root_height(
     co2_ppmv: float,
     water_stress_beta: torch.Tensor | None = None,
     is_vegetated_land: torch.Tensor | None = None,
+    daily_t_min_k: torch.Tensor | None = None,
 ) -> None:
-    """Update prognostic EEO LAI, root-zone storage `S_R`, and canopy height `h_c` once per day.
+    """Update prognostic EEO LAI, evergreen/deciduous habit `f_evg`, `S_R`, and canopy height `h_c` once per day.
 
     References
     ----------
@@ -1055,6 +1082,10 @@ def update_daily_lai_root_height(
       Energy-limited `fAPAR_c` and water-limited `fAPAR_w` combined via log-sum-exp (`K = 10`).
     - Zhou et al. (2025, Global Change Biol., 31, e70125, Eqs. 6 & 15-20):
       Aridity-dependent `f_0(AI)` and Lambert-`W_0` steady-state `L_s` with `alpha = 0.067` EMA.
+    - Kikuzawa (1991, Am. Nat., 138, 1250-1263), Givnish (2002, Silva Fennica, 36, 703-743),
+      Sakai & Larcher (1987), & Wang et al. (2023, Science Advances, 9, eadd5667):
+      Autonomous evergreen vs. deciduous leaf-habit dominance `f_evg` from leaf-longevity carbon
+      profit optimization with temperature-dependent off-season respiration and winter frost damage.
     - Gao et al. (2014, Geophys. Res. Lett., 41, 7916-7923):
       Cumulative dry-season water deficit `(PET * fAPAR_max - P)^+` sizing `S_R`.
     - Kempes et al. (2011, PLoS ONE, 6, e20551, Eqs. 2-5):
@@ -1105,14 +1136,31 @@ def update_daily_lai_root_height(
         torch.full_like(ema_pet, 3.0),
     )
 
-    # Update annual running accumulators
+    # Update annual running accumulators (favorable season includes both thermal & non-drought conditions)
     bio.ema_ann_precip = (1.0 - alpha_yr) * bio.ema_ann_precip + alpha_yr * (daily_precip_mm * 365.2425)
     bio.ema_ann_pet = (1.0 - alpha_yr) * bio.ema_ann_pet + alpha_yr * (daily_pet_mm * 365.2425)
     bio.ema_ann_a0 = (1.0 - alpha_yr) * bio.ema_ann_a0 + alpha_yr * (a0_day * 365.2425)
-    above_zero = (daily_temp_k > C.T_FREEZE).to(daily_temp_k.dtype)
-    bio.ema_gsl_frac = (1.0 - alpha_yr) * bio.ema_gsl_frac + alpha_yr * above_zero
+    ws_b = water_stress_beta if water_stress_beta is not None else torch.ones_like(daily_temp_k)
+    a0_day_fav = a0_day * torch.clamp(ws_b, 0.0, 1.0)
+    a0_fav_prev = bio.ema_ann_a0_fav if bio.ema_ann_a0_fav is not None else bio.ema_ann_a0.clone()
+    bio.ema_ann_a0_fav = (1.0 - alpha_yr) * a0_fav_prev + alpha_yr * (a0_day_fav * 365.2425)
+    is_fav = (daily_temp_k > C.T_FREEZE) & (ws_b > 0.20)
+    bio.ema_gsl_frac = (1.0 - alpha_yr) * bio.ema_gsl_frac + alpha_yr * is_fav.to(daily_temp_k.dtype)
 
-    # 2. Annual maximum greenness fAPAR_max & LAI_max (Cai et al., 2025, Eqs. 1-2 & 12; Zhou et al., 2025, Eq. 6)
+    # Track off-season temperature T_off and climatological annual minimum temperature T_min,yr
+    t_min_in = daily_t_min_k if daily_t_min_k is not None else daily_temp_k
+    t_off_prev = bio.ema_offseason_temp if bio.ema_offseason_temp is not None else daily_temp_k.clone()
+    alpha_off = torch.where(~is_fav, torch.full_like(daily_temp_k, 1.0 / 30.0), torch.full_like(daily_temp_k, alpha_yr))
+    bio.ema_offseason_temp = (1.0 - alpha_off) * t_off_prev + alpha_off * daily_temp_k
+
+    ann_tmin = bio.ann_min_temp_k if bio.ann_min_temp_k is not None else t_min_in.clone()
+    ema_tmin = bio.ema_tmin_k if bio.ema_tmin_k is not None else t_min_in.clone()
+    ann_tmin_next = torch.minimum(ann_tmin + 0.25 * alpha_yr * torch.clamp(t_min_in - ann_tmin, min=0.0), t_min_in)
+    ema_tmin_next = (1.0 - 2.0 * alpha_yr) * ema_tmin + (2.0 * alpha_yr) * ann_tmin_next
+    bio.ann_min_temp_k = ann_tmin_next
+    bio.ema_tmin_k = ema_tmin_next
+
+    # 2. Annual hydroclimatic water limit fAPAR_w & baseline canopy assimilation a_leaf
     # Per Zhou et al. (2025, Sec. 2.1.2), f_0 = 0.65 in energy-limited climates (AI <= 1.9) and declines
     # as AI increases beyond 1.9 into water-limited regimes.
     ai = torch.clamp(bio.ema_ann_pet / torch.clamp(bio.ema_ann_precip, min=10.0), 0.05, 50.0)
@@ -1121,28 +1169,85 @@ def update_daily_lai_root_height(
     p_mol_yr = bio.ema_ann_precip * (1000.0 / 18.01528)            # 1 kg H2O = 55.508 mol H2O
     a0_yr = torch.clamp(bio.ema_ann_a0, min=1.0e-2)
 
-    fapar_w = f0 * p_mol_yr * ca_pa * (1.0 - chi3) / torch.clamp(1.6 * d_s * a0_yr, min=1.0)
-    fapar_c = 1.0 - Z_FOLIAGE_COST / (K_BEER_LAI * a0_yr)
-    # Smooth minimum via log-sum-exp with K = 10 (Cai et al., 2025, Eq. 12)
     k_lse = 10.0
-    m_pair = torch.minimum(fapar_w, fapar_c)
-    fapar_smooth = m_pair - (1.0 / k_lse) * torch.log(
-        torch.exp(-k_lse * (fapar_w - m_pair)) + torch.exp(-k_lse * (fapar_c - m_pair))
+
+    def _lse_min(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        mp = torch.minimum(x, y)
+        return mp - (1.0 / k_lse) * torch.log(torch.exp(-k_lse * (x - mp)) + torch.exp(-k_lse * (y - mp)))
+
+    fapar_w = f0 * p_mol_yr * ca_pa * (1.0 - chi3) / torch.clamp(1.6 * d_s * a0_yr, min=1.0)
+    fapar_c0 = 1.0 - Z_FOLIAGE_COST / (K_BEER_LAI * a0_yr)
+    fapar_max0 = torch.clamp(_lse_min(fapar_w, fapar_c0), 0.0, 0.96)
+    lai_max0 = -torch.log(1.0 - fapar_max0) / K_BEER_LAI
+
+    # 2b. Autonomous Evergreen vs. Deciduous Leaf-Habit Optimality (Kikuzawa, 1991; Givnish, 2002;
+    #     Sakai & Larcher, 1987; Wang et al., 2023, Science Advances, 9, eadd5667)
+    f_gsl = torch.clamp(bio.ema_gsl_frac, 0.05, 1.0)
+    a0_fav_yr = torch.clamp(bio.ema_ann_a0_fav, min=1.0e-2)
+    a_leaf = torch.clamp(a0_fav_yr * fapar_max0 / torch.clamp(lai_max0, min=0.50), min=1.0)
+    # Cold-hardening structural LMA investment & efficiency trade-off below 0 degC
+    f_cold = torch.sigmoid((C.T_FREEZE - ema_tmin_next) / 5.0)
+    c_dec = Z_FOLIAGE_COST
+    c_evg = (EVG_COST_RATIO_BASE + EVG_COST_RATIO_COLD * f_cold) * c_dec
+    eta_evg = torch.clamp(1.0 - EVG_COLD_EFF_PENALTY * f_cold, min=0.40)
+    # Kikuzawa (1991, Eq. 5) optimal evergreen leaf lifespan tau_evg [yr]
+    tau_evg = torch.clamp(torch.sqrt(2.0 * LEAF_AGING_B_YR * c_evg / torch.clamp(eta_evg * a_leaf, min=1.0)), 1.0, 7.0)
+    # Temperature-dependent off-season maintenance/stress cost (Q10 ~ 2.0, Heskel et al., 2016)
+    f_resp_off = torch.exp(torch.clamp(0.0693 * (bio.ema_offseason_temp - 298.15), min=-6.0, max=3.0))
+    # Extreme continental winter frost-damage penalty (Sakai & Larcher, 1987; Givnish, 2002; Larix belt)
+    frost_pen = EVG_FROST_COST * torch.sigmoid((EVG_FROST_CRIT_K - ema_tmin_next) / 4.0)
+
+    b_dec = max(LEAF_AGING_B_YR / 2.5, 1.0)
+    flush_frac = torch.clamp(1.0 - DECID_FLUSH_DAYS / torch.clamp(365.2425 * f_gsl, min=15.0), min=0.0)
+    g_dec = flush_frac * (1.0 - f_gsl / (2.0 * b_dec)) * a_leaf - c_dec
+    g_evg = (
+        eta_evg * (1.0 - tau_evg / (2.0 * LEAF_AGING_B_YR)) * a_leaf
+        - (c_evg / tau_evg)
+        - EVG_OFFSEASON_RESP25 * f_resp_off * (1.0 - f_gsl)
+        - frost_pen
     )
-    fapar_max = torch.clamp(fapar_smooth, 0.0, 0.96)
+    f_evg_target = torch.sigmoid(4.0 * (g_evg - g_dec) / max(c_dec, 1.0))
+    f_evg_prev = bio.f_evg if bio.f_evg is not None else (0.5 * veg.to(daily_temp_k.dtype))
+    f_evg_new = torch.where(veg, (1.0 - alpha_yr) * f_evg_prev + alpha_yr * f_evg_target, torch.zeros_like(f_evg_target))
+    bio.f_evg = torch.clamp(f_evg_new, 0.0, 1.0)
+
+    # Effective amortized annual foliage cost z_eff lowers carbon barrier for long-lived evergreen canopies
+    z_eff = (1.0 - bio.f_evg) * c_dec + bio.f_evg * (c_evg / tau_evg)
+    fapar_c = 1.0 - z_eff / (K_BEER_LAI * a0_yr)
+    fapar_max = torch.clamp(_lse_min(fapar_w, fapar_c), 0.0, 0.96)
     lai_max = -torch.log(1.0 - fapar_max) / K_BEER_LAI
 
-    # 3. Daily steady-state LAI via Lambert W_0 & EMA phenology (Zhou et al., 2025, Eqs. 15, 16, 20)
-    gsl_days = torch.clamp(bio.ema_gsl_frac * 365.2425, min=15.0)
-    m_alloc = SIGMA_ZHOU * gsl_days * lai_max / torch.clamp(a0_yr * fapar_max, min=0.1)
-    mu_lai = m_alloc * a0_day
+    # 3. Dual-timescale prognostic LAI: evergreen persistence + Zhou et al. (2025) deciduous phenology
+    gsl_days = torch.clamp(f_gsl * 365.2425, min=15.0)
+    m_alloc = SIGMA_ZHOU * gsl_days * lai_max / torch.clamp(a0_fav_yr * fapar_max, min=0.1)
+    mu_lai = m_alloc * a0_day_fav
     u_lai = K_BEER_LAI * mu_lai
     arg_w = -u_lai * torch.exp(-torch.clamp(u_lai, max=40.0))
     ls_raw = mu_lai + lambert_w0(arg_w) / K_BEER_LAI
     l_steady = torch.clamp(torch.minimum(ls_raw, lai_max), min=0.0)
 
-    lai_new = (1.0 - ALPHA_EMA_ACCLIM) * bio.lai + ALPHA_EMA_ACCLIM * l_steady
-    bio.lai = torch.where(veg, torch.clamp(lai_new, 0.0, 8.0), torch.zeros_like(lai_new))
+    lai_evg_prev = bio.lai_evg if bio.lai_evg is not None else (bio.f_evg * bio.lai)
+    lai_dec_prev = bio.lai_dec if bio.lai_dec is not None else ((1.0 - bio.f_evg) * bio.lai)
+
+    lai_evg_target = bio.f_evg * lai_max
+    alpha_evg_turn = 1.0 / (365.2425 * tau_evg)
+    # Multi-year evergreen retention in winter; faster crown build-up on growth, drought dieback above lai_max,
+    # and acute winter frost-kill mortality when T_min falls below EVG_FROST_CRIT_K (-40 degC)
+    alpha_frost = 0.025 * torch.sigmoid((EVG_FROST_CRIT_K - t_min_in) / 4.0)
+    alpha_evg_up = torch.clamp(4.0 * alpha_evg_turn, max=ALPHA_EMA_ACCLIM)
+    alpha_evg_down = torch.maximum(alpha_evg_turn, alpha_frost)
+    alpha_evg_eff = torch.where(
+        lai_evg_prev > lai_max,
+        torch.clamp(alpha_evg_down, min=0.015),
+        torch.where(lai_evg_target > lai_evg_prev, alpha_evg_up, alpha_evg_down),
+    )
+    lai_evg_new = (1.0 - alpha_evg_eff) * lai_evg_prev + alpha_evg_eff * lai_evg_target
+    lai_dec_target = (1.0 - bio.f_evg) * l_steady
+    lai_dec_new = (1.0 - ALPHA_EMA_ACCLIM) * lai_dec_prev + ALPHA_EMA_ACCLIM * lai_dec_target
+
+    bio.lai_evg = torch.where(veg, torch.clamp(lai_evg_new, 0.0, 8.0), torch.zeros_like(lai_evg_new))
+    bio.lai_dec = torch.where(veg, torch.clamp(lai_dec_new, 0.0, 8.0), torch.zeros_like(lai_dec_new))
+    bio.lai = torch.where(veg, torch.clamp(bio.lai_evg + bio.lai_dec, 0.0, 8.0), torch.zeros_like(lai_max))
 
     # 4. Optimal drought-bridging root-zone storage S_R [kg m^-2] (Gao et al., 2014)
     daily_demand = fapar_max * daily_pet_mm

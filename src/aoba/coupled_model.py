@@ -581,6 +581,12 @@ def _apply_dynamic_icesheet_update(model: AOBAState) -> None:
         sfc_sub.swe_land = torch.where(gl_sub, torch.full_like(sfc_sub.swe_land, SWE_GLACIER_MAX), sfc_sub.swe_land)
         sfc_sub.swe_max_season = torch.where(gl_sub, torch.full_like(sfc_sub.swe_max_season, SWE_GLACIER_MAX), sfc_sub.swe_max_season)
         sfc_sub.bio.lai = torch.where(gl_sub, torch.zeros_like(sfc_sub.bio.lai), sfc_sub.bio.lai)
+        if sfc_sub.bio.lai_evg is not None:
+            sfc_sub.bio.lai_evg = torch.where(gl_sub, torch.zeros_like(sfc_sub.bio.lai_evg), sfc_sub.bio.lai_evg)
+        if sfc_sub.bio.lai_dec is not None:
+            sfc_sub.bio.lai_dec = torch.where(gl_sub, torch.zeros_like(sfc_sub.bio.lai_dec), sfc_sub.bio.lai_dec)
+        if sfc_sub.bio.f_evg is not None:
+            sfc_sub.bio.f_evg = torch.where(gl_sub, torch.zeros_like(sfc_sub.bio.f_evg), sfc_sub.bio.f_evg)
         sfc_sub.bio.h_canopy = torch.where(gl_sub, torch.zeros_like(sfc_sub.bio.h_canopy), sfc_sub.bio.h_canopy)
 
     if newly_deglaciated_cell.any():
@@ -593,6 +599,12 @@ def _apply_dynamic_icesheet_update(model: AOBAState) -> None:
         w_dg_avail, _, _ = compute_root_zone_weights_and_water(sfc_sub.w_liq_soil, sfc_sub.bio.s_root_cap)
         sfc_sub.w_root = torch.where(dg_sub, w_dg_avail, sfc_sub.w_root)
         sfc_sub.bio.lai = torch.where(dg_sub, torch.full_like(sfc_sub.bio.lai, 0.25), sfc_sub.bio.lai)
+        if sfc_sub.bio.lai_evg is not None:
+            sfc_sub.bio.lai_evg = torch.where(dg_sub, torch.full_like(sfc_sub.bio.lai_evg, 0.125), sfc_sub.bio.lai_evg)
+        if sfc_sub.bio.lai_dec is not None:
+            sfc_sub.bio.lai_dec = torch.where(dg_sub, torch.full_like(sfc_sub.bio.lai_dec, 0.125), sfc_sub.bio.lai_dec)
+        if sfc_sub.bio.f_evg is not None:
+            sfc_sub.bio.f_evg = torch.where(dg_sub, torch.full_like(sfc_sub.bio.f_evg, 0.5), sfc_sub.bio.f_evg)
         sfc_sub.bio.h_canopy = torch.where(dg_sub, torch.full_like(sfc_sub.bio.h_canopy, 0.5), sfc_sub.bio.h_canopy)
 
     # Keep active ice-sheet cells replenished to glacier cap since net mass change was transferred to ice.h_ice
@@ -1101,17 +1113,20 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
     steps_per_day = max(int(round(C.SECONDS_PER_DAY / dt)), 1)
     if clim_sub.day_steps >= steps_per_day:
         ws_beta_sub = compute_optimal_soil_water_beta(sfc_sub.w_root, sfc_sub.bio)
+        daily_t_mean_sub = clim_sub.day_temp_sum / float(clim_sub.day_steps)
+        daily_t_min_sub = torch.where(clim_sub.day_t_min < 399.0, clim_sub.day_t_min, daily_t_mean_sub)
         update_daily_lai_root_height(
             bio=sfc_sub.bio,
             daily_precip_mm=clim_sub.day_precip_mm,
             daily_pet_mm=torch.clamp(clim_sub.day_pet_mm, min=0.05),
             daily_ppfd_mol_m2=clim_sub.day_ppfd_mol,
-            daily_temp_k=clim_sub.day_temp_sum / float(clim_sub.day_steps),
+            daily_temp_k=daily_t_mean_sub,
             daily_vpd_pa=clim_sub.day_vpd_sum / float(clim_sub.day_steps),
             pres_sfc=pres_sfc_post_sub,
             co2_ppmv=cfg.co2_ppmv,
             water_stress_beta=ws_beta_sub,
             is_vegetated_land=(sfc_sub.surf_type == SURF_LAND),
+            daily_t_min_k=daily_t_min_sub,
         )
         clim_sub.day_precip_mm.zero_()
         clim_sub.day_pet_mm.zero_()

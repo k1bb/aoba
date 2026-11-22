@@ -95,6 +95,24 @@ def _restore_surface(sfc_target, payload: dict, device: torch.device) -> None:
 
     w_ice_cap = torch.clamp(SOIL_POROSITY - sfc_target.w_liq_soil, min=0.0)
     sfc_target.w_ice_soil = torch.clamp(sfc_target.w_ice_soil, min=0.0).minimum(w_ice_cap)
+    # Backward-compatible warm-start for evergreen/deciduous leaf-habit fields
+    bio_payload = payload.get("bio", {}) or {}
+    if "f_evg" not in bio_payload or sfc_target.bio.f_evg is None:
+        from aoba.surface import SURF_LAND
+        veg_f = (sfc_target.surf_type == SURF_LAND).to(sfc_target.bio.lai.dtype)
+        sfc_target.bio.f_evg = 0.5 * veg_f
+    if "lai_evg" not in bio_payload or sfc_target.bio.lai_evg is None:
+        sfc_target.bio.lai_evg = sfc_target.bio.f_evg * sfc_target.bio.lai
+    if "lai_dec" not in bio_payload or sfc_target.bio.lai_dec is None:
+        sfc_target.bio.lai_dec = (1.0 - sfc_target.bio.f_evg) * sfc_target.bio.lai
+    if "ema_offseason_temp" not in bio_payload or sfc_target.bio.ema_offseason_temp is None:
+        sfc_target.bio.ema_offseason_temp = sfc_target.t_canopy.clone()
+    if "ann_min_temp_k" not in bio_payload or sfc_target.bio.ann_min_temp_k is None:
+        sfc_target.bio.ann_min_temp_k = sfc_target.t_canopy.clone()
+    if "ema_tmin_k" not in bio_payload or sfc_target.bio.ema_tmin_k is None:
+        sfc_target.bio.ema_tmin_k = sfc_target.t_canopy.clone()
+    if "ema_ann_a0_fav" not in bio_payload or sfc_target.bio.ema_ann_a0_fav is None:
+        sfc_target.bio.ema_ann_a0_fav = sfc_target.bio.ema_ann_a0.clone()
 
 
 def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] | None = None) -> None:
