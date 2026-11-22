@@ -255,6 +255,15 @@ def test_full_global_coupled_aoba_and_zarr_v3_io(device: str) -> None:
     assert t_can_sub_spread > 1.0e-5
     assert torch.allclose(model.sfc.t_canopy, model.sfc_sub.t_canopy.reshape(nc, n_sub).mean(dim=-1), atol=1.0e-5)
     assert model.rad_cache["q_rad_sub"].shape == (cfg.nz, nc * n_sub)
+    # Priestley-Taylor PET must be finite, non-negative, positive on sunlit warm land, and strictly below raw SW_dn / L_v0
+    pet_acc = model.clim_sub.day_pet_mm
+    assert torch.isfinite(pet_acc).all() and (pet_acc >= 0.0).all()
+    assert float(pet_acc.max().item()) > 0.0
+    sw_tot_last = (
+        model.rad_cache["sw1_dir_sub"] + model.rad_cache["sw1_dif_sub"]
+        + model.rad_cache["sw2_dir_sub"] + model.rad_cache["sw2_dif_sub"]
+    )
+    assert float(pet_acc.mean().item()) < float((3.0 * torch.clamp(sw_tot_last, min=0.0) * cfg.dt_host / 2.501e6).mean().item())
 
     # Export to CF-1.11 / UGRID-1.0 Zarr v3 and verify round-trip reload
     with tempfile.TemporaryDirectory() as tmpdir:

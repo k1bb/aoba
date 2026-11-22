@@ -388,7 +388,7 @@ AOBA は PFT 分類・経験的パラメータ表を一切使わず、植物の�
    $$
    \tau = 0.85\, D_{\max} + 6.59\ [\mathrm{days}], \qquad \beta_{\mathrm{opt}} = \mathrm{clip}\!\left(\sqrt{\frac{\max(W_{\mathrm{eff}} - 0.05\, S_R,\, 0)}{\max(\tau\, E_{\mathrm{pot,EMA}},\, 0.10\, S_R)}},\ 0,\ 1\right),
    $$
-   ここで $W_{\mathrm{eff}} = f_{\mathrm{unfrozen}} W_{\mathrm{root}}$ は未凍結有効根圏水分、$E_{\mathrm{pot,EMA}}$ は15日移動平均ポテンシャル蒸発要求である。なお、日次予報 LAI の潜在光合成 $A_{0,\mathrm{day}}$ にはこの $\beta_{\mathrm{opt}}$ を重複乗算せず、長期水制限は $\mathrm{fAPAR}_w$ と $f_0(\mathrm{AI})$ のみで評価する。
+   ここで $W_{\mathrm{eff}} = f_{\mathrm{unfrozen}} W_{\mathrm{root}}$ は未凍結有効根圏水分、$E_{\mathrm{pot,EMA}}$ は Priestley & Taylor (1972, *Mon. Wea. Rev.*, 100, 81–92) のポテンシャル蒸発散 $E_{\mathrm{pot}} = 1.26\,\frac{s}{s + \gamma}\,\frac{\max(R_n,\, 0)}{L_{v0}}$（$s = \mathrm{d}e_s / \mathrm{d}T$, $\gamma = c_{pd} p_{\mathrm{sfc}} / (\varepsilon_w L_{v0})$, 地表面正味放射 $R_n = S_{\mathrm{net}} + \varepsilon_{\mathrm{sfc}}(L^\downarrow - \sigma T_{\mathrm{rad,sfc}}^4)$）の 15日移動平均である。なお、日次予報 LAI の潜在光合成 $A_{0,\mathrm{day}}$ にはこの $\beta_{\mathrm{opt}}$ を重複乗算せず、長期水制限は $\mathrm{fAPAR}_w$ と $f_0(\mathrm{AI})$ のみで評価する。
 
 ### 7.3 二ストリーム樹冠アルベド・自律的 C₄ 比率 $F_4$・Lambert-$W_0$ 予報植生構造
 

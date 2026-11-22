@@ -1068,7 +1068,21 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
 
     precip_tot_sub = rain_new_sub + snow_new_sub
     clim_sub.day_precip_mm = clim_sub.day_precip_mm + precip_tot_sub * dt
-    clim_sub.day_pet_mm = clim_sub.day_pet_mm + torch.clamp(sw1_dir_sub + sw1_dif_sub + sw2_dir_sub + sw2_dif_sub, min=0.0) * dt / C.L_V0
+    # Priestley & Taylor (1972, Mon. Wea. Rev., 100, 81-92) potential evapotranspiration [kg m^-2 s^-1]:
+    # PET = 1.26 * [s / (s + gamma)] * max(R_n, 0) / L_v0 (consistent with Cai et al., 2025; Zhou et al., 2025)
+    sw_net_sub = (
+        (1.0 - sfc_diag_sub.alb_vis_dir) * sw1_dir_sub
+        + (1.0 - sfc_diag_sub.alb_vis_dif) * sw1_dif_sub
+        + (1.0 - sfc_diag_sub.alb_nir_dir) * sw2_dir_sub
+        + (1.0 - sfc_diag_sub.alb_nir_dif) * sw2_dif_sub
+    )
+    lw_net_sub = sfc_diag_sub.emiss_sfc * (lw_dn_sub - C.STEFAN_BOLTZMANN * (sfc_diag_sub.t_rad_sfc ** 4))
+    rn_pos_sub = torch.clamp(sw_net_sub + lw_net_sub, min=0.0)
+    t_denom_pt = torch.clamp(t_air_sub - 29.65, min=10.0)
+    des_dt_sub = es_sub * (17.67 * 243.5) / (t_denom_pt * t_denom_pt)
+    gamma_psy_sub = (C.CP_D * pres_sfc_post_sub) / (C.EPS_WATER * C.L_V0)
+    pet_pt_sub = 1.26 * (des_dt_sub / (des_dt_sub + gamma_psy_sub)) * rn_pos_sub / C.L_V0
+    clim_sub.day_pet_mm = clim_sub.day_pet_mm + pet_pt_sub * dt
     clim_sub.day_ppfd_mol = clim_sub.day_ppfd_mol + (4.57 * sw1_dir_sub + 4.24 * sw1_dif_sub) * 1.0e-6 * dt
     clim_sub.day_temp_sum = clim_sub.day_temp_sum + t_air_sub
     clim_sub.day_vpd_sum = clim_sub.day_vpd_sum + vpd_sub

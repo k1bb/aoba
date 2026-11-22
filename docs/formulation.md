@@ -258,7 +258,7 @@ Local-solar-noon $(\mathrm{VIS}_b, \mathrm{VIS}_d, \mu_0)$ are EMA-smoothed ($\a
 $$
 \tau = 0.85\, D_{\max} + 6.59\ [\mathrm{days}], \qquad \beta_{\mathrm{opt}} = \mathrm{clip}\!\left(\sqrt{\frac{\max(W_{\mathrm{eff}} - 0.05\, S_R,\, 0)}{\max(\tau\, E_{\mathrm{pot,EMA}},\, 0.10\, S_R)}},\ 0,\ 1\right),
 $$
-where $W_{\mathrm{eff}} = f_{\mathrm{unfrozen}} W_{\mathrm{root}}$ is unfrozen root-zone water and $E_{\mathrm{pot,EMA}}$ is the 15-day EMA potential ET demand. Root-zone storage $S_R \in [50, 650]\ \mathrm{kg\ m^{-2}}$ (Gao et al., 2014) and vascular canopy height $h_c \in [0.05, 40]\ \mathrm{m}$ (Kempes et al., 2011) evolve dynamically via:
+where $W_{\mathrm{eff}} = f_{\mathrm{unfrozen}} W_{\mathrm{root}}$ is unfrozen root-zone water and $E_{\mathrm{pot,EMA}}$ is the 15-day EMA potential ET demand evaluated from Priestley & Taylor (1972, *Mon. Wea. Rev.*, 100, 81–92), $E_{\mathrm{pot}} = 1.26\,\frac{s}{s + \gamma}\,\frac{\max(R_n,\, 0)}{L_{v0}}$ with Clausius–Clapeyron slope $s = \mathrm{d}e_s / \mathrm{d}T$, psychrometric constant $\gamma = c_{pd} p_{\mathrm{sfc}} / (\varepsilon_w L_{v0})$, and surface net radiation $R_n = S_{\mathrm{net}} + \varepsilon_{\mathrm{sfc}}(L^\downarrow - \sigma T_{\mathrm{rad,sfc}}^4)$. Root-zone storage $S_R \in [50, 650]\ \mathrm{kg\ m^{-2}}$ (Gao et al., 2014) and vascular canopy height $h_c \in [0.05, 40]\ \mathrm{m}$ (Kempes et al., 2011) evolve dynamically via:
 $$
 \begin{aligned}
 a_s &= \frac{\omega}{2}\frac{0.5}{0.5 + \mu_s}\left[1 - \frac{\mu_s}{0.5 + \mu_s}\ln\!\left(\frac{0.5 + \mu_s}{\mu_s}\right)\right], \qquad \beta_0 = \mathrm{clip}\!\left(\frac{(1 + \bar{\mu}K)a_s}{\omega \bar{\mu} K},\ 0.05,\ 0.95\right), \\
