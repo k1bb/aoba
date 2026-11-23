@@ -14,6 +14,7 @@ from typing import Any
 
 from aoba import biosphere as _bio
 from aoba import constants as C
+from aoba import gravity_wave as _gwd
 from aoba import icesheet as _ice
 from aoba import microphysics as _mp
 from aoba import ocean_ekman as _ocn
@@ -222,6 +223,19 @@ _MODULE_PARAM_MAP: dict[str, dict[str, tuple[Any, str]]] = {
         "cd_block": (_oro, "CD_BLOCK"),
         "g_wave": (_oro, "G_WAVE"),
     },
+    "gravity_wave": {
+        "ngwd_front_thresh": (_gwd, "NGWD_FRONT_THRESH"),
+        "ngwd_front_launch_hpa": (_gwd, "NGWD_FRONT_LAUNCH_HPA"),
+        "ngwd_front_tau0": (_gwd, "NGWD_FRONT_TAU0"),
+        "ngwd_front_cw": (_gwd, "NGWD_FRONT_CW"),
+        "ngwd_front_eff": (_gwd, "NGWD_FRONT_EFF"),
+        "ngwd_conv_tau0": (_gwd, "NGWD_CONV_TAU0"),
+        "ngwd_conv_qref": (_gwd, "NGWD_CONV_QREF"),
+        "ngwd_conv_eff": (_gwd, "NGWD_CONV_EFF"),
+        "ngwd_wavelength_m": (_gwd, "NGWD_WAVELENGTH_M"),
+        "ngwd_cmax": (_gwd, "NGWD_CMAX"),
+        "ngwd_tend_max": (_gwd, "NGWD_TEND_MAX"),
+    },
     "icesheet_physics": {
         "rho_ice": (_ice, "RHO_ICE"),
         "rho_mantle": (_ice, "RHO_MANTLE"),
@@ -239,7 +253,7 @@ _GRID_KEYS: tuple[str, ...] = (
 )
 _FORCING_KEYS: tuple[str, ...] = (
     "co2_ppmv", "co2_mode", "co2_scenario", "co2_csv_path",
-    "o3_mode", "o3_file_path", "o3_lw_coupling",
+    "o3_mode", "o3_file_path", "o3_lw_coupling", "enable_nonoro_gwd",
     "solar_constant", "omega", "obliquity_deg", "eccentricity", "perihelion_deg",
     "start_date", "calendar_type", "insolation_mode", "fixed_insolation_date", "diurnal_cycle",
     "use_earth2014", "earth2014_dir", "earth2014_stride", "enable_superparam",
@@ -330,6 +344,7 @@ def dump_aoba_toml(cfg_dict: dict[str, dict[str, Any]]) -> str:
         "biosphere": "Two-Leaf Non-Rectangular-Hyperbola EEO Biosphere Parameters",
         "ocean_ekman": "Codron (2012) 1.5-Layer Wind-Driven Voronoi Ekman Ocean Parameters",
         "orography": "Lott & Miller (1997) Subgrid Orographic Drag Parameters",
+        "gravity_wave": "Map-Free Flow-Dependent Non-Orographic GWD (Beres 2004; Charron & Manzini 2002; Richter 2010)",
         "icesheet_physics": "Glen Flow Law & Lithospheric Isostasy Physics Constants",
     }
     lines = [
@@ -420,5 +435,6 @@ SECTION_META: dict[str, dict[str, str]] = {
     "biosphere": {"ja": "Two-Leaf EEO 植生", "en": "EEO Biosphere"},
     "ocean_ekman": {"ja": "1.5層エクマン海洋", "en": "Ekman Ocean"},
     "orography": {"ja": "山岳重力波ドラッグ", "en": "Orographic Drag"},
+    "gravity_wave": {"ja": "非地形性重力波 (対流・前線)", "en": "Non-Orographic GWD"},
     "icesheet_physics": {"ja": "SIA 氷床物理定数", "en": "SIA Ice-Sheet Physics"},
 }

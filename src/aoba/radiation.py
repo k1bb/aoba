@@ -566,8 +566,12 @@ def compute_four_band_radiation(
     o3_vmr = torch.clamp(torch.flip(o3_vmr_c, dims=[0]), min=0.0) if o3_vmr_c is not None else background_ozone_vmr(p_c)
     o3_mass_kgm2 = o3_vmr * (48.0 / 28.964) * dm_dry
     du_o3_cm = o3_mass_kgm2 / 2.1415e-2
+    # Analytic overhead O3 column above model top (p in [0, p_top]) assuming O3 ~ p^g2
+    # Prevents spurious Hartley-band UV heating spikes in the top layer of high-top runs
+    u_o3_above = (o3_vmr[0:1] * (48.0 / 28.964) * (p_w[0:1] / C.GRAVITY)) / ((C.O3_G2 + 1.0) * 2.1415e-2)
     u_o3_cum = torch.zeros((N + 1,) + col_shape, dtype=dtype, device=device)
-    u_o3_cum[1:] = torch.cumsum(du_o3_cm, dim=0)
+    u_o3_cum[0:1] = u_o3_above
+    u_o3_cum[1:] = u_o3_above + torch.cumsum(du_o3_cm, dim=0)
 
     x_o3 = u_o3_cum * mag_o3.unsqueeze(0)
     # Normalize total-solar Lacis-Hansen O3 absorptance into SW1 band fraction
@@ -664,9 +668,16 @@ def compute_four_band_radiation(
     dp2_norm = torch.clamp(p_w[1:] ** 2 - p_w[:-1] ** 2, min=0.0) / (C.P_REF ** 2)
 
     # LW1: Voigt/Lorentz pressure-scaled H2O rotational/vibrational bands ((p/p0)^0.55;
-    # Goody, 1964; Weaver & Ramanathan, 1995) + CO2 15-um band (Sherwood et al., 2020)
+    # Goody, 1964; Weaver & Ramanathan, 1995) + CO2 15-um tropospheric & stratospheric
+    # Voigt/Doppler core cooling (Dickinson, 1973; Andrews et al., 1987, Sec. 2.5; Sherwood et al., 2020)
     dtau_wv_lw1 = 0.30 * torch.pow(torch.clamp(p_c / C.P_REF, min=1.0e-4), 0.55) * qv * dm_dry
-    dtau_co2_lw1 = max(0.02, 0.85 + 0.22 * ln_co2) * dp2_norm + 0.020 * (dp_pa / C.P_REF)
+    strat_co2_core = (
+        0.22
+        * max(0.20, 1.0 + 0.35 * ln_co2)
+        * torch.exp(-p_c / 10000.0)
+        * torch.pow(torch.clamp(10000.0 / torch.clamp(p_c, min=50.0), min=1.0), 0.50)
+    )
+    dtau_co2_lw1 = max(0.02, 0.85 + 0.22 * ln_co2) * dp2_norm + (0.020 + strat_co2_core) * (dp_pa / C.P_REF)
 
     # LW2: 8-12.5 um atmospheric window: H2O e-type self-continuum (Roberts et al., 1976;
     # Koll & Cronin, 2018) + weak foreign continuum + CO2 15-um wing / 10-um band overlap

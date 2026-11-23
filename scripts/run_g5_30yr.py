@@ -157,15 +157,212 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
     os.replace(tmp, path)
 
 
+def _interp_vertical_batch(
+    z_old: torch.Tensor,
+    val_old: torch.Tensor,
+    z_new: torch.Tensor,
+) -> torch.Tensor:
+    """Vectorized 1D piecewise-linear vertical interpolation `[nz_old, N] -> [nz_new, N]`."""
+    nz_old = z_old.shape[0]
+    zo_t = z_old.transpose(0, 1).contiguous()   # [N, nz_old]
+    vo_t = val_old.transpose(0, 1).contiguous() # [N, nz_old]
+    zn_t = z_new.transpose(0, 1).contiguous()   # [N, nz_new]
+
+    idx_hi = torch.searchsorted(zo_t, zn_t).clamp(1, nz_old - 1)
+    idx_lo = idx_hi - 1
+    z0 = torch.gather(zo_t, 1, idx_lo)
+    z1 = torch.gather(zo_t, 1, idx_hi)
+    v0 = torch.gather(vo_t, 1, idx_lo)
+    v1 = torch.gather(vo_t, 1, idx_hi)
+    w = ((zn_t - z0) / torch.clamp(z1 - z0, min=1.0e-3)).clamp(0.0, 1.0)
+    return ((1.0 - w) * v0 + w * v1).transpose(0, 1).contiguous()
+
+
+def _stratosphere_temp_extension(z_new: torch.Tensor, z_top_old: torch.Tensor, t_top_old: torch.Tensor) -> torch.Tensor:
+    """Continuous U.S. Standard Atmosphere (1976) temperature extrapolation above `z_top_old`."""
+    def _us76_offset(z: torch.Tensor) -> torch.Tensor:
+        return torch.where(
+            z <= 20000.0,
+            torch.zeros_like(z),
+            torch.where(
+                z <= 32000.0,
+                0.0010 * (z - 20000.0),
+                torch.where(
+                    z <= 47000.0,
+                    12.0 + 0.0028 * (z - 32000.0),
+                    torch.where(
+                        z <= 51000.0,
+                        torch.full_like(z, 54.0),
+                        torch.clamp(54.0 - 0.0024 * (z - 51000.0), min=-28.0),
+                    ),
+                ),
+            ),
+        )
+
+    dt_ext = _us76_offset(z_new) - _us76_offset(z_top_old)
+    return torch.clamp(t_top_old + dt_ext, min=180.0, max=285.0)
+
+
+def _remap_thermo_columns(
+    z_old: torch.Tensor,
+    rho_old: torch.Tensor,
+    thm_old: torch.Tensor,
+    qv_old: torch.Tensor,
+    qc_old: torch.Tensor,
+    qi_old: torch.Tensor,
+    qp_old: torch.Tensor,
+    z_new: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Hydrostatically consistent vertical remap + stratospheric extension `[nz_old, N] -> [nz_new, N]`."""
+    zo = z_old.to(torch.float64)
+    zn = z_new.to(torch.float64)
+    p_old, _, t_old = diagnose_pressure_temperature(
+        rho_old.to(torch.float64), thm_old.to(torch.float64), qv_old.to(torch.float64)
+    )
+    ln_p_interp = _interp_vertical_batch(zo, torch.log(torch.clamp(p_old, min=1.0)), zn)
+    t_interp = _interp_vertical_batch(zo, t_old, zn)
+    qv_interp = torch.clamp(_interp_vertical_batch(zo, qv_old.to(torch.float64), zn), min=1.0e-7)
+    qc_interp = torch.clamp(_interp_vertical_batch(zo, qc_old.to(torch.float64), zn), min=0.0)
+    qi_interp = torch.clamp(_interp_vertical_batch(zo, qi_old.to(torch.float64), zn), min=0.0)
+    qp_interp = torch.clamp(_interp_vertical_batch(zo, qp_old.to(torch.float64), zn), min=0.0)
+
+    z_top_old = zo[-1:].expand_as(zn)
+    above = zn > z_top_old
+    t_new = torch.where(above, _stratosphere_temp_extension(zn, z_top_old, t_old[-1:].expand_as(zn)), t_interp)
+    qv_top_dry = torch.clamp(qv_old[-1:].to(torch.float64), min=1.0e-7, max=4.0e-6).expand_as(zn)
+    qv_new = torch.where(above, qv_top_dry, qv_interp)
+    qc_new = torch.where(above, torch.zeros_like(qc_interp), qc_interp)
+    qi_new = torch.where(above, torch.zeros_like(qi_interp), qi_interp)
+    qp_new = torch.where(above, torch.zeros_like(qp_interp), qp_interp)
+    qn_new = qv_new + qc_new + qi_new
+
+    p_new = torch.exp(ln_p_interp)
+    nz_new = zn.shape[0]
+    for k in range(1, nz_new):
+        ab_k = above[k]
+        if ab_k.any():
+            dz_k = torch.clamp(zn[k] - zn[k - 1], min=1.0)
+            t_mid = 0.5 * (t_new[k - 1] + t_new[k])
+            p_hyd = p_new[k - 1] * torch.exp(-C.GRAVITY * dz_k / (C.R_D * t_mid))
+            p_new[k] = torch.where(ab_k, torch.clamp(p_hyd, min=1.0), p_new[k])
+
+    rho_new = p_new / (C.R_D * t_new * (1.0 + C.RV_OVER_RD * qv_new))
+    thm_new = (C.P_REF / (C.R_D * rho_new)) * torch.pow(p_new / C.P_REF, 1.0 / C.GAMMA_D)
+    return (
+        rho_new.to(rho_old.dtype),
+        thm_new.to(thm_old.dtype),
+        qn_new.to(qv_old.dtype),
+        qp_new.to(qp_old.dtype),
+        qv_new.to(qv_old.dtype),
+        qc_new.to(qc_old.dtype),
+        qi_new.to(qi_old.dtype),
+    )
+
+
 def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device) -> dict[str, Any]:
-    """Restore prognostic tensors (including subgrid `sfc_sub` & `clim_sub`) from `restart.pt`."""
+    """Restore prognostic tensors (including vertical remap when `nz` / `z_top` changes) from `restart.pt`."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.sim_time_sec = float(ckpt["sim_time_sec"])
     model.step_count = int(ckpt["step_count"])
-    for k, v in ckpt["atmos"].__dict__.items():
-        setattr(model.atmos, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
-    for k, v in ckpt["crm"].__dict__.items():
-        setattr(model.crm, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+
+    ck_atmos = ckpt["atmos"]
+    ck_crm = ckpt["crm"]
+    nz_old = int(ck_atmos.rho_d.shape[0])
+    nz_new = int(model.atmos.rho_d.shape[0])
+    z_top_old_val = float(ck_atmos.z_w[-1].mean().item())
+    z_top_new_val = float(model.atmos.z_w[-1].mean().item())
+    needs_vremap = (nz_old != nz_new) or (abs(z_top_old_val - z_top_new_val) > 50.0)
+
+    if not needs_vremap:
+        for k, v in ck_atmos.__dict__.items():
+            setattr(model.atmos, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+        for k, v in ck_crm.__dict__.items():
+            setattr(model.crm, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+        model.rad_cache = {k: v.to(device=device) for k, v in ckpt["rad_cache"].items()}
+    else:
+        print(
+            f"  [Vertical Remap] Seamlessly connecting restart ({nz_old} layers, top={z_top_old_val/1000:.1f} km) "
+            f"-> active grid ({nz_new} layers, top={z_top_new_val/1000:.1f} km)...",
+            flush=True,
+        )
+        z_old_c = ck_atmos.z_c.cpu()
+        z_new_c = model.atmos.z_c.cpu()
+        z_old_w = ck_atmos.z_w.cpu()
+        z_new_w = model.atmos.z_w.cpu()
+
+        # 1. Host thermodynamics (hydrostatic stratospheric extension above z_old_top)
+        rho_n, thm_n, qn_n, qp_n, qv_n, qc_n, qi_n = _remap_thermo_columns(
+            z_old_c, ck_atmos.rho_d, ck_atmos.theta_m, ck_atmos.q_v, ck_atmos.q_c, ck_atmos.q_i, ck_atmos.q_p, z_new_c
+        )
+        model.atmos.rho_d = rho_n.to(device=device)
+        model.atmos.theta_m = thm_n.to(device=device)
+        model.atmos.q_n = qn_n.to(device=device)
+        model.atmos.q_p = qp_n.to(device=device)
+        model.atmos.q_v = qv_n.to(device=device)
+        model.atmos.q_c = qc_n.to(device=device)
+        model.atmos.q_i = qi_n.to(device=device)
+
+        # Host edge winds: interpolate below z_old_top, smooth exponential taper aloft
+        c0 = model.mesh.cells_on_edge[:, 0].cpu()
+        c1 = model.mesh.cells_on_edge[:, 1].cpu()
+        ze_old = 0.5 * (z_old_c[:, c0] + z_old_c[:, c1])
+        ze_new = 0.5 * (z_new_c[:, c0] + z_new_c[:, c1])
+        ue_interp = _interp_vertical_batch(ze_old, ck_atmos.u_edge, ze_new)
+        taper_e = torch.exp(-torch.clamp(ze_new - ze_old[-1:], min=0.0) / 12000.0)
+        model.atmos.u_edge = (ue_interp * taper_e).to(device=device)
+
+        w_interp = _interp_vertical_batch(z_old_w, ck_atmos.w, z_new_w)
+        model.atmos.w = torch.where(z_new_w > z_old_w[-1:], torch.zeros_like(w_interp), w_interp).to(device=device)
+        if getattr(ck_atmos, "q_dust", None) is not None and model.atmos.q_dust is not None:
+            qd_i = torch.clamp(_interp_vertical_batch(z_old_c, ck_atmos.q_dust, z_new_c), min=0.0)
+            model.atmos.q_dust = torch.where(z_new_c > z_old_c[-1:], torch.zeros_like(qd_i), qd_i).to(device=device)
+
+        # 2. Embedded 1:1 CRM columns [nz, nc, ny, nx] -> flatten to [nz, nc*ny*nx]
+        _, nc, ny, nx = ck_crm.rho_d.shape
+        n_sub = ny * nx
+        m_sub = nc * n_sub
+        zo_sub = z_old_c.unsqueeze(-1).expand(nz_old, nc, n_sub).reshape(nz_old, m_sub)
+        zn_sub = z_new_c.unsqueeze(-1).expand(nz_new, nc, n_sub).reshape(nz_new, m_sub)
+        zow_sub = z_old_w.unsqueeze(-1).expand(nz_old + 1, nc, n_sub).reshape(nz_old + 1, m_sub)
+        znw_sub = z_new_w.unsqueeze(-1).expand(nz_new + 1, nc, n_sub).reshape(nz_new + 1, m_sub)
+
+        c_rho, c_thm, c_qn, c_qp, c_qv, c_qc, c_qi = _remap_thermo_columns(
+            zo_sub,
+            ck_crm.rho_d.reshape(nz_old, m_sub),
+            ck_crm.theta_m.reshape(nz_old, m_sub),
+            ck_crm.q_v.reshape(nz_old, m_sub),
+            ck_crm.q_c.reshape(nz_old, m_sub),
+            ck_crm.q_i.reshape(nz_old, m_sub),
+            ck_crm.q_p.reshape(nz_old, m_sub),
+            zn_sub,
+        )
+        taper_sub = torch.exp(-torch.clamp(zn_sub - zo_sub[-1:], min=0.0) / 12000.0)
+        c_u = _interp_vertical_batch(zo_sub, ck_crm.u.reshape(nz_old, m_sub), zn_sub) * taper_sub
+        c_v = _interp_vertical_batch(zo_sub, ck_crm.v.reshape(nz_old, m_sub), zn_sub) * taper_sub
+        c_w_i = _interp_vertical_batch(zow_sub, ck_crm.w.reshape(nz_old + 1, m_sub), znw_sub)
+        c_w = torch.where(znw_sub > zow_sub[-1:], torch.zeros_like(c_w_i), c_w_i)
+        c_qke_i = _interp_vertical_batch(zo_sub, ck_crm.qke.reshape(nz_old, m_sub), zn_sub)
+        c_qke = torch.where(zn_sub > zo_sub[-1:], torch.full_like(c_qke_i, 2.0e-4), torch.clamp(c_qke_i, min=2.0e-4))
+
+        sh4 = (nz_new, nc, ny, nx)
+        model.crm.rho_d = c_rho.reshape(sh4).to(device=device)
+        model.crm.theta_m = c_thm.reshape(sh4).to(device=device)
+        model.crm.q_n = c_qn.reshape(sh4).to(device=device)
+        model.crm.q_p = c_qp.reshape(sh4).to(device=device)
+        model.crm.q_v = c_qv.reshape(sh4).to(device=device)
+        model.crm.q_c = c_qc.reshape(sh4).to(device=device)
+        model.crm.q_i = c_qi.reshape(sh4).to(device=device)
+        model.crm.u = c_u.reshape(sh4).to(device=device)
+        model.crm.v = c_v.reshape(sh4).to(device=device)
+        model.crm.w = c_w.reshape(nz_new + 1, nc, ny, nx).to(device=device)
+        model.crm.qke = c_qke.reshape(sh4).to(device=device)
+
+        # Force fresh radiation evaluation on the first step with the new vertical grid
+        model.rad_cache = {}
+        stride = max(int(model.cfg.rad_stride), 1)
+        model.step_count = (model.step_count // stride) * stride
+        ckpt["_vertical_remapped"] = True
+
     # Honor active run_config grid spacing (`crm_dx`) when switching spacing on resume
     model.crm.dx = float(model.cfg.crm_dx)
     model.crm.dy = float(model.cfg.crm_dx)
@@ -185,7 +382,6 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
     if ckpt.get("mesh_dynamic") is not None:
         for k, v in ckpt["mesh_dynamic"].items():
             setattr(model.mesh, k, v.to(device=device))
-    model.rad_cache = {k: v.to(device=device) for k, v in ckpt["rad_cache"].items()}
     return ckpt
 
 
@@ -325,6 +521,12 @@ def main() -> None:
     parser.add_argument("--out-dir", type=str, default="")
     parser.add_argument("--device", type=str, default="")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument(
+        "--init-from-restart",
+        type=str,
+        default="",
+        help="Optional external restart.pt / restart_mid.pt to warm-start from (supports vertical grid remap)",
+    )
     parser.add_argument("--dynamic-icesheet", action="store_true", default=None, help="Enable SIA + EMA-accelerated ice-sheet coupling")
     parser.add_argument("--icesheet-ema-years", type=float, default=None)
     parser.add_argument("--icesheet-accel", type=float, default=None)
@@ -398,6 +600,7 @@ def main() -> None:
     resume_m_idx = 0
     resume_m_cnt = 0
     resume_m_sums: dict[str, torch.Tensor] = {}
+    resumed_existing = False
     if not args.no_resume:
         for y in range(years, 0, -1):
             y_dir = out_root / f"year_{y:04d}"
@@ -405,17 +608,34 @@ def main() -> None:
                 print(f"Resuming from completed Year {y:04d} ({y_dir / 'restart.pt'})...", flush=True)
                 _load_restart_into_model(model, y_dir / "restart.pt", dev)
                 start_year = y + 1
+                resumed_existing = True
                 break
         if start_year <= years:
             mid_pt = out_root / f"year_{start_year:04d}" / "restart_mid.pt"
             if mid_pt.exists():
                 print(f"Resuming mid-year from {mid_pt}...", flush=True)
                 ckpt_mid = _load_restart_into_model(model, mid_pt, dev)
-                resume_step_in_yr = int(ckpt_mid.get("resume_step_in_yr", 0))
-                resume_m_idx = int(ckpt_mid.get("resume_m_idx", 0))
-                resume_m_cnt = int(ckpt_mid.get("resume_m_cnt", 0))
-                raw_msums = ckpt_mid.get("resume_m_sums", {}) or {}
-                resume_m_sums = {k: v.to(device=dev) for k, v in raw_msums.items()}
+                resumed_existing = True
+                if not ckpt_mid.get("_vertical_remapped", False):
+                    resume_step_in_yr = int(ckpt_mid.get("resume_step_in_yr", 0))
+                    resume_m_idx = int(ckpt_mid.get("resume_m_idx", 0))
+                    resume_m_cnt = int(ckpt_mid.get("resume_m_cnt", 0))
+                    raw_msums = ckpt_mid.get("resume_m_sums", {}) or {}
+                    resume_m_sums = {k: v.to(device=dev) for k, v in raw_msums.items()}
+
+    if not resumed_existing and args.init_from_restart:
+        init_pt = Path(args.init_from_restart).expanduser()
+        if not init_pt.exists():
+            raise FileNotFoundError(f"--init-from-restart file not found: {init_pt}")
+        print(f"Warm-starting from external restart checkpoint: {init_pt}...", flush=True)
+        _load_restart_into_model(model, init_pt, dev)
+        elapsed_yr = int(math.floor(model.sim_time_sec / (C.SECONDS_PER_DAY * days_per_year) + 1.0e-6))
+        start_year = max(1, min(years, elapsed_yr + 1))
+        print(
+            f"  Continuing at date {model.calendar.date_at(model.sim_time_sec).iso_datetime} "
+            f"(start_year={start_year:04d}/{years:04d})",
+            flush=True,
+        )
 
     # Expose initial T2 / OLR / LAI + Earth2014 continents immediately for Tab 5 live globes
     _write_live_preview_atomic(

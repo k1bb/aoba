@@ -6,10 +6,10 @@
 # --- Horizontal, Vertical & Subgrid CRM Mesh Settings ---
 [grid]
 glevel = 3
-nz = 32
-z_top = 24000.0
+nz = 44
+z_top = 48000.0
 dz_min = 60.0
-z_sponge_base = 17500.0
+z_sponge_base = 36000.0
 tau_sponge_min = 300.0
 terrain_scale_exp = 1.5
 crm_nx = 8
@@ -28,9 +28,10 @@ co2_ppmv = 400.0
 co2_mode = "constant"
 co2_scenario = "obs_historical_noaa"
 co2_csv_path = ""
-o3_mode = "rcemip"
+o3_mode = "latitude_seasonal"
 o3_file_path = ""
-o3_lw_coupling = false
+o3_lw_coupling = true
+enable_nonoro_gwd = true
 solar_constant = 1361.0
 omega = 7.292115e-05
 obliquity_deg = 23.44
@@ -255,6 +256,20 @@ enable_shallow_water_ocn = true
 hn_crit = 0.5
 cd_block = 1.0
 g_wave = 0.8
+
+# --- Map-Free Flow-Dependent Non-Orographic GWD (Beres 2004; Charron & Manzini 2002; Richter 2010) ---
+[gravity_wave]
+ngwd_front_thresh = 1.25e-15
+ngwd_front_launch_hpa = 600.0
+ngwd_front_tau0 = 0.0015
+ngwd_front_cw = 30.0
+ngwd_front_eff = 0.1
+ngwd_conv_tau0 = 0.002
+ngwd_conv_qref = 0.0002
+ngwd_conv_eff = 0.25
+ngwd_wavelength_m = 200000.0
+ngwd_cmax = 80.0
+ngwd_tend_max = 0.001157
 
 # --- Glen Flow Law & Lithospheric Isostasy Physics Constants ---
 [icesheet_physics]

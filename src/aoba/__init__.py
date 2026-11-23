@@ -39,6 +39,7 @@ from aoba.icesheet import (
     remap_atmosphere_and_crm_vertical,
     step_sia_icesheet_scvt,
 )
+from aoba.gravity_wave import compute_frontogenesis_2d, compute_nonorographic_gwd
 from aoba.io_zarr import append_zarr, export_aoba_snapshot_xarray, load_zarr, save_zarr
 from aoba.kernels import solve_tridiagonal_batched
 from aoba.koppen import KOPPEN_NAMES, classify_koppen_geiger

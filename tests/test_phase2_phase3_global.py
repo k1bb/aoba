@@ -273,7 +273,7 @@ def test_full_global_coupled_aoba_and_zarr_v3_io(device: str) -> None:
         ds_reloaded = load_zarr(zpath)
         assert ds_reloaded.attrs["Conventions"] == "CF-1.11 UGRID-1.0"
         assert ds_reloaded.sizes["n_cell"] == 162
-        assert ds_reloaded.sizes["nz"] == 32
+        assert ds_reloaded.sizes["nz"] == cfg.nz
         assert ds_reloaded.sizes["crm_y"] == cfg.crm_ny
         assert ds_reloaded.sizes["crm_x"] == cfg.crm_nx
         assert "koppen_code" in ds_reloaded.data_vars

@@ -103,6 +103,26 @@ def init_global_hydrostatic_atmosphere(
         t_sl.unsqueeze(0) - lapse * zc64,
         torch.full_like(zc64, t_strat),
     )
+    # U.S. Standard Atmosphere (1976) stratospheric inversion & mesospheric lapse above 20 km
+    # Keeps z <= 20 km identical while giving realistic static stability N^2 & stratopause (~262 K) up to 48-80 km
+    strat_dt = torch.where(
+        zc64 <= 20000.0,
+        torch.zeros_like(zc64),
+        torch.where(
+            zc64 <= 32000.0,
+            0.0010 * (zc64 - 20000.0),
+            torch.where(
+                zc64 <= 47000.0,
+                12.0 + 0.0028 * (zc64 - 32000.0),
+                torch.where(
+                    zc64 <= 51000.0,
+                    torch.full_like(zc64, 54.0),
+                    torch.clamp(54.0 - 0.0024 * (zc64 - 51000.0), min=-28.0),
+                ),
+            ),
+        ),
+    )
+    temp64 = temp64 + strat_dt
     if baroclinic_pert:
         # Small localized synoptic temperature wave in midlatitudes to seed baroclinic eddies
         wave = 1.0 * torch.sin(3.0 * lon64) * (torch.sin(2.0 * lat64) ** 2)

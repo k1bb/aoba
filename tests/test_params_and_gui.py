@@ -47,8 +47,8 @@ def test_toml_roundtrip_and_module_sync() -> None:
 
     defaults = default_config_dict()
     loaded = load_aoba_toml(toml_p)
-    assert len(defaults) == 13
-    assert sum(len(v) for v in defaults.values()) == 222
+    assert len(defaults) == 14
+    assert sum(len(v) for v in defaults.values()) == 234
     assert set(loaded.keys()) == set(defaults.keys())
     for sec in defaults:
         assert set(loaded[sec].keys()) == set(defaults[sec].keys()), f"Key mismatch in [{sec}]"
@@ -129,7 +129,7 @@ def test_gui_server_endpoints() -> None:
             assert len(m_resp["verts_on_cell_b64"]) > 0 and len(m_resp["surf_type_b64"]) > 0
 
         state = json.loads(urllib.request.urlopen(f"{base}/api/state").read().decode("utf-8"))
-        assert state["param_count"] == 222
+        assert state["param_count"] == 234
         assert "grid" in state["config"]
 
         co2_cat = json.loads(urllib.request.urlopen(f"{base}/api/co2_catalog").read().decode("utf-8"))
@@ -387,11 +387,106 @@ def test_ozone_forcing_modes_and_high_top() -> None:
     assert rad_on.toa_olr.item() < rad_off.toa_olr.item()
 
 
+def test_nonorographic_gwd_and_stratosphere_high_top() -> None:
+    import torch
+    from aoba.coupled_model import step_aoba_model
+    from aoba.gravity_wave import compute_frontogenesis_2d, compute_nonorographic_gwd
+    from aoba.scvt_mesh import build_scvt_mesh
+    from aoba.thermodynamics import diagnose_pressure_temperature
+
+    # 1. Frontogenesis operator: zero for uniform field, positive in confluent thermal gradient
+    mesh = build_scvt_mesh(glevel=2, n_lloyd_iter=4, use_earth2014=False, device="cpu")
+    th_const = torch.full((mesh.n_cells,), 300.0)
+    u_zero = torch.zeros((mesh.n_cells,))
+    ff_zero = compute_frontogenesis_2d(mesh, th_const, u_zero, u_zero)
+    assert float(ff_zero.abs().max().item()) < 1e-18
+
+    # Synthetic midlatitude baroclinic frontal zone with meridional confluence
+    th_grad = 300.0 - 20.0 * torch.tanh(10.0 * (mesh.lat_cell - 0.785))
+    v_conf = -20.0 * torch.tanh(10.0 * (mesh.lat_cell - 0.785))
+    ff_front = compute_frontogenesis_2d(mesh, th_grad, u_zero, v_conf)
+    assert float(ff_front.max().item()) > 1.25e-15
+
+    # 2. High-top stratospheric coupled integration (48 km, nz=44, map-free NGWD + 2D O3 + 9.6 um LW)
+    cfg = AOBAConfig(
+        glevel=1,
+        nz=44,
+        z_top=48000.0,
+        z_sponge_base=36000.0,
+        crm_nx=2,
+        crm_ny=1,
+        use_earth2014=False,
+        enable_nonoro_gwd=True,
+        o3_mode="latitude_seasonal",
+        o3_lw_coupling=True,
+        dt_host=600.0,
+        n_crm_dyn_substeps=15,
+        rad_stride=1,
+    )
+    model = init_aoba_model(cfg, device="cpu")
+    p0, _, t0 = diagnose_pressure_temperature(model.atmos.rho_d, model.atmos.theta_m, model.atmos.q_v)
+    # Initial stratopause near 46 km should be ~0.5-1.5 hPa and ~255-275 K
+    assert 50.0 < float(p0[-1].mean().item()) < 200.0
+    assert 245.0 < float(t0[-1].mean().item()) < 280.0
+
+    # Inject realistic convective heating and shear wind to verify Beres + Lindzen saturation in stratosphere
+    q_conv = torch.zeros_like(model.atmos.rho_d)
+    trop_mask = (model.atmos.z_c > 2000.0) & (model.atmos.z_c < 12000.0)
+    q_conv = torch.where(trop_mask, torch.full_like(q_conv, 3.0e-4), q_conv)
+    u_shear = 45.0 * torch.tanh((model.atmos.z_c - 15000.0) / 10000.0)
+    du_gwd, dv_gwd = compute_nonorographic_gwd(
+        mesh=model.mesh,
+        rho_d=model.atmos.rho_d,
+        pres_c=p0,
+        u_cell=u_shear,
+        v_cell=torch.zeros_like(u_shear),
+        theta_m=model.atmos.theta_m,
+        z_rel_c=model.atmos.z_c - model.atmos.z_w[0:1],
+        dz_c=model.atmos.dz_c,
+        q_conv_c=q_conv,
+        dt=600.0,
+    )
+    assert torch.isfinite(du_gwd).all() and torch.isfinite(dv_gwd).all()
+    # Stratospheric breaking above 20 km should decelerate the strong positive westerly jet
+    strat_idx = model.vgrid.zeta_c > 20000.0
+    assert float(du_gwd[strat_idx].abs().max().item()) > 1.0e-6
+
+    # Run 6 coupled steps across the full 48 km stratosphere domain
+    for _ in range(6):
+        diag = step_aoba_model(model)
+        assert 150.0 < diag.global_mean_t_sfc_k < 340.0
+    p1, _, t1 = diagnose_pressure_temperature(model.atmos.rho_d, model.atmos.theta_m, model.atmos.q_v)
+    assert torch.isfinite(t1).all() and float(t1[-1].min().item()) > 180.0 and float(t1[-1].max().item()) < 310.0
+
+    # 3. Seamless vertical-remap restart: low-top (nz=16, 24 km) -> high-top (nz=44, 48 km)
+    from run_g5_30yr import _load_restart_into_model, _save_restart_atomic
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg_low = AOBAConfig(
+            glevel=1, nz=16, z_top=24000.0, z_sponge_base=17500.0,
+            crm_nx=2, crm_ny=1, use_earth2014=False, dt_host=600.0, n_crm_dyn_substeps=10,
+        )
+        m_low = init_aoba_model(cfg_low, device="cpu")
+        step_aoba_model(m_low)
+        ckpt_p = Path(tmpdir) / "low_top_restart.pt"
+        _save_restart_atomic(m_low, ckpt_p)
+
+        m_high = init_aoba_model(cfg, device="cpu")
+        ck = _load_restart_into_model(m_high, ckpt_p, torch.device("cpu"))
+        assert ck.get("_vertical_remapped", False) is True
+        assert m_high.atmos.rho_d.shape[0] == 44 and m_high.crm.rho_d.shape[0] == 44
+        for _ in range(2):
+            d_hi = step_aoba_model(m_high)
+            assert 150.0 < d_hi.global_mean_t_sfc_k < 340.0
+        _, _, t_hi = diagnose_pressure_temperature(m_high.atmos.rho_d, m_high.atmos.theta_m, m_high.atmos.q_v)
+        assert torch.isfinite(t_hi).all() and float(t_hi[-1].min().item()) > 180.0 and float(t_hi[-1].max().item()) < 310.0
+
+
 if __name__ == "__main__":
     test_toml_roundtrip_and_module_sync()
     test_snapshot_variable_filtering()
     test_gui_server_endpoints()
     test_co2_forcing_modes_and_calendar()
     test_ozone_forcing_modes_and_high_top()
+    test_nonorographic_gwd_and_stratosphere_high_top()
     test_runner_cli_with_custom_toml_cpu()
     print("ALL PARAMS, OUTPUT & GUI TESTS PASSED.")

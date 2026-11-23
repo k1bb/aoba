@@ -500,9 +500,18 @@ $$
 $$
 ここで絶対渦度 $\eta_v = \zeta_v + f_v$、歪対称重み $w_{e,e'}$ は恒等式 $A_e w_{e,e'} + A_{e'} w_{e',e} = 0$ を満たしてコリオリ力・回転項のエネルギー生成をゼロに保つ。水平混合項 $D_{u,e}$ は3D発散ダンピング・Smagorinsky 粘性および4階超粘性 $\nabla^4$ で構成され、鉛直方向には第9章と共通構造の圧縮性 HEVI ソルバ（地形勾配に伴う反変鉛直速度 $u \cdot \nabla z$ を含む）および SCVT 上の Zalesak FCT 移流を統合する。
 
-### 10.2 Lott & Miller (1997) サブグリッド山岳ドラッグ (`src/aoba/orography.py`)
+### 10.2 Lott & Miller (1997) サブグリッド山岳ドラッグ ＆ マップ不要・流れ依存 非地形性重力波 (`src/aoba/orography.py`, `src/aoba/gravity_wave.py`)
 
 各セルの `Earth2014` 起伏共分散統計 $(\mu = \sigma_{\mathrm{topo}},\ \text{勾配 } \sigma,\ \text{異方性 } \gamma,\ \text{主軸角 } \psi)$ と下層入射流 $(\mathbf{U}_L, \bar{N}_L)$ から逆フルード数 $H_n = \bar{N}_L (2\mu) / |\mathbf{U}_L|$ を評価する。風向と主軸のなす角 $\phi = \theta_{\mathrm{wind}} - \psi$ から楕円指向性因子 $D_{\mathrm{dir}}(\phi, \gamma)$ を求め、$H_n > H_{nc} = 0.50$ のときブロッキング高さ $Z_b = 2\mu(1 - H_{nc}/H_n)$ 以下には陰的減衰率付きの鈍頭物体ウェイクドラッグ（$C_d = 1.00$）を課す。残余山高 $h_{\mathrm{eff}} = 2\mu - Z_b$ からは重力波起動応力 $\tau_{\mathrm{launch}} = \rho_L k_w \bar{N}_L |\mathbf{U}_L| h_{\mathrm{eff}}^2$（$G = 0.80$）を発射し、上層各境界で Lindzen 飽和応力 $\tau_{\mathrm{sat}}(z) \propto \rho U_{\mathrm{proj}}^3 / (N H_{nc}^2)$ を超過する運動量フラックスを砕波減速として大気へ還元する（MIROC6, Sec. 3.5）。
+
+さらに `enable_nonoro_gwd = true` 時には、処方波源マップを一切用いずに成層圏循環・極渦・QBO を自律駆動する**流れ依存（flow-dependent）非地形性重力波ドラッグ**（`src/aoba/gravity_wave.py`）を結合する：
+1. **前線・ジェット由来波源**（Hoskins, 1982; Charron & Manzini, 2002, Eqs. 1–7; Richter et al., 2010, Sec. 2a, Eqs. 1–2）：$600\ \mathrm{hPa}$ 付近で SCVT ガウス・グリーン水平勾配から2次元前線形成関数
+   $$
+   \mathcal{F} = -\left(\frac{\partial \theta}{\partial x}\right)^2\frac{\partial u}{\partial x} - \left(\frac{\partial \theta}{\partial y}\right)^2\frac{\partial v}{\partial y} - \frac{\partial \theta}{\partial x}\frac{\partial \theta}{\partial y}\left(\frac{\partial v}{\partial x} + \frac{\partial u}{\partial y}\right)
+   $$
+   を算出し、$\mathcal{F} > \mathcal{F}_{\mathrm{crit}} = 1.25\times 10^{-15}\ \mathrm{K^2\ m^{-2}\ s^{-1}}$ を超える前線域から風向に沿ったガウス型位相速度スペクトル $\tau_{\mathrm{fr}}(c_m) \propto \tau_{\mathrm{bgnd}}\exp[-(c_m - u_{\mathrm{src}})^2/c_w^2]$（$c_w = 30\ \mathrm{m\ s^{-1}}$）を発射する。
+2. **1:1 CRM 対流加熱由来波源**（Beres, Alexander, & Holton, 2004, Eqs. 6–12; Beres et al., 2005; Richter et al., 2010, Sec. 2b）：対流圏内の CRM 潜熱加熱プロファイル $Q_{\mathrm{conv}}(z) > 0$ から最大加熱率 $Q_0$・加熱層厚 $h_d$（$Q > 0.1 Q_0$）・加熱層平均風 $\mathbf{u}_h$・安定度 $N_h$ を直接診断し、固有位相速度ピーク $\sigma_c = \mathrm{clip}(N_h h_d / \pi, 10, 60)\ \mathrm{m\ s^{-1}}$ の2峰スペクトル $\tau_{\mathrm{conv}}(c_m) \propto \tau_{c,0}(Q_0/Q_{\mathrm{ref}})^2 (|c_m - u_h|/\sigma_c)\exp[-\frac{1}{2}((c_m - u_h)/\sigma_c)^2]$ を東西・南北2軸へ発射する。
+3. **上端透過スペクトル伝播と Lindzen 飽和**（Lindzen, 1981; Alexander & Dunkerton, 1999; Richter et al., 2010, Eqs. 4–10）：離散位相速度ビン $c_m \in [-80, +80]\ \mathrm{m\ s^{-1}}$ を上向き伝播し、臨界層吸収（$\hat{c}_m = c_m - u_{\mathrm{proj}}$ の符号反転または $|\hat{c}_m| \le 2\ \mathrm{m\ s^{-1}}$）および Lindzen 飽和 $\tau_{\mathrm{sat}, m} = \frac{1}{2}\varepsilon_{\mathrm{eff}}\rho k_h |\hat{c}_m|^3 / N$（$\lambda_h = 200\ \mathrm{km}$）で砕波減速を与える。最上端は**開放透過境界（open-top）**とし、未砕波フラックスがモデル上端（24–80 km）で偽の暴走加速を起こさない設計としている。
 
 ### 10.3 処方 $Q$ フラックス不要 1.5層ボロノイエクマン＋浅水波海洋 (`src/aoba/ocean_ekman.py`)
 
@@ -571,14 +580,14 @@ $$
 
 ## 12. 単一 TOML 設定管理・出力仕様・GUI コンフィギュレータ・全パラメータ一覧
 
-### 12.1 一元テキスト管理アーキテクチャと実行・GUI ツール (`src/aoba/params.py`, `src/aoba/co2_forcing.py`, `src/aoba/ozone_forcing.py`, `scripts/aoba_config_gui.py`)
+### 12.1 一元テキスト管理アーキテクチャと実行・GUI ツール (`src/aoba/params.py`, `src/aoba/co2_forcing.py`, `src/aoba/ozone_forcing.py`, `src/aoba/gravity_wave.py`, `scripts/aoba_config_gui.py`)
 
-モデルの再現性と透明性を保証するため、すべての格子設定・強制外力・動的氷床設定・出力ストリーム・物理定数（**13セクション・全222項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。大気 $\mathrm{CO_2}$ 濃度は `co2_mode` により **固定値 (`constant`)・シナリオ補間 (`scenario`)・独自 CSV (`csv`)** の3通りを選択でき、`scenario` 時はモデルの連続暦年（負の BCE 年を含む）に応じて同梱テーブル `src/aoba/assets/co2_scenarios.csv`（CMIP5 RCP・CMIP6 historical/SSP・南極氷床コア80万年復元・NOAA GML 接続）または `scripts/fetch_co2_data.py`／AOBA Studio から随時更新した最新キャッシュ `data/forcing/co2/co2_latest.csv` を線形補間する。大気オゾン $\mathrm{O_3}$ も同様に `o3_mode` により **1D RCEMIP (`rcemip`; Wing et al., 2018)・解析的2D緯度×季節 (`latitude_seasonal`)・外部帯状平均気候値 (`climatology`; `scripts/fetch_ozone_data.py` で CMIP6/CMIP7 input4MIPs から取得し、高空モデルトップ拡張時はテーブル上端より上で $p^{g_2}$ 減衰外挿)** を選択でき、さらに `o3_lw_coupling = true` で 9.6 μm 窓領域長波吸収も有効化できる。
+モデルの再現性と透明性を保証するため、すべての格子設定（成層圏拡張標準 `nz = 44, z_top = 48 km`、低トップ 24 km 切替可）・強制外力・非地形性重力波・動的氷床設定・出力ストリーム・物理定数（**14セクション・全234項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。大気 $\mathrm{CO_2}$ 濃度は `co2_mode` により **固定値 (`constant`)・シナリオ補間 (`scenario`)・独自 CSV (`csv`)** の3通りを選択でき、`scenario` 時はモデルの連続暦年（負の BCE 年を含む）に応じて同梱テーブル `src/aoba/assets/co2_scenarios.csv`（CMIP5 RCP・CMIP6 historical/SSP・南極氷床コア80万年復元・NOAA GML 接続）または `scripts/fetch_co2_data.py`／AOBA Studio から随時更新した最新キャッシュ `data/forcing/co2/co2_latest.csv` を線形補間する。大気オゾン $\mathrm{O_3}$ も同様に `o3_mode` により **解析的2D緯度×季節 (`latitude_seasonal`、既定)・1D RCEMIP (`rcemip`; Wing et al., 2018)・外部帯状平均気候値 (`climatology`; `scripts/fetch_ozone_data.py` で CMIP6/CMIP7 input4MIPs から取得し、高空モデルトップ拡張時はテーブル上端より上で $p^{g_2}$ 減衰外挿)** を選択でき、`o3_lw_coupling = true` で 9.6 μm 窓領域長波吸収およびオーバーヘッド $\mathrm{O_3}$・成層圏 15 μm $\mathrm{CO_2}$ 冷却を有効化する。
 - **ランタイム同期・ハードウェア自動チューニング (`src/aoba/params.py`, `src/aoba/runtime.py`)**: `load_aoba_toml()` で読み込んだ設定辞書に対し `build_configs_from_dict(cfg_dict, apply_modules=True)` を呼ぶと、`(AOBAConfig, OutputConfig)` インスタンスを生成すると同時に、`_MODULE_PARAM_MAP` に登録された `src/aoba/*` モジュールの全定数をライブ更新し、各モジュールの `recompute_derived_constants()`（`microphysics`, `turbulence`, `ocean_ekman`, `icesheet` 内の Metal 定数配列や導出係数を含む）を再計算する。さらに `detect_hardware_profile()` / `compute_optimal_chunks()` / `apply_runtime_tuning()` により実行マシンの GPU コア数・利用可能メモリ・P-core 数を自動検出し、メモリ予算 $B = 0.45\, M_{\mathrm{dev}}$ の範囲内で解像度を変えずに最速 1 パス／安全分割となる `crm_col_chunk`・`rad_col_chunk` と CPU スレッド数を自動適用する。
 - **Web GUI 統合ワークベンチ (`scripts/aoba_config_gui.py` / AOBA Studio)**: 標準ライブラリ（`http.server`）のみで動作するゼロ依存ローカル Web アプリ（`python scripts/aoba_config_gui.py --port 8765`）を備え、モデル設定から実行起動、プロセス監視、CPU リアルタイム可視化まで一気通貫で提供する：
   1. `glevel`（0〜6）の変更に連動してリアルタイム描画される**正二十面体 SCVT Voronoi 球面メッシュ可視化図 ＋ 1ホストセル対埋め込み CRM 領域スケール比較図 ＋ ストレッチ鉛直層・スポンジ層図**。
   2. 自転半減実験 (`0.5×Ω`)・LGM・`4×CO₂` プリセット、**CO₂/O₃ シナリオ選択・推移グラフ・NOAA/NCEI/RCMIP/ESGF 最新データ取得ボタン**、**カレンダー／固定日射設定**、および**氷床加速率 $\alpha_{\mathrm{eff}}(t)$／EMA 重み減衰曲線**プレビュー。
-  3. 出力ファイル種別・間隔設定、予想年間 Zarr/リスタート容量試算、および222パラメータ横断検索・TOML 保存。
+  3. 出力ファイル種別・間隔設定、予想年間 Zarr/リスタート容量試算、および234パラメータ横断検索・TOML 保存。
   4. **実行コントロール・ライブ監視・CPU リアルタイム日平均 3地球プレビュー**: GUI 上からの計算実行・停止、稼働中外部ジョブ（`run.log` / `daily_global.csv` / カレンダー日付 `YYYY-MM-DD`）の監視に加え、GPU 計算を一切阻害しない待機 CPU 上の `cKDTree` 球面再格子化エンジンにより、**日平均 `T2`（地表付近気温 $0.35 T_{\mathrm{sfc}} + 0.65 T_{a,z_1}$）・日平均降水量 `Precip [mm/d]`・`LAI`** の3つの正射図法地球儀を「1モデル日＝1周（$360^\circ / T_{\mathrm{wall,day}}$）」の実時間同期自転または任意速度でリアルタイム可視化する（`live_preview.npz`, `snapshots.zarr`, `monthly.zarr` に対応）。
 
 ### 12.2 出力ファイル種別・平均値 vs 瞬時値仕様 (`OutputConfig`, `src/aoba/io_zarr.py`)
@@ -593,18 +602,18 @@ $$
 | `snapshots.zarr` | **瞬時値** (スナップショット) | `snapshots_enabled`, `snapshots_periods_per_year` (既定 `12`), `snapshots_include_{2d,3d,subgrid_2d}` | 上記2D (`h_canopy`, `vcmax25_c3`, `f_c4`, `f_evg` を含む)・3D変数 (`temp`, `pres`, `q_v`, `u_zonal`, `v_merid`) および上記サブグリッド2D瞬時場 (`*_sub`) |
 | `restart.pt` / `restart_mid.pt` | チェックポイント | `restart_interval_years` (既定 `1` 年), `restart_monthly` (既定 `true`), `zarr_dir_partition` | 完全な `GlobalAtmosState`, `CRMState`, `SurfaceState` (`sfc` & `sfc_sub`), `EkmanOceanState`, `IceSheetState`, `ClimateAccumulator`。`restart_monthly=true` 時は毎月末に `restart_mid.pt` を自動保存し、年内途中から Zarr/CSV 欠損なく決定論的再開可能 |
 
-### 12.3 全モデル設定・物理パラメータレジストリ（全13セクション・222項目）
+### 12.3 全モデル設定・物理パラメータレジストリ（全14セクション・234項目）
 
-表 12.1 に [`config/aoba_default.toml`](../config/aoba_default.toml) に定義された全222パラメータのセクション別完全リストを示す。
+表 12.1 に [`config/aoba_default.toml`](../config/aoba_default.toml) に定義された全234パラメータのセクション別完全リストを示す。
 
 #### `[grid]` — 水平・鉛直・サブグリッド CRM 格子設定（16項目）
 | TOML キー | 標準値 | 説明・単位 |
 | :--- | :--- | :--- |
 | `glevel` | `3` | SCVT 再帰分割レベル（$N_{\mathrm{cells}} = 10\cdot 4^g + 2$: G3=642, G4=2562, G5=10242） |
-| `nz` | `32` | ホスト・CRM 共通鉛直層数 |
-| `z_top` | `24000.0` | モデル上端高度 [m] |
+| `nz` | `44` | ホスト・CRM 共通鉛直層数（対流圏〜成層圏界面；低トップ時は `32`） |
+| `z_top` | `48000.0` | モデル上端高度 [m]（成層圏界面 ~0.85 hPa；低トップ時は `24000.0`） |
 | `dz_min` | `60.0` | 地表最下層厚 [m] |
-| `z_sponge_base` | `17500.0` | レイリー減衰スポンジ層底面高度 [m] |
+| `z_sponge_base` | `36000.0` | レイリー減衰スポンジ層底面高度 [m]（低トップ時は `17500.0`） |
 | `tau_sponge_min` | `300.0` | モデル上端最小スポンジ減衰時定数 [s] |
 | `terrain_scale_exp` | `1.5` | Klemp STF 減衰指数 $p$ [-] |
 | `crm_nx`, `crm_ny`, `crm_dx` | `8`, `1`, `4000.0` | 埋め込み CRM の $x, y$ 格子数および水平格子幅 [m] |
@@ -613,14 +622,14 @@ $$
 | `rad_stride` | `5` | 放射計算の呼出し間隔（ステップ数） |
 | `crm_col_chunk`, `rad_col_chunk` | `16384`, `32768` | GPU/CPU メモリ制御用バッチチャンクサイズ [columns] |
 
-#### `[forcing]`・`[icesheet]`・`[output]` — 外力・氷床制御・出力管理（52項目）
+#### `[forcing]`・`[icesheet]`・`[output]` — 外力・氷床制御・出力管理（53項目）
 | セクション | キー ＝ 標準値 |
 | :--- | :--- |
-| `[forcing]` (27) | `co2_ppmv = 400.0`, `co2_mode = "constant"`, `co2_scenario = "obs_historical_noaa"`, `co2_csv_path = ""`, `o3_mode = "rcemip"`, `o3_file_path = ""`, `o3_lw_coupling = false`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `start_date = "2000-03-20"`, `calendar_type = "gregorian"`, `insolation_mode = "seasonal"`, `fixed_insolation_date = "2000-03-20"`, `diurnal_cycle = true`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `enable_dust = true`, `dust_emis_factor = 1.5e-5`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 48.0`, `cloud_sw_inhomog = 0.85` |
+| `[forcing]` (28) | `co2_ppmv = 400.0`, `co2_mode = "constant"`, `co2_scenario = "obs_historical_noaa"`, `co2_csv_path = ""`, `o3_mode = "latitude_seasonal"`, `o3_file_path = ""`, `o3_lw_coupling = true`, `enable_nonoro_gwd = true`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `start_date = "2000-03-20"`, `calendar_type = "gregorian"`, `insolation_mode = "seasonal"`, `fixed_insolation_date = "2000-03-20"`, `diurnal_cycle = true`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `enable_dust = true`, `dust_emis_factor = 1.5e-5`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 48.0`, `cloud_sw_inhomog = 0.85` |
 | `[icesheet]` (5) | `enable_dynamic_icesheet = false`, `icesheet_ema_years = 5.0`, `icesheet_accel_factor = 100.0`, `icesheet_accel_spinup_years = 0.0`, `icesheet_isostasy_tau_yr = 1000.0` |
 | `[output]` (20) | `out_dir = ""`, `years = 30`, `end_date = ""`, `days_per_year = 365.2425`, `zarr_dir_partition = "yearly"`, `daily_csv_enabled = true`, `daily_csv_interval_days = 1.0`, `monthly_mean_enabled = true`, `monthly_mean_periods_per_year = 12`, `monthly_mean_sample_hours = 6.0`, `monthly_mean_include_2d = true`, `monthly_mean_include_3d = true`, `monthly_mean_include_subgrid_2d = true`, `snapshots_enabled = true`, `snapshots_periods_per_year = 12`, `snapshots_include_2d = true`, `snapshots_include_3d = true`, `snapshots_include_subgrid_2d = true`, `restart_interval_years = 1`, `restart_monthly = true` |
 
-#### `[constants]` 〜 `[icesheet_physics]` — 全物理・生態系・雪氷・海洋定数レジストリ（154項目）
+#### `[constants]` 〜 `[icesheet_physics]` — 全物理・生態系・雪氷・海洋定数レジストリ（165項目）
 | セクション | 項目数 | 登録キー ＝ 標準値（`src/aoba/` 対応モジュール名） |
 | :--- | :--- | :--- |
 | `[constants]` | 26 | `earth_radius = 6.371e6`, `gravity = 9.79764`, `omega_earth = 7.292115e-5`, `seconds_per_day = 86400.0`, `days_per_year = 365.2425`, `r_d = 287.04`, `cp_d = 1004.64`, `r_v = 461.5`, `cp_v = 1846.0`, `p_ref = 1e5`, `t_freeze = 273.15`, `t_triple = 273.16`, `e_triple = 611.2`, `l_v0 = 2.501e6`, `l_f0 = 3.337e5`, `t_ice_all = 253.15`, `t_liq_all = 273.16`, `stefan_boltzmann = 5.670374419e-8`, `von_karman = 0.4`, `rho_seawater = 1025.0`, `cp_seawater = 3990.0`, `t_freeze_ocean = 271.35`, `rho_seaice = 917.0`, `k_therm_seaice = 2.034`, `k_therm_snow = 0.3096`, `o2_mixing_ratio = 0.20946` (`constants.py`) |
@@ -631,4 +640,5 @@ $$
 | `[biosphere]` | 41 | `theta_nrh = 0.85`, `cost_c_smith = 0.05336251`, `phi_psii_ref_c3 = 0.257`, `beta_c3 = 146.0`, `beta_c4 = 166.0`, `gamma_star25_c3 = 4.332`, `kc25_c3 = 41.03`, `ko25_c3 = 28210.0`, `dha_gamma = 37830.0`, `dha_kc_c3 = 79430.0`, `dha_ko_c3 = 36380.0`, `gamma_star25_c4 = 2.6`, `kp25_umol_c4 = 60.5`, `dha_kp_c4 = 27200.0`, `kc25_c4 = 121.0`, `dha_kc_c4 = 64200.0`, `ko25_c4 = 29200.0`, `dha_ko_c4 = 10500.0`, `phi_leak_c4 = 0.2`, `gbs_c4 = 0.003`, `ha_vcmax = 71513.0`, `ha_jmax = 49884.0`, `ha_vpmax = 55000.0`, `hd_enzyme = 2e5`, `b_resp_ren = 0.018`, `leaf_scat_vis = 0.15`, `leaf_scat_nir = 0.8`, `kd_prime_par = 0.719`, `rho_cd_par = 0.036`, `z_foliage_cost = 12.227`, `k_beer_lai = 0.5`, `sigma_zhou = 0.771`, `alpha_ema_acclim = 0.067`, `evg_cost_ratio_base = 1.35`, `evg_cost_ratio_cold = 0.55`, `evg_cold_eff_penalty = 0.14`, `leaf_aging_b_yr = 15.0`, `decid_flush_days = 25.0`, `evg_offseason_resp25 = 32.0`, `evg_frost_crit_k = 233.15`, `evg_frost_cost = 18.0` (`biosphere.py`) |
 | `[ocean_ekman]` | 7 | `h_thermocline = 200.0`, `r_ekman_damp_days = 2.0`, `kappa_ocn_horiz = 2000.0`, `kappa_ocn_vert = 2e-5`, `g_prime_ocn = 0.03`, `tau_sw_drag_days = 180.0`, `enable_shallow_water_ocn = true` (`ocean_ekman.py`) |
 | `[orography]` | 3 | `hn_crit = 0.5`, `cd_block = 1.0`, `g_wave = 0.8` (`orography.py`) |
+| `[gravity_wave]` | 11 | `ngwd_front_thresh = 1.25e-15`, `ngwd_front_launch_hpa = 600.0`, `ngwd_front_tau0 = 1.5e-3`, `ngwd_front_cw = 30.0`, `ngwd_front_eff = 0.1`, `ngwd_conv_tau0 = 2e-3`, `ngwd_conv_qref = 2e-4`, `ngwd_conv_eff = 0.25`, `ngwd_wavelength_m = 2e5`, `ngwd_cmax = 80.0`, `ngwd_tend_max = 1.157e-3` (`gravity_wave.py`) |
 | `[icesheet_physics]` | 5 | `rho_ice = 917.0`, `rho_mantle = 3300.0`, `a_glen_per_year = 1e-16`, `h_ice_threshold_m = 5.0`, `h_ice_max_m = 6000.0` (`icesheet.py`) |

@@ -33,6 +33,7 @@ from aoba.biosphere import (
 )
 from aoba.crm import CRMState, SPTendencies, step_crm_physics_and_dynamics
 from aoba.dust import compute_dust_emission_sub, step_dust_column
+from aoba.gravity_wave import compute_nonorographic_gwd
 from aoba.icesheet import (
     H_ICE_THRESHOLD_M,
     IceSheetState,
@@ -79,10 +80,10 @@ class AOBAConfig:
     """Configuration for a global 1:1 Superparameterized AOBA simulation."""
 
     glevel: int = 3                          # SCVT mesh level (3 -> 642 cells; 4 -> 2562; 5 -> 10242)
-    nz: int = 32                             # Shared Charney-Phillips vertical levels
-    z_top: float = 24000.0                   # Model top height [m]
+    nz: int = 44                             # Shared Charney-Phillips vertical levels (troposphere + full stratosphere)
+    z_top: float = 48000.0                   # Model top height [m] (~0.85 hPa stratopause; 24000 m for low-top mode)
     dz_min: float = 60.0                     # Lowest layer thickness [m]
-    z_sponge_base: float = 17500.0           # Rayleigh sponge base height [m]
+    z_sponge_base: float = 36000.0           # Rayleigh sponge base height [m] (upper stratosphere 36-48 km)
     tau_sponge_min: float = 300.0            # Minimum sponge damping timescale [s]
     terrain_scale_exp: float = 1.5           # Klemp STF attenuation exponent p [-]
     h_ml_ocean: float = 50.0                 # Ocean mixed-layer depth [m]
@@ -102,9 +103,10 @@ class AOBAConfig:
     co2_mode: str = "constant"               # "constant", "scenario", or "csv"
     co2_scenario: str = "obs_historical_noaa"  # Scenario key when co2_mode="scenario"
     co2_csv_path: str = ""                   # Custom (year, co2_ppmv) CSV path when co2_mode="csv"
-    o3_mode: str = "rcemip"                  # "rcemip" (1D), "latitude_seasonal" (2D analytical), or "climatology"
+    o3_mode: str = "latitude_seasonal"       # "rcemip" (1D), "latitude_seasonal" (2D analytical), or "climatology"
     o3_file_path: str = ""                   # Optional external zonal/3D ozone (.npz/.nc) when o3_mode="climatology"
-    o3_lw_coupling: bool = False             # Enable 9.6 um O3 absorption in LW2 atmospheric window
+    o3_lw_coupling: bool = True              # Enable 9.6 um O3 absorption in LW2 atmospheric window
+    enable_nonoro_gwd: bool = True           # Map-free flow-dependent convective + frontal non-orographic GWD
     solar_constant: float = C.SOLAR_CONSTANT # Total solar irradiance S_0 [W m^-2]
     omega: float = C.OMEGA_EARTH             # Planetary rotation rate [rad s^-1]
     obliquity_deg: float = C.OBLIQUITY_DEG   # Axial tilt [deg]
@@ -169,6 +171,7 @@ class AOBAState:
     calendar: AobaCalendar = field(default_factory=AobaCalendar)
     co2_series: CO2ForcingSeries | None = None
     o3_provider: OzoneForcingProvider | None = None
+    q_conv_diag: torch.Tensor | None = None  # Previous-step 1:1 CRM convective heating [Nz, N_cells] [K s^-1]
 
     def current_co2_ppmv(self, sim_time_sec: float | None = None) -> float:
         """Return active atmospheric CO2 [ppmv] at ``sim_time_sec`` (or ``self.sim_time_sec``)."""
@@ -867,7 +870,8 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
         sfc_sub.m_seaice,
     )
 
-    # 5. Lott & Miller (1997) Subgrid Orographic Drag
+    # 5. Subgrid Orographic Drag (Lott & Miller, 1997) + Map-Free Non-Orographic GWD
+    #    (Convective: Beres et al., 2004, 2005; Frontal: Charron & Manzini, 2002; Richter et al., 2010)
     u_cell, v_cell = reconstruct_cell_winds(mesh, atmos.u_edge)
     du_oro_c, dv_oro_c = compute_orographic_drag_lott_miller(
         rho_d=atmos.rho_d,
@@ -882,6 +886,22 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
         angle_topo=mesh.angle_topo,
         dt=dt,
     )
+    if cfg.enable_nonoro_gwd:
+        pres_host_gwd, _, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        du_ngwd_c, dv_ngwd_c = compute_nonorographic_gwd(
+            mesh=mesh,
+            rho_d=atmos.rho_d,
+            pres_c=pres_host_gwd,
+            u_cell=u_cell,
+            v_cell=v_cell,
+            theta_m=atmos.theta_m,
+            z_rel_c=z_rel_c,
+            dz_c=atmos.dz_c,
+            q_conv_c=model.q_conv_diag,
+            dt=dt,
+        )
+        du_oro_c = du_oro_c + du_ngwd_c
+        dv_oro_c = dv_oro_c + dv_ngwd_c
     du_oro_edge = project_cell_vectors_to_edges(mesh, du_oro_c, dv_oro_c)
 
     # 6. Host SCVT Nonhydrostatic RK3-HEVI Dynamical Core & Voronoi FCT
@@ -892,7 +912,7 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
     if dc_min is None:
         dc_min = float(mesh.dc_edge.min().item())
         setattr(mesh, "_dc_edge_min_m", dc_min)
-    dt_adv_host = min(900.0, 0.40 * dc_min / 80.0)
+    dt_adv_host = min(900.0, 0.40 * dc_min / 100.0)
     n_hdyn = max(cfg.n_host_dyn_substeps, int(math.ceil(dt / max(dt_adv_host, 1.0))))
     dt_hdyn = dt / float(n_hdyn)
 
@@ -936,6 +956,7 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
     q_rad_4d = q_rad_sub.reshape(nz, nc, ny, nx)
 
     if cfg.enable_superparam:
+        thm_before_crm = atmos.theta_m.clone()
         du_crm_c = torch.zeros_like(u_host_new)
         dv_crm_c = torch.zeros_like(v_host_new)
         sfc_diag_3d = {k: v.reshape(nc, ny, nx) for k, v in sfc_diag_sub.__dict__.items()}
@@ -1046,6 +1067,11 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
 
         du_sp_edge = project_cell_vectors_to_edges(mesh, du_crm_c, dv_crm_c)
         atmos.u_edge = atmos.u_edge + dt * du_sp_edge
+        # Diagnose net 1:1 CRM convective diabatic heating [K s^-1] (excluding radiative heating)
+        # for map-free Beres et al. (2004, 2005) convective gravity-wave source parameterization
+        _, pi_post_crm, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        q_rad_cell = _sub_to_cell(q_rad_sub, nc, n_sub)
+        model.q_conv_diag = torch.clamp(((atmos.theta_m - thm_before_crm) / dt) * pi_post_crm - q_rad_cell, min=0.0)
 
     rain_new = _sub_to_cell(rain_new_sub, nc, n_sub)
     snow_new = _sub_to_cell(snow_new_sub, nc, n_sub)

@@ -884,10 +884,11 @@ _HTML_PAGE = r"""<!DOCTYPE html>
       <div class="card">
         <h2 data-i18n="g_ctrl_title">水平解像度 (SCVT) &amp; 子領域 CRM 設定</h2>
         <div class="preset-bar">
-          <button onclick="applyGridPreset(3, 8, 1, 4000, 32, 720)" data-i18n="pre_g3">標準軽量 (G3, 8×1)</button>
-          <button onclick="applyGridPreset(4, 8, 1, 4000, 32, 720)" data-i18n="pre_g4">長期気候 (G4, 8×1)</button>
-          <button onclick="applyGridPreset(5, 8, 1, 4000, 32, 720)" data-i18n="pre_g5">高解像度 (G5, 8×1)</button>
-          <button onclick="applyGridPreset(4, 8, 8, 4000, 32, 600)" data-i18n="pre_3dcrm">3D CRM (G4, 8×8, 4km)</button>
+          <button onclick="applyGridPreset(3, 8, 1, 4000, 44, 720, 48000, 36000)" data-i18n="pre_g3">成層圏標準 (G3, 44層 48km)</button>
+          <button onclick="applyGridPreset(4, 8, 1, 4000, 44, 720, 48000, 36000)" data-i18n="pre_g4">成層圏気候 (G4, 44層 48km)</button>
+          <button onclick="applyGridPreset(5, 8, 1, 4000, 44, 720, 48000, 36000)" data-i18n="pre_g5">成層圏高解像 (G5, 44層 48km)</button>
+          <button onclick="applyGridPreset(5, 8, 1, 4000, 32, 720, 24000, 17500)">高速対流圏 (G5, 32層 24km)</button>
+          <button onclick="applyGridPreset(4, 8, 8, 4000, 44, 600, 48000, 36000)" data-i18n="pre_3dcrm">3D CRM (G4, 8×8, 48km)</button>
           <button onclick="autoTuneChunks()" style="border-color:var(--accent); color:var(--accent);">⚡ マシン最適チャンク (解像度維持)</button>
           <span id="hw-badge" class="pill" style="font-size:11px;"></span>
         </div>
@@ -1347,6 +1348,7 @@ const PARAM_DOCS = {
   o3_mode: { ja: "オゾン分布モード (rcemip: 1D一様 / latitude_seasonal: 解析的2D緯度季節 / climatology: 外部帯状平均)", en: "Ozone mode (rcemip 1D / latitude_seasonal 2D / climatology external)" },
   o3_file_path: { ja: "外部オゾン気候値ファイル (.npz / .nc; 空欄時は data/boundary/ozone を参照)", en: "External ozone climatology path (.npz/.nc; blank uses data/boundary/ozone)" },
   o3_lw_coupling: { ja: "長波 9.6 μm 窓領域オゾン吸収を有効化", en: "Enable 9.6 um longwave O3 absorption in LW2 window" },
+  enable_nonoro_gwd: { ja: "マップ不要・流れ依存の非地形性重力波 (対流 Beres 2004 + 前線 Charron & Manzini 2002)", en: "Map-free flow-dependent non-orographic GWD (convective + frontal sources)" },
   start_date: { ja: "シミュレーション開始年月日 (YYYY-MM-DD)", en: "Simulation start date (YYYY-MM-DD)" },
   end_date: { ja: "終了年月日 (YYYY-MM-DD、空欄なら years を使用)", en: "Optional end date (YYYY-MM-DD; blank uses years)" },
   calendar_type: { ja: "暦の種類 (gregorian: 閏年あり / noleap: 365日 / 360_day)", en: "Calendar type (gregorian / noleap / 360_day)" },
@@ -1702,10 +1704,10 @@ function updateBadgesAndDiagrams() {
   updateRunCmd();
 }
 
-function applyGridPreset(g, nx, ny, dx, nz, dt) {
-  Object.assign(STATE.config.grid, { glevel: g, crm_nx: nx, crm_ny: ny, crm_dx: dx, nz: nz, dt_host: dt });
+function applyGridPreset(g, nx, ny, dx, nz, dt, ztop = 48000, zsp = 36000) {
+  Object.assign(STATE.config.grid, { glevel: g, crm_nx: nx, crm_ny: ny, crm_dx: dx, nz: nz, dt_host: dt, z_top: ztop, z_sponge_base: zsp });
   renderAll();
-  showToast(`格子プリセット G${g} (${nx}×${ny}, dx=${dx}m) を適用`);
+  showToast(`格子プリセット G${g} (${nx}×${ny}, dx=${dx}m, nz=${nz}, top=${ztop/1000}km) を適用`);
 }
 
 function applyForcingPreset(kind) {
