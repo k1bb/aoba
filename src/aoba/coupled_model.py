@@ -81,7 +81,7 @@ from aoba.vertical_grid import VerticalGrid, build_vertical_grid
 class AOBAConfig:
     """Configuration for a global 1:1 Superparameterized AOBA simulation."""
 
-    glevel: int = 3                          # SCVT mesh level (3 -> 642 cells; 4 -> 2562; 5 -> 10242)
+    glevel: int = 5                          # SCVT mesh level (default 5 -> 10242 cells; 3 -> 642; 4 -> 2562)
     nz: int = 44                             # Shared Charney-Phillips vertical levels (troposphere + full stratosphere)
     z_top: float = 48000.0                   # Model top height [m] (~0.85 hPa stratopause; 24000 m for low-top mode)
     dz_min: float = 60.0                     # Lowest layer thickness [m]
@@ -97,7 +97,7 @@ class AOBAConfig:
     crm_dx: float = 4000.0                   # Embedded CRM horizontal spacing [m] (4 km resolves convective cores cleanly)
     dt_host: float = 720.0                   # Coupled host / physics / SP time step [s] (12 min climate coupling)
     n_host_dyn_substeps: int = 1             # Minimum host RK3-HEVI substeps per dt_host (auto-increased if CFL requires)
-    n_crm_dyn_substeps: int = 18             # Embedded CRM RK3-HEVI substeps per dt_host (18 x 40 s = 720 s at dx=4 km)
+    n_crm_dyn_substeps: int = 12             # Embedded 2D CRM RK3-HEVI substeps per dt_host (12 x 60 s = 720 s at dx=4 km)
     rad_stride: int = 5                      # Radiation evaluation stride (steps; 5 x 720 s = 3600 s = 1 hr)
     crm_col_chunk: int = 16384               # Column batch chunk size for CRM evaluation (Unified Memory single-pass)
     rad_col_chunk: int = 32768               # Subcolumn chunk size for ICA radiative transfer (caps MPS peak buffer)

@@ -2000,6 +2000,756 @@ kernel void crm_2d_fast_hevi_loop_64(
 }
 
 // =========================================================================
+// 10b. Zero-Shared-Memory SIMD-Shuffle Fused 2D CRM Kernels
+//      (ny == 1, nx in {2,4,8,16,32}, nz <= 48, 0 KB threadgroup memory)
+// =========================================================================
+
+kernel void crm_2d_stage_prep_simd(
+    device const float* rho_s      [[buffer(0)]],
+    device const float* Thm_s      [[buffer(1)]],
+    device const float* u_s        [[buffer(2)]],
+    device const float* v_s        [[buffer(3)]],
+    device const float* w_s        [[buffer(4)]],
+    device const float* q_n_in     [[buffer(5)]],
+    device const float* q_p_in     [[buffer(6)]],
+    device const float* du_sgs     [[buffer(7)]],
+    device const float* dv_sgs     [[buffer(8)]],
+    device const float* dw_sgs     [[buffer(9)]],
+    device const float* dz_c       [[buffer(10)]],
+    device const float* dz_w_int   [[buffer(11)]],
+    device const float* sponge_c   [[buffer(12)]],
+    device const float* sponge_w   [[buffer(13)]],
+    device float4* stage_c0        [[buffer(14)]],  // [nz, M] (a_p_s, dp_dThm_s, rho_x, rtot_x_inv)
+    device float4* stage_c1        [[buffer(15)]],  // [nz, M] (thm_x_eff, tend_u_sl, tend_v_sl, q_load)
+    device float4* stage_w0        [[buffer(16)]],  // [nz-1, M] (rho_dw, rho_tot_w, thm_w, tend_w_sl)
+    device float4* stage_w1        [[buffer(17)]],  // [nz-1, M] (dl, inv_den, c_star, 0)
+    constant ulong4& u_p0          [[buffer(18)]],  // [nz, n_col, nx, dz_cols]
+    constant float4& f_p0          [[buffer(19)]],  // [p_ref, r_d, gamma_d, dx]
+    constant float4& f_p1          [[buffer(20)]],  // [dt_ac, beta_hevi, gravity, 0]
+    uint gid                       [[thread_position_in_grid]],
+    uint simd_lane                 [[thread_index_in_simdgroup]])
+{
+    uint nz = uint(u_p0.x);
+    uint n_col = uint(u_p0.y);
+    uint nx = uint(u_p0.z);
+    uint dz_cols = uint(u_p0.w);
+
+    uint col = gid / nx;
+    uint ix = gid - col * nx;
+    bool active = (col < n_col);
+    uint col_s = active ? col : 0u;
+    uint M = n_col * nx;
+    uint tid = col_s * nx + ix;
+    uint col_dz = (dz_cols > 1u) ? col_s : 0u;
+
+    uint mask = nx - 1u;
+    uint lane_base = simd_lane & (~mask);
+    ushort l_xm2 = ushort(lane_base + ((ix + nx - 2u) & mask));
+    ushort l_xm1 = ushort(lane_base + ((ix + nx - 1u) & mask));
+    ushort l_xp1 = ushort(lane_base + ((ix + 1u) & mask));
+    ushort l_xp2 = ushort(lane_base + ((ix + 2u) & mask));
+
+    float p_ref   = f_p0.x;
+    float r_d     = f_p0.y;
+    float gamma_d = f_p0.z;
+    float inv_dx  = 1.0f / f_p0.w;
+    float dt_ac   = f_p1.x;
+    float beta    = f_p1.y;
+    float gravity = f_p1.z;
+    float bdt2    = (beta * dt_ac) * (beta * dt_ac);
+    float inv_nx  = 1.0f / float(nx);
+
+    float r_cur = rho_s[tid];
+    float T_cur = Thm_s[tid];
+    float q_cur = 1.0f + q_n_in[tid] + q_p_in[tid];
+    float u_cur = u_s[tid];
+    float v_cur = v_s[tid];
+    float thm_cur = T_cur / max(r_cur, 1.0e-5f);
+    float p_cur = p_ref * pow(max((r_d * T_cur) / p_ref, 1.0e-7f), gamma_d);
+    float dp_cur = gamma_d * p_cur / max(T_cur, 1.0e-3f);
+    float ap_cur = p_cur - dp_cur * T_cur;
+    float rtot_cur = r_cur * q_cur;
+    float dz_cur = dz_c[col_dz];
+
+    float w_prev2 = 0.0f;
+    float w_below = w_s[tid];
+    float w_cur   = w_s[M + tid];
+
+    float r_prev = 0.0f, q_prev = 0.0f, u_prev = 0.0f, v_prev = 0.0f;
+    float thm_prev = 0.0f, rtot_prev = 0.0f, dp_prev = 0.0f, dz_prev = 1.0f;
+    float w_ux_dn = 0.0f;
+    float thw_prev_m = 0.0f;
+    float c_prev = 0.0f;
+
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * M + tid;
+
+        float r_next = 0.0f, T_next = 0.0f, q_next = 0.0f, u_next = 0.0f, v_next = 0.0f;
+        float thm_next = 0.0f, dp_next = 0.0f, ap_next = 0.0f, rtot_next = 0.0f, dz_next = 1.0f;
+        if (k + 1u < nz) {
+            uint idx_n = (k + 1u) * M + tid;
+            r_next = rho_s[idx_n];
+            T_next = Thm_s[idx_n];
+            q_next = 1.0f + q_n_in[idx_n] + q_p_in[idx_n];
+            u_next = u_s[idx_n];
+            v_next = v_s[idx_n];
+            thm_next = T_next / max(r_next, 1.0e-5f);
+            float p_n = p_ref * pow(max((r_d * T_next) / p_ref, 1.0e-7f), gamma_d);
+            dp_next = gamma_d * p_n / max(T_next, 1.0e-3f);
+            ap_next = p_n - dp_next * T_next;
+            rtot_next = r_next * q_next;
+            dz_next = dz_c[(k + 1u) * dz_cols + col_dz];
+        }
+
+        float r_xp1 = simd_shuffle(r_cur, l_xp1);
+        float rtot_xp1 = simd_shuffle(rtot_cur, l_xp1);
+        float rho_x_v = 0.5f * (r_cur + r_xp1);
+        float rtot_xi = 1.0f / max(0.5f * (rtot_cur + rtot_xp1), 1.0e-5f);
+
+        float th_xm1 = simd_shuffle(thm_cur, l_xm1);
+        float th_xp1 = simd_shuffle(thm_cur, l_xp1);
+        float th_xp2 = simd_shuffle(thm_cur, l_xp2);
+        float sgn_u = (u_cur > 0.0f) ? 1.0f : ((u_cur < 0.0f) ? -1.0f : 0.0f);
+        float thm_xe = (
+            (-th_xm1 + 7.0f * thm_cur + 7.0f * th_xp1 - th_xp2)
+            + 0.25f * sgn_u * (th_xp2 - 3.0f * th_xp1 + 3.0f * thm_cur - th_xm1)
+        ) * (1.0f / 12.0f);
+
+        float u_xm2 = simd_shuffle(u_cur, l_xm2);
+        float u_xm1 = simd_shuffle(u_cur, l_xm1);
+        float u_xp1 = simd_shuffle(u_cur, l_xp1);
+        float u_xp2 = simd_shuffle(u_cur, l_xp2);
+        float v_xm2 = simd_shuffle(v_cur, l_xm2);
+        float v_xm1 = simd_shuffle(v_cur, l_xm1);
+        float v_xp1 = simd_shuffle(v_cur, l_xp1);
+        float v_xp2 = simd_shuffle(v_cur, l_xp2);
+
+        float u_c_left  = 0.5f * (u_cur + u_xm1);
+        float u_c_right = 0.5f * (u_cur + u_xp1);
+        float adv_u = -(
+            u_c_right * (ws3_face(u_xm1, u_cur, u_xp1, u_xp2, u_c_right) - u_cur)
+            - u_c_left * (ws3_face(u_xm2, u_xm1, u_cur, u_xp1, u_c_left) - u_cur)
+        ) * inv_dx;
+        float adv_v = -(
+            u_cur * (ws3_face(v_xm1, v_cur, v_xp1, v_xp2, u_cur) - v_cur)
+            - u_xm1 * (ws3_face(v_xm2, v_xm1, v_cur, v_xp1, u_xm1) - v_cur)
+        ) * inv_dx;
+
+        float w_ux_up = 0.0f;
+        float vadv_u = 0.0f;
+        float vadv_v = 0.0f;
+        if (k + 1u < nz) {
+            float dzw_up = dz_w_int[k * dz_cols + col_dz];
+            float w_cur_xp1 = simd_shuffle(w_cur, l_xp1);
+            w_ux_up = 0.5f * (w_cur + w_cur_xp1);
+            if (w_ux_up < 0.0f) vadv_u += -w_ux_up * (u_next - u_cur) / dzw_up;
+            if (w_cur   < 0.0f) vadv_v += -w_cur   * (v_next - v_cur) / dzw_up;
+        }
+        if (k > 0u) {
+            float dzw_dn = dz_w_int[(k - 1u) * dz_cols + col_dz];
+            if (w_ux_dn > 0.0f) vadv_u += -w_ux_dn * (u_cur - u_prev) / dzw_dn;
+            if (w_below > 0.0f) vadv_v += -w_below * (v_cur - v_prev) / dzw_dn;
+        }
+
+        float sp = sponge_c[k];
+        float damp_u = 0.0f;
+        float damp_v = 0.0f;
+        if (sp > 0.0f) {
+            float usum = u_cur;
+            float vsum = v_cur;
+            for (uint s = 1u; s < nx; s <<= 1u) {
+                usum += simd_shuffle_xor(usum, ushort(s));
+                vsum += simd_shuffle_xor(vsum, ushort(s));
+            }
+            damp_u = sp * (u_cur - usum * inv_nx);
+            damp_v = sp * (v_cur - vsum * inv_nx);
+        }
+
+        float tu_sl = adv_u + vadv_u + du_sgs[idx] - damp_u;
+        float tv_sl = adv_v + vadv_v + dv_sgs[idx] - damp_v;
+
+        if (active) {
+            stage_c0[idx] = float4(ap_cur, dp_cur, rho_x_v, rtot_xi);
+            stage_c1[idx] = float4(thm_xe, tu_sl, tv_sl, q_cur);
+        }
+
+        if (k >= 1u) {
+            uint m = k - 1u;
+            uint midx = m * M + tid;
+            float u_w_right = 0.5f * (u_prev + u_cur);
+            float u_w_left  = simd_shuffle(u_w_right, l_xm1);
+
+            float w_int = w_below;
+            float w_xm2 = simd_shuffle(w_int, l_xm2);
+            float w_xm1 = simd_shuffle(w_int, l_xm1);
+            float w_xp1 = simd_shuffle(w_int, l_xp1);
+            float w_xp2 = simd_shuffle(w_int, l_xp2);
+            float adv_w_h = -(
+                u_w_right * (ws3_face(w_xm1, w_int, w_xp1, w_xp2, u_w_right) - w_int)
+                - u_w_left * (ws3_face(w_xm2, w_xm1, w_int, w_xp1, u_w_left) - w_int)
+            ) * inv_dx;
+
+            float dw_dz_dn = (w_int - w_prev2) / dz_prev;
+            float dw_dz_up = (w_cur - w_int) / dz_cur;
+            float adv_w_v = -(max(w_int, 0.0f) * dw_dz_dn + min(w_int, 0.0f) * dw_dz_up);
+            float tw_sl = adv_w_h + adv_w_v + dw_sgs[idx];
+
+            float rdw = 0.5f * (r_prev + r_cur);
+            float rtw = 0.5f * (rtot_prev + rtot_cur);
+            float thw = 0.5f * (thm_prev + thm_cur);
+            float dz_wm = dz_w_int[m * dz_cols + col_dz];
+
+            float fac_p = bdt2 * (rdw / (rtw * dz_wm));
+            float fac_g = bdt2 * (0.5f * gravity * (rdw / rtw));
+            float c_dn = dp_prev / dz_prev;
+            float c_up = dp_cur / dz_cur;
+
+            float diag_m = max(
+                1.0f + dt_ac * sponge_w[m] + fac_p * thw * (c_up + c_dn) + fac_g * (q_cur / dz_cur - q_prev / dz_prev),
+                0.5f
+            );
+            float dl_m = (m > 0u) ? (-fac_p * c_dn * thw_prev_m + fac_g * (q_prev / dz_prev)) : 0.0f;
+            float du_m = (m + 1u < nz - 1u)
+                ? (-fac_p * c_up * (0.5f * (thm_cur + thm_next)) - fac_g * (q_cur / dz_cur))
+                : 0.0f;
+
+            float inv_den = 1.0f / max((m == 0u) ? diag_m : (diag_m - dl_m * c_prev), 1.0e-6f);
+            c_prev = (m + 1u < nz - 1u) ? (du_m * inv_den) : 0.0f;
+            thw_prev_m = thw;
+
+            if (active) {
+                stage_w0[midx] = float4(rdw, rtw, thw, tw_sl);
+                stage_w1[midx] = float4(dl_m, inv_den, c_prev, 0.0f);
+            }
+        }
+
+        r_prev = r_cur; q_prev = q_cur; u_prev = u_cur; v_prev = v_cur;
+        thm_prev = thm_cur; rtot_prev = rtot_cur; dp_prev = dp_cur; dz_prev = dz_cur;
+        w_ux_dn = w_ux_up;
+
+        r_cur = r_next; T_cur = T_next; q_cur = q_next; u_cur = u_next; v_cur = v_next;
+        thm_cur = thm_next; dp_cur = dp_next; ap_cur = ap_next; rtot_cur = rtot_next; dz_cur = dz_next;
+        w_prev2 = w_below;
+        w_below = w_cur;
+        w_cur = (k + 2u <= nz) ? w_s[(k + 2u) * M + tid] : 0.0f;
+    }
+}
+
+kernel void crm_2d_fast_hevi_simd(
+    device const float* rho0       [[buffer(0)]],
+    device const float* Thm0       [[buffer(1)]],
+    device const float* u0_in      [[buffer(2)]],
+    device const float* v0_in      [[buffer(3)]],
+    device const float* w0_in      [[buffer(4)]],
+    device float* rho_s            [[buffer(5)]],
+    device float* Thm_s            [[buffer(6)]],
+    device float* u_s              [[buffer(7)]],
+    device float* v_s              [[buffer(8)]],
+    device float* w_s              [[buffer(9)]],
+    device const float4* stage_c0  [[buffer(10)]],  // (a_p_s, dp_dThm_s, rho_x, rtot_x_inv)
+    device const float4* stage_c1  [[buffer(11)]],  // (thm_x_eff, tend_u_sl, tend_v_sl, q_load)
+    device const float4* stage_w0  [[buffer(12)]],  // (rho_dw, rho_tot_w, thm_w, tend_w_sl)
+    device const float4* stage_w1  [[buffer(13)]],  // (dl, inv_den, c_star, 0)
+    device const float* tend_Thm   [[buffer(14)]],
+    device const float* dz_c       [[buffer(15)]],
+    device const float* dz_w_int   [[buffer(16)]],
+    device const float* sponge_w   [[buffer(17)]],
+    device float* fx_acc           [[buffer(18)]],
+    device float* fz_acc           [[buffer(19)]],
+    constant ulong4& u_p0          [[buffer(20)]],  // [nz, n_col, nx, (dz_cols<<16)|(n_ac<<1)|accum]
+    constant float4& f_p           [[buffer(21)]],  // [dt_ac, beta_hevi, gravity, dx]
+    uint gid                       [[thread_position_in_grid]],
+    uint simd_lane                 [[thread_index_in_simdgroup]])
+{
+    uint nz = uint(u_p0.x);
+    uint n_col = uint(u_p0.y);
+    uint nx = uint(u_p0.z);
+    uint pk = uint(u_p0.w);
+    uint dz_cols = pk >> 16u;
+    uint n_ac = (pk >> 1u) & 0x7FFFu;
+    uint accum = pk & 1u;
+
+    uint col = gid / nx;
+    uint ix = gid - col * nx;
+    bool active = (col < n_col);
+    uint col_s = active ? col : 0u;
+    uint M = n_col * nx;
+    uint tid = col_s * nx + ix;
+    uint col_dz = (dz_cols > 1u) ? col_s : 0u;
+
+    uint mask = nx - 1u;
+    uint lane_base = simd_lane & (~mask);
+    ushort l_xm1 = ushort(lane_base + ((ix + nx - 1u) & mask));
+    ushort l_xp1 = ushort(lane_base + ((ix + 1u) & mask));
+
+    float dt_ac   = f_p.x;
+    float beta    = f_p.y;
+    float gravity = f_p.z;
+    float inv_dx  = 1.0f / f_p.w;
+    float n_ac_f  = float(n_ac);
+    float inv_nac = 1.0f / n_ac_f;
+
+    // 0 KB threadgroup memory => maximum SIMD occupancy & full global-load latency hiding on Apple GPU
+    float d_star[48];
+
+    for (uint ac = 0u; ac < n_ac; ++ac) {
+        bool first_ac = (ac == 0u);
+        bool last_ac  = (ac + 1u == n_ac);
+
+        float p_blend_prev = 0.0f;
+        float rtot_blend_prev = 0.0f;
+        float fz_old_below = 0.0f;
+        float thm_w_below = 0.0f;
+        float d_prev = 0.0f;
+        float4 w0_below = float4(0.0f);
+
+        for (uint k = 0u; k < nz; ++k) {
+            uint idx = k * M + tid;
+            float4 c0 = stage_c0[idx];
+            float4 c1 = stage_c1[idx];
+
+            float r_cur = first_ac ? rho0[idx] : rho_s[idx];
+            float T_cur = first_ac ? Thm0[idx] : Thm_s[idx];
+            float u_old = first_ac ? u0_in[idx] : u_s[idx];
+
+            float ap = c0.x;
+            float dp = c0.y;
+            float p_k0 = fma(dp, T_cur, ap);
+            float p_k1 = simd_shuffle(p_k0, l_xp1);
+
+            float pgf_u = -(p_k1 - p_k0) * inv_dx * c0.w;
+            float u_n = u_old + dt_ac * (c1.y + pgf_u);
+            float fx_k = c0.z * (1.10f * u_n - 0.10f * u_old);
+            float fx_thm_k = fx_k * c1.x;
+
+            float fx_m = simd_shuffle(fx_k, l_xm1);
+            float fx_thm_m = simd_shuffle(fx_thm_k, l_xm1);
+
+            if (active) {
+                u_s[idx] = u_n;
+                if (accum != 0u) {
+                    float fx_sum = first_ac ? fx_k : (fx_acc[idx] + fx_k);
+                    fx_acc[idx] = last_ac ? (fx_sum * inv_nac) : fx_sum;
+                }
+                if (last_ac) {
+                    v_s[idx] = v0_in[idx] + (n_ac_f * dt_ac) * c1.z;
+                }
+            }
+
+            float div_h_rho = (fx_k - fx_m) * inv_dx;
+            float div_h_Thm = (fx_thm_k - fx_thm_m) * inv_dx;
+
+            float4 w0_ab = float4(0.0f);
+            float fz_old_above = 0.0f;
+            float thm_w_above = 0.0f;
+            if (k + 1u < nz) {
+                w0_ab = stage_w0[idx];
+                float w_ab = first_ac ? w0_in[(k + 1u) * M + tid] : w_s[(k + 1u) * M + tid];
+                fz_old_above = w0_ab.x * w_ab;
+                thm_w_above = w0_ab.z;
+            }
+
+            float dz_val = dz_c[k * dz_cols + col_dz];
+            float r_dag = r_cur - dt_ac * (div_h_rho + (fz_old_above - fz_old_below) / dz_val);
+            float T_dag = T_cur + dt_ac * (
+                -div_h_Thm
+                - (thm_w_above * fz_old_above - thm_w_below * fz_old_below) / dz_val
+                + tend_Thm[idx]
+            );
+            if (active) {
+                rho_s[idx] = r_dag;
+                Thm_s[idx] = T_dag;
+            }
+
+            float p_blend = fma(dp, (1.0f - beta) * T_cur + beta * T_dag, ap);
+            float rtot_blend = ((1.0f - beta) * r_cur + beta * r_dag) * c1.w;
+
+            if (k >= 1u) {
+                uint um = k - 1u;
+                uint idx_m = um * M + tid;
+                float4 w1_m = stage_w1[idx_m];
+                float dz_w_val = dz_w_int[um * dz_cols + col_dz];
+                float nh_imb = (p_blend - p_blend_prev) / dz_w_val + 0.5f * (rtot_blend + rtot_blend_prev) * gravity;
+                float rdw_m = w0_below.x;
+                float rtw_m = max(w0_below.y, 1.0e-5f);
+                float rhs_m = dt_ac * (
+                    rdw_m * w0_below.w
+                    - (rdw_m / rtw_m) * nh_imb
+                    - sponge_w[um] * fz_old_below
+                );
+                float inv_den = w1_m.y;
+                d_prev = (um == 0u) ? (rhs_m * inv_den) : ((rhs_m - w1_m.x * d_prev) * inv_den);
+                d_star[um] = d_prev;
+            }
+
+            p_blend_prev = p_blend;
+            rtot_blend_prev = rtot_blend;
+            fz_old_below = fz_old_above;
+            thm_w_below = thm_w_above;
+            w0_below = w0_ab;
+        }
+
+        if (active) {
+            w_s[tid] = 0.0f;
+            w_s[nz * M + tid] = 0.0f;
+            if (accum != 0u && first_ac) {
+                fz_acc[tid] = 0.0f;
+                fz_acc[nz * M + tid] = 0.0f;
+            }
+
+            float dfz_above = 0.0f;
+            float thm_w_above = 0.0f;
+            for (int m = int(nz) - 2; m >= 0; --m) {
+                uint um = uint(m);
+                uint idx_m = um * M + tid;
+                float4 w0_m = stage_w0[idx_m];
+                float4 w1_m = stage_w1[idx_m];
+                float dfz_cur = (m == int(nz) - 2) ? d_star[um] : (d_star[um] - w1_m.z * dfz_above);
+                float rdw_m = w0_m.x;
+                uint w_idx = (um + 1u) * M + tid;
+                float fz_old_m = rdw_m * (first_ac ? w0_in[w_idx] : w_s[w_idx]);
+                float fz_new_m = fz_old_m + dfz_cur;
+                w_s[w_idx] = fz_new_m / max(rdw_m, 1.0e-5f);
+                if (accum != 0u) {
+                    float fz_val = fz_old_m + beta * dfz_cur;
+                    float fz_sum = first_ac ? fz_val : (fz_acc[w_idx] + fz_val);
+                    fz_acc[w_idx] = last_ac ? (fz_sum * inv_nac) : fz_sum;
+                }
+
+                uint k_layer = um + 1u;
+                uint idx_l = k_layer * M + tid;
+                float thm_w_m = w0_m.z;
+                float dz_val = dz_c[k_layer * dz_cols + col_dz];
+                rho_s[idx_l] = max(rho_s[idx_l] - beta * dt_ac * (dfz_above - dfz_cur) / dz_val, 1.0e-5f);
+                Thm_s[idx_l] = Thm_s[idx_l] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) / dz_val;
+
+                dfz_above = dfz_cur;
+                thm_w_above = thm_w_m;
+            }
+            float dz_0 = dz_c[col_dz];
+            rho_s[tid] = max(rho_s[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-5f);
+            Thm_s[tid] = Thm_s[tid] - beta * dt_ac * (thm_w_above * dfz_above) / dz_0;
+        }
+    }
+}
+
+kernel void crm_2d_sgs_simd(
+    device const float* rho_d      [[buffer(0)]],
+    device const float* u          [[buffer(1)]],
+    device const float* v          [[buffer(2)]],
+    device const float* w          [[buffer(3)]],
+    device const float* theta_m    [[buffer(4)]],
+    device const float* dz_c       [[buffer(5)]],
+    device const float* dz_w_int   [[buffer(6)]],
+    device const float* cs_lam2_b  [[buffer(7)]],
+    device float* du_sgs_out       [[buffer(8)]],
+    device float* dv_sgs_out       [[buffer(9)]],
+    device float* dw_sgs_out       [[buffer(10)]],
+    device float* dThm_sgs_out     [[buffer(11)]],
+    constant ulong4& u_p0          [[buffer(12)]],  // [nz, n_col, nx, dz_cols]
+    constant float4& f_p           [[buffer(13)]],  // [dx, dy, gravity, c_s]
+    uint gid                       [[thread_position_in_grid]],
+    uint simd_lane                 [[thread_index_in_simdgroup]])
+{
+    uint nz = uint(u_p0.x);
+    uint n_col = uint(u_p0.y);
+    uint nx = uint(u_p0.z);
+    uint dz_cols = uint(u_p0.w);
+
+    uint col = gid / nx;
+    uint ix = gid - col * nx;
+    bool active = (col < n_col);
+    uint col_s = active ? col : 0u;
+    uint M = n_col * nx;
+    uint tid = col_s * nx + ix;
+    uint col_dz = (dz_cols > 1u) ? col_s : 0u;
+
+    uint mask = nx - 1u;
+    uint lane_base = simd_lane & (~mask);
+    ushort l_xm1 = ushort(lane_base + ((ix + nx - 1u) & mask));
+    ushort l_xp1 = ushort(lane_base + ((ix + 1u) & mask));
+
+    float dx = f_p.x;
+    float dy = f_p.y;
+    float gravity = f_p.z;
+    float inv_dx = 1.0f / dx;
+    float inv_dx2 = inv_dx * inv_dx;
+    float nu_bg = 0.004f * (dx * dy) / 10.0f;
+
+    float u_cur = u[tid];
+    float v_cur = v[tid];
+    float th_cur = theta_m[tid];
+    float uc_cur = 0.5f * (u_cur + simd_shuffle(u_cur, l_xm1));
+    float w_cur = w[tid];
+
+    float uc_prev = 0.0f, v_prev = 0.0f, th_prev = 0.0f, nu_prev = 0.0f;
+
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * M + tid;
+        float w_above = w[(k + 1u) * M + tid];
+
+        float u_next = 0.0f, v_next = 0.0f, th_next = 0.0f, uc_next = 0.0f;
+        if (k + 1u < nz) {
+            uint idx_n = (k + 1u) * M + tid;
+            u_next = u[idx_n];
+            v_next = v[idx_n];
+            th_next = theta_m[idx_n];
+            uc_next = 0.5f * (u_next + simd_shuffle(u_next, l_xm1));
+        }
+
+        float u_xm1 = simd_shuffle(u_cur, l_xm1);
+        float u_xp1 = simd_shuffle(u_cur, l_xp1);
+        float v_xm1 = simd_shuffle(v_cur, l_xm1);
+        float v_xp1 = simd_shuffle(v_cur, l_xp1);
+
+        float du_dx = (u_cur - u_xm1) * inv_dx;
+        float dv_dx = 0.5f * (v_xp1 - v_xm1) * inv_dx;
+        float dz = dz_c[k * dz_cols + col_dz];
+        float dw_dz = (w_above - w_cur) / dz;
+
+        float du_dz = 0.0f;
+        float dv_dz = 0.0f;
+        float n2 = 0.0f;
+        if (k + 1u < nz) {
+            float dzw = dz_w_int[k * dz_cols + col_dz];
+            du_dz += 0.5f * (uc_next - uc_cur) / dzw;
+            dv_dz += 0.5f * (v_next - v_cur) / dzw;
+            n2 += 0.5f * (gravity / max(0.5f * (th_next + th_cur), 200.0f)) * ((th_next - th_cur) / dzw);
+        }
+        if (k > 0u) {
+            float dzw = dz_w_int[(k - 1u) * dz_cols + col_dz];
+            du_dz += 0.5f * (uc_cur - uc_prev) / dzw;
+            dv_dz += 0.5f * (v_cur - v_prev) / dzw;
+            n2 += 0.5f * (gravity / max(0.5f * (th_cur + th_prev), 200.0f)) * ((th_cur - th_prev) / dzw);
+        }
+
+        float s2 = 2.0f * (du_dx * du_dx + dw_dz * dw_dz) + dv_dx * dv_dx + du_dz * du_dz + dv_dz * dv_dz;
+        float strain_mag = sqrt(max(s2, 1.0e-12f));
+        float cs_lam2_s = cs_lam2_b[k * dz_cols + col_dz] * strain_mag;
+        float ri = n2 / max(strain_mag * strain_mag, 1.0e-10f);
+
+        float pr_n = 0.70f;
+        float ri_c = 0.25f;
+        float g_coef = (1.0f - pr_n) / ri_c;
+        float nu_sgs = 0.0f;
+        float d_sgs = 0.0f;
+        if (ri < 0.0f) {
+            nu_sgs = cs_lam2_s * sqrt(1.0f - 16.0f * ri);
+            d_sgs  = (cs_lam2_s / pr_n) * sqrt(1.0f - 40.0f * ri);
+        } else if (ri < ri_c) {
+            float sf = 1.0f - ri / ri_c;
+            float stab_fac = sf * sf * sf * sf;
+            nu_sgs = cs_lam2_s * stab_fac;
+            d_sgs  = (cs_lam2_s / pr_n) * stab_fac * (1.0f - g_coef * ri);
+        }
+
+        float nu_eff = nu_sgs + nu_bg;
+        float du_v = nu_eff * (u_xp1 - 2.0f * u_cur + u_xm1) * inv_dx2;
+        float dv_v = nu_eff * (v_xp1 - 2.0f * v_cur + v_xm1) * inv_dx2;
+
+        float w_xm1 = simd_shuffle(w_cur, l_xm1);
+        float w_xp1 = simd_shuffle(w_cur, l_xp1);
+        float dw_v = (0.5f * (nu_prev + nu_sgs) + nu_bg) * (w_xp1 - 2.0f * w_cur + w_xm1) * inv_dx2;
+
+        float r_cur = rho_d[idx];
+        float r_xp1 = simd_shuffle(r_cur, l_xp1);
+        float d_xp1 = simd_shuffle(d_sgs, l_xp1);
+        float th_xp1 = simd_shuffle(th_cur, l_xp1);
+        float fth_xp = -0.25f * (r_cur + r_xp1) * (d_sgs + d_xp1) * (th_xp1 - th_cur) * inv_dx;
+        float fth_xm = simd_shuffle(fth_xp, l_xm1);
+        float dThm_v = -(fth_xp - fth_xm) * inv_dx;
+
+        if (active) {
+            du_sgs_out[idx] = du_v;
+            dv_sgs_out[idx] = dv_v;
+            dThm_sgs_out[idx] = dThm_v;
+            if (k == 0u) {
+                dw_sgs_out[tid] = 0.0f;
+                dw_sgs_out[nz * M + tid] = 0.0f;
+            } else {
+                dw_sgs_out[idx] = dw_v;
+            }
+        }
+
+        uc_prev = uc_cur; v_prev = v_cur; th_prev = th_cur; nu_prev = nu_sgs;
+        u_cur = u_next; v_cur = v_next; th_cur = th_next; uc_cur = uc_next;
+        w_cur = w_above;
+    }
+}
+
+kernel void crm_2d_fct_simd_pair(
+    device const float* q0_in      [[buffer(0)]],
+    device const float* q1_in      [[buffer(1)]],
+    device const float* rho_old    [[buffer(2)]],
+    device const float* rho_new    [[buffer(3)]],
+    device const float* fx         [[buffer(4)]],
+    device const float* fz         [[buffer(5)]],
+    device const float* dz_c       [[buffer(6)]],
+    device float* q0_out           [[buffer(7)]],
+    device float* q1_out           [[buffer(8)]],
+    constant ulong4& u_p0          [[buffer(9)]],   // [nz, n_col, nx, (dz_cols<<16) | n_tg_per_tr]
+    constant float4& f_p           [[buffer(10)]],  // [dt, dx, 0, 0]
+    uint lid                       [[thread_position_in_threadgroup]],
+    uint tg_id                     [[threadgroup_position_in_grid]],
+    uint simd_lane                 [[thread_index_in_simdgroup]])
+{
+    uint nz = uint(u_p0.x);
+    uint n_col = uint(u_p0.y);
+    uint nx = uint(u_p0.z);
+    uint pk = uint(u_p0.w);
+    uint dz_cols = pk >> 16u;
+    uint n_tg = pk & 0xFFFFu;
+
+    uint b = tg_id / n_tg;
+    uint tg_loc = tg_id - b * n_tg;
+    uint g_loc = tg_loc * 64u + lid;
+
+    uint col = g_loc / nx;
+    uint ix = g_loc - col * nx;
+    bool active = (col < n_col);
+    uint col_s = active ? col : 0u;
+    uint M = n_col * nx;
+    uint tid = col_s * nx + ix;
+    uint col_dz = (dz_cols > 1u) ? col_s : 0u;
+
+    device const float* q_in = (b == 0u) ? q0_in : q1_in;
+    device float* q_out = (b == 0u) ? q0_out : q1_out;
+
+    uint mask = nx - 1u;
+    uint lane_base = simd_lane & (~mask);
+    ushort l_xm1 = ushort(lane_base + ((ix + nx - 1u) & mask));
+    ushort l_xp1 = ushort(lane_base + ((ix + 1u) & mask));
+    ushort l_xp2 = ushort(lane_base + ((ix + 2u) & mask));
+
+    float dt = f_p.x;
+    float inv_dx = 1.0f / f_p.y;
+    float eps = 1.0e-20f;
+
+    float q_td[48];
+    float ax[48];
+    float az[48];
+    float r_p[48];
+    float r_m[48];
+
+    // Pass 1: Low-order donor-cell update q_td + anti-diffusive fluxes ax, az
+    az[0] = 0.0f;
+    float q_km1 = 0.0f;
+    float q_k   = q_in[tid];
+    float q_kp1 = (nz > 1u) ? q_in[M + tid] : q_k;
+    float q_kp2 = (nz > 2u) ? q_in[2u * M + tid] : q_kp1;
+    float fl_z_dn = 0.0f;
+
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * M + tid;
+        float q_xm1 = simd_shuffle(q_k, l_xm1);
+        float q_xp1 = simd_shuffle(q_k, l_xp1);
+        float q_xp2 = simd_shuffle(q_k, l_xp2);
+
+        float fx_self = fx[idx];
+        float fl_x_self = max(fx_self, 0.0f) * q_k + min(fx_self, 0.0f) * q_xp1;
+        float fl_x_xm1  = simd_shuffle(fl_x_self, l_xm1);
+        float fh_x_self = fx_self * ((-q_xm1 + 7.0f * q_k + 7.0f * q_xp1 - q_xp2) * (1.0f / 12.0f));
+        ax[k] = fh_x_self - fl_x_self;
+
+        float fl_z_up = 0.0f;
+        if (k + 1u < nz) {
+            uint m = k + 1u;
+            float fz_up = fz[m * M + tid];
+            fl_z_up = max(fz_up, 0.0f) * q_k + min(fz_up, 0.0f) * q_kp1;
+            float fh_z_up;
+            if (nz >= 4u && m >= 2u && m <= nz - 2u) {
+                fh_z_up = fz_up * ((-q_km1 + 7.0f * q_k + 7.0f * q_kp1 - q_kp2) * (1.0f / 12.0f));
+            } else {
+                fh_z_up = fz_up * (0.5f * (q_k + q_kp1));
+            }
+            az[m] = fh_z_up - fl_z_up;
+        }
+
+        float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
+        float div_fl = (fl_x_self - fl_x_xm1) * inv_dx + (fl_z_up - fl_z_dn) * inv_dz;
+        float rho_safe = max(rho_new[idx], 1.0e-5f);
+        float qt = max((rho_old[idx] * q_k - dt * div_fl) / rho_safe, 0.0f);
+        q_td[k] = qt;
+        r_p[k] = max(q_k, qt);
+        r_m[k] = min(q_k, qt);
+
+        fl_z_dn = fl_z_up;
+        q_km1 = q_k;
+        q_k = q_kp1;
+        q_kp1 = q_kp2;
+        q_kp2 = (k + 3u < nz) ? q_in[(k + 3u) * M + tid] : q_kp1;
+    }
+
+    // Pass 2: 5-point cross neighborhood bounds + Zalesak ratios R^+, R^-
+    float qhi_prev = r_p[0];
+    float qlo_prev = r_m[0];
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * M + tid;
+        float qhi_cur = r_p[k];
+        float qlo_cur = r_m[k];
+        float qhi_next = (k + 1u < nz) ? r_p[k + 1u] : qhi_cur;
+        float qlo_next = (k + 1u < nz) ? r_m[k + 1u] : qlo_cur;
+
+        float qhi_xm1 = simd_shuffle(qhi_cur, l_xm1);
+        float qhi_xp1 = simd_shuffle(qhi_cur, l_xp1);
+        float qlo_xm1 = simd_shuffle(qlo_cur, l_xm1);
+        float qlo_xp1 = simd_shuffle(qlo_cur, l_xp1);
+
+        float q_max = max(qhi_cur, max(max(qhi_prev, qhi_next), max(qhi_xm1, qhi_xp1)));
+        float q_min = min(qlo_cur, min(min(qlo_prev, qlo_next), min(qlo_xm1, qlo_xp1)));
+
+        float ax0 = ax[k];
+        float ax_m = simd_shuffle(ax0, l_xm1);
+        float az_dn = az[k];
+        float az_up = (k + 1u < nz) ? az[k + 1u] : 0.0f;
+        float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
+
+        float p_plus  = dt * ((max(ax_m, 0.0f) - min(ax0, 0.0f)) * inv_dx + (max(az_dn, 0.0f) - min(az_up, 0.0f)) * inv_dz);
+        float p_minus = dt * ((max(ax0, 0.0f) - min(ax_m, 0.0f)) * inv_dx + (max(az_up, 0.0f) - min(az_dn, 0.0f)) * inv_dz);
+
+        float rho_safe = max(rho_new[idx], 1.0e-5f);
+        float q_plus  = rho_safe * max(q_max - q_td[k], 0.0f);
+        float q_minus = rho_safe * max(q_td[k] - q_min, 0.0f);
+
+        r_p[k] = (p_plus  > eps) ? clamp(q_plus  / (p_plus  + eps), 0.0f, 1.0f) : 1.0f;
+        r_m[k] = (p_minus > eps) ? clamp(q_minus / (p_minus + eps), 0.0f, 1.0f) : 1.0f;
+
+        qhi_prev = qhi_cur;
+        qlo_prev = qlo_cur;
+    }
+
+    // Pass 3: Face limiters & final anti-diffusive correction
+    float az_lim_dn = 0.0f;
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * M + tid;
+        float rp0 = r_p[k];
+        float rm0 = r_m[k];
+        float rp_x1 = simd_shuffle(rp0, l_xp1);
+        float rm_x1 = simd_shuffle(rm0, l_xp1);
+
+        float ax0 = ax[k];
+        float cx = (ax0 >= 0.0f) ? min(rm0, rp_x1) : min(rp0, rm_x1);
+        float ax_lim = cx * ax0;
+        float ax_lim_m = simd_shuffle(ax_lim, l_xm1);
+
+        float az_lim_up = 0.0f;
+        if (k + 1u < nz) {
+            float az_u = az[k + 1u];
+            float cz = (az_u >= 0.0f) ? min(rm0, r_p[k + 1u]) : min(rp0, r_m[k + 1u]);
+            az_lim_up = cz * az_u;
+        }
+
+        float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
+        float div_anti = (ax_lim - ax_lim_m) * inv_dx + (az_lim_up - az_lim_dn) * inv_dz;
+        float rho_safe = max(rho_new[idx], 1.0e-5f);
+        if (active) {
+            q_out[idx] = max(q_td[k] - (dt / rho_safe) * div_anti, 0.0f);
+        }
+        az_lim_dn = az_lim_up;
+    }
+}
+
+// =========================================================================
 // 11. SCVT Mesh Operators (Divergence, Vorticity, Vector/Scalar Laplacian, TRiSK)
 // =========================================================================
 
@@ -2194,6 +2944,25 @@ def run_crm_fct_advect_metal(
     dz_2d = dz_c.view(nz, -1).contiguous()
     dz_cols = dz_2d.shape[1]
 
+    if ny == 1 and 1 < nx <= 32 and nz <= 48 and (32 % nx == 0) and B in (1, 2):
+        q_out = torch.empty_like(q_batch)
+        q0_in = q_batch[0].contiguous()
+        q1_in = q_batch[1].contiguous() if B == 2 else q0_in
+        q0_out = q_out[0]
+        q1_out = q_out[1] if B == 2 else q0_out
+        c_tg = 64 // nx
+        n_tg = (n_col + c_tg - 1) // c_tg
+        lib.crm_2d_fct_simd_pair(
+            q0_in, q1_in,
+            rho_old.contiguous(), rho_new.contiguous(),
+            fx.contiguous(), fz.contiguous(), dz_2d,
+            q0_out, q1_out,
+            [nz, n_col, nx, (int(dz_cols) << 16) | int(n_tg)],
+            [float(dt), float(dx), 0.0, 0.0],
+            threads=(B * n_tg * 64,), group_size=(64,),
+        )
+        return q_out
+
     key = (dev.index or 0, B, nz, n_col, ny, nx)
     ws = _FCT_WS_CACHE.get(key)
     if ws is None:
@@ -2233,6 +3002,45 @@ def run_crm_fct_advect_metal(
         q_out, u_p0, u_p1, f_p, threads=total_q,
     )
     return q_out
+
+
+def run_crm_fct_pair_metal(
+    lib: Any,
+    q0: torch.Tensor,
+    q1: torch.Tensor,
+    rho_old: torch.Tensor,
+    rho_new: torch.Tensor,
+    fx: torch.Tensor,
+    fy: torch.Tensor,
+    fz: torch.Tensor,
+    dx: float,
+    dy: float,
+    dz_c: torch.Tensor,
+    dt: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero-stack 2-tracer Zalesak FCT on Metal GPU for `(q_n, q_p)`."""
+    nz, n_col, ny, nx = q0.shape
+    if ny == 1 and 1 < nx <= 32 and nz <= 48 and (32 % nx == 0):
+        dz_2d = dz_c.view(nz, -1).contiguous()
+        dz_cols = dz_2d.shape[1]
+        q0_out = torch.empty_like(q0)
+        q1_out = torch.empty_like(q1)
+        c_tg = 64 // nx
+        n_tg = (n_col + c_tg - 1) // c_tg
+        lib.crm_2d_fct_simd_pair(
+            q0.contiguous(), q1.contiguous(),
+            rho_old.contiguous(), rho_new.contiguous(),
+            fx.contiguous(), fz.contiguous(), dz_2d,
+            q0_out, q1_out,
+            [nz, n_col, nx, (int(dz_cols) << 16) | int(n_tg)],
+            [float(dt), float(dx), 0.0, 0.0],
+            threads=(2 * n_tg * 64,), group_size=(64,),
+        )
+        return q0_out, q1_out
+    q_np = run_crm_fct_advect_metal(
+        lib, torch.stack([q0, q1], dim=0), rho_old, rho_new, fx, fy, fz, dx, dy, dz_c, dt
+    )
+    return q_np[0], q_np[1]
 
 
 def run_crm_sgs_metal(
@@ -2291,6 +3099,17 @@ def run_crm_sgs_metal(
     v_c = v.contiguous()
     w_c = w.contiguous()
     th_c = theta_m.contiguous()
+
+    if ny == 1 and 1 < nx <= 32 and (32 % nx == 0):
+        c_tg = 64 // nx
+        n_tg = (n_col + c_tg - 1) // c_tg
+        lib.crm_2d_sgs_simd(
+            r_c, u_c, v_c, w_c, th_c, dz_2d, dzw_2d, ws["cs_lam2"],
+            ws["du"], ws["dv"], ws["dw"], ws["dThm"],
+            [nz, n_col, nx, int(dz_cols)], f_p,
+            threads=(n_tg * 64,), group_size=(64,),
+        )
+        return ws["du"], ws["dv"], ws["dw"], ws["dThm"]
 
     lib.crm_sgs_eddy_uv(
         u_c, v_c, w_c, th_c, dz_2d, dzw_2d, ws["cs_lam2"],

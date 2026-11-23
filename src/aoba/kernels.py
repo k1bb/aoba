@@ -24,6 +24,7 @@ from aoba.kernels_extra import (
     EXTRA_METAL_SHADER_SRC,
     _get_scvt_mesh_cache,
     run_crm_fct_advect_metal,
+    run_crm_fct_pair_metal,
     run_crm_microphysics_metal,
     run_crm_mynn_metal,
     run_crm_sgs_metal,
@@ -851,6 +852,24 @@ def dispatch_crm_fct_advect_metal(
     return run_crm_fct_advect_metal(lib, q_batch, rho_old, rho_new, fx, fy, fz, dx, dy, dz_c, dt)
 
 
+def dispatch_crm_fct_pair_metal(
+    q0: torch.Tensor,
+    q1: torch.Tensor,
+    rho_old: torch.Tensor,
+    rho_new: torch.Tensor,
+    fx: torch.Tensor,
+    fy: torch.Tensor,
+    fz: torch.Tensor,
+    dx: float,
+    dy: float,
+    dz_c: torch.Tensor,
+    dt: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_crm_fct_pair_metal(lib, q0, q1, rho_old, rho_new, fx, fy, fz, dx, dy, dz_c, dt)
+
+
 def dispatch_crm_sgs_metal(
     rho_d: torch.Tensor,
     u: torch.Tensor,
@@ -1018,7 +1037,7 @@ def run_crm_rk3_hevi_metal(
     u0: torch.Tensor,
     v0: torch.Tensor,
     w0: torch.Tensor,
-    q_load: torch.Tensor,
+    q_load: torch.Tensor | None,
     du_sgs: torch.Tensor,
     dv_sgs: torch.Tensor,
     dw_sgs: torch.Tensor,
@@ -1028,6 +1047,8 @@ def run_crm_rk3_hevi_metal(
     sponge_c: torch.Tensor,
     sponge_w: torch.Tensor,
     f_cor: torch.Tensor | None,
+    q_n: torch.Tensor | None = None,
+    q_p: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Execute the full 3-stage Split-Explicit Wicker-Skamarock RK3-HEVI step on Metal GPU."""
     lib = _get_metal_lib()
@@ -1045,7 +1066,6 @@ def run_crm_rk3_hevi_metal(
     u0_c = u0.contiguous()
     v0_c = v0.contiguous()
     w0_c = w0.contiguous()
-    ql_c = q_load.contiguous()
     du_s_c = du_sgs.contiguous()
     dv_s_c = dv_sgs.contiguous()
     dw_s_c = dw_sgs.contiguous()
@@ -1110,10 +1130,66 @@ def run_crm_rk3_hevi_metal(
     rho_b, Thm_b, u_b, v_b, w_b = ws["rho_b"], ws["Thm_b"], ws["u_b"], ws["v_b"], ws["w_b"]
     fx_buf, fy_buf = ws["fx_buf"], ws["fy_buf"]
     fx_acc, fy_acc, fz_acc = ws["fx_acc"], ws["fy_acc"], ws["fz_acc"]
+    dummy = ws["dummy"]
+
+    use_simd_2d = (ny == 1 and 1 < nx <= 32 and nz <= 48 and (32 % nx == 0) and (f_cor is None))
+    if use_simd_2d:
+        if "stage_c0" not in ws:
+            ws["stage_c0"] = torch.empty((nz, M, 4), device=dev, dtype=torch.float32)
+            ws["stage_c1"] = torch.empty((nz, M, 4), device=dev, dtype=torch.float32)
+            ws["stage_w0"] = torch.empty((nz - 1, M, 4), device=dev, dtype=torch.float32)
+            ws["stage_w1"] = torch.empty((nz - 1, M, 4), device=dev, dtype=torch.float32)
+            ws["fy_zero"] = torch.zeros_like(rho0_c)
+        stage_c0, stage_c1, stage_w0, stage_w1 = (
+            ws["stage_c0"], ws["stage_c1"], ws["stage_w0"], ws["stage_w1"]
+        )
+        # Ping-pong output buffer so rho0_c..w0_c never alias rho_out..w_out across substeps
+        if rho0_c.data_ptr() == rho_a.data_ptr():
+            rho_out, Thm_out, u_out, v_out, w_out = rho_b, Thm_b, u_b, v_b, w_b
+        else:
+            rho_out, Thm_out, u_out, v_out, w_out = rho_a, Thm_a, u_a, v_a, w_a
+
+        qn_c = q_n.contiguous() if q_n is not None else (q_load - 1.0).contiguous()
+        qp_c = q_p.contiguous() if q_p is not None else ws["fy_zero"]
+
+        c_tg = 64 // nx
+        n_tg = (n_col + c_tg - 1) // c_tg
+        grid_64 = (n_tg * 64,)
+        u_prep = [nz, n_col, nx, dz_cols]
+        f_prep0 = [float(p_ref), float(r_d), float(gamma_d), float(dx)]
+
+        rho_s, Thm_s, u_s, v_s, w_s = rho0_c, Thm0_c, u0_c, v0_c, w0_c
+        import math as _math
+        rk_taus = (dt_dyn / 3.0, 0.5 * dt_dyn, dt_dyn)
+        for stage_idx, dtau in enumerate(rk_taus):
+            n_ac = max(1, int(_math.ceil(dtau / max(dt_ac_max, 0.1))))
+            dt_ac = dtau / float(n_ac)
+            f_prep1 = [float(dt_ac), float(beta_hevi), float(gravity), 0.0]
+            lib.crm_2d_stage_prep_simd(
+                rho_s, Thm_s, u_s, v_s, w_s,
+                qn_c, qp_c, du_s_c, dv_s_c, dw_s_c, dzc_c, dzw_c, spc_c, spw_c,
+                stage_c0, stage_c1, stage_w0, stage_w1,
+                u_prep, f_prep0, f_prep1,
+                threads=grid_64, group_size=(64,),
+            )
+            accum_i = 1 if stage_idx == 2 else 0
+            u_fast = [nz, n_col, nx, (int(dz_cols) << 16) | (int(n_ac) << 1) | accum_i]
+            f_fast = [float(dt_ac), float(beta_hevi), float(gravity), float(dx)]
+            lib.crm_2d_fast_hevi_simd(
+                rho0_c, Thm0_c, u0_c, v0_c, w0_c,
+                rho_out, Thm_out, u_out, v_out, w_out,
+                stage_c0, stage_c1, stage_w0, stage_w1,
+                tTh_c, dzc_c, dzw_c, spw_c,
+                fx_acc, fz_acc, u_fast, f_fast,
+                threads=grid_64, group_size=(64,),
+            )
+            rho_s, Thm_s, u_s, v_s, w_s = rho_out, Thm_out, u_out, v_out, w_out
+        return rho_s, Thm_s, u_s, v_s, w_s, fx_acc, ws["fy_zero"], fz_acc
+
+    ql_c = q_load.contiguous() if q_load is not None else (1.0 + q_n + q_p).contiguous()
     fx_acc.zero_()
     fy_acc.zero_()
     fz_acc.zero_()
-    dummy = ws["dummy"]
 
     thm_s, a_p_s, dp_dThm_s, rho_tot_s = (
         ws["thm_s"], ws["a_p_s"], ws["dp_dThm_s"], ws["rho_tot_s"]

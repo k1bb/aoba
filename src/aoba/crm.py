@@ -40,6 +40,7 @@ from aoba.biosphere import (
 from aoba.kernels import (
     can_use_crm_metal,
     dispatch_crm_fct_advect_metal,
+    dispatch_crm_fct_pair_metal,
     dispatch_crm_sgs_metal,
     run_crm_rk3_hevi_metal,
     solve_tridiagonal_batched,
@@ -642,12 +643,18 @@ def step_crm_rk3_hevi(
     beta_hevi: float = 0.60,
     z_c_col: torch.Tensor | None = None,
     dz_c_col: torch.Tensor | None = None,
+    *,
+    Thm_in: torch.Tensor | None = None,
+    sgs_in: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    update_theta_m: bool = True,
+    thm_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Advance `(rho_d, u, v, w, theta_m)` over one Split-Explicit RK3-HEVI step `dt_dyn` [s].
 
     Slow advection, Coriolis, and 3D Smagorinsky-Lilly SGS tendencies are evaluated once per
     RK3 stage (`dt_dyn`), while horizontal sound waves and implicit vertical HEVI oscillations are
-    sub-stepped at the acoustic Courant limit `dt_ac <= 0.45 * min(dx, dy) / 350`. On Apple Silicon
+    sub-stepped at the acoustic Courant limit (`0.70 * dx / 350` for 2D C-grid where the von Neumann
+    limit is `1.0`, `0.45 * min(dx, dy) / 350` for 3D; Skamarock & Klemp, 1992). On Apple Silicon
     (`mps`), the entire fast acoustic+HEVI loop dispatches to fused Metal compute kernels.
 
     Returns the stage-averaged mass fluxes `(fx_avg, fy_avg, fz_avg)` matching the
@@ -670,13 +677,16 @@ def step_crm_rk3_hevi(
     u0 = crm.u
     v0 = crm.v
     w0 = crm.w
-    Thm0 = rho0 * crm.theta_m
-    q_load = 1.0 + crm.q_n + crm.q_p  # Exact moist mass loading rho_tot / rho_d
+    Thm0 = Thm_in if Thm_in is not None else (rho0 * crm.theta_m)
 
-    # Compute SGS tendencies once at start of RK3 step (Skamarock et al., 2012, Sec. 3)
-    du_sgs, dv_sgs, dw_sgs, dThm_sgs = _compute_3d_sgs_tendencies(
-        rho0, u0, v0, w0, crm.theta_m, dx, dy, dz_c, dz_w_int
-    )
+    # Compute SGS tendencies once at start of RK3 step (or reuse caller-cached tendencies)
+    if sgs_in is not None:
+        du_sgs, dv_sgs, dw_sgs, dThm_sgs = sgs_in
+    else:
+        thm_for_sgs = (Thm0 / torch.clamp(rho0, min=1.0e-5)) if (Thm_in is not None and not update_theta_m) else crm.theta_m
+        du_sgs, dv_sgs, dw_sgs, dThm_sgs = _compute_3d_sgs_tendencies(
+            rho0, u0, v0, w0, thm_for_sgs, dx, dy, dz_c, dz_w_int
+        )
 
     # Dimension-aware Coriolis handling for embedded periodic CRMs (Khairoutdinov et al., 2005; Yamazaki & Miura, 2024):
     # - 1D (1x1) & 2D (nx==1 or ny==1): disable CRM Coriolis (no cross-plane background PGF; host handles rotation).
@@ -688,21 +698,30 @@ def step_crm_rk3_hevi(
         du_sgs = du_sgs + f_col * v_pert
         dv_sgs = dv_sgs - f_col * u_pert
 
-    dt_ac_max = 0.45 * min(dx, dy) / 350.0 if (ny > 1 or nx > 1) else dt_dyn
+    is_2d_crm = (ny == 1) ^ (nx == 1)
+    cfl_ac = 0.70 if is_2d_crm else 0.45
+    dt_ac_max = cfl_ac * min(dx, dy) / 350.0 if (ny > 1 or nx > 1) else dt_dyn
     if can_use_crm_metal(rho0):
         rho_s, Thm_s, u_s, v_s, w_s, fx_final, fy_final, fz_final = run_crm_rk3_hevi_metal(
             dt_dyn, beta_hevi, dt_ac_max,
             C.P_REF, C.R_D, C.GAMMA_D, C.GRAVITY, dx, dy,
-            rho0, Thm0, u0, v0, w0, q_load,
+            rho0, Thm0, u0, v0, w0, None,
             du_sgs, dv_sgs, dw_sgs, dThm_sgs,
             dz_c, dz_w_int, sponge_c, sponge_w, None,
+            q_n=crm.q_n, q_p=crm.q_p,
         )
         crm.rho_d = rho_s
         crm.u = u_s
         crm.v = v_s
         crm.w = w_s
-        crm.theta_m = Thm_s / crm.rho_d
+        if thm_out is not None:
+            thm_out.clear()
+            thm_out.append(Thm_s)
+        if update_theta_m:
+            crm.theta_m = Thm_s / crm.rho_d
         return fx_final, fy_final, fz_final
+
+    q_load = 1.0 + crm.q_n + crm.q_p  # Exact moist mass loading rho_tot / rho_d
 
     rho_s = rho0
     u_s = u0
@@ -831,7 +850,11 @@ def step_crm_rk3_hevi(
     crm.u = u_s
     crm.v = v_s
     crm.w = w_s
-    crm.theta_m = Thm_s / crm.rho_d
+    if thm_out is not None:
+        thm_out.clear()
+        thm_out.append(Thm_s)
+    if update_theta_m:
+        crm.theta_m = Thm_s / crm.rho_d
 
     return fx_final, fy_final, fz_final
 
@@ -890,60 +913,102 @@ def step_crm_physics_and_dynamics(
         crm.v = crm.v + dv_relax
 
     # 2. Acoustic/nonhydrostatic RK3-HEVI + Flux-Averaged Zalesak 3D FCT (Skamarock et al., 2012, Sec. 3c)
-    #Note: When ny == 1 and nx == 1 (1D column spinup mode), horizontal acoustic waves vanish identically!
+    # Note: When ny == 1 and nx == 1 (1D column spinup mode), horizontal acoustic waves vanish identically!
+    is_2d_crm = (ny == 1) ^ (nx == 1)
     if ny == 1 and nx == 1:
         n_sub = max(n_dyn_substeps, 0)
     else:
-        # Split-explicit outer RK3 obeys the convective/gravity-wave CFL (~45 m/s),
+        # Split-explicit outer RK3-WS3 obeys the convective/gravity-wave CFL (~45 m/s;
+        # Wicker & Skamarock, 2002 stability limit is 1.25 in 2D -> 0.675 gives dt_sub = 60 s at dx = 4 km),
         # while step_crm_rk3_hevi sub-steps horizontal acoustic waves automatically.
-        dt_cfl_max = min(60.0, 0.45 * min(crm.dx, crm.dy) / 45.0)
+        cfl_adv = 0.675 if is_2d_crm else 0.45
+        dt_cfl_max = min(60.0, cfl_adv * min(crm.dx, crm.dy) / 45.0)
         n_sub = max(n_dyn_substeps, int(math.ceil(dt_crm / max(dt_cfl_max, 0.1))))
     dt_sub = dt_crm / float(max(n_sub, 1))
     dz_fct = dz_c_col if dz_c_col is not None else vgrid.dzeta_c
 
-    # Group acoustic substeps into advective super-steps (<= 60 s) via exact time-averaged mass fluxes
+    # Group acoustic substeps into advective super-steps (<= 60 s) via exact time-averaged mass fluxes,
+    # and refresh slow 3D Smagorinsky-Lilly eddy viscosity every ~120 s (every 2 substeps at dt_sub = 60 s).
     adv_group = max(1, min(n_sub, int(math.floor(60.0 / max(dt_sub, 1.0e-3)))))
-    s_idx = 0
-    while s_idx < n_sub:
-        k_cnt = min(adv_group, n_sub - s_idx)
-        rho_start = crm.rho_d.clone()
-        if k_cnt == 1:
-            fx_mean, fy_mean, fz_mean = step_crm_rk3_hevi(crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col)
-        else:
-            fx_acc = torch.zeros_like(crm.rho_d)
-            fy_acc = torch.zeros_like(crm.rho_d)
-            fz_acc = torch.zeros_like(crm.w)
-            for _ in range(k_cnt):
-                fx, fy, fz = step_crm_rk3_hevi(crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col)
-                fx_acc = fx_acc + fx
-                fy_acc = fy_acc + fy
-                fz_acc = fz_acc + fz
-            inv_k = 1.0 / float(k_cnt)
-            fx_mean = fx_acc * inv_k
-            fy_mean = fy_acc * inv_k
-            fz_mean = fz_acc * inv_k
-        dt_adv = dt_sub * float(k_cnt)
-        if can_use_crm_metal(crm.rho_d):
-            q_np = dispatch_crm_fct_advect_metal(
-                torch.stack([crm.q_n, crm.q_p], dim=0),
-                rho_start,
-                crm.rho_d,
-                fx_mean,
-                fy_mean,
-                fz_mean,
-                crm.dx,
-                crm.dy,
-                dz_fct,
-                dt_adv,
-            )
-            crm.q_n = q_np[0]
-            crm.q_p = q_np[1]
-        else:
-            crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
-            crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+    sgs_stride = max(1, int(math.floor(120.0 / max(dt_sub, 1.0e-3)))) if is_2d_crm else 1
+    use_metal_crm = can_use_crm_metal(crm.rho_d)
+    if n_sub > 0:
+        dz_c_sgs = dz_c_col.view(nz, -1, 1, 1) if dz_c_col is not None else vgrid.dzeta_c.view(nz, 1, 1, 1)
+        dz_w_sgs = (
+            (z_c_col[1:] - z_c_col[:-1]).view(nz - 1, -1, 1, 1)
+            if z_c_col is not None
+            else (vgrid.zeta_c[1:] - vgrid.zeta_c[:-1]).view(nz - 1, 1, 1, 1)
+        )
+        Thm_cur = crm.rho_d * crm.theta_m
+        thm_box: list[torch.Tensor] = []
+        sgs_cached: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        s_idx = 0
+        simd_pingpong = (use_metal_crm and ny == 1 and 1 < nx <= 32 and nz <= 48 and (32 % nx == 0))
+        while s_idx < n_sub:
+            k_cnt = min(adv_group, n_sub - s_idx)
+            rho_start = crm.rho_d if (k_cnt == 1 and simd_pingpong) else crm.rho_d.clone()
+            if k_cnt == 1:
+                if sgs_cached is None or (s_idx % sgs_stride == 0):
+                    thm_sgs = crm.theta_m if s_idx == 0 else (Thm_cur / torch.clamp(crm.rho_d, min=1.0e-5))
+                    sgs_cached = _compute_3d_sgs_tendencies(
+                        crm.rho_d, crm.u, crm.v, crm.w, thm_sgs, crm.dx, crm.dy, dz_c_sgs, dz_w_sgs
+                    )
+                fx_mean, fy_mean, fz_mean = step_crm_rk3_hevi(
+                    crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col,
+                    Thm_in=Thm_cur, sgs_in=sgs_cached, update_theta_m=False, thm_out=thm_box,
+                )
+                Thm_cur = thm_box[0]
+            else:
+                fx_acc: torch.Tensor | None = None
+                fy_acc: torch.Tensor | None = None
+                fz_acc: torch.Tensor | None = None
+                for sub_i in range(k_cnt):
+                    cur_s = s_idx + sub_i
+                    if sgs_cached is None or (cur_s % sgs_stride == 0):
+                        thm_sgs = crm.theta_m if cur_s == 0 else (Thm_cur / torch.clamp(crm.rho_d, min=1.0e-5))
+                        sgs_cached = _compute_3d_sgs_tendencies(
+                            crm.rho_d, crm.u, crm.v, crm.w, thm_sgs, crm.dx, crm.dy, dz_c_sgs, dz_w_sgs
+                        )
+                    fx, fy, fz = step_crm_rk3_hevi(
+                        crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col,
+                        Thm_in=Thm_cur, sgs_in=sgs_cached, update_theta_m=False, thm_out=thm_box,
+                    )
+                    Thm_cur = thm_box[0]
+                    if sub_i == 0:
+                        fx_acc = fx.clone()
+                        fz_acc = fz.clone()
+                        if ny > 1:
+                            fy_acc = fy.clone()
+                    else:
+                        assert fx_acc is not None and fz_acc is not None
+                        fx_acc.add_(fx)
+                        fz_acc.add_(fz)
+                        if ny > 1 and fy_acc is not None:
+                            fy_acc.add_(fy)
+                inv_k = 1.0 / float(k_cnt)
+                assert fx_acc is not None and fz_acc is not None
+                fx_acc.mul_(inv_k)
+                fz_acc.mul_(inv_k)
+                fx_mean = fx_acc
+                fz_mean = fz_acc
+                if ny > 1 and fy_acc is not None:
+                    fy_acc.mul_(inv_k)
+                    fy_mean = fy_acc
+                else:
+                    fy_mean = fx_mean
+            dt_adv = dt_sub * float(k_cnt)
+            if use_metal_crm:
+                crm.q_n, crm.q_p = dispatch_crm_fct_pair_metal(
+                    crm.q_n, crm.q_p, rho_start, crm.rho_d,
+                    fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv,
+                )
+            else:
+                crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+                crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+            s_idx += k_cnt
+        crm.theta_m = Thm_cur / crm.rho_d
         q_cond_adv = torch.minimum(crm.q_c + crm.q_i, crm.q_n)
         crm.q_v = torch.clamp(crm.q_n - q_cond_adv, min=0.0)
-        s_idx += k_cnt
 
     # Expand column vertical metrics across `[Nz, m_sub]` if terrain-following
     zc_flat = (
