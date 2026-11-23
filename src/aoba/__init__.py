@@ -59,6 +59,7 @@ from aoba.params import (
     save_aoba_toml,
 )
 from aoba.radiation import RadiationOutput, compute_four_band_radiation, compute_solar_zenith
+from aoba.radiation_ckd import CH4_PREIND_PPMV, N2O_PREIND_PPMV, compute_ckd_radiation
 from aoba.runtime import ensure_earth2014_data, get_data_dir, get_device, get_output_dir
 from aoba.scvt_dynamics import (
     GlobalAtmosState,
@@ -121,6 +122,9 @@ __all__ = [
     "RadiationOutput",
     "compute_solar_zenith",
     "compute_four_band_radiation",
+    "compute_ckd_radiation",
+    "CH4_PREIND_PPMV",
+    "N2O_PREIND_PPMV",
     "MicrophysicsResult",
     "step_microphysics",
     "canopy_roughness_raupach",

@@ -40,6 +40,7 @@ from aoba.kernels_physics import (
     run_dust_column_metal,
     run_ngwd_propagate_metal,
     run_oro_gwd_metal,
+    run_rad_ckd_metal,
     run_rad_four_band_metal,
     run_scvt_fct_advect_metal,
     run_scvt_project_winds_metal,
@@ -984,6 +985,14 @@ def dispatch_rad_four_band_metal(
     lib = _get_metal_lib()
     assert lib is not None
     return run_rad_four_band_metal(lib, **kwargs)
+
+
+def dispatch_rad_ckd_metal(
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_rad_ckd_metal(lib, **kwargs)
 
 
 def dispatch_surface_albedos_metal(**kwargs: Any) -> torch.Tensor:

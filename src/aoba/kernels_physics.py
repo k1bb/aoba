@@ -1140,6 +1140,553 @@ kernel void rad_four_band_col(
     }
 }
 
+inline float rad_ckd_planck_tail(float nu, float inv_t, float c2, bool is_upper) {
+    if (nu <= 0.0f) return is_upper ? 0.0f : 1.0f;
+    float x = (c2 * nu) * inv_t;
+    float acc = 0.0f;
+    constexpr float inv_n4[6] = {1.0f, 0.0625f, 0.012345679f, 0.00390625f, 0.0016f, 0.00077160494f};
+    for (uint i = 0u; i < 6u; ++i) {
+        float nx = float(i + 1u) * x;
+        float e = exp(-min(nx, 60.0f));
+        acc += e * inv_n4[i] * (((nx + 3.0f) * nx + 6.0f) * nx + 6.0f);
+    }
+    return clamp(0.15398973382026505f * acc, 0.0f, 1.0f);
+}
+
+inline float rad_ckd_band_frac(float nu1, float nu2, float temp_k, float c2) {
+    float inv_t = 1.0f / max(temp_k, 100.0f);
+    float f1 = rad_ckd_planck_tail(nu1, inv_t, c2, false);
+    float f2 = rad_ckd_planck_tail(nu2, inv_t, c2, true);
+    return max(f1 - f2, 0.0f);
+}
+
+kernel void rad_ckd_col(
+    device const float* pres_c       [[buffer(0)]],
+    device const float* pres_w       [[buffer(1)]],
+    device const float* temp_c       [[buffer(2)]],
+    device const float* temp_w       [[buffer(3)]],
+    device const float* dz_c         [[buffer(4)]],
+    device const float* rho_d_c      [[buffer(5)]],
+    device const float* qv_c         [[buffer(6)]],
+    device const float* qc_c         [[buffer(7)]],
+    device const float* qi_c         [[buffer(8)]],
+    device const float* q_dust_c     [[buffer(9)]],
+    device const float* o3_vmr_c     [[buffer(10)]],
+    device const float* re_liq_c     [[buffer(11)]],
+    device const float* re_ice_c     [[buffer(12)]],
+    device const float* sfc_in       [[buffer(13)]],
+    device float* sw_up_out          [[buffer(14)]],
+    device float* sw_dn_out          [[buffer(15)]],
+    device float* lw_up_out          [[buffer(16)]],
+    device float* lw_dn_out          [[buffer(17)]],
+    device float* q_rad_3d           [[buffer(18)]],
+    device float* sfc_out            [[buffer(19)]],
+    device const float* tbl          [[buffer(20)]],
+    constant ulong4& u_p             [[buffer(21)]],
+    constant float4& f_p0            [[buffer(22)]],
+    constant float4& f_p1            [[buffer(23)]],
+    uint col                         [[thread_position_in_grid]]
+) {
+    uint N = uint(u_p.x);
+    uint M = uint(u_p.y);
+    uint dz_cols = uint(u_p.z);
+    uint flags = uint(u_p.w);
+    if (col >= M || N == 0u || N > RAD_MAX_NZ) return;
+
+    bool has_dust   = (flags & 1u) != 0u;
+    bool has_o3     = (flags & 2u) != 0u;
+    bool o3_lw_cpl  = (flags & 4u) != 0u;
+    bool has_re_l3d = (flags & 8u) != 0u;
+    bool has_re_i3d = (flags & 16u) != 0u;
+
+    uint dz_col = (dz_cols == 1u) ? 0u : col;
+
+    // Unpack physical constants from tbl[820..837]
+    float STEFAN_B   = tbl[820];
+    float O3_G1      = tbl[821];
+    float O3_G2      = tbl[822];
+    float O3_G3      = tbl[823];
+    float CP_D       = tbl[824];
+    float CP_V       = tbl[825];
+    float EPS_WATER  = tbl[826];
+    float P_REF      = tbl[827];
+    float GRAVITY    = tbl[828];
+    float O2_VMR     = tbl[829];
+    float C2_PLANCK  = tbl[830];
+    float LW_DIFF    = tbl[831];
+    float SW1_PAR_F  = tbl[832];
+    float R_CO2      = tbl[833];
+    float R_O3       = tbl[834];
+    float R_CH4      = tbl[835];
+    float R_N2O      = tbl[836];
+    float R_O2       = tbl[837];
+
+    float co2_ppmv   = max(f_p0.x, 0.0f);
+    float ch4_ppmv   = max(f_p0.y, 0.0f);
+    float n2o_ppmv   = max(f_p0.z, 0.0f);
+    float chi_sw     = f_p0.w;
+    float re_l_sc    = clamp(f_p1.x, 3.0f, 40.0f);
+    float re_i_sc    = clamp(f_p1.y, 10.0f, 150.0f);
+
+    float co2_mass_f = co2_ppmv * 1.0e-6f * R_CO2;
+    float ch4_mass_f = ch4_ppmv * 1.0e-6f * R_CH4;
+    float n2o_mass_f = n2o_ppmv * 1.0e-6f * R_N2O;
+    float o2_mass_f  = O2_VMR * R_O2;
+
+    float ts_c       = max(sfc_in[0u * M + col], 100.0f);
+    float alb_vis_d  = clamp(sfc_in[1u * M + col], 0.0f, 1.0f);
+    float alb_nir_d  = clamp(sfc_in[2u * M + col], 0.0f, 1.0f);
+    float alb_vis_f  = clamp(sfc_in[3u * M + col], 0.0f, 1.0f);
+    float alb_nir_f  = clamp(sfc_in[4u * M + col], 0.0f, 1.0f);
+    float mu0_in     = sfc_in[5u * M + col];
+    float s_toa_col  = sfc_in[6u * M + col];
+    float emiss_sfc  = clamp(sfc_in[7u * M + col], 0.0f, 1.0f);
+
+    float c_star[2 * RAD_MAX_NZ];
+    float d_star[2 * RAD_MAX_NZ];
+
+    // Zero SW outputs up front
+    for (uint k = 0u; k <= N; ++k) {
+        sw_up_out[k * M + col] = 0.0f;
+        sw_dn_out[k * M + col] = 0.0f;
+    }
+    float s_vis_dir = 0.0f, s_vis_dif = 0.0f;
+    float s_nir_dir = 0.0f, s_nir_dif = 0.0f;
+    float s_par_wm2 = 0.0f;
+
+    // ------------------------------------------------------------------
+    // A. Shortwave 6-Band (18 g-point) Delta-Quadrature Two-Stream
+    // ------------------------------------------------------------------
+    bool is_day = (mu0_in > 1.0e-4f) && (s_toa_col > 1.0e-4f);
+    if (is_day) {
+        float mu0_safe = max(mu0_in, 1.0e-3f);
+        float mu0_ts   = max(mu0_in, 1.0e-4f);
+        float inv_mu0  = 1.0f / mu0_ts;
+        float sqrt3    = 1.7320508075688772f;
+        uint nq1       = N * M;
+        uint nq2       = 2u * nq1;
+
+        // Overhead O3 mass above model top
+        uint k_toa = N - 1u;
+        uint idx_toa = k_toa * M + col;
+        float o3_top;
+        if (has_o3) {
+            o3_top = max(o3_vmr_c[idx_toa], 0.0f);
+        } else {
+            float ph = max(pres_c[idx_toa] * 0.01f, 1.0e-3f);
+            o3_top = O3_G1 * pow(ph, O3_G2) * exp(-ph / O3_G3) * 1.0e-6f;
+        }
+        float u_o3_above = (o3_top * R_O3 * (pres_w[N * M + col] / GRAVITY)) / (O3_G2 + 1.0f);
+
+        for (uint g_idx = 0u; g_idx < 18u; ++g_idx) {
+            uint goff = 640u + 10u * g_idx;
+            uint b    = uint(tbl[goff] + 0.5f);
+            float w_g = tbl[goff + 1u];
+            float ko  = tbl[goff + 2u];
+            float kh  = tbl[goff + 3u];
+            float gh  = tbl[goff + 4u];
+            float kc  = tbl[goff + 5u];
+            float gc  = tbl[goff + 6u];
+            float km  = tbl[goff + 7u];
+            float gm  = tbl[goff + 8u];
+            float ko2 = tbl[goff + 9u];
+
+            float f_beam0 = (w_g * tbl[538u + b]) * s_toa_col;
+            if (ko > 0.0f) {
+                f_beam0 *= exp(-min(ko * u_o3_above / mu0_safe, 40.0f));
+            }
+            if (f_beam0 <= 1.0e-6f) continue;
+
+            bool is_vis = (b <= 1u);
+            float r_dir = is_vis ? alb_vis_d : alb_nir_d;
+            float r_sfc = is_vis ? alb_vis_f : alb_nir_f;
+
+            float ray0 = tbl[544u + b];
+            float la = tbl[550u + b], lb = tbl[556u + b], lc = tbl[562u + b], ld = tbl[568u + b], le = tbl[574u + b], lf = tbl[580u + b];
+            float ia = tbl[586u + b], ib = tbl[592u + b], ic = tbl[598u + b], id = tbl[604u + b], ie = tbl[610u + b], i_f = tbl[616u + b];
+            float dk = tbl[622u + b], ds = tbl[628u + b], da = tbl[634u + b];
+
+            float tau_cum = 0.0f;
+            float att_prev = 1.0f;
+            float e1_p = 1.0f, e2_p = 1.0f, e3_p = 0.0f, e4_p = 0.0f, cp_t_p = 0.0f, cm_t_p = 0.0f;
+
+            for (uint n = 0u; n < N; ++n) {
+                uint k = N - 1u - n;
+                uint idx = k * M + col;
+                float pk = pres_c[idx];
+                float dzk = dz_c[k * dz_cols + dz_col];
+                float dm_dry = rho_d_c[idx] * dzk;
+                float dp_frac = max(pres_w[k * M + col] - pres_w[(k + 1u) * M + col], 1.0f) / P_REF;
+
+                float tau_ray = ray0 * dp_frac;
+                float tau_lay = tau_ray;
+                float scat_lay = tau_ray;
+                float asym_scat_lay = 0.0f;
+
+                float qck = max(qc_c[idx], 0.0f);
+                float qik = max(qi_c[idx], 0.0f);
+                if (qck > 0.0f) {
+                    float rel = has_re_l3d ? clamp(re_liq_c[idx], 3.0f, 40.0f) : re_l_sc;
+                    float lwp = 1000.0f * qck * dm_dry;
+                    float tl = chi_sw * lwp * (la + lb / rel);
+                    float ol = clamp(1.0f - (lc + ld * rel), 0.0f, 0.999999f);
+                    float gl = clamp(le + lf * rel, -0.99f, 0.99f);
+                    tau_lay += tl;
+                    scat_lay += tl * ol;
+                    asym_scat_lay += tl * ol * gl;
+                }
+                if (qik > 0.0f) {
+                    float rei = has_re_i3d ? clamp(re_ice_c[idx], 10.0f, 150.0f) : re_i_sc;
+                    float iwp = 1000.0f * qik * dm_dry;
+                    float ti = chi_sw * iwp * (ia + ib / rei);
+                    float oi = clamp(1.0f - (ic + id * rei), 0.0f, 0.999999f);
+                    float gi = clamp(ie + i_f * rei, -0.99f, 0.99f);
+                    tau_lay += ti;
+                    scat_lay += ti * oi;
+                    asym_scat_lay += ti * oi * gi;
+                }
+                if (has_dust) {
+                    float qdk = max(q_dust_c[idx], 0.0f);
+                    if (qdk > 0.0f) {
+                        float td = dk * (qdk * dm_dry);
+                        tau_lay += td;
+                        scat_lay += td * ds;
+                        asym_scat_lay += td * ds * da;
+                    }
+                }
+                if (ko > 0.0f) {
+                    float o3v;
+                    if (has_o3) {
+                        o3v = max(o3_vmr_c[idx], 0.0f);
+                    } else {
+                        float ph = max(pk * 0.01f, 1.0e-3f);
+                        o3v = O3_G1 * pow(ph, O3_G2) * exp(-ph / O3_G3) * 1.0e-6f;
+                    }
+                    tau_lay += ko * (o3v * R_O3 * dm_dry);
+                }
+                if (kh > 0.0f) {
+                    float qvk = max(qv_c[idx], 0.0f);
+                    tau_lay += kh * pow(max((pk + 80.0f) / P_REF, 1.0e-4f), gh) * (qvk * dm_dry);
+                }
+                if (kc > 0.0f) {
+                    tau_lay += kc * pow(max((pk + 150.0f) / P_REF, 1.0e-4f), gc) * (co2_mass_f * dm_dry);
+                }
+                if (km > 0.0f) {
+                    float sf = pow(min(pk / 8000.0f, 1.0f), 0.38f);
+                    tau_lay += km * pow(max((pk + 100.0f) / P_REF, 1.0e-4f), gm) * (ch4_mass_f * sf * dm_dry);
+                }
+                if (ko2 > 0.0f) {
+                    tau_lay += ko2 * pow(max(pk / P_REF, 1.0e-4f), 0.85f) * (o2_mass_f * dm_dry);
+                }
+
+                float w0 = clamp(scat_lay / max(tau_lay, 1.0e-8f), 0.0f, 0.999999f);
+                float g0 = clamp(asym_scat_lay / max(scat_lay, 1.0e-8f), -0.99f, 0.99f);
+                float f_del = g0 * g0;
+                float denom_del = max(1.0f - w0 * f_del, 1.0e-7f);
+                float tau = max(tau_lay * (1.0f - w0 * f_del), 1.0e-7f);
+                float w = clamp((w0 * (1.0f - f_del)) / denom_del, 0.0f, 0.999999f);
+                float g = (g0 - f_del) / max(1.0f - f_del, 1.0e-7f);
+
+                float gamma1 = 0.5f * sqrt3 * (2.0f - w * (1.0f + g));
+                float gamma2 = 0.5f * sqrt3 * w * (1.0f - g);
+                float gamma3 = 0.5f * (1.0f - sqrt3 * g * mu0_ts);
+                float gamma4 = 1.0f - gamma3;
+
+                float lam = sqrt(max(gamma1 * gamma1 - gamma2 * gamma2, 1.0e-12f));
+                float big_gamma = gamma2 / (gamma1 + lam);
+
+                tau_cum += tau;
+                float denom_res = lam * lam - inv_mu0 * inv_mu0;
+                if (fabs(denom_res) < 1.0e-5f) {
+                    denom_res = (denom_res >= 0.0f) ? 1.0e-5f : -1.0e-5f;
+                }
+
+                float att_bot = exp(-min(tau_cum * inv_mu0, 60.0f));
+                float cp_c = w * f_beam0 * ((gamma1 - inv_mu0) * gamma3 + gamma4 * gamma2) / denom_res;
+                float cm_c = w * f_beam0 * ((gamma1 + inv_mu0) * gamma4 + gamma2 * gamma3) / denom_res;
+                float cp_0 = cp_c * att_prev;
+                float cp_t = cp_c * att_bot;
+                float cm_0 = cm_c * att_prev;
+                float cm_t = cm_c * att_bot;
+
+                float exp_lt = exp(-min(lam * tau, 50.0f));
+                float e1 = 1.0f + big_gamma * exp_lt;
+                float e2 = 1.0f - big_gamma * exp_lt;
+                float e3 = big_gamma + exp_lt;
+                float e4 = big_gamma - exp_lt;
+
+                uint nidx = n * M + col;
+                lw_up_out[nidx] = big_gamma;
+                lw_dn_out[nidx] = exp_lt;
+                q_rad_3d[nidx] = att_bot;
+                q_rad_3d[nq1 + nidx] = cp_c;
+                q_rad_3d[nq2 + nidx] = cm_c;
+
+                if (n == 0u) {
+                    float inv_b0 = 1.0f / e1;
+                    c_star[0] = (-e2) * inv_b0;
+                    d_star[0] = (-cm_0) * inv_b0;
+                } else {
+                    uint r1 = 2u * n - 1u;
+                    float A1 = e1_p * e2 - e3_p * e4;
+                    float B1 = e2_p * e2 - e4_p * e4;
+                    float D1 = e1 * e4 - e2 * e3;
+                    float E1 = (cp_0 - cp_t_p) * e2 + (cm_t_p - cm_0) * e4;
+                    float inv1 = 1.0f / (B1 - A1 * c_star[r1 - 1u]);
+                    c_star[r1] = D1 * inv1;
+                    d_star[r1] = (E1 - A1 * d_star[r1 - 1u]) * inv1;
+
+                    uint r2 = 2u * n;
+                    float A2 = e2_p * e3_p - e4_p * e1_p;
+                    float B2 = e1_p * e1 - e3_p * e3;
+                    float D2 = e3_p * e4 - e1_p * e2;
+                    float E2 = e3_p * (cp_0 - cp_t_p) + e1_p * (cm_t_p - cm_0);
+                    float inv2 = 1.0f / (B2 - A2 * c_star[r2 - 1u]);
+                    c_star[r2] = D2 * inv2;
+                    d_star[r2] = (E2 - A2 * d_star[r2 - 1u]) * inv2;
+                }
+
+                e1_p = e1; e2_p = e2; e3_p = e3; e4_p = e4;
+                cp_t_p = cp_t; cm_t_p = cm_t;
+                att_prev = att_bot;
+            }
+
+            // Bottom surface row
+            {
+                uint r_last = 2u * N - 1u;
+                float direct_sfc = mu0_ts * f_beam0 * att_prev;
+                float Al = e1_p - r_sfc * e3_p;
+                float Bl = e2_p - r_sfc * e4_p;
+                float El = r_dir * direct_sfc - cp_t_p + r_sfc * cm_t_p;
+                float inv_l = 1.0f / (Bl - Al * c_star[r_last - 1u]);
+                d_star[r_last] = (El - Al * d_star[r_last - 1u]) * inv_l;
+            }
+
+            float y_next = 0.0f;
+            for (int in = int(N) - 1; in >= 0; --in) {
+                uint n = uint(in);
+                float y2 = (n == N - 1u) ? d_star[2u * N - 1u] : (d_star[2u * n + 1u] - c_star[2u * n + 1u] * y_next);
+                float y1 = d_star[2u * n] - c_star[2u * n] * y2;
+                y_next = y1;
+
+                uint nidx = n * M + col;
+                float G = lw_up_out[nidx];
+                float E = lw_dn_out[nidx];
+                float att_b = q_rad_3d[nidx];
+                float cp_c = q_rad_3d[nq1 + nidx];
+                float cm_c = q_rad_3d[nq2 + nidx];
+
+                float e1 = 1.0f + G * E;
+                float e2 = 1.0f - G * E;
+                float e3 = G + E;
+                float e4 = G - E;
+                float cp_t = cp_c * att_b;
+                float cm_t = cm_c * att_b;
+
+                float f_dir = mu0_ts * f_beam0 * att_b;
+                float f_up_b = max(y1 * e1 + y2 * e2 + cp_t, 0.0f);
+                float f_dn_b = max(y1 * e3 + y2 * e4 + cm_t + f_dir, 0.0f);
+
+                uint k_bot = N - 1u - n;
+                uint out_b = k_bot * M + col;
+                sw_up_out[out_b] += f_up_b;
+                sw_dn_out[out_b] += f_dn_b;
+                if (n == N - 1u) {
+                    float sd = max(f_dir, 0.0f);
+                    float sf_d = max(f_dn_b - sd, 0.0f);
+                    if (is_vis) {
+                        s_vis_dir += sd;
+                        s_vis_dif += sf_d;
+                        if (b == 1u) s_par_wm2 += SW1_PAR_F * (sd + sf_d);
+                    } else {
+                        s_nir_dir += sd;
+                        s_nir_dif += sf_d;
+                    }
+                }
+                if (n == 0u) {
+                    uint out_t = N * M + col;
+                    sw_up_out[out_t] += max(y1 * e3 - y2 * e4 + cp_c, 0.0f);
+                    sw_dn_out[out_t] += mu0_ts * f_beam0;
+                }
+            }
+        }
+    }
+    sfc_out[0u * M + col] = s_vis_dir;
+    sfc_out[1u * M + col] = s_vis_dif;
+    sfc_out[2u * M + col] = s_nir_dir;
+    sfc_out[3u * M + col] = s_nir_dif;
+    sfc_out[4u * M + col] = s_par_wm2;
+
+    // ------------------------------------------------------------------
+    // B. Longwave 10-Band (32 g-point) Linear-in-tau Absorption Solver
+    // ------------------------------------------------------------------
+    for (uint k = 0u; k <= N; ++k) {
+        lw_up_out[k * M + col] = 0.0f;
+        lw_dn_out[k * M + col] = 0.0f;
+    }
+
+    float ts2 = ts_c * ts_c;
+    float eb_sfc = STEFAN_B * (ts2 * ts2);
+    float r_lw = 1.0f - emiss_sfc;
+
+    constexpr uint lw_g_start[10] = {0u, 4u, 7u, 11u, 15u, 19u, 21u, 24u, 26u, 29u};
+    constexpr uint lw_g_end[10]   = {4u, 7u, 11u, 15u, 19u, 21u, 24u, 26u, 29u, 32u};
+
+    for (uint b = 0u; b < 10u; ++b) {
+        float nu1 = tbl[2u * b];
+        float nu2 = tbl[2u * b + 1u];
+        float c_self = tbl[20u + b];
+        float c_for  = tbl[30u + b];
+        float cla = tbl[40u + b], clb = tbl[50u + b];
+        float cia = tbl[60u + b], cib = tbl[70u + b];
+        float kd_lw = tbl[80u + b];
+
+        float bsfc_b = rad_ckd_band_frac(nu1, nu2, ts_c, C2_PLANCK) * eb_sfc;
+
+        // Precompute band Planck flux at all N+1 interfaces into q_rad_3d[0..N]
+        // and band base optical depth (continuum + cloud + dust) into d_star[RAD_MAX_NZ + n]
+        for (uint n = 0u; n <= N; ++n) {
+            uint kw = N - n;
+            float tw = max(temp_w[kw * M + col], 100.0f);
+            float tw2 = tw * tw;
+            float ebw = STEFAN_B * (tw2 * tw2);
+            q_rad_3d[n * M + col] = rad_ckd_band_frac(nu1, nu2, tw, C2_PLANCK) * ebw;
+        }
+        for (uint n = 0u; n < N; ++n) {
+            uint k = N - 1u - n;
+            uint idx = k * M + col;
+            float pk = pres_c[idx];
+            float tk = temp_c[idx];
+            float dzk = dz_c[k * dz_cols + dz_col];
+            float dm_dry = rho_d_c[idx] * dzk;
+            float qvk = max(qv_c[idx], 0.0f);
+            float qck = max(qc_c[idx], 0.0f);
+            float qik = max(qi_c[idx], 0.0f);
+
+            float p_atm = pk / 101325.0f;
+            float e_atm = (qvk * p_atm) / (EPS_WATER + qvk);
+            float t_self = exp(clamp(1800.0f * (1.0f / max(tk, 180.0f) - 1.0f / 296.0f), -3.0f, 6.0f));
+            float tb = (c_self * e_atm * t_self + c_for * p_atm) * (qvk * dm_dry);
+            if (qck > 0.0f) {
+                float rel = has_re_l3d ? clamp(re_liq_c[idx], 3.0f, 40.0f) : re_l_sc;
+                tb += (cla + clb / rel) * (1000.0f * qck * dm_dry);
+            }
+            if (qik > 0.0f) {
+                float rei = has_re_i3d ? clamp(re_ice_c[idx], 10.0f, 150.0f) : re_i_sc;
+                tb += (cia + cib / rei) * (1000.0f * qik * dm_dry);
+            }
+            if (has_dust) {
+                float qdk = max(q_dust_c[idx], 0.0f);
+                tb += kd_lw * (qdk * dm_dry);
+            }
+            d_star[RAD_MAX_NZ + n] = tb;
+        }
+
+        // Loop over g-points in band b
+        for (uint g_idx = lw_g_start[b]; g_idx < lw_g_end[b]; ++g_idx) {
+            uint goff = 90u + 14u * g_idx;
+            float w_g = tbl[goff + 1u];
+            float kh  = tbl[goff + 2u];
+            float gh  = tbl[goff + 3u];
+            float kc  = tbl[goff + 4u];
+            float gc  = tbl[goff + 5u];
+            float pvc = tbl[goff + 6u];
+            float btc = tbl[goff + 7u];
+            float ko  = tbl[goff + 8u];
+            float go  = tbl[goff + 9u];
+            float km  = tbl[goff + 10u];
+            float gm  = tbl[goff + 11u];
+            float kn  = tbl[goff + 12u];
+            float gn  = tbl[goff + 13u];
+
+            float cur_dn = 0.0f;
+            float fb0 = w_g * q_rad_3d[col];
+            for (uint n = 0u; n < N; ++n) {
+                uint k = N - 1u - n;
+                uint idx = k * M + col;
+                float pk = pres_c[idx];
+                float tk = temp_c[idx];
+                float dzk = dz_c[k * dz_cols + dz_col];
+                float dm_dry = rho_d_c[idx] * dzk;
+
+                float tau = d_star[RAD_MAX_NZ + n];
+                if (kh > 0.0f) {
+                    float qvk = max(qv_c[idx], 0.0f);
+                    tau += kh * pow(max((pk + 80.0f) / P_REF, 1.0e-4f), gh) * (qvk * dm_dry);
+                }
+                if (kc > 0.0f) {
+                    float pf = pow(max((pk + pvc) / P_REF, 1.0e-4f), gc);
+                    float tf = (btc != 0.0f)
+                        ? exp(clamp(btc * ((1.0f / 260.0f) - (1.0f / max(tk, 160.0f))), -4.0f, 4.0f))
+                        : 1.0f;
+                    tau += (kc * pf * tf) * (co2_mass_f * dm_dry);
+                }
+                if (ko > 0.0f && o3_lw_cpl) {
+                    float o3v;
+                    if (has_o3) {
+                        o3v = max(o3_vmr_c[idx], 0.0f);
+                    } else {
+                        float ph = max(pk * 0.01f, 1.0e-3f);
+                        o3v = O3_G1 * pow(ph, O3_G2) * exp(-ph / O3_G3) * 1.0e-6f;
+                    }
+                    tau += ko * pow(max((pk + 120.0f) / P_REF, 1.0e-4f), go) * (o3v * R_O3 * dm_dry);
+                }
+                if (km > 0.0f || kn > 0.0f) {
+                    float sf = pow(min(pk / 8000.0f, 1.0f), 0.38f);
+                    float pn = max((pk + 100.0f) / P_REF, 1.0e-4f);
+                    if (km > 0.0f) tau += km * pow(pn, gm) * (ch4_mass_f * sf * dm_dry);
+                    if (kn > 0.0f) tau += kn * pow(pn, gn) * (n2o_mass_f * sf * dm_dry);
+                }
+
+                float dtau = clamp(LW_DIFF * tau, 1.0e-6f, 50.0f);
+                float exp_lt = exp(-dtau);
+                float alpha = (dtau > 1.0e-3f) ? ((1.0f - exp_lt) / dtau) : (1.0f - 0.5f * dtau + (1.0f / 6.0f) * dtau * dtau);
+                float w1 = 1.0f - alpha;
+                float w2 = max(alpha - exp_lt, 0.0f);
+
+                float fb1 = w_g * q_rad_3d[(n + 1u) * M + col];
+                cur_dn = cur_dn * exp_lt + (w2 * fb0 + w1 * fb1);
+                c_star[n] = exp_lt;
+                d_star[n] = w1 * fb0 + w2 * fb1;
+                lw_dn_out[k * M + col] += cur_dn;
+                fb0 = fb1;
+            }
+
+            float cur_up = emiss_sfc * (w_g * bsfc_b) + r_lw * cur_dn;
+            lw_up_out[col] += cur_up;
+            for (int in = int(N) - 1; in >= 0; --in) {
+                uint n = uint(in);
+                cur_up = cur_up * c_star[n] + d_star[n];
+                uint k_top = N - n;
+                lw_up_out[k_top * M + col] += cur_up;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // C. Bottom-up Radiative Heating Rates [3, nz, M]
+    // ------------------------------------------------------------------
+    uint plane = N * M;
+    uint plane2 = 2u * plane;
+    float fnet_sw_prev = sw_up_out[col] - sw_dn_out[col];
+    float fnet_lw_prev = lw_up_out[col] - lw_dn_out[col];
+    for (uint k = 0u; k < N; ++k) {
+        uint idx = k * M + col;
+        uint up_idx = (k + 1u) * M + col;
+        float fnet_sw_cur = sw_up_out[up_idx] - sw_dn_out[up_idx];
+        float fnet_lw_cur = lw_up_out[up_idx] - lw_dn_out[up_idx];
+        float dzk = dz_c[k * dz_cols + dz_col];
+        float cp_lay = (CP_D + CP_V * max(qv_c[idx], 0.0f)) * (rho_d_c[idx] * dzk);
+        float qsw = -(fnet_sw_cur - fnet_sw_prev) / cp_lay;
+        float qlw = -(fnet_lw_cur - fnet_lw_prev) / cp_lay;
+        q_rad_3d[idx] = qsw;
+        q_rad_3d[plane + idx] = qlw;
+        q_rad_3d[plane2 + idx] = qsw + qlw;
+        fnet_sw_prev = fnet_sw_cur;
+        fnet_lw_prev = fnet_lw_cur;
+    }
+}
+
 inline float2 sfc_dai_band(float lc, float mu_s, float omega, float alb_g_dir, float alb_g_dif) {
     float k_opt = 0.5f / mu_s;
     float tmp_as = 0.5f * omega * (0.5f / (0.5f + mu_s)) * (
@@ -2059,6 +2606,142 @@ def run_rad_four_band_metal(
         [int(nz), int(M), int(dz_2d.shape[1]), int(flags)],
         [float(co2_ppmv), float(re_liq_um), float(re_ice_um), float(cloud_sw_inhomog)],
         [emiss_scalar, 0.0, 0.0, 0.0],
+        threads=M,
+    )
+    return (
+        sw_up.view((nz + 1,) + col_shape),
+        sw_dn.view((nz + 1,) + col_shape),
+        lw_up.view((nz + 1,) + col_shape),
+        lw_dn.view((nz + 1,) + col_shape),
+        q_rad_3d.view((3, nz) + col_shape),
+        sfc_out.view((5,) + col_shape),
+    )
+
+
+def run_rad_ckd_metal(
+    lib: Any,
+    pres_c: torch.Tensor,
+    pres_w: torch.Tensor,
+    temp_c: torch.Tensor,
+    temp_w: torch.Tensor,
+    dz_c: torch.Tensor,
+    rho_d_c: torch.Tensor,
+    qv_c: torch.Tensor,
+    qc_c: torch.Tensor,
+    qi_c: torch.Tensor,
+    t_sfc: torch.Tensor,
+    albedo_vis: torch.Tensor,
+    albedo_nir: torch.Tensor,
+    mu0: torch.Tensor,
+    s_toa: torch.Tensor,
+    co2_ppmv: float,
+    ch4_ppmv: float,
+    n2o_ppmv: float,
+    emiss_sfc: float | torch.Tensor,
+    re_liq_um: float | torch.Tensor,
+    re_ice_um: float | torch.Tensor,
+    cloud_sw_inhomog: float,
+    albedo_vis_dif: torch.Tensor | None,
+    albedo_nir_dif: torch.Tensor | None,
+    q_dust_c: torch.Tensor | None,
+    o3_vmr_c: torch.Tensor | None,
+    o3_lw_coupling: bool,
+    ckd_tables: tuple[float, ...],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    nz = pres_c.shape[0]
+    col_shape = t_sfc.shape
+    M = t_sfc.numel()
+    dev = pres_c.device
+
+    tbl_buf = _RAD_CONST_CACHE.get(ckd_tables)
+    if tbl_buf is None or tbl_buf.device != dev:
+        tbl_buf = torch.tensor(ckd_tables, dtype=torch.float32, device=dev)
+        _RAD_CONST_CACHE[ckd_tables] = tbl_buf
+
+    dummy = t_sfc.view(-1)
+    dz_2d = dz_c.view(nz, -1).contiguous()
+
+    flags = 0
+    if q_dust_c is not None:
+        flags |= 1
+        dust_buf = q_dust_c.view(nz, M).contiguous()
+    else:
+        dust_buf = dummy
+    if o3_vmr_c is not None:
+        flags |= 2
+        o3_buf = o3_vmr_c.view(nz, M).contiguous()
+    else:
+        o3_buf = dummy
+    if o3_lw_coupling:
+        flags |= 4
+    if isinstance(re_liq_um, torch.Tensor):
+        flags |= 8
+        re_l_buf = re_liq_um.view(nz, M).contiguous()
+        re_l_scalar = 10.0
+    else:
+        re_l_buf = dummy
+        re_l_scalar = float(re_liq_um)
+    if isinstance(re_ice_um, torch.Tensor):
+        flags |= 16
+        re_i_buf = re_ice_um.view(nz, M).contiguous()
+        re_i_scalar = 48.0
+    else:
+        re_i_buf = dummy
+        re_i_scalar = float(re_ice_um)
+
+    vis_dif = albedo_vis_dif if albedo_vis_dif is not None else albedo_vis
+    nir_dif = albedo_nir_dif if albedo_nir_dif is not None else albedo_nir
+    emiss_vec = (
+        emiss_sfc.view(M).contiguous()
+        if isinstance(emiss_sfc, torch.Tensor)
+        else torch.full((M,), float(emiss_sfc), dtype=torch.float32, device=dev)
+    )
+    sfc_in = torch.stack(
+        [
+            t_sfc.view(M),
+            albedo_vis.view(M),
+            albedo_nir.view(M),
+            vis_dif.view(M),
+            nir_dif.view(M),
+            mu0.view(M),
+            s_toa.view(M),
+            emiss_vec,
+        ],
+        dim=0,
+    ).contiguous()
+
+    sw_up = torch.empty((nz + 1, M), dtype=torch.float32, device=dev)
+    sw_dn = torch.empty((nz + 1, M), dtype=torch.float32, device=dev)
+    lw_up = torch.empty((nz + 1, M), dtype=torch.float32, device=dev)
+    lw_dn = torch.empty((nz + 1, M), dtype=torch.float32, device=dev)
+    q_rad_3d = torch.empty((3, nz, M), dtype=torch.float32, device=dev)
+    sfc_out = torch.empty((5, M), dtype=torch.float32, device=dev)
+
+    lib.rad_ckd_col(
+        pres_c.view(nz, M).contiguous(),
+        pres_w.view(nz + 1, M).contiguous(),
+        temp_c.view(nz, M).contiguous(),
+        temp_w.view(nz + 1, M).contiguous(),
+        dz_2d,
+        rho_d_c.view(nz, M).contiguous(),
+        qv_c.view(nz, M).contiguous(),
+        qc_c.view(nz, M).contiguous(),
+        qi_c.view(nz, M).contiguous(),
+        dust_buf,
+        o3_buf,
+        re_l_buf,
+        re_i_buf,
+        sfc_in,
+        sw_up,
+        sw_dn,
+        lw_up,
+        lw_dn,
+        q_rad_3d,
+        sfc_out,
+        tbl_buf,
+        [int(nz), int(M), int(dz_2d.shape[1]), int(flags)],
+        [float(co2_ppmv), float(ch4_ppmv), float(n2o_ppmv), float(cloud_sw_inhomog)],
+        [re_l_scalar, re_i_scalar, 0.0, 0.0],
         threads=M,
     )
     return (

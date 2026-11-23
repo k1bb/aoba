@@ -24,10 +24,13 @@ rad_col_chunk = 32768
 
 # --- Planetary Boundary, Orbital & Atmospheric Forcing ---
 [forcing]
-co2_ppmv = 400.0
+co2_ppmv = 284.3
 co2_mode = "constant"
 co2_scenario = "obs_historical_noaa"
 co2_csv_path = ""
+ch4_ppmv = 0.80825
+n2o_ppmv = 0.27302
+rad_scheme = "ckd"
 o3_mode = "latitude_seasonal"
 o3_file_path = ""
 o3_lw_coupling = true

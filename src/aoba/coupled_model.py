@@ -46,6 +46,7 @@ from aoba.koppen import classify_koppen_geiger
 from aoba.ocean_ekman import EkmanOceanState, init_ekman_ocean_state, step_ekman_ocean_voronoi
 from aoba.orography import compute_orographic_drag_lott_miller
 from aoba.radiation import compute_four_band_radiation
+from aoba.radiation_ckd import CH4_PREIND_PPMV, N2O_PREIND_PPMV, compute_ckd_radiation
 from aoba.scvt_dynamics import (
     GlobalAtmosState,
     fct_advect_scvt,
@@ -101,10 +102,13 @@ class AOBAConfig:
     rad_stride: int = 5                      # Radiation evaluation stride (steps; 5 x 720 s = 3600 s = 1 hr)
     crm_col_chunk: int = 16384               # Column batch chunk size for CRM evaluation (Unified Memory single-pass)
     rad_col_chunk: int = 32768               # Subcolumn chunk size for ICA radiative transfer (caps MPS peak buffer)
-    co2_ppmv: float = 400.0                  # Well-mixed atmospheric CO2 concentration [ppmv] (used when co2_mode="constant")
+    co2_ppmv: float = 284.3                  # Well-mixed atmospheric CO2 [ppmv] (default CMIP6 1850 piControl)
     co2_mode: str = "constant"               # "constant", "scenario", or "csv"
     co2_scenario: str = "obs_historical_noaa"  # Scenario key when co2_mode="scenario"
     co2_csv_path: str = ""                   # Custom (year, co2_ppmv) CSV path when co2_mode="csv"
+    ch4_ppmv: float = CH4_PREIND_PPMV        # Well-mixed atmospheric CH4 [ppmv] (1850 piControl = 0.80825)
+    n2o_ppmv: float = N2O_PREIND_PPMV        # Well-mixed atmospheric N2O [ppmv] (1850 piControl = 0.27302)
+    rad_scheme: str = "ckd"                  # Radiative transfer scheme: "ckd" (16-band 50 g-pt) or "four_band"
     o3_mode: str = "latitude_seasonal"       # "rcemip" (1D), "latitude_seasonal" (2D analytical), or "climatology"
     o3_file_path: str = ""                   # Optional external zonal/3D ozone (.npz/.nc) when o3_mode="climatology"
     o3_lw_coupling: bool = True              # Enable 9.6 um O3 absorption in LW2 atmospheric window
@@ -250,43 +254,62 @@ def _compute_four_band_radiation_chunked(
     albedo_vis_dif: torch.Tensor,
     albedo_nir_dif: torch.Tensor,
     col_chunk: int,
-    re_liq_um: float = 10.0,
-    re_ice_um: float = 48.0,
+    re_liq_um: float | torch.Tensor = 10.0,
+    re_ice_um: float | torch.Tensor = 48.0,
     cloud_sw_inhomog: float = 0.85,
     q_dust_c: torch.Tensor | None = None,
     o3_vmr_c: torch.Tensor | None = None,
     o3_lw_coupling: bool = False,
+    rad_scheme: str = "ckd",
+    ch4_ppmv: float = CH4_PREIND_PPMV,
+    n2o_ppmv: float = N2O_PREIND_PPMV,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Evaluate 1D ICA 4-band radiative transfer across `[nz, m_sub]`, chunking when `m_sub > col_chunk`."""
+    """Evaluate 1D ICA radiative transfer across `[nz, m_sub]`, chunking when `m_sub > col_chunk`."""
     nz, m_sub = pres_c.shape
     chunk = max(col_chunk, 1)
-    if chunk >= m_sub:
-        rad = compute_four_band_radiation(
-            pres_c=pres_c,
-            pres_w=pres_w,
-            temp_c=temp_c,
-            temp_w=temp_w,
-            dz_c=dz_c,
-            rho_d_c=rho_d_c,
-            qv_c=qv_c,
-            qc_c=qc_c,
-            qi_c=qi_c,
-            t_sfc=t_sfc,
-            albedo_vis=albedo_vis,
-            albedo_nir=albedo_nir,
-            mu0=mu0,
-            s_toa=s_toa,
-            co2_ppmv=co2_ppmv,
-            emiss_sfc=emiss_sfc,
-            re_liq_um=re_liq_um,
-            re_ice_um=re_ice_um,
-            cloud_sw_inhomog=cloud_sw_inhomog,
-            albedo_vis_dif=albedo_vis_dif,
-            albedo_nir_dif=albedo_nir_dif,
-            q_dust_c=q_dust_c,
-            o3_vmr_c=o3_vmr_c,
+    use_ckd = str(rad_scheme).strip().lower() == "ckd"
+
+    def _eval_slice(sl: slice | None):
+        if sl is None:
+            pc, pw, tc, tw, dz, rh = pres_c, pres_w, temp_c, temp_w, dz_c, rho_d_c
+            qv, qc, qi, ts = qv_c, qc_c, qi_c, t_sfc
+            av, an, m0, st, em = albedo_vis, albedo_nir, mu0, s_toa, emiss_sfc
+            avf, anf = albedo_vis_dif, albedo_nir_dif
+            qd, o3 = q_dust_c, o3_vmr_c
+            rel = re_liq_um
+            rei = re_ice_um
+        else:
+            pc, pw, tc, tw, dz, rh = pres_c[:, sl], pres_w[:, sl], temp_c[:, sl], temp_w[:, sl], dz_c[:, sl], rho_d_c[:, sl]
+            qv, qc, qi, ts = qv_c[:, sl], qc_c[:, sl], qi_c[:, sl], t_sfc[sl]
+            av, an, m0, st, em = albedo_vis[sl], albedo_nir[sl], mu0[sl], s_toa[sl], emiss_sfc[sl]
+            avf, anf = albedo_vis_dif[sl], albedo_nir_dif[sl]
+            qd = q_dust_c[:, sl] if q_dust_c is not None else None
+            o3 = o3_vmr_c[:, sl] if o3_vmr_c is not None else None
+            rel = re_liq_um[:, sl] if isinstance(re_liq_um, torch.Tensor) else re_liq_um
+            rei = re_ice_um[:, sl] if isinstance(re_ice_um, torch.Tensor) else re_ice_um
+
+        if use_ckd:
+            return compute_ckd_radiation(
+                pres_c=pc, pres_w=pw, temp_c=tc, temp_w=tw, dz_c=dz, rho_d_c=rh,
+                qv_c=qv, qc_c=qc, qi_c=qi, t_sfc=ts, albedo_vis=av, albedo_nir=an,
+                mu0=m0, s_toa=st, co2_ppmv=co2_ppmv, ch4_ppmv=ch4_ppmv, n2o_ppmv=n2o_ppmv,
+                emiss_sfc=em, re_liq_um=rel, re_ice_um=rei, cloud_sw_inhomog=cloud_sw_inhomog,
+                albedo_vis_dif=avf, albedo_nir_dif=anf, q_dust_c=qd, o3_vmr_c=o3,
+                o3_lw_coupling=o3_lw_coupling,
+            )
+        rel_f = float(rel.mean().item()) if isinstance(rel, torch.Tensor) else float(rel)
+        rei_f = float(rei.mean().item()) if isinstance(rei, torch.Tensor) else float(rei)
+        return compute_four_band_radiation(
+            pres_c=pc, pres_w=pw, temp_c=tc, temp_w=tw, dz_c=dz, rho_d_c=rh,
+            qv_c=qv, qc_c=qc, qi_c=qi, t_sfc=ts, albedo_vis=av, albedo_nir=an,
+            mu0=m0, s_toa=st, co2_ppmv=co2_ppmv, emiss_sfc=em,
+            re_liq_um=rel_f, re_ice_um=rei_f, cloud_sw_inhomog=cloud_sw_inhomog,
+            albedo_vis_dif=avf, albedo_nir_dif=anf, q_dust_c=qd, o3_vmr_c=o3,
             o3_lw_coupling=o3_lw_coupling,
         )
+
+    if chunk >= m_sub:
+        rad = _eval_slice(None)
         return (
             rad.q_rad_net,
             rad.sfc_sw1_dir_dn,
@@ -311,32 +334,7 @@ def _compute_four_band_radiation_chunked(
     for i0 in range(0, m_sub, chunk):
         i1 = min(i0 + chunk, m_sub)
         sl = slice(i0, i1)
-        rad = compute_four_band_radiation(
-            pres_c=pres_c[:, sl],
-            pres_w=pres_w[:, sl],
-            temp_c=temp_c[:, sl],
-            temp_w=temp_w[:, sl],
-            dz_c=dz_c[:, sl],
-            rho_d_c=rho_d_c[:, sl],
-            qv_c=qv_c[:, sl],
-            qc_c=qc_c[:, sl],
-            qi_c=qi_c[:, sl],
-            t_sfc=t_sfc[sl],
-            albedo_vis=albedo_vis[sl],
-            albedo_nir=albedo_nir[sl],
-            mu0=mu0[sl],
-            s_toa=s_toa[sl],
-            co2_ppmv=co2_ppmv,
-            emiss_sfc=emiss_sfc[sl],
-            re_liq_um=re_liq_um,
-            re_ice_um=re_ice_um,
-            cloud_sw_inhomog=cloud_sw_inhomog,
-            albedo_vis_dif=albedo_vis_dif[sl],
-            albedo_nir_dif=albedo_nir_dif[sl],
-            q_dust_c=q_dust_c[:, sl] if q_dust_c is not None else None,
-            o3_vmr_c=o3_vmr_c[:, sl] if o3_vmr_c is not None else None,
-            o3_lw_coupling=o3_lw_coupling,
-        )
+        rad = _eval_slice(sl)
         q_rad[:, sl] = rad.q_rad_net
         sw1_dir[sl] = rad.sfc_sw1_dir_dn
         sw1_dif[sl] = rad.sfc_sw1_dif_dn
@@ -805,6 +803,9 @@ def step_aoba_model(
                 q_dust_c=q_dust_rad,
                 o3_vmr_c=o3_vmr_rad,
                 o3_lw_coupling=cfg.o3_lw_coupling,
+                rad_scheme=cfg.rad_scheme,
+                ch4_ppmv=cfg.ch4_ppmv,
+                n2o_ppmv=cfg.n2o_ppmv,
             )
         )
         model.rad_cache["q_rad_sub"] = q_rad_sub
