@@ -44,7 +44,14 @@ from aoba.params import (
     load_aoba_toml,
 )
 from aoba.radiation import compute_four_band_radiation
-from aoba.runtime import apply_runtime_tuning, compute_optimal_chunks, get_device, get_output_dir
+from aoba.kernels import get_active_gpu_backend
+from aoba.runtime import (
+    apply_runtime_tuning,
+    compute_optimal_chunks,
+    get_device,
+    get_output_dir,
+    synchronize_device,
+)
 from aoba.scvt_mesh import reconstruct_cell_winds
 from aoba.surface import SURF_LAND, SURF_OCEAN, compute_surface_albedos
 from aoba.thermodynamics import diagnose_pressure_temperature
@@ -616,10 +623,11 @@ def main() -> None:
     out_root = Path(out_dir_str).expanduser() if out_dir_str else get_output_dir(f"glevel{cfg.glevel}_{years}yr")
     out_root.mkdir(parents=True, exist_ok=True)
 
+    gpu_kern = get_active_gpu_backend(dev)
     print(
         f"Initializing AOBA Glevel-{cfg.glevel} ({cfg.crm_nx}x{cfg.crm_ny}, dx={cfg.crm_dx:.0f} m, "
         f"nz={cfg.nz}, dt={cfg.dt_host:.0f} s, CO2={cfg.co2_mode}:{cfg.co2_scenario if cfg.co2_mode == 'scenario' else cfg.co2_ppmv}) on {dev} "
-        f"[{hw.chip_name}, {hw.gpu_cores} GPUc, {hw.perf_cores} P-cores, {hw.total_ram_gb:.0f}GB RAM | "
+        f"[{hw.chip_name}, {hw.gpu_cores} GPUc/SMs, {hw.device_mem_gb:.1f}GB VRAM, kernels={gpu_kern} | "
         f"chunks crm={cfg.crm_col_chunk} rad={cfg.rad_col_chunk}]...",
         flush=True,
     )
@@ -881,8 +889,7 @@ def main() -> None:
                 m_cnt += 1
 
             if step_in_yr % csv_stride_steps == 0 or step_in_yr == steps_per_year:
-                if dev.type == "mps":
-                    torch.mps.synchronize()
+                synchronize_device(dev)
                 wall_day = time.perf_counter() - t_day0
                 t_day0 = time.perf_counter()
                 inv_d = 1.0 / float(max(day_cnt, 1))

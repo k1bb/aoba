@@ -995,8 +995,9 @@ _HTML_PAGE = r"""<!DOCTYPE html>
           <p class="sub" style="margin:2px 0 0;" data-i18n="mon_ctrl_sub">MPS GPU 上で稼働中の計算（既存の外部ジョブやこの画面から起動した実験）を邪魔せず、CPU バックグラウンド処理でリアルタイムプレビューを生成します。</p>
         </div>
         <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
-          <select id="launch-device" style="width:110px;">
-            <option value="auto">Auto (MPS)</option>
+          <select id="launch-device" style="width:120px;">
+            <option value="auto">Auto (GPU)</option>
+            <option value="cuda">CUDA GPU</option>
             <option value="mps">MPS GPU</option>
             <option value="cpu">CPU</option>
           </select>

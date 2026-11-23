@@ -30,6 +30,7 @@ import torch
 from aoba import constants as C
 from aoba.kernels import (
     can_use_crm_metal,
+    can_use_elem_metal,
     dispatch_scvt_div_metal,
     dispatch_scvt_fast_acoustic_metal,
     dispatch_scvt_fct_advect_metal,
@@ -182,11 +183,11 @@ def init_global_hydrostatic_atmosphere(
 # 2. Horizontal Discrete Calculus Operators on SCVT Voronoi C-Grid
 # ---------------------------------------------------------------------------
 def _can_use_scvt_metal(x: torch.Tensor) -> bool:
-    """Return True for 1D `[N]` or 2D `[Nz<=64, N]` float32 MPS tensors."""
-    if x.device.type != "mps" or x.dtype != torch.float32 or x.requires_grad:
+    """Return True for 1D `[N]` or 2D `[Nz<=64, N]` float32 GPU (Metal/CUDA) tensors."""
+    if x.device.type not in ("mps", "cuda") or x.dtype != torch.float32 or x.requires_grad:
         return False
     if x.ndim == 1:
-        return True
+        return can_use_elem_metal(x)
     return x.ndim == 2 and can_use_crm_metal(x)
 
 
@@ -710,7 +711,7 @@ def step_scvt_rk3_hevi(
         if stage_idx == 0:
             udotz0 = u_dot_gradz_s
 
-        if u0.device.type != "mps":
+        if not can_use_crm_metal(u0):
             m_s, Thm_s, u_s, w_s, uh_accum, om_accum = _scvt_fast_acoustic_hevi_cpu_gpu(
                 n_ac=n_ac,
                 dt_ac=dt_ac,

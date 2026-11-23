@@ -10,9 +10,11 @@ Used identically by:
 2. Generalized multi-layer two-stream radiative transfer (Toon et al., 1989, Eqs. 39-47;
    K = 2 * N_z).
 
-On Apple Silicon GPUs (`mps`), compiles a fused Metal compute shader (1 GPU thread per
-column m) to eliminate Python loop kernel-launch overhead while retaining an identical
-pure-PyTorch implementation for CPU and CUDA backends.
+On Apple Silicon GPUs (`mps`), compiles fused Metal compute shaders (1 GPU thread per
+column m or 32-lane SIMD warp). On NVIDIA GPUs (`cuda`), automatically transpiles the
+identical single-source shaders into native CUDA C++17 kernels via `aoba.kernels_cuda`
+and PyTorch's JIT extension compiler, while retaining an identical pure-PyTorch fallback
+for CPU backends.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from __future__ import annotations
 from typing import Any
 import torch
 
+from aoba.kernels_cuda import get_cuda_lib
 from aoba.kernels_extra import (
     EXTRA_METAL_SHADER_SRC,
     _get_scvt_mesh_cache,
@@ -54,7 +57,7 @@ from aoba.kernels_physics import (
 _MAX_METAL_K: int = 128
 _MAX_COL_METAL_K: int = 64
 _METAL_SHADER_LIB = None
-_CRM_WS_CACHE: dict[tuple[int, int, int, int, int, int], dict[str, torch.Tensor]] = {}
+_CRM_WS_CACHE: dict[tuple[str, int, int, int, int, int, int], dict[str, torch.Tensor]] = {}
 
 _METAL_THOMAS_SRC = """
 #include <metal_stdlib>
@@ -727,13 +730,59 @@ kernel void crm_stage_w_hevi(
 """
 
 
+def _all_shader_src() -> str:
+    return _METAL_THOMAS_SRC + EXTRA_METAL_SHADER_SRC + PHYSICS_METAL_SHADER_SRC
+
+
 def _get_metal_lib():
     global _METAL_SHADER_LIB
     if _METAL_SHADER_LIB is None and hasattr(torch.mps, "compile_shader"):
-        _METAL_SHADER_LIB = torch.mps.compile_shader(
-            _METAL_THOMAS_SRC + EXTRA_METAL_SHADER_SRC + PHYSICS_METAL_SHADER_SRC
-        )
+        _METAL_SHADER_LIB = torch.mps.compile_shader(_all_shader_src())
     return _METAL_SHADER_LIB
+
+
+def _get_gpu_lib(device: torch.device | str | None = None):
+    """Return the active fused GPU kernel library for `device` (`mps` Metal or `cuda` CUDA)."""
+    dev = torch.device(device) if device is not None else None
+    if dev is None:
+        if torch.cuda.is_available():
+            dev = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            dev = torch.device("mps")
+        else:
+            return None
+    if dev.type == "mps":
+        return _get_metal_lib()
+    if dev.type == "cuda":
+        return get_cuda_lib(_all_shader_src())
+    return None
+
+
+def _first_tensor_device(*args: Any, **kwargs: Any) -> torch.device | None:
+    for a in args:
+        if isinstance(a, torch.Tensor):
+            return a.device
+    for v in kwargs.values():
+        if isinstance(v, torch.Tensor):
+            return v.device
+    return None
+
+
+def get_active_gpu_backend(device: torch.device | str | None = None) -> str:
+    """Return active fused kernel backend name: `'cuda'`, `'mps'`, or `'pytorch'`."""
+    dev = torch.device(device) if device is not None else None
+    if dev is None:
+        if torch.cuda.is_available():
+            dev = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            dev = torch.device("mps")
+        else:
+            return "pytorch"
+    if dev.type == "cuda" and _get_gpu_lib(dev) is not None:
+        return "cuda"
+    if dev.type == "mps" and _get_gpu_lib(dev) is not None:
+        return "mps"
+    return "pytorch"
 
 
 def solve_tridiagonal_pytorch(
@@ -790,16 +839,16 @@ def solve_tridiagonal_batched(
     if K == 1:
         return rhs / d
 
-    use_metal = (
-        rhs.device.type == "mps"
+    use_gpu = (
+        rhs.device.type in ("mps", "cuda")
         and rhs.dtype == torch.float32
         and K <= _MAX_METAL_K
         and not (
             dl.requires_grad or d.requires_grad or du.requires_grad or rhs.requires_grad
         )
     )
-    if use_metal:
-        lib = _get_metal_lib()
+    if use_gpu:
+        lib = _get_gpu_lib(rhs.device)
         if lib is not None:
             M = rhs[0].numel()
             if M > 0:
@@ -815,26 +864,30 @@ def solve_tridiagonal_batched(
 
 
 def can_use_crm_metal(rho0: torch.Tensor) -> bool:
-    """Return True when the fused CRM/SCVT Metal shaders can be dispatched."""
+    """Return True when fused CRM/SCVT GPU kernels (Metal on MPS or CUDA on NVIDIA) can run."""
     nz = rho0.shape[0]
     return (
-        rho0.device.type == "mps"
+        rho0.device.type in ("mps", "cuda")
         and rho0.dtype == torch.float32
         and 2 <= nz <= _MAX_COL_METAL_K
         and not rho0.requires_grad
-        and _get_metal_lib() is not None
+        and _get_gpu_lib(rho0.device) is not None
     )
 
 
 def can_use_elem_metal(t: torch.Tensor) -> bool:
-    """Return True when single-level/elementwise Metal shaders can be dispatched."""
+    """Return True when single-level/elementwise GPU kernels (Metal or CUDA) can run."""
     return (
-        t.device.type == "mps"
+        t.device.type in ("mps", "cuda")
         and t.dtype == torch.float32
         and t.numel() > 0
         and not t.requires_grad
-        and _get_metal_lib() is not None
+        and _get_gpu_lib(t.device) is not None
     )
+
+
+can_use_crm_gpu = can_use_crm_metal
+can_use_elem_gpu = can_use_elem_metal
 
 
 def dispatch_crm_fct_advect_metal(
@@ -849,7 +902,7 @@ def dispatch_crm_fct_advect_metal(
     dz_c: torch.Tensor,
     dt: float,
 ) -> torch.Tensor:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(q_batch.device)
     assert lib is not None
     return run_crm_fct_advect_metal(lib, q_batch, rho_old, rho_new, fx, fy, fz, dx, dy, dz_c, dt)
 
@@ -867,7 +920,7 @@ def dispatch_crm_fct_pair_metal(
     dz_c: torch.Tensor,
     dt: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(q0.device)
     assert lib is not None
     return run_crm_fct_pair_metal(lib, q0, q1, rho_old, rho_new, fx, fy, fz, dx, dy, dz_c, dt)
 
@@ -885,7 +938,7 @@ def dispatch_crm_sgs_metal(
     gravity: float,
     c_s: float = 0.18,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(rho_d.device)
     assert lib is not None
     return run_crm_sgs_metal(lib, rho_d, u, v, w, theta_m, dx, dy, dz_c, dz_w_int, gravity, c_s)
 
@@ -900,55 +953,55 @@ def dispatch_crm_microphysics_metal(
     dt: float,
     mp_consts: list[float],
 ) -> tuple[torch.Tensor, ...]:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(rho_d.device)
     assert lib is not None
     return run_crm_microphysics_metal(lib, rho_d, theta_m_c, q_n, q_p, q_v_prev, dz_c, dt, mp_consts)
 
 
 def dispatch_crm_microphysics_2m_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_crm_microphysics_2m_metal(lib, **kwargs)
 
 
 def dispatch_scvt_fast_acoustic_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_scvt_fast_acoustic_metal(lib, **kwargs)
 
 
 def dispatch_crm_mynn_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_crm_mynn_metal(lib, **kwargs)
 
 
 def dispatch_scvt_div_metal(mesh: Any, flux_edge: torch.Tensor) -> torch.Tensor:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(flux_edge.device)
     assert lib is not None
     return run_scvt_div_metal(lib, mesh, flux_edge)
 
 
 def dispatch_scvt_vorticity_metal(mesh: Any, u_edge: torch.Tensor) -> torch.Tensor:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(u_edge.device)
     assert lib is not None
     return run_scvt_vorticity_metal(lib, mesh, u_edge)
 
 
 def dispatch_scvt_vec_lap_metal(mesh: Any, u_edge: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(u_edge.device)
     assert lib is not None
     return run_scvt_vec_lap_metal(lib, mesh, u_edge)
 
 
 def dispatch_scvt_scalar_lap_metal(mesh: Any, phi_cell: torch.Tensor) -> torch.Tensor:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(phi_cell.device)
     assert lib is not None
     return run_scvt_scalar_lap_metal(lib, mesh, phi_cell)
 
 
 def dispatch_scvt_trisk_rot_metal(mesh: Any, zeta_v: torch.Tensor, u_edge: torch.Tensor) -> torch.Tensor:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(u_edge.device)
     assert lib is not None
     return run_scvt_trisk_rot_metal(lib, mesh, zeta_v, u_edge)
 
@@ -962,26 +1015,26 @@ def dispatch_scvt_fct_advect_metal(
     omega_z: torch.Tensor,
     dt: float,
 ) -> torch.Tensor:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(q_batch.device)
     assert lib is not None
     mc = _get_scvt_mesh_cache(mesh)
     return run_scvt_fct_advect_metal(lib, mesh, mc, q_batch, mass_old, mass_new, uh_edge, omega_z, dt)
 
 
 def dispatch_dust_column_metal(**kwargs: Any) -> torch.Tensor:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_dust_column_metal(lib, **kwargs)
 
 
 def dispatch_oro_gwd_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_oro_gwd_metal(lib, **kwargs)
 
 
 def dispatch_ngwd_propagate_metal(**kwargs: Any) -> torch.Tensor:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_ngwd_propagate_metal(lib, **kwargs)
 
@@ -989,7 +1042,7 @@ def dispatch_ngwd_propagate_metal(**kwargs: Any) -> torch.Tensor:
 def dispatch_rad_four_band_metal(
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_rad_four_band_metal(lib, **kwargs)
 
@@ -997,31 +1050,31 @@ def dispatch_rad_four_band_metal(
 def dispatch_rad_ckd_metal(
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_rad_ckd_metal(lib, **kwargs)
 
 
 def dispatch_surface_albedos_metal(**kwargs: Any) -> torch.Tensor:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_surface_albedos_metal(lib, **kwargs)
 
 
 def dispatch_surface_transfer_metal(**kwargs: Any) -> torch.Tensor:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_surface_transfer_metal(lib, **kwargs)
 
 
 def dispatch_two_leaf_gas_exchange_metal(**kwargs: Any) -> torch.Tensor:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_two_leaf_gas_exchange_metal(lib, **kwargs)
 
 
 def dispatch_scvt_reconstruct_winds_metal(mesh: Any, u_edge: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(u_edge.device)
     assert lib is not None
     mc = _get_scvt_mesh_cache(mesh)
     return run_scvt_reconstruct_winds_metal(lib, mc, u_edge)
@@ -1032,7 +1085,7 @@ def dispatch_scvt_project_winds_metal(
     vec_east_cell: torch.Tensor,
     vec_north_cell: torch.Tensor,
 ) -> torch.Tensor:
-    lib = _get_metal_lib()
+    lib = _get_gpu_lib(vec_east_cell.device)
     assert lib is not None
     mc = _get_scvt_mesh_cache(mesh)
     return run_scvt_project_winds_metal(lib, mc, vec_east_cell, vec_north_cell)
@@ -1066,8 +1119,8 @@ def run_crm_rk3_hevi_metal(
     q_n: torch.Tensor | None = None,
     q_p: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Execute the full 3-stage Split-Explicit Wicker-Skamarock RK3-HEVI step on Metal GPU."""
-    lib = _get_metal_lib()
+    """Execute the full 3-stage Split-Explicit Wicker-Skamarock RK3-HEVI step on GPU (Metal or CUDA)."""
+    lib = _get_gpu_lib(rho0.device)
     assert lib is not None
 
     nz, n_col, ny, nx = rho0.shape
@@ -1094,7 +1147,7 @@ def run_crm_rk3_hevi_metal(
     has_cor = 1 if f_cor is not None else 0
     fcor_c = f_cor.view(n_col).contiguous() if f_cor is not None else torch.zeros(1, device=dev, dtype=torch.float32)
 
-    ws_key = (dev.index or 0, nz, n_col, ny, nx, dz_cols)
+    ws_key = (dev.type, dev.index or 0, nz, n_col, ny, nx, dz_cols)
     ws = _CRM_WS_CACHE.get(ws_key)
     if ws is None:
         if len(_CRM_WS_CACHE) >= 8:

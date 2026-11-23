@@ -2781,7 +2781,7 @@ def run_scvt_fct_advect_metal(
         nb_idx = torch.where(valid_nb, raw_nb, cell_id.expand_as(raw_nb)).to(torch.int32).contiguous()
         mc["nb_idx"] = nb_idx
 
-    key = (dev.index or 0, B, nz, nc, ne)
+    key = (dev.type, dev.index or 0, B, nz, nc, ne)
     ws = _SCVT_FCT_WS_CACHE.get(key)
     if ws is None:
         ws = {

@@ -41,7 +41,7 @@ from aoba.icesheet import (
 )
 from aoba.gravity_wave import compute_frontogenesis_2d, compute_nonorographic_gwd
 from aoba.io_zarr import append_zarr, export_aoba_snapshot_xarray, load_zarr, save_zarr
-from aoba.kernels import solve_tridiagonal_batched
+from aoba.kernels import get_active_gpu_backend, solve_tridiagonal_batched
 from aoba.koppen import KOPPEN_NAMES, classify_koppen_geiger
 from aoba.microphysics import (
     MicrophysicsResult,
@@ -73,7 +73,7 @@ from aoba.params import (
 )
 from aoba.radiation import RadiationOutput, compute_four_band_radiation, compute_solar_zenith
 from aoba.radiation_ckd import CH4_PREIND_PPMV, N2O_PREIND_PPMV, compute_ckd_radiation
-from aoba.runtime import ensure_earth2014_data, get_data_dir, get_device, get_output_dir
+from aoba.runtime import ensure_earth2014_data, get_data_dir, get_device, get_output_dir, synchronize_device
 from aoba.scvt_dynamics import (
     GlobalAtmosState,
     compute_held_suarez_forcing,
@@ -118,6 +118,8 @@ __all__ = [
     "__version__",
     "constants",
     "get_device",
+    "synchronize_device",
+    "get_active_gpu_backend",
     "get_output_dir",
     "get_data_dir",
     "ensure_earth2014_data",

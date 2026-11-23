@@ -36,6 +36,15 @@ def get_device(preferred: str | None = None) -> torch.device:
     return torch.device("cpu")
 
 
+def synchronize_device(device: torch.device | str | None = None) -> None:
+    """Synchronize asynchronous GPU streams cleanly on CUDA or Apple Silicon MPS."""
+    dev = torch.device(device) if device is not None else get_device()
+    if dev.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(dev)
+    elif dev.type == "mps" and torch.backends.mps.is_available():
+        torch.mps.synchronize()
+
+
 def get_output_dir(run_name: str | None = None) -> Path:
     """Return local SSD output path outside Google Drive sync by default."""
     base = Path(os.environ.get("AOBA_OUTPUT_DIR", Path.home() / "aoba_outputs")).expanduser()

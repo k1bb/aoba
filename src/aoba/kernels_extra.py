@@ -3225,7 +3225,7 @@ kernel void scvt_trisk_rot_edge(
 
 def _get_const_buf(dev: torch.device, tag: str, vals: list[float]) -> torch.Tensor:
     tvals = tuple(float(v) for v in vals)
-    key = (dev.index or 0, tag, tvals)
+    key = (dev.type, dev.index or 0, tag, tvals)
     t = _CONST_BUF_CACHE.get(key)
     if t is None:
         if len(_CONST_BUF_CACHE) >= 32:
@@ -3301,7 +3301,7 @@ def run_crm_fct_advect_metal(
         )
         return q_out
 
-    key = (dev.index or 0, B, nz, n_col, ny, nx)
+    key = (dev.type, dev.index or 0, B, nz, n_col, ny, nx)
     ws = _FCT_WS_CACHE.get(key)
     if ws is None:
         ws = {
@@ -3404,7 +3404,7 @@ def run_crm_sgs_metal(
     dzw_2d = dz_w_int.view(nz - 1, -1).contiguous()
     dz_cols = dz_2d.shape[1]
 
-    key = (dev.index or 0, nz, n_col, ny, nx, dz_cols)
+    key = (dev.type, dev.index or 0, nz, n_col, ny, nx, dz_cols)
     ws = _SGS_WS_CACHE.get(key)
     if ws is None:
         ws = {
@@ -3646,7 +3646,7 @@ def run_scvt_fast_acoustic_metal(
     dev = m0.device
     accum_u = 1 if accum_fluxes else 0
 
-    key = (dev.index or 0, nz, n_cells, n_edges)
+    key = (dev.type, dev.index or 0, nz, n_cells, n_edges)
     ws = _SCVT_WS_CACHE.get(key)
     if ws is None:
         ws = {
@@ -3817,7 +3817,7 @@ def run_crm_mynn_metal(
 
 def _get_scvt_mesh_cache(mesh: Any) -> dict[str, Any]:
     mc = getattr(mesh, "_metal_ops_cache", None)
-    if mc is None:
+    if mc is None or mc["c0"].device != mesh.area_cell.device:
         c0 = mesh.cells_on_edge[:, 0].to(torch.int32).contiguous()
         c1 = mesh.cells_on_edge[:, 1].to(torch.int32).contiguous()
         v0 = mesh.verts_on_edge[:, 0].to(torch.int32).contiguous()
