@@ -36,6 +36,7 @@ import math
 import torch
 
 from aoba import constants as C
+from aoba.kernels import can_use_crm_metal, dispatch_ngwd_propagate_metal
 from aoba.scvt_mesh import SCVTMesh
 
 
@@ -68,16 +69,19 @@ def compute_scvt_horizontal_gradient(
     f_edge = 0.5 * (field[..., c0] + field[..., c1])  # [..., N_edges]
 
     e_idx = mesh.edges_on_cell          # [N_cells, 6]
-    sgn = mesh.edge_sign_on_cell        # [N_cells, 6]
+    grad_w = getattr(mesh, "_grad_w_xy", None)
+    if grad_w is None:
+        w_base = mesh.edge_sign_on_cell * mesh.dv_edge[e_idx]
+        inv_a = 1.0 / torch.clamp(mesh.area_cell, min=1.0).unsqueeze(-1)
+        wx = w_base * mesh.east_normal_edge[e_idx] * inv_a
+        wy = w_base * mesh.north_normal_edge[e_idx] * inv_a
+        grad_w = (wx, wy)
+        setattr(mesh, "_grad_w_xy", grad_w)
+    wx, wy = grad_w
     df_loc = f_edge[..., e_idx] - field.unsqueeze(-1)  # [..., N_cells, 6]
-    w_base = sgn * mesh.dv_edge[e_idx]  # [N_cells, 6]
 
-    nx_e = mesh.east_normal_edge[e_idx]
-    ny_e = mesh.north_normal_edge[e_idx]
-    inv_a = 1.0 / torch.clamp(mesh.area_cell, min=1.0)
-
-    df_dx = (df_loc * (w_base * nx_e)).sum(dim=-1) * inv_a
-    df_dy = (df_loc * (w_base * ny_e)).sum(dim=-1) * inv_a
+    df_dx = (df_loc * wx).sum(dim=-1)
+    df_dy = (df_loc * wy).sum(dim=-1)
     return df_dx, df_dy
 
 
@@ -121,6 +125,21 @@ def _propagate_spectral_batched(
     n_axes, nz, n_cells = u_proj_b.shape
     dtype = rho_d.dtype
     device = rho_d.device
+    if can_use_crm_metal(rho_d) and c_bins.numel() <= 32:
+        return dispatch_ngwd_propagate_metal(
+            u_proj_b=u_proj_b,
+            rho_d=rho_d,
+            dz_c=dz_c,
+            n_int=n_int,
+            tau_launch_b=tau_launch_b,
+            u_src_b=u_src_b,
+            k_launch_b=k_launch_b,
+            effgw_b=effgw_b,
+            c_bins=c_bins,
+            k_h=k_h,
+            dt=dt,
+            tend_max=NGWD_TEND_MAX,
+        )
 
     c_bins_b = c_bins.view(1, -1, 1)                 # [1, M, 1]
     c_rel_src = c_bins_b - u_src_b.unsqueeze(1)      # [A, M, N_cells]

@@ -24,6 +24,7 @@ import math
 import torch
 
 from aoba import constants as C
+from aoba.kernels import can_use_crm_metal, dispatch_dust_column_metal
 from aoba.surface import SOIL_POROSITY, SURF_LAND
 
 
@@ -70,6 +71,8 @@ def _dry_threshold_coefficient() -> float:
 V_SETTLE_DUST: float = 4.0e-3       # Effective Stokes settling velocity (~1.5 um radius) [m s^-1]
 V_DEP_DUST: float = 6.0e-3          # Surface dry deposition velocity (>= v_settle, aerodynamic+settling) [m s^-1]
 ALPHA_WET_SCAV: float = 0.50        # Precipitation washout coefficient (Zender et al., 2003; Croft et al., 2010) [m^2 kg^-1]
+_DRY_THRESHOLD_COEF: float = _dry_threshold_coefficient()
+_DUST_ALPHA_SALT: float = 100.0 * math.exp((13.4 * min(DUST_CLAY_FRAC, 0.20) - 6.0) * math.log(10.0))
 
 # Broadband optical properties (Balkanski et al., 2007)
 DUST_K_EXT_SW1: float = 600.0       # VIS mass extinction efficiency [m^2 kg^-1]
@@ -121,7 +124,7 @@ def compute_dust_emission_sub(
         torch.ones_like(w_grav),
     )
     rho = torch.clamp(rho_atm, min=0.1)
-    u_thr = _dry_threshold_coefficient() / torch.sqrt(rho) * f_w
+    u_thr = _DRY_THRESHOLD_COEF / torch.sqrt(rho) * f_w
 
     # Owen (1964) effect on the saltation friction speed using the log-law 10-m wind (Eqs. 31.12-31.13)
     u_st = torch.clamp(u_star, min=1.0e-3)
@@ -140,11 +143,7 @@ def compute_dust_emission_sub(
         torch.zeros_like(u_salt),
     )
 
-    # Marticorena & Bergametti (1995) sandblasting efficiency alpha [m^-1] (Eq. 31.4)
-    m_clay = min(DUST_CLAY_FRAC, 0.20)
-    alpha = 100.0 * math.exp((13.4 * m_clay - 6.0) * math.log(10.0))
-
-    return float(dust_emis_factor) * f_m * alpha * q_salt * DUST_TRANSPORTED_FRAC
+    return float(dust_emis_factor) * f_m * _DUST_ALPHA_SALT * q_salt * DUST_TRANSPORTED_FRAC
 
 
 def step_dust_column(
@@ -158,6 +157,20 @@ def step_dust_column(
     dt: float,
 ) -> torch.Tensor:
     """Advance 3D host dust mixing ratio `[Nz, N_cells]` via emission, PBL mixing, settling & washout."""
+    if can_use_crm_metal(q_dust) and q_dust.ndim == 2:
+        return dispatch_dust_column_metal(
+            q_dust=q_dust,
+            rho_d=rho_d,
+            dz_c=dz_c,
+            z_c=z_c,
+            f_dust_emit=f_dust_emit,
+            precip_rate=precip_rate,
+            u_star_cell=u_star_cell,
+            dt=dt,
+            v_dep=V_DEP_DUST,
+            v_settle=V_SETTLE_DUST,
+            alpha_scav=ALPHA_WET_SCAV,
+        )
     nz = q_dust.shape[0]
     m_k = torch.clamp(rho_d * dz_c, min=1.0e-3)
     q_cur = torch.clamp(q_dust, min=0.0).clone()

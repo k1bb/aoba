@@ -22,6 +22,7 @@ import torch
 
 from aoba.kernels_extra import (
     EXTRA_METAL_SHADER_SRC,
+    _get_scvt_mesh_cache,
     run_crm_fct_advect_metal,
     run_crm_microphysics_metal,
     run_crm_mynn_metal,
@@ -32,6 +33,13 @@ from aoba.kernels_extra import (
     run_scvt_trisk_rot_metal,
     run_scvt_vec_lap_metal,
     run_scvt_vorticity_metal,
+)
+from aoba.kernels_physics import (
+    PHYSICS_METAL_SHADER_SRC,
+    run_dust_column_metal,
+    run_ngwd_propagate_metal,
+    run_oro_gwd_metal,
+    run_scvt_fct_advect_metal,
 )
 
 _MAX_METAL_K: int = 128
@@ -713,7 +721,9 @@ kernel void crm_stage_w_hevi(
 def _get_metal_lib():
     global _METAL_SHADER_LIB
     if _METAL_SHADER_LIB is None and hasattr(torch.mps, "compile_shader"):
-        _METAL_SHADER_LIB = torch.mps.compile_shader(_METAL_THOMAS_SRC + EXTRA_METAL_SHADER_SRC)
+        _METAL_SHADER_LIB = torch.mps.compile_shader(
+            _METAL_THOMAS_SRC + EXTRA_METAL_SHADER_SRC + PHYSICS_METAL_SHADER_SRC
+        )
     return _METAL_SHADER_LIB
 
 
@@ -897,6 +907,39 @@ def dispatch_scvt_trisk_rot_metal(mesh: Any, zeta_v: torch.Tensor, u_edge: torch
     lib = _get_metal_lib()
     assert lib is not None
     return run_scvt_trisk_rot_metal(lib, mesh, zeta_v, u_edge)
+
+
+def dispatch_scvt_fct_advect_metal(
+    mesh: Any,
+    q_batch: torch.Tensor,
+    mass_old: torch.Tensor,
+    mass_new: torch.Tensor,
+    uh_edge: torch.Tensor,
+    omega_z: torch.Tensor,
+    dt: float,
+) -> torch.Tensor:
+    lib = _get_metal_lib()
+    assert lib is not None
+    mc = _get_scvt_mesh_cache(mesh)
+    return run_scvt_fct_advect_metal(lib, mesh, mc, q_batch, mass_old, mass_new, uh_edge, omega_z, dt)
+
+
+def dispatch_dust_column_metal(**kwargs: Any) -> torch.Tensor:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_dust_column_metal(lib, **kwargs)
+
+
+def dispatch_oro_gwd_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_oro_gwd_metal(lib, **kwargs)
+
+
+def dispatch_ngwd_propagate_metal(**kwargs: Any) -> torch.Tensor:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_ngwd_propagate_metal(lib, **kwargs)
 
 
 def run_crm_rk3_hevi_metal(

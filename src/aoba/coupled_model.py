@@ -49,6 +49,7 @@ from aoba.radiation import compute_four_band_radiation
 from aoba.scvt_dynamics import (
     GlobalAtmosState,
     fct_advect_scvt,
+    fct_advect_scvt_batch,
     init_global_hydrostatic_atmosphere,
     step_scvt_rk3_hevi,
 )
@@ -946,10 +947,23 @@ def step_aoba_model(
 
     inv_nh = 1.0 / float(n_hdyn)
     m_new_host = atmos.rho_d * atmos.dz_c
-    atmos.q_n = fct_advect_scvt(mesh, atmos.q_n, m_old_host, m_new_host, uh_acc * inv_nh, om_acc * inv_nh, dt)
-    atmos.q_p = fct_advect_scvt(mesh, atmos.q_p, m_old_host, m_new_host, uh_acc * inv_nh, om_acc * inv_nh, dt)
+    uh_mean = uh_acc * inv_nh
+    om_mean = om_acc * inv_nh
     if cfg.enable_dust and atmos.q_dust is not None:
-        atmos.q_dust = fct_advect_scvt(mesh, atmos.q_dust, m_old_host, m_new_host, uh_acc * inv_nh, om_acc * inv_nh, dt)
+        q_adv = fct_advect_scvt_batch(
+            mesh, torch.stack([atmos.q_n, atmos.q_p, atmos.q_dust], dim=0),
+            m_old_host, m_new_host, uh_mean, om_mean, dt,
+        )
+        atmos.q_n = q_adv[0]
+        atmos.q_p = q_adv[1]
+        atmos.q_dust = q_adv[2]
+    else:
+        q_adv = fct_advect_scvt_batch(
+            mesh, torch.stack([atmos.q_n, atmos.q_p], dim=0),
+            m_old_host, m_new_host, uh_mean, om_mean, dt,
+        )
+        atmos.q_n = q_adv[0]
+        atmos.q_p = q_adv[1]
 
     dthm_ls = (atmos.theta_m - thm_before_dyn) / dt
     dqn_ls = (atmos.q_n - qn_before_dyn) / dt

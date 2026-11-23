@@ -32,6 +32,7 @@ from aoba.kernels import (
     can_use_crm_metal,
     dispatch_scvt_div_metal,
     dispatch_scvt_fast_acoustic_metal,
+    dispatch_scvt_fct_advect_metal,
     dispatch_scvt_scalar_lap_metal,
     dispatch_scvt_trisk_rot_metal,
     dispatch_scvt_vec_lap_metal,
@@ -180,6 +181,15 @@ def init_global_hydrostatic_atmosphere(
 # ---------------------------------------------------------------------------
 # 2. Horizontal Discrete Calculus Operators on SCVT Voronoi C-Grid
 # ---------------------------------------------------------------------------
+def _can_use_scvt_metal(x: torch.Tensor) -> bool:
+    """Return True for 1D `[N]` or 2D `[Nz<=64, N]` float32 MPS tensors."""
+    if x.device.type != "mps" or x.dtype != torch.float32 or x.requires_grad:
+        return False
+    if x.ndim == 1:
+        return True
+    return x.ndim == 2 and can_use_crm_metal(x)
+
+
 def compute_scvt_divergence(
     mesh: SCVTMesh,
     flux_edge: torch.Tensor,
@@ -188,7 +198,9 @@ def compute_scvt_divergence(
 
     Satisfies exact spherical integral conservation: `sum_i A_i * div_i == 0`.
     """
-    if flux_edge.ndim == 2 and can_use_crm_metal(flux_edge):
+    if _can_use_scvt_metal(flux_edge):
+        if flux_edge.ndim == 1:
+            return dispatch_scvt_div_metal(mesh, flux_edge.unsqueeze(0)).squeeze(0)
         return dispatch_scvt_div_metal(mesh, flux_edge)
     le_flux = flux_edge * mesh.dv_edge  # [..., n_edges]
     gathered = le_flux[..., mesh.edges_on_cell]  # [..., n_cells, 6]
@@ -200,7 +212,9 @@ def compute_scvt_vorticity(
     u_edge: torch.Tensor,
 ) -> torch.Tensor:
     """Discrete Stokes curl `(1 / A_v) * sum_{e in vert v} s_{v,e} * dc_e * u_edge[..., e]`."""
-    if u_edge.ndim == 2 and can_use_crm_metal(u_edge):
+    if _can_use_scvt_metal(u_edge):
+        if u_edge.ndim == 1:
+            return dispatch_scvt_vorticity_metal(mesh, u_edge.unsqueeze(0)).squeeze(0)
         return dispatch_scvt_vorticity_metal(mesh, u_edge)
     dc_u = u_edge * mesh.dc_edge  # [..., n_edges]
     ev = mesh.edges_on_vert       # [n_verts, 3]
@@ -212,7 +226,10 @@ def compute_vector_laplacian_edge(
     u_edge: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute vector Laplacian `grad(div u) - curl(zeta)` and pure grad-div on edges `[..., n_edges]`."""
-    if u_edge.ndim == 2 and can_use_crm_metal(u_edge):
+    if _can_use_scvt_metal(u_edge):
+        if u_edge.ndim == 1:
+            lap, gd = dispatch_scvt_vec_lap_metal(mesh, u_edge.unsqueeze(0))
+            return lap.squeeze(0), gd.squeeze(0)
         return dispatch_scvt_vec_lap_metal(mesh, u_edge)
     div_c = compute_scvt_divergence(mesh, u_edge)      # [..., n_cells]
     zeta_v = compute_scvt_vorticity(mesh, u_edge)      # [..., n_verts]
@@ -236,7 +253,9 @@ def compute_scalar_laplacian_cell(
     phi_cell: torch.Tensor,
 ) -> torch.Tensor:
     """Compute conservative cell-centered scalar Laplacian `div(grad(phi))` `[..., n_cells]`."""
-    if phi_cell.ndim == 2 and can_use_crm_metal(phi_cell):
+    if _can_use_scvt_metal(phi_cell):
+        if phi_cell.ndim == 1:
+            return dispatch_scvt_scalar_lap_metal(mesh, phi_cell.unsqueeze(0)).squeeze(0)
         return dispatch_scvt_scalar_lap_metal(mesh, phi_cell)
     c0 = mesh.cells_on_edge[:, 0]
     c1 = mesh.cells_on_edge[:, 1]
@@ -247,6 +266,35 @@ def compute_scalar_laplacian_cell(
 # ---------------------------------------------------------------------------
 # 3. Positive-Definite Zalesak FCT Tracer Advection on SCVT Voronoi Grid
 # ---------------------------------------------------------------------------
+def fct_advect_scvt_batch(
+    mesh: SCVTMesh,
+    q_batch: torch.Tensor,
+    mass_old: torch.Tensor,
+    mass_new: torch.Tensor,
+    uh_edge: torch.Tensor,
+    omega_z: torch.Tensor,
+    dt: float,
+) -> torch.Tensor:
+    """Batched positive-definite SCVT Zalesak FCT over `[B, Nz, N_cells]`."""
+    if q_batch.ndim == 3 and can_use_crm_metal(q_batch[0]):
+        return dispatch_scvt_fct_advect_metal(
+            mesh=mesh,
+            q_batch=q_batch,
+            mass_old=mass_old,
+            mass_new=mass_new,
+            uh_edge=uh_edge,
+            omega_z=omega_z,
+            dt=dt,
+        )
+    return torch.stack(
+        [
+            fct_advect_scvt(mesh, q_batch[b], mass_old, mass_new, uh_edge, omega_z, dt)
+            for b in range(q_batch.shape[0])
+        ],
+        dim=0,
+    )
+
+
 def fct_advect_scvt(
     mesh: SCVTMesh,
     q: torch.Tensor,
@@ -268,6 +316,16 @@ def fct_advect_scvt(
     omega_z : torch.Tensor
         Contravariant vertical dry-mass flux `[Nz+1, N_cells]` [kg m^-2 s^-1].
     """
+    if q.ndim == 2 and can_use_crm_metal(q):
+        return dispatch_scvt_fct_advect_metal(
+            mesh=mesh,
+            q_batch=q.unsqueeze(0),
+            mass_old=mass_old,
+            mass_new=mass_new,
+            uh_edge=uh_edge,
+            omega_z=omega_z,
+            dt=dt,
+        ).squeeze(0)
     nz, n_cells = q.shape
     c0 = mesh.cells_on_edge[:, 0]
     c1 = mesh.cells_on_edge[:, 1]
@@ -649,9 +707,8 @@ def step_scvt_rk3_hevi(
         du[:-1] = -fac_p[:-1] * c_up[:-1] * thm_w[1:] - fac_g[:-1] * (q_load[1:-1] / dz_c[1:-1])
 
         # --- Fast Horizontal Acoustic + Vertical Implicit HEVI Loop from U^0 over n_ac steps of dt_ac ---
-        udotz0 = u_dot_gradz_s if stage_idx == 0 else (
-            ((area_e * 0.5 * (u0[:-1] + u0[1:]) * zw_slope_e)[:, mesh.edges_on_cell] * valid_ce).sum(dim=-1) / area_c
-        )
+        if stage_idx == 0:
+            udotz0 = u_dot_gradz_s
 
         if u0.device.type != "mps":
             m_s, Thm_s, u_s, w_s, uh_accum, om_accum = _scvt_fast_acoustic_hevi_cpu_gpu(
@@ -740,6 +797,7 @@ def step_scvt_rk3_hevi(
                 dl=dl,
                 diag=diag,
                 du=du,
+                mesh=mesh,
             )
         else:
             m_k = m0

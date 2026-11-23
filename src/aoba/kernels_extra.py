@@ -1014,14 +1014,14 @@ kernel void scvt_fast_edge(
     device float* uh_k             [[buffer(16)]],  // [nz, N_edges]
     device float* fTh_h_k          [[buffer(17)]],  // [nz, N_edges]
     device float* uh_accum         [[buffer(18)]],  // [nz, N_edges]
-    device const uint* u_params    [[buffer(19)]],  // [nz, N_cells, N_edges, accum]
-    device const float* f_params   [[buffer(20)]],  // [dt_ac, beta_hevi, gravity]
+    constant ulong4& u_p           [[buffer(19)]],  // [nz, N_cells, N_edges, accum]
+    constant float4& f_p           [[buffer(20)]],  // [dt_ac, beta_hevi, gravity, 0]
     uint gid [[thread_position_in_grid]])
 {
-    uint nz = u_params[0];
-    uint n_cells = u_params[1];
-    uint n_edges = u_params[2];
-    uint accum = u_params[3];
+    uint nz = uint(u_p.x);
+    uint n_cells = uint(u_p.y);
+    uint n_edges = uint(u_p.z);
+    uint accum = uint(u_p.w);
     if (gid >= nz * n_edges) return;
 
     uint k = gid / n_edges;
@@ -1036,7 +1036,7 @@ kernel void scvt_fast_edge(
     float pgf = -(p1 * fac_z1[gid] - p0 * fac_z0[gid]) / (rtot_e[gid] * dc_e[e]);
 
     float u0 = u_c[gid];
-    float dt_ac = f_params[0];
+    float dt_ac = f_p.x;
     float un = u0 + dt_ac * (tend_u_sl[gid] + pgf - sponge_c[k] * u0);
     float uh = m_edge[gid] * (1.10f * un - 0.10f * u0);
 
@@ -1076,14 +1076,14 @@ kernel void scvt_fast_cell_hevi(
     device float* w_n              [[buffer(24)]],  // [nz+1, N_cells]
     device float* udotz_n          [[buffer(25)]],  // [nz-1, N_cells]
     device float* om_accum         [[buffer(26)]],  // [nz+1, N_cells]
-    device const uint* u_params    [[buffer(27)]],  // [nz, N_cells, N_edges, accum]
-    device const float* f_params   [[buffer(28)]],  // [dt_ac, beta_hevi, gravity]
+    constant ulong4& u_p           [[buffer(27)]],  // [nz, N_cells, N_edges, accum]
+    constant float4& f_p           [[buffer(28)]],  // [dt_ac, beta_hevi, gravity, 0]
     uint c [[thread_position_in_grid]])
 {
-    uint nz = u_params[0];
-    uint n_cells = u_params[1];
-    uint n_edges = u_params[2];
-    uint accum = u_params[3];
+    uint nz = uint(u_p.x);
+    uint n_cells = uint(u_p.y);
+    uint n_edges = uint(u_p.z);
+    uint accum = uint(u_p.w);
     if (c >= n_cells) return;
 
     uint n_int = nz - 1u;
@@ -1095,9 +1095,9 @@ kernel void scvt_fast_cell_hevi(
     device const float* diag   = hevi_c + 4u * int_stride;
     device const float* du     = hevi_c + 5u * int_stride;
 
-    float dt_ac = f_params[0];
-    float beta = f_params[1];
-    float gravity = f_params[2];
+    float dt_ac = f_p.x;
+    float beta = f_p.y;
+    float gravity = f_p.z;
 
     float inv_Ac = 1.0f / area_cell[c];
     uint e_id[6];
@@ -2400,6 +2400,7 @@ def run_scvt_fast_acoustic_metal(
     dl: torch.Tensor,
     diag: torch.Tensor,
     du: torch.Tensor,
+    mesh: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Execute global SCVT horizontal acoustic + vertical HEVI loop on Metal GPU."""
     nz, n_cells = m0.shape
@@ -2437,45 +2438,68 @@ def run_scvt_fast_acoustic_metal(
         ws["uh_acc"].zero_()
         ws["om_acc"].zero_()
 
-    c0_i32 = c0.to(torch.int32).contiguous()
-    c1_i32 = c1.to(torch.int32).contiguous()
-    eoc_i32 = edges_on_cell.to(torch.int32).contiguous()
-    esgn_c = edge_sign_on_cell.contiguous()
-    area_c_c = area_cell.contiguous()
-    dv_c = dv_edge.contiguous()
+    if mesh is not None:
+        mc = _get_scvt_mesh_cache(mesh)
+        c0_i32 = mc["c0"]
+        c1_i32 = mc["c1"]
+        eoc_i32 = mc["eoc"]
+        esgn_c = mc["esgn"]
+        area_c_c = mc["area_cell"]
+        dv_c = mc["dv_edge"]
+    else:
+        c0_i32 = c0.to(torch.int32).contiguous()
+        c1_i32 = c1.to(torch.int32).contiguous()
+        eoc_i32 = edges_on_cell.to(torch.int32).contiguous()
+        esgn_c = edge_sign_on_cell.contiguous()
+        area_c_c = area_cell.contiguous()
+        dv_c = dv_edge.contiguous()
     ae_c = area_e.view(-1).contiguous()
     dce_c = dc_e.view(-1).contiguous()
     spc_c = sponge_c.view(-1).contiguous()
     spw_c = sponge_w.view(-1).contiguous()
 
-    u_params = torch.tensor([nz, n_cells, n_edges, accum_u], dtype=torch.uint32, device=dev)
-    f_params = torch.tensor([dt_ac, beta_hevi, gravity], dtype=torch.float32, device=dev)
+    u_p = [nz, n_cells, n_edges, accum_u]
+    f_p = [float(dt_ac), float(beta_hevi), float(gravity), 0.0]
     hevi_c = torch.stack([rho_dw, rtot_w, thm_w, dl, diag, du], dim=0).contiguous()
+    rt_e_c = rtot_e.contiguous()
+    fz0_c = fac_z0.contiguous()
+    fz1_c = fac_z1.contiguous()
+    me_c = m_edge.contiguous()
+    the_c = thm_e.contiguous()
+    tu_c = tend_u_slow.contiguous()
+    ps_c = pres_s.contiguous()
+    dp_c = dp_dThm_s.contiguous()
+    tr_c = Thm_ref.contiguous()
+    zw_c = zw_slope_e.contiguous()
+    tth_c = tend_Thm_slow.contiguous()
+    dzc_c = dz_c.contiguous()
+    dzw_c = dz_w_int.contiguous()
+    ql_c = q_load.contiguous()
 
     cur = (ws["m_a"], ws["Thm_a"], ws["u_a"], ws["w_a"], ws["udz_a"])
     nxt = (ws["m_b"], ws["Thm_b"], ws["u_b"], ws["w_b"], ws["udz_b"])
 
     for _ in range(n_ac):
-        mc, Tc, uc, wc, uzc = cur
-        mn, Tn, un, wn, uzn = nxt
+        mc_s, Tc, uc, wc, uzc = cur
+        mn_s, Tn, un, wn, uzn = nxt
         lib.scvt_fast_edge(
-            c0_i32, c1_i32, dce_c, rtot_e.contiguous(), fac_z0.contiguous(), fac_z1.contiguous(),
-            m_edge.contiguous(), thm_e.contiguous(), tend_u_slow.contiguous(), spc_c,
-            pres_s.contiguous(), dp_dThm_s.contiguous(), Thm_ref.contiguous(), Tc, uc,
+            c0_i32, c1_i32, dce_c, rt_e_c, fz0_c, fz1_c,
+            me_c, the_c, tu_c, spc_c,
+            ps_c, dp_c, tr_c, Tc, uc,
             un, ws["uh_k"], ws["fTh_h_k"], ws["uh_acc"],
-            u_params, f_params, threads=nz * n_edges,
+            u_p, f_p, threads=nz * n_edges,
         )
         lib.scvt_fast_cell_hevi(
-            eoc_i32, esgn_c, area_c_c, dv_c, ae_c, zw_slope_e.contiguous(), un, ws["uh_k"], ws["fTh_h_k"],
-            mc, Tc, wc, uzc, pres_s.contiguous(), dp_dThm_s.contiguous(), Thm_ref.contiguous(),
-            tend_Thm_slow.contiguous(), dz_c.contiguous(), dz_w_int.contiguous(), q_load.contiguous(),
-            hevi_c, spw_c, mn, Tn, wn, uzn, ws["om_acc"],
-            u_params, f_params, threads=n_cells,
+            eoc_i32, esgn_c, area_c_c, dv_c, ae_c, zw_c, un, ws["uh_k"], ws["fTh_h_k"],
+            mc_s, Tc, wc, uzc, ps_c, dp_c, tr_c,
+            tth_c, dzc_c, dzw_c, ql_c,
+            hevi_c, spw_c, mn_s, Tn, wn, uzn, ws["om_acc"],
+            u_p, f_p, threads=n_cells,
         )
         cur, nxt = nxt, cur
 
-    mc, Tc, uc, wc, _ = cur
-    return mc.clone(), Tc.clone(), uc.clone(), wc.clone(), ws["uh_acc"].clone(), ws["om_acc"].clone()
+    mc_s, Tc, uc, wc, _ = cur
+    return mc_s.clone(), Tc.clone(), uc.clone(), wc.clone(), ws["uh_acc"].clone(), ws["om_acc"].clone()
 
 
 def run_crm_mynn_metal(
@@ -2574,6 +2598,9 @@ def _get_scvt_mesh_cache(mesh: Any) -> dict[str, Any]:
             "f_vert": mesh.f_vert.contiguous(),
             "div_w": div_w, "vort_w": vort_w,
             "inv_dc": inv_dc, "inv_dv": inv_dv,
+            "esgn": mesh.edge_sign_on_cell.contiguous(),
+            "area_cell": mesh.area_cell.contiguous(),
+            "dv_edge": mesh.dv_edge.contiguous(),
             "n_cells": int(mesh.n_cells),
             "n_edges": int(mesh.n_edges),
             "n_verts": int(mesh.n_verts),

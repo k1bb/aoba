@@ -19,6 +19,7 @@ from __future__ import annotations
 import torch
 
 from aoba import constants as C
+from aoba.kernels import can_use_crm_metal, dispatch_oro_gwd_metal
 
 
 # Lott & Miller (1997, Sec. 2.4) standard dimensionless constants
@@ -45,6 +46,24 @@ def compute_orographic_drag_lott_miller(
     Uses implicit limiting on both low-level wake drag and wave-breaking tendencies so large
     host time steps (`dt <= 600 s`) remain unconditionally stable over steep mountain ranges.
     """
+    if can_use_crm_metal(rho_d) and rho_d.ndim == 2:
+        return dispatch_oro_gwd_metal(
+            rho_d=rho_d,
+            u_cell=u_cell,
+            v_cell=v_cell,
+            theta_m=theta_m,
+            z_rel_c=z_rel_c,
+            dz_c=dz_c,
+            sigma_topo=sigma_topo,
+            slope_topo=slope_topo,
+            aniso_topo=aniso_topo,
+            angle_topo=angle_topo,
+            dt=dt,
+            gravity=C.GRAVITY,
+            g_wave=G_WAVE,
+            cd_block=CD_BLOCK,
+            hn_crit=HN_CRIT,
+        )
     nz, n_cells = rho_d.shape
     active = (sigma_topo > 10.0) & (slope_topo > 1.0e-4)
 
