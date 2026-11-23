@@ -361,6 +361,8 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         model.crm.v = c_v.reshape(sh4).to(device=device)
         model.crm.w = c_w.reshape(nz_new + 1, nc, ny, nx).to(device=device)
         model.crm.qke = c_qke.reshape(sh4).to(device=device)
+        model.crm.n_c = None
+        model.crm.n_i = None
 
         # Force fresh radiation evaluation on the first step with the new vertical grid
         model.rad_cache = {}

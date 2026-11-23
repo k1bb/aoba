@@ -121,6 +121,10 @@ _MODULE_PARAM_MAP: dict[str, dict[str, tuple[Any, str]]] = {
         "rate_ice_aggreg": (_mp, "RATE_ICE_AGGREG"),
         "vt_cloud_ice": (_mp, "VT_CLOUD_ICE"),
         "cloud_droplet_conc_cm3": (_mp, "CLOUD_DROPLET_CONC_CM3"),
+        "ccn_ocean_base_cm3": (_mp, "CCN_OCEAN_BASE_CM3"),
+        "ccn_land_base_cm3": (_mp, "CCN_LAND_BASE_CM3"),
+        "ccn_dust_scale_cm3": (_mp, "CCN_DUST_SCALE_CM3"),
+        "inp_dust_enhance": (_mp, "INP_DUST_ENHANCE"),
         "t0_precip": (_mp, "T0_PRECIP"),
         "t00_precip": (_mp, "T00_PRECIP"),
         "t0_graupel": (_mp, "T0_GRAUPEL"),
@@ -266,7 +270,7 @@ _FORCING_KEYS: tuple[str, ...] = (
     "use_earth2014", "earth2014_dir", "earth2014_stride", "enable_superparam",
     "enable_dust", "dust_emis_factor",
     "h_ml_ocean", "ocean_mode", "ocean_nz", "enable_seaice_drift",
-    "re_liq_um", "re_ice_um", "cloud_sw_inhomog",
+    "re_liq_um", "re_ice_um", "cloud_sw_inhomog", "microphysics_scheme",
 )
 _ICESHEET_CFG_KEYS: tuple[str, ...] = (
     "enable_dynamic_icesheet", "icesheet_ema_years", "icesheet_accel_factor",

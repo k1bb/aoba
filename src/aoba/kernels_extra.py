@@ -990,6 +990,344 @@ kernel void crm_microphysics_col(
     }
 }
 
+kernel void crm_microphysics_2m_col(
+    device const float* rho_d      [[buffer(0)]],
+    device const float* theta_m_c  [[buffer(1)]],
+    device const float* q_n_in     [[buffer(2)]],
+    device const float* q_p_in     [[buffer(3)]],
+    device const float* q_v_prev   [[buffer(4)]],
+    device const float* n_c_in     [[buffer(5)]],
+    device const float* n_i_in     [[buffer(6)]],
+    device const float* dz_c       [[buffer(7)]],
+    device const float* w_eff_in   [[buffer(8)]],
+    device const float* q_dust_in  [[buffer(9)]],
+    device const float* sfc_2m     [[buffer(10)]],  // [2, M]: row 0 = is_ocean_f, row 1 = u_sfc
+    device float* thm_out          [[buffer(11)]],
+    device float* qn_out           [[buffer(12)]],
+    device float* qp_out           [[buffer(13)]],
+    device float* temp_out         [[buffer(14)]],
+    device float* qv_out           [[buffer(15)]],
+    device float* qc_out           [[buffer(16)]],
+    device float* qi_out           [[buffer(17)]],
+    device float* nc_out           [[buffer(18)]],
+    device float* ni_out           [[buffer(19)]],
+    device float* rain_out         [[buffer(20)]],
+    device float* snow_out         [[buffer(21)]],
+    constant ulong4& u_dim         [[buffer(22)]],  // [nz, M, dz_cols, flags]
+    constant float& dt             [[buffer(23)]],
+    device const float* mp         [[buffer(24)]],  // 61 constants
+    uint m [[thread_position_in_grid]])
+{
+    uint nz = uint(u_dim.x);
+    uint M = uint(u_dim.y);
+    uint dz_cols = uint(u_dim.z);
+    uint flags = uint(u_dim.w);
+    if (m >= M || nz == 0u || nz > 64u) return;
+
+    bool has_weff = (flags & 1u) != 0u;
+    bool has_sfc  = (flags & 2u) != 0u;
+    bool has_dust = (flags & 4u) != 0u;
+    uint col_dz = (dz_cols > 1u) ? m : 0u;
+
+    float p_ref     = mp[0];
+    float r_d       = mp[1];
+    float r_v       = mp[2];
+    float cp_d      = mp[3];
+    float gamma_d   = mp[4];
+    float kappa_d   = mp[5];
+    float rv_ov_rd  = mp[6];
+    float eps_w     = mp[7];
+    float lv0       = mp[8];
+    float lf0       = mp[9];
+    float ls0       = mp[10];
+    float e_tr      = mp[11];
+    float t_frz     = mp[12];
+    float t_tri     = mp[13];
+    float t_ice     = mp[14];
+    float t_liq     = mp[15];
+    float qi_thresh = mp[17];
+    float r_aggr    = mp[19];
+    float vt_ci     = mp[20];
+    float t0_p      = mp[21];
+    float t00_p     = mp[22];
+    float t0_g      = mp[23];
+    float t00_g     = mp[24];
+    float diff_v    = mp[25];
+    float k_th_a    = mp[26];
+    float c_r       = mp[27];
+    float c_s       = mp[28];
+    float c_g       = mp[29];
+    float n0_r      = mp[30];
+    float n0_s      = mp[31];
+    float n0_g      = mp[32];
+    float b_r       = mp[33];
+    float b_s       = mp[34];
+    float b_g       = mp[35];
+    float fp_r      = mp[36];
+    float fp_s      = mp[37];
+    float fp_g      = mp[38];
+    float ac_rc     = mp[39];
+    float ac_sc     = mp[40];
+    float ac_gc     = mp[41];
+    float ac_ri     = mp[42];
+    float ac_si     = mp[43];
+    float ac_gi     = mp[44];
+    float aem_r     = mp[45];
+    float bem_r     = mp[46];
+    float aem_s     = mp[47];
+    float bem_s     = mp[48];
+    float aem_g     = mp[49];
+    float bem_g     = mp[50];
+    float n_drop_fb = mp[51];
+    float ccn_ocn0  = mp[52];
+    float ccn_lnd0  = mp[53];
+    float ccn_dust  = mp[54];
+    float inp_dust  = mp[55];
+    float kk00_c    = mp[56];
+    float rho_ci    = mp[57];
+    float rei_min   = mp[58];
+    float rei_max   = mp[59];
+    float inp_min   = mp[60];
+
+    float eps_small = 1.0e-15f;
+    float exp_r = 0.25f * (3.0f + b_r);
+    float exp_s = 0.25f * (3.0f + b_s);
+    float exp_g = 0.25f * (3.0f + b_g);
+    float ev_exp_r = 0.125f * (5.0f + b_r);
+    float ev_exp_s = 0.125f * (5.0f + b_s);
+    float ev_exp_g = 0.125f * (5.0f + b_g);
+    float f_exp_r = 1.0f + 0.25f * b_r;
+    float f_exp_s = 1.0f + 0.25f * b_s;
+    float f_exp_g = 1.0f + 0.25f * b_g;
+    float kg_d = gamma_d * kappa_d;
+
+    float eps_acc_r = pow(eps_small, exp_r);
+    float eps_acc_s = pow(eps_small, exp_s);
+    float eps_acc_g = pow(eps_small, exp_g);
+    float eps_ev_r  = pow(eps_small, ev_exp_r);
+    float eps_ev_s  = pow(eps_small, ev_exp_s);
+    float eps_ev_g  = pow(eps_small, ev_exp_g);
+    float eps_fl_r  = pow(eps_small, f_exp_r);
+    float eps_fl_s  = pow(eps_small, f_exp_s);
+    float eps_fl_g  = pow(eps_small, f_exp_g);
+
+    float ccn_base_col = n_drop_fb;
+    if (has_sfc) {
+        float is_o = sfc_2m[m];
+        float u10 = clamp(sfc_2m[M + m], 0.0f, 35.0f);
+        float c_ocn = clamp(ccn_ocn0 * exp(0.055f * u10), 30.0f, 140.0f);
+        ccn_base_col = (is_o > 0.5f) ? c_ocn : ccn_lnd0;
+    }
+
+    float tli_a[64];
+    float pres_a[64];
+    float exn_a[64];
+    float qn_a[64];
+    float qp_a[64];
+    float qi_a[64];
+    float nc_a[64];
+    float ni_a[64];
+    float mass_a[64];
+    float ratep_a[64];
+    float rateqi_a[64];
+    float rho_a[64];
+    float omega_p_s0 = 0.0f;
+
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * M + m;
+        float rd = rho_d[idx];
+        float rd_safe = max(rd, 1.0e-3f);
+        float thm = theta_m_c[idx];
+        float qn = max(q_n_in[idx], 0.0f);
+        float qp = max(q_p_in[idx], 0.0f);
+        float nc_c = max(n_c_in[idx], 0.0f);
+        float ni_c = max(n_i_in[idx], 0.0f);
+        float qvg = min(max(q_v_prev[idx], 0.0f), qn);
+
+        float arg = max(r_d * rd * thm / p_ref, 1.0e-8f);
+        float exner = pow(arg, kg_d);
+        float pres = p_ref * arg * exner;
+        float temp_old = exner * (thm / (1.0f + rv_ov_rd * qvg));
+        float q_cond_old = max(qn - qvg, 0.0f);
+        float om_n_old = clamp((temp_old - t_ice) / (t_liq - t_ice), 0.0f, 1.0f);
+        float t_li = temp_old - (om_n_old * lv0 + (1.0f - om_n_old) * ls0) * q_cond_old / cp_d;
+
+        float temp, qv, qc, qi, qsat_mix;
+        mp_sat_adj(t_li, pres, qn, e_tr, t_frz, t_ice, t_liq, eps_w, lv0, ls0, cp_d, temp, qv, qc, qi, qsat_mix);
+
+        float om_p_old = clamp((temp - t00_p) / (t0_p - t00_p), 0.0f, 1.0f);
+        float om_g_old = clamp((temp - t00_g) / (t0_g - t00_g), 0.0f, 1.0f);
+
+        // Natural CCN & INP activation
+        float dust_ug = has_dust ? max(rd * q_dust_in[idx] * 1.0e9f, 0.0f) : 0.0f;
+        float n_ccn_cm3 = ccn_base_col + (has_dust ? (ccn_dust * sqrt(dust_ug / 10.0f + 1.0e-6f)) : 0.0f);
+        float act_fac = 0.85f;
+        if (has_weff) {
+            float wp = clamp(w_eff_in[idx], 0.05f, 20.0f);
+            act_fac = pow(wp / (wp + 0.35f), 0.45f);
+        }
+        float n_act_m3 = clamp(n_ccn_cm3 * act_fac, 15.0f, 450.0f) * 1.0e6f;
+
+        float dt_sup = clamp(t_frz - temp, 0.0f, 40.0f);
+        float n_het = clamp(5.0f * exp(0.304f * dt_sup) * (1.0f + inp_dust * pow(dust_ug / 10.0f, 0.4f)), inp_min, 5.0e5f);
+        float hom_f = clamp((238.0f - temp) / 6.0f, 0.0f, 1.0f);
+        float n_inp_m3 = clamp((1.0f - hom_f) * n_het + hom_f * 2.0e5f, inp_min, 5.0e5f);
+
+        float nc_act = (qc > 1.0e-7f) ? max(nc_c, n_act_m3 / rd_safe) : 0.0f;
+        float ni_act = (qi > 1.0e-8f) ? max(ni_c, n_inp_m3 / rd_safe) : 0.0f;
+        float nc_cm3 = clamp(rd_safe * nc_act * 1.0e-6f, 10.0f, 600.0f);
+
+        float liq_sink = 0.0f;
+        float ice_sink = 0.0f;
+        float inv_sqrt_rd = rsqrt(max(rd, 0.01f));
+        if (qc + qi > 0.0f) {
+            float ice_tfac = exp(0.025f * (temp - t_tri));
+            float dq_auto = (qc > 1.0e-6f) ? (kk00_c * pow(qc, 2.47f) * pow(nc_cm3, -1.79f)) : 0.0f;
+            float dq_aggr = r_aggr * ice_tfac * max(qi - qi_thresh, 0.0f);
+
+            float accr_c = 0.0f;
+            float accr_i = 0.0f;
+            if (qp > 1.0e-12f) {
+                float qr = om_p_old * qp;
+                float qs = (1.0f - om_p_old) * (1.0f - om_g_old) * qp;
+                float qg = (1.0f - om_p_old) * om_g_old * qp;
+                float qr_pow = pow(max(rd * qr, 0.0f) + eps_small, exp_r) - eps_acc_r;
+                float qs_pow = pow(max(rd * qs, 0.0f) + eps_small, exp_s) - eps_acc_s;
+                float qg_pow = pow(max(rd * qg, 0.0f) + eps_small, exp_g) - eps_acc_g;
+                accr_c = inv_sqrt_rd * qc * (ac_rc * qr_pow + ac_sc * qs_pow + ac_gc * qg_pow);
+                accr_i = inv_sqrt_rd * ice_tfac * qi * (ac_ri * qr_pow + ac_si * qs_pow + ac_gi * qg_pow);
+            }
+            liq_sink = min((dq_auto + accr_c) * dt, qc);
+            ice_sink = min((dq_aggr + accr_i) * dt, qi);
+        }
+        float conv_delta = liq_sink + ice_sink;
+        float nc_mid = (qc > 1.0e-9f) ? nc_act * clamp(1.0f - liq_sink / qc, 0.0f, 1.0f) : 0.0f;
+        float ni_mid = (qi > 1.0e-9f) ? ni_act * clamp(1.0f - ice_sink / qi, 0.0f, 1.0f) : 0.0f;
+
+        float qn_mid = qn - conv_delta;
+        float qp_mid = qp + conv_delta;
+
+        float evap_delta = 0.0f;
+        float subsat = max(1.0f - qv / max(qsat_mix, 1.0e-8f), 0.0f);
+        if (qp_mid > 1.0e-12f && subsat > 0.0f) {
+            float ew = mp_esat_w(temp, e_tr, t_frz);
+            float ei = mp_esat_i(temp, e_tr, t_frz);
+            float ab_liq = (lv0 / (k_th_a * temp)) * (lv0 / (r_v * temp) - 1.0f) + (r_v * temp) / (diff_v * max(ew, 1.0e-3f));
+            float ab_ice = (ls0 / (k_th_a * temp)) * (ls0 / (r_v * temp) - 1.0f) + (r_v * temp) / (diff_v * max(ei, 1.0e-4f));
+
+            float qrm = om_p_old * qp_mid;
+            float qsm = (1.0f - om_p_old) * (1.0f - om_g_old) * qp_mid;
+            float qgm = (1.0f - om_p_old) * om_g_old * qp_mid;
+
+            float rrq = max(rd * qrm, 0.0f);
+            float rsq = max(rd * qsm, 0.0f);
+            float rgq = max(rd * qgm, 0.0f);
+            float rd_m025 = pow(max(rd, 0.01f), -0.25f);
+
+            float vent_r = aem_r * sqrt(rrq) + bem_r * (pow(rrq + eps_small, ev_exp_r) - eps_ev_r) * rd_m025;
+            float vent_s = aem_s * sqrt(rsq) + bem_s * (pow(rsq + eps_small, ev_exp_s) - eps_ev_s) * rd_m025;
+            float vent_g = aem_g * sqrt(rgq) + bem_g * (pow(rgq + eps_small, ev_exp_g) - eps_ev_g) * rd_m025;
+
+            float evap_r = (2.0f * 3.14159265f * c_r * n0_r / (rd_safe * ab_liq)) * vent_r * subsat;
+            float subl_s = (2.0f * 3.14159265f * c_s * n0_s / (rd_safe * ab_ice)) * vent_s * subsat;
+            float subl_g = (2.0f * 3.14159265f * c_g * n0_g / (rd_safe * ab_ice)) * vent_g * subsat;
+
+            float max_evap = min(qp_mid, max(qsat_mix - qv, 0.0f));
+            evap_delta = min((evap_r + subl_s + subl_g) * dt, max_evap);
+        }
+
+        float qn_after = qn_mid + evap_delta;
+        float qp_after = qp_mid - evap_delta;
+        float leff_prec = om_p_old * lv0 + (1.0f - om_p_old) * ls0;
+        float t_li_after = t_li + (leff_prec / cp_d) * (conv_delta - evap_delta);
+
+        float rate_p = 0.0f;
+        if (qp_after > 1.0e-12f) {
+            float qrs = om_p_old * qp_after;
+            float qss = (1.0f - om_p_old) * (1.0f - om_g_old) * qp_after;
+            float qgs = (1.0f - om_p_old) * om_g_old * qp_after;
+            float flux_p0 =
+                fp_r * inv_sqrt_rd * (pow(max(rd * qrs, 0.0f) + eps_small, f_exp_r) - eps_fl_r)
+                + fp_s * inv_sqrt_rd * (pow(max(rd * qss, 0.0f) + eps_small, f_exp_s) - eps_fl_s)
+                + fp_g * inv_sqrt_rd * (pow(max(rd * qgs, 0.0f) + eps_small, f_exp_g) - eps_fl_g);
+            rate_p = min(flux_p0 / qp_after, 15.0f * rd);
+        }
+
+        // Size-aware ice terminal velocity
+        float re_i = 48.0f;
+        if (qi > 1.0e-8f && ni_mid > 10.0f) {
+            float den_i = (4.1887902f * rho_ci) * ni_mid;
+            re_i = clamp(0.85f * pow(qi / den_i, 0.33333334f) * 1.0e6f, rei_min, rei_max);
+        }
+        float vt_ice_eff = clamp(vt_ci * (re_i / 48.0f), 0.10f, 1.20f);
+
+        if (k == 0u) omega_p_s0 = om_p_old;
+        tli_a[k] = t_li_after;
+        pres_a[k] = pres;
+        exn_a[k] = exner;
+        qn_a[k] = qn_after;
+        qp_a[k] = qp_after;
+        qi_a[k] = qi;
+        nc_a[k] = nc_mid;
+        ni_a[k] = ni_mid;
+        mass_a[k] = max(rd * dz_c[k * dz_cols + col_dz], 1.0e-4f);
+        ratep_a[k] = rate_p;
+        rateqi_a[k] = rd * vt_ice_eff;
+        rho_a[k] = rd_safe;
+    }
+
+    float qp_above = 0.0f;
+    float qi_above = 0.0f;
+    float ni_above = 0.0f;
+    float ratep_above = 0.0f;
+    float rateqi_above = 0.0f;
+
+    for (int k_i = int(nz) - 1; k_i >= 0; --k_i) {
+        uint k = uint(k_i);
+        float inv_mass = 1.0f / mass_a[k];
+
+        float diag_p = 1.0f + dt * ratep_a[k] * inv_mass;
+        float du_qp = (k + 1u < nz) ? (-dt * ratep_above * inv_mass) * qp_above : 0.0f;
+        float qp_sed = max((qp_a[k] - du_qp) / diag_p, 0.0f);
+        qp_above = qp_sed;
+        ratep_above = ratep_a[k];
+
+        float rqi = rateqi_a[k];
+        float diag_qi = 1.0f + dt * rqi * inv_mass;
+        float du_qi = (k + 1u < nz) ? (-dt * rateqi_above * inv_mass) * qi_above : 0.0f;
+        float du_ni = (k + 1u < nz) ? (-dt * rateqi_above * inv_mass) * ni_above : 0.0f;
+        float qi_sed = max((qi_a[k] - du_qi) / diag_qi, 0.0f);
+        float ni_sed = max((ni_a[k] - du_ni) / diag_qi, 0.0f);
+        qi_above = qi_sed;
+        ni_above = ni_sed;
+        rateqi_above = rqi;
+
+        if (k == 0u) {
+            float p_sfc_tot = ratep_a[0] * qp_sed;
+            rain_out[m] = omega_p_s0 * p_sfc_tot;
+            snow_out[m] = (1.0f - omega_p_s0) * p_sfc_tot + rqi * qi_sed;
+        }
+
+        float dqn_sed = qi_sed - qi_a[k];
+        float qn_final = max(qn_a[k] + dqn_sed, 0.0f);
+        float t_li_final = tli_a[k] - (ls0 / cp_d) * dqn_sed;
+        float t_new, qv_new, qc_new, qi_new, qsat_u;
+        mp_sat_adj(t_li_final, pres_a[k], qn_final, e_tr, t_frz, t_ice, t_liq, eps_w, lv0, ls0, cp_d, t_new, qv_new, qc_new, qi_new, qsat_u);
+
+        float rd_s = rho_a[k];
+        uint idx = k * M + m;
+        thm_out[idx] = (t_new / exn_a[k]) * (1.0f + rv_ov_rd * qv_new);
+        qn_out[idx] = qn_final;
+        qp_out[idx] = qp_sed;
+        temp_out[idx] = t_new;
+        qv_out[idx] = qv_new;
+        qc_out[idx] = qc_new;
+        qi_out[idx] = qi_new;
+        nc_out[idx] = (qc_new > 1.0e-7f) ? clamp(nc_a[k], 10.0e6f / rd_s, 600.0e6f / rd_s) : 0.0f;
+        ni_out[idx] = (qi_new > 1.0e-8f) ? clamp(ni_sed, inp_min / rd_s, 5.0e5f / rd_s) : 0.0f;
+    }
+}
+
 // =========================================================================
 // 8. Global SCVT Fast Acoustic-HEVI Sub-Step Kernels
 // =========================================================================
@@ -3175,6 +3513,87 @@ def run_crm_microphysics_metal(
         [nz, n_col, stride_c, dz_cols], float(dt), mp_buf, threads=M,
     )
     return thm_out, qn_out, qp_out, temp_out, qv_out, qc_out, qi_out, rain_out, snow_out
+
+
+def run_crm_microphysics_2m_metal(
+    lib: Any,
+    rho_d: torch.Tensor,
+    theta_m_c: torch.Tensor,
+    q_n: torch.Tensor,
+    q_p: torch.Tensor,
+    q_v_prev: torch.Tensor,
+    n_c_in: torch.Tensor,
+    n_i_in: torch.Tensor,
+    dz_c: torch.Tensor,
+    dt: float,
+    w_eff: torch.Tensor | None,
+    is_ocean: torch.Tensor | None,
+    u_sfc: torch.Tensor | None,
+    q_dust: torch.Tensor | None,
+    mp_consts: list[float],
+) -> tuple[torch.Tensor, ...]:
+    """Execute fused 2-moment mixed-phase microphysics + sedimentation in 1 Metal kernel."""
+    orig_shape = rho_d.shape
+    nz = orig_shape[0]
+    M = rho_d.numel() // nz
+    dev = rho_d.device
+
+    dz_2d = dz_c.view(nz, -1).contiguous()
+    dz_cols = dz_2d.shape[1]
+    dummy = rho_d.view(-1)
+
+    flags = 0
+    if w_eff is not None:
+        flags |= 1
+        weff_buf = w_eff.reshape(nz, M).contiguous()
+    else:
+        weff_buf = dummy
+    if is_ocean is not None:
+        flags |= 2
+        is_o_f = is_ocean.reshape(M).to(dtype=torch.float32)
+        u_s_f = u_sfc.reshape(M).to(dtype=torch.float32) if u_sfc is not None else torch.zeros_like(is_o_f)
+        sfc_2m = torch.stack([is_o_f, u_s_f], dim=0).contiguous()
+    else:
+        sfc_2m = dummy
+    if q_dust is not None:
+        flags |= 4
+        dust_buf = q_dust.reshape(nz, M).contiguous()
+    else:
+        dust_buf = dummy
+
+    r_c = rho_d.reshape(nz, M).contiguous()
+    th_c = theta_m_c.reshape(nz, M).contiguous()
+    qn_c = q_n.reshape(nz, M).contiguous()
+    qp_c = q_p.reshape(nz, M).contiguous()
+    qv_c = q_v_prev.reshape(nz, M).contiguous()
+    nc_c = n_c_in.reshape(nz, M).contiguous()
+    ni_c = n_i_in.reshape(nz, M).contiguous()
+
+    thm_out = torch.empty_like(r_c)
+    qn_out = torch.empty_like(r_c)
+    qp_out = torch.empty_like(r_c)
+    temp_out = torch.empty_like(r_c)
+    qv_out = torch.empty_like(r_c)
+    qc_out = torch.empty_like(r_c)
+    qi_out = torch.empty_like(r_c)
+    nc_out = torch.empty_like(r_c)
+    ni_out = torch.empty_like(r_c)
+    sfc_shape = orig_shape[1:]
+    rain_out = torch.empty((M,), device=dev, dtype=torch.float32)
+    snow_out = torch.empty((M,), device=dev, dtype=torch.float32)
+
+    mp_buf = _get_const_buf(dev, "mp2m", mp_consts)
+    lib.crm_microphysics_2m_col(
+        r_c, th_c, qn_c, qp_c, qv_c, nc_c, ni_c, dz_2d, weff_buf, dust_buf, sfc_2m,
+        thm_out, qn_out, qp_out, temp_out, qv_out, qc_out, qi_out, nc_out, ni_out, rain_out, snow_out,
+        [int(nz), int(M), int(dz_cols), int(flags)], float(dt), mp_buf, threads=M,
+    )
+    return (
+        thm_out.view(orig_shape), qn_out.view(orig_shape), qp_out.view(orig_shape),
+        temp_out.view(orig_shape), qv_out.view(orig_shape), qc_out.view(orig_shape),
+        qi_out.view(orig_shape), nc_out.view(orig_shape), ni_out.view(orig_shape),
+        rain_out.view(sfc_shape), snow_out.view(sfc_shape),
+    )
 
 
 def run_scvt_fast_acoustic_metal(

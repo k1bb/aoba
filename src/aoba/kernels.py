@@ -25,6 +25,7 @@ from aoba.kernels_extra import (
     _get_scvt_mesh_cache,
     run_crm_fct_advect_metal,
     run_crm_fct_pair_metal,
+    run_crm_microphysics_2m_metal,
     run_crm_microphysics_metal,
     run_crm_mynn_metal,
     run_crm_sgs_metal,
@@ -902,6 +903,12 @@ def dispatch_crm_microphysics_metal(
     lib = _get_metal_lib()
     assert lib is not None
     return run_crm_microphysics_metal(lib, rho_d, theta_m_c, q_n, q_p, q_v_prev, dz_c, dt, mp_consts)
+
+
+def dispatch_crm_microphysics_2m_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_crm_microphysics_2m_metal(lib, **kwargs)
 
 
 def dispatch_scvt_fast_acoustic_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:

@@ -45,7 +45,7 @@ from aoba.kernels import (
     run_crm_rk3_hevi_metal,
     solve_tridiagonal_batched,
 )
-from aoba.microphysics import step_microphysics
+from aoba.microphysics import step_microphysics, step_microphysics_two_moment
 from aoba.radiation import compute_four_band_radiation
 from aoba.surface import SurfaceFluxDiagnostics, SurfaceState, compute_surface_albedos, step_surface
 from aoba.thermodynamics import (
@@ -75,6 +75,8 @@ class CRMState:
     dx: float = 4000.0     # Horizontal x-spacing [m]
     dy: float = 4000.0     # Horizontal y-spacing [m]
     f_coriolis: torch.Tensor | None = None  # Column Coriolis parameter [s^-1], shape [N_col]
+    n_c: torch.Tensor | None = None  # 2-moment cloud droplet number mixing ratio [kg^-1], [Nz, N_col, Ny, Nx]
+    n_i: torch.Tensor | None = None  # 2-moment cloud ice crystal number mixing ratio [kg^-1], [Nz, N_col, Ny, Nx]
 
 
 @dataclass
@@ -874,6 +876,10 @@ def step_crm_physics_and_dynamics(
     z_c_col: torch.Tensor | None = None,
     z_w_col: torch.Tensor | None = None,
     dz_c_col: torch.Tensor | None = None,
+    microphysics_scheme: str = "one_moment",
+    is_ocean_sub: torch.Tensor | None = None,
+    u_sfc_sub: torch.Tensor | None = None,
+    q_dust_sub: torch.Tensor | None = None,
 ) -> SPTendencies:
     """Advance 3D CRM by `dt_crm` [s] (RK3-HEVI + Zalesak FCT + MYNN 2.5 + SAM Microphysics).
 
@@ -882,6 +888,12 @@ def step_crm_physics_and_dynamics(
     """
     nz, n_col, ny, nx = crm.rho_d.shape
     m_sub = n_col * ny * nx
+    use_2m_mp = str(microphysics_scheme).strip().lower() == "two_moment"
+    if use_2m_mp:
+        if crm.n_c is None:
+            crm.n_c = torch.zeros_like(crm.q_c)
+        if crm.n_i is None:
+            crm.n_i = torch.zeros_like(crm.q_i)
 
     # Record initial horizontal-mean profiles before CRM physics + subgrid transport
     thm_mean_0 = crm.theta_m.mean(dim=(-2, -1))
@@ -1005,6 +1017,15 @@ def step_crm_physics_and_dynamics(
             else:
                 crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
                 crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+            if use_2m_mp and crm.n_c is not None and crm.n_i is not None:
+                if use_metal_crm:
+                    crm.n_c, crm.n_i = dispatch_crm_fct_pair_metal(
+                        crm.n_c, crm.n_i, rho_start, crm.rho_d,
+                        fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv,
+                    )
+                else:
+                    crm.n_c = fct_advect_3d(crm.n_c, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+                    crm.n_i = fct_advect_3d(crm.n_i, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
             s_idx += k_cnt
         crm.theta_m = Thm_cur / crm.rho_d
         q_cond_adv = torch.minimum(crm.q_c + crm.q_i, crm.q_n)
@@ -1066,16 +1087,39 @@ def step_crm_physics_and_dynamics(
         crm.q_c = qc_f.reshape(nz, n_col, ny, nx)
         crm.q_i = qi_f.reshape(nz, n_col, ny, nx)
 
-    # 4. SAM 1-moment mixed-phase microphysics & sub-cycled sedimentation
-    mp = step_microphysics(
-        rho_d=crm.rho_d.reshape(nz, m_sub),
-        theta_m_c=crm.theta_m.reshape(nz, m_sub),
-        q_n=crm.q_n.reshape(nz, m_sub),
-        q_p=crm.q_p.reshape(nz, m_sub),
-        q_v_prev=crm.q_v.reshape(nz, m_sub),
-        dz_c=dz_flat,
-        dt=dt_crm,
-    )
+    # 4. Mixed-phase microphysics (2-moment Morrison/KK00 or 1-moment SAM KR03) & sedimentation
+    if use_2m_mp and crm.n_c is not None and crm.n_i is not None:
+        w_center = 0.5 * (crm.w[:-1] + crm.w[1:])
+        w_eff = (torch.clamp(w_center, min=0.0) + 0.7 * torch.sqrt(0.5 * torch.clamp(crm.qke, min=0.0))).reshape(nz, m_sub)
+        mp = step_microphysics_two_moment(
+            rho_d=crm.rho_d.reshape(nz, m_sub),
+            theta_m_c=crm.theta_m.reshape(nz, m_sub),
+            q_n=crm.q_n.reshape(nz, m_sub),
+            q_p=crm.q_p.reshape(nz, m_sub),
+            q_v_prev=crm.q_v.reshape(nz, m_sub),
+            n_c_in=crm.n_c.reshape(nz, m_sub),
+            n_i_in=crm.n_i.reshape(nz, m_sub),
+            dz_c=dz_flat,
+            dt=dt_crm,
+            w_eff=w_eff,
+            is_ocean=is_ocean_sub.reshape(m_sub) if is_ocean_sub is not None else None,
+            u_sfc=u_sfc_sub.reshape(m_sub) if u_sfc_sub is not None else None,
+            q_dust=q_dust_sub.reshape(nz, m_sub) if q_dust_sub is not None else None,
+        )
+        if mp.n_c is not None:
+            crm.n_c = mp.n_c.reshape(nz, n_col, ny, nx)
+        if mp.n_i is not None:
+            crm.n_i = mp.n_i.reshape(nz, n_col, ny, nx)
+    else:
+        mp = step_microphysics(
+            rho_d=crm.rho_d.reshape(nz, m_sub),
+            theta_m_c=crm.theta_m.reshape(nz, m_sub),
+            q_n=crm.q_n.reshape(nz, m_sub),
+            q_p=crm.q_p.reshape(nz, m_sub),
+            q_v_prev=crm.q_v.reshape(nz, m_sub),
+            dz_c=dz_flat,
+            dt=dt_crm,
+        )
     crm.theta_m = mp.theta_m_c.reshape(nz, n_col, ny, nx)
     crm.q_n = mp.q_n.reshape(nz, n_col, ny, nx)
     crm.q_p = mp.q_p.reshape(nz, n_col, ny, nx)

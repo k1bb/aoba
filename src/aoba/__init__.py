@@ -43,7 +43,13 @@ from aoba.gravity_wave import compute_frontogenesis_2d, compute_nonorographic_gw
 from aoba.io_zarr import append_zarr, export_aoba_snapshot_xarray, load_zarr, save_zarr
 from aoba.kernels import solve_tridiagonal_batched
 from aoba.koppen import KOPPEN_NAMES, classify_koppen_geiger
-from aoba.microphysics import MicrophysicsResult, step_microphysics
+from aoba.microphysics import (
+    MicrophysicsResult,
+    compute_natural_ccn_inp,
+    diagnose_cloud_effective_radii,
+    step_microphysics,
+    step_microphysics_two_moment,
+)
 from aoba.ocean_ekman import EkmanOceanState, init_ekman_ocean_state, step_ekman_ocean_voronoi
 from aoba.ocean_ogcm import (
     OceanOGCMState,

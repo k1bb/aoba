@@ -43,6 +43,7 @@ from aoba.icesheet import (
     step_sia_icesheet_scvt,
 )
 from aoba.koppen import classify_koppen_geiger
+from aoba.microphysics import diagnose_cloud_effective_radii
 from aoba.ocean_ekman import EkmanOceanState, init_ekman_ocean_state, step_ekman_ocean_voronoi
 from aoba.ocean_ogcm import OceanOGCMState, init_ogcm_state, step_ogcm_voronoi
 from aoba.orography import compute_orographic_drag_lott_miller
@@ -94,9 +95,10 @@ class AOBAConfig:
     ocean_mode: str = "ogcm_3d"              # Ocean model: "ogcm_3d" (3D multi-layer OGCM) or "ekman_sw" (1.5-layer shallow-water)
     ocean_nz: int = 18                       # Vertical z-levels when ocean_mode="ogcm_3d" (0..6000 m)
     enable_seaice_drift: bool = True         # Enable dynamic wind/current sea-ice drift in 3D OGCM mode
-    re_liq_um: float = 10.0                  # Cloud liquid droplet effective radius [um]
-    re_ice_um: float = 48.0                  # Cloud ice crystal effective radius [um]
-    cloud_sw_inhomog: float = 0.85           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
+    re_liq_um: float = 10.0                  # Fallback/1M cloud liquid droplet effective radius [um]
+    re_ice_um: float = 48.0                  # Fallback/1M cloud ice crystal effective radius [um]
+    cloud_sw_inhomog: float = 0.65           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
+    microphysics_scheme: str = "two_moment"  # Cloud microphysics: "two_moment" (Morrison/KK00 + prognostic r_e) or "one_moment"
     crm_nx: int = 8                          # Embedded CRM x-grid points per SCVT cell (default 2D 8x1 = 32 km curtain)
     crm_ny: int = 1                          # Embedded CRM y-grid points (1 = SP-CAM 2.5D curtain for Mac climate runs)
     crm_dx: float = 4000.0                   # Embedded CRM horizontal spacing [m] (4 km resolves convective cores cleanly)
@@ -779,6 +781,15 @@ def step_aoba_model(
         if cfg.enable_dust and atmos.q_dust is None:
             atmos.q_dust = torch.zeros_like(atmos.q_n)
         q_dust_rad = _cell_to_sub(atmos.q_dust, nc, n_sub) if (cfg.enable_dust and atmos.q_dust is not None) else None
+        if str(cfg.microphysics_scheme).strip().lower() == "two_moment" and crm.n_c is not None and crm.n_i is not None:
+            re_liq_rad, re_ice_rad = diagnose_cloud_effective_radii(
+                rho_sub, qc_sub, qi_sub,
+                crm.n_c.reshape(nz, m_sub), crm.n_i.reshape(nz, m_sub),
+                re_liq_fallback=cfg.re_liq_um, re_ice_fallback=cfg.re_ice_um,
+            )
+        else:
+            re_liq_rad = cfg.re_liq_um
+            re_ice_rad = cfg.re_ice_um
         o3_vmr_rad = None
         if model.o3_provider is not None and model.o3_provider.mode != "rcemip":
             doy_now = float(model.calendar.date_at(model.sim_time_sec).doy)
@@ -808,8 +819,8 @@ def step_aoba_model(
                 albedo_vis_dif=alb_vf,
                 albedo_nir_dif=alb_nf,
                 col_chunk=cfg.rad_col_chunk,
-                re_liq_um=cfg.re_liq_um,
-                re_ice_um=cfg.re_ice_um,
+                re_liq_um=re_liq_rad,
+                re_ice_um=re_ice_rad,
                 cloud_sw_inhomog=cfg.cloud_sw_inhomog,
                 q_dust_c=q_dust_rad,
                 o3_vmr_c=o3_vmr_rad,
@@ -1028,6 +1039,13 @@ def step_aoba_model(
         du_crm_c = torch.zeros_like(u_host_new)
         dv_crm_c = torch.zeros_like(v_host_new)
         sfc_diag_3d = {k: v.reshape(nc, ny, nx) for k, v in sfc_diag_sub.__dict__.items()}
+        is_ocn_3d = is_ocn_sub.reshape(nc, ny, nx)
+        u_sfc_3d = torch.hypot(u_sub_post, v_sub_post).reshape(nc, ny, nx)
+        q_dust_4d = (
+            atmos.q_dust.unsqueeze(-1).unsqueeze(-1).expand(nz, nc, ny, nx)
+            if (cfg.enable_dust and atmos.q_dust is not None)
+            else None
+        )
 
         chunk = max(cfg.crm_col_chunk, 1)
         if chunk >= nc:
@@ -1049,6 +1067,10 @@ def step_aoba_model(
                 z_c_col=atmos.z_c,
                 z_w_col=atmos.z_w,
                 dz_c_col=atmos.dz_c,
+                microphysics_scheme=cfg.microphysics_scheme,
+                is_ocean_sub=is_ocn_3d,
+                u_sfc_sub=u_sfc_3d,
+                q_dust_sub=q_dust_4d,
             )
             atmos.theta_m = crm.theta_m.mean(dim=(-2, -1))
             atmos.q_n = crm.q_n.mean(dim=(-2, -1))
@@ -1087,6 +1109,8 @@ def step_aoba_model(
                     dx=cfg.crm_dx,
                     dy=cfg.crm_dx,
                     f_coriolis=mesh.f_cell[sl],
+                    n_c=crm.n_c[:, sl] if crm.n_c is not None else None,
+                    n_i=crm.n_i[:, sl] if crm.n_i is not None else None,
                 )
                 sub_sfc = SurfaceFluxDiagnostics(**{k: v[sl] for k, v in sfc_diag_3d.items()})
                 sp = step_crm_physics_and_dynamics(
@@ -1104,6 +1128,10 @@ def step_aoba_model(
                     z_c_col=atmos.z_c[:, sl],
                     z_w_col=atmos.z_w[:, sl],
                     dz_c_col=atmos.dz_c[:, sl],
+                    microphysics_scheme=cfg.microphysics_scheme,
+                    is_ocean_sub=is_ocn_3d[sl],
+                    u_sfc_sub=u_sfc_3d[sl],
+                    q_dust_sub=q_dust_4d[:, sl] if q_dust_4d is not None else None,
                 )
                 crm.rho_d[:, sl] = sub_crm.rho_d
                 crm.u[:, sl] = sub_crm.u
@@ -1116,6 +1144,14 @@ def step_aoba_model(
                 crm.q_c[:, sl] = sub_crm.q_c
                 crm.q_i[:, sl] = sub_crm.q_i
                 crm.qke[:, sl] = sub_crm.qke
+                if sub_crm.n_c is not None:
+                    if crm.n_c is None:
+                        crm.n_c = torch.zeros_like(crm.q_c)
+                    crm.n_c[:, sl] = sub_crm.n_c
+                if sub_crm.n_i is not None:
+                    if crm.n_i is None:
+                        crm.n_i = torch.zeros_like(crm.q_i)
+                    crm.n_i[:, sl] = sub_crm.n_i
 
                 atmos.theta_m[:, sl] = sub_crm.theta_m.mean(dim=(-2, -1))
                 atmos.q_n[:, sl] = sub_crm.q_n.mean(dim=(-2, -1))

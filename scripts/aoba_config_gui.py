@@ -1345,6 +1345,13 @@ const PARAM_DOCS = {
   co2_mode: { ja: "CO₂ 強制モード (constant: 固定値 / scenario: CMIP・観測・古気候 / csv: 独自CSV)", en: "CO2 forcing mode (constant / scenario / csv)" },
   co2_scenario: { ja: "CO₂ シナリオ名 (NOAA観測 / CMIP5 RCP / CMIP6 SSP / 80万年氷床コア)", en: "CO2 scenario key (NOAA Obs / CMIP5 RCP / CMIP6 SSP / 800ka Ice Core)" },
   co2_csv_path: { ja: "独自 CO₂ 時系列 CSV パス (year, co2_ppmv 列; co2_mode='csv' 時)", en: "Custom (year, co2_ppmv) CSV path when co2_mode='csv'" },
+  ch4_ppmv: { ja: "大気 CH₄ 濃度 [ppmv] (1850 piControl: 0.80825, 現代: 1.803)", en: "Atmospheric CH4 concentration [ppmv] (1850 piControl: 0.80825)" },
+  n2o_ppmv: { ja: "大気 N₂O 濃度 [ppmv] (1850 piControl: 0.27302, 現代: 0.332)", en: "Atmospheric N2O concentration [ppmv] (1850 piControl: 0.27302)" },
+  rad_scheme: { ja: "放射伝達スキーム (ckd: 16バンド50g点 Correlated-k / four_band: 旧4バンド)", en: "Radiative transfer scheme (ckd 16-band 50 g-pt / four_band legacy)" },
+  ocean_mode: { ja: "海洋モデル選択 (ogcm_3d: 3次元多層OGCM+塩分+海氷移流 / ekman_sw: 1.5層浅水エクマン)", en: "Ocean model mode (ogcm_3d 3D multi-layer OGCM / ekman_sw 1.5-layer shallow water)" },
+  ocean_nz: { ja: "3D OGCM の鉛直層数 (ocean_mode='ogcm_3d' 時; 既定18層 0〜6000 m)", en: "Number of 3D OGCM vertical z-levels (default 18 covering 0-6000 m)" },
+  enable_seaice_drift: { ja: "3D OGCM 時の風・海流による海氷の力学的移流 (Hibler 1979 準拠)", en: "Enable dynamic wind/current sea-ice drift in 3D OGCM mode" },
+  microphysics_scheme: { ja: "雲微物理スキーム (two_moment: 2モーメント数濃度+粒径依存放射 / one_moment: 旧SAM 1M)", en: "Cloud microphysics scheme (two_moment prognostic Nc,Ni,re / one_moment legacy KR03)" },
   o3_mode: { ja: "オゾン分布モード (rcemip: 1D一様 / latitude_seasonal: 解析的2D緯度季節 / climatology: 外部帯状平均)", en: "Ozone mode (rcemip 1D / latitude_seasonal 2D / climatology external)" },
   o3_file_path: { ja: "外部オゾン気候値ファイル (.npz / .nc; 空欄時は data/boundary/ozone を参照)", en: "External ozone climatology path (.npz/.nc; blank uses data/boundary/ozone)" },
   o3_lw_coupling: { ja: "長波 9.6 μm 窓領域オゾン吸収を有効化", en: "Enable 9.6 um longwave O3 absorption in LW2 window" },
@@ -1604,7 +1611,7 @@ function setKey(sec, key, val) {
   const def = STATE.defaults[sec]?.[key];
   if (typeof def === "boolean") val = Boolean(val);
   else if (typeof def === "number") {
-    const intKeys = ["glevel","nz","crm_nx","crm_ny","n_host_dyn_substeps","n_crm_dyn_substeps","rad_stride","crm_col_chunk","rad_col_chunk","earth2014_stride","years","monthly_mean_periods_per_year","snapshots_periods_per_year","restart_interval_years"];
+    const intKeys = ["glevel","nz","ocean_nz","crm_nx","crm_ny","n_host_dyn_substeps","n_crm_dyn_substeps","rad_stride","crm_col_chunk","rad_col_chunk","earth2014_stride","years","monthly_mean_periods_per_year","snapshots_periods_per_year","restart_interval_years"];
     val = intKeys.includes(key) ? Math.round(Number(val)) : Number(val);
     if (Number.isNaN(val)) val = def;
   }
@@ -1646,6 +1653,21 @@ function buildFieldRow(sec, key, skipKeys = []) {
     } else {
       ctrl = `<input type="text" value="${String(cur).replace(/"/g,'&quot;')}" onchange="setKey('${sec}','${key}',this.value)" />`;
     }
+  } else if (key === "rad_scheme") {
+    ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
+      <option value="ckd" ${cur==="ckd"?"selected":""}>ckd (16バンド 50g点 Correlated-k: H2O/CO2/CH4/N2O/O3)</option>
+      <option value="four_band" ${cur==="four_band"?"selected":""}>four_band (旧4バンド解析的2ストリーム)</option>
+    </select>`;
+  } else if (key === "ocean_mode") {
+    ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
+      <option value="ogcm_3d" ${cur==="ogcm_3d"?"selected":""}>ogcm_3d (3次元多層OGCM: Earth2014海底地形・塩分・GM90・海氷移流)</option>
+      <option value="ekman_sw" ${cur==="ekman_sw"?"selected":""}>ekman_sw (1.5層浅水・風成エクマン海洋)</option>
+    </select>`;
+  } else if (key === "microphysics_scheme") {
+    ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
+      <option value="two_moment" ${cur==="two_moment"?"selected":""}>two_moment (2モーメント Nc/Ni・自然CCN/INP・診断有効半径)</option>
+      <option value="one_moment" ${cur==="one_moment"?"selected":""}>one_moment (旧SAM 1モーメント固定粒径)</option>
+    </select>`;
   } else if (key === "o3_mode") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
       <option value="rcemip" ${cur==="rcemip"?"selected":""}>rcemip (Wing 2018 1D一様)</option>
