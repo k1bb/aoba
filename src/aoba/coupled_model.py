@@ -747,7 +747,8 @@ def step_aoba_model(
     z_ref_rel_sub = torch.clamp(_cell_to_sub(z_rel_c[0], nc, n_sub) - 0.65 * sfc_sub.bio.h_canopy, min=5.0)
 
     # 3. Subcolumn surface albedos & ICA 4-band radiative transfer across all `[Nz, m_sub]`
-    alb_vd, alb_vf, alb_nd, alb_nf, _, lai_exp_sub, _, f_ice_sub = compute_surface_albedos(sfc_sub, mu0_sub)
+    _pre_alb_sub = compute_surface_albedos(sfc_sub, mu0_sub)
+    alb_vd, alb_vf, alb_nd, alb_nf, _, lai_exp_sub, _, f_ice_sub = _pre_alb_sub
     if need_rad:
         t_rad_ocn = ((1.0 - f_ice_sub) * (sfc_sub.t_ocean_ml ** 4) + f_ice_sub * (torch.clamp(sfc_sub.t_seaice, min=150.0) ** 4)) ** 0.25
         t_rad_in = torch.where(sfc_sub.surf_type == SURF_OCEAN, t_rad_ocn, sfc_sub.t_canopy)
@@ -855,6 +856,7 @@ def step_aoba_model(
         mu0=mu0_sub,
         co2_ppmv=model.current_co2_ppmv(),
         dt=dt,
+        precomputed_albedos=_pre_alb_sub,
     )
 
     is_ocn_sub = sfc_sub.surf_type == SURF_OCEAN

@@ -39,7 +39,11 @@ from aoba.kernels_physics import (
     run_dust_column_metal,
     run_ngwd_propagate_metal,
     run_oro_gwd_metal,
+    run_rad_four_band_metal,
     run_scvt_fct_advect_metal,
+    run_surface_albedos_metal,
+    run_surface_transfer_metal,
+    run_two_leaf_gas_exchange_metal,
 )
 
 _MAX_METAL_K: int = 128
@@ -817,6 +821,17 @@ def can_use_crm_metal(rho0: torch.Tensor) -> bool:
     )
 
 
+def can_use_elem_metal(t: torch.Tensor) -> bool:
+    """Return True when single-level/elementwise Metal shaders can be dispatched."""
+    return (
+        t.device.type == "mps"
+        and t.dtype == torch.float32
+        and t.numel() > 0
+        and not t.requires_grad
+        and _get_metal_lib() is not None
+    )
+
+
 def dispatch_crm_fct_advect_metal(
     q_batch: torch.Tensor,
     rho_old: torch.Tensor,
@@ -940,6 +955,32 @@ def dispatch_ngwd_propagate_metal(**kwargs: Any) -> torch.Tensor:
     lib = _get_metal_lib()
     assert lib is not None
     return run_ngwd_propagate_metal(lib, **kwargs)
+
+
+def dispatch_rad_four_band_metal(
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_rad_four_band_metal(lib, **kwargs)
+
+
+def dispatch_surface_albedos_metal(**kwargs: Any) -> torch.Tensor:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_surface_albedos_metal(lib, **kwargs)
+
+
+def dispatch_surface_transfer_metal(**kwargs: Any) -> torch.Tensor:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_surface_transfer_metal(lib, **kwargs)
+
+
+def dispatch_two_leaf_gas_exchange_metal(**kwargs: Any) -> torch.Tensor:
+    lib = _get_metal_lib()
+    assert lib is not None
+    return run_two_leaf_gas_exchange_metal(lib, **kwargs)
 
 
 def run_crm_rk3_hevi_metal(

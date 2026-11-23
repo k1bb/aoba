@@ -35,7 +35,9 @@ import torch
 from aoba import constants as C
 from aoba.kernels import (
     can_use_crm_metal,
+    can_use_elem_metal,
     dispatch_crm_mynn_metal,
+    dispatch_surface_transfer_metal,
     solve_tridiagonal_batched,
 )
 from aoba.thermodynamics import diagnose_pressure_temperature, qsat_mixed, saturation_adjustment
@@ -265,6 +267,33 @@ def compute_surface_transfer(
     - De Ridder (2010, Boundary-Layer Meteorol., 134, Eqs. 6-7 & 22).
     - Bonan et al. (2018, Geosci. Model Dev., 11, Sec. 2.2) & Lee et al. (2020, GMD, 13, Eqs. 6-11).
     """
+    if (
+        can_use_elem_metal(u_1)
+        and u_1.shape == theta_v1.shape == theta_vsfc.shape == z_ref.shape == z0m.shape == z0h.shape == z0q.shape
+        and (rsl_depth is None or (rsl_depth.shape == u_1.shape and not rsl_depth.requires_grad))
+    ):
+        out_6 = dispatch_surface_transfer_metal(
+            u_1=u_1,
+            v_1=v_1,
+            theta_v1=theta_v1,
+            theta_vsfc=theta_vsfc,
+            z_ref=z_ref,
+            z0m=z0m,
+            z0h=z0h,
+            z0q=z0q,
+            rsl_depth=rsl_depth,
+            n_iter=n_iter,
+            consts=(C.GRAVITY, C.VON_KARMAN, RSL_MU_M, RSL_MU_H, RSL_NU, RSL_LAMBDA),
+        )
+        return SurfaceTransferState(
+            c_m=out_6[0],
+            c_h=out_6[1],
+            c_q=out_6[2],
+            u_star=out_6[3],
+            zeta=out_6[4],
+            wind_eff=out_6[5],
+        )
+
     z_safe = torch.clamp(z_ref, min=2.0)
     z0m_s = torch.minimum(torch.clamp(z0m, min=1.0e-6), 0.45 * z_safe)
     z0h_s = torch.minimum(torch.clamp(z0h, min=1.0e-7), 0.45 * z_safe)

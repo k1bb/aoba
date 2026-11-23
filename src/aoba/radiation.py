@@ -34,7 +34,7 @@ import math
 import torch
 
 from aoba import constants as C
-from aoba.kernels import solve_tridiagonal_batched
+from aoba.kernels import can_use_crm_metal, dispatch_rad_four_band_metal, solve_tridiagonal_batched
 
 
 @dataclass
@@ -431,70 +431,43 @@ def toon_two_stream_lw(
     device = tau_in.device
 
     tau = torch.clamp(tau_in, min=1.0e-6)
-    gamma1 = 2.0  # Hemispheric Mean (mu_1 = 0.5) with omega_0 = 0 (Toon et al., 1989, Table 1)
-    lam = 2.0
+    # Exact analytical decoupling of Toon et al. (1989) Hemispheric Mean (omega_0 = 0):
+    # Gamma = 0 => e1 = e2 = 1, e3 = -e4 = exp(-2*tau). Upward & downward streams decouple
+    # cleanly except via the surface boundary U_N = emiss * fb_sfc + (1 - emiss) * D_N.
+    # Rewriting cm_t - cm_0*E and cp_0 - cp_t*E in terms of w1 = 1 - (1-E)/(2*tau) and
+    # w2 = (1-E)/(2*tau) - E eliminates 1/tau cancellation and keeps all weights > 0.
+    two_tau = torch.clamp(2.0 * tau, max=50.0)
+    exp_lt = torch.exp(-two_tau)
+    one_minus_e = -torch.expm1(-two_tau)
+    alpha = torch.where(
+        two_tau > 1.0e-3,
+        one_minus_e / two_tau,
+        1.0 - 0.5 * two_tau + (1.0 / 6.0) * two_tau * two_tau,
+    )
+    w1 = 1.0 - alpha
+    w2 = torch.clamp(alpha - exp_lt, min=0.0)
 
-    # Linear-in-tau Planck source across each layer (Toon Eqs. 25-27):
-    # F_B(tau) = fb0 + fb1 * tau, with 2*pi*mu_1*B = pi*B = f_band * sigma * T^4
     fb0 = fb_int_in[:-1]
     fb_bot = fb_int_in[1:]
-    fb1 = (fb_bot - fb0) / tau
+    src_dn = w2 * fb0 + w1 * fb_bot
+    src_up = w1 * fb0 + w2 * fb_bot
 
-    inv_g = 1.0 / gamma1  # = 0.5
-    cp_0 = fb0 + fb1 * inv_g
-    cp_t = fb_bot + fb1 * inv_g
-    cm_0 = fb0 - fb1 * inv_g
-    cm_t = fb_bot - fb1 * inv_g
-
-    exp_lt = torch.exp(-torch.clamp(lam * tau, max=50.0))
-    # Since omega_0 = 0 => Gamma = 0 => e1 = 1, e2 = 1, e3 = exp(-2*tau), e4 = -exp(-2*tau)
-    # Using general Toon Eqs. (41-43) solves upward & downward streams simultaneously
-    # including surface IR reflection R_sfc = 1 - emiss_sfc!
-    e1 = torch.ones_like(tau)
-    e2 = torch.ones_like(tau)
-    e3 = exp_lt
-    e4 = -exp_lt
-
-    two_N = 2 * N
-    A = torch.zeros((two_N,) + col_shape, dtype=dtype, device=device)
-    B = torch.zeros((two_N,) + col_shape, dtype=dtype, device=device)
-    D = torch.zeros((two_N,) + col_shape, dtype=dtype, device=device)
-    E = torch.zeros((two_N,) + col_shape, dtype=dtype, device=device)
-
-    # Top boundary: zero downward thermal IR from space F_1^-(0) = 0
-    B[0] = e1[0]
-    D[0] = -e2[0]
-    E[0] = -cm_0[0]
-
-    if N > 1:
-        A[1 : two_N - 1 : 2] = e1[:-1] * e2[1:] - e3[:-1] * e4[1:]
-        B[1 : two_N - 1 : 2] = e2[:-1] * e2[1:] - e4[:-1] * e4[1:]
-        D[1 : two_N - 1 : 2] = e1[1:] * e4[1:] - e2[1:] * e3[1:]
-        E[1 : two_N - 1 : 2] = (cp_0[1:] - cp_t[:-1]) * e2[1:] + (cm_t[:-1] - cm_0[1:]) * e4[1:]
-
-        A[2:two_N:2] = e2[:-1] * e3[:-1] - e4[:-1] * e1[:-1]
-        B[2:two_N:2] = e1[:-1] * e1[1:] - e3[:-1] * e3[1:]
-        D[2:two_N:2] = e3[:-1] * e4[1:] - e1[:-1] * e2[1:]
-        E[2:two_N:2] = e3[:-1] * (cp_0[1:] - cp_t[:-1]) + e1[:-1] * (cm_t[:-1] - cm_0[1:])
+    flux_dn = torch.empty((N + 1,) + col_shape, dtype=dtype, device=device)
+    flux_up = torch.empty((N + 1,) + col_shape, dtype=dtype, device=device)
+    flux_dn[0] = 0.0
+    dn_cur = flux_dn[0]
+    for n in range(N):
+        dn_cur = dn_cur * exp_lt[n] + src_dn[n]
+        flux_dn[n + 1] = dn_cur
 
     r_sfc = 1.0 - emiss_sfc
-    s_sfc = emiss_sfc * fb_sfc
-    A[-1] = e1[-1] - r_sfc * e3[-1]
-    B[-1] = e2[-1] - r_sfc * e4[-1]
-    E[-1] = s_sfc - cp_t[-1] + r_sfc * cm_t[-1]
+    up_cur = emiss_sfc * fb_sfc + r_sfc * dn_cur
+    flux_up[N] = up_cur
+    for n in range(N - 1, -1, -1):
+        up_cur = up_cur * exp_lt[n] + src_up[n]
+        flux_up[n] = up_cur
 
-    Y = solve_tridiagonal_batched(A, B, D, E)
-    Y1 = Y[0::2]
-    Y2 = Y[1::2]
-
-    flux_up = torch.zeros((N + 1,) + col_shape, dtype=dtype, device=device)
-    flux_dn = torch.zeros((N + 1,) + col_shape, dtype=dtype, device=device)
-
-    flux_up[0] = torch.clamp(Y1[0] * e3[0] - Y2[0] * e4[0] + cp_0[0], min=0.0)
-    flux_dn[0] = 0.0
-    flux_up[1:] = torch.clamp(Y1 * e1 + Y2 * e2 + cp_t, min=0.0)
-    flux_dn[1:] = torch.clamp(Y1 * e3 + Y2 * e4 + cm_t, min=0.0)
-    return flux_up, flux_dn
+    return torch.clamp(flux_up, min=0.0), torch.clamp(flux_dn, min=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +505,93 @@ def compute_four_band_radiation(
     of shape `[nz, ...]` and `pres_w`, `temp_w` of shape `[nz + 1, ...]`) use AOBA's
     standard bottom-up indexing (`0 = surface`, `nz = TOA`).
     """
+    if can_use_crm_metal(pres_c) and t_sfc.numel() > 0:
+        from aoba.dust import (
+            DUST_ASYM_SW1,
+            DUST_ASYM_SW2,
+            DUST_K_ABS_LW1,
+            DUST_K_ABS_LW2,
+            DUST_K_EXT_SW1,
+            DUST_K_EXT_SW2,
+            DUST_SSA_SW1,
+            DUST_SSA_SW2,
+        )
+
+        consts = (
+            float(C.SOLAR_FRAC_SW1),
+            float(C.SOLAR_FRAC_SW2),
+            float(C.LW_NONWIN_FRAC),
+            float(C.LW_WINDOW_FRAC),
+            float(C.STEFAN_BOLTZMANN),
+            float(C.O3_G1),
+            float(C.O3_G2),
+            float(C.O3_G3),
+            float(C.CO2_PREIND_PPMV),
+            float(C.PAR_FRAC_OF_SW1),
+            float(C.CP_D),
+            float(C.CP_V),
+            float(C.EPS_WATER),
+            float(C.P_REF),
+            float(C.T_FREEZE),
+            float(C.GRAVITY),
+            float(DUST_K_EXT_SW1),
+            float(DUST_SSA_SW1),
+            float(DUST_ASYM_SW1),
+            float(DUST_K_EXT_SW2),
+            float(DUST_SSA_SW2),
+            float(DUST_ASYM_SW2),
+            float(DUST_K_ABS_LW1),
+            float(DUST_K_ABS_LW2),
+        )
+        sw_up, sw_dn, lw_up, lw_dn, q_rad_3d, sfc_out = dispatch_rad_four_band_metal(
+            pres_c=pres_c,
+            pres_w=pres_w,
+            temp_c=temp_c,
+            temp_w=temp_w,
+            dz_c=dz_c,
+            rho_d_c=rho_d_c,
+            qv_c=qv_c,
+            qc_c=qc_c,
+            qi_c=qi_c,
+            t_sfc=t_sfc,
+            albedo_vis=albedo_vis,
+            albedo_nir=albedo_nir,
+            mu0=mu0,
+            s_toa=s_toa,
+            co2_ppmv=co2_ppmv,
+            emiss_sfc=emiss_sfc,
+            re_liq_um=re_liq_um,
+            re_ice_um=re_ice_um,
+            cloud_sw_inhomog=cloud_sw_inhomog,
+            albedo_vis_dif=albedo_vis_dif,
+            albedo_nir_dif=albedo_nir_dif,
+            q_dust_c=q_dust_c,
+            o3_vmr_c=o3_vmr_c,
+            o3_lw_coupling=o3_lw_coupling,
+            consts=consts,
+        )
+        sfc_par_wm2 = sfc_out[4]
+        return RadiationOutput(
+            sw_flux_up=sw_up,
+            sw_flux_dn=sw_dn,
+            lw_flux_up=lw_up,
+            lw_flux_dn=lw_dn,
+            q_rad_sw=q_rad_3d[0],
+            q_rad_lw=q_rad_3d[1],
+            q_rad_net=q_rad_3d[2],
+            toa_insolation=sw_dn[-1],
+            toa_asr=sw_dn[-1] - sw_up[-1],
+            toa_olr=lw_up[-1],
+            sfc_sw_net=sw_dn[0] - sw_up[0],
+            sfc_lw_net=lw_dn[0] - lw_up[0],
+            sfc_par_wm2=sfc_par_wm2,
+            sfc_ppfd=C.UMOL_PER_JOULE_PAR * sfc_par_wm2,
+            sfc_sw1_dir_dn=sfc_out[0],
+            sfc_sw1_dif_dn=sfc_out[1],
+            sfc_sw2_dir_dn=sfc_out[2],
+            sfc_sw2_dif_dn=sfc_out[3],
+        )
+
     # Flip vertical axis to top-down [0 = TOA, N - 1 = bottom layer] for Toon et al. (1989)
     p_c = torch.flip(pres_c, dims=[0])
     p_w = torch.flip(pres_w, dims=[0])

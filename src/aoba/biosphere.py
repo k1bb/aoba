@@ -47,6 +47,7 @@ import math
 import torch
 
 from aoba import constants as C
+from aoba.kernels import can_use_elem_metal, dispatch_two_leaf_gas_exchange_metal
 
 # ---------------------------------------------------------------------------
 # 1. Universal EEO Constants (Smith et al., 2019; Scott & Smith, 2022; Cai et al., 2025; Zhou et al., 2025)
@@ -788,6 +789,8 @@ class TwoLeafAllocation:
     vp25_c4_sh: torch.Tensor
     r25_c4_sun: torch.Tensor
     r25_c4_sh: torch.Tensor
+    sun_frac: torch.Tensor | None = None
+    bio: BiosphereState | None = None
 
 
 def prepare_two_leaf_allocation(
@@ -805,14 +808,64 @@ def prepare_two_leaf_allocation(
     k_db = inst_rad.k_db
     l_sun = inst_rad.l_sun
 
-    vc25_c3_sun, vc25_c3_sh = allocate_two_leaf_capacity(bio.vcmax25_c3, acclim_rad, k_db, l_sun, lai_exposed)
-    jm25_c3_sun, jm25_c3_sh = allocate_two_leaf_capacity(bio.jmax25_c3, acclim_rad, k_db, l_sun, lai_exposed)
-    r25_c3_sun, r25_c3_sh = allocate_two_leaf_capacity(bio.r25_c3, acclim_rad, k_db, l_sun, lai_exposed)
+    lc = torch.clamp(lai_exposed, min=0.0)
+    has_veg = lc >= 0.01
+    has_light = acclim_rad.i_c > 1.0e-2
+    term_b = (
+        (1.0 - acclim_rad.rho_cb)
+        * acclim_rad.k_b_prime
+        * acclim_rad.i_b0
+        * (1.0 - torch.exp(-torch.clamp((acclim_rad.k_b_prime + k_db) * lc, max=50.0)))
+        / (acclim_rad.k_b_prime + k_db)
+    )
+    term_d = (
+        (1.0 - RHO_CD_PAR)
+        * KD_PRIME_PAR
+        * acclim_rad.i_d0
+        * (1.0 - torch.exp(-torch.clamp((KD_PRIME_PAR + k_db) * lc, max=50.0)))
+        / (KD_PRIME_PAR + k_db)
+    )
+    sun_frac_opt = (term_b + term_d) / torch.clamp(acclim_rad.i_c, min=1.0e-2)
+    sun_frac_area = l_sun / torch.clamp(lc, min=1.0e-4)
+    sun_frac = torch.clamp(torch.where(has_light, sun_frac_opt, sun_frac_area), max=1.0)
+    zero = torch.zeros_like(bio.vcmax25_c3)
 
-    vc25_c4_sun, vc25_c4_sh = allocate_two_leaf_capacity(bio.vcmax25_c4, acclim_rad, k_db, l_sun, lai_exposed)
-    jm25_c4_sun, jm25_c4_sh = allocate_two_leaf_capacity(bio.jmax25_c4, acclim_rad, k_db, l_sun, lai_exposed)
-    vp25_c4_sun, vp25_c4_sh = allocate_two_leaf_capacity(bio.vpmax25_c4, acclim_rad, k_db, l_sun, lai_exposed)
-    r25_c4_sun, r25_c4_sh = allocate_two_leaf_capacity(bio.r25_c4, acclim_rad, k_db, l_sun, lai_exposed)
+    if can_use_elem_metal(lai_exposed):
+        # On MPS Metal, two_leaf_gas_exchange_col partitions from bio.* and sun_frac in registers,
+        # avoiding 14 full-grid multiply/clamp/where launches here.
+        return TwoLeafAllocation(
+            inst_rad=inst_rad,
+            vc25_c3_sun=zero,
+            vc25_c3_sh=zero,
+            jm25_c3_sun=zero,
+            jm25_c3_sh=zero,
+            r25_c3_sun=zero,
+            r25_c3_sh=zero,
+            vc25_c4_sun=zero,
+            vc25_c4_sh=zero,
+            jm25_c4_sun=zero,
+            jm25_c4_sh=zero,
+            vp25_c4_sun=zero,
+            vp25_c4_sh=zero,
+            r25_c4_sun=zero,
+            r25_c4_sh=zero,
+            sun_frac=sun_frac,
+            bio=bio,
+        )
+
+    def _split(x_tot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x_s = torch.where(has_veg, x_tot * sun_frac, zero)
+        x_h = torch.where(has_veg, torch.clamp(x_tot - x_s, min=1.0e-6), zero)
+        return x_s, x_h
+
+    vc25_c3_sun, vc25_c3_sh = _split(bio.vcmax25_c3)
+    jm25_c3_sun, jm25_c3_sh = _split(bio.jmax25_c3)
+    r25_c3_sun, r25_c3_sh = _split(bio.r25_c3)
+
+    vc25_c4_sun, vc25_c4_sh = _split(bio.vcmax25_c4)
+    jm25_c4_sun, jm25_c4_sh = _split(bio.jmax25_c4)
+    vp25_c4_sun, vp25_c4_sh = _split(bio.vpmax25_c4)
+    r25_c4_sun, r25_c4_sh = _split(bio.r25_c4)
 
     return TwoLeafAllocation(
         inst_rad=inst_rad,
@@ -830,6 +883,8 @@ def prepare_two_leaf_allocation(
         vp25_c4_sh=vp25_c4_sh,
         r25_c4_sun=r25_c4_sun,
         r25_c4_sh=r25_c4_sh,
+        sun_frac=sun_frac,
+        bio=bio,
     )
 
 
@@ -885,6 +940,72 @@ def compute_two_leaf_gas_exchange(
     inst_rad = alloc.inst_rad
     l_sun = inst_rad.l_sun
     l_sh = inst_rad.l_sh
+    if (
+        can_use_elem_metal(lai_exposed)
+        and alloc.sun_frac is not None
+        and (alloc.bio is bio)
+        and (gbw_sun is None or not gbw_sun.requires_grad)
+        and (gbw_sh is None or not gbw_sh.requires_grad)
+    ):
+        gas_consts = (
+            float(C.R_GAS_UNIVERSAL),
+            float(C.T_FREEZE),
+            float(C.O2_MIXING_RATIO),
+            float(THETA_NRH),
+            float(PHI_PSII_REF_C3),
+            float(BETA_C3),
+            float(BETA_C4),
+            float(GAMMA_STAR25_C3),
+            float(KC25_C3),
+            float(KO25_C3),
+            float(DHA_GAMMA),
+            float(DHA_KC_C3),
+            float(DHA_KO_C3),
+            float(KP25_UMOL_C4),
+            float(DHA_KP_C4),
+            float(PHI_LEAK_C4),
+            float(HA_VCMAX),
+            float(HA_JMAX),
+            float(HA_VPMAX),
+            float(HD_ENZYME),
+        )
+        out_5 = dispatch_two_leaf_gas_exchange_metal(
+            i_sun=inst_rad.i_sun,
+            i_sh=inst_rad.i_sh,
+            l_sun=l_sun,
+            l_sh=l_sh,
+            sun_frac=alloc.sun_frac,
+            vc25_c3=bio.vcmax25_c3,
+            jm25_c3=bio.jmax25_c3,
+            r25_c3=bio.r25_c3,
+            vc25_c4=bio.vcmax25_c4,
+            jm25_c4=bio.jmax25_c4,
+            vp25_c4=bio.vpmax25_c4,
+            r25_c4=bio.r25_c4,
+            tg_mid=bio.ema_temp_mid,
+            f_c4=bio.f_c4,
+            t_sun=temp_sun,
+            t_sh=temp_sh,
+            vpd_sun=vpd_sun,
+            vpd_sh=vpd_sh,
+            pres_sfc=pres_sfc,
+            lai_exp=lai_exposed,
+            ws_beta=water_stress_beta,
+            gbw_sun=gbw_sun,
+            gbw_sh=gbw_sh,
+            co2_ppmv=co2_ppmv,
+            consts=gas_consts,
+        )
+        return TwoLeafFluxResult(
+            gpp=out_5[0],
+            resp_leaf=out_5[1],
+            an_net=out_5[2],
+            gsw_sun=out_5[3],
+            gsw_sh=out_5[4],
+            l_sun=l_sun,
+            l_sh=l_sh,
+        )
+
     has_veg = lai_exposed >= 0.01
 
     ca_pa = (co2_ppmv * 1.0e-6) * pres_sfc

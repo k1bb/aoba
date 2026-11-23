@@ -58,7 +58,11 @@ from aoba.biosphere import (
     init_biosphere_state,
     prepare_two_leaf_allocation,
 )
-from aoba.kernels import solve_tridiagonal_batched
+from aoba.kernels import (
+    can_use_elem_metal,
+    dispatch_surface_albedos_metal,
+    solve_tridiagonal_batched,
+)
 from aoba.thermodynamics import esat_ice, esat_liquid, qsat_mixed
 from aoba.turbulence import (
     canopy_roughness_raupach,
@@ -392,6 +396,41 @@ def compute_surface_albedos(
     mu0: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Diagnose 2-band direct/diffuse albedos, exposed canopy `(h_exp, lai_exp)`, `A_sn`, and `f_ice`."""
+    if can_use_elem_metal(mu0) and mu0.shape == sfc.surf_type.shape:
+        if getattr(sfc, "_surf_type_i32_src", None) is not sfc.surf_type:
+            sfc._surf_type_i32 = sfc.surf_type.to(torch.int32)
+            sfc._surf_type_i32_src = sfc.surf_type
+        out_8 = dispatch_surface_albedos_metal(
+            surf_type_i32=sfc._surf_type_i32,
+            swe_land=sfc.swe_land,
+            swe_max=sfc.swe_max_season,
+            sigma_topo=sfc.sigma_topo,
+            snow_age=sfc.snow_age,
+            w_liq_top=sfc.w_liq_soil[0],
+            h_canopy=sfc.bio.h_canopy,
+            lai=sfc.bio.lai,
+            m_seaice=sfc.m_seaice,
+            swe_seaice=sfc.swe_seaice,
+            mu0=mu0,
+            consts=(
+                float(ALB_SNOW_VIS_NEW),
+                float(ALB_SNOW_NIR_NEW),
+                float(ALB_SNOW_VIS_OLD),
+                float(ALB_SNOW_NIR_OLD),
+                float(RHO_SNOWPACK),
+                float(SOIL_POROSITY),
+                float(MC_SEAICE_CRIT),
+                float(ALB_SEAICE_VIS),
+                float(ALB_SEAICE_NIR),
+                float(LEAF_SCAT_VIS),
+                float(LEAF_SCAT_NIR),
+            ),
+        )
+        return (
+            out_8[0], out_8[1], out_8[2], out_8[3],
+            out_8[4], out_8[5], out_8[6], out_8[7],
+        )
+
     is_ocean = sfc.surf_type == SURF_OCEAN
     is_ice = sfc.surf_type == SURF_ICESHEET
 
@@ -744,6 +783,7 @@ def step_surface(
     mu0: torch.Tensor,
     co2_ppmv: float,
     dt: float,
+    precomputed_albedos: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> SurfaceFluxDiagnostics:
     """Advance land/snow/soil and ocean/sea-ice states by `dt` [s] and compute lower BCs."""
     is_ocean = sfc.surf_type == SURF_OCEAN
@@ -761,7 +801,7 @@ def step_surface(
         lai_exp,
         a_sn,
         f_ice,
-    ) = compute_surface_albedos(sfc, mu0)
+    ) = precomputed_albedos if precomputed_albedos is not None else compute_surface_albedos(sfc, mu0)
 
     # Absorbed net shortwave [W m^-2]
     sw_abs = (
@@ -1298,8 +1338,10 @@ def step_surface(
     z0q_sea = (1.0 - f_ice) * z0q_ocn + f_ice * (0.2 * z0m_ice)
 
     # Open-water saturation specific humidity (0.98 salinity reduction; MIROC6) & sea-ice saturation
-    qsat_ow = 0.98 * C.EPS_WATER * esat_liquid(sfc.t_ocean_ml) / torch.clamp(pres_sfc - esat_liquid(sfc.t_ocean_ml), min=0.1 * pres_sfc)
-    qsat_si = C.EPS_WATER * esat_ice(sfc.t_seaice) / torch.clamp(pres_sfc - esat_ice(sfc.t_seaice), min=0.1 * pres_sfc)
+    esat_ow = esat_liquid(sfc.t_ocean_ml)
+    esat_si = esat_ice(sfc.t_seaice)
+    qsat_ow = 0.98 * C.EPS_WATER * esat_ow / torch.clamp(pres_sfc - esat_ow, min=0.1 * pres_sfc)
+    qsat_si = C.EPS_WATER * esat_si / torch.clamp(pres_sfc - esat_si, min=0.1 * pres_sfc)
     t_skin_sea = (1.0 - f_ice) * sfc.t_ocean_ml + f_ice * sfc.t_seaice
     q_skin_sea = (1.0 - f_ice) * qsat_ow + f_ice * qsat_si
     theta_vsfc_o = (t_skin_sea / exner_s) * (1.0 + C.ZVIR * q_skin_sea)
