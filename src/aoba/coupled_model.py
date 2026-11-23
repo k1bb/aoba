@@ -893,6 +893,12 @@ def step_aoba_model(
     if str(cfg.ocean_mode).strip().lower() == "ogcm_3d":
         if model.ogcm is None:
             model.ogcm = init_ogcm_state(sfc, mesh, nz_ocn=cfg.ocean_nz)
+        sw_abs_ocn_sub = (1.0 - torch.clamp(sfc_diag_sub.f_seaice, 0.0, 1.0)) * (
+            sw1_dir_sub * (1.0 - sfc_diag_sub.alb_vis_dir)
+            + sw1_dif_sub * (1.0 - sfc_diag_sub.alb_vis_dif)
+            + sw2_dir_sub * (1.0 - sfc_diag_sub.alb_nir_dir)
+            + sw2_dif_sub * (1.0 - sfc_diag_sub.alb_nir_dif)
+        )
         step_ogcm_voronoi(
             ogcm=model.ogcm,
             sfc=sfc,
@@ -906,6 +912,7 @@ def step_aoba_model(
             runoff_glacier=_sub_to_cell(sfc_diag_sub.runoff_ice, nc, n_sub),
             dt=dt,
             enable_seaice_drift=bool(cfg.enable_seaice_drift),
+            sw_net_ocn=_sub_to_cell(sw_abs_ocn_sub, nc, n_sub),
         )
     else:
         step_ekman_ocean_voronoi(

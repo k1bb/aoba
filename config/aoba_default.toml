@@ -263,8 +263,14 @@ tau_sw_drag_days = 180.0
 enable_shallow_water_ocn = true
 kappa_gm = 800.0
 kappa_redi_horiz = 1000.0
-kappa_v_bg = 2e-05
-kappa_v_abyss = 0.0001
+enable_full_redi = true
+kpp_ri_crit = 0.3
+kpp_cs_nonlocal = 6.33
+shear_nu_0 = 0.005
+tidal_e0_wm2 = 0.008
+sw_pen_zeta2_m = 23.0
+kappa_v_bg = 1.5e-05
+kappa_v_abyss = 3e-05
 seaice_h_ridge_m = 3.0
 
 # --- Lott & Miller (1997) Subgrid Orographic Drag Parameters ---
