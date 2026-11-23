@@ -44,6 +44,7 @@ from aoba.icesheet import (
 )
 from aoba.koppen import classify_koppen_geiger
 from aoba.ocean_ekman import EkmanOceanState, init_ekman_ocean_state, step_ekman_ocean_voronoi
+from aoba.ocean_ogcm import OceanOGCMState, init_ogcm_state, step_ogcm_voronoi
 from aoba.orography import compute_orographic_drag_lott_miller
 from aoba.radiation import compute_four_band_radiation
 from aoba.radiation_ckd import CH4_PREIND_PPMV, N2O_PREIND_PPMV, compute_ckd_radiation
@@ -90,6 +91,9 @@ class AOBAConfig:
     tau_sponge_min: float = 300.0            # Minimum sponge damping timescale [s]
     terrain_scale_exp: float = 1.5           # Klemp STF attenuation exponent p [-]
     h_ml_ocean: float = 50.0                 # Ocean mixed-layer depth [m]
+    ocean_mode: str = "ogcm_3d"              # Ocean model: "ogcm_3d" (3D multi-layer OGCM) or "ekman_sw" (1.5-layer shallow-water)
+    ocean_nz: int = 18                       # Vertical z-levels when ocean_mode="ogcm_3d" (0..6000 m)
+    enable_seaice_drift: bool = True         # Enable dynamic wind/current sea-ice drift in 3D OGCM mode
     re_liq_um: float = 10.0                  # Cloud liquid droplet effective radius [um]
     re_ice_um: float = 48.0                  # Cloud ice crystal effective radius [um]
     cloud_sw_inhomog: float = 0.85           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
@@ -168,6 +172,7 @@ class AOBAState:
     sfc: SurfaceState
     ocn: EkmanOceanState
     clim: ClimateAccumulator
+    ogcm: OceanOGCMState | None = None
     sfc_sub: SurfaceState | None = None
     clim_sub: ClimateAccumulator | None = None
     icesheet: IceSheetState | None = None
@@ -468,6 +473,11 @@ def init_aoba_model(
     sfc.m_seaice = torch.where(polar_cold, torch.full_like(t_sfc_lat, 900.0), torch.zeros_like(t_sfc_lat))
 
     ocn = init_ekman_ocean_state(sfc)
+    ogcm = (
+        init_ogcm_state(sfc, mesh, nz_ocn=cfg.ocean_nz)
+        if str(cfg.ocean_mode).strip().lower() == "ogcm_3d"
+        else None
+    )
 
     sfc_sub = init_surface_state(
         _cell_to_sub(mesh.surf_type, nc, n_sub),
@@ -538,6 +548,7 @@ def init_aoba_model(
         crm=crm,
         sfc=sfc,
         ocn=ocn,
+        ogcm=ogcm,
         clim=_make_clim(nc, include_monthly=True),
         sfc_sub=sfc_sub,
         clim_sub=_make_clim(m_sub, include_monthly=False),
@@ -863,21 +874,42 @@ def step_aoba_model(
     is_ocn_sub = sfc_sub.surf_type == SURF_OCEAN
     t1_cell_before = _sub_to_cell(sfc_sub.t_ocean_ml, nc, n_sub)
     m_ice_cell_before = _sub_to_cell(sfc_sub.m_seaice, nc, n_sub)
+    swe_ice_cell_before = _sub_to_cell(sfc_sub.swe_seaice, nc, n_sub)
     sfc.t_ocean_ml = t1_cell_before.clone()
     sfc.m_seaice = m_ice_cell_before.clone()
+    sfc.swe_seaice = swe_ice_cell_before.clone()
     sfc.h_ocean_ml = _sub_to_cell(sfc_sub.h_ocean_ml, nc, n_sub)
-    step_ekman_ocean_voronoi(
-        ocn=model.ocn,
-        sfc=sfc,
-        mesh=mesh,
-        tau_x_sfc=_sub_to_cell(sfc_diag_sub.tau_x, nc, n_sub),
-        tau_y_sfc=_sub_to_cell(sfc_diag_sub.tau_y, nc, n_sub),
-        f_seaice=_sub_to_cell(sfc_diag_sub.f_seaice, nc, n_sub),
-        runoff_glacier=_sub_to_cell(sfc_diag_sub.runoff_ice, nc, n_sub),
-        dt=dt,
-    )
+    if str(cfg.ocean_mode).strip().lower() == "ogcm_3d":
+        if model.ogcm is None:
+            model.ogcm = init_ogcm_state(sfc, mesh, nz_ocn=cfg.ocean_nz)
+        step_ogcm_voronoi(
+            ogcm=model.ogcm,
+            sfc=sfc,
+            mesh=mesh,
+            tau_x_sfc=_sub_to_cell(sfc_diag_sub.tau_x, nc, n_sub),
+            tau_y_sfc=_sub_to_cell(sfc_diag_sub.tau_y, nc, n_sub),
+            f_seaice=_sub_to_cell(sfc_diag_sub.f_seaice, nc, n_sub),
+            evap_cell=_sub_to_cell(sfc_diag_sub.evap, nc, n_sub),
+            precip_cell=_sub_to_cell(rain_prev_sub + snow_prev_sub, nc, n_sub),
+            runoff_total=_sub_to_cell(sfc_diag_sub.runoff_total, nc, n_sub),
+            runoff_glacier=_sub_to_cell(sfc_diag_sub.runoff_ice, nc, n_sub),
+            dt=dt,
+            enable_seaice_drift=bool(cfg.enable_seaice_drift),
+        )
+    else:
+        step_ekman_ocean_voronoi(
+            ocn=model.ocn,
+            sfc=sfc,
+            mesh=mesh,
+            tau_x_sfc=_sub_to_cell(sfc_diag_sub.tau_x, nc, n_sub),
+            tau_y_sfc=_sub_to_cell(sfc_diag_sub.tau_y, nc, n_sub),
+            f_seaice=_sub_to_cell(sfc_diag_sub.f_seaice, nc, n_sub),
+            runoff_glacier=_sub_to_cell(sfc_diag_sub.runoff_ice, nc, n_sub),
+            dt=dt,
+        )
     dt1_sub = _cell_to_sub(sfc.t_ocean_ml - t1_cell_before, nc, n_sub)
     dm_ice_sub = _cell_to_sub(sfc.m_seaice - m_ice_cell_before, nc, n_sub)
+    dswe_ice_sub = _cell_to_sub(sfc.swe_seaice - swe_ice_cell_before, nc, n_sub)
     t1_sub_next = sfc_sub.t_ocean_ml + dt1_sub
     freeze_def = torch.where(is_ocn_sub, torch.clamp(C.T_FREEZE_OCEAN - t1_sub_next, min=0.0), torch.zeros_like(t1_sub_next))
     c1_sub = C.CP_SEAWATER * C.RHO_SEAWATER * sfc_sub.h_ocean_ml
@@ -886,6 +918,11 @@ def step_aoba_model(
         is_ocn_sub,
         torch.clamp(sfc_sub.m_seaice + dm_ice_sub + (c1_sub * freeze_def) / C.L_F0, min=0.0),
         sfc_sub.m_seaice,
+    )
+    sfc_sub.swe_seaice = torch.where(
+        is_ocn_sub,
+        torch.clamp(sfc_sub.swe_seaice + dswe_ice_sub, min=0.0),
+        sfc_sub.swe_seaice,
     )
 
     # 5. Subgrid Orographic Drag (Lott & Miller, 1997) + Map-Free Non-Orographic GWD

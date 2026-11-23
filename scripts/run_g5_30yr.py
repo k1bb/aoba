@@ -132,6 +132,11 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
         "sfc": _serialize_surface(model.sfc),
         "sfc_sub": _serialize_surface(model.sfc_sub) if model.sfc_sub is not None else None,
         "ocn": {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.ocn.__dict__.items()},
+        "ogcm": (
+            {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.ogcm.__dict__.items()}
+            if model.ogcm is not None
+            else None
+        ),
         "clim": {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.clim.__dict__.items()},
         "clim_sub": (
             {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.clim_sub.__dict__.items()}
@@ -371,6 +376,14 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         _restore_surface(model.sfc_sub, ckpt["sfc_sub"], device)
     for k, v in ckpt["ocn"].items():
         setattr(model.ocn, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+    if model.ogcm is not None:
+        if ckpt.get("ogcm") is not None and int(ckpt["ogcm"].get("nz_ocn", -1)) == model.ogcm.nz_ocn:
+            for k, v in ckpt["ogcm"].items():
+                setattr(model.ogcm, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+        else:
+            from aoba.ocean_ogcm import init_ogcm_state
+
+            model.ogcm = init_ogcm_state(model.sfc, model.mesh, nz_ocn=model.cfg.ocean_nz)
     for k, v in ckpt["clim"].items():
         setattr(model.clim, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     if ckpt.get("clim_sub") is not None and model.clim_sub is not None:

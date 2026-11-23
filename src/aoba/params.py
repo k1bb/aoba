@@ -18,6 +18,7 @@ from aoba import gravity_wave as _gwd
 from aoba import icesheet as _ice
 from aoba import microphysics as _mp
 from aoba import ocean_ekman as _ocn
+from aoba import ocean_ogcm as _ogcm
 from aoba import orography as _oro
 from aoba import surface as _sfc
 from aoba import turbulence as _turb
@@ -217,6 +218,11 @@ _MODULE_PARAM_MAP: dict[str, dict[str, tuple[Any, str]]] = {
         "g_prime_ocn": (_ocn, "G_PRIME_OCN"),
         "tau_sw_drag_days": (_ocn, "TAU_SW_DRAG_DAYS"),
         "enable_shallow_water_ocn": (_ocn, "ENABLE_SHALLOW_WATER_OCN"),
+        "kappa_gm": (_ogcm, "KAPPA_GM"),
+        "kappa_redi_horiz": (_ogcm, "KAPPA_REDI_HORIZ"),
+        "kappa_v_bg": (_ogcm, "KAPPA_V_BG"),
+        "kappa_v_abyss": (_ogcm, "KAPPA_V_ABYSS"),
+        "seaice_h_ridge_m": (_ogcm, "SEAICE_H_RIDGE_M"),
     },
     "orography": {
         "hn_crit": (_oro, "HN_CRIT"),
@@ -259,7 +265,8 @@ _FORCING_KEYS: tuple[str, ...] = (
     "start_date", "calendar_type", "insolation_mode", "fixed_insolation_date", "diurnal_cycle",
     "use_earth2014", "earth2014_dir", "earth2014_stride", "enable_superparam",
     "enable_dust", "dust_emis_factor",
-    "h_ml_ocean", "re_liq_um", "re_ice_um", "cloud_sw_inhomog",
+    "h_ml_ocean", "ocean_mode", "ocean_nz", "enable_seaice_drift",
+    "re_liq_um", "re_ice_um", "cloud_sw_inhomog",
 )
 _ICESHEET_CFG_KEYS: tuple[str, ...] = (
     "enable_dynamic_icesheet", "icesheet_ema_years", "icesheet_accel_factor",

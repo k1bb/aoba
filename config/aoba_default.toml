@@ -52,6 +52,9 @@ enable_superparam = true
 enable_dust = true
 dust_emis_factor = 1.5e-05
 h_ml_ocean = 50.0
+ocean_mode = "ogcm_3d"
+ocean_nz = 18
+enable_seaice_drift = true
 re_liq_um = 10.0
 re_ice_um = 48.0
 cloud_sw_inhomog = 0.85
@@ -253,6 +256,11 @@ kappa_ocn_vert = 2e-05
 g_prime_ocn = 0.03
 tau_sw_drag_days = 180.0
 enable_shallow_water_ocn = true
+kappa_gm = 800.0
+kappa_redi_horiz = 1000.0
+kappa_v_bg = 2e-05
+kappa_v_abyss = 0.0001
+seaice_h_ridge_m = 3.0
 
 # --- Lott & Miller (1997) Subgrid Orographic Drag Parameters ---
 [orography]
