@@ -1542,7 +1542,7 @@ kernel void crm_mynn_col(
 }
 
 // =========================================================================
-// 10. 2D (ny == 1, nx <= 32, nz <= 32) Threadgroup-Fused CRM Fast Acoustic-HEVI Loop
+// 10. 2D (ny == 1, nx <= 32, nz <= 64) Threadgroup-Fused CRM Fast Acoustic-HEVI Loop
 // =========================================================================
 
 kernel void crm_2d_fast_hevi_loop(
@@ -1586,9 +1586,10 @@ kernel void crm_2d_fast_hevi_loop(
     uint n_ac = u_params[4];
     uint accum = u_params[5];
 
+    uint tg_stride = (nz <= 32u) ? 64u : 32u;
     uint local_c = lid / nx;
     uint ix = lid - local_c * nx;
-    uint c_tg = 64u / nx;
+    uint c_tg = tg_stride / nx;
     uint col = tg_id * c_tg + local_c;
     bool active = (col < n_col);
 
@@ -1608,12 +1609,12 @@ kernel void crm_2d_fast_hevi_loop(
     threadgroup float tg_Thm[2048];
     threadgroup float tg_fx[2048];
 
-    float c_star[32], d_star[32];
+    float c_star[64], d_star[64];
 
     for (uint ac = 0u; ac < n_ac; ++ac) {
         if (active) {
             for (uint k = 0u; k < nz; ++k) {
-                tg_Thm[k * 64u + lid] = Thm_s[k * M + tid];
+                tg_Thm[k * tg_stride + lid] = Thm_s[k * M + tid];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1624,10 +1625,10 @@ kernel void crm_2d_fast_hevi_loop(
                 float ps0 = pres_s[idx];
                 float dp0 = dp_dThm_s[idx];
                 float Tr0 = Thm_ref[idx];
-                float p_k0 = ps0 + dp0 * (tg_Thm[k * 64u + lid] - Tr0);
+                float p_k0 = ps0 + dp0 * (tg_Thm[k * tg_stride + lid] - Tr0);
 
                 uint idx_xp1 = k * M + col * nx + ix_p1;
-                float p_k1 = pres_s[idx_xp1] + dp_dThm_s[idx_xp1] * (tg_Thm[k * 64u + lid_xp1] - Thm_ref[idx_xp1]);
+                float p_k1 = pres_s[idx_xp1] + dp_dThm_s[idx_xp1] * (tg_Thm[k * tg_stride + lid_xp1] - Thm_ref[idx_xp1]);
 
                 float pgf_u = -(p_k1 - p_k0) * inv_dx * rtot_x_inv[idx];
                 float u0 = u_s[idx];
@@ -1636,7 +1637,7 @@ kernel void crm_2d_fast_hevi_loop(
                 float v_n = v0 + dt_ac * tend_v_sl[idx];
 
                 float fx_k = rho_x[idx] * (1.10f * u_n - 0.10f * u0);
-                tg_fx[k * 64u + lid] = fx_k;
+                tg_fx[k * tg_stride + lid] = fx_k;
                 if (accum != 0u) {
                     fx_acc[idx] += fx_k;
                     fy_acc[idx] += rho_s[idx] * (1.10f * v_n - 0.10f * v0);
@@ -1659,8 +1660,8 @@ kernel void crm_2d_fast_hevi_loop(
                 uint idx = k * M + tid;
                 uint idx_xm = k * M + col * nx + ix_m1;
 
-                float fx_0 = tg_fx[k * 64u + lid];
-                float fx_m = tg_fx[k * 64u + lid_xm1];
+                float fx_0 = tg_fx[k * tg_stride + lid];
+                float fx_m = tg_fx[k * tg_stride + lid_xm1];
                 float div_h_rho = (fx_0 - fx_m) * inv_dx;
                 float div_h_Thm = (fx_0 * thm_x_eff[idx] - fx_m * thm_x_eff[idx_xm]) * inv_dx;
 

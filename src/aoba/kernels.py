@@ -1025,8 +1025,9 @@ def run_crm_rk3_hevi_metal(
         w_a.copy_(w0_c)
 
         accum = stage_idx == 2
-        if ny == 1 and 1 < nx <= 32 and nz <= 32 and (64 % nx == 0):
-            c_tg = 64 // nx
+        tg_sz = 64 if nz <= 32 else 32
+        if ny == 1 and 1 < nx <= 32 and nz <= 64 and (tg_sz % nx == 0):
+            c_tg = tg_sz // nx
             n_tg = (n_col + c_tg - 1) // c_tg
             u_2d = torch.tensor(
                 [nz, n_col, nx, dz_cols, n_ac, 1 if accum else 0],
@@ -1040,7 +1041,7 @@ def run_crm_rk3_hevi_metal(
                 tend_u_slow, tend_v_slow, tend_w_slow, tTh_c,
                 rho_dw, rho_tot_w, thm_w, dl, diag, du, dzc_c, dzw_c, spw_c,
                 fx_acc, fy_acc, fz_acc, u_2d, f_2d,
-                threads=(n_tg * 64,), group_size=(64,),
+                threads=(n_tg * tg_sz,), group_size=(tg_sz,),
             )
             rho_s, Thm_s, u_s, v_s, w_s = rho_a, Thm_a, u_a, v_a, w_a
         else:
