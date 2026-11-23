@@ -59,6 +59,18 @@ def esat_ice(temp: torch.Tensor) -> torch.Tensor:
     return C.E_TRIPLE * torch.exp(21.8745584 * (t_safe - C.T_FREEZE) / (t_safe - 7.66))
 
 
+def qsat_mixed_val(temp: torch.Tensor, pres: torch.Tensor) -> torch.Tensor:
+    """Compute mixed-phase saturation mixing ratio q_sat(T, p) without temperature derivatives."""
+    omega = liquid_fraction_condensate(temp)
+    ew = esat_liquid(temp)
+    ei = esat_ice(temp)
+    denom_w = torch.clamp(pres - ew, min=0.05 * pres)
+    denom_i = torch.clamp(pres - ei, min=0.05 * pres)
+    qsw = C.EPS_WATER * ew / denom_w
+    qsi = C.EPS_WATER * ei / denom_i
+    return omega * qsw + (1.0 - omega) * qsi
+
+
 def qsat_mixed(temp: torch.Tensor, pres: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Mixed-phase saturation mixing ratio q_sat(T, p) [kg/kg dry air] and d(q_sat)/dT.
 
@@ -103,11 +115,9 @@ def diagnose_pressure_temperature(
         Pi = (p / p_0)^(R_d / c_pd)
         T = Pi * theta = Pi * theta_m / (1 + (R_v / R_d) * q_v)
     """
-    pres = C.P_REF * torch.pow(
-        torch.clamp(C.R_D * rho_d * theta_m / C.P_REF, min=1.0e-8),
-        C.GAMMA_D,
-    )
-    exner = torch.pow(pres / C.P_REF, C.KAPPA_D)
+    arg = torch.clamp(C.R_D * rho_d * theta_m / C.P_REF, min=1.0e-8)
+    exner = torch.pow(arg, C.R_D / C.CV_D)
+    pres = C.P_REF * arg * exner
     theta = theta_m / (1.0 + C.RV_OVER_RD * torch.clamp(q_v, min=0.0))
     temp = exner * theta
     return pres, exner, temp
@@ -153,7 +163,7 @@ def saturation_adjustment(
     t_li = temp_init
 
     # Check if unsaturated at T = T_li (where q_cond = 0)
-    qsat0, _ = qsat_mixed(t_li, pres)
+    qsat0 = qsat_mixed_val(t_li, pres)
     is_sat = qn_pos > qsat0
 
     temp = t_li.clone()
@@ -171,7 +181,7 @@ def saturation_adjustment(
         step = res / torch.clamp(df_dT, min=1.0)
         temp = torch.where(is_sat, temp - step, t_li)
 
-    qsat_final, _ = qsat_mixed(temp, pres)
+    qsat_final = qsat_mixed_val(temp, pres)
     q_cond_final = torch.where(is_sat, torch.clamp(qn_pos - qsat_final, min=0.0), torch.zeros_like(qn_pos))
     q_v = qn_pos - q_cond_final
     omega_final = liquid_fraction_condensate(temp)

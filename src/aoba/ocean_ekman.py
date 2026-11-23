@@ -101,8 +101,6 @@ def step_ekman_ocean_voronoi(
     atmosphere ON the ocean is `tau_ocn = -(1 - 0.5 * f_seaice) * tau_sfc`.
     """
     is_ocean = sfc.surf_type == SURF_OCEAN
-    if not is_ocean.any():
-        return
 
     c0 = mesh.cells_on_edge[:, 0]
     c1 = mesh.cells_on_edge[:, 1]
@@ -143,7 +141,10 @@ def step_ekman_ocean_voronoi(
         u_sw = ocn.u_sw_edge * mask_edge
         tau_n_e = (tx_e * mesh.east_normal_edge + ty_e * mesh.north_normal_edge) * mask_edge
 
-        dc_min = float(mesh.dc_edge.min().item())
+        dc_min = getattr(mesh, "_dc_edge_min_m", None)
+        if dc_min is None:
+            dc_min = float(mesh.dc_edge.min().item())
+            setattr(mesh, "_dc_edge_min_m", dc_min)
         c_gw_max = math.sqrt(max(G_PRIME_OCN * 600.0, 1.0))
         dt_sw_cfl = 0.40 * dc_min / max(c_gw_max, 5.0)
         n_sw = max(1, int(math.ceil(dt / max(dt_sw_cfl, 1.0))))
@@ -235,12 +236,11 @@ def step_ekman_ocean_voronoi(
     q_diap = C.CP_SEAWATER * C.RHO_SEAWATER * KAPPA_OCN_VERT * (t2 - t1)
 
     # 4. Conservative coastal glacier calving fusion cooling (MIROC6 Sec. 4.1.2)
+    # Total fusion cooling power [W] = L_f0 * area_land * runoff_glacier routed to coastal_ocean_idx
     q_calve = torch.zeros_like(t1)
-    if (runoff_glacier > 0.0).any():
-        # Total fusion cooling power [W] = L_f0 * area_land * runoff_glacier routed to coastal_ocean_idx
-        power_glac = C.L_F0 * mesh.area_cell * torch.clamp(runoff_glacier, min=0.0)
-        q_calve.scatter_add_(0, mesh.coastal_ocean_idx, power_glac)
-        q_calve = q_calve / mesh.area_cell  # [W m^-2] over receiving coastal ocean cell
+    power_glac = C.L_F0 * mesh.area_cell * torch.clamp(runoff_glacier, min=0.0)
+    q_calve.scatter_add_(0, mesh.coastal_ocean_idx, power_glac)
+    q_calve = q_calve / mesh.area_cell  # [W m^-2] over receiving coastal ocean cell
 
     c1_cap = C.CP_SEAWATER * C.RHO_SEAWATER * sfc.h_ocean_ml
     c2_cap_new = C.CP_SEAWATER * C.RHO_SEAWATER * h2_new

@@ -85,29 +85,28 @@ kernel void crm_fast_uv_flux(
     device const float* rho_y        [[buffer(1)]],
     device const float* rtot_x_inv   [[buffer(2)]],
     device const float* rtot_y_inv   [[buffer(3)]],
-    device const float* pres_s       [[buffer(4)]],
+    device const float* a_p_s        [[buffer(4)]],   // pres_s - dp_dThm_s * Thm_ref
     device const float* dp_dThm_s    [[buffer(5)]],
-    device const float* Thm_s        [[buffer(6)]],
-    device const float* tend_u_slow  [[buffer(7)]],
-    device const float* tend_v_slow  [[buffer(8)]],
-    device const float* Thm_cur      [[buffer(9)]],
-    device const float* u_cur        [[buffer(10)]],
-    device const float* v_cur        [[buffer(11)]],
-    device float* u_nxt              [[buffer(12)]],
-    device float* v_nxt              [[buffer(13)]],
-    device float* fx_buf             [[buffer(14)]],
-    device float* fy_buf             [[buffer(15)]],
-    device float* fx_acc             [[buffer(16)]],
-    device float* fy_acc             [[buffer(17)]],
-    device const uint* u_params      [[buffer(18)]],  // [nz, n_col, ny, nx, accum_flux, 0]
-    device const float* f_params     [[buffer(19)]],  // [dt_ac, dx, dy]
+    device const float* tend_u_slow  [[buffer(6)]],
+    device const float* tend_v_slow  [[buffer(7)]],
+    device const float* Thm_cur      [[buffer(8)]],
+    device const float* u_cur        [[buffer(9)]],
+    device const float* v_cur        [[buffer(10)]],
+    device float* u_nxt              [[buffer(11)]],
+    device float* v_nxt              [[buffer(12)]],
+    device float* fx_buf             [[buffer(13)]],
+    device float* fy_buf             [[buffer(14)]],
+    device float* fx_acc             [[buffer(15)]],
+    device float* fy_acc             [[buffer(16)]],
+    constant ulong4& u_dim           [[buffer(17)]],  // [nz, n_col, ny, nx]
+    constant uint& accum             [[buffer(18)]],
+    constant float4& f_p             [[buffer(19)]],  // [dt_ac, dx, dy, 0]
     uint gid [[thread_position_in_grid]])
 {
-    uint nz = u_params[0];
-    uint n_col = u_params[1];
-    uint ny = u_params[2];
-    uint nx = u_params[3];
-    uint accum = u_params[4];
+    uint nz = uint(u_dim.x);
+    uint n_col = uint(u_dim.y);
+    uint ny = uint(u_dim.z);
+    uint nx = uint(u_dim.w);
     uint stride_c = ny * nx;
     uint M = n_col * stride_c;
     if (gid >= nz * M) return;
@@ -124,13 +123,13 @@ kernel void crm_fast_uv_flux(
     uint idx_xp = k * M + col * stride_c + iy * nx + ix_p1;
     uint idx_yp = k * M + col * stride_c + iy_p1 * nx + ix;
 
-    float p_self = pres_s[gid] + dp_dThm_s[gid] * (Thm_cur[gid] - Thm_s[gid]);
-    float p_xp   = pres_s[idx_xp] + dp_dThm_s[idx_xp] * (Thm_cur[idx_xp] - Thm_s[idx_xp]);
-    float p_yp   = pres_s[idx_yp] + dp_dThm_s[idx_yp] * (Thm_cur[idx_yp] - Thm_s[idx_yp]);
+    float p_self = fma(dp_dThm_s[gid],    Thm_cur[gid],    a_p_s[gid]);
+    float p_xp   = fma(dp_dThm_s[idx_xp], Thm_cur[idx_xp], a_p_s[idx_xp]);
+    float p_yp   = fma(dp_dThm_s[idx_yp], Thm_cur[idx_yp], a_p_s[idx_yp]);
 
-    float dt_ac = f_params[0];
-    float inv_dx = 1.0f / f_params[1];
-    float inv_dy = 1.0f / f_params[2];
+    float dt_ac = f_p.x;
+    float inv_dx = 1.0f / f_p.y;
+    float inv_dy = 1.0f / f_p.z;
 
     float pgf_u = -(p_xp - p_self) * inv_dx * rtot_x_inv[gid];
     float pgf_v = -(p_yp - p_self) * inv_dy * rtot_y_inv[gid];
@@ -161,35 +160,36 @@ kernel void crm_fast_hevi_col(
     device const float* fy_buf        [[buffer(4)]],
     device const float* thm_x_eff     [[buffer(5)]],
     device const float* thm_y_eff     [[buffer(6)]],
-    device const float* pres_s        [[buffer(7)]],
+    device const float* a_p_s         [[buffer(7)]],
     device const float* dp_dThm_s     [[buffer(8)]],
-    device const float* Thm_s         [[buffer(9)]],
-    device const float* q_load        [[buffer(10)]],
-    device const float* tend_w_slow   [[buffer(11)]],
-    device const float* tend_Thm_slow [[buffer(12)]],
-    device const float* rho_dw        [[buffer(13)]],
-    device const float* rho_tot_w     [[buffer(14)]],
-    device const float* thm_w         [[buffer(15)]],
-    device const float* dl            [[buffer(16)]],
-    device const float* diag          [[buffer(17)]],
-    device const float* du            [[buffer(18)]],
-    device const float* dz_c          [[buffer(19)]],
-    device const float* dz_w_int      [[buffer(20)]],
-    device const float* sponge_w      [[buffer(21)]],
-    device float* rho_nxt             [[buffer(22)]],
-    device float* Thm_nxt             [[buffer(23)]],
-    device float* w_nxt               [[buffer(24)]],
-    device float* fz_acc              [[buffer(25)]],
-    device const uint* u_params       [[buffer(26)]],  // [nz, n_col, ny, nx, dz_cols, accum_flux]
-    device const float* f_params      [[buffer(27)]],  // [dt_ac, beta_hevi, gravity, dx, dy]
+    device const float* q_load        [[buffer(9)]],
+    device const float* tend_w_slow   [[buffer(10)]],
+    device const float* tend_Thm_slow [[buffer(11)]],
+    device const float* rho_dw        [[buffer(12)]],
+    device const float* rho_tot_w     [[buffer(13)]],
+    device const float* thm_w         [[buffer(14)]],
+    device const float* dl            [[buffer(15)]],
+    device const float* inv_den_buf   [[buffer(16)]],  // pre-factored inv_den in diag
+    device const float* c_star_buf    [[buffer(17)]],  // pre-factored c_star in du
+    device const float* dz_c          [[buffer(18)]],
+    device const float* dz_w_int      [[buffer(19)]],
+    device const float* sponge_w      [[buffer(20)]],
+    device float* rho_nxt             [[buffer(21)]],
+    device float* Thm_nxt             [[buffer(22)]],
+    device float* w_nxt               [[buffer(23)]],
+    device float* fz_acc              [[buffer(24)]],
+    constant ulong4& u_dim            [[buffer(25)]],  // [nz, n_col, ny, nx]
+    constant ulong4& u_flg            [[buffer(26)]],  // [dz_cols, accum, 0, 0]
+    constant float4& f_p0             [[buffer(27)]],  // [dt_ac, beta, gravity, dx]
+    constant float& dy_p              [[buffer(28)]],
     uint tid [[thread_position_in_grid]])
 {
-    uint K = u_params[0];
-    uint n_col = u_params[1];
-    uint ny = u_params[2];
-    uint nx = u_params[3];
-    uint dz_cols = u_params[4];
-    uint accum = u_params[5];
+    uint K = uint(u_dim.x);
+    uint n_col = uint(u_dim.y);
+    uint ny = uint(u_dim.z);
+    uint nx = uint(u_dim.w);
+    uint dz_cols = uint(u_flg.x);
+    uint accum = uint(u_flg.y);
     uint stride_c = ny * nx;
     uint M = n_col * stride_c;
     if (tid >= M || K < 2u || K > 128u) return;
@@ -205,20 +205,18 @@ kernel void crm_fast_hevi_col(
     uint tid_xm = col * stride_c + iy * nx + ix_m1;
     uint tid_ym = col * stride_c + iy_m1 * nx + ix;
 
-    float dt_ac = f_params[0];
-    float beta = f_params[1];
-    float gravity = f_params[2];
-    float inv_dx = 1.0f / f_params[3];
-    float inv_dy = 1.0f / f_params[4];
+    float dt_ac = f_p0.x;
+    float beta = f_p0.y;
+    float gravity = f_p0.z;
+    float inv_dx = 1.0f / f_p0.w;
+    float inv_dy = 1.0f / dy_p;
 
-    float c_star[128];
     float d_star[128];
 
     float p_blend_prev = 0.0f;
     float rtot_blend_prev = 0.0f;
     float fz_old_below = 0.0f;
     float thm_w_below = 0.0f;
-    float c_prev = 0.0f;
     float d_prev = 0.0f;
 
     for (uint k = 0u; k < K; ++k) {
@@ -257,12 +255,10 @@ kernel void crm_fast_hevi_col(
         rho_nxt[idx] = r_dag;
         Thm_nxt[idx] = T_dag;
 
-        float ps = pres_s[idx];
+        float ap = a_p_s[idx];
         float dp = dp_dThm_s[idx];
-        float Ts = Thm_s[idx];
-        float p_cur = ps + dp * (T_cur - Ts);
-        float p_dag = ps + dp * (T_dag - Ts);
-        float p_blend = (1.0f - beta) * p_cur + beta * p_dag;
+        float T_blend = (1.0f - beta) * T_cur + beta * T_dag;
+        float p_blend = fma(dp, T_blend, ap);
         float rtot_blend = ((1.0f - beta) * r_cur + beta * r_dag) * q_load[idx];
 
         if (k >= 1u) {
@@ -277,16 +273,8 @@ kernel void crm_fast_hevi_col(
                 - (rdw_m / rtw_m) * nh_imb
                 - sponge_w[um] * fz_old_below
             );
-            if (um == 0u) {
-                float inv_b0 = 1.0f / diag[idx_m];
-                c_prev = du[idx_m] * inv_b0;
-                d_prev = rhs_m * inv_b0;
-            } else {
-                float inv_den = 1.0f / (diag[idx_m] - dl[idx_m] * c_prev);
-                c_prev = (um < K - 2u) ? (du[idx_m] * inv_den) : 0.0f;
-                d_prev = (rhs_m - dl[idx_m] * d_prev) * inv_den;
-            }
-            c_star[um] = c_prev;
+            float inv_den = inv_den_buf[idx_m];
+            d_prev = (um == 0u) ? (rhs_m * inv_den) : ((rhs_m - dl[idx_m] * d_prev) * inv_den);
             d_star[um] = d_prev;
         }
         p_blend_prev = p_blend;
@@ -303,7 +291,7 @@ kernel void crm_fast_hevi_col(
     for (int m = int(K) - 2; m >= 0; --m) {
         uint um = uint(m);
         uint idx_m = um * M + tid;
-        float dfz_cur = (m == int(K) - 2) ? d_star[um] : (d_star[um] - c_star[um] * dfz_above);
+        float dfz_cur = (m == int(K) - 2) ? d_star[um] : (d_star[um] - c_star_buf[idx_m] * dfz_above);
         float rdw_m = rho_dw[idx_m];
         float fz_old_m = rdw_m * w_cur[(um + 1u) * M + tid];
         float fz_new_m = fz_old_m + dfz_cur;
@@ -328,30 +316,79 @@ kernel void crm_fast_hevi_col(
     Thm_nxt[tid] = Thm_nxt[tid] - beta * dt_ac * (thm_w_above * dfz_above) / dz_0;
 }
 
+kernel void crm_copy_state5(
+    device const float* rho0 [[buffer(0)]],
+    device const float* Thm0 [[buffer(1)]],
+    device const float* u0   [[buffer(2)]],
+    device const float* v0   [[buffer(3)]],
+    device const float* w0   [[buffer(4)]],
+    device float* rho_a      [[buffer(5)]],
+    device float* Thm_a      [[buffer(6)]],
+    device float* u_a        [[buffer(7)]],
+    device float* v_a        [[buffer(8)]],
+    device float* w_a        [[buffer(9)]],
+    constant uint& n_c       [[buffer(10)]],
+    constant uint& n_w       [[buffer(11)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < n_c) {
+        rho_a[gid] = rho0[gid];
+        Thm_a[gid] = Thm0[gid];
+        u_a[gid]   = u0[gid];
+        v_a[gid]   = v0[gid];
+    }
+    if (gid < n_w) {
+        w_a[gid] = w0[gid];
+    }
+}
+
+kernel void crm_stage_hevi_factor(
+    device const float* dl      [[buffer(0)]],
+    device float* diag_inv      [[buffer(1)]],
+    device float* du_cstar      [[buffer(2)]],
+    constant uint& n_int        [[buffer(3)]],
+    constant uint& M            [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= M || n_int == 0u) return;
+    float inv_b0 = 1.0f / diag_inv[tid];
+    float c_prev = (n_int > 1u) ? (du_cstar[tid] * inv_b0) : 0.0f;
+    diag_inv[tid] = inv_b0;
+    du_cstar[tid] = c_prev;
+    for (uint um = 1u; um < n_int; ++um) {
+        uint idx = um * M + tid;
+        float inv_den = 1.0f / (diag_inv[idx] - dl[idx] * c_prev);
+        c_prev = (um + 1u < n_int) ? (du_cstar[idx] * inv_den) : 0.0f;
+        diag_inv[idx] = inv_den;
+        du_cstar[idx] = c_prev;
+    }
+}
+
 kernel void crm_stage_thermo(
     device const float* rho_s     [[buffer(0)]],
     device const float* Thm_s     [[buffer(1)]],
     device const float* q_load    [[buffer(2)]],
     device float* thm_s           [[buffer(3)]],
-    device float* pres_s          [[buffer(4)]],
+    device float* a_p_s           [[buffer(4)]],   // pres_s - dp_dThm_s * Thm_s
     device float* dp_dThm_s       [[buffer(5)]],
     device float* rho_tot_s       [[buffer(6)]],
-    device const uint* u_params   [[buffer(7)]],  // [total_pts]
-    device const float* f_params  [[buffer(8)]],  // [p_ref, r_d, gamma_d]
+    constant uint& total_pts      [[buffer(7)]],
+    constant float4& f_p          [[buffer(8)]],   // [p_ref, r_d, gamma_d, 0]
     uint gid [[thread_position_in_grid]])
 {
-    if (gid >= u_params[0]) return;
-    float p_ref = f_params[0];
-    float r_d = f_params[1];
-    float gamma_d = f_params[2];
+    if (gid >= total_pts) return;
+    float p_ref = f_p.x;
+    float r_d = f_p.y;
+    float gamma_d = f_p.z;
 
     float r = rho_s[gid];
     float T = Thm_s[gid];
     thm_s[gid] = T / max(r, 1.0e-5f);
     float arg = max((r_d * T) / p_ref, 1.0e-7f);
     float p = p_ref * pow(arg, gamma_d);
-    pres_s[gid] = p;
-    dp_dThm_s[gid] = gamma_d * p / max(T, 1.0e-3f);
+    float dp = gamma_d * p / max(T, 1.0e-3f);
+    dp_dThm_s[gid] = dp;
+    a_p_s[gid] = p - dp * T;
     rho_tot_s[gid] = r * q_load[gid];
 }
 
@@ -383,16 +420,18 @@ kernel void crm_stage_uv_flux(
     device float* thm_y_eff        [[buffer(18)]],
     device float* tend_u_slow      [[buffer(19)]],
     device float* tend_v_slow      [[buffer(20)]],
-    device const uint* u_params    [[buffer(21)]],  // [nz, n_col, ny, nx, dz_cols, has_cor]
-    device const float* f_params   [[buffer(22)]],  // [dx, dy]
+    constant ulong4& u_dim         [[buffer(21)]],  // [nz, n_col, ny, nx]
+    constant ulong4& u_flg         [[buffer(22)]],  // [dz_cols, has_cor, k_sp0, 0]
+    constant float4& f_p           [[buffer(23)]],  // [dx, dy, 0, 0]
     uint gid [[thread_position_in_grid]])
 {
-    uint nz = u_params[0];
-    uint n_col = u_params[1];
-    uint ny = u_params[2];
-    uint nx = u_params[3];
-    uint dz_cols = u_params[4];
-    uint has_cor = u_params[5];
+    uint nz = uint(u_dim.x);
+    uint n_col = uint(u_dim.y);
+    uint ny = uint(u_dim.z);
+    uint nx = uint(u_dim.w);
+    uint dz_cols = uint(u_flg.x);
+    uint has_cor = uint(u_flg.y);
+    uint k_sp0 = uint(u_flg.z);
     uint stride_c = ny * nx;
     uint M = n_col * stride_c;
     if (gid >= nz * M) return;
@@ -427,8 +466,8 @@ kernel void crm_stage_uv_flux(
     uint idx_yp1_xm1 = base_k + iy_p1 * nx + ix_m1;
     uint idx_ym1_xp1 = base_k + iy_m1 * nx + ix_p1;
 
-    float inv_dx = 1.0f / f_params[0];
-    float inv_dy = 1.0f / f_params[1];
+    float inv_dx = 1.0f / f_p.x;
+    float inv_dy = 1.0f / f_p.y;
 
     rho_x[gid] = 0.5f * (rho_s[gid] + rho_s[idx_xp1]);
     rho_y[gid] = 0.5f * (rho_s[gid] + rho_s[idx_yp1]);
@@ -521,11 +560,16 @@ kernel void crm_stage_uv_flux(
 
     float fc = (has_cor != 0u) ? f_cor[col] : 0.0f;
     float sp = sponge_c[k];
-    float um = u_mean[k * n_col + col];
-    float vm = v_mean[k * n_col + col];
+    float damp_u = 0.0f;
+    float damp_v = 0.0f;
+    if (sp > 0.0f && k >= k_sp0) {
+        uint sp_idx = (k - k_sp0) * n_col + col;
+        damp_u = sp * (u0 - u_mean[sp_idx]);
+        damp_v = sp * (v0 - v_mean[sp_idx]);
+    }
 
-    tend_u_slow[gid] = adv_u + vadv_u + fc * v_at_u + du_sgs[gid] - sp * (u0 - um);
-    tend_v_slow[gid] = adv_v + vadv_v - fc * u_at_v + dv_sgs[gid] - sp * (v0 - vm);
+    tend_u_slow[gid] = adv_u + vadv_u + fc * v_at_u + du_sgs[gid] - damp_u;
+    tend_v_slow[gid] = adv_v + vadv_v - fc * u_at_v + dv_sgs[gid] - damp_v;
 }
 
 kernel void crm_stage_w_hevi(
@@ -548,15 +592,16 @@ kernel void crm_stage_w_hevi(
     device float* dl               [[buffer(16)]],
     device float* diag             [[buffer(17)]],
     device float* du               [[buffer(18)]],
-    device const uint* u_params    [[buffer(19)]],  // [nz, n_col, ny, nx, dz_cols, 0]
-    device const float* f_params   [[buffer(20)]],  // [dt_ac, beta_hevi, gravity, dx, dy]
+    constant ulong4& u_dim         [[buffer(19)]],  // [nz, n_col, ny, nx]
+    constant uint& dz_cols         [[buffer(20)]],
+    constant float4& f_p0          [[buffer(21)]],  // [dt_ac, beta_hevi, gravity, dx]
+    constant float& dy_p           [[buffer(22)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint nz = u_params[0];
-    uint n_col = u_params[1];
-    uint ny = u_params[2];
-    uint nx = u_params[3];
-    uint dz_cols = u_params[4];
+    uint nz = uint(u_dim.x);
+    uint n_col = uint(u_dim.y);
+    uint ny = uint(u_dim.z);
+    uint nx = uint(u_dim.w);
     uint stride_c = ny * nx;
     uint M = n_col * stride_c;
     uint n_int = nz - 1u;
@@ -592,8 +637,8 @@ kernel void crm_stage_w_hevi(
     uint idx_mp1 = (m + 1u) * M + tid;
     uint idx_mp2 = (m + 2u) * M + tid;
 
-    float inv_dx = 1.0f / f_params[3];
-    float inv_dy = 1.0f / f_params[4];
+    float inv_dx = 1.0f / f_p0.w;
+    float inv_dy = 1.0f / dy_p;
 
     float u_w_left  = 0.5f * (u_s[m * M + tid_xm1] + u_s[(m + 1u) * M + tid_xm1]);
     float u_w_right = 0.5f * (u_s[idx_m]           + u_s[idx_mp1]);
@@ -633,9 +678,9 @@ kernel void crm_stage_w_hevi(
     rho_tot_w[gid] = rtw;
     thm_w[gid] = thw;
 
-    float dt_ac = f_params[0];
-    float beta = f_params[1];
-    float gravity = f_params[2];
+    float dt_ac = f_p0.x;
+    float beta = f_p0.y;
+    float gravity = f_p0.z;
     float bdt2 = (beta * dt_ac) * (beta * dt_ac);
 
     float fac_p = bdt2 * (rdw / (rtw * dz_wm));
@@ -744,9 +789,7 @@ def solve_tridiagonal_batched(
                 du_c = du.contiguous().view(K, M)
                 rhs_c = rhs.contiguous().view(K, M)
                 out = torch.empty_like(rhs_c)
-                k_buf = torch.tensor([K], dtype=torch.uint32, device=rhs.device)
-                m_buf = torch.tensor([M], dtype=torch.uint32, device=rhs.device)
-                lib.batched_thomas(dl_c, d_c, du_c, rhs_c, out, k_buf, m_buf, threads=M)
+                lib.batched_thomas(dl_c, d_c, du_c, rhs_c, out, int(K), int(M), threads=M)
                 return out.view(orig_shape)
 
     return solve_tridiagonal_pytorch(dl, d, du, rhs)
@@ -917,6 +960,8 @@ def run_crm_rk3_hevi_metal(
         if len(_CRM_WS_CACHE) >= 8:
             _CRM_WS_CACHE.pop(next(iter(_CRM_WS_CACHE)))
         shape_w = (nz - 1, n_col, ny, nx)
+        sp_nz = (spc_c > 0.0).nonzero(as_tuple=False)
+        k_sp0 = int(sp_nz[0].item()) if sp_nz.numel() > 0 else nz
         ws = {
             "rho_a": torch.empty_like(rho0_c),
             "Thm_a": torch.empty_like(Thm0_c),
@@ -935,8 +980,7 @@ def run_crm_rk3_hevi_metal(
             "fz_acc": torch.empty_like(w0_c),
             "dummy": torch.zeros(1, device=dev, dtype=torch.float32),
             "thm_s": torch.empty_like(rho0_c),
-            "Thm_ref": torch.empty_like(rho0_c),
-            "pres_s": torch.empty_like(rho0_c),
+            "a_p_s": torch.empty_like(rho0_c),
             "dp_dThm_s": torch.empty_like(rho0_c),
             "rho_tot_s": torch.empty_like(rho0_c),
             "rho_x": torch.empty_like(rho0_c),
@@ -954,12 +998,7 @@ def run_crm_rk3_hevi_metal(
             "dl": torch.empty(shape_w, device=dev, dtype=torch.float32),
             "diag": torch.empty(shape_w, device=dev, dtype=torch.float32),
             "du": torch.empty(shape_w, device=dev, dtype=torch.float32),
-            "u_th": torch.tensor([total_pts], dtype=torch.uint32, device=dev),
-            "u_sw": torch.tensor([nz, n_col, ny, nx, dz_cols, 0], dtype=torch.uint32, device=dev),
-            "u_uv_0": torch.tensor([nz, n_col, ny, nx, 0, 0], dtype=torch.uint32, device=dev),
-            "u_uv_1": torch.tensor([nz, n_col, ny, nx, 1, 0], dtype=torch.uint32, device=dev),
-            "u_hevi_0": torch.tensor([nz, n_col, ny, nx, dz_cols, 0], dtype=torch.uint32, device=dev),
-            "u_hevi_1": torch.tensor([nz, n_col, ny, nx, dz_cols, 1], dtype=torch.uint32, device=dev),
+            "k_sp0": k_sp0,
         }
         _CRM_WS_CACHE[ws_key] = ws
 
@@ -972,8 +1011,8 @@ def run_crm_rk3_hevi_metal(
     fz_acc.zero_()
     dummy = ws["dummy"]
 
-    thm_s, Thm_ref, pres_s, dp_dThm_s, rho_tot_s = (
-        ws["thm_s"], ws["Thm_ref"], ws["pres_s"], ws["dp_dThm_s"], ws["rho_tot_s"]
+    thm_s, a_p_s, dp_dThm_s, rho_tot_s = (
+        ws["thm_s"], ws["a_p_s"], ws["dp_dThm_s"], ws["rho_tot_s"]
     )
     rho_x, rho_y, rtot_x_inv, rtot_y_inv = ws["rho_x"], ws["rho_y"], ws["rtot_x_inv"], ws["rtot_y_inv"]
     thm_x_eff, thm_y_eff, tend_u_slow, tend_v_slow = (
@@ -982,11 +1021,13 @@ def run_crm_rk3_hevi_metal(
     tend_w_slow, rho_dw, rho_tot_w, thm_w, dl, diag, du = (
         ws["tend_w_slow"], ws["rho_dw"], ws["rho_tot_w"], ws["thm_w"], ws["dl"], ws["diag"], ws["du"]
     )
-
-    u_th, u_sw = ws["u_th"], ws["u_sw"]
-    f_th = torch.tensor([p_ref, r_d, gamma_d], dtype=torch.float32, device=dev)
-    u_suv = torch.tensor([nz, n_col, ny, nx, dz_cols, has_cor], dtype=torch.uint32, device=dev)
-    f_suv = torch.tensor([dx, dy], dtype=torch.float32, device=dev)
+    k_sp0 = int(ws["k_sp0"])
+    u_dim4 = [nz, n_col, ny, nx]
+    f_th4 = [float(p_ref), float(r_d), float(gamma_d), 0.0]
+    u_suv_flg = [dz_cols, has_cor, k_sp0, 0]
+    f_suv4 = [float(dx), float(dy), 0.0, 0.0]
+    n_w_pts = (nz + 1) * M
+    n_int = nz - 1
 
     rho_s, Thm_s, u_s, v_s, w_s = rho0_c, Thm0_c, u0_c, v0_c, w0_c
     fx_final = dummy
@@ -999,48 +1040,43 @@ def run_crm_rk3_hevi_metal(
         n_ac = max(1, int(_math.ceil(dtau / max(dt_ac_max, 0.1))))
         dt_ac = dtau / float(n_ac)
 
-        lib.crm_stage_thermo(rho_s, Thm_s, ql_c, thm_s, pres_s, dp_dThm_s, rho_tot_s, u_th, f_th, threads=total_pts)
-        u_mean = u_s.mean(dim=(-2, -1)).contiguous()
-        v_mean = v_s.mean(dim=(-2, -1)).contiguous()
+        lib.crm_stage_thermo(rho_s, Thm_s, ql_c, thm_s, a_p_s, dp_dThm_s, rho_tot_s, total_pts, f_th4, threads=total_pts)
+        if k_sp0 < nz:
+            u_mean = u_s[k_sp0:].mean(dim=(-2, -1)).contiguous()
+            v_mean = v_s[k_sp0:].mean(dim=(-2, -1)).contiguous()
+        else:
+            u_mean = dummy
+            v_mean = dummy
         lib.crm_stage_uv_flux(
             rho_s, rho_tot_s, thm_s, u_s, v_s, w_s, du_s_c, dv_s_c, u_mean, v_mean,
             dzw_c, spc_c, fcor_c,
             rho_x, rho_y, rtot_x_inv, rtot_y_inv, thm_x_eff, thm_y_eff, tend_u_slow, tend_v_slow,
-            u_suv, f_suv, threads=total_pts,
+            u_dim4, u_suv_flg, f_suv4, threads=total_pts,
         )
-        f_hevi = torch.tensor([dt_ac, beta_hevi, gravity, dx, dy], dtype=torch.float32, device=dev)
+        f_hevi4 = [float(dt_ac), float(beta_hevi), float(gravity), float(dx)]
         lib.crm_stage_w_hevi(
             rho_s, rho_tot_s, thm_s, dp_dThm_s, ql_c, u_s, v_s, w_s, dw_s_c,
             dzc_c, dzw_c, spw_c,
             tend_w_slow, rho_dw, rho_tot_w, thm_w, dl, diag, du,
-            u_sw, f_hevi, threads=n_int_pts,
+            u_dim4, int(dz_cols), f_hevi4, float(dy), threads=n_int_pts,
         )
-
-        Thm_ref.copy_(Thm_s)
-
-        rho_a.copy_(rho0_c)
-        Thm_a.copy_(Thm0_c)
-        u_a.copy_(u0_c)
-        v_a.copy_(v0_c)
-        w_a.copy_(w0_c)
+        lib.crm_stage_hevi_factor(dl, diag, du, int(n_int), int(M), threads=M)
+        lib.crm_copy_state5(rho0_c, Thm0_c, u0_c, v0_c, w0_c, rho_a, Thm_a, u_a, v_a, w_a, total_pts, n_w_pts, threads=n_w_pts)
 
         accum = stage_idx == 2
+        accum_i = 1 if accum else 0
         if ny == 1 and 1 < nx <= 32 and nz <= 48 and (64 % nx == 0):
             c_tg = 64 // nx
             n_tg = (n_col + c_tg - 1) // c_tg
-            u_2d = torch.tensor(
-                [nz, n_col, nx, dz_cols, n_ac, 1 if accum else 0],
-                dtype=torch.uint32,
-                device=dev,
-            )
-            f_2d = torch.tensor([dt_ac, beta_hevi, gravity, dx], dtype=torch.float32, device=dev)
+            u_2d4 = [nz, n_col, nx, (int(dz_cols) << 16) | (int(n_ac) << 1) | accum_i]
+            f_2d4 = [float(dt_ac), float(beta_hevi), float(gravity), float(dx)]
             kern_2d = lib.crm_2d_fast_hevi_loop if nz <= 32 else lib.crm_2d_fast_hevi_loop_64
             kern_2d(
                 rho_a, Thm_a, u_a, v_a, w_a,
-                rho_x, rtot_x_inv, thm_x_eff, pres_s, dp_dThm_s, Thm_ref, ql_c,
+                rho_x, rtot_x_inv, thm_x_eff, a_p_s, dp_dThm_s, ql_c,
                 tend_u_slow, tend_v_slow, tend_w_slow, tTh_c,
                 rho_dw, rho_tot_w, thm_w, dl, diag, du, dzc_c, dzw_c, spw_c,
-                fx_acc, fy_acc, fz_acc, u_2d, f_2d,
+                fx_acc, fy_acc, fz_acc, u_2d4, f_2d4,
                 threads=(n_tg * 64,), group_size=(64,),
             )
             rho_s, Thm_s, u_s, v_s, w_s = rho_a, Thm_a, u_a, v_a, w_a
@@ -1049,9 +1085,8 @@ def run_crm_rk3_hevi_metal(
             fy_out = fy_acc if accum else dummy
             fz_out = fz_acc if accum else dummy
 
-            u_uv = ws["u_uv_1"] if accum else ws["u_uv_0"]
-            f_uv = torch.tensor([dt_ac, dx, dy], dtype=torch.float32, device=dev)
-            u_hevi = ws["u_hevi_1"] if accum else ws["u_hevi_0"]
+            f_uv4 = [float(dt_ac), float(dx), float(dy), 0.0]
+            u_flg4 = [int(dz_cols), accum_i, 0, 0]
 
             cur = (rho_a, Thm_a, u_a, v_a, w_a)
             nxt = (rho_b, Thm_b, u_b, v_b, w_b)
@@ -1060,17 +1095,17 @@ def run_crm_rk3_hevi_metal(
                 rho_c, Thm_c, u_c, v_c, w_c = cur
                 rho_n, Thm_n, u_n, v_n, w_n = nxt
                 lib.crm_fast_uv_flux(
-                    rho_x, rho_y, rtot_x_inv, rtot_y_inv, pres_s, dp_dThm_s, Thm_ref,
+                    rho_x, rho_y, rtot_x_inv, rtot_y_inv, a_p_s, dp_dThm_s,
                     tend_u_slow, tend_v_slow, Thm_c, u_c, v_c,
                     u_n, v_n, fx_buf, fy_buf, fx_out, fy_out,
-                    u_uv, f_uv, threads=total_pts,
+                    u_dim4, accum_i, f_uv4, threads=total_pts,
                 )
                 lib.crm_fast_hevi_col(
                     rho_c, Thm_c, w_c, fx_buf, fy_buf, thm_x_eff, thm_y_eff,
-                    pres_s, dp_dThm_s, Thm_ref, ql_c, tend_w_slow, tTh_c,
+                    a_p_s, dp_dThm_s, ql_c, tend_w_slow, tTh_c,
                     rho_dw, rho_tot_w, thm_w, dl, diag, du, dzc_c, dzw_c, spw_c,
                     rho_n, Thm_n, w_n, fz_out,
-                    u_hevi, f_hevi, threads=M,
+                    u_dim4, u_flg4, f_hevi4, float(dy), threads=M,
                 )
                 cur, nxt = nxt, cur
 

@@ -442,6 +442,41 @@ def compute_surface_albedos(
 # ---------------------------------------------------------------------------
 # 4. Five-Layer Implicit Soil Heat Conduction & Freeze-Thaw Phase Change
 # ---------------------------------------------------------------------------
+_SOIL_GEOM_CACHE: dict[tuple[str, int, torch.dtype, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_soil_geom_tensors(
+    dev: torch.device,
+    dtype: torch.dtype,
+    col_shape: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return cached 5-layer soil `(dz, z_top, dz_int)` geometry tensors on `(dev, dtype)`."""
+    key = (dev.type, dev.index or 0, dtype, col_shape)
+    cached = _SOIL_GEOM_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_SOIL_GEOM_CACHE) >= 32:
+        _SOIL_GEOM_CACHE.pop(next(iter(_SOIL_GEOM_CACHE)))
+    view_shape = (N_SOIL_LAYERS,) + (1,) * len(col_shape)
+    dz = torch.tensor(SOIL_LAYER_DEPTHS, device=dev, dtype=dtype).view(view_shape)
+    z_bot_vals = []
+    z_mid_vals = []
+    acc = 0.0
+    for d in SOIL_LAYER_DEPTHS:
+        z_mid_vals.append(acc + 0.5 * d)
+        acc += d
+        z_bot_vals.append(acc)
+    z_top = torch.tensor([0.0] + z_bot_vals[:-1], device=dev, dtype=dtype).view(view_shape)
+    dz_int = torch.tensor(
+        [z_mid_vals[k + 1] - z_mid_vals[k] for k in range(N_SOIL_LAYERS - 1)],
+        device=dev,
+        dtype=dtype,
+    ).view((N_SOIL_LAYERS - 1,) + (1,) * len(col_shape))
+    cached = (dz, z_top, dz_int)
+    _SOIL_GEOM_CACHE[key] = cached
+    return cached
+
+
 def step_multilayer_soil_thermodynamics(
     t_soil: torch.Tensor,
     w_liq: torch.Tensor,
@@ -462,7 +497,7 @@ def step_multilayer_soil_thermodynamics(
     dev = t_soil.device
     dtype = t_soil.dtype
     col_shape = t_soil.shape[1:]
-    dz = torch.tensor(SOIL_LAYER_DEPTHS, device=dev, dtype=dtype).view((N_SOIL_LAYERS,) + (1,) * len(col_shape))
+    dz, _, _ = _get_soil_geom_tensors(dev, dtype, col_shape)
 
     mw = RHO_WATER * torch.clamp(w_liq, min=0.0)        # Liquid mass density [kg m^-3]
     mi = RHO_ICE_SOLID * torch.clamp(w_ice, min=0.0)    # Ice mass density [kg m^-3]
@@ -529,16 +564,9 @@ def compute_root_zone_weights_and_water(
     dev = w_liq_soil.device
     dtype = w_liq_soil.dtype
     col_shape = w_liq_soil.shape[1:]
-    view_shape = (N_SOIL_LAYERS,) + (1,) * len(col_shape)
 
-    dz = torch.tensor(SOIL_LAYER_DEPTHS, device=dev, dtype=dtype).view(view_shape)
-    z_bot_vals = []
-    acc = 0.0
-    for d in SOIL_LAYER_DEPTHS:
-        acc += d
-        z_bot_vals.append(acc)
-    z_tot = acc
-    z_top = torch.tensor([0.0] + z_bot_vals[:-1], device=dev, dtype=dtype).view(view_shape)
+    dz, z_top, _ = _get_soil_geom_tensors(dev, dtype, col_shape)
+    z_tot = sum(SOIL_LAYER_DEPTHS)
 
     theta_fc = SOIL_POROSITY * (abs(PSI_SAT_SOIL) / 3.3) ** (1.0 / B_CLAPP_SOIL)
     theta_wp = SOIL_POROSITY * (abs(PSI_SAT_SOIL) / 150.0) ** (1.0 / B_CLAPP_SOIL)
@@ -593,19 +621,8 @@ def step_multilayer_soil_hydrology(
     dev = w_liq.device
     dtype = w_liq.dtype
     col_shape = w_liq.shape[1:]
-    view_shape = (N_SOIL_LAYERS,) + (1,) * len(col_shape)
 
-    dz = torch.tensor(SOIL_LAYER_DEPTHS, device=dev, dtype=dtype).view(view_shape)
-    z_mid_vals = []
-    acc = 0.0
-    for d in SOIL_LAYER_DEPTHS:
-        z_mid_vals.append(acc + 0.5 * d)
-        acc += d
-    dz_int = torch.tensor(
-        [z_mid_vals[k + 1] - z_mid_vals[k] for k in range(N_SOIL_LAYERS - 1)],
-        device=dev,
-        dtype=dtype,
-    ).view((N_SOIL_LAYERS - 1,) + (1,) * len(col_shape))
+    dz, _, dz_int = _get_soil_geom_tensors(dev, dtype, col_shape)
 
     w_l = torch.clamp(w_liq, min=0.0)
     w_i = torch.clamp(w_ice, min=0.0)
@@ -640,7 +657,7 @@ def step_multilayer_soil_hydrology(
     f_imp = 1.0 - f_ice[0]
     f_sat = f_imp + (1.0 - f_imp) * torch.pow(s_top_tot, 4.0)
     q_infil_cap = RHO_WATER * f_ice[0] * K_SAT_SOIL * torch.clamp(
-        1.0 + (PSI_SAT_SOIL - psi[0]) / z_mid_vals[0], min=1.0, max=1.0e4
+        1.0 + (PSI_SAT_SOIL - psi[0]) / (0.5 * SOIL_LAYER_DEPTHS[0]), min=1.0, max=1.0e4
     )
     q_infil = torch.minimum((1.0 - f_sat) * q_liq_in, q_infil_cap)
     q_infil = torch.where(is_ice, torch.zeros_like(q_infil), q_infil)

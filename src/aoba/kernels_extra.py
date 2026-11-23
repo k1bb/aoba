@@ -11,8 +11,9 @@ from aoba import constants as C
 
 _MAX_WS_CACHE: int = 8
 _FCT_WS_CACHE: dict[tuple[Any, ...], dict[str, torch.Tensor]] = {}
-_SGS_WS_CACHE: dict[tuple[Any, ...], dict[str, torch.Tensor]] = {}
+_SGS_WS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _SCVT_WS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_CONST_BUF_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
 
 
 def _cache_put(cache: dict[tuple[Any, ...], Any], key: tuple[Any, ...], val: Any) -> None:
@@ -38,16 +39,17 @@ kernel void crm_fct_flux_td(
     device float* ay_out           [[buffer(8)]],   // [B, nz, n_col, ny, nx]
     device float* az_out           [[buffer(9)]],   // [B, nz+1, n_col, ny, nx]
     device float* q_td             [[buffer(10)]],  // [B, nz, n_col, ny, nx]
-    device const uint* u_params    [[buffer(11)]],  // [B, nz, n_col, ny, nx, dz_cols]
-    device const float* f_params   [[buffer(12)]],  // [dt, dx, dy]
+    constant ulong4& u_p0          [[buffer(11)]],  // [B, nz, n_col, ny]
+    constant ulong4& u_p1          [[buffer(12)]],  // [nx, dz_cols, 0, 0]
+    constant float4& f_p           [[buffer(13)]],  // [dt, dx, dy, 0]
     uint gid [[thread_position_in_grid]])
 {
-    uint B = u_params[0];
-    uint nz = u_params[1];
-    uint n_col = u_params[2];
-    uint ny = u_params[3];
-    uint nx = u_params[4];
-    uint dz_cols = u_params[5];
+    uint B = uint(u_p0.x);
+    uint nz = uint(u_p0.y);
+    uint n_col = uint(u_p0.z);
+    uint ny = uint(u_p0.w);
+    uint nx = uint(u_p1.x);
+    uint dz_cols = uint(u_p1.y);
 
     uint stride_c = ny * nx;
     uint M = n_col * stride_c;
@@ -67,9 +69,6 @@ kernel void crm_fct_flux_td(
     uint ix_m1 = (ix > 0u) ? (ix - 1u) : (nx - 1u);
     uint ix_p1 = (ix + 1u < nx) ? (ix + 1u) : 0u;
     uint ix_p2 = (ix + 2u < nx) ? (ix + 2u) : ((nx == 1u) ? 0u : (ix + 2u - nx));
-    uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
-    uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
-    uint iy_p2 = (iy + 2u < ny) ? (iy + 2u) : ((ny == 1u) ? 0u : (iy + 2u - ny));
 
     uint q_k_base = b * vol_pts + k * M + col * stride_c;
     uint f_k_base = k * M + col * stride_c;
@@ -78,9 +77,6 @@ kernel void crm_fct_flux_td(
     float q_xm1 = q[q_k_base + iy * nx + ix_m1];
     float q_xp1 = q[q_k_base + iy * nx + ix_p1];
     float q_xp2 = q[q_k_base + iy * nx + ix_p2];
-    float q_ym1 = q[q_k_base + iy_m1 * nx + ix];
-    float q_yp1 = q[q_k_base + iy_p1 * nx + ix];
-    float q_yp2 = q[q_k_base + iy_p2 * nx + ix];
 
     float fx_self = fx[loc];
     float fx_xm1  = fx[f_k_base + iy * nx + ix_m1];
@@ -89,12 +85,25 @@ kernel void crm_fct_flux_td(
     float fh_x_self = fx_self * ((-q_xm1 + 7.0f * q0 + 7.0f * q_xp1 - q_xp2) * (1.0f / 12.0f));
     ax_out[gid] = fh_x_self - fl_x_self;
 
-    float fy_self = fy[loc];
-    float fy_ym1  = fy[f_k_base + iy_m1 * nx + ix];
-    float fl_y_self = max(fy_self, 0.0f) * q0    + min(fy_self, 0.0f) * q_yp1;
-    float fl_y_ym1  = max(fy_ym1,  0.0f) * q_ym1 + min(fy_ym1,  0.0f) * q0;
-    float fh_y_self = fy_self * ((-q_ym1 + 7.0f * q0 + 7.0f * q_yp1 - q_yp2) * (1.0f / 12.0f));
-    ay_out[gid] = fh_y_self - fl_y_self;
+    float dt = f_p.x;
+    float inv_dx = 1.0f / f_p.y;
+    float inv_dy = 1.0f / f_p.z;
+    float div_fl_y = 0.0f;
+    if (ny > 1u) {
+        uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
+        uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
+        uint iy_p2 = (iy + 2u < ny) ? (iy + 2u) : (iy + 2u - ny);
+        float q_ym1 = q[q_k_base + iy_m1 * nx + ix];
+        float q_yp1 = q[q_k_base + iy_p1 * nx + ix];
+        float q_yp2 = q[q_k_base + iy_p2 * nx + ix];
+        float fy_self = fy[loc];
+        float fy_ym1  = fy[f_k_base + iy_m1 * nx + ix];
+        float fl_y_self = max(fy_self, 0.0f) * q0    + min(fy_self, 0.0f) * q_yp1;
+        float fl_y_ym1  = max(fy_ym1,  0.0f) * q_ym1 + min(fy_ym1,  0.0f) * q0;
+        float fh_y_self = fy_self * ((-q_ym1 + 7.0f * q0 + 7.0f * q_yp1 - q_yp2) * (1.0f / 12.0f));
+        ay_out[gid] = fh_y_self - fl_y_self;
+        div_fl_y = (fl_y_self - fl_y_ym1) * inv_dy;
+    }
 
     uint az_base = b * (nz + 1u) * M;
     if (k == 0u) {
@@ -128,14 +137,8 @@ kernel void crm_fct_flux_td(
         az_out[az_base + m * M + tid] = fh_z_up - fl_z_up;
     }
 
-    float dt = f_params[0];
-    float inv_dx = 1.0f / f_params[1];
-    float inv_dy = 1.0f / f_params[2];
     float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
-
-    float div_fl = (fl_x_self - fl_x_xm1) * inv_dx
-                 + (fl_y_self - fl_y_ym1) * inv_dy
-                 + (fl_z_up - fl_z_dn) * inv_dz;
+    float div_fl = (fl_x_self - fl_x_xm1) * inv_dx + div_fl_y + (fl_z_up - fl_z_dn) * inv_dz;
     float rho_safe = max(rho_new[loc], 1.0e-5f);
     q_td[gid] = max((rho_old[loc] * q0 - dt * div_fl) / rho_safe, 0.0f);
 }
@@ -150,16 +153,17 @@ kernel void crm_fct_bounds_ratios(
     device const float* dz_c       [[buffer(6)]],
     device float* r_plus           [[buffer(7)]],
     device float* r_minus          [[buffer(8)]],
-    device const uint* u_params    [[buffer(9)]],
-    device const float* f_params   [[buffer(10)]],
+    constant ulong4& u_p0          [[buffer(9)]],
+    constant ulong4& u_p1          [[buffer(10)]],
+    constant float4& f_p           [[buffer(11)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint B = u_params[0];
-    uint nz = u_params[1];
-    uint n_col = u_params[2];
-    uint ny = u_params[3];
-    uint nx = u_params[4];
-    uint dz_cols = u_params[5];
+    uint B = uint(u_p0.x);
+    uint nz = uint(u_p0.y);
+    uint n_col = uint(u_p0.z);
+    uint ny = uint(u_p0.w);
+    uint nx = uint(u_p1.x);
+    uint dz_cols = uint(u_p1.y);
 
     uint stride_c = ny * nx;
     uint M = n_col * stride_c;
@@ -178,8 +182,6 @@ kernel void crm_fct_bounds_ratios(
 
     uint ix_m1 = (ix > 0u) ? (ix - 1u) : (nx - 1u);
     uint ix_p1 = (ix + 1u < nx) ? (ix + 1u) : 0u;
-    uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
-    uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
     uint km1 = (k > 0u) ? (k - 1u) : 0u;
     uint kp1 = (k + 1u < nz) ? (k + 1u) : (nz - 1u);
 
@@ -187,8 +189,6 @@ kernel void crm_fct_bounds_ratios(
     uint base_k = q_base + k * M + col * stride_c;
     uint idx_xm1 = base_k + iy * nx + ix_m1;
     uint idx_xp1 = base_k + iy * nx + ix_p1;
-    uint idx_ym1 = base_k + iy_m1 * nx + ix;
-    uint idx_yp1 = base_k + iy_p1 * nx + ix;
     uint idx_km1 = q_base + km1 * M + tid;
     uint idx_kp1 = q_base + kp1 * M + tid;
 
@@ -199,42 +199,44 @@ kernel void crm_fct_bounds_ratios(
 
     q_max = max(q_max, max(q[idx_xm1], q_td[idx_xm1]));
     q_max = max(q_max, max(q[idx_xp1], q_td[idx_xp1]));
-    q_max = max(q_max, max(q[idx_ym1], q_td[idx_ym1]));
-    q_max = max(q_max, max(q[idx_yp1], q_td[idx_yp1]));
     q_max = max(q_max, max(q[idx_km1], q_td[idx_km1]));
     q_max = max(q_max, max(q[idx_kp1], q_td[idx_kp1]));
 
     q_min = min(q_min, min(q[idx_xm1], q_td[idx_xm1]));
     q_min = min(q_min, min(q[idx_xp1], q_td[idx_xp1]));
-    q_min = min(q_min, min(q[idx_ym1], q_td[idx_ym1]));
-    q_min = min(q_min, min(q[idx_yp1], q_td[idx_yp1]));
     q_min = min(q_min, min(q[idx_km1], q_td[idx_km1]));
     q_min = min(q_min, min(q[idx_kp1], q_td[idx_kp1]));
 
     float ax_s = ax[gid];
     float ax_m = ax[idx_xm1];
-    float ay_s = ay[gid];
-    float ay_m = ay[idx_ym1];
+    float dt = f_p.x;
+    float inv_dx = 1.0f / f_p.y;
+    float inv_dy = 1.0f / f_p.z;
+    float py_plus = 0.0f;
+    float py_minus = 0.0f;
+
+    if (ny > 1u) {
+        uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
+        uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
+        uint idx_ym1 = base_k + iy_m1 * nx + ix;
+        uint idx_yp1 = base_k + iy_p1 * nx + ix;
+        q_max = max(q_max, max(q[idx_ym1], q_td[idx_ym1]));
+        q_max = max(q_max, max(q[idx_yp1], q_td[idx_yp1]));
+        q_min = min(q_min, min(q[idx_ym1], q_td[idx_ym1]));
+        q_min = min(q_min, min(q[idx_yp1], q_td[idx_yp1]));
+        float ay_s = ay[gid];
+        float ay_m = ay[idx_ym1];
+        py_plus  = (max(ay_m, 0.0f) - min(ay_s, 0.0f)) * inv_dy;
+        py_minus = (max(ay_s, 0.0f) - min(ay_m, 0.0f)) * inv_dy;
+    }
 
     uint az_base = b * (nz + 1u) * M;
     float az_dn = az[az_base + k * M + tid];
     float az_up = az[az_base + (k + 1u) * M + tid];
-
-    float dt = f_params[0];
-    float inv_dx = 1.0f / f_params[1];
-    float inv_dy = 1.0f / f_params[2];
     float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
 
-    float p_plus = dt * (
-        (max(ax_m, 0.0f) - min(ax_s, 0.0f)) * inv_dx
-        + (max(ay_m, 0.0f) - min(ay_s, 0.0f)) * inv_dy
-        + (max(az_dn, 0.0f) - min(az_up, 0.0f)) * inv_dz
-    );
-    float p_minus = dt * (
-        (max(ax_s, 0.0f) - min(ax_m, 0.0f)) * inv_dx
-        + (max(ay_s, 0.0f) - min(ay_m, 0.0f)) * inv_dy
-        + (max(az_up, 0.0f) - min(az_dn, 0.0f)) * inv_dz
-    );
+    float p_plus = dt * ((max(ax_m, 0.0f) - min(ax_s, 0.0f)) * inv_dx + py_plus + (max(az_dn, 0.0f) - min(az_up, 0.0f)) * inv_dz);
+    float p_minus = dt * ((max(ax_s, 0.0f) - min(ax_m, 0.0f)) * inv_dx + py_minus + (max(az_up, 0.0f) - min(az_dn, 0.0f)) * inv_dz);
 
     float rho_safe = max(rho_new[loc], 1.0e-5f);
     float q_plus = rho_safe * max(q_max - qtd0, 0.0f);
@@ -255,16 +257,17 @@ kernel void crm_fct_limit_apply(
     device const float* r_minus    [[buffer(6)]],
     device const float* dz_c       [[buffer(7)]],
     device float* q_out            [[buffer(8)]],
-    device const uint* u_params    [[buffer(9)]],
-    device const float* f_params   [[buffer(10)]],
+    constant ulong4& u_p0          [[buffer(9)]],
+    constant ulong4& u_p1          [[buffer(10)]],
+    constant float4& f_p           [[buffer(11)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint B = u_params[0];
-    uint nz = u_params[1];
-    uint n_col = u_params[2];
-    uint ny = u_params[3];
-    uint nx = u_params[4];
-    uint dz_cols = u_params[5];
+    uint B = uint(u_p0.x);
+    uint nz = uint(u_p0.y);
+    uint n_col = uint(u_p0.z);
+    uint ny = uint(u_p0.w);
+    uint nx = uint(u_p1.x);
+    uint dz_cols = uint(u_p1.y);
 
     uint stride_c = ny * nx;
     uint M = n_col * stride_c;
@@ -283,14 +286,10 @@ kernel void crm_fct_limit_apply(
 
     uint ix_m1 = (ix > 0u) ? (ix - 1u) : (nx - 1u);
     uint ix_p1 = (ix + 1u < nx) ? (ix + 1u) : 0u;
-    uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
-    uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
 
     uint base_k = b * vol_pts + k * M + col * stride_c;
     uint idx_xm1 = base_k + iy * nx + ix_m1;
     uint idx_xp1 = base_k + iy * nx + ix_p1;
-    uint idx_ym1 = base_k + iy_m1 * nx + ix;
-    uint idx_yp1 = base_k + iy_p1 * nx + ix;
 
     float rp_0 = r_plus[gid];
     float rm_0 = r_minus[gid];
@@ -304,14 +303,25 @@ kernel void crm_fct_limit_apply(
     float cx_s = (ax_s >= 0.0f) ? min(rm_0, rp_xp1) : min(rp_0, rm_xp1);
     float cx_m = (ax_m >= 0.0f) ? min(rm_xm1, rp_0) : min(rp_xm1, rm_0);
 
-    float ay_s = ay[gid];
-    float ay_m = ay[idx_ym1];
-    float rp_yp1 = r_plus[idx_yp1];
-    float rm_yp1 = r_minus[idx_yp1];
-    float rp_ym1 = r_plus[idx_ym1];
-    float rm_ym1 = r_minus[idx_ym1];
-    float cy_s = (ay_s >= 0.0f) ? min(rm_0, rp_yp1) : min(rp_0, rm_yp1);
-    float cy_m = (ay_m >= 0.0f) ? min(rm_ym1, rp_0) : min(rp_ym1, rm_0);
+    float dt = f_p.x;
+    float inv_dx = 1.0f / f_p.y;
+    float inv_dy = 1.0f / f_p.z;
+    float div_y_anti = 0.0f;
+    if (ny > 1u) {
+        uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
+        uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
+        uint idx_ym1 = base_k + iy_m1 * nx + ix;
+        uint idx_yp1 = base_k + iy_p1 * nx + ix;
+        float ay_s = ay[gid];
+        float ay_m = ay[idx_ym1];
+        float rp_yp1 = r_plus[idx_yp1];
+        float rm_yp1 = r_minus[idx_yp1];
+        float rp_ym1 = r_plus[idx_ym1];
+        float rm_ym1 = r_minus[idx_ym1];
+        float cy_s = (ay_s >= 0.0f) ? min(rm_0, rp_yp1) : min(rp_0, rm_yp1);
+        float cy_m = (ay_m >= 0.0f) ? min(rm_ym1, rp_0) : min(rp_ym1, rm_0);
+        div_y_anti = (cy_s * ay_s - cy_m * ay_m) * inv_dy;
+    }
 
     uint az_base = b * (nz + 1u) * M;
     float az_dn_lim = 0.0f;
@@ -331,14 +341,8 @@ kernel void crm_fct_limit_apply(
         az_up_lim = cz_up * az_up;
     }
 
-    float dt = f_params[0];
-    float inv_dx = 1.0f / f_params[1];
-    float inv_dy = 1.0f / f_params[2];
     float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
-
-    float div_anti = (cx_s * ax_s - cx_m * ax_m) * inv_dx
-                   + (cy_s * ay_s - cy_m * ay_m) * inv_dy
-                   + (az_up_lim - az_dn_lim) * inv_dz;
+    float div_anti = (cx_s * ax_s - cx_m * ax_m) * inv_dx + div_y_anti + (az_up_lim - az_dn_lim) * inv_dz;
     float rho_safe = max(rho_new[loc], 1.0e-5f);
     q_out[gid] = max(q_td[gid] - (dt / rho_safe) * div_anti, 0.0f);
 }
@@ -382,19 +386,20 @@ kernel void crm_sgs_eddy_uv(
     device const float* theta_m    [[buffer(3)]],
     device const float* dz_c       [[buffer(4)]],
     device const float* dz_w_int   [[buffer(5)]],
-    device float* nu_sgs_out       [[buffer(6)]],
-    device float* d_sgs_out        [[buffer(7)]],
-    device float* du_sgs_out       [[buffer(8)]],
-    device float* dv_sgs_out       [[buffer(9)]],
-    device const uint* u_params    [[buffer(10)]],  // [nz, n_col, ny, nx, dz_cols]
-    device const float* f_params   [[buffer(11)]],  // [dx, dy, gravity, c_s]
+    device const float* cs_lam2_b  [[buffer(6)]],   // [nz, dz_cols] precomputed (c_s * lam)^2
+    device float* nu_sgs_out       [[buffer(7)]],
+    device float* d_sgs_out        [[buffer(8)]],
+    device float* du_sgs_out       [[buffer(9)]],
+    device float* dv_sgs_out       [[buffer(10)]],
+    constant ulong4& u_p0          [[buffer(11)]],  // [nz, n_col, ny, nx]
+    constant uint& dz_cols         [[buffer(12)]],
+    constant float4& f_p           [[buffer(13)]],  // [dx, dy, gravity, c_s]
     uint gid [[thread_position_in_grid]])
 {
-    uint nz = u_params[0];
-    uint n_col = u_params[1];
-    uint ny = u_params[2];
-    uint nx = u_params[3];
-    uint dz_cols = u_params[4];
+    uint nz = uint(u_p0.x);
+    uint n_col = uint(u_p0.y);
+    uint ny = uint(u_p0.z);
+    uint nx = uint(u_p0.w);
     uint stride_c = ny * nx;
     uint M = n_col * stride_c;
     if (gid >= nz * M) return;
@@ -409,51 +414,64 @@ kernel void crm_sgs_eddy_uv(
 
     uint ix_m1 = (ix > 0u) ? (ix - 1u) : (nx - 1u);
     uint ix_p1 = (ix + 1u < nx) ? (ix + 1u) : 0u;
-    uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
-    uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
 
     uint base_k = k * M + col * stride_c;
     uint idx_xm1 = base_k + iy * nx + ix_m1;
     uint idx_xp1 = base_k + iy * nx + ix_p1;
-    uint idx_ym1 = base_k + iy_m1 * nx + ix;
-    uint idx_yp1 = base_k + iy_p1 * nx + ix;
-    uint idx_ym1_xm1 = base_k + iy_m1 * nx + ix_m1;
-    uint idx_yp1_xm1 = base_k + iy_p1 * nx + ix_m1;
-    uint idx_ym1_xp1 = base_k + iy_m1 * nx + ix_p1;
 
-    float dx = f_params[0];
-    float dy = f_params[1];
-    float gravity = f_params[2];
-    float c_s = f_params[3];
+    float dx = f_p.x;
+    float dy = f_p.y;
+    float gravity = f_p.z;
     float inv_dx = 1.0f / dx;
     float inv_dy = 1.0f / dy;
-    float dz = dz_c[k * dz_cols + col_dz];
 
     float u0 = u[gid];
     float u_xm1 = u[idx_xm1];
     float u_xp1 = u[idx_xp1];
-    float u_ym1 = u[idx_ym1];
-    float u_yp1 = u[idx_yp1];
-
     float v0 = v[gid];
     float v_xm1 = v[idx_xm1];
     float v_xp1 = v[idx_xp1];
-    float v_ym1 = v[idx_ym1];
-    float v_yp1 = v[idx_yp1];
 
     float du_dx = (u0 - u_xm1) * inv_dx;
-    float dv_dy = (v0 - v_ym1) * inv_dy;
+    float dv_dy = 0.0f;
+    float du_dy = 0.0f;
+    float dv_dx = 0.5f * (v_xp1 - v_xm1) * inv_dx;
+    float u_lap_y = 0.0f;
+    float v_lap_y = 0.0f;
+
+    float uc_0 = 0.5f * (u0 + u_xm1);
+    float vc_0 = v0;
+
+    if (ny > 1u) {
+        uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
+        uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
+        uint idx_ym1 = base_k + iy_m1 * nx + ix;
+        uint idx_yp1 = base_k + iy_p1 * nx + ix;
+        uint idx_ym1_xm1 = base_k + iy_m1 * nx + ix_m1;
+        uint idx_yp1_xm1 = base_k + iy_p1 * nx + ix_m1;
+        uint idx_ym1_xp1 = base_k + iy_m1 * nx + ix_p1;
+
+        float u_ym1 = u[idx_ym1];
+        float u_yp1 = u[idx_yp1];
+        float v_ym1 = v[idx_ym1];
+        float v_yp1 = v[idx_yp1];
+
+        dv_dy = (v0 - v_ym1) * inv_dy;
+        float uc_yp1 = 0.5f * (u_yp1 + u[idx_yp1_xm1]);
+        float uc_ym1 = 0.5f * (u_ym1 + u[idx_ym1_xm1]);
+        du_dy = 0.5f * (uc_yp1 - uc_ym1) * inv_dy;
+
+        vc_0 = 0.5f * (v0 + v_ym1);
+        float vc_xp1 = 0.5f * (v_xp1 + v[idx_ym1_xp1]);
+        float vc_xm1 = 0.5f * (v_xm1 + v[idx_ym1_xm1]);
+        dv_dx = 0.5f * (vc_xp1 - vc_xm1) * inv_dx;
+
+        u_lap_y = (u_yp1 - 2.0f * u0 + u_ym1) * (inv_dy * inv_dy);
+        v_lap_y = (v_yp1 - 2.0f * v0 + v_ym1) * (inv_dy * inv_dy);
+    }
+
+    float dz = dz_c[k * dz_cols + col_dz];
     float dw_dz = (w[(k + 1u) * M + tid] - w[k * M + tid]) / dz;
-
-    float uc_0   = 0.5f * (u0 + u_xm1);
-    float uc_yp1 = 0.5f * (u_yp1 + u[idx_yp1_xm1]);
-    float uc_ym1 = 0.5f * (u_ym1 + u[idx_ym1_xm1]);
-    float du_dy = 0.5f * (uc_yp1 - uc_ym1) * inv_dy;
-
-    float vc_0   = 0.5f * (v0 + v_ym1);
-    float vc_xp1 = 0.5f * (v_xp1 + v[idx_ym1_xp1]);
-    float vc_xm1 = 0.5f * (v_xm1 + v[idx_ym1_xm1]);
-    float dv_dx = 0.5f * (vc_xp1 - vc_xm1) * inv_dx;
 
     float du_dz = 0.0f;
     float dv_dz = 0.0f;
@@ -464,7 +482,9 @@ kernel void crm_sgs_eddy_uv(
         float dzw = dz_w_int[k * dz_cols + col_dz];
         uint kp1_base = (k + 1u) * M + col * stride_c;
         float uc_kp1 = 0.5f * (u[kp1_base + iy * nx + ix] + u[kp1_base + iy * nx + ix_m1]);
-        float vc_kp1 = 0.5f * (v[kp1_base + iy * nx + ix] + v[kp1_base + iy_m1 * nx + ix]);
+        float vc_kp1 = (ny > 1u)
+            ? (0.5f * (v[kp1_base + iy * nx + ix] + v[kp1_base + (((iy > 0u) ? (iy - 1u) : (ny - 1u)) * nx + ix)]))
+            : v[kp1_base + ix];
         du_dz += 0.5f * (uc_kp1 - uc_0) / dzw;
         dv_dz += 0.5f * (vc_kp1 - vc_0) / dzw;
         float th_kp1 = theta_m[(k + 1u) * M + tid];
@@ -474,7 +494,9 @@ kernel void crm_sgs_eddy_uv(
         float dzw = dz_w_int[(k - 1u) * dz_cols + col_dz];
         uint km1_base = (k - 1u) * M + col * stride_c;
         float uc_km1 = 0.5f * (u[km1_base + iy * nx + ix] + u[km1_base + iy * nx + ix_m1]);
-        float vc_km1 = 0.5f * (v[km1_base + iy * nx + ix] + v[km1_base + iy_m1 * nx + ix]);
+        float vc_km1 = (ny > 1u)
+            ? (0.5f * (v[km1_base + iy * nx + ix] + v[km1_base + (((iy > 0u) ? (iy - 1u) : (ny - 1u)) * nx + ix)]))
+            : v[km1_base + ix];
         du_dz += 0.5f * (uc_0 - uc_km1) / dzw;
         dv_dz += 0.5f * (vc_0 - vc_km1) / dzw;
         float th_km1 = theta_m[(k - 1u) * M + tid];
@@ -486,12 +508,7 @@ kernel void crm_sgs_eddy_uv(
              + du_dz * du_dz + dv_dz * dv_dz;
     float strain_mag = sqrt(max(s2, 1.0e-12f));
 
-    float dh = sqrt(dx * dy);
-    float dz_safe = max(dz, 1.0f);
-    float aspect = max(dh / dz_safe, dz_safe / dh);
-    float delta_f = pow(dx * dy * dz_safe, 1.0f / 3.0f);
-    float lam = scotti_aspect(aspect) * delta_f;
-    float cs_lam2_s = (c_s * lam) * (c_s * lam) * strain_mag;
+    float cs_lam2_s = cs_lam2_b[k * dz_cols + col_dz] * strain_mag;
 
     float ri = n2 / max(strain_mag * strain_mag, 1.0e-10f);
     float pr_n = 0.70f;
@@ -514,10 +531,8 @@ kernel void crm_sgs_eddy_uv(
     d_sgs_out[gid] = d_sgs;
 
     float nu_eff = nu_sgs + 0.004f * (dx * dy) / 10.0f;
-    float lap_u = (u_xp1 - 2.0f * u0 + u_xm1) * (inv_dx * inv_dx)
-                + (u_yp1 - 2.0f * u0 + u_ym1) * (inv_dy * inv_dy);
-    float lap_v = (v_xp1 - 2.0f * v0 + v_xm1) * (inv_dx * inv_dx)
-                + (v_yp1 - 2.0f * v0 + v_ym1) * (inv_dy * inv_dy);
+    float lap_u = (u_xp1 - 2.0f * u0 + u_xm1) * (inv_dx * inv_dx) + u_lap_y;
+    float lap_v = (v_xp1 - 2.0f * v0 + v_xm1) * (inv_dx * inv_dx) + v_lap_y;
 
     du_sgs_out[gid] = nu_eff * lap_u;
     dv_sgs_out[gid] = nu_eff * lap_v;
@@ -531,14 +546,14 @@ kernel void crm_sgs_heat_w(
     device const float* d_sgs      [[buffer(4)]],
     device float* dw_sgs_out       [[buffer(5)]],
     device float* dThm_sgs_out     [[buffer(6)]],
-    device const uint* u_params    [[buffer(7)]],
-    device const float* f_params   [[buffer(8)]],
+    constant ulong4& u_p0          [[buffer(7)]],
+    constant float4& f_p           [[buffer(8)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint nz = u_params[0];
-    uint n_col = u_params[1];
-    uint ny = u_params[2];
-    uint nx = u_params[3];
+    uint nz = uint(u_p0.x);
+    uint n_col = uint(u_p0.y);
+    uint ny = uint(u_p0.z);
+    uint nx = uint(u_p0.w);
     uint stride_c = ny * nx;
     uint M = n_col * stride_c;
     if (gid >= nz * M) return;
@@ -552,11 +567,9 @@ kernel void crm_sgs_heat_w(
 
     uint ix_m1 = (ix > 0u) ? (ix - 1u) : (nx - 1u);
     uint ix_p1 = (ix + 1u < nx) ? (ix + 1u) : 0u;
-    uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
-    uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
 
-    float dx = f_params[0];
-    float dy = f_params[1];
+    float dx = f_p.x;
+    float dy = f_p.y;
     float inv_dx = 1.0f / dx;
     float inv_dy = 1.0f / dy;
     float nu_bg = 0.004f * (dx * dy) / 10.0f;
@@ -564,44 +577,48 @@ kernel void crm_sgs_heat_w(
     uint base_k = k * M + col * stride_c;
     uint idx_xm1 = base_k + iy * nx + ix_m1;
     uint idx_xp1 = base_k + iy * nx + ix_p1;
-    uint idx_ym1 = base_k + iy_m1 * nx + ix;
-    uint idx_yp1 = base_k + iy_p1 * nx + ix;
+
+    float w_lap_y = 0.0f;
+    float div_fth_y = 0.0f;
+    float th0 = theta_m[gid];
+    float d0  = d_sgs[gid];
+    float r0  = rho_d[gid];
+
+    if (ny > 1u) {
+        uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
+        uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
+        uint idx_ym1 = base_k + iy_m1 * nx + ix;
+        uint idx_yp1 = base_k + iy_p1 * nx + ix;
+        if (k > 0u) {
+            float w0 = w[gid];
+            w_lap_y = (w[idx_yp1] - 2.0f * w0 + w[idx_ym1]) * (inv_dy * inv_dy);
+        }
+        float fth_yp = -0.5f * (r0 + rho_d[idx_yp1]) * 0.5f * (d0 + d_sgs[idx_yp1]) * (theta_m[idx_yp1] - th0) * inv_dy;
+        float fth_ym = -0.5f * (rho_d[idx_ym1] + r0) * 0.5f * (d_sgs[idx_ym1] + d0) * (th0 - theta_m[idx_ym1]) * inv_dy;
+        div_fth_y = (fth_yp - fth_ym) * inv_dy;
+    }
 
     if (k == 0u) {
         dw_sgs_out[tid] = 0.0f;
         dw_sgs_out[nz * M + tid] = 0.0f;
     } else {
         float w0 = w[gid];
-        float w_lap = (w[idx_xp1] - 2.0f * w0 + w[idx_xm1]) * (inv_dx * inv_dx)
-                    + (w[idx_yp1] - 2.0f * w0 + w[idx_ym1]) * (inv_dy * inv_dy);
+        float w_lap = (w[idx_xp1] - 2.0f * w0 + w[idx_xm1]) * (inv_dx * inv_dx) + w_lap_y;
         float nu_w = 0.5f * (nu_sgs[gid - M] + nu_sgs[gid]) + nu_bg;
         dw_sgs_out[gid] = nu_w * w_lap;
     }
 
-    float th0   = theta_m[gid];
     float th_x1 = theta_m[idx_xp1];
     float th_xm = theta_m[idx_xm1];
-    float th_y1 = theta_m[idx_yp1];
-    float th_ym = theta_m[idx_ym1];
-
-    float d0   = d_sgs[gid];
     float d_x1 = d_sgs[idx_xp1];
     float d_xm = d_sgs[idx_xm1];
-    float d_y1 = d_sgs[idx_yp1];
-    float d_ym = d_sgs[idx_ym1];
-
-    float r0   = rho_d[gid];
     float r_x1 = rho_d[idx_xp1];
     float r_xm = rho_d[idx_xm1];
-    float r_y1 = rho_d[idx_yp1];
-    float r_ym = rho_d[idx_ym1];
 
     float fth_xp = -0.5f * (r0 + r_x1) * 0.5f * (d0 + d_x1) * (th_x1 - th0) * inv_dx;
     float fth_xm = -0.5f * (r_xm + r0) * 0.5f * (d_xm + d0) * (th0 - th_xm) * inv_dx;
-    float fth_yp = -0.5f * (r0 + r_y1) * 0.5f * (d0 + d_y1) * (th_y1 - th0) * inv_dy;
-    float fth_ym = -0.5f * (r_ym + r0) * 0.5f * (d_ym + d0) * (th0 - th_ym) * inv_dy;
 
-    dThm_sgs_out[gid] = -(fth_xp - fth_xm) * inv_dx - (fth_yp - fth_ym) * inv_dy;
+    dThm_sgs_out[gid] = -(fth_xp - fth_xm) * inv_dx - div_fth_y;
 }
 
 // =========================================================================
@@ -647,7 +664,7 @@ inline void mp_sat_adj(
     float t_li, float pres, float qn_in,
     float e_tr, float t_frz, float t_ice, float t_liq, float eps_w,
     float lv0, float ls0, float cpd,
-    thread float& T_out, thread float& qv_out, thread float& qc_out, thread float& qi_out)
+    thread float& T_out, thread float& qv_out, thread float& qc_out, thread float& qi_out, thread float& qsat_out)
 {
     float qn = max(qn_in, 0.0f);
     float qsat0, dq0;
@@ -657,6 +674,7 @@ inline void mp_sat_adj(
         qv_out = qn;
         qc_out = 0.0f;
         qi_out = 0.0f;
+        qsat_out = qsat0;
         return;
     }
     float T = t_li;
@@ -679,6 +697,7 @@ inline void mp_sat_adj(
     qv_out = qn - qcond;
     qc_out = om_f * qcond;
     qi_out = (1.0f - om_f) * qcond;
+    qsat_out = qsat_f;
 }
 
 kernel void crm_microphysics_col(
@@ -697,72 +716,72 @@ kernel void crm_microphysics_col(
     device float* qi_out           [[buffer(12)]],
     device float* rain_out         [[buffer(13)]],
     device float* snow_out         [[buffer(14)]],
-    device const uint* u_params    [[buffer(15)]],  // [nz, n_col, stride_c, dz_cols]
-    device const float* mp         [[buffer(16)]],  // precomputed constants & dt
+    constant ulong4& u_dim         [[buffer(15)]],  // [nz, n_col, stride_c, dz_cols]
+    constant float& dt             [[buffer(16)]],
+    device const float* mp         [[buffer(17)]],  // precomputed static constants
     uint m [[thread_position_in_grid]])
 {
-    uint nz = u_params[0];
-    uint n_col = u_params[1];
-    uint stride_c = u_params[2];
-    uint dz_cols = u_params[3];
+    uint nz = uint(u_dim.x);
+    uint n_col = uint(u_dim.y);
+    uint stride_c = uint(u_dim.z);
+    uint dz_cols = uint(u_dim.w);
     uint M = n_col * stride_c;
     if (m >= M) return;
 
     uint col = m / stride_c;
     uint col_dz = (dz_cols > 1u) ? col : 0u;
 
-    float dt        = mp[0];
-    float p_ref     = mp[1];
-    float r_d       = mp[2];
-    float r_v       = mp[3];
-    float cp_d      = mp[4];
-    float gamma_d   = mp[5];
-    float kappa_d   = mp[6];
-    float rv_ov_rd  = mp[7];
-    float eps_w     = mp[8];
-    float lv0       = mp[9];
-    float ls0       = mp[11];
-    float e_tr      = mp[12];
-    float t_frz     = mp[13];
-    float t_tri     = mp[14];
-    float t_ice     = mp[15];
-    float t_liq     = mp[16];
-    float qc_thresh = mp[17];
-    float qi_thresh = mp[18];
-    float r_auto    = mp[19];
-    float r_aggr    = mp[20];
-    float vt_ci     = mp[21];
-    float t0_p      = mp[22];
-    float t00_p     = mp[23];
-    float t0_g      = mp[24];
-    float t00_g     = mp[25];
-    float diff_v    = mp[26];
-    float k_th_a    = mp[27];
-    float c_r       = mp[28];
-    float c_s       = mp[29];
-    float c_g       = mp[30];
-    float n0_r      = mp[31];
-    float n0_s      = mp[32];
-    float n0_g      = mp[33];
-    float b_r       = mp[34];
-    float b_s       = mp[35];
-    float b_g       = mp[36];
-    float fp_r      = mp[37];
-    float fp_s      = mp[38];
-    float fp_g      = mp[39];
-    float ac_rc     = mp[40];
-    float ac_sc     = mp[41];
-    float ac_gc     = mp[42];
-    float ac_ri     = mp[43];
-    float ac_si     = mp[44];
-    float ac_gi     = mp[45];
-    float aem_r     = mp[46];
-    float bem_r     = mp[47];
-    float aem_s     = mp[48];
-    float bem_s     = mp[49];
-    float aem_g     = mp[50];
-    float bem_g     = mp[51];
-    float n_drop    = mp[52];
+    float p_ref     = mp[0];
+    float r_d       = mp[1];
+    float r_v       = mp[2];
+    float cp_d      = mp[3];
+    float gamma_d   = mp[4];
+    float kappa_d   = mp[5];
+    float rv_ov_rd  = mp[6];
+    float eps_w     = mp[7];
+    float lv0       = mp[8];
+    float ls0       = mp[10];
+    float e_tr      = mp[11];
+    float t_frz     = mp[12];
+    float t_tri     = mp[13];
+    float t_ice     = mp[14];
+    float t_liq     = mp[15];
+    float qc_thresh = mp[16];
+    float qi_thresh = mp[17];
+    float r_auto    = mp[18];
+    float r_aggr    = mp[19];
+    float vt_ci     = mp[20];
+    float t0_p      = mp[21];
+    float t00_p     = mp[22];
+    float t0_g      = mp[23];
+    float t00_g     = mp[24];
+    float diff_v    = mp[25];
+    float k_th_a    = mp[26];
+    float c_r       = mp[27];
+    float c_s       = mp[28];
+    float c_g       = mp[29];
+    float n0_r      = mp[30];
+    float n0_s      = mp[31];
+    float n0_g      = mp[32];
+    float b_r       = mp[33];
+    float b_s       = mp[34];
+    float b_g       = mp[35];
+    float fp_r      = mp[36];
+    float fp_s      = mp[37];
+    float fp_g      = mp[38];
+    float ac_rc     = mp[39];
+    float ac_sc     = mp[40];
+    float ac_gc     = mp[41];
+    float ac_ri     = mp[42];
+    float ac_si     = mp[43];
+    float ac_gi     = mp[44];
+    float aem_r     = mp[45];
+    float bem_r     = mp[46];
+    float aem_s     = mp[47];
+    float bem_s     = mp[48];
+    float aem_g     = mp[49];
+    float bem_g     = mp[50];
+    float n_drop    = mp[51];
     float d_drop    = (n_drop > 0.0f) ? max(0.146f - 0.05964f * log(max(n_drop, 1.0f) / 2000.0f), 0.05f) : 0.0f;
 
     float eps_small = 1.0e-15f;
@@ -775,6 +794,7 @@ kernel void crm_microphysics_col(
     float f_exp_r = 1.0f + 0.25f * b_r;
     float f_exp_s = 1.0f + 0.25f * b_s;
     float f_exp_g = 1.0f + 0.25f * b_g;
+    float kg_d = gamma_d * kappa_d;
 
     float eps_acc_r = pow(eps_small, exp_r);
     float eps_acc_s = pow(eps_small, exp_s);
@@ -792,9 +812,13 @@ kernel void crm_microphysics_col(
     float qn_a[64];
     float qp_a[64];
     float qi_a[64];
+    float qv_a[64];
+    float qc_a[64];
+    float temp0_a[64];
     float mass_a[64];
     float ratep_a[64];
     float rho_a[64];
+    uchar unchanged_a[64];
     float omega_p_s0 = 0.0f;
 
     for (uint k = 0u; k < nz; ++k) {
@@ -805,72 +829,78 @@ kernel void crm_microphysics_col(
         float qp = max(q_p_in[idx], 0.0f);
         float qvg = min(max(q_v_prev[idx], 0.0f), qn);
 
-        float pres = p_ref * pow(max(r_d * rd * thm / p_ref, 1.0e-8f), gamma_d);
-        float exner = pow(pres / p_ref, kappa_d);
+        float arg = max(r_d * rd * thm / p_ref, 1.0e-8f);
+        float exner = pow(arg, kg_d);
+        float pres = p_ref * arg * exner;
         float temp_old = exner * (thm / (1.0f + rv_ov_rd * qvg));
         float q_cond_old = max(qn - qvg, 0.0f);
         float om_n_old = clamp((temp_old - t_ice) / (t_liq - t_ice), 0.0f, 1.0f);
         float t_li = temp_old - (om_n_old * lv0 + (1.0f - om_n_old) * ls0) * q_cond_old / cp_d;
 
-        float temp, qv, qc, qi;
-        mp_sat_adj(t_li, pres, qn, e_tr, t_frz, t_ice, t_liq, eps_w, lv0, ls0, cp_d, temp, qv, qc, qi);
+        float temp, qv, qc, qi, qsat_mix;
+        mp_sat_adj(t_li, pres, qn, e_tr, t_frz, t_ice, t_liq, eps_w, lv0, ls0, cp_d, temp, qv, qc, qi, qsat_mix);
 
         float om_p_old = clamp((temp - t00_p) / (t0_p - t00_p), 0.0f, 1.0f);
         float om_g_old = clamp((temp - t00_g) / (t0_g - t00_g), 0.0f, 1.0f);
-        float qr = om_p_old * qp;
-        float qs = (1.0f - om_p_old) * (1.0f - om_g_old) * qp;
-        float qg = (1.0f - om_p_old) * om_g_old * qp;
 
-        float ice_tfac = exp(0.025f * (temp - t_tri));
-        float dq_auto;
-        if (n_drop > 0.0f) {
-            float rho_qc = rd * qc;
-            dq_auto = (16.7f * d_drop * rho_qc * rho_qc * qc) / (5.0f * d_drop * rho_qc + 3.6e-5f * n_drop);
-        } else {
-            dq_auto = r_auto * max(qc - qc_thresh, 0.0f);
-        }
-        float dq_aggr = r_aggr * ice_tfac * max(qi - qi_thresh, 0.0f);
-
-        float qr_pow = pow(max(rd * qr, 0.0f) + eps_small, exp_r) - eps_acc_r;
-        float qs_pow = pow(max(rd * qs, 0.0f) + eps_small, exp_s) - eps_acc_s;
-        float qg_pow = pow(max(rd * qg, 0.0f) + eps_small, exp_g) - eps_acc_g;
+        float conv_delta = 0.0f;
         float inv_sqrt_rd = rsqrt(max(rd, 0.01f));
+        if (qc + qi > 0.0f) {
+            float ice_tfac = exp(0.025f * (temp - t_tri));
+            float dq_auto;
+            if (n_drop > 0.0f) {
+                float rho_qc = rd * qc;
+                dq_auto = (16.7f * d_drop * rho_qc * rho_qc * qc) / (5.0f * d_drop * rho_qc + 3.6e-5f * n_drop);
+            } else {
+                dq_auto = r_auto * max(qc - qc_thresh, 0.0f);
+            }
+            float dq_aggr = r_aggr * ice_tfac * max(qi - qi_thresh, 0.0f);
 
-        float accr_c = inv_sqrt_rd * qc * (ac_rc * qr_pow + ac_sc * qs_pow + ac_gc * qg_pow);
-        float accr_i = inv_sqrt_rd * ice_tfac * qi * (ac_ri * qr_pow + ac_si * qs_pow + ac_gi * qg_pow);
-
-        float conv_delta = min((dq_auto + dq_aggr + accr_c + accr_i) * dt, qc + qi);
+            float accr_c = 0.0f;
+            float accr_i = 0.0f;
+            if (qp > 1.0e-12f) {
+                float qr = om_p_old * qp;
+                float qs = (1.0f - om_p_old) * (1.0f - om_g_old) * qp;
+                float qg = (1.0f - om_p_old) * om_g_old * qp;
+                float qr_pow = pow(max(rd * qr, 0.0f) + eps_small, exp_r) - eps_acc_r;
+                float qs_pow = pow(max(rd * qs, 0.0f) + eps_small, exp_s) - eps_acc_s;
+                float qg_pow = pow(max(rd * qg, 0.0f) + eps_small, exp_g) - eps_acc_g;
+                accr_c = inv_sqrt_rd * qc * (ac_rc * qr_pow + ac_sc * qs_pow + ac_gc * qg_pow);
+                accr_i = inv_sqrt_rd * ice_tfac * qi * (ac_ri * qr_pow + ac_si * qs_pow + ac_gi * qg_pow);
+            }
+            conv_delta = min((dq_auto + dq_aggr + accr_c + accr_i) * dt, qc + qi);
+        }
         float qn_mid = qn - conv_delta;
         float qp_mid = qp + conv_delta;
 
-        float qsat_mix, dq_unused;
-        mp_qsat_mix(temp, pres, e_tr, t_frz, t_ice, t_liq, eps_w, qsat_mix, dq_unused);
+        float evap_delta = 0.0f;
         float subsat = max(1.0f - qv / max(qsat_mix, 1.0e-8f), 0.0f);
+        if (qp_mid > 1.0e-12f && subsat > 0.0f) {
+            float ew = mp_esat_w(temp, e_tr, t_frz);
+            float ei = mp_esat_i(temp, e_tr, t_frz);
+            float ab_liq = (lv0 / (k_th_a * temp)) * (lv0 / (r_v * temp) - 1.0f) + (r_v * temp) / (diff_v * max(ew, 1.0e-3f));
+            float ab_ice = (ls0 / (k_th_a * temp)) * (ls0 / (r_v * temp) - 1.0f) + (r_v * temp) / (diff_v * max(ei, 1.0e-4f));
 
-        float ew = mp_esat_w(temp, e_tr, t_frz);
-        float ei = mp_esat_i(temp, e_tr, t_frz);
-        float ab_liq = (lv0 / (k_th_a * temp)) * (lv0 / (r_v * temp) - 1.0f) + (r_v * temp) / (diff_v * max(ew, 1.0e-3f));
-        float ab_ice = (ls0 / (k_th_a * temp)) * (ls0 / (r_v * temp) - 1.0f) + (r_v * temp) / (diff_v * max(ei, 1.0e-4f));
+            float qrm = om_p_old * qp_mid;
+            float qsm = (1.0f - om_p_old) * (1.0f - om_g_old) * qp_mid;
+            float qgm = (1.0f - om_p_old) * om_g_old * qp_mid;
 
-        float qrm = om_p_old * max(qp_mid, 0.0f);
-        float qsm = (1.0f - om_p_old) * (1.0f - om_g_old) * max(qp_mid, 0.0f);
-        float qgm = (1.0f - om_p_old) * om_g_old * max(qp_mid, 0.0f);
+            float rrq = max(rd * qrm, 0.0f);
+            float rsq = max(rd * qsm, 0.0f);
+            float rgq = max(rd * qgm, 0.0f);
+            float rd_m025 = pow(rd, -0.25f);
 
-        float rrq = max(rd * qrm, 0.0f);
-        float rsq = max(rd * qsm, 0.0f);
-        float rgq = max(rd * qgm, 0.0f);
-        float rd_m025 = pow(rd, -0.25f);
+            float vent_r = aem_r * sqrt(rrq) + bem_r * (pow(rrq + eps_small, ev_exp_r) - eps_ev_r) * rd_m025;
+            float vent_s = aem_s * sqrt(rsq) + bem_s * (pow(rsq + eps_small, ev_exp_s) - eps_ev_s) * rd_m025;
+            float vent_g = aem_g * sqrt(rgq) + bem_g * (pow(rgq + eps_small, ev_exp_g) - eps_ev_g) * rd_m025;
 
-        float vent_r = aem_r * sqrt(rrq) + bem_r * (pow(rrq + eps_small, ev_exp_r) - eps_ev_r) * rd_m025;
-        float vent_s = aem_s * sqrt(rsq) + bem_s * (pow(rsq + eps_small, ev_exp_s) - eps_ev_s) * rd_m025;
-        float vent_g = aem_g * sqrt(rgq) + bem_g * (pow(rgq + eps_small, ev_exp_g) - eps_ev_g) * rd_m025;
+            float evap_r = (2.0f * 3.14159265f * c_r * n0_r / (rd * ab_liq)) * vent_r * subsat;
+            float subl_s = (2.0f * 3.14159265f * c_s * n0_s / (rd * ab_ice)) * vent_s * subsat;
+            float subl_g = (2.0f * 3.14159265f * c_g * n0_g / (rd * ab_ice)) * vent_g * subsat;
 
-        float evap_r = (2.0f * 3.14159265f * c_r * n0_r / (rd * ab_liq)) * vent_r * subsat;
-        float subl_s = (2.0f * 3.14159265f * c_s * n0_s / (rd * ab_ice)) * vent_s * subsat;
-        float subl_g = (2.0f * 3.14159265f * c_g * n0_g / (rd * ab_ice)) * vent_g * subsat;
-
-        float max_evap = min(qp_mid, max(qsat_mix - qn_mid, 0.0f));
-        float evap_delta = min((evap_r + subl_s + subl_g) * dt, max_evap);
+            float max_evap = min(qp_mid, max(qsat_mix - qn_mid, 0.0f));
+            evap_delta = min((evap_r + subl_s + subl_g) * dt, max_evap);
+        }
 
         float qn_after = qn_mid + evap_delta;
         float qp_after = qp_mid - evap_delta;
@@ -878,14 +908,17 @@ kernel void crm_microphysics_col(
         float dt_li_micro = (leff_prec / cp_d) * (conv_delta - evap_delta);
         float t_li_after = t_li + dt_li_micro;
 
-        float qrs = om_p_old * max(qp_after, 0.0f);
-        float qss = (1.0f - om_p_old) * (1.0f - om_g_old) * max(qp_after, 0.0f);
-        float qgs = (1.0f - om_p_old) * om_g_old * max(qp_after, 0.0f);
-        float flux_p0 =
-            fp_r * inv_sqrt_rd * (pow(max(rd * qrs, 0.0f) + eps_small, f_exp_r) - eps_fl_r)
-            + fp_s * inv_sqrt_rd * (pow(max(rd * qss, 0.0f) + eps_small, f_exp_s) - eps_fl_s)
-            + fp_g * inv_sqrt_rd * (pow(max(rd * qgs, 0.0f) + eps_small, f_exp_g) - eps_fl_g);
-        float rate_p = (qp_after > 1.0e-12f) ? min(flux_p0 / max(qp_after, 1.0e-12f), 15.0f * rd) : 0.0f;
+        float rate_p = 0.0f;
+        if (qp_after > 1.0e-12f) {
+            float qrs = om_p_old * qp_after;
+            float qss = (1.0f - om_p_old) * (1.0f - om_g_old) * qp_after;
+            float qgs = (1.0f - om_p_old) * om_g_old * qp_after;
+            float flux_p0 =
+                fp_r * inv_sqrt_rd * (pow(max(rd * qrs, 0.0f) + eps_small, f_exp_r) - eps_fl_r)
+                + fp_s * inv_sqrt_rd * (pow(max(rd * qss, 0.0f) + eps_small, f_exp_s) - eps_fl_s)
+                + fp_g * inv_sqrt_rd * (pow(max(rd * qgs, 0.0f) + eps_small, f_exp_g) - eps_fl_g);
+            rate_p = min(flux_p0 / qp_after, 15.0f * rd);
+        }
 
         if (k == 0u) omega_p_s0 = om_p_old;
         tli_a[k] = t_li_after;
@@ -894,6 +927,10 @@ kernel void crm_microphysics_col(
         qn_a[k] = qn_after;
         qp_a[k] = qp_after;
         qi_a[k] = qi;
+        qv_a[k] = qv;
+        qc_a[k] = qc;
+        temp0_a[k] = temp;
+        unchanged_a[k] = (conv_delta == 0.0f && evap_delta == 0.0f) ? 1u : 0u;
         mass_a[k] = max(rd * dz_c[k * dz_cols + col_dz], 1.0e-4f);
         ratep_a[k] = rate_p;
         rho_a[k] = rd;
@@ -929,10 +966,18 @@ kernel void crm_microphysics_col(
 
         float dqn_sed = qi_sed - qi_a[k];
         float qn_final = max(qn_a[k] + dqn_sed, 0.0f);
-        float t_li_final = tli_a[k] - (ls0 / cp_d) * dqn_sed;
 
         float t_new, qv_new, qc_new, qi_new;
-        mp_sat_adj(t_li_final, pres_a[k], qn_final, e_tr, t_frz, t_ice, t_liq, eps_w, lv0, ls0, cp_d, t_new, qv_new, qc_new, qi_new);
+        if (unchanged_a[k] != 0u && dqn_sed == 0.0f) {
+            t_new = temp0_a[k];
+            qv_new = qv_a[k];
+            qc_new = qc_a[k];
+            qi_new = qi_a[k];
+        } else {
+            float t_li_final = tli_a[k] - (ls0 / cp_d) * dqn_sed;
+            float qsat_u;
+            mp_sat_adj(t_li_final, pres_a[k], qn_final, e_tr, t_frz, t_ice, t_liq, eps_w, lv0, ls0, cp_d, t_new, qv_new, qc_new, qi_new, qsat_u);
+        }
 
         uint idx = k * M + m;
         thm_out[idx] = (t_new / exn_a[k]) * (1.0f + rv_ov_rd * qv_new);
@@ -1242,50 +1287,50 @@ kernel void crm_mynn_col(
     device float* qv_out           [[buffer(20)]],
     device float* qc_out           [[buffer(21)]],
     device float* qi_out           [[buffer(22)]],
-    device const uint* u_params    [[buffer(23)]],  // [nz, M, dz_cols]
-    device const float* mp         [[buffer(24)]],  // [dt, constants...]
+    constant ulong4& u_dim         [[buffer(23)]],  // [nz, M, dz_cols, 0]
+    constant float& dt             [[buffer(24)]],
+    device const float* mp         [[buffer(25)]],  // [static constants...]
     uint m [[thread_position_in_grid]])
 {
-    uint nz = u_params[0];
-    uint M = u_params[1];
-    uint dz_cols = u_params[2];
+    uint nz = uint(u_dim.x);
+    uint M = uint(u_dim.y);
+    uint dz_cols = uint(u_dim.z);
     if (m >= M) return;
     uint col_dz = (dz_cols > 1u) ? m : 0u;
 
-    float dt       = mp[0];
-    float p_ref    = mp[1];
-    float r_d      = mp[2];
-    float cp_d     = mp[3];
-    float cp_v     = mp[4];
-    float gamma_d  = mp[5];
-    float kappa_d  = mp[6];
-    float rv_ov_rd = mp[7];
-    float eps_w    = mp[8];
-    float zvir     = mp[9];
-    float gravity  = mp[10];
-    float kappa_vk = mp[11];
-    float lv0      = mp[12];
-    float ls0      = mp[13];
-    float e_tr     = mp[14];
-    float t_frz    = mp[15];
-    float t_ice    = mp[16];
-    float t_liq    = mp[17];
-    float tke_min  = mp[18];
-    float B1       = mp[19];
-    float B2       = mp[20];
-    float C1       = mp[21];
-    float C2       = mp[22];
-    float C3       = mp[23];
-    float C5       = mp[24];
-    float A1       = mp[25];
-    float A2       = mp[26];
-    float GAM1     = mp[27];
-    float GAM2     = mp[28];
-    float F1       = mp[29];
-    float F2       = mp[30];
-    float RF1      = mp[31];
-    float RF2      = mp[32];
-    float RFC      = mp[33];
+    float p_ref    = mp[0];
+    float r_d      = mp[1];
+    float cp_d     = mp[2];
+    float cp_v     = mp[3];
+    float gamma_d  = mp[4];
+    float kappa_d  = mp[5];
+    float rv_ov_rd = mp[6];
+    float eps_w    = mp[7];
+    float zvir     = mp[8];
+    float gravity  = mp[9];
+    float kappa_vk = mp[10];
+    float lv0      = mp[11];
+    float ls0      = mp[12];
+    float e_tr     = mp[13];
+    float t_frz    = mp[14];
+    float t_ice    = mp[15];
+    float t_liq    = mp[16];
+    float tke_min  = mp[17];
+    float B1       = mp[18];
+    float B2       = mp[19];
+    float C1       = mp[20];
+    float C2       = mp[21];
+    float C3       = mp[22];
+    float C5       = mp[23];
+    float A1       = mp[24];
+    float A2       = mp[25];
+    float GAM1     = mp[26];
+    float GAM2     = mp[27];
+    float F1       = mp[28];
+    float F2       = mp[29];
+    float RF1      = mp[30];
+    float RF2      = mp[31];
+    float RFC      = mp[32];
 
     float u_star       = sfc6[m];
     float sfc_buoy     = sfc6[M + m];
@@ -1312,8 +1357,9 @@ kernel void crm_mynn_col(
         float q2 = max(qke_in[idx], 2.0f * tke_min);
         float qvel = sqrt(q2);
 
-        float pres = p_ref * pow(max(r_d * rd * thm / p_ref, 1.0e-8f), gamma_d);
-        float exner = pow(pres / p_ref, kappa_d);
+        float arg = max(r_d * rd * thm / p_ref, 1.0e-8f);
+        float exner = pow(arg, gamma_d * kappa_d);
+        float pres = p_ref * arg * exner;
         float temp = exner * (thm / (1.0f + rv_ov_rd * qv));
         float theta = temp / exner;
         float theta_l = theta - (lv0 * qc + ls0 * qi) / (cp_d * exner);
@@ -1531,8 +1577,8 @@ kernel void crm_mynn_col(
         uint idx = k * M + m;
         float qn_new = max(sol_a[k], 0.0f);
         float t_li_new = thl_new_a[k] * exn_a[k];
-        float t_new, qv_new, qc_new, qi_new;
-        mp_sat_adj(t_li_new, pres_a[k], qn_new, e_tr, t_frz, t_ice, t_liq, eps_w, lv0, ls0, cp_d, t_new, qv_new, qc_new, qi_new);
+        float t_new, qv_new, qc_new, qi_new, qsat_u;
+        mp_sat_adj(t_li_new, pres_a[k], qn_new, e_tr, t_frz, t_ice, t_liq, eps_w, lv0, ls0, cp_d, t_new, qv_new, qc_new, qi_new, qsat_u);
         qn_out[idx]  = qn_new;
         qv_out[idx]  = qv_new;
         qc_out[idx]  = qc_new;
@@ -1554,37 +1600,37 @@ kernel void crm_2d_fast_hevi_loop(
     device const float* rho_x      [[buffer(5)]],
     device const float* rtot_x_inv [[buffer(6)]],
     device const float* thm_x_eff  [[buffer(7)]],
-    device const float* pres_s     [[buffer(8)]],
+    device const float* a_p_s      [[buffer(8)]],   // pres_s - dp_dThm_s * Thm_ref
     device const float* dp_dThm_s  [[buffer(9)]],
-    device const float* Thm_ref    [[buffer(10)]],
-    device const float* q_load     [[buffer(11)]],
-    device const float* tend_u_sl  [[buffer(12)]],
-    device const float* tend_v_sl  [[buffer(13)]],
-    device const float* tend_w_sl  [[buffer(14)]],  // [nz-1, n_col, 1, nx]
-    device const float* tend_Thm   [[buffer(15)]],
-    device const float* rho_dw     [[buffer(16)]],  // [nz-1, ...]
-    device const float* rho_tot_w  [[buffer(17)]],
-    device const float* thm_w      [[buffer(18)]],
-    device const float* dl         [[buffer(19)]],
-    device const float* diag       [[buffer(20)]],
-    device const float* du         [[buffer(21)]],
-    device const float* dz_c       [[buffer(22)]],  // [nz, dz_cols]
-    device const float* dz_w_int   [[buffer(23)]],  // [nz-1, dz_cols]
-    device const float* sponge_w   [[buffer(24)]],  // [nz-1]
-    device float* fx_acc           [[buffer(25)]],
-    device float* fy_acc           [[buffer(26)]],
-    device float* fz_acc           [[buffer(27)]],
-    device const uint* u_params    [[buffer(28)]],  // [nz, n_col, nx, dz_cols, n_ac, accum]
-    device const float* f_params   [[buffer(29)]],  // [dt_ac, beta_hevi, gravity, dx]
+    device const float* q_load     [[buffer(10)]],
+    device const float* tend_u_sl  [[buffer(11)]],
+    device const float* tend_v_sl  [[buffer(12)]],
+    device const float* tend_w_sl  [[buffer(13)]],  // [nz-1, n_col, 1, nx]
+    device const float* tend_Thm   [[buffer(14)]],
+    device const float* rho_dw     [[buffer(15)]],  // [nz-1, ...]
+    device const float* rho_tot_w  [[buffer(16)]],
+    device const float* thm_w      [[buffer(17)]],
+    device const float* dl         [[buffer(18)]],
+    device const float* inv_den_b  [[buffer(19)]],  // pre-factored inv_den in diag
+    device const float* c_star_b   [[buffer(20)]],  // pre-factored c_star in du
+    device const float* dz_c       [[buffer(21)]],  // [nz, dz_cols]
+    device const float* dz_w_int   [[buffer(22)]],  // [nz-1, dz_cols]
+    device const float* sponge_w   [[buffer(23)]],  // [nz-1]
+    device float* fx_acc           [[buffer(24)]],
+    device float* fy_acc           [[buffer(25)]],
+    device float* fz_acc           [[buffer(26)]],
+    constant ulong4& u_p0           [[buffer(27)]],  // [nz, n_col, nx, (dz_cols<<16)|(n_ac<<1)|accum]
+    constant float4& f_p           [[buffer(28)]],  // [dt_ac, beta_hevi, gravity, dx]
     uint lid [[thread_position_in_threadgroup]],
     uint tg_id [[threadgroup_position_in_grid]])
 {
-    uint nz = u_params[0];
-    uint n_col = u_params[1];
-    uint nx = u_params[2];
-    uint dz_cols = u_params[3];
-    uint n_ac = u_params[4];
-    uint accum = u_params[5];
+    uint nz = uint(u_p0.x);
+    uint n_col = uint(u_p0.y);
+    uint nx = uint(u_p0.z);
+    uint pk = uint(u_p0.w);
+    uint dz_cols = pk >> 16u;
+    uint n_ac = (pk >> 1u) & 0x7FFFu;
+    uint accum = pk & 1u;
 
     uint local_c = lid / nx;
     uint ix = lid - local_c * nx;
@@ -1600,49 +1646,52 @@ kernel void crm_2d_fast_hevi_loop(
     uint tid = active ? (col * nx + ix) : 0u;
     uint col_dz = (dz_cols > 1u && active) ? col : 0u;
 
-    float dt_ac = f_params[0];
-    float beta = f_params[1];
-    float gravity = f_params[2];
-    float inv_dx = 1.0f / f_params[3];
+    float dt_ac = f_p.x;
+    float beta = f_p.y;
+    float gravity = f_p.z;
+    float inv_dx = 1.0f / f_p.w;
 
-    threadgroup float tg_Thm[2048];
+    threadgroup float tg_P[2048];
     threadgroup float tg_fx[2048];
 
-    float c_star[32], d_star[32];
+    float d_star[32];
 
     for (uint ac = 0u; ac < n_ac; ++ac) {
         if (active) {
             for (uint k = 0u; k < nz; ++k) {
-                tg_Thm[k * 64u + lid] = Thm_s[k * M + tid];
+                uint idx = k * M + tid;
+                tg_P[k * 64u + lid] = fma(dp_dThm_s[idx], Thm_s[idx], a_p_s[idx]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (active) {
+            bool last_ac = (ac + 1u == n_ac);
+            float n_ac_f = float(n_ac);
             for (uint k = 0u; k < nz; ++k) {
                 uint idx = k * M + tid;
-                float ps0 = pres_s[idx];
-                float dp0 = dp_dThm_s[idx];
-                float Tr0 = Thm_ref[idx];
-                float p_k0 = ps0 + dp0 * (tg_Thm[k * 64u + lid] - Tr0);
-
-                uint idx_xp1 = k * M + col * nx + ix_p1;
-                float p_k1 = pres_s[idx_xp1] + dp_dThm_s[idx_xp1] * (tg_Thm[k * 64u + lid_xp1] - Thm_ref[idx_xp1]);
+                float p_k0 = tg_P[k * 64u + lid];
+                float p_k1 = tg_P[k * 64u + lid_xp1];
 
                 float pgf_u = -(p_k1 - p_k0) * inv_dx * rtot_x_inv[idx];
                 float u0 = u_s[idx];
-                float v0 = v_s[idx];
                 float u_n = u0 + dt_ac * (tend_u_sl[idx] + pgf_u);
-                float v_n = v0 + dt_ac * tend_v_sl[idx];
 
                 float fx_k = rho_x[idx] * (1.10f * u_n - 0.10f * u0);
                 tg_fx[k * 64u + lid] = fx_k;
                 if (accum != 0u) {
                     fx_acc[idx] += fx_k;
-                    fy_acc[idx] += rho_s[idx] * (1.10f * v_n - 0.10f * v0);
                 }
                 u_s[idx] = u_n;
-                v_s[idx] = v_n;
+                if (last_ac) {
+                    float v0 = v_s[idx];
+                    float tv = tend_v_sl[idx];
+                    float v_n = v0 + (n_ac_f * dt_ac) * tv;
+                    v_s[idx] = v_n;
+                    if (accum != 0u) {
+                        fy_acc[idx] += n_ac_f * rho_s[idx] * (v0 + (0.5f * n_ac_f + 0.6f) * dt_ac * tv);
+                    }
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1652,7 +1701,6 @@ kernel void crm_2d_fast_hevi_loop(
             float rtot_blend_prev = 0.0f;
             float fz_old_below = 0.0f;
             float thm_w_below = 0.0f;
-            float c_prev = 0.0f;
             float d_prev = 0.0f;
 
             for (uint k = 0u; k < nz; ++k) {
@@ -1683,10 +1731,9 @@ kernel void crm_2d_fast_hevi_loop(
                 rho_s[idx] = r_dag;
                 Thm_s[idx] = T_dag;
 
-                float ps = pres_s[idx];
+                float ap = a_p_s[idx];
                 float dp = dp_dThm_s[idx];
-                float Ts = Thm_ref[idx];
-                float p_blend = (1.0f - beta) * (ps + dp * (T_cur - Ts)) + beta * (ps + dp * (T_dag - Ts));
+                float p_blend = fma(dp, (1.0f - beta) * T_cur + beta * T_dag, ap);
                 float rtot_blend = ((1.0f - beta) * r_cur + beta * r_dag) * q_load[idx];
 
                 if (k >= 1u) {
@@ -1701,16 +1748,8 @@ kernel void crm_2d_fast_hevi_loop(
                         - (rdw_m / rtw_m) * nh_imb
                         - sponge_w[um] * fz_old_below
                     );
-                    if (um == 0u) {
-                        float inv_b0 = 1.0f / diag[idx_m];
-                        c_prev = du[idx_m] * inv_b0;
-                        d_prev = rhs_m * inv_b0;
-                    } else {
-                        float inv_den = 1.0f / (diag[idx_m] - dl[idx_m] * c_prev);
-                        c_prev = (um < nz - 2u) ? (du[idx_m] * inv_den) : 0.0f;
-                        d_prev = (rhs_m - dl[idx_m] * d_prev) * inv_den;
-                    }
-                    c_star[um] = c_prev;
+                    float inv_den = inv_den_b[idx_m];
+                    d_prev = (um == 0u) ? (rhs_m * inv_den) : ((rhs_m - dl[idx_m] * d_prev) * inv_den);
                     d_star[um] = d_prev;
                 }
                 p_blend_prev = p_blend;
@@ -1727,7 +1766,7 @@ kernel void crm_2d_fast_hevi_loop(
             for (int m = int(nz) - 2; m >= 0; --m) {
                 uint um = uint(m);
                 uint idx_m = um * M + tid;
-                float dfz_cur = (m == int(nz) - 2) ? d_star[um] : (d_star[um] - c_star[um] * dfz_above);
+                float dfz_cur = (m == int(nz) - 2) ? d_star[um] : (d_star[um] - c_star_b[idx_m] * dfz_above);
                 float rdw_m = rho_dw[idx_m];
                 uint w_idx = (um + 1u) * M + tid;
                 float fz_old_m = rdw_m * w_s[w_idx];
@@ -1763,37 +1802,37 @@ kernel void crm_2d_fast_hevi_loop_64(
     device const float* rho_x      [[buffer(5)]],
     device const float* rtot_x_inv [[buffer(6)]],
     device const float* thm_x_eff  [[buffer(7)]],
-    device const float* pres_s     [[buffer(8)]],
+    device const float* a_p_s      [[buffer(8)]],
     device const float* dp_dThm_s  [[buffer(9)]],
-    device const float* Thm_ref    [[buffer(10)]],
-    device const float* q_load     [[buffer(11)]],
-    device const float* tend_u_sl  [[buffer(12)]],
-    device const float* tend_v_sl  [[buffer(13)]],
-    device const float* tend_w_sl  [[buffer(14)]],
-    device const float* tend_Thm   [[buffer(15)]],
-    device const float* rho_dw     [[buffer(16)]],
-    device const float* rho_tot_w  [[buffer(17)]],
-    device const float* thm_w      [[buffer(18)]],
-    device const float* dl         [[buffer(19)]],
-    device const float* diag       [[buffer(20)]],
-    device const float* du         [[buffer(21)]],
-    device const float* dz_c       [[buffer(22)]],
-    device const float* dz_w_int   [[buffer(23)]],
-    device const float* sponge_w   [[buffer(24)]],
-    device float* fx_acc           [[buffer(25)]],
-    device float* fy_acc           [[buffer(26)]],
-    device float* fz_acc           [[buffer(27)]],
-    device const uint* u_params    [[buffer(28)]],
-    device const float* f_params   [[buffer(29)]],
+    device const float* q_load     [[buffer(10)]],
+    device const float* tend_u_sl  [[buffer(11)]],
+    device const float* tend_v_sl  [[buffer(12)]],
+    device const float* tend_w_sl  [[buffer(13)]],
+    device const float* tend_Thm   [[buffer(14)]],
+    device const float* rho_dw     [[buffer(15)]],
+    device const float* rho_tot_w  [[buffer(16)]],
+    device const float* thm_w      [[buffer(17)]],
+    device const float* dl         [[buffer(18)]],
+    device const float* inv_den_b  [[buffer(19)]],
+    device const float* c_star_b   [[buffer(20)]],
+    device const float* dz_c       [[buffer(21)]],
+    device const float* dz_w_int   [[buffer(22)]],
+    device const float* sponge_w   [[buffer(23)]],
+    device float* fx_acc           [[buffer(24)]],
+    device float* fy_acc           [[buffer(25)]],
+    device float* fz_acc           [[buffer(26)]],
+    constant ulong4& u_p0           [[buffer(27)]],
+    constant float4& f_p           [[buffer(28)]],
     uint lid [[thread_position_in_threadgroup]],
     uint tg_id [[threadgroup_position_in_grid]])
 {
-    uint nz = u_params[0];
-    uint n_col = u_params[1];
-    uint nx = u_params[2];
-    uint dz_cols = u_params[3];
-    uint n_ac = u_params[4];
-    uint accum = u_params[5];
+    uint nz = uint(u_p0.x);
+    uint n_col = uint(u_p0.y);
+    uint nx = uint(u_p0.z);
+    uint pk = uint(u_p0.w);
+    uint dz_cols = pk >> 16u;
+    uint n_ac = (pk >> 1u) & 0x7FFFu;
+    uint accum = pk & 1u;
 
     uint local_c = lid / nx;
     uint ix = lid - local_c * nx;
@@ -1809,23 +1848,26 @@ kernel void crm_2d_fast_hevi_loop_64(
     uint tid = active ? (col * nx + ix) : 0u;
     uint col_dz = (dz_cols > 1u && active) ? col : 0u;
 
-    float dt_ac = f_params[0];
-    float beta = f_params[1];
-    float gravity = f_params[2];
-    float inv_dx = 1.0f / f_params[3];
+    float dt_ac = f_p.x;
+    float beta = f_p.y;
+    float gravity = f_p.z;
+    float inv_dx = 1.0f / f_p.w;
 
     // Total shared memory = 16 KB (4 KB + 12 KB), allowing 2 concurrent threadgroups per core on M1 Max
-    threadgroup float tg_Thm[1024];  // 16 * 64 = 4 KB
+    threadgroup float tg_P[1024];    // 16 * 64 = 4 KB
     threadgroup float tg_fx[3072];   // 48 * 64 = 12 KB
 
-    float c_star[48], d_star[48];
+    float d_star[48];
 
     for (uint ac = 0u; ac < n_ac; ++ac) {
+        bool last_ac = (ac + 1u == n_ac);
+        float n_ac_f = float(n_ac);
         for (uint kb = 0u; kb < nz; kb += 16u) {
             uint k_end = min(kb + 16u, nz);
             if (active) {
                 for (uint k = kb; k < k_end; ++k) {
-                    tg_Thm[(k - kb) * 64u + lid] = Thm_s[k * M + tid];
+                    uint idx = k * M + tid;
+                    tg_P[(k - kb) * 64u + lid] = fma(dp_dThm_s[idx], Thm_s[idx], a_p_s[idx]);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1833,28 +1875,28 @@ kernel void crm_2d_fast_hevi_loop_64(
             if (active) {
                 for (uint k = kb; k < k_end; ++k) {
                     uint idx = k * M + tid;
-                    float ps0 = pres_s[idx];
-                    float dp0 = dp_dThm_s[idx];
-                    float Tr0 = Thm_ref[idx];
-                    float p_k0 = ps0 + dp0 * (tg_Thm[(k - kb) * 64u + lid] - Tr0);
-
-                    uint idx_xp1 = k * M + col * nx + ix_p1;
-                    float p_k1 = pres_s[idx_xp1] + dp_dThm_s[idx_xp1] * (tg_Thm[(k - kb) * 64u + lid_xp1] - Thm_ref[idx_xp1]);
+                    float p_k0 = tg_P[(k - kb) * 64u + lid];
+                    float p_k1 = tg_P[(k - kb) * 64u + lid_xp1];
 
                     float pgf_u = -(p_k1 - p_k0) * inv_dx * rtot_x_inv[idx];
                     float u0 = u_s[idx];
-                    float v0 = v_s[idx];
                     float u_n = u0 + dt_ac * (tend_u_sl[idx] + pgf_u);
-                    float v_n = v0 + dt_ac * tend_v_sl[idx];
 
                     float fx_k = rho_x[idx] * (1.10f * u_n - 0.10f * u0);
                     tg_fx[k * 64u + lid] = fx_k;
                     if (accum != 0u) {
                         fx_acc[idx] += fx_k;
-                        fy_acc[idx] += rho_s[idx] * (1.10f * v_n - 0.10f * v0);
                     }
                     u_s[idx] = u_n;
-                    v_s[idx] = v_n;
+                    if (last_ac) {
+                        float v0 = v_s[idx];
+                        float tv = tend_v_sl[idx];
+                        float v_n = v0 + (n_ac_f * dt_ac) * tv;
+                        v_s[idx] = v_n;
+                        if (accum != 0u) {
+                            fy_acc[idx] += n_ac_f * rho_s[idx] * (v0 + (0.5f * n_ac_f + 0.6f) * dt_ac * tv);
+                        }
+                    }
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1865,7 +1907,6 @@ kernel void crm_2d_fast_hevi_loop_64(
             float rtot_blend_prev = 0.0f;
             float fz_old_below = 0.0f;
             float thm_w_below = 0.0f;
-            float c_prev = 0.0f;
             float d_prev = 0.0f;
 
             for (uint k = 0u; k < nz; ++k) {
@@ -1896,10 +1937,9 @@ kernel void crm_2d_fast_hevi_loop_64(
                 rho_s[idx] = r_dag;
                 Thm_s[idx] = T_dag;
 
-                float ps = pres_s[idx];
+                float ap = a_p_s[idx];
                 float dp = dp_dThm_s[idx];
-                float Ts = Thm_ref[idx];
-                float p_blend = (1.0f - beta) * (ps + dp * (T_cur - Ts)) + beta * (ps + dp * (T_dag - Ts));
+                float p_blend = fma(dp, (1.0f - beta) * T_cur + beta * T_dag, ap);
                 float rtot_blend = ((1.0f - beta) * r_cur + beta * r_dag) * q_load[idx];
 
                 if (k >= 1u) {
@@ -1914,16 +1954,8 @@ kernel void crm_2d_fast_hevi_loop_64(
                         - (rdw_m / rtw_m) * nh_imb
                         - sponge_w[um] * fz_old_below
                     );
-                    if (um == 0u) {
-                        float inv_b0 = 1.0f / diag[idx_m];
-                        c_prev = du[idx_m] * inv_b0;
-                        d_prev = rhs_m * inv_b0;
-                    } else {
-                        float inv_den = 1.0f / (diag[idx_m] - dl[idx_m] * c_prev);
-                        c_prev = (um < nz - 2u) ? (du[idx_m] * inv_den) : 0.0f;
-                        d_prev = (rhs_m - dl[idx_m] * d_prev) * inv_den;
-                    }
-                    c_star[um] = c_prev;
+                    float inv_den = inv_den_b[idx_m];
+                    d_prev = (um == 0u) ? (rhs_m * inv_den) : ((rhs_m - dl[idx_m] * d_prev) * inv_den);
                     d_star[um] = d_prev;
                 }
                 p_blend_prev = p_blend;
@@ -1940,7 +1972,7 @@ kernel void crm_2d_fast_hevi_loop_64(
             for (int m = int(nz) - 2; m >= 0; --m) {
                 uint um = uint(m);
                 uint idx_m = um * M + tid;
-                float dfz_cur = (m == int(nz) - 2) ? d_star[um] : (d_star[um] - c_star[um] * dfz_above);
+                float dfz_cur = (m == int(nz) - 2) ? d_star[um] : (d_star[um] - c_star_b[idx_m] * dfz_above);
                 float rdw_m = rho_dw[idx_m];
                 uint w_idx = (um + 1u) * M + tid;
                 float fz_old_m = rdw_m * w_s[w_idx];
@@ -1964,7 +1996,6 @@ kernel void crm_2d_fast_hevi_loop_64(
             rho_s[tid] = max(rho_s[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-5f);
             Thm_s[tid] = Thm_s[tid] - beta * dt_ac * (thm_w_above * dfz_above) / dz_0;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -2104,6 +2135,43 @@ kernel void scvt_trisk_rot_edge(
 """
 
 
+def _get_const_buf(dev: torch.device, tag: str, vals: list[float]) -> torch.Tensor:
+    tvals = tuple(float(v) for v in vals)
+    key = (dev.index or 0, tag, tvals)
+    t = _CONST_BUF_CACHE.get(key)
+    if t is None:
+        if len(_CONST_BUF_CACHE) >= 32:
+            _CONST_BUF_CACHE.pop(next(iter(_CONST_BUF_CACHE)))
+        t = torch.tensor(vals, dtype=torch.float32, device=dev)
+        _CONST_BUF_CACHE[key] = t
+    return t
+
+
+def _scotti_cs_lam2(dz_2d: torch.Tensor, dx: float, dy: float, c_s: float) -> torch.Tensor:
+    """Precompute `(c_s * scotti_aspect * delta_f)^2` over `[nz, dz_cols]`."""
+    dh = math.sqrt(dx * dy)
+    dz_s = torch.clamp(dz_2d, min=1.0)
+    a = torch.clamp(torch.maximum(dh / dz_s, dz_s / dh), min=1.0)
+    b1 = torch.atan(1.0 / a)
+    b2 = 1.5707963267948966 - b1
+    p2 = lambda z: z * (0.98 + z * (0.073 + z * (-0.418 + 0.120 * z)))
+    p3 = lambda z: z * (0.976 + z * (0.188 + z * (1.169 + z * (0.755 - 0.151 * z))))
+    p1 = lambda z: 2.5 * p2(z) - 1.5 * torch.pow(torch.clamp(torch.cos(z), min=0.0), 2.0 / 3.0) * torch.sin(z)
+    bracket = (
+        4.0 * p1(b1) * torch.pow(a, 1.0 / 3.0)
+        + 0.222 * p2(b1) * torch.pow(a, -5.0 / 3.0)
+        + 0.077 * p3(b1) * torch.pow(a, -11.0 / 3.0)
+        - 3.0 * b1
+        + 4.0 * p1(b2)
+        + 0.222 * p2(b2)
+        + 0.077 * p3(b2)
+        - 3.0 * b2
+    )
+    asp = 1.736 * torch.pow(a, 1.0 / 3.0) * torch.pow(torch.clamp(bracket, min=0.1), -0.75)
+    lam = asp * torch.pow(dx * dy * dz_s, 1.0 / 3.0)
+    return ((c_s * lam) ** 2).contiguous()
+
+
 def run_crm_fct_advect_metal(
     lib: Any,
     q_batch: torch.Tensor,
@@ -2126,17 +2194,16 @@ def run_crm_fct_advect_metal(
     dz_2d = dz_c.view(nz, -1).contiguous()
     dz_cols = dz_2d.shape[1]
 
-    key = (dev.index or 0, B, nz, n_col, ny, nx, dz_cols)
+    key = (dev.index or 0, B, nz, n_col, ny, nx)
     ws = _FCT_WS_CACHE.get(key)
     if ws is None:
         ws = {
             "ax": torch.empty((B, nz, n_col, ny, nx), device=dev, dtype=torch.float32),
-            "ay": torch.empty((B, nz, n_col, ny, nx), device=dev, dtype=torch.float32),
+            "ay": torch.empty((B, nz, n_col, ny, nx) if ny > 1 else (1,), device=dev, dtype=torch.float32),
             "az": torch.empty((B, nz + 1, n_col, ny, nx), device=dev, dtype=torch.float32),
             "q_td": torch.empty((B, nz, n_col, ny, nx), device=dev, dtype=torch.float32),
             "r_plus": torch.empty((B, nz, n_col, ny, nx), device=dev, dtype=torch.float32),
             "r_minus": torch.empty((B, nz, n_col, ny, nx), device=dev, dtype=torch.float32),
-            "u_params": torch.tensor([B, nz, n_col, ny, nx, dz_cols], dtype=torch.uint32, device=dev),
         }
         _cache_put(_FCT_WS_CACHE, key, ws)
 
@@ -2147,21 +2214,23 @@ def run_crm_fct_advect_metal(
     fy_c = fy.contiguous()
     fz_c = fz.contiguous()
     q_out = torch.empty_like(q_c)
-    f_params = torch.tensor([dt, dx, dy], dtype=torch.float32, device=dev)
+    u_p0 = [B, nz, n_col, ny]
+    u_p1 = [nx, dz_cols, 0, 0]
+    f_p = [float(dt), float(dx), float(dy), 0.0]
 
     lib.crm_fct_flux_td(
         q_c, ro_c, rn_c, fx_c, fy_c, fz_c, dz_2d,
         ws["ax"], ws["ay"], ws["az"], ws["q_td"],
-        ws["u_params"], f_params, threads=total_q,
+        u_p0, u_p1, f_p, threads=total_q,
     )
     lib.crm_fct_bounds_ratios(
         q_c, ws["q_td"], rn_c, ws["ax"], ws["ay"], ws["az"], dz_2d,
         ws["r_plus"], ws["r_minus"],
-        ws["u_params"], f_params, threads=total_q,
+        u_p0, u_p1, f_p, threads=total_q,
     )
     lib.crm_fct_limit_apply(
         ws["q_td"], rn_c, ws["ax"], ws["ay"], ws["az"], ws["r_plus"], ws["r_minus"], dz_2d,
-        q_out, ws["u_params"], f_params, threads=total_q,
+        q_out, u_p0, u_p1, f_p, threads=total_q,
     )
     return q_out
 
@@ -2199,12 +2268,23 @@ def run_crm_sgs_metal(
             "dv": torch.empty((nz, n_col, ny, nx), device=dev, dtype=torch.float32),
             "dw": torch.empty((nz + 1, n_col, ny, nx), device=dev, dtype=torch.float32),
             "dThm": torch.empty((nz, n_col, ny, nx), device=dev, dtype=torch.float32),
-            "u_params": torch.tensor([nz, n_col, ny, nx, dz_cols], dtype=torch.uint32, device=dev),
+            "cs_lam2": None,
+            "cs_meta": None,
+            "dz_ref": None,
+            "dz_ver": -1,
         }
         _cache_put(_SGS_WS_CACHE, key, ws)
 
-    f_eddy = torch.tensor([dx, dy, gravity, c_s], dtype=torch.float32, device=dev)
-    f_hw = torch.tensor([dx, dy], dtype=torch.float32, device=dev)
+    dz_ver = getattr(dz_c, "_version", 0)
+    cs_meta = (float(dx), float(dy), float(c_s))
+    if ws["cs_lam2"] is None or ws["cs_meta"] != cs_meta or ws["dz_ref"] is not dz_c or ws["dz_ver"] != dz_ver:
+        ws["cs_lam2"] = _scotti_cs_lam2(dz_2d, dx, dy, c_s)
+        ws["cs_meta"] = cs_meta
+        ws["dz_ref"] = dz_c
+        ws["dz_ver"] = dz_ver
+
+    u_p0 = [nz, n_col, ny, nx]
+    f_p = [float(dx), float(dy), float(gravity), float(c_s)]
 
     r_c = rho_d.contiguous()
     u_c = u.contiguous()
@@ -2213,14 +2293,14 @@ def run_crm_sgs_metal(
     th_c = theta_m.contiguous()
 
     lib.crm_sgs_eddy_uv(
-        u_c, v_c, w_c, th_c, dz_2d, dzw_2d,
+        u_c, v_c, w_c, th_c, dz_2d, dzw_2d, ws["cs_lam2"],
         ws["nu"], ws["d"], ws["du"], ws["dv"],
-        ws["u_params"], f_eddy, threads=total_pts,
+        u_p0, int(dz_cols), f_p, threads=total_pts,
     )
     lib.crm_sgs_heat_w(
         r_c, w_c, th_c, ws["nu"], ws["d"],
         ws["dw"], ws["dThm"],
-        ws["u_params"], f_hw, threads=total_pts,
+        u_p0, f_p, threads=total_pts,
     )
     return ws["du"], ws["dv"], ws["dw"], ws["dThm"]
 
@@ -2268,13 +2348,12 @@ def run_crm_microphysics_metal(
     rain_out = torch.empty(sfc_shape, device=dev, dtype=torch.float32)
     snow_out = torch.empty(sfc_shape, device=dev, dtype=torch.float32)
 
-    u_params = torch.tensor([nz, n_col, stride_c, dz_cols], dtype=torch.uint32, device=dev)
-    mp_buf = torch.tensor([dt, *mp_consts], dtype=torch.float32, device=dev)
+    mp_buf = _get_const_buf(dev, "mp", mp_consts)
 
     lib.crm_microphysics_col(
         r_c, th_c, qn_c, qp_c, qv_c, dz_2d,
         thm_out, qn_out, qp_out, temp_out, qv_out, qc_out, qi_out, rain_out, snow_out,
-        u_params, mp_buf, threads=M,
+        [nz, n_col, stride_c, dz_cols], float(dt), mp_buf, threads=M,
     )
     return thm_out, qn_out, qp_out, temp_out, qv_out, qc_out, qi_out, rain_out, snow_out
 
@@ -2463,14 +2542,13 @@ def run_crm_mynn_metal(
     qc_out = torch.empty_like(r_c)
     qi_out = torch.empty_like(r_c)
 
-    u_params = torch.tensor([nz, M, dz_cols], dtype=torch.uint32, device=dev)
-    mp_buf = torch.tensor([dt, *mynn_consts], dtype=torch.float32, device=dev)
+    mp_buf = _get_const_buf(dev, "mynn", mynn_consts)
 
     lib.crm_mynn_col(
         r_c, u_c, v_c, th_c, qn_c, qv_c, qc_c, qi_c, qke_c,
         zc_2d, zw_2d, dz_2d, sfc6,
         u_out, v_out, thm_out, qn_out, qke_out, km_out, kh_out, qv_out, qc_out, qi_out,
-        u_params, mp_buf, threads=M,
+        [nz, M, dz_cols, 0], float(dt), mp_buf, threads=M,
     )
     return u_out, v_out, thm_out, qn_out, qke_out, km_out, kh_out, qv_out, qc_out, qi_out
 

@@ -907,24 +907,30 @@ def step_crm_physics_and_dynamics(
     while s_idx < n_sub:
         k_cnt = min(adv_group, n_sub - s_idx)
         rho_start = crm.rho_d.clone()
-        fx_acc = torch.zeros_like(crm.rho_d)
-        fy_acc = torch.zeros_like(crm.rho_d)
-        fz_acc = torch.zeros_like(crm.w)
-        for _ in range(k_cnt):
-            fx, fy, fz = step_crm_rk3_hevi(crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col)
-            fx_acc = fx_acc + fx
-            fy_acc = fy_acc + fy
-            fz_acc = fz_acc + fz
-        inv_k = 1.0 / float(k_cnt)
+        if k_cnt == 1:
+            fx_mean, fy_mean, fz_mean = step_crm_rk3_hevi(crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col)
+        else:
+            fx_acc = torch.zeros_like(crm.rho_d)
+            fy_acc = torch.zeros_like(crm.rho_d)
+            fz_acc = torch.zeros_like(crm.w)
+            for _ in range(k_cnt):
+                fx, fy, fz = step_crm_rk3_hevi(crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col)
+                fx_acc = fx_acc + fx
+                fy_acc = fy_acc + fy
+                fz_acc = fz_acc + fz
+            inv_k = 1.0 / float(k_cnt)
+            fx_mean = fx_acc * inv_k
+            fy_mean = fy_acc * inv_k
+            fz_mean = fz_acc * inv_k
         dt_adv = dt_sub * float(k_cnt)
         if can_use_crm_metal(crm.rho_d):
             q_np = dispatch_crm_fct_advect_metal(
                 torch.stack([crm.q_n, crm.q_p], dim=0),
                 rho_start,
                 crm.rho_d,
-                fx_acc * inv_k,
-                fy_acc * inv_k,
-                fz_acc * inv_k,
+                fx_mean,
+                fy_mean,
+                fz_mean,
                 crm.dx,
                 crm.dy,
                 dz_fct,
@@ -933,8 +939,8 @@ def step_crm_physics_and_dynamics(
             crm.q_n = q_np[0]
             crm.q_p = q_np[1]
         else:
-            crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_acc * inv_k, fy_acc * inv_k, fz_acc * inv_k, crm.dx, crm.dy, dz_fct, dt_adv)
-            crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_acc * inv_k, fy_acc * inv_k, fz_acc * inv_k, crm.dx, crm.dy, dz_fct, dt_adv)
+            crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+            crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
         q_cond_adv = torch.minimum(crm.q_c + crm.q_i, crm.q_n)
         crm.q_v = torch.clamp(crm.q_n - q_cond_adv, min=0.0)
         s_idx += k_cnt

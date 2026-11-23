@@ -47,9 +47,6 @@ def compute_orographic_drag_lott_miller(
     """
     nz, n_cells = rho_d.shape
     active = (sigma_topo > 10.0) & (slope_topo > 1.0e-4)
-    if not active.any():
-        zeros = torch.zeros_like(u_cell)
-        return zeros, zeros
 
     mu = torch.clamp(sigma_topo, min=1.0)      # [N_cells]
     slope = torch.clamp(slope_topo, min=0.0)   # [N_cells]

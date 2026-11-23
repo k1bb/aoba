@@ -532,7 +532,10 @@ def step_scvt_rk3_hevi(
     # Scale-aware horizontal divergence damping & del^4 hyperviscosity (Skamarock et al., 2012, Sec. 3d)
     # Note: on hexagonal Voronoi grids dv_edge ~ dc_edge / sqrt(3), so max(|lambda(lap4)|) ~ 480 / dc_min^4;
     # setting nu_4 = 0.0002 * dc_min^4 / dt_dyn keeps |dt_dyn * nu_4 * lambda_max| < 0.10 unconditionally!
-    dx_min = float(mesh.dc_edge.min().item())
+    dx_min = getattr(mesh, "_dc_edge_min_m", None)
+    if dx_min is None:
+        dx_min = float(mesh.dc_edge.min().item())
+        setattr(mesh, "_dc_edge_min_m", dx_min)
     nu_div = 0.02 * (dx_min ** 2) / max(dt_dyn, 1.0)
     nu_4 = 0.0002 * (dx_min ** 4) / max(dt_dyn, 1.0)
 

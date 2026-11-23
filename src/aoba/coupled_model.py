@@ -27,6 +27,7 @@ from aoba.calendar import AobaCalendar
 from aoba.co2_forcing import CO2ForcingSeries, resolve_co2_series
 from aoba.ozone_forcing import OzoneForcingProvider, resolve_ozone_provider
 from aoba.biosphere import (
+    BiosphereState,
     compute_optimal_soil_water_beta,
     update_daily_acclimation_smith,
     update_daily_lai_root_height,
@@ -677,7 +678,11 @@ _ACCLIM_BIO_ATTRS: tuple[str, ...] = (
 )
 
 
-def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
+def step_aoba_model(
+    model: AOBAState,
+    compute_diagnostics: bool = True,
+    sync_host_surface: bool = True,
+) -> GlobalStepDiagnostics:
     """Advance the global 1:1 Superparameterized AOBA Earth System Model by `cfg.dt_host` [s]."""
     assert model.sfc_sub is not None and model.clim_sub is not None
     cfg = model.cfg
@@ -695,25 +700,28 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
     n_sub = ny * nx
     m_sub = nc * n_sub
 
-    # 1. Orbital solar geometry & local solar noon crossings
+    # 1. Orbital solar geometry & zero-sync CPU local solar noon detection
     yr_sec_trop = C.DAYS_PER_YEAR * C.SECONDS_PER_DAY
-    t_seas_prev, t_diur_prev = model.calendar.orbital_times_sec(model.sim_time_sec, yr_sec_trop)
+    _, t_diur_prev = model.calendar.orbital_times_sec(model.sim_time_sec, yr_sec_trop)
     t_seas_next, t_diur_next = model.calendar.orbital_times_sec(model.sim_time_sec + dt, yr_sec_trop)
-    _, _, h_prev = compute_orbital_insolation(
-        t_seas_prev, mesh.lat_cell, mesh.lon_cell,
-        cfg.solar_constant, cfg.obliquity_deg, cfg.eccentricity, cfg.perihelion_deg,
-        t_diurnal_sec=t_diur_prev, diurnal_cycle=cfg.diurnal_cycle,
-    )
-    mu0, s_toa, h_next = compute_orbital_insolation(
+    lon_cpu = getattr(mesh, "_lon_cell_cpu", None)
+    if lon_cpu is None:
+        lon_cpu = mesh.lon_cell.detach().cpu()
+        setattr(mesh, "_lon_cell_cpu", lon_cpu)
+    frac_prev = (t_diur_prev % C.SECONDS_PER_DAY) / C.SECONDS_PER_DAY
+    frac_next = (t_diur_next % C.SECONDS_PER_DAY) / C.SECONDS_PER_DAY
+    h_raw_prev = 2.0 * math.pi * frac_prev + lon_cpu - math.pi
+    h_raw_next = 2.0 * math.pi * frac_next + lon_cpu - math.pi
+    h_prev_cpu = torch.atan2(torch.sin(h_raw_prev), torch.cos(h_raw_prev))
+    h_next_cpu = torch.atan2(torch.sin(h_raw_next), torch.cos(h_raw_next))
+    crossed_noon_cpu = (h_prev_cpu < 0.0) & (h_next_cpu >= 0.0) & ((h_next_cpu - h_prev_cpu) < math.pi)
+    mu0, s_toa, _ = compute_orbital_insolation(
         t_seas_next, mesh.lat_cell, mesh.lon_cell,
         cfg.solar_constant, cfg.obliquity_deg, cfg.eccentricity, cfg.perihelion_deg,
         t_diurnal_sec=t_diur_next, diurnal_cycle=cfg.diurnal_cycle,
     )
-    # Local solar noon crossed when h_prev < 0 <= h_next (excluding midnight wrap around +/-pi)
-    crossed_noon = (h_prev < 0.0) & (h_next >= 0.0) & ((h_next - h_prev) < math.pi)
     mu0_sub = _cell_to_sub(mu0, nc, n_sub)
     s_toa_sub = _cell_to_sub(s_toa, nc, n_sub)
-    crossed_noon_sub = _cell_to_sub(crossed_noon, nc, n_sub)
 
     # 2. Subcolumn CRM lowest-layer meteorology & host cell reference heights
     u_sub_0 = (0.5 * (crm.u[0] + torch.roll(crm.u[0], 1, dims=-1))).reshape(m_sub)
@@ -724,16 +732,22 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
     qc_sub = crm.q_c.reshape(nz, m_sub)
     qi_sub = crm.q_i.reshape(nz, m_sub)
 
-    pres_sub, _, temp_sub = diagnose_pressure_temperature(rho_sub, thm_sub, qv_sub)
+    need_rad = (not model.rad_cache) or ("q_rad_sub" not in model.rad_cache) or (model.step_count % max(cfg.rad_stride, 1) == 0)
+    if need_rad:
+        pres_sub, _, temp_sub = diagnose_pressure_temperature(rho_sub, thm_sub, qv_sub)
+        pres_sub_0 = pres_sub[0]
+        temp_sub_0 = temp_sub[0]
+    else:
+        pres_sub_0, _, temp_sub_0 = diagnose_pressure_temperature(rho_sub[0], thm_sub[0], qv_sub[0])
     dz0_col = atmos.z_c[0] - atmos.z_w[0]
     dz0_sub = _cell_to_sub(dz0_col, nc, n_sub)
-    pres_sfc_sub = pres_sub[0] + C.GRAVITY * rho_sub[0] * (1.0 + qv_sub[0]) * dz0_sub
+    pres_sfc_sub = pres_sub_0 + C.GRAVITY * rho_sub[0] * (1.0 + qv_sub[0]) * dz0_sub
     z_rel_c = atmos.z_c - atmos.z_w[0:1]
     z_ref_rel_sub = torch.clamp(_cell_to_sub(z_rel_c[0], nc, n_sub) - 0.65 * sfc_sub.bio.h_canopy, min=5.0)
 
     # 3. Subcolumn surface albedos & ICA 4-band radiative transfer across all `[Nz, m_sub]`
     alb_vd, alb_vf, alb_nd, alb_nf, _, lai_exp_sub, _, f_ice_sub = compute_surface_albedos(sfc_sub, mu0_sub)
-    if (not model.rad_cache) or ("q_rad_sub" not in model.rad_cache) or (model.step_count % max(cfg.rad_stride, 1) == 0):
+    if need_rad:
         t_rad_ocn = ((1.0 - f_ice_sub) * (sfc_sub.t_ocean_ml ** 4) + f_ice_sub * (torch.clamp(sfc_sub.t_seaice, min=150.0) ** 4)) ** 0.25
         t_rad_in = torch.where(sfc_sub.surf_type == SURF_OCEAN, t_rad_ocn, sfc_sub.t_canopy)
         emiss_in = torch.where(
@@ -825,9 +839,9 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
         sfc=sfc_sub,
         u_1=u_sub_0,
         v_1=v_sub_0,
-        temp_1=temp_sub[0],
+        temp_1=temp_sub_0,
         qv_1=qv_sub[0],
-        pres_1=pres_sub[0],
+        pres_1=pres_sub_0,
         pres_sfc=pres_sfc_sub,
         z_ref_rel=z_ref_rel_sub,
         sw1_dir_down=sw1_dir_sub,
@@ -1118,34 +1132,39 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
     model.rad_cache["gpp"] = gpp_cell
 
     # 8. Subgrid Solar Noon EEO Acclimation, Daily LAI/Root Phenology, Host Sync, & Monthly Köppen
-    rho_post_sub = crm.rho_d.reshape(nz, m_sub)
-    thm_post_sub = crm.theta_m.reshape(nz, m_sub)
-    qv_post_sub = crm.q_v.reshape(nz, m_sub)
-    pres_post_sub, _, temp_post_sub = diagnose_pressure_temperature(rho_post_sub, thm_post_sub, qv_post_sub)
-    t_air_sub = temp_post_sub[0]
-    pres_sfc_post_sub = pres_post_sub[0] + C.GRAVITY * rho_post_sub[0] * (1.0 + qv_post_sub[0]) * dz0_sub
+    rho_post_0 = crm.rho_d[0].reshape(m_sub)
+    thm_post_0 = crm.theta_m[0].reshape(m_sub)
+    qv_post_0 = crm.q_v[0].reshape(m_sub)
+    pres_post_0, _, t_air_sub = diagnose_pressure_temperature(rho_post_0, thm_post_0, qv_post_0)
+    pres_sfc_post_sub = pres_post_0 + C.GRAVITY * rho_post_0 * (1.0 + qv_post_0) * dz0_sub
     es_sub = 611.2 * torch.exp(17.67 * (t_air_sub - C.T_FREEZE) / torch.clamp(t_air_sub - 29.65, min=10.0))
-    e_sub = qv_post_sub[0] * pres_post_sub[0] / (C.EPS_WATER + (1.0 - C.EPS_WATER) * qv_post_sub[0])
+    e_sub = qv_post_0 * pres_post_0 / (C.EPS_WATER + (1.0 - C.EPS_WATER) * qv_post_0)
     vpd_sub = torch.clamp(es_sub - e_sub, min=50.0)
 
-    is_veg_noon_sub = crossed_noon_sub & (sfc_sub.surf_type == SURF_LAND)
-    if is_veg_noon_sub.any():
-        saved_bio = {a: getattr(sfc_sub.bio, a).clone() for a in _ACCLIM_BIO_ATTRS}
+    if bool(crossed_noon_cpu.any()):
+        noon_cells = torch.nonzero(crossed_noon_cpu, as_tuple=False).squeeze(-1).to(device=rho_post_0.device)
+        noon_sub_idx = (
+            noon_cells.unsqueeze(-1) * n_sub + torch.arange(n_sub, device=rho_post_0.device)
+        ).reshape(-1)
+        land_noon = sfc_sub.surf_type[noon_sub_idx] == SURF_LAND
+        sub_bio = BiosphereState(**{k: v[noon_sub_idx] for k, v in sfc_sub.bio.__dict__.items()})
         update_daily_acclimation_smith(
-            bio=sfc_sub.bio,
-            midday_vis_beam=sw1_dir_sub,
-            midday_vis_diff=sw1_dif_sub,
-            midday_mu0=torch.clamp(mu0_sub, min=0.05),
-            midday_temp=t_air_sub,
-            midday_vpd=vpd_sub,
-            night_temp=torch.minimum(clim_sub.day_t_min, t_air_sub - 2.0),
-            pres_sfc=pres_sfc_post_sub,
+            bio=sub_bio,
+            midday_vis_beam=sw1_dir_sub[noon_sub_idx],
+            midday_vis_diff=sw1_dif_sub[noon_sub_idx],
+            midday_mu0=torch.clamp(mu0_sub[noon_sub_idx], min=0.05),
+            midday_temp=t_air_sub[noon_sub_idx],
+            midday_vpd=vpd_sub[noon_sub_idx],
+            night_temp=torch.minimum(clim_sub.day_t_min[noon_sub_idx], t_air_sub[noon_sub_idx] - 2.0),
+            pres_sfc=pres_sfc_post_sub[noon_sub_idx],
             co2_ppmv=model.current_co2_ppmv(),
-            lai_exposed=lai_exp_sub,
-            is_vegetated_land=(sfc_sub.surf_type == SURF_LAND),
+            lai_exposed=lai_exp_sub[noon_sub_idx],
+            is_vegetated_land=land_noon,
         )
-        for a, old_val in saved_bio.items():
-            setattr(sfc_sub.bio, a, torch.where(is_veg_noon_sub, getattr(sfc_sub.bio, a), old_val))
+        for a in _ACCLIM_BIO_ATTRS:
+            full_arr = getattr(sfc_sub.bio, a)
+            old_sub = full_arr[noon_sub_idx]
+            full_arr[noon_sub_idx] = torch.where(land_noon, getattr(sub_bio, a), old_sub)
 
     precip_tot_sub = rain_new_sub + snow_new_sub
     clim_sub.day_precip_mm = clim_sub.day_precip_mm + precip_tot_sub * dt
@@ -1205,7 +1224,8 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
         clim_sub.day_t_min.fill_(400.0)
         clim_sub.day_steps = 0
 
-    _sync_host_surface_from_subgrid(sfc, sfc_sub, nc, n_sub)
+    if sync_host_surface:
+        _sync_host_surface_from_subgrid(sfc, sfc_sub, nc, n_sub)
 
     model.sim_time_sec += dt
     model.step_count += 1
@@ -1218,19 +1238,36 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
             _apply_dynamic_icesheet_update(model)
             _sync_host_surface_from_subgrid(sfc, sfc_sub, nc, n_sub)
 
-    # Compute area-weighted global diagnostics
+    if not compute_diagnostics:
+        return GlobalStepDiagnostics(
+            sim_time_days=model.sim_time_sec / C.SECONDS_PER_DAY,
+            global_mean_t_sfc_k=0.0,
+            global_mean_olr_wm2=0.0,
+            global_mean_asr_wm2=0.0,
+            global_mean_precip_mm_day=0.0,
+            land_mean_gpp_umol=0.0,
+            land_mean_lai=0.0,
+            seaice_area_million_km2=0.0,
+            date_str=model.calendar.date_at(model.sim_time_sec).iso_date,
+        )
+
+    # Compute area-weighted global diagnostics with a single batched GPU->CPU sync
     area = mesh.area_cell
     area_tot = area.sum()
     land_mask = (sfc.surf_type == SURF_LAND).to(area.dtype)
     land_area = torch.clamp((area * land_mask).sum(), min=1.0)
+    lai_cell = sfc.bio.lai if sync_host_surface else _sub_to_cell(sfc_sub.bio.lai, nc, n_sub)
 
-    t_sfc_mean = float(((area * t_rad_cell).sum() / area_tot).item())
-    olr_mean = float(((area * olr).sum() / area_tot).item())
-    asr_mean = float(((area * asr).sum() / area_tot).item())
-    p_mm_day = float(((area * precip_tot * C.SECONDS_PER_DAY).sum() / area_tot).item())
-    gpp_land = float(((area * land_mask * gpp_cell).sum() / land_area).item())
-    lai_land = float(((area * land_mask * sfc.bio.lai).sum() / land_area).item())
-    seaice_mkm2 = float(((area * f_seaice_cell).sum() * 1.0e-12).item())
+    diag_vec = torch.stack([
+        (area * t_rad_cell).sum() / area_tot,
+        (area * olr).sum() / area_tot,
+        (area * asr).sum() / area_tot,
+        (area * precip_tot * C.SECONDS_PER_DAY).sum() / area_tot,
+        (area * land_mask * gpp_cell).sum() / land_area,
+        (area * land_mask * lai_cell).sum() / land_area,
+        (area * f_seaice_cell).sum() * 1.0e-12,
+    ]).cpu().tolist()
+    t_sfc_mean, olr_mean, asr_mean, p_mm_day, gpp_land, lai_land, seaice_mkm2 = diag_vec
 
     return GlobalStepDiagnostics(
         sim_time_days=model.sim_time_sec / C.SECONDS_PER_DAY,
