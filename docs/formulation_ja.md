@@ -186,11 +186,12 @@ $$
 全気柱の層乾燥質量を $\Delta m_{d, n} = \rho_{d, n} \Delta z_n\ [\mathrm{kg\ m^{-2}}]$、雲水・雲氷パスを $\mathrm{LWP}_n = 10^3 \rho_{d, n} q_{c, n} \Delta z_n$、$\mathrm{IWP}_n = 10^3 \rho_{d, n} q_{i, n} \Delta z_n\ [\mathrm{g\ m^{-2}}]$（規定有効半径 $r_{e,\mathrm{liq}} = 10\ \mu\mathrm{m},\ r_{e,\mathrm{ice}} = 50\ \mu\mathrm{m}$）とおく。
 
 1. **SW1（UV・可視光・PAR 帯, $0.25\text{--}0.69\ \mu\mathrm{m}$, 分割比 $w_{\mathrm{SW1}} = 0.459760$）**:
-   - Wing et al. (2018, Eq. 1) の水平一様オゾン体積混合比：
+   - オゾン体積混合比 $\mathrm{O}_3$ は `o3_mode` で選択可能：`"rcemip"` は Wing et al. (2018, Eq. 1) の水平一様プロファイル：
      $$
      \mathrm{O}_3(p) = g_1\, p_{\mathrm{hPa}}^{g_2} \exp\!\left(-\frac{p_{\mathrm{hPa}}}{g_3}\right) \times 10^{-6}, \qquad (g_1, g_2, g_3) = (3.6478,\ 0.83209,\ 11.3515\ \mathrm{hPa}),
      $$
-     と Rodgers 球面大気路程補正係数 $M(\mu_0) = 35 / \sqrt{1224\mu_0^2 + 1}$ による積算斜めオゾン路程 $x = u_{\mathrm{O3}} M(\mu_0)$ に対し、Lacis & Hansen (1974, Eqs. 8–10) のUV・Chappuis 吸収：
+     `"latitude_seasonal"` は Brewer–Dobson 循環による高緯度増大・対流圏界面高度の緯度勾配・各半球春季極大を再現する地図不要の解析的2D緯度×季節パラメータ化（Fortuin & Kelder, 1998）、`"climatology"` は外部の月別帯状平均 CMIP6/CMIP7 input4MIPs 気候値を `(month, lat, ln p)` で補間する（モデル上端 `z_top` を成層圏・中間圏まで拡張してもテーブル上端より上で $p^{g_2}$ 減衰外挿を行い範囲外にならない）。また `o3_lw_coupling = true` 時は `LW2` 窓領域に 9.6 μm 帯吸収 $+4.5\, m_{\mathrm{O3}}$ を加算する（Ramanathan & Dickinson, 1979）。
+     これに Rodgers 球面大気路程補正係数 $M(\mu_0) = 35 / \sqrt{1224\mu_0^2 + 1}$ による積算斜めオゾン路程 $x = u_{\mathrm{O3}} M(\mu_0)$ に対し、Lacis & Hansen (1974, Eqs. 8–10) のUV・Chappuis 吸収：
      $$
      A_{\mathrm{oz}}(x) = \frac{1.082\, x}{(1 + 138.6 x)^{0.805}} + \frac{0.0658\, x}{1 + (103.6 x)^3} + \frac{0.02118\, x}{1 + 0.042 x + 0.000323 x^2},
      $$
@@ -570,14 +571,14 @@ $$
 
 ## 12. 単一 TOML 設定管理・出力仕様・GUI コンフィギュレータ・全パラメータ一覧
 
-### 12.1 一元テキスト管理アーキテクチャと実行・GUI ツール (`src/aoba/params.py`, `src/aoba/co2_forcing.py`, `scripts/aoba_config_gui.py`)
+### 12.1 一元テキスト管理アーキテクチャと実行・GUI ツール (`src/aoba/params.py`, `src/aoba/co2_forcing.py`, `src/aoba/ozone_forcing.py`, `scripts/aoba_config_gui.py`)
 
-モデルの再現性と透明性を保証するため、すべての格子設定・強制外力・動的氷床設定・出力ストリーム・物理定数（**13セクション・全219項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。大気 $\mathrm{CO_2}$ 濃度は `co2_mode` により **固定値 (`constant`)・シナリオ補間 (`scenario`)・独自 CSV (`csv`)** の3通りを選択でき、`scenario` 時はモデルの連続暦年（負の BCE 年を含む）に応じて同梱テーブル `src/aoba/assets/co2_scenarios.csv`（CMIP5 RCP・CMIP6 historical/SSP・南極氷床コア80万年復元・NOAA GML 接続）または `scripts/fetch_co2_data.py`／AOBA Studio から随時更新した最新キャッシュ `data/forcing/co2/co2_latest.csv` を線形補間する。
+モデルの再現性と透明性を保証するため、すべての格子設定・強制外力・動的氷床設定・出力ストリーム・物理定数（**13セクション・全222項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。大気 $\mathrm{CO_2}$ 濃度は `co2_mode` により **固定値 (`constant`)・シナリオ補間 (`scenario`)・独自 CSV (`csv`)** の3通りを選択でき、`scenario` 時はモデルの連続暦年（負の BCE 年を含む）に応じて同梱テーブル `src/aoba/assets/co2_scenarios.csv`（CMIP5 RCP・CMIP6 historical/SSP・南極氷床コア80万年復元・NOAA GML 接続）または `scripts/fetch_co2_data.py`／AOBA Studio から随時更新した最新キャッシュ `data/forcing/co2/co2_latest.csv` を線形補間する。大気オゾン $\mathrm{O_3}$ も同様に `o3_mode` により **1D RCEMIP (`rcemip`; Wing et al., 2018)・解析的2D緯度×季節 (`latitude_seasonal`)・外部帯状平均気候値 (`climatology`; `scripts/fetch_ozone_data.py` で CMIP6/CMIP7 input4MIPs から取得し、高空モデルトップ拡張時はテーブル上端より上で $p^{g_2}$ 減衰外挿)** を選択でき、さらに `o3_lw_coupling = true` で 9.6 μm 窓領域長波吸収も有効化できる。
 - **ランタイム同期・ハードウェア自動チューニング (`src/aoba/params.py`, `src/aoba/runtime.py`)**: `load_aoba_toml()` で読み込んだ設定辞書に対し `build_configs_from_dict(cfg_dict, apply_modules=True)` を呼ぶと、`(AOBAConfig, OutputConfig)` インスタンスを生成すると同時に、`_MODULE_PARAM_MAP` に登録された `src/aoba/*` モジュールの全定数をライブ更新し、各モジュールの `recompute_derived_constants()`（`microphysics`, `turbulence`, `ocean_ekman`, `icesheet` 内の Metal 定数配列や導出係数を含む）を再計算する。さらに `detect_hardware_profile()` / `compute_optimal_chunks()` / `apply_runtime_tuning()` により実行マシンの GPU コア数・利用可能メモリ・P-core 数を自動検出し、メモリ予算 $B = 0.45\, M_{\mathrm{dev}}$ の範囲内で解像度を変えずに最速 1 パス／安全分割となる `crm_col_chunk`・`rad_col_chunk` と CPU スレッド数を自動適用する。
 - **Web GUI 統合ワークベンチ (`scripts/aoba_config_gui.py` / AOBA Studio)**: 標準ライブラリ（`http.server`）のみで動作するゼロ依存ローカル Web アプリ（`python scripts/aoba_config_gui.py --port 8765`）を備え、モデル設定から実行起動、プロセス監視、CPU リアルタイム可視化まで一気通貫で提供する：
   1. `glevel`（0〜6）の変更に連動してリアルタイム描画される**正二十面体 SCVT Voronoi 球面メッシュ可視化図 ＋ 1ホストセル対埋め込み CRM 領域スケール比較図 ＋ ストレッチ鉛直層・スポンジ層図**。
-  2. 自転半減実験 (`0.5×Ω`)・LGM・`4×CO₂` プリセット、**CO₂ シナリオ選択・推移グラフ・NOAA/NCEI/RCMIP 最新データ取得ボタン**、**カレンダー／固定日射設定**、および**氷床加速率 $\alpha_{\mathrm{eff}}(t)$／EMA 重み減衰曲線**プレビュー。
-  3. 出力ファイル種別・間隔設定、予想年間 Zarr/リスタート容量試算、および219パラメータ横断検索・TOML 保存。
+  2. 自転半減実験 (`0.5×Ω`)・LGM・`4×CO₂` プリセット、**CO₂/O₃ シナリオ選択・推移グラフ・NOAA/NCEI/RCMIP/ESGF 最新データ取得ボタン**、**カレンダー／固定日射設定**、および**氷床加速率 $\alpha_{\mathrm{eff}}(t)$／EMA 重み減衰曲線**プレビュー。
+  3. 出力ファイル種別・間隔設定、予想年間 Zarr/リスタート容量試算、および222パラメータ横断検索・TOML 保存。
   4. **実行コントロール・ライブ監視・CPU リアルタイム日平均 3地球プレビュー**: GUI 上からの計算実行・停止、稼働中外部ジョブ（`run.log` / `daily_global.csv` / カレンダー日付 `YYYY-MM-DD`）の監視に加え、GPU 計算を一切阻害しない待機 CPU 上の `cKDTree` 球面再格子化エンジンにより、**日平均 `T2`（地表付近気温 $0.35 T_{\mathrm{sfc}} + 0.65 T_{a,z_1}$）・日平均降水量 `Precip [mm/d]`・`LAI`** の3つの正射図法地球儀を「1モデル日＝1周（$360^\circ / T_{\mathrm{wall,day}}$）」の実時間同期自転または任意速度でリアルタイム可視化する（`live_preview.npz`, `snapshots.zarr`, `monthly.zarr` に対応）。
 
 ### 12.2 出力ファイル種別・平均値 vs 瞬時値仕様 (`OutputConfig`, `src/aoba/io_zarr.py`)
@@ -592,9 +593,9 @@ $$
 | `snapshots.zarr` | **瞬時値** (スナップショット) | `snapshots_enabled`, `snapshots_periods_per_year` (既定 `12`), `snapshots_include_{2d,3d,subgrid_2d}` | 上記2D (`h_canopy`, `vcmax25_c3`, `f_c4`, `f_evg` を含む)・3D変数 (`temp`, `pres`, `q_v`, `u_zonal`, `v_merid`) および上記サブグリッド2D瞬時場 (`*_sub`) |
 | `restart.pt` / `restart_mid.pt` | チェックポイント | `restart_interval_years` (既定 `1` 年), `restart_monthly` (既定 `true`), `zarr_dir_partition` | 完全な `GlobalAtmosState`, `CRMState`, `SurfaceState` (`sfc` & `sfc_sub`), `EkmanOceanState`, `IceSheetState`, `ClimateAccumulator`。`restart_monthly=true` 時は毎月末に `restart_mid.pt` を自動保存し、年内途中から Zarr/CSV 欠損なく決定論的再開可能 |
 
-### 12.3 全モデル設定・物理パラメータレジストリ（全13セクション・219項目）
+### 12.3 全モデル設定・物理パラメータレジストリ（全13セクション・222項目）
 
-表 12.1 に [`config/aoba_default.toml`](../config/aoba_default.toml) に定義された全219パラメータのセクション別完全リストを示す。
+表 12.1 に [`config/aoba_default.toml`](../config/aoba_default.toml) に定義された全222パラメータのセクション別完全リストを示す。
 
 #### `[grid]` — 水平・鉛直・サブグリッド CRM 格子設定（16項目）
 | TOML キー | 標準値 | 説明・単位 |
@@ -612,10 +613,10 @@ $$
 | `rad_stride` | `5` | 放射計算の呼出し間隔（ステップ数） |
 | `crm_col_chunk`, `rad_col_chunk` | `16384`, `32768` | GPU/CPU メモリ制御用バッチチャンクサイズ [columns] |
 
-#### `[forcing]`・`[icesheet]`・`[output]` — 外力・氷床制御・出力管理（49項目）
+#### `[forcing]`・`[icesheet]`・`[output]` — 外力・氷床制御・出力管理（52項目）
 | セクション | キー ＝ 標準値 |
 | :--- | :--- |
-| `[forcing]` (24) | `co2_ppmv = 400.0`, `co2_mode = "constant"`, `co2_scenario = "obs_historical_noaa"`, `co2_csv_path = ""`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `start_date = "2000-03-20"`, `calendar_type = "gregorian"`, `insolation_mode = "seasonal"`, `fixed_insolation_date = "2000-03-20"`, `diurnal_cycle = true`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `enable_dust = true`, `dust_emis_factor = 1.5e-5`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 48.0`, `cloud_sw_inhomog = 0.85` |
+| `[forcing]` (27) | `co2_ppmv = 400.0`, `co2_mode = "constant"`, `co2_scenario = "obs_historical_noaa"`, `co2_csv_path = ""`, `o3_mode = "rcemip"`, `o3_file_path = ""`, `o3_lw_coupling = false`, `solar_constant = 1361.0`, `omega = 7.292115e-5`, `obliquity_deg = 23.44`, `eccentricity = 0.0167`, `perihelion_deg = 283.0`, `start_date = "2000-03-20"`, `calendar_type = "gregorian"`, `insolation_mode = "seasonal"`, `fixed_insolation_date = "2000-03-20"`, `diurnal_cycle = true`, `use_earth2014 = true`, `earth2014_dir = "data/boundary/earth2014_5min"`, `earth2014_stride = 2`, `enable_superparam = true`, `enable_dust = true`, `dust_emis_factor = 1.5e-5`, `h_ml_ocean = 50.0`, `re_liq_um = 10.0`, `re_ice_um = 48.0`, `cloud_sw_inhomog = 0.85` |
 | `[icesheet]` (5) | `enable_dynamic_icesheet = false`, `icesheet_ema_years = 5.0`, `icesheet_accel_factor = 100.0`, `icesheet_accel_spinup_years = 0.0`, `icesheet_isostasy_tau_yr = 1000.0` |
 | `[output]` (20) | `out_dir = ""`, `years = 30`, `end_date = ""`, `days_per_year = 365.2425`, `zarr_dir_partition = "yearly"`, `daily_csv_enabled = true`, `daily_csv_interval_days = 1.0`, `monthly_mean_enabled = true`, `monthly_mean_periods_per_year = 12`, `monthly_mean_sample_hours = 6.0`, `monthly_mean_include_2d = true`, `monthly_mean_include_3d = true`, `monthly_mean_include_subgrid_2d = true`, `snapshots_enabled = true`, `snapshots_periods_per_year = 12`, `snapshots_include_2d = true`, `snapshots_include_3d = true`, `snapshots_include_subgrid_2d = true`, `restart_interval_years = 1`, `restart_monthly = true` |
 

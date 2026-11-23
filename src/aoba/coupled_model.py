@@ -25,6 +25,7 @@ import torch
 from aoba import constants as C
 from aoba.calendar import AobaCalendar
 from aoba.co2_forcing import CO2ForcingSeries, resolve_co2_series
+from aoba.ozone_forcing import OzoneForcingProvider, resolve_ozone_provider
 from aoba.biosphere import (
     compute_optimal_soil_water_beta,
     update_daily_acclimation_smith,
@@ -101,6 +102,9 @@ class AOBAConfig:
     co2_mode: str = "constant"               # "constant", "scenario", or "csv"
     co2_scenario: str = "obs_historical_noaa"  # Scenario key when co2_mode="scenario"
     co2_csv_path: str = ""                   # Custom (year, co2_ppmv) CSV path when co2_mode="csv"
+    o3_mode: str = "rcemip"                  # "rcemip" (1D), "latitude_seasonal" (2D analytical), or "climatology"
+    o3_file_path: str = ""                   # Optional external zonal/3D ozone (.npz/.nc) when o3_mode="climatology"
+    o3_lw_coupling: bool = False             # Enable 9.6 um O3 absorption in LW2 atmospheric window
     solar_constant: float = C.SOLAR_CONSTANT # Total solar irradiance S_0 [W m^-2]
     omega: float = C.OMEGA_EARTH             # Planetary rotation rate [rad s^-1]
     obliquity_deg: float = C.OBLIQUITY_DEG   # Axial tilt [deg]
@@ -164,6 +168,7 @@ class AOBAState:
     rad_cache: dict[str, torch.Tensor] = field(default_factory=dict)
     calendar: AobaCalendar = field(default_factory=AobaCalendar)
     co2_series: CO2ForcingSeries | None = None
+    o3_provider: OzoneForcingProvider | None = None
 
     def current_co2_ppmv(self, sim_time_sec: float | None = None) -> float:
         """Return active atmospheric CO2 [ppmv] at ``sim_time_sec`` (or ``self.sim_time_sec``)."""
@@ -244,6 +249,8 @@ def _compute_four_band_radiation_chunked(
     re_ice_um: float = 48.0,
     cloud_sw_inhomog: float = 0.85,
     q_dust_c: torch.Tensor | None = None,
+    o3_vmr_c: torch.Tensor | None = None,
+    o3_lw_coupling: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Evaluate 1D ICA 4-band radiative transfer across `[nz, m_sub]`, chunking when `m_sub > col_chunk`."""
     nz, m_sub = pres_c.shape
@@ -272,6 +279,8 @@ def _compute_four_band_radiation_chunked(
             albedo_vis_dif=albedo_vis_dif,
             albedo_nir_dif=albedo_nir_dif,
             q_dust_c=q_dust_c,
+            o3_vmr_c=o3_vmr_c,
+            o3_lw_coupling=o3_lw_coupling,
         )
         return (
             rad.q_rad_net,
@@ -320,6 +329,8 @@ def _compute_four_band_radiation_chunked(
             albedo_vis_dif=albedo_vis_dif[sl],
             albedo_nir_dif=albedo_nir_dif[sl],
             q_dust_c=q_dust_c[:, sl] if q_dust_c is not None else None,
+            o3_vmr_c=o3_vmr_c[:, sl] if o3_vmr_c is not None else None,
+            o3_lw_coupling=o3_lw_coupling,
         )
         q_rad[:, sl] = rad.q_rad_net
         sw1_dir[sl] = rad.sfc_sw1_dir_dn
@@ -542,6 +553,10 @@ def init_aoba_model(
             co2_scenario=cfg.co2_scenario,
             co2_csv_path=cfg.co2_csv_path,
         ),
+        o3_provider=resolve_ozone_provider(
+            o3_mode=cfg.o3_mode,
+            o3_file_path=cfg.o3_file_path,
+        ),
     )
     broadcast_host_surface_to_subgrid(model)
     return model
@@ -736,6 +751,14 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
         if cfg.enable_dust and atmos.q_dust is None:
             atmos.q_dust = torch.zeros_like(atmos.q_n)
         q_dust_rad = _cell_to_sub(atmos.q_dust, nc, n_sub) if (cfg.enable_dust and atmos.q_dust is not None) else None
+        o3_vmr_rad = None
+        if model.o3_provider is not None and model.o3_provider.mode != "rcemip":
+            doy_now = float(model.calendar.date_at(model.sim_time_sec).doy)
+            o3_vmr_rad = model.o3_provider.compute_vmr(
+                pres_sub,
+                lat_rad=_cell_to_sub(mesh.lat_cell, nc, n_sub),
+                doy=doy_now,
+            )
         q_rad_sub, sw1_dir_sub, sw1_dif_sub, sw2_dir_sub, sw2_dif_sub, lw_dn_sub, olr_sub, asr_sub = (
             _compute_four_band_radiation_chunked(
                 pres_c=pres_sub,
@@ -761,6 +784,8 @@ def step_aoba_model(model: AOBAState) -> GlobalStepDiagnostics:
                 re_ice_um=cfg.re_ice_um,
                 cloud_sw_inhomog=cfg.cloud_sw_inhomog,
                 q_dust_c=q_dust_rad,
+                o3_vmr_c=o3_vmr_rad,
+                o3_lw_coupling=cfg.o3_lw_coupling,
             )
         )
         model.rad_cache["q_rad_sub"] = q_rad_sub

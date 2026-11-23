@@ -42,6 +42,7 @@ if str(_SRC_DIR) not in sys.path:
 
 from aoba.calendar import AobaCalendar  # noqa: E402
 from aoba.co2_forcing import fetch_latest_co2_sources, get_co2_catalog_summary  # noqa: E402
+from aoba.ozone_forcing import fetch_input4mips_ozone_climatology, get_ozone_status_summary  # noqa: E402
 from aoba.params import (  # noqa: E402
     SECTION_META,
     build_configs_from_dict,
@@ -927,6 +928,13 @@ _HTML_PAGE = r"""<!DOCTYPE html>
           </div>
           <div id="co2-status-lbl" class="sub" style="margin-bottom:8px;">Loading CO2 catalog...</div>
           <canvas id="co2Canvas" width="600" height="180"></canvas>
+          <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:space-between; margin-top:10px; padding-top:8px; border-top:1px solid #1e293b;">
+            <span id="o3-status-lbl" class="sub" style="margin:0;">O₃ 外部境界: 未確認</span>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+              <button class="btn-secondary" style="padding:4px 9px; font-size:11px;" onclick="fetchOzoneData('CMIP6')">🌐 CMIP6 O₃取得</button>
+              <button class="btn-secondary" style="padding:4px 9px; font-size:11px;" onclick="fetchOzoneData('CMIP7')">🌐 CMIP7 O₃取得</button>
+            </div>
+          </div>
         </div>
         <div class="card">
           <h2 data-i18n="ice_title">平衡/加速 SIA 氷床モデル設定 (Dynamic Ice Sheet)</h2>
@@ -1336,6 +1344,9 @@ const PARAM_DOCS = {
   co2_mode: { ja: "CO₂ 強制モード (constant: 固定値 / scenario: CMIP・観測・古気候 / csv: 独自CSV)", en: "CO2 forcing mode (constant / scenario / csv)" },
   co2_scenario: { ja: "CO₂ シナリオ名 (NOAA観測 / CMIP5 RCP / CMIP6 SSP / 80万年氷床コア)", en: "CO2 scenario key (NOAA Obs / CMIP5 RCP / CMIP6 SSP / 800ka Ice Core)" },
   co2_csv_path: { ja: "独自 CO₂ 時系列 CSV パス (year, co2_ppmv 列; co2_mode='csv' 時)", en: "Custom (year, co2_ppmv) CSV path when co2_mode='csv'" },
+  o3_mode: { ja: "オゾン分布モード (rcemip: 1D一様 / latitude_seasonal: 解析的2D緯度季節 / climatology: 外部帯状平均)", en: "Ozone mode (rcemip 1D / latitude_seasonal 2D / climatology external)" },
+  o3_file_path: { ja: "外部オゾン気候値ファイル (.npz / .nc; 空欄時は data/boundary/ozone を参照)", en: "External ozone climatology path (.npz/.nc; blank uses data/boundary/ozone)" },
+  o3_lw_coupling: { ja: "長波 9.6 μm 窓領域オゾン吸収を有効化", en: "Enable 9.6 um longwave O3 absorption in LW2 window" },
   start_date: { ja: "シミュレーション開始年月日 (YYYY-MM-DD)", en: "Simulation start date (YYYY-MM-DD)" },
   end_date: { ja: "終了年月日 (YYYY-MM-DD、空欄なら years を使用)", en: "Optional end date (YYYY-MM-DD; blank uses years)" },
   calendar_type: { ja: "暦の種類 (gregorian: 閏年あり / noleap: 365日 / 360_day)", en: "Calendar type (gregorian / noleap / 360_day)" },
@@ -1398,6 +1409,43 @@ async function fetchCO2Catalog() {
     renderSectionContainer("forcing", "forcing-fields");
     drawCO2Canvas();
   } catch (e) { console.warn("CO2 catalog load failed:", e); }
+  fetchOzoneStatus();
+}
+
+async function fetchOzoneStatus() {
+  try {
+    const res = await fetch("/api/ozone_status");
+    const d = await res.json();
+    const el = document.getElementById("o3-status-lbl");
+    if (el) {
+      if (d.cache_exists && d.meta && d.meta.mip_era) {
+        el.textContent = `O₃ 外部境界: ${d.meta.mip_era} (${(d.meta.p_hpa_range||[]).map(x=>x.toFixed(2)).join("..")} hPa)`;
+      } else {
+        el.textContent = "O₃ 外部境界: 未取得 (rcemip / latitude_seasonal は不要)";
+      }
+    }
+  } catch (e) { console.warn("O3 status failed:", e); }
+}
+
+async function fetchOzoneData(era) {
+  const el = document.getElementById("o3-status-lbl");
+  if (el) el.textContent = `ESGF input4MIPs (${era}) から帯状平均 O₃ を取得中...`;
+  try {
+    const res = await fetch("/api/ozone_fetch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mip_era: era }),
+    });
+    const d = await res.json();
+    if (d.ok) {
+      showToast(`${era} オゾン気候値を取得・キャッシュしました`);
+      fetchOzoneStatus();
+    } else {
+      showToast("O₃ 取得エラー: " + (d.error || "unknown"));
+    }
+  } catch (e) {
+    showToast("O₃ 取得に失敗しました: " + e);
+  }
 }
 
 async function fetchLatestCO2(fullSync) {
@@ -1596,6 +1644,12 @@ function buildFieldRow(sec, key, skipKeys = []) {
     } else {
       ctrl = `<input type="text" value="${String(cur).replace(/"/g,'&quot;')}" onchange="setKey('${sec}','${key}',this.value)" />`;
     }
+  } else if (key === "o3_mode") {
+    ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
+      <option value="rcemip" ${cur==="rcemip"?"selected":""}>rcemip (Wing 2018 1D一様)</option>
+      <option value="latitude_seasonal" ${cur==="latitude_seasonal"?"selected":""}>latitude_seasonal (解析的 2D 緯度×季節)</option>
+      <option value="climatology" ${cur==="climatology"?"selected":""}>climatology (外部 CMIP6/7 帯状平均)</option>
+    </select>`;
   } else if (key === "insolation_mode") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
       <option value="seasonal" ${cur==="seasonal"?"selected":""}>seasonal (通常の季節変化)</option>
@@ -2973,6 +3027,10 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
             self._send_json(get_co2_catalog_summary(prefer_cache=True))
             return
 
+        if parsed.path == "/api/ozone_status":
+            self._send_json(get_ozone_status_summary())
+            return
+
         if parsed.path == "/api/scvt_mesh":
             qs = parse_qs(parsed.query)
             try:
@@ -3102,6 +3160,15 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
                 inc_paleo = bool(payload.get("include_paleo", False))
                 st = fetch_latest_co2_sources(include_rcmip=inc_rcmip, include_paleo=inc_paleo, write_bundled=False)
                 self._send_json({"ok": True, "status": st, "catalog": get_co2_catalog_summary(prefer_cache=True)})
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/ozone_fetch":
+            try:
+                era = str(payload.get("mip_era", "CMIP6"))
+                res = fetch_input4mips_ozone_climatology(mip_era=era)
+                self._send_json(res)
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
             return

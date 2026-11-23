@@ -48,7 +48,7 @@ def test_toml_roundtrip_and_module_sync() -> None:
     defaults = default_config_dict()
     loaded = load_aoba_toml(toml_p)
     assert len(defaults) == 13
-    assert sum(len(v) for v in defaults.values()) == 219
+    assert sum(len(v) for v in defaults.values()) == 222
     assert set(loaded.keys()) == set(defaults.keys())
     for sec in defaults:
         assert set(loaded[sec].keys()) == set(defaults[sec].keys()), f"Key mismatch in [{sec}]"
@@ -129,11 +129,14 @@ def test_gui_server_endpoints() -> None:
             assert len(m_resp["verts_on_cell_b64"]) > 0 and len(m_resp["surf_type_b64"]) > 0
 
         state = json.loads(urllib.request.urlopen(f"{base}/api/state").read().decode("utf-8"))
-        assert state["param_count"] == 219
+        assert state["param_count"] == 222
         assert "grid" in state["config"]
 
         co2_cat = json.loads(urllib.request.urlopen(f"{base}/api/co2_catalog").read().decode("utf-8"))
         assert len(co2_cat["scenarios"]) >= 20
+
+        o3_st = json.loads(urllib.request.urlopen(f"{base}/api/ozone_status").read().decode("utf-8"))
+        assert "rcemip" in o3_st["modes"] and "latitude_seasonal" in o3_st["modes"]
 
         disc = json.loads(urllib.request.urlopen(f"{base}/api/runs/discover").read().decode("utf-8"))
         assert disc["ok"]
@@ -323,10 +326,72 @@ def test_co2_forcing_modes_and_calendar() -> None:
         assert abs(s_csv.evaluate(2005.0) - 380.0) < 1e-9
 
 
+def test_ozone_forcing_modes_and_high_top() -> None:
+    import numpy as np
+    import torch
+    from aoba.ozone_forcing import resolve_ozone_provider
+    from aoba.radiation import compute_four_band_radiation
+
+    # 1. latitude_seasonal mode: poleward column increase + high-top stratosphere decay (down to 0.01 hPa)
+    p_hpa = torch.tensor([1000.0, 500.0, 200.0, 50.0, 10.0, 1.0, 0.05, 0.01], dtype=torch.float32)
+    pres_pa = (p_hpa * 100.0).unsqueeze(1).expand(-1, 3)  # [8, 3]
+    lat_rad = torch.deg2rad(torch.tensor([0.0, 55.0, -55.0], dtype=torch.float32))
+
+    prov_ls = resolve_ozone_provider("latitude_seasonal")
+    vmr_apr = prov_ls.compute_vmr(pres_pa, lat_rad=lat_rad, doy=90.0)
+    assert vmr_apr.shape == (8, 3)
+    assert torch.isfinite(vmr_apr).all() and (vmr_apr >= 0.0).all()
+    # High-top mesosphere (0.01 hPa) should decay well below the ~10 hPa peak
+    assert vmr_apr[7, 0] < 0.2 * vmr_apr[4, 0]
+    # NH spring (DOY 90) higher at 55N than 55S
+    assert vmr_apr[3, 1] > vmr_apr[3, 2]
+
+    # 2. External climatology mode with high-top extrapolation above table top (0.3 hPa -> 0.01 hPa)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        o3_npz = Path(tmpdir) / "test_o3.npz"
+        p_tbl = np.array([0.3, 1.0, 10.0, 50.0, 200.0, 1000.0], dtype=np.float32)
+        lat_tbl = np.array([-90.0, 0.0, 90.0], dtype=np.float32)
+        vmr_tbl = np.zeros((12, len(p_tbl), len(lat_tbl)), dtype=np.float32)
+        vmr_tbl[:, 0, :] = 1.5e-6
+        vmr_tbl[:, 1, :] = 6.0e-6
+        vmr_tbl[:, 2, :] = 9.0e-6
+        vmr_tbl[:, 3, :] = 2.0e-6
+        vmr_tbl[:, 4, :] = 2.0e-7
+        vmr_tbl[:, 5, :] = 3.0e-8
+        np.savez(o3_npz, lat_deg=lat_tbl, p_hpa=p_tbl, vmr=vmr_tbl)
+
+        prov_ext = resolve_ozone_provider("climatology", str(o3_npz))
+        vmr_ext = prov_ext.compute_vmr(pres_pa, lat_rad=lat_rad, doy=15.0)
+        assert vmr_ext.shape == (8, 3) and torch.isfinite(vmr_ext).all()
+        assert vmr_ext[7, 0] < vmr_ext[5, 0]  # Decays smoothly above 0.3 hPa table top
+
+    # 3. 9.6 um LW coupling reduces TOA OLR slightly
+    nz = 8
+    p_w = torch.linspace(100000.0, 100.0, nz + 1)
+    p_c = 0.5 * (p_w[:-1] + p_w[1:])
+    t_c = torch.linspace(290.0, 220.0, nz)
+    t_w = torch.linspace(295.0, 220.0, nz + 1)
+    dz = torch.full((nz,), 2000.0)
+    rho = p_c / (287.04 * t_c)
+    z0 = torch.zeros((nz, 1))
+    rad_off = compute_four_band_radiation(
+        p_c[:, None], p_w[:, None], t_c[:, None], t_w[:, None], dz[:, None], rho[:, None],
+        z0 + 1e-3, z0, z0, torch.tensor([295.0]), torch.tensor([0.1]), torch.tensor([0.2]),
+        torch.tensor([0.5]), torch.tensor([1361.0]), o3_lw_coupling=False,
+    )
+    rad_on = compute_four_band_radiation(
+        p_c[:, None], p_w[:, None], t_c[:, None], t_w[:, None], dz[:, None], rho[:, None],
+        z0 + 1e-3, z0, z0, torch.tensor([295.0]), torch.tensor([0.1]), torch.tensor([0.2]),
+        torch.tensor([0.5]), torch.tensor([1361.0]), o3_lw_coupling=True,
+    )
+    assert rad_on.toa_olr.item() < rad_off.toa_olr.item()
+
+
 if __name__ == "__main__":
     test_toml_roundtrip_and_module_sync()
     test_snapshot_variable_filtering()
     test_gui_server_endpoints()
     test_co2_forcing_modes_and_calendar()
+    test_ozone_forcing_modes_and_high_top()
     test_runner_cli_with_custom_toml_cpu()
     print("ALL PARAMS, OUTPUT & GUI TESTS PASSED.")

@@ -523,6 +523,8 @@ def compute_four_band_radiation(
     albedo_vis_dif: torch.Tensor | None = None,
     albedo_nir_dif: torch.Tensor | None = None,
     q_dust_c: torch.Tensor | None = None,
+    o3_vmr_c: torch.Tensor | None = None,
+    o3_lw_coupling: bool = False,
 ) -> RadiationOutput:
     """Evaluate 4-band (SW1, SW2, LW1, LW2) radiative fluxes and heating rates.
 
@@ -561,7 +563,7 @@ def compute_four_band_radiation(
 
     # Layer ozone column u_O3 [cm-NTP]:
     # 1 mol O3 = 0.048 kg, molar air mass = 0.028964 kg/mol, 1 cm-NTP = 2.1415e-2 kg O3 m^-2
-    o3_vmr = background_ozone_vmr(p_c)
+    o3_vmr = torch.clamp(torch.flip(o3_vmr_c, dims=[0]), min=0.0) if o3_vmr_c is not None else background_ozone_vmr(p_c)
     o3_mass_kgm2 = o3_vmr * (48.0 / 28.964) * dm_dry
     du_o3_cm = o3_mass_kgm2 / 2.1415e-2
     u_o3_cum = torch.zeros((N + 1,) + col_shape, dtype=dtype, device=device)
@@ -677,6 +679,9 @@ def compute_four_band_radiation(
 
     tau_lw1 = dtau_wv_lw1 + dtau_co2_lw1 + tau_cld_lw1
     tau_lw2 = dtau_wv_lw2 + dtau_co2_lw2 + tau_cld_lw2
+    if o3_lw_coupling:
+        # 9.6 um O3 band absorption inside the 8-12.5 um atmospheric window (Ramanathan & Dickinson, 1979)
+        tau_lw2 = tau_lw2 + 4.5 * o3_mass_kgm2
     if q_dust is not None:
         from aoba.dust import DUST_K_ABS_LW1, DUST_K_ABS_LW2
 
