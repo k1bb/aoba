@@ -104,7 +104,8 @@ class SCVTMesh:
         """Move all mesh tensors to target compute device (`cpu` or `mps`) and float `dtype`."""
         dev = torch.device(device)
         fields = {}
-        for name, val in self.__dict__.items():
+        for name in self.__dataclass_fields__:
+            val = getattr(self, name)
             if isinstance(val, torch.Tensor):
                 if val.is_floating_point():
                     fields[name] = val.to(device=dev, dtype=dtype)
