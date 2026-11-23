@@ -629,11 +629,12 @@ def main() -> None:
                 start_year = y + 1
                 resumed_existing = True
                 break
-        if start_year <= years:
-            mid_pt = out_root / f"year_{start_year:04d}" / "restart_mid.pt"
+        for y in range(years, start_year - 1, -1):
+            mid_pt = out_root / f"year_{y:04d}" / "restart_mid.pt"
             if mid_pt.exists():
                 print(f"Resuming mid-year from {mid_pt}...", flush=True)
                 ckpt_mid = _load_restart_into_model(model, mid_pt, dev)
+                start_year = y
                 resumed_existing = True
                 if not ckpt_mid.get("_vertical_remapped", False):
                     resume_step_in_yr = int(ckpt_mid.get("resume_step_in_yr", 0))
@@ -641,6 +642,7 @@ def main() -> None:
                     resume_m_cnt = int(ckpt_mid.get("resume_m_cnt", 0))
                     raw_msums = ckpt_mid.get("resume_m_sums", {}) or {}
                     resume_m_sums = {k: v.to(device=dev) for k, v in raw_msums.items()}
+                break
 
     if not resumed_existing and args.init_from_restart:
         init_pt = Path(args.init_from_restart).expanduser()
