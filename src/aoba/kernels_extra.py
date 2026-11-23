@@ -2591,6 +2591,11 @@ def _get_scvt_mesh_cache(mesh: Any) -> dict[str, Any]:
         vort_w = (mesh.edge_sign_on_vert * mesh.dc_edge[mesh.edges_on_vert] / mesh.area_vert.unsqueeze(-1)).contiguous()
         inv_dc = (1.0 / mesh.dc_edge).contiguous()
         inv_dv = (1.0 / torch.clamp(mesh.dv_edge, min=100.0)).contiguous()
+        w_edge = 0.5 * mesh.dc_edge * mesh.dv_edge
+        active_c = (mesh.edge_sign_on_cell != 0.0).to(w_edge.dtype)
+        inv_area_c = 1.0 / mesh.area_cell.unsqueeze(-1)
+        rec_ew = ((w_edge * mesh.east_normal_edge)[mesh.edges_on_cell] * active_c * inv_area_c).contiguous()
+        rec_nw = ((w_edge * mesh.north_normal_edge)[mesh.edges_on_cell] * active_c * inv_area_c).contiguous()
         mc = {
             "c0": c0, "c1": c1, "v0": v0, "v1": v1,
             "eoc": eoc, "eov": eov, "ep": ep,
@@ -2598,6 +2603,9 @@ def _get_scvt_mesh_cache(mesh: Any) -> dict[str, Any]:
             "f_vert": mesh.f_vert.contiguous(),
             "div_w": div_w, "vort_w": vort_w,
             "inv_dc": inv_dc, "inv_dv": inv_dv,
+            "rec_ew": rec_ew, "rec_nw": rec_nw,
+            "east_ne": mesh.east_normal_edge.contiguous(),
+            "north_ne": mesh.north_normal_edge.contiguous(),
             "esgn": mesh.edge_sign_on_cell.contiguous(),
             "area_cell": mesh.area_cell.contiguous(),
             "dv_edge": mesh.dv_edge.contiguous(),

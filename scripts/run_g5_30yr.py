@@ -385,6 +385,15 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
     return ckpt
 
 
+_SUBGRID_2D_UNITS: dict[str, str] = {
+    "lwp_sub": "kg m-2", "iwp_sub": "kg m-2", "w_max_sub": "m s-1",
+    "precip_mm_day_sub": "mm day-1", "sw1_dir_sub": "W m-2", "sw1_dif_sub": "W m-2",
+    "sw_dn_sub": "W m-2", "lw_dn_sub": "W m-2", "olr_sub": "W m-2", "shf_sub": "W m-2",
+    "evap_mm_day_sub": "mm day-1", "gpp_sub": "umol m-2 s-1", "t_sfc_sub": "K",
+    "m_seaice_sub": "kg m-2", "swe_land_sub": "kg m-2", "w_root_sub": "kg m-2", "lai_sub": "m2 m-2",
+}
+
+
 def _build_monthly_mean_xarray(
     model: AOBAState,
     sums: dict[str, torch.Tensor],
@@ -425,9 +434,10 @@ def _build_monthly_mean_xarray(
             arr = (sums[name] * inv).detach().cpu().numpy()[None, :, :]
             data_vars[name] = (("time", "nz", "n_cell"), arr, {"units": unit})
     if include_subgrid_2d:
-        for name, (_, unit) in diagnose_subgrid_2d_fields(model).items():
-            arr = (sums[name] * inv).detach().cpu().numpy()[None, :, :, :]
-            data_vars[name] = (("time", "n_cell", "crm_y", "crm_x"), arr, {"units": unit})
+        for name, unit in _SUBGRID_2D_UNITS.items():
+            if name in sums:
+                arr = (sums[name] * inv).detach().cpu().numpy()[None, :, :, :]
+                data_vars[name] = (("time", "n_cell", "crm_y", "crm_x"), arr, {"units": unit})
 
     _, _, ny, nx = model.crm.rho_d.shape
 
@@ -489,12 +499,21 @@ def _write_live_preview_atomic(
     h_ice = model.icesheet.h_ice if model.icesheet is not None else torch.zeros_like(t2_k)
 
     date_str = model.calendar.date_at(model.sim_time_sec).iso_datetime[:16]
+    coords_np = getattr(mesh, "_live_preview_coords", None)
+    if coords_np is None:
+        coords_np = (
+            np.rad2deg(mesh.lat_cell.detach().cpu().numpy()).astype(np.float32),
+            np.rad2deg(mesh.lon_cell.detach().cpu().numpy()).astype(np.float32),
+            mesh.surf_type.detach().cpu().numpy().astype(np.int8),
+        )
+        mesh._live_preview_coords = coords_np
+    lat_deg_np, lon_deg_np, surf_type_np = coords_np
     tmp_path = out_path.with_name(f".{out_path.name}.tmp.npz")
     np.savez(
         tmp_path,
-        lat_deg=np.rad2deg(mesh.lat_cell.detach().cpu().numpy()).astype(np.float32),
-        lon_deg=np.rad2deg(mesh.lon_cell.detach().cpu().numpy()).astype(np.float32),
-        surf_type=mesh.surf_type.detach().cpu().numpy().astype(np.int8),
+        lat_deg=lat_deg_np,
+        lon_deg=lon_deg_np,
+        surf_type=surf_type_np,
         t2_k=t2_k.detach().cpu().numpy().astype(np.float32),
         precip_mm_day=precip_mm_day.detach().cpu().numpy().astype(np.float32),
         olr=olr.detach().cpu().numpy().astype(np.float32),
@@ -716,7 +735,32 @@ def main() -> None:
         prev_cal_month = model.calendar.date_at(model.sim_time_sec).month
 
         for step_in_yr in range(step_start, steps_per_year + 1):
-            diag = step_aoba_model(model)
+            is_preview_step = (step_in_yr % preview_stride_steps == 0)
+            is_monthly_end = (
+                out_cfg.monthly_mean_enabled
+                and m_idx + 1 < len(mean_bounds)
+                and step_in_yr >= mean_bounds[m_idx + 1]
+            )
+            is_monthly_sample = out_cfg.monthly_mean_enabled and (
+                (step_in_yr % sample_stride == 0) or is_monthly_end
+            )
+            is_snap_step = out_cfg.snapshots_enabled and (step_in_yr in snap_steps)
+            next_cal_month = model.calendar.date_at(model.sim_time_sec + cfg.dt_host).month
+            is_month_restart = (
+                getattr(out_cfg, "restart_monthly", True)
+                and (next_cal_month != prev_cal_month)
+                and (step_in_yr < steps_per_year)
+            )
+            is_year_end = (step_in_yr == steps_per_year) or (
+                max_total_steps is not None and (model.step_count + 1) >= max_total_steps
+            )
+            is_sync_step = is_preview_step or is_monthly_sample or is_snap_step or is_month_restart or is_year_end
+
+            diag = step_aoba_model(
+                model,
+                compute_diagnostics=bool(out_cfg.daily_csv_enabled),
+                sync_host_surface=is_sync_step,
+            )
 
             day_accum["ts"] += diag.global_mean_t_sfc_k
             day_accum["olr"] += diag.global_mean_olr_wm2
@@ -731,7 +775,12 @@ def main() -> None:
             _, _, temp0_p = diagnose_pressure_temperature(
                 model.atmos.rho_d[0:1], model.atmos.theta_m[0:1], model.atmos.q_v[0:1]
             )
-            t_sfc_p = torch.where(model.mesh.surf_type == SURF_OCEAN, model.sfc.t_ocean_ml, model.sfc.t_canopy)
+            if is_sync_step or model.sfc_sub is None:
+                t_sfc_p = torch.where(model.mesh.surf_type == SURF_OCEAN, model.sfc.t_ocean_ml, model.sfc.t_canopy)
+            else:
+                ss = model.sfc_sub
+                n_sub = model.cfg.crm_ny * model.cfg.crm_nx
+                t_sfc_p = torch.where(ss.surf_type == SURF_OCEAN, ss.t_ocean_ml, ss.t_canopy).reshape(model.mesh.n_cells, n_sub).mean(dim=-1)
             t2_inst = 0.35 * t_sfc_p + 0.65 * temp0_p[0]
             rain_p = model.rad_cache.get("rain", torch.zeros_like(t2_inst))
             snow_p = model.rad_cache.get("snow", torch.zeros_like(t2_inst))

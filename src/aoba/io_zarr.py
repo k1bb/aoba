@@ -124,10 +124,6 @@ def export_aoba_snapshot_xarray(
     atmos = model.atmos
     sfc = model.sfc
 
-    u_c, v_c = reconstruct_cell_winds(mesh, atmos.u_edge)
-    pres_c, _, temp_c = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
-    kg30, kg5 = diagnose_model_koppen_geiger(model)
-
     t_days = np.array([model.sim_time_sec / C.SECONDS_PER_DAY], dtype=np.float64)
     lat_deg = np.rad2deg(mesh.lat_cell.detach().cpu().numpy())
     lon_deg = np.rad2deg(mesh.lon_cell.detach().cpu().numpy())
@@ -143,10 +139,6 @@ def export_aoba_snapshot_xarray(
         # [n_cell, ny, nx] -> [1, n_cell, ny, nx]
         return t.detach().cpu().numpy()[None, :, :, :]
 
-    sub_vars = {
-        k: (("time", "n_cell", "crm_y", "crm_x"), _c3(val), {"units": unit})
-        for k, (val, unit) in diagnose_subgrid_2d_fields(model).items()
-    }
     _, _, ny, nx = model.crm.rho_d.shape
 
     data_vars: dict[str, Any] = {
@@ -165,6 +157,7 @@ def export_aoba_snapshot_xarray(
         "z_topo": (("n_cell",), mesh.z_topo.detach().cpu().numpy(), {"units": "m"}),
     }
     if include_2d:
+        kg30, kg5 = diagnose_model_koppen_geiger(model)
         data_vars.update({
             "t_ocean_ml": (("time", "n_cell"), _c1(sfc.t_ocean_ml), {"units": "K"}),
             "t_canopy": (("time", "n_cell"), _c1(sfc.t_canopy), {"units": "K"}),
@@ -183,6 +176,8 @@ def export_aoba_snapshot_xarray(
             data_vars["h_ice"] = (("time", "n_cell"), _c1(model.icesheet.h_ice), {"units": "m"})
             data_vars["z_topo_dyn"] = (("time", "n_cell"), _c1(mesh.z_topo), {"units": "m"})
     if include_3d:
+        u_c, v_c = reconstruct_cell_winds(mesh, atmos.u_edge)
+        pres_c, _, temp_c = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
         data_vars.update({
             "temp": (("time", "nz", "n_cell"), _c2(temp_c), {"units": "K"}),
             "pres": (("time", "nz", "n_cell"), _c2(pres_c), {"units": "Pa"}),
@@ -191,7 +186,8 @@ def export_aoba_snapshot_xarray(
             "v_merid": (("time", "nz", "n_cell"), _c2(v_c), {"units": "m s-1"}),
         })
     if include_subgrid_2d:
-        data_vars.update(sub_vars)
+        for k, (val, unit) in diagnose_subgrid_2d_fields(model).items():
+            data_vars[k] = (("time", "n_cell", "crm_y", "crm_x"), _c3(val), {"units": unit})
 
     coords: dict[str, Any] = {
         "time": ("time", t_days, {"units": "days since 2000-03-20 00:00:00"}),

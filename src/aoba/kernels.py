@@ -41,6 +41,8 @@ from aoba.kernels_physics import (
     run_oro_gwd_metal,
     run_rad_four_band_metal,
     run_scvt_fct_advect_metal,
+    run_scvt_project_winds_metal,
+    run_scvt_reconstruct_winds_metal,
     run_surface_albedos_metal,
     run_surface_transfer_metal,
     run_two_leaf_gas_exchange_metal,
@@ -981,6 +983,24 @@ def dispatch_two_leaf_gas_exchange_metal(**kwargs: Any) -> torch.Tensor:
     lib = _get_metal_lib()
     assert lib is not None
     return run_two_leaf_gas_exchange_metal(lib, **kwargs)
+
+
+def dispatch_scvt_reconstruct_winds_metal(mesh: Any, u_edge: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_metal_lib()
+    assert lib is not None
+    mc = _get_scvt_mesh_cache(mesh)
+    return run_scvt_reconstruct_winds_metal(lib, mc, u_edge)
+
+
+def dispatch_scvt_project_winds_metal(
+    mesh: Any,
+    vec_east_cell: torch.Tensor,
+    vec_north_cell: torch.Tensor,
+) -> torch.Tensor:
+    lib = _get_metal_lib()
+    assert lib is not None
+    mc = _get_scvt_mesh_cache(mesh)
+    return run_scvt_project_winds_metal(lib, mc, vec_east_cell, vec_north_cell)
 
 
 def run_crm_rk3_hevi_metal(

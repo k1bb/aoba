@@ -1674,7 +1674,116 @@ kernel void two_leaf_gas_exchange_col(
     out_5[3u * M + col] = gsw_sun_r;
     out_5[4u * M + col] = gsw_sh_r;
 }
+
+kernel void scvt_reconstruct_winds(
+    device const float* u_edge     [[buffer(0)]],
+    device const int* eoc          [[buffer(1)]],
+    device const float* rec_ew     [[buffer(2)]],
+    device const float* rec_nw     [[buffer(3)]],
+    device float* u_zonal          [[buffer(4)]],
+    device float* v_merid          [[buffer(5)]],
+    constant ulong4& u_p           [[buffer(6)]],
+    uint gid                       [[thread_position_in_grid]]
+) {
+    uint nz = uint(u_p.x);
+    uint n_cells = uint(u_p.y);
+    uint n_edges = uint(u_p.z);
+    if (gid >= nz * n_cells) return;
+    uint k = gid / n_cells;
+    uint cell = gid - k * n_cells;
+    uint cbase = cell * 6u;
+    uint kbase = k * n_edges;
+    float ue = 0.0f;
+    float vn = 0.0f;
+    for (uint m = 0u; m < 6u; ++m) {
+        uint e = uint(eoc[cbase + m]);
+        float val = u_edge[kbase + e];
+        ue = fma(val, rec_ew[cbase + m], ue);
+        vn = fma(val, rec_nw[cbase + m], vn);
+    }
+    u_zonal[gid] = ue;
+    v_merid[gid] = vn;
+}
+
+kernel void scvt_project_winds(
+    device const float* vec_east   [[buffer(0)]],
+    device const float* vec_north  [[buffer(1)]],
+    device const int* c0           [[buffer(2)]],
+    device const int* c1           [[buffer(3)]],
+    device const float* east_ne    [[buffer(4)]],
+    device const float* north_ne   [[buffer(5)]],
+    device float* u_edge_out       [[buffer(6)]],
+    constant ulong4& u_p           [[buffer(7)]],
+    uint gid                       [[thread_position_in_grid]]
+) {
+    uint nz = uint(u_p.x);
+    uint n_edges = uint(u_p.y);
+    uint n_cells = uint(u_p.z);
+    if (gid >= nz * n_edges) return;
+    uint k = gid / n_edges;
+    uint e = gid - k * n_edges;
+    uint kbase = k * n_cells;
+    uint i0 = kbase + uint(c0[e]);
+    uint i1 = kbase + uint(c1[e]);
+    float ve = 0.5f * (vec_east[i0] + vec_east[i1]);
+    float vn = 0.5f * (vec_north[i0] + vec_north[i1]);
+    u_edge_out[gid] = ve * east_ne[e] + vn * north_ne[e];
+}
 """
+
+
+def run_scvt_reconstruct_winds_metal(
+    lib: Any,
+    mc: dict[str, Any],
+    u_edge: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    is_1d = u_edge.ndim == 1
+    u_2d = u_edge.unsqueeze(0) if is_1d else u_edge
+    nz = u_2d.shape[0]
+    nc = mc["n_cells"]
+    ne = mc["n_edges"]
+    u_zonal = torch.empty((nz, nc), dtype=torch.float32, device=u_edge.device)
+    v_merid = torch.empty((nz, nc), dtype=torch.float32, device=u_edge.device)
+    lib.scvt_reconstruct_winds(
+        u_2d.contiguous(),
+        mc["eoc"],
+        mc["rec_ew"],
+        mc["rec_nw"],
+        u_zonal,
+        v_merid,
+        [int(nz), int(nc), int(ne), 0],
+        threads=nz * nc,
+    )
+    if is_1d:
+        return u_zonal[0], v_merid[0]
+    return u_zonal, v_merid
+
+
+def run_scvt_project_winds_metal(
+    lib: Any,
+    mc: dict[str, Any],
+    vec_east_cell: torch.Tensor,
+    vec_north_cell: torch.Tensor,
+) -> torch.Tensor:
+    is_1d = vec_east_cell.ndim == 1
+    ve_2d = vec_east_cell.unsqueeze(0) if is_1d else vec_east_cell
+    vn_2d = vec_north_cell.unsqueeze(0) if is_1d else vec_north_cell
+    nz = ve_2d.shape[0]
+    nc = mc["n_cells"]
+    ne = mc["n_edges"]
+    out = torch.empty((nz, ne), dtype=torch.float32, device=vec_east_cell.device)
+    lib.scvt_project_winds(
+        ve_2d.contiguous(),
+        vn_2d.contiguous(),
+        mc["c0"],
+        mc["c1"],
+        mc["east_ne"],
+        mc["north_ne"],
+        out,
+        [int(nz), int(ne), int(nc), 0],
+        threads=nz * ne,
+    )
+    return out[0] if is_1d else out
 
 
 _SFC_CONST_CACHE: dict[tuple[float, ...], torch.Tensor] = {}

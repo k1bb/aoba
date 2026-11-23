@@ -35,6 +35,11 @@ from scipy.spatial import ConvexHull, cKDTree
 import torch
 
 from aoba import constants as C
+from aoba.kernels import (
+    can_use_elem_metal,
+    dispatch_scvt_project_winds_metal,
+    dispatch_scvt_reconstruct_winds_metal,
+)
 from aoba.runtime import ensure_earth2014_data
 
 
@@ -752,6 +757,9 @@ def reconstruct_cell_winds(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reconstruct cell-center zonal & meridional winds `(u_zonal, v_merid)` `[..., n_cells]`
     from edge normal velocities `u_edge` `[..., n_edges]` via Perot (2000) / Ringler et al. (2010, Eq. 29)."""
+    if u_edge.ndim in (1, 2) and u_edge.shape[-1] == mesh.n_edges and can_use_elem_metal(u_edge):
+        return dispatch_scvt_reconstruct_winds_metal(mesh, u_edge)
+
     # Weighted least-squares / Perot vector reconstruction:
     # u_vec_i = (1 / A_i) * sum_{e in cell i} (0.5 * dc_e * dv_e) * u_e * n_e
     w_e = 0.5 * mesh.dc_edge * mesh.dv_edge  # [n_edges] = area_edge
@@ -773,6 +781,15 @@ def project_cell_vectors_to_edges(
     vec_north_cell: torch.Tensor,
 ) -> torch.Tensor:
     """Project cell-centered `(east, north)` vector tendencies `[..., n_cells]` onto C-grid edge normals."""
+    if (
+        vec_east_cell.ndim in (1, 2)
+        and vec_east_cell.shape == vec_north_cell.shape
+        and vec_east_cell.shape[-1] == mesh.n_cells
+        and can_use_elem_metal(vec_east_cell)
+        and not vec_north_cell.requires_grad
+    ):
+        return dispatch_scvt_project_winds_metal(mesh, vec_east_cell, vec_north_cell)
+
     c0 = mesh.cells_on_edge[:, 0]
     c1 = mesh.cells_on_edge[:, 1]
     ve = 0.5 * (vec_east_cell[..., c0] + vec_east_cell[..., c1])

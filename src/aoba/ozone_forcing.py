@@ -173,35 +173,50 @@ class ZonalOzoneClimatology:
         """Interpolate ``vmr[12, p, lat]`` onto ``pres_pa [Nz, N_col]`` and ``lat_rad [N_col]``."""
         dtype = pres_pa.dtype
         device = pres_pa.device
-        nz, ncol = pres_pa.shape
+        cache = getattr(self, "_dev_cache", None)
+        if cache is None:
+            cache = {}
+            self._dev_cache = cache
+        ckey = (device.type, device.index or 0, str(dtype))
+        entry = cache.get(ckey)
+        if entry is None:
+            entry = (
+                torch.as_tensor(self.lat_deg, device=device, dtype=dtype).contiguous(),
+                torch.as_tensor(self.ln_p, device=device, dtype=dtype).contiguous(),
+                torch.as_tensor(self.vmr, device=device, dtype=dtype).contiguous(),
+            )
+            cache[ckey] = entry
+        lat_tbl, ln_p_tbl, vmr_tbl = entry
 
         # Cyclic monthly interpolation (month centers at DOY ~ 15.2, 45.6, ...)
         m_float = ((float(doy) - 15.2) / 365.2425) * 12.0
         m0 = int(math.floor(m_float)) % 12
         m1 = (m0 + 1) % 12
         w_m = m_float - math.floor(m_float)
-        vmr_m = (1.0 - w_m) * self.vmr[m0] + w_m * self.vmr[m1]  # [n_plev, n_lat]
+        vmr_m = (1.0 - w_m) * vmr_tbl[m0] + w_m * vmr_tbl[m1]  # [n_plev, n_lat]
 
-        lat_deg_np = np.rad2deg(lat_rad.detach().cpu().numpy()).astype(np.float64)
-        # First interpolate in latitude for every pressure level -> [n_plev, N_col]
-        vmr_lat = np.empty((len(self.p_hpa), ncol), dtype=np.float64)
-        for k in range(len(self.p_hpa)):
-            vmr_lat[k] = np.interp(lat_deg_np, self.lat_deg, vmr_m[k])
+        # Vectorized linear interpolation in latitude on native device
+        lat_d = torch.rad2deg(lat_rad).to(dtype).contiguous()
+        n_lat = lat_tbl.numel()
+        j1 = torch.searchsorted(lat_tbl, lat_d).clamp(0, n_lat - 1)
+        j0 = (j1 - 1).clamp(0, n_lat - 1)
+        w_lat = torch.clamp((lat_d - lat_tbl[j0]) / torch.clamp(lat_tbl[j1] - lat_tbl[j0], min=1.0e-6), 0.0, 1.0)
+        vmr_lat = (1.0 - w_lat).unsqueeze(0) * vmr_m[:, j0] + w_lat.unsqueeze(0) * vmr_m[:, j1]  # [n_plev, N_col]
 
-        # Then interpolate in ln(p) per column -> [Nz, N_col]
-        # Above table top (p < p_hpa[0], e.g. high-top stratosphere/mesosphere runs), apply
-        # Wing et al. (2018) p^g2 decay from the table top rather than unphysical constant clamping.
-        p_col_hpa = np.clip(pres_pa.detach().cpu().numpy().astype(np.float64) * 0.01, 1.0e-4, 1200.0)
-        ln_p_col = np.log(p_col_hpa)
+        # Vectorized linear interpolation in ln(p) on native device across all columns
+        p_hpa = torch.clamp(pres_pa * 0.01, min=1.0e-4, max=1200.0)
+        ln_p_col = torch.log(p_hpa).contiguous()
+        n_p = ln_p_tbl.numel()
+        k1 = torch.searchsorted(ln_p_tbl, ln_p_col).clamp(0, n_p - 1)
+        k0 = (k1 - 1).clamp(0, n_p - 1)
+        w_p = torch.clamp((ln_p_col - ln_p_tbl[k0]) / torch.clamp(ln_p_tbl[k1] - ln_p_tbl[k0], min=1.0e-6), 0.0, 1.0)
+        v0 = torch.gather(vmr_lat, 0, k0)
+        v1 = torch.gather(vmr_lat, 0, k1)
+        prof = (1.0 - w_p) * v0 + w_p * v1
+
         p_top_tbl = float(self.p_hpa[0])
-        out = np.empty((nz, ncol), dtype=np.float64)
-        for j in range(ncol):
-            prof = np.interp(ln_p_col[:, j], self.ln_p, vmr_lat[:, j])
-            above = p_col_hpa[:, j] < p_top_tbl
-            if np.any(above):
-                prof[above] = prof[above] * np.power(p_col_hpa[above, j] / p_top_tbl, C.O3_G2)
-            out[:, j] = prof
-        return torch.from_numpy(out).to(device=device, dtype=dtype)
+        above = p_hpa < p_top_tbl
+        return torch.where(above, prof * torch.pow(torch.clamp(p_hpa / p_top_tbl, max=1.0), C.O3_G2), prof)
 
 
 @dataclass
