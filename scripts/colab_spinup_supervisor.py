@@ -58,6 +58,7 @@ class Supervisor:
         poll_sec: int,
         max_session_hours: float,
         min_cu_reserve: float,
+        enable_ocean_bgc: bool = False,
     ) -> None:
         self.session = session
         self.gpu = gpu
@@ -67,6 +68,7 @@ class Supervisor:
         self.poll_sec = poll_sec
         self.max_session_hours = max_session_hours
         self.min_cu_reserve = min_cu_reserve
+        self.enable_ocean_bgc = enable_ocean_bgc
         self.log_path = self.out_dir / "supervisor.log"
         self.status_path = self.out_dir / "spinup_status.json"
         self.stop_requested = False
@@ -285,6 +287,8 @@ cmd = [
     "--out-dir", "{REMOTE_OUT}",
     "--device", "cuda",
 ]
+if {bool(self.enable_ocean_bgc)!r}:
+    cmd.append("--enable-ocean-bgc")
 p = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, env=env, cwd="{REMOTE_REPO}", start_new_session=True)
 (out_dir / "runner.pid").write_text(str(p.pid))
 print(f"LAUNCHED_PID={{p.pid}}", flush=True)
@@ -636,6 +640,7 @@ def main() -> None:
     parser.add_argument("--poll-sec", type=int, default=900, help="Sync & monitor interval in seconds (default 15 min)")
     parser.add_argument("--max-session-hours", type=float, default=21.5, help="Graceful VM rotation threshold [hours]")
     parser.add_argument("--min-cu-reserve", type=float, default=100.0, help="Minimum CU balance reserve before halting")
+    parser.add_argument("--enable-ocean-bgc", action="store_true", help="Enable FlexPFT marine BGC & carbonate chemistry")
     args = parser.parse_args()
 
     sup = Supervisor(
@@ -646,6 +651,7 @@ def main() -> None:
         poll_sec=args.poll_sec,
         max_session_hours=args.max_session_hours,
         min_cu_reserve=args.min_cu_reserve,
+        enable_ocean_bgc=bool(args.enable_ocean_bgc),
     )
     sup.run_forever()
 

@@ -142,7 +142,15 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
         "sfc_sub": _serialize_surface(model.sfc_sub) if model.sfc_sub is not None else None,
         "ocn": {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.ocn.__dict__.items()},
         "ogcm": (
-            {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.ogcm.__dict__.items()}
+            {
+                k: (
+                    {bk: bv.detach().cpu() if isinstance(bv, torch.Tensor) else bv for bk, bv in v.__dict__.items()}
+                    if k == "bgc" and v is not None
+                    else (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+                )
+                for k, v in model.ogcm.__dict__.items()
+                if k != "_static_cache"
+            }
             if model.ogcm is not None
             else None
         ),
@@ -390,11 +398,23 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
     if model.ogcm is not None:
         if ckpt.get("ogcm") is not None and int(ckpt["ogcm"].get("nz_ocn", -1)) == model.ogcm.nz_ocn:
             for k, v in ckpt["ogcm"].items():
+                if k == "_static_cache":
+                    continue
+                if k == "bgc":
+                    if v is not None and model.ogcm.bgc is not None:
+                        bgc_items = v.items() if isinstance(v, dict) else v.__dict__.items()
+                        for bk, bv in bgc_items:
+                            setattr(model.ogcm.bgc, bk, bv.to(device=device) if isinstance(bv, torch.Tensor) else bv)
+                    continue
                 setattr(model.ogcm, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
         else:
             from aoba.ocean_ogcm import init_ogcm_state
 
             model.ogcm = init_ogcm_state(model.sfc, model.mesh, nz_ocn=model.cfg.ocean_nz)
+            if bool(model.cfg.enable_ocean_bgc):
+                from aoba.ocean_bgc import init_ocean_bgc_state
+
+                model.ogcm.bgc = init_ocean_bgc_state(model.ogcm.wet_c, model.ogcm.h_c, model.ogcm.z_c, model.mesh.area_cell)
     for k, v in ckpt["clim"].items():
         setattr(model.clim, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     if ckpt.get("clim_sub") is not None and model.clim_sub is not None:
@@ -613,6 +633,7 @@ def main() -> None:
     parser.add_argument("--icesheet-accel-spinup-years", type=float, default=None)
     parser.add_argument("--icesheet-isostasy-tau-yr", type=float, default=None)
     parser.add_argument("--cmip7-output", action="store_true", default=None, help="Enable CMIP7 Data Request v1.2 ESM-BCV monthly Zarr stream")
+    parser.add_argument("--enable-ocean-bgc", action="store_true", default=None, help="Enable FlexPFT marine BGC & OMIP/mocsy 2.0 carbonate chemistry")
     args = parser.parse_args()
 
     if args.config:
@@ -644,6 +665,8 @@ def main() -> None:
         cfg.icesheet_isostasy_tau_yr = args.icesheet_isostasy_tau_yr
     if args.cmip7_output is not None:
         out_cfg.cmip7_output_enabled = bool(args.cmip7_output)
+    if args.enable_ocean_bgc is not None:
+        cfg.enable_ocean_bgc = bool(args.enable_ocean_bgc)
 
     years = args.years if args.years is not None else out_cfg.years
     days_per_year = args.days_per_year if args.days_per_year is not None else out_cfg.days_per_year
@@ -1162,6 +1185,20 @@ def main() -> None:
                         f"Ice(NH/SH)={ocn_m['seaice_nh_mkm2']:.1f}/{ocn_m['seaice_sh_mkm2']:.1f} Mkm2",
                         flush=True,
                     )
+                if model.ogcm is not None and model.ogcm.bgc is not None:
+                    from aoba.ocean_bgc import diagnose_ocean_bgc_metrics
+
+                    bgc_m = diagnose_ocean_bgc_metrics(model.ogcm.bgc, model.ogcm, model.mesh)
+                    if bgc_m:
+                        print(
+                            f"[FlexPFT Y{year:03d} M{mon_num:02d} | {diag.date_str}] "
+                            f"NPP={bgc_m['ocean_npp_pgc_yr']:.1f} PgC/yr | "
+                            f"EPC100={bgc_m['ocean_epc100_pgc_yr']:.1f} PgC/yr | "
+                            f"fgCO2={bgc_m['ocean_fgco2_pgc_yr']:+.2f} PgC/yr | "
+                            f"Chl={bgc_m['ocean_chl_sfc_mg_m3']:.3f} mg/m3 | "
+                            f"pCO2={bgc_m['ocean_spco2_uatm']:.1f} uatm | pH={bgc_m['ocean_ph_sfc']:.3f}",
+                            flush=True,
+                        )
                 for k in mon_accum:
                     mon_accum[k] = 0.0
                 mon_cnt = 0
