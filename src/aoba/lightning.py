@@ -20,6 +20,8 @@ References
   "The global lightning-induced nitrogen oxides source",
   Atmospheric Chemistry and Physics, 7, 3823-3907, Sec. 4 & Table 20
   (~44 +/- 5 flashes s^-1 globally; 250 mol NOx = 3.5 kg N per flash -> ~5 Tg N yr^-1).
+
+AOBA Formulation Reference: Sec. 5.5, Eq. (5.10) (CRM Non-Inductive Charging Lightning & LNOx).
 """
 
 from __future__ import annotations
@@ -61,6 +63,7 @@ class LightningDiagnostics:
     n_dep_lnox_cell: torch.Tensor    # Host-cell mean LNOx N deposition [N_cells] [kg N m^-2 s^-1]
 
 
+# AOBA Formulation Eq. (5.10)
 def compute_crm_lightning_and_lnox(
     rho_d: torch.Tensor,
     theta_m: torch.Tensor,

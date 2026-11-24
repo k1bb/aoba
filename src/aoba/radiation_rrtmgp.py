@@ -13,6 +13,8 @@ interpolation algorithm of Pincus, Mlawer, & Delamere (2019, *J. Adv. Model. Ear
 3074-3089) fully vectorized in PyTorch (batched across all 128 LW / 112 SW g-points simultaneously
 on MPS/CUDA/CPU), coupled with Slingo (1989) liquid, Ebert & Curry (1992) ice, Chou et al. (1999)
 LW cloud scattering, Balkanski et al. (2007) dust, and AOBA's 5-species natural aerosols.
+
+AOBA Formulation Reference: Sec. 4.6, Eq. (4.10) (Official HITRAN / MT_CKD 4.1 RRTMGP 240 g-pt Radiation).
 """
 
 from __future__ import annotations

@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 532" width="860" height="532" role="img" aria-label="AOBA Earth System Architecture &amp; Multi-Scale Coupling">
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; rx: 14; }
+      .title { font: 700 17px -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", sans-serif; fill: #0f172a; }
+      .sub { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", sans-serif; fill: #475569; }
+      .box-t { font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", sans-serif; fill: #0f172a; }
+      .box-s { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", sans-serif; fill: #334155; }
+      .mono { font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #0f172a; }
+      .lbl { font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", sans-serif; fill: #1e293b; }
+      .badge { font: 700 10px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #ffffff; }
+    </style>
+    <marker id="arr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#334155"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#0284c7"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#dc2626"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#15803d"/>
+    </marker>
+    <marker id="arr-amber" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#d97706"/>
+    </marker>
+  </defs>
+  <rect class="bg" x="2" y="2" width="856" height="528" rx="14"/>
+  <text class="title" x="24" y="32">AOBA Earth System Architecture &amp; Multi-Scale Coupling</text>
+  <text class="sub" x="24" y="51">How large-scale dynamics, cloud-resolving convection, radiation, land biosphere, ocean, cryosphere, and biogeochemistry couple without prescribed maps</text>
+  <line x1="24" y1="62" x2="836" y2="62" stroke="#e2e8f0" stroke-width="1.2"/>
+  <rect x="24" y="78" width="812" height="82" rx="10" fill="#e0f2fe" stroke="#0284c7" stroke-width="1.6"/>
+  <rect x="737" y="85" width="91" height="17" rx="8" fill="#0369a1"/>
+  <text class="badge" x="782.5" y="97" text-anchor="middle">Sec. 1-3, 9</text>
+  <text class="box-t" x="36" y="100">1. Global Host Atmosphere (SCVT Icosahedral Voronoi C-Grid, Nonhydrostatic RK3-HEVI)</text>
+  <text class="box-s" x="36" y="118">Synoptic Rossby waves, Hadley/Walker cells, stratospheric Brewer-Dobson circulation, Zalesak FCT tracer advection</text>
+  <text class="box-s" x="36" y="134">Orographic &amp; non-orographic GWD  |  Prognostic O3, CO2 (3D), Dust, Sea-Salt, DMS/SO4, BC/OC, Volcanic H2SO4, H2^18O/HDO</text>
+  <rect x="24" y="194" width="260" height="134" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <rect x="178" y="201" width="98" height="17" rx="8" fill="#1d4ed8"/>
+  <text class="badge" x="227.0" y="213" text-anchor="middle">Sec. 5, 6, 9</text>
+  <text class="box-t" x="36" y="216">2. Embedded Cloud-Resolving Model</text>
+  <text class="box-s" x="36" y="234">1:1 Superparameterization (2D/3D CRM)</text>
+  <text class="box-s" x="36" y="250">Cumulus-free explicit convection (dx=4 km)</text>
+  <text class="box-s" x="36" y="266">Selectable Microphysics: 1M / 2M / 6-Class</text>
+  <text class="box-s" x="36" y="282">MYNN 2.5 PBL + 3D Smagorinsky SGS</text>
+  <text class="box-s" x="36" y="298">CRM Lightning Flash &amp; LNOx Emission</text>
+  <text class="box-s" x="36" y="314">Optional: Standalone Global CRM mode</text>
+  <rect x="304" y="194" width="252" height="134" rx="10" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.6"/>
+  <rect x="464" y="201" width="84" height="17" rx="8" fill="#a16207"/>
+  <text class="badge" x="506.0" y="213" text-anchor="middle">Sec. 4, 10</text>
+  <text class="box-t" x="316" y="216">3. Radiation, Ozone &amp; Aerosols</text>
+  <text class="box-s" x="316" y="234">Selectable rad_scheme:</text>
+  <text class="box-s" x="316" y="250">  four_band | ckd | ckd_hd | rrtmgp</text>
+  <text class="box-s" x="316" y="266">Optional 3D TICA cloud-side scattering</text>
+  <text class="box-s" x="316" y="282">Prognostic 3D O3 (Chapman/PSC/dep)</text>
+  <text class="box-s" x="316" y="298">Natural Aerosols (Dust/SS/DMS/SOA)</text>
+  <text class="box-s" x="316" y="314">Volcanic SO2-&gt;H2SO4 &amp; 11-yr Solar</text>
+  <rect x="576" y="194" width="260" height="134" rx="10" fill="#f3e8ff" stroke="#7e22ce" stroke-width="1.6"/>
+  <rect x="737" y="201" width="91" height="17" rx="8" fill="#6b21a8"/>
+  <text class="badge" x="782.5" y="213" text-anchor="middle">Sec. 10, 11</text>
+  <text class="box-t" x="588" y="216">4. Closed Biogeochemical Loops</text>
+  <text class="box-s" x="588" y="234">Prognostic CO2 (emissions-driven + 3D)</text>
+  <text class="box-s" x="588" y="250">Prognostic CH4 &amp; N2O (OH/UV sinks)</text>
+  <text class="box-s" x="588" y="266">Silicate Weathering CO2 Thermostat</text>
+  <text class="box-s" x="588" y="282">Stable Water Isotopes (H2^18O, HDO)</text>
+  <text class="box-s" x="588" y="298">Milankovitch Orbit &amp; Planetary Presets</text>
+  <text class="box-s" x="588" y="314">Aquaplanet / Snowball / TRAPPIST-1e</text>
+  <rect x="24" y="362" width="260" height="132" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="1.6"/>
+  <rect x="199" y="369" width="77" height="17" rx="8" fill="#15803d"/>
+  <text class="badge" x="237.5" y="381" text-anchor="middle">Sec. 7, 8</text>
+  <text class="box-t" x="36" y="384">5. MAML Land, EEO Biosphere &amp; C/N</text>
+  <text class="box-s" x="36" y="402">1:1 Subgrid Land under each CRM col</text>
+  <text class="box-s" x="36" y="418">Emergent C3/C4 EEO Optimal Vegetation</text>
+  <text class="box-s" x="36" y="434">Subgrid Orography &amp; Dynamic Wetlands</text>
+  <text class="box-s" x="36" y="450">5-Layer Freeze-Thaw Soil &amp; Snowpack</text>
+  <text class="box-s" x="36" y="466">Prognostic C/N Pools &amp; SPITFIRE Fire</text>
+  <text class="box-s" x="36" y="482">D8 River Routing -&gt; Ocean Salinity/Nut</text>
+  <rect x="304" y="362" width="252" height="132" rx="10" fill="#cffafe" stroke="#0891b2" stroke-width="1.6"/>
+  <rect x="492" y="369" width="56" height="17" rx="8" fill="#0e7490"/>
+  <text class="badge" x="520.0" y="381" text-anchor="middle">Sec. 9</text>
+  <text class="box-t" x="316" y="384">6. Ocean, Sea Ice, Waves &amp; BGC</text>
+  <text class="box-s" x="316" y="402">Selectable: 3D OGCM | 1.5-Layer Ekman</text>
+  <text class="box-s" x="316" y="418">Optional Fine Ocean Grid (ocean_glevel)</text>
+  <text class="box-s" x="316" y="434">EVP-ITD Sea Ice &amp; SNICAR BC Albedo</text>
+  <text class="box-s" x="316" y="450">Waves Hs/Tp -&gt; Langmuir KPP &amp; Spray</text>
+  <text class="box-s" x="316" y="466">FlexPFT Marine BGC + O2 / OMZ / N2O</text>
+  <text class="box-s" x="316" y="482">Current-Relative Wind Air-Sea Flux</text>
+  <rect x="576" y="362" width="260" height="132" rx="10" fill="#f1f5f9" stroke="#475569" stroke-width="1.6"/>
+  <rect x="765" y="369" width="63" height="17" rx="8" fill="#334155"/>
+  <text class="badge" x="796.5" y="381" text-anchor="middle">Sec. 11</text>
+  <text class="box-t" x="588" y="384">7. Dynamic Ice Sheet &amp; Isostasy</text>
+  <text class="box-s" x="588" y="402">Glen Flow Law (n=3) SCVT SIA Solver</text>
+  <text class="box-s" x="588" y="418">EMA Surface Mass Balance (SMB)</text>
+  <text class="box-s" x="588" y="434">Optional Acceleration (10x - 100x)</text>
+  <text class="box-s" x="588" y="450">Bedrock Glacial Isostatic Adjustment</text>
+  <text class="box-s" x="588" y="466">Dynamic Land &lt;-&gt; IceSheet Mask Flip</text>
+  <text class="box-s" x="588" y="482">Conservative Barometric Vertical Remap</text>
+  <line x1="154" y1="160" x2="154" y2="192" stroke="#0284c7" stroke-width="2" marker-end="url(#arr-blue)" marker-start="url(#arr-blue)"/>
+  <line x1="430" y1="160" x2="430" y2="192" stroke="#d97706" stroke-width="2" marker-end="url(#arr-amber)" marker-start="url(#arr-amber)"/>
+  <line x1="706" y1="160" x2="706" y2="192" stroke="#7e22ce" stroke-width="2" marker-end="url(#arr)" marker-start="url(#arr)"/>
+  <line x1="284" y1="260" x2="302" y2="260" stroke="#334155" stroke-width="1.8" marker-end="url(#arr)" marker-start="url(#arr)"/>
+  <line x1="556" y1="260" x2="574" y2="260" stroke="#334155" stroke-width="1.8" marker-end="url(#arr)" marker-start="url(#arr)"/>
+  <line x1="154" y1="328" x2="154" y2="360" stroke="#15803d" stroke-width="2" marker-end="url(#arr-green)" marker-start="url(#arr-green)"/>
+  <line x1="430" y1="328" x2="430" y2="360" stroke="#0284c7" stroke-width="2" marker-end="url(#arr-blue)" marker-start="url(#arr-blue)"/>
+  <line x1="284" y1="428" x2="302" y2="428" stroke="#0284c7" stroke-width="1.8" marker-end="url(#arr-blue)"/>
+  <text class="lbl" x="293" y="420" text-anchor="middle" font-size="9">River</text>
+  <line x1="556" y1="428" x2="574" y2="428" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)" marker-start="url(#arr)"/>
+  <line x1="706" y1="328" x2="706" y2="360" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)" marker-start="url(#arr)"/>
+  <text class="sub" x="24" y="516">Design Principle: 100% map-free universal physics (only Earth2014 topography/bathymetry). Single float32 codebase: Laptop (MPS) to HPC (CUDA).</text>
+</svg>

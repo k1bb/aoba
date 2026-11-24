@@ -16,6 +16,8 @@ hothouse climates) and planetary habitability experiments from universal physica
      index `e * sin(varpi(t))` across multi-millennial timescales (`t_kyr` relative to J2000),
      directly driving AOBA's orbital insolation (`compute_orbital_insolation`) and dynamic
      SIA ice sheets (`icesheet.py`).
+
+AOBA Formulation Reference: Sec. 10.5 Eq. (10.11) & Sec. 11.3 Eq. (11.5) (Silicate Weathering & Milankovitch Orbit).
 """
 
 from __future__ import annotations

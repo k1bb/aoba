@@ -26,6 +26,8 @@ polygon of its generator `xyz_atm[i]`. Consequently, each fine ocean cell center
   `(dT_sfc, dm_ice_sfc, dswe_sfc)` from `step_surface` are applied directly to the fine
   ocean surface state `ocn_sfc` (with exact latent-heat freezing protection) so fine-scale
   ocean SST and sea-ice structures are never diffused onto the coarse atmospheric grid.
+
+AOBA Formulation Reference: Sec. 9.4, Eq. (9.7) (Independent Fine Ocean Grid Voronoi Conservative Coupler).
 """
 
 from __future__ import annotations
@@ -166,6 +168,7 @@ def atm_to_ocn_conservative_flux(
     return raw_ocn * torch.clamp(scale, min=0.0, max=10.0)
 
 
+# AOBA Formulation Eq. (9.7)
 def ocn_to_atm_mean(
     coupler: OceanAtmosCoupler,
     field_ocn: torch.Tensor,

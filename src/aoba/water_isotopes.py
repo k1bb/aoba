@@ -22,6 +22,8 @@ Physical Parameterizations & References
    - Uses exact exponential/log Rayleigh fractionation `R_new = R_old * (q_new / q_old)^(alpha-1)`
      (zero Forward Euler, unconditionally positivity- and ratio-bounded) and archives snowfall
      `d18o_snow_permil` & `dd_snow_permil` for direct proxy comparison with ice cores.
+
+AOBA Formulation Reference: Sec. 10.6, Eqs. (10.12)-(10.16) (Prognostic 3D H2^18O/HDO, Craig-Gordon & Rayleigh).
 """
 
 from __future__ import annotations
@@ -54,6 +56,7 @@ class WaterIsotopeState:
     snow_iso_weight: torch.Tensor      # [N_cells] cumulative snowfall mass weight [kg m^-2]
 
 
+# AOBA Formulation Eqs. (10.13)-(10.14)
 def equilibrium_fractionation_factors(
     temp_k: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -102,6 +105,7 @@ def init_water_isotope_state(q_v: torch.Tensor) -> WaterIsotopeState:
     )
 
 
+# AOBA Formulation Eqs. (10.12), (10.15)-(10.16)
 def step_water_isotopes(
     iso: WaterIsotopeState,
     q_v: torch.Tensor,            # [Nz, N_cells] updated atmospheric vapor [kg kg^-1]

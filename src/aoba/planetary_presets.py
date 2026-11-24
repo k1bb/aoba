@@ -17,6 +17,8 @@ Supported Presets (`planet_preset`):
   `enable_tidal_lock = True`, `co2_ppmv = 1000.0`, aquaplanet surface; Fauchez et al., 2020).
 - `"mars_like"`: Cold arid terrestrial planet (`S_0 = 589 W m^-2`, 100% dry bare land, low
   moisture, `omega = 7.088e-5 rad s^-1`, `obliquity = 25.19 deg`).
+
+AOBA Formulation Reference: Sec. 11.4, Eq. (11.6) (Universal Planetary / Exoplanet Presets & Tidal Lock).
 """
 
 from __future__ import annotations
@@ -100,6 +102,7 @@ def resolve_planet_preset_config(cfg: Any) -> Any:
     return replace(cfg, **updates)
 
 
+# AOBA Formulation Eq. (11.6)
 def compute_tidally_locked_insolation(
     lat_cell: torch.Tensor,
     lon_cell: torch.Tensor,

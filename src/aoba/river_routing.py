@@ -12,6 +12,8 @@ exponential-reservoir time integration (Mizukami et al., 2016, *Geosci. Model De
 2223-2238; Miller et al., 1994, *J. Climate*, 7, 914-928), delivering focused freshwater
 plumes (Amazon, Congo, Yangtze, Siberian Arctic rivers) to coastal ocean Voronoi cells
 with exact float32 + Kahan mass conservation.
+
+AOBA Formulation Reference: Sec. 7.5, Eq. (7.15) (D8 Priority-Flood Global River Routing).
 """
 
 from __future__ import annotations

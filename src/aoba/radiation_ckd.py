@@ -38,6 +38,8 @@ References
 - Balkanski et al. (2007, Atmos. Chem. Phys., 7, 81-95)
 - Etminan, Myhre, Highwood, & Shine (2016, Geophys. Res. Lett., 43, 12614-12623)
 - Pincus et al. (2020, J. Adv. Model. Earth Syst., 12, e2019MS001919, RFMIP)
+
+AOBA Formulation Reference: Sec. 4.4, Eqs. (4.7)-(4.8) (16-Band / 50 g-pt Correlated-k Radiation).
 """
 
 from __future__ import annotations

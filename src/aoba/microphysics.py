@@ -21,6 +21,8 @@ Implements the complete mixed-phase single-moment microphysics of SAM:
   & Skamarock et al. (2012, Eq. 5):
   * Exact conversion of microphysical latent heating and moisture changes into the
     compressible flux variable `theta_m = theta * (1 + (R_v / R_d) * q_v)`.
+
+AOBA Formulation Reference: Sec. 5.2-5.3, Eqs. (5.1)-(5.7) (SAM 1-Moment & Aerosol-Aware 2-Moment KK00).
 """
 
 from __future__ import annotations

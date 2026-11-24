@@ -14,6 +14,8 @@ and mass-conserving PBL vertical mixing so Northern Hemisphere seasonal forest b
 (Keeling Curve) and interhemispheric gradients emerge autonomously without geographic maps.
 
 All global reservoir updates use float64 exact mass conservation (zero float32 ULP drift).
+
+AOBA Formulation Reference: Sec. 10.5, Eq. (10.9) (Emissions-Driven Prognostic CO2 Global & 3D Budget).
 """
 
 from __future__ import annotations
@@ -64,6 +66,7 @@ def init_prognostic_co2_state(
     return PrognosticCO2State(co2_ppmv_glob=c0, co2_vmr=vmr)
 
 
+# AOBA Formulation Eq. (10.9)
 def step_prognostic_co2(
     state: PrognosticCO2State,
     area_cell: torch.Tensor,

@@ -7,6 +7,8 @@ Supports:
 
 Also supports perpetual insolation experiments (``insolation_mode="perpetual_date"``)
 and optional diurnal-cycle averaging (``diurnal_cycle=False``).
+
+AOBA Formulation Reference: Sec. 1.3, Eqs. (1.1)-(1.4) (Orbital Solar Geometry & Calendar).
 """
 
 from __future__ import annotations

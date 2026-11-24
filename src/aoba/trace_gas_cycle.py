@@ -19,6 +19,8 @@ Closes the natural non-CO2 greenhouse-gas biogeochemical loops completely map-fr
 
 Uses float64 global atmospheric burden integration and exact exponential relaxation
 (zero Forward Euler, unconditionally stable for multi-millennial runs).
+
+AOBA Formulation Reference: Sec. 10.5, Eq. (10.10) (Prognostic Atmospheric CH4 & N2O Cycles).
 """
 
 from __future__ import annotations

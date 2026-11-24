@@ -42,6 +42,8 @@ Key Physical & Biogeochemical Processes:
      pH scale (avoids float32 underflow of [H+]^2 ~ 10^-16).
    - Exact Wanninkhof (2014) CO2 Schmidt polynomial & quadratic gas-transfer velocity
      attenuated by sea-ice cover `(1 - f_seaice)`.
+
+AOBA Formulation Reference: Sec. 9.7, Eqs. (9.13)-(9.16) (FlexPFT Marine BGC, Carbonate pCO2, Dissolved O2 & OMZ).
 """
 
 from __future__ import annotations

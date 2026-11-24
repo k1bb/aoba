@@ -20,6 +20,8 @@ hydrology/river discharge:
      and local Priority-Flood river discharge (`river_routing.py`).
    - Feeds directly into surface albedo/evaporation (inundated open water) and anoxic wetland CH4
      emissions (`trace_gas_cycle.py`).
+
+AOBA Formulation Reference: Sec. 7.4, Eqs. (7.11)-(7.12) (MAML Subgrid Orography & Dynamic Wetlands/Lakes).
 """
 
 from __future__ import annotations

@@ -11,6 +11,8 @@ References
   anchored at the effective aerodynamic datum h(x) = z_topo(x) + d(x).
 - Khairoutdinov & Randall (2003, J. Atmos. Sci., 60, Sec. 2) & Skamarock et al. (2012):
   Upper-domain Rayleigh wave-absorbing sponge profile above z_sponge.
+
+AOBA Formulation Reference: Sec. 2.2-2.3, Eqs. (2.1)-(2.3) (Stretched Charney-Phillips Levels, Sponge & Klemp STF).
 """
 
 from __future__ import annotations
@@ -71,6 +73,7 @@ class VerticalGrid:
         )
 
 
+# AOBA Formulation Eqs. (2.1)-(2.2)
 def build_vertical_grid(
     nz: int = 32,
     z_top: float = 24000.0,
@@ -145,6 +148,7 @@ def build_vertical_grid(
     )
 
 
+# AOBA Formulation Eq. (2.3)
 def compute_stf_heights(
     vgrid: VerticalGrid,
     z_datum: torch.Tensor,

@@ -21,6 +21,8 @@ References
 - Morrison, H., Curry, J. A., & Khvorostyanov, V. I. (2005): *JAS*, 62, 1665-1691.
 - Seifert, A., & Beheng, K. D. (2006): *Meteorol. Atmos. Phys.*, 92, 45-66.
 - Khairoutdinov, M., & Kogan, Y. (2000): *Mon. Wea. Rev.*, 128, 229-243.
+
+AOBA Formulation Reference: Sec. 5.4, Eqs. (5.8)-(5.9) (Morrison 6-Class 2-Moment Rain/Snow/Graupel).
 """
 
 from __future__ import annotations

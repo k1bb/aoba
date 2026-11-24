@@ -20,6 +20,8 @@ Provides two map-free external/natural climate forcing mechanisms toggleable via
    - Modulates total solar irradiance (`s_toa` by `+/- solar_cycle_amp_wm2`, default `1.0 W m^-2`,
      Lean et al., 2005, *Solar Phys.*, 230, 27) AND stratospheric UV O2 photolysis `J_O2`
      (`+/- 3%` UV modulation, Gray et al., 2010, *Rev. Geophys.*, 48, RG4001).
+
+AOBA Formulation Reference: Sec. 10.4, Eqs. (10.6)-(10.8) (2-Stage Bateman Volcanic SO2->H2SO4 & 11-yr Solar Cycle).
 """
 
 from __future__ import annotations
@@ -68,6 +70,7 @@ def init_volcanic_solar_state(
     return VolcanicSolarState(so2_strat_kgm2=z.clone(), h2so4_strat_kgm2=z.clone())
 
 
+# AOBA Formulation Eq. (10.8)
 def compute_solar_cycle_modulation(
     sim_time_days: float,
     amp_wm2: float = 1.0,
@@ -84,6 +87,7 @@ def compute_solar_cycle_modulation(
     return tsi_delta, uv_scale
 
 
+# AOBA Formulation Eqs. (10.6)-(10.7)
 def step_volcanic_aerosols(
     vs: VolcanicSolarState,
     mesh,

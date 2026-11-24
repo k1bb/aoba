@@ -38,6 +38,8 @@ Implements a fully parameter-table-free terrestrial biosphere combining:
      Optimal root-zone water storage capacity `S_R` and supply limit `S_w`.
    - Kempes, West, Crowell, & Girvan (2011, PLoS ONE, 6, e20551, Eqs. 2-5):
      Metabolic vs water-limited maximum canopy height `h_c`.
+
+AOBA Formulation Reference: Sec. 7.2, Eqs. (7.1)-(7.6) (Two-Leaf C3/C4 EEO Biosphere & Lambert-W0 LAI).
 """
 
 from __future__ import annotations

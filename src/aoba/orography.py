@@ -12,6 +12,8 @@ References
 - Palmer, Shutts, & Swinbank (1986, Q. J. R. Meteorol. Soc., 112, 1001-1039) &
   MIROC6 AGCM Document Writing Team (2021, Sec. 3.5):
   Lindzen saturation criterion and upper-boundary momentum conservation.
+
+AOBA Formulation Reference: Sec. 8.3, Eq. (8.5) (Lott & Miller Subgrid Orographic Blocking & Mountain-Wave Drag).
 """
 
 from __future__ import annotations

@@ -43,6 +43,7 @@ if str(_SRC_DIR) not in sys.path:
 from aoba.calendar import AobaCalendar  # noqa: E402
 from aoba.co2_forcing import fetch_latest_co2_sources, get_co2_catalog_summary  # noqa: E402
 from aoba.ozone_forcing import fetch_input4mips_ozone_climatology, get_ozone_status_summary  # noqa: E402
+from aoba.param_docs import PARAM_DOCS  # noqa: E402
 from aoba.params import (  # noqa: E402
     SECTION_META,
     build_configs_from_dict,
@@ -898,13 +899,34 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   .doc-content blockquote { border-left: 3px solid var(--accent); margin: 10px 0; padding: 4px 12px; color: var(--muted); background: #101723; border-radius: 0 6px 6px 0; }
   .math-block {
     background: #0d1523; border: 1px solid #24344c; border-radius: 8px;
-    padding: 10px 16px; margin: 12px 0; overflow-x: auto;
-    font-family: "STIX Two Math", "Cambria Math", Georgia, serif; font-size: 15px; text-align: center; color: #f1f5f9;
+    padding: 11px 16px; margin: 12px 0; overflow-x: auto;
+    font-family: "STIX Two Math", "Cambria Math", "Times New Roman", Georgia, serif;
+    font-size: 15.5px; color: #f1f5f9;
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
   }
-  .math-inline { font-family: "STIX Two Math", "Cambria Math", Georgia, serif; font-style: italic; color: #e0f2fe; padding: 0 1px; }
-  .math-frac { display: inline-flex; flex-direction: column; vertical-align: middle; text-align: center; font-size: 0.88em; margin: 0 3px; }
-  .math-frac > span:first-child { border-bottom: 1px solid #cbd5e1; padding: 0 4px 1px; }
-  .math-frac > span:last-child { padding: 1px 4px 0; }
+  .math-block-eq { flex: 1; text-align: center; line-height: 1.55; }
+  .math-tag { flex-shrink: 0; font-family: var(--mono); font-size: 12.5px; color: #94a3b8; user-select: text; }
+  .math-inline { font-family: "STIX Two Math", "Cambria Math", "Times New Roman", Georgia, serif; font-style: italic; color: #e0f2fe; padding: 0 1px; }
+  .math-rm { font-style: normal; }
+  .math-bf { font-style: normal; font-weight: 700; }
+  .math-frac { display: inline-flex; flex-direction: column; vertical-align: middle; text-align: center; font-size: 0.88em; margin: 0 3px; line-height: 1.15; }
+  .math-frac > span:first-child { border-bottom: 1px solid #cbd5e1; padding: 0 4px 2px; }
+  .math-frac > span:last-child { padding: 2px 4px 0; }
+  .math-sqrt { display: inline-flex; align-items: stretch; vertical-align: middle; }
+  .math-sqrt-rad { font-style: normal; font-size: 1.12em; line-height: 1.0; padding-right: 1px; }
+  .math-sqrt-body { border-top: 1px solid #cbd5e1; padding: 0 3px; }
+  .math-over { display: inline-block; border-top: 1px solid #cbd5e1; line-height: 1.05; padding-top: 1px; }
+  .math-under { display: inline-flex; flex-direction: column; align-items: center; vertical-align: middle; line-height: 1.1; }
+  .math-under > span:last-child { font-size: 0.72em; color: #94a3b8; border-top: 1px solid #64748b; padding-top: 1px; }
+  .math-aligned { border-collapse: collapse; margin: 0 auto; }
+  .math-aligned td { border: none !important; padding: 2px 4px !important; background: transparent !important; vertical-align: middle; }
+  .math-aligned td.al-r { text-align: right; }
+  .math-aligned td.al-l { text-align: left; }
+  .math-cases-wrap { display: inline-flex; align-items: center; vertical-align: middle; }
+  .math-cases-brace { font-style: normal; font-size: 2.1em; font-weight: 200; line-height: 0.9; margin-right: 4px; color: #cbd5e1; }
+  .doc-fig { margin: 16px 0; text-align: center; }
+  .doc-fig img { max-width: 100%; height: auto; border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 4px 18px rgba(0,0,0,0.35); background: #f8fafc; }
+  .doc-fig figcaption { font-size: 12px; color: var(--muted); margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -1721,7 +1743,7 @@ function setKey(sec, key, val) {
   const def = STATE.defaults[sec]?.[key];
   if (typeof def === "boolean") val = Boolean(val);
   else if (typeof def === "number") {
-    const intKeys = ["glevel","nz","ocean_nz","crm_nx","crm_ny","n_host_dyn_substeps","n_crm_dyn_substeps","rad_stride","crm_col_chunk","rad_col_chunk","earth2014_stride","years","monthly_mean_periods_per_year","snapshots_periods_per_year","restart_interval_years"];
+    const intKeys = ["glevel","ocean_glevel","nz","ocean_nz","crm_nx","crm_ny","n_host_dyn_substeps","n_crm_dyn_substeps","rad_stride","crm_col_chunk","rad_col_chunk","earth2014_stride","years","monthly_mean_periods_per_year","snapshots_periods_per_year","restart_interval_years","land_eb_iterations"];
     val = intKeys.includes(key) ? Math.round(Number(val)) : Number(val);
     if (Number.isNaN(val)) val = def;
   }
@@ -1734,14 +1756,14 @@ function buildFieldRow(sec, key, skipKeys = []) {
   const cur = STATE.config[sec][key];
   const def = STATE.defaults[sec][key];
   const mod = isModified(sec, key);
-  const pd = PARAM_DOCS[key];
-  const desc = pd ? (pd[LANG] || pd.ja) : ("Default: " + String(def));
+  const pd = (STATE.param_docs && STATE.param_docs[key]) || PARAM_DOCS[key];
+  const desc = pd ? (pd[LANG] || pd.ja || pd.en) : ("Default: " + String(def));
   const modLbl = LANG === "ja" ? "変更" : "MOD";
   let ctrl = "";
   if (key === "zarr_dir_partition") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
-      <option value="yearly" ${cur==="yearly"?"selected":""}>yearly (年別)</option>
-      <option value="single" ${cur==="single"?"selected":""}>single (単一Zarr)</option>
+      <option value="yearly" ${cur==="yearly"?"selected":""}>yearly (年別 year_XXXX/ 分割・推奨)</option>
+      <option value="single" ${cur==="single"?"selected":""}>single (単一 Zarr ストア)</option>
     </select>`;
   } else if (key === "calendar_type") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
@@ -1752,8 +1774,9 @@ function buildFieldRow(sec, key, skipKeys = []) {
   } else if (key === "co2_mode") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
       <option value="constant" ${cur==="constant"?"selected":""}>constant (固定数値 ppmv)</option>
-      <option value="scenario" ${cur==="scenario"?"selected":""}>scenario (CMIP・NOAA観測・古気候)</option>
+      <option value="scenario" ${cur==="scenario"?"selected":""}>scenario (CMIP・NOAA観測・古気候補間)</option>
       <option value="csv" ${cur==="csv"?"selected":""}>csv (独自 CSV ファイル)</option>
+      <option value="prognostic" ${cur==="prognostic"?"selected":""}>prognostic (排出駆動・完全双方向予報 CO₂)</option>
     </select>`;
   } else if (key === "co2_scenario") {
     const scns = CO2_CATALOG.scenarios || [];
@@ -1765,29 +1788,43 @@ function buildFieldRow(sec, key, skipKeys = []) {
     }
   } else if (key === "rad_scheme") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
-      <option value="ckd" ${cur==="ckd"?"selected":""}>ckd (16バンド 50g点 Correlated-k: H2O/CO2/CH4/N2O/O3)</option>
-      <option value="four_band" ${cur==="four_band"?"selected":""}>four_band (旧4バンド解析的2ストリーム)</option>
+      <option value="four_band" ${cur==="four_band"?"selected":""}>four_band (高速4バンド解析的2ストリーム)</option>
+      <option value="ckd" ${cur==="ckd"?"selected":""}>ckd (標準16バンド 50g点 Correlated-k)</option>
+      <option value="ckd_hd" ${cur==="ckd_hd"?"selected":""}>ckd_hd (高精度29バンド 111g点 MSTRN11級)</option>
+      <option value="rrtmgp" ${cur==="rrtmgp"?"selected":""}>rrtmgp (公式 HITRAN / MT_CKD 4.1 240g点)</option>
     </select>`;
   } else if (key === "ocean_mode") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
-      <option value="ogcm_3d" ${cur==="ogcm_3d"?"selected":""}>ogcm_3d (3次元多層OGCM: Earth2014海底地形・塩分・GM90・海氷移流)</option>
-      <option value="ekman_sw" ${cur==="ekman_sw"?"selected":""}>ekman_sw (1.5層浅水・風成エクマン海洋)</option>
+      <option value="ogcm_3d" ${cur==="ogcm_3d"?"selected":""}>ogcm_3d (3次元多層OGCM: 海底地形・塩分・GM90・海氷移流)</option>
+      <option value="ekman_sw" ${cur==="ekman_sw"?"selected":""}>ekman_sw (高速1.5層浅水・風成エクマン海洋)</option>
     </select>`;
   } else if (key === "microphysics_scheme") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
-      <option value="two_moment" ${cur==="two_moment"?"selected":""}>two_moment (2モーメント Nc/Ni・自然CCN/INP・診断有効半径)</option>
-      <option value="one_moment" ${cur==="one_moment"?"selected":""}>one_moment (旧SAM 1モーメント固定粒径)</option>
+      <option value="one_moment" ${cur==="one_moment"?"selected":""}>one_moment (SAM 1モーメント固定粒径)</option>
+      <option value="two_moment" ${cur==="two_moment"?"selected":""}>two_moment (標準2モーメント KK00 Nc/Ni・CCN/INP)</option>
+      <option value="six_class_2m" ${cur==="six_class_2m"?"selected":""}>six_class_2m (6種2モーメント Morrison 雨・雪・霰)</option>
     </select>`;
   } else if (key === "o3_mode") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
       <option value="rcemip" ${cur==="rcemip"?"selected":""}>rcemip (Wing 2018 1D一様)</option>
       <option value="latitude_seasonal" ${cur==="latitude_seasonal"?"selected":""}>latitude_seasonal (解析的 2D 緯度×季節)</option>
       <option value="climatology" ${cur==="climatology"?"selected":""}>climatology (外部 CMIP6/7 帯状平均)</option>
+      <option value="prognostic" ${cur==="prognostic"?"selected":""}>prognostic (地図不要 3D 光化学・PSC 予報オゾン)</option>
+    </select>`;
+  } else if (key === "planet_preset") {
+    ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
+      <option value="earth" ${cur==="earth"?"selected":""}>earth (現代／古気候地球)</option>
+      <option value="aquaplanet" ${cur==="aquaplanet"?"selected":""}>aquaplanet (100% 全球海・地形なし)</option>
+      <option value="snowball_earth" ${cur==="snowball_earth"?"selected":""}>snowball_earth (全球凍結スノーボールアース)</option>
+      <option value="tidally_locked" ${cur==="tidally_locked"?"selected":""}>tidally_locked (同期潮汐固定惑星)</option>
+      <option value="trappist1e" ${cur==="trappist1e"?"selected":""}>trappist1e (TRAPPIST-1e 系外惑星)</option>
+      <option value="mars_like" ${cur==="mars_like"?"selected":""}>mars_like (乾燥寒冷・火星型惑星)</option>
     </select>`;
   } else if (key === "insolation_mode") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
-      <option value="seasonal" ${cur==="seasonal"?"selected":""}>seasonal (通常の季節変化)</option>
+      <option value="seasonal" ${cur==="seasonal"?"selected":""}>seasonal (通常の年周季節変化)</option>
       <option value="perpetual_date" ${cur==="perpetual_date"?"selected":""}>perpetual_date (日付固定日射実験)</option>
+      <option value="annual_mean" ${cur==="annual_mean"?"selected":""}>annual_mean (年平均固定日射)</option>
     </select>`;
   } else if (key === "start_date" || key === "end_date" || key === "fixed_insolation_date") {
     ctrl = `<input type="date" value="${String(cur||"")}" onchange="setKey('${sec}','${key}',this.value)" />`;
@@ -2652,117 +2689,308 @@ function bindGlobeInteractions() {
   }
 }
 
-/* --- OFFLINE MARKDOWN + LATEX DOCUMENTATION VIEWER --- */
+/* --- OFFLINE MARKDOWN + RECURSIVE-DESCENT LATEX DOCUMENTATION VIEWER --- */
 function escHtml(s) {
-  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
-function _extractBracedArg(str, startIdx) {
-  if (startIdx >= str.length || str[startIdx] !== "{") return null;
-  let depth = 0;
-  for (let i = startIdx; i < str.length; i++) {
-    if (str[i] === "{") depth++;
-    else if (str[i] === "}") {
-      depth--;
-      if (depth === 0) return { content: str.slice(startIdx + 1, i), nextIdx: i + 1 };
+
+const _TEX_SYMS = {
+  alpha:"α", beta:"β", gamma:"γ", delta:"δ", epsilon:"ε", varepsilon:"ε", zeta:"ζ",
+  eta:"η", theta:"θ", vartheta:"ϑ", iota:"ι", kappa:"κ", lambda:"λ", mu:"μ", nu:"ν",
+  xi:"ξ", pi:"π", varpi:"ϖ", rho:"ρ", varrho:"ϱ", sigma:"σ", varsigma:"ς", tau:"τ",
+  upsilon:"υ", phi:"φ", varphi:"φ", chi:"χ", psi:"ψ", omega:"ω",
+  Gamma:"Γ", Delta:"Δ", Theta:"Θ", Lambda:"Λ", Xi:"Ξ", Pi:"Π", Sigma:"Σ",
+  Upsilon:"Υ", Phi:"Φ", Psi:"Ψ", Omega:"Ω",
+  nabla:"∇", partial:"∂", infty:"∞", ell:"ℓ", hbar:"ℏ", Re:"ℜ", Im:"ℑ",
+  cdot:"·", cdotp:"·", times:"×", div:"÷", pm:"±", mp:"∓", ast:"∗", star:"⋆", circ:"°", bullet:"•",
+  le:"≤", leq:"≤", ge:"≥", geq:"≥", ll:"≪", gg:"≫", ne:"≠", neq:"≠", approx:"≈",
+  simeq:"≃", sim:"∼", equiv:"≡", propto:"∝", cong:"≅", doteq:"≐",
+  to:"→", rightarrow:"→", leftarrow:"←", leftrightarrow:"↔", Rightarrow:"⇒", Leftarrow:"⇐",
+  Leftrightarrow:"⇔", implies:"⇒", iff:"⇔", mapsto:"↦", uparrow:"↑", downarrow:"↓",
+  in:"∈", notin:"∉", subset:"⊂", subseteq:"⊆", supset:"⊃", cup:"∪", cap:"∩",
+  forall:"∀", exists:"∃", neg:"¬", land:"∧", lor:"∨", empty:"∅", varnothing:"∅",
+  sum:"∑", prod:"∏", int:"∫", oint:"∮",
+  dots:"…", ldots:"…", cdots:"⋯", vdots:"⋮", ddots:"⋱",
+  langle:"⟨", rangle:"⟩", lfloor:"⌊", rfloor:"⌋", lceil:"⌈", rceil:"⌉",
+  vert:"|", mid:"∣", parallel:"∥", backslash:"\\", prime:"′", dagger:"†",
+  oplus:"⊕", otimes:"⊗", top:"⊤", bot:"⊥", perp:"⊥", angle:"∠",
+  quad:"&emsp;", qquad:"&emsp;&emsp;", enspace:"&ensp;", thinspace:"&thinsp;"
+};
+const _TEX_FUNCS = new Set([
+  "exp","ln","log","sin","cos","tan","cot","sec","csc","arcsin","arccos","arctan",
+  "sinh","cosh","tanh","max","min","sup","inf","lim","arg","det","dim","ker",
+  "sgn","mod","bmod","gcd","erf","erfc","atan2","expm1","log1p","clamp","clip"
+]);
+
+function _parseLatex(src) {
+  let i = 0;
+  const n = src.length;
+  const skipWs = () => { while (i < n && /\s/.test(src[i])) i++; };
+
+  function readGroup() {
+    skipWs();
+    if (i >= n) return "";
+    if (src[i] === "{") {
+      i++;
+      const inner = parseSeq("}");
+      if (i < n && src[i] === "}") i++;
+      return inner;
     }
+    return parseAtom();
   }
-  return null;
-}
-function _replaceLatexFracs(str) {
-  let out = "", i = 0;
-  while (i < str.length) {
-    const rest = str.slice(i);
-    const m = rest.match(/^\\(?:d|t)?frac\s*\{/);
-    if (m) {
-      const arg1Start = i + m[0].length - 1;
-      const a1 = _extractBracedArg(str, arg1Start);
-      if (a1) {
-        let j = a1.nextIdx;
-        while (j < str.length && /\s/.test(str[j])) j++;
-        const a2 = _extractBracedArg(str, j);
-        if (a2) {
-          const num = _replaceLatexFracs(a1.content);
-          const den = _replaceLatexFracs(a2.content);
-          out += `<span class="math-frac"><span>${num}</span><span>${den}</span></span>`;
-          i = a2.nextIdx;
-          continue;
+
+  function readRawGroup() {
+    skipWs();
+    if (i >= n) return "";
+    if (src[i] === "{") {
+      let depth = 0, start = i + 1;
+      for (; i < n; i++) {
+        if (src[i] === "\\" && i + 1 < n) { i++; continue; }
+        if (src[i] === "{") depth++;
+        else if (src[i] === "}") {
+          depth--;
+          if (depth === 0) { const s = src.slice(start, i); i++; return s; }
         }
       }
+      return src.slice(start);
     }
-    out += str[i];
-    i++;
+    return src[i++];
   }
-  return out;
-}
-function _replaceSupSub(str) {
-  let out = "", i = 0;
-  while (i < str.length) {
-    const ch = str[i];
-    if ((ch === "^" || ch === "_") && i + 1 < str.length) {
-      const tag = ch === "^" ? "sup" : "sub";
-      if (str[i + 1] === "{") {
-        const a = _extractBracedArg(str, i + 1);
-        if (a) {
-          out += `<${tag}>${_replaceSupSub(a.content)}</${tag}>`;
-          i = a.nextIdx;
-          continue;
+
+  function readOptBracket() {
+    skipWs();
+    if (i < n && src[i] === "[") {
+      i++;
+      const start = i;
+      let depth = 1;
+      while (i < n && depth > 0) {
+        if (src[i] === "[") depth++;
+        else if (src[i] === "]") depth--;
+        if (depth > 0) i++;
+      }
+      const content = src.slice(start, i);
+      if (i < n && src[i] === "]") i++;
+      return content;
+    }
+    return null;
+  }
+
+  function parseEnv(envName) {
+    const endTag = `\\end{${envName}}`;
+    const endIdx = src.indexOf(endTag, i);
+    const body = endIdx >= 0 ? src.slice(i, endIdx) : src.slice(i);
+    i = endIdx >= 0 ? endIdx + endTag.length : n;
+    const rows = body.split(/\\\\/).map(r => r.trim()).filter(r => r.length > 0);
+    if (envName === "cases") {
+      const trs = rows.map(r => {
+        const cols = r.split("&").map(c => _parseLatex(c.trim()));
+        return `<tr><td class="al-l">${cols[0] || ""}</td><td class="al-l" style="padding-left:14px !important;">${cols.slice(1).join(" ")}</td></tr>`;
+      }).join("");
+      return `<span class="math-cases-wrap"><span class="math-cases-brace">{</span><table class="math-aligned">${trs}</table></span>`;
+    }
+    const trs = rows.map(r => {
+      const cols = r.split("&").map(c => _parseLatex(c.trim()));
+      if (cols.length === 1) return `<tr><td colspan="2" class="al-l">${cols[0]}</td></tr>`;
+      return `<tr>${cols.map((c, ci) => `<td class="${ci % 2 === 0 ? "al-r" : "al-l"}">${c}</td>`).join("")}</tr>`;
+    }).join("");
+    return `<table class="math-aligned">${trs}</table>`;
+  }
+
+  function parseAtom() {
+    skipWs();
+    if (i >= n) return "";
+    const ch = src[i];
+    if (ch === "{") {
+      i++;
+      const inner = parseSeq("}");
+      if (i < n && src[i] === "}") i++;
+      return inner;
+    }
+    if (ch === "\\") {
+      i++;
+      if (i >= n) return "";
+      const c1 = src[i];
+      if (!/[A-Za-z]/.test(c1)) {
+        i++;
+        if (c1 === "," || c1 === ";") return "&thinsp;";
+        if (c1 === ":") return "&nbsp;";
+        if (c1 === "!") return "";
+        if (c1 === " ") return "&nbsp;";
+        if (c1 === "\\") return "<br/>";
+        if (c1 === "|") return "∥";
+        if (c1 === "{" || c1 === "}" || c1 === "%" || c1 === "_" || c1 === "$" || c1 === "#") return escHtml(c1);
+        return escHtml(c1);
+      }
+      const start = i;
+      while (i < n && /[A-Za-z]/.test(src[i])) i++;
+      const cmd = src.slice(start, i);
+
+      if (cmd === "frac" || cmd === "dfrac" || cmd === "tfrac") {
+        const num = readGroup();
+        const den = readGroup();
+        return `<span class="math-frac"><span>${num}</span><span>${den}</span></span>`;
+      }
+      if (cmd === "sqrt") {
+        const opt = readOptBracket();
+        const arg = readGroup();
+        const idxHtml = opt ? `<sup style="font-size:0.7em;margin-right:-2px;">${_parseLatex(opt)}</sup>` : "";
+        return `${idxHtml}<span class="math-sqrt"><span class="math-sqrt-rad">√</span><span class="math-sqrt-body">${arg}</span></span>`;
+      }
+      if (cmd === "mathrm" || cmd === "text" || cmd === "textrm" || cmd === "operatorname" || cmd === "rm") {
+        if (cmd === "rm") return "";
+        const raw = readRawGroup();
+        if (cmd === "text" || cmd === "textrm") return `<span class="math-rm">${escHtml(raw)}</span>`;
+        return `<span class="math-rm">${_parseLatex(raw)}</span>`;
+      }
+      if (cmd === "mathbf" || cmd === "boldsymbol" || cmd === "bm") {
+        return `<span class="math-bf">${readGroup()}</span>`;
+      }
+      if (cmd === "mathcal" || cmd === "mathbb" || cmd === "mathit" || cmd === "mathsf") {
+        return `<span class="math-rm">${readGroup()}</span>`;
+      }
+      if (cmd === "overline" || cmd === "bar") {
+        return `<span class="math-over">${readGroup()}</span>`;
+      }
+      if (cmd === "hat" || cmd === "widehat") {
+        return `${readGroup()}\u0302`;
+      }
+      if (cmd === "tilde" || cmd === "widetilde") {
+        return `${readGroup()}\u0303`;
+      }
+      if (cmd === "vec") {
+        return `<span class="math-bf">${readGroup()}</span>`;
+      }
+      if (cmd === "dot") return `${readGroup()}\u0307`;
+      if (cmd === "ddot") return `${readGroup()}\u0308`;
+      if (cmd === "underbrace" || cmd === "overbrace") {
+        const body = readGroup();
+        skipWs();
+        let note = "";
+        if (i < n && (src[i] === "_" || src[i] === "^")) {
+          i++;
+          note = readGroup();
         }
-      } else if (/[A-Za-z0-9*+\-]/.test(str[i + 1])) {
-        out += `<${tag}>${str[i + 1]}</${tag}>`;
-        i += 2;
+        return `<span class="math-under"><span>${body}</span><span>${note}</span></span>`;
+      }
+      if (cmd === "left" || cmd === "right" || cmd === "big" || cmd === "Big" || cmd === "bigg" || cmd === "Bigg" || cmd === "bigl" || cmd === "bigr" || cmd === "Bigl" || cmd === "Bigr") {
+        skipWs();
+        if (i < n && src[i] === ".") { i++; return ""; }
+        if (i < n && src[i] === "\\") return parseAtom();
+        if (i < n) return `<span class="math-rm">${escHtml(src[i++])}</span>`;
+        return "";
+      }
+      if (cmd === "begin") {
+        const env = readRawGroup().trim();
+        return parseEnv(env);
+      }
+      if (cmd === "end") {
+        readRawGroup();
+        return "";
+      }
+      if (cmd === "tag") {
+        readRawGroup();
+        return "";
+      }
+      if (cmd === "displaystyle" || cmd === "textstyle" || cmd === "limits" || cmd === "nolimits" || cmd === "nonumber" || cmd === "notag") {
+        return "";
+      }
+      if (_TEX_FUNCS.has(cmd)) {
+        return `<span class="math-rm">${cmd}</span>`;
+      }
+      if (Object.prototype.hasOwnProperty.call(_TEX_SYMS, cmd)) {
+        return `<span class="math-rm">${_TEX_SYMS[cmd]}</span>`;
+      }
+      return `<span class="math-rm">${escHtml(cmd)}</span>`;
+    }
+    i++;
+    if (ch === "&") return "&emsp;";
+    if (/[0-9.,:;()[\]=+\-/*<>|!]/.test(ch)) return `<span class="math-rm">${escHtml(ch)}</span>`;
+    return escHtml(ch);
+  }
+
+  function parseSeq(stopChar) {
+    let out = "";
+    while (i < n) {
+      if (stopChar && src[i] === stopChar) break;
+      if (/\s/.test(src[i])) {
+        while (i < n && /\s/.test(src[i])) i++;
+        if (out && !out.endsWith(" ")) out += " ";
         continue;
       }
+      if (src[i] === "^" || src[i] === "_") {
+        const tag = src[i++] === "^" ? "sup" : "sub";
+        out += `<${tag}>${readGroup()}</${tag}>`;
+        continue;
+      }
+      let atom = parseAtom();
+      let sup = null, sub = null;
+      while (true) {
+        const saved = i;
+        skipWs();
+        if (i < n && src[i] === "^" && sup === null) { i++; sup = readGroup(); }
+        else if (i < n && src[i] === "_" && sub === null) { i++; sub = readGroup(); }
+        else { i = saved; break; }
+      }
+      if (sub !== null) atom += `<sub>${sub}</sub>`;
+      if (sup !== null) atom += `<sup>${sup}</sup>`;
+      out += atom;
     }
-    out += ch;
-    i++;
+    return out;
   }
-  return out;
+
+  return parseSeq(null);
 }
+
 function renderLatexPretty(tex) {
-  let s = escHtml(tex.trim());
-  for (let p = 0; p < 3; p++) {
-    s = s.replace(/\\(?:mathrm|mathbf|boldsymbol|text)\{([^{}]*)\}/g, "$1");
-  }
-  s = _replaceLatexFracs(s);
-  const greek = {
-    "\\\\alpha":"α","\\\\beta":"β","\\\\gamma":"γ","\\\\delta":"δ","\\\\varepsilon":"ε","\\\\epsilon":"ε","\\\\zeta":"ζ",
-    "\\\\eta":"η","\\\\theta":"θ","\\\\kappa":"κ","\\\\lambda":"λ","\\\\mu":"μ","\\\\nu":"ν",
-    "\\\\xi":"ξ","\\\\pi":"π","\\\\rho":"ρ","\\\\sigma":"σ","\\\\tau":"τ","\\\\phi":"φ",
-    "\\\\varphi":"φ","\\\\chi":"χ","\\\\psi":"ψ","\\\\omega":"ω",
-    "\\\\Gamma":"Γ","\\\\Delta":"Δ","\\\\Theta":"Θ","\\\\Lambda":"Λ","\\\\Pi":"Π","\\\\Sigma":"Σ","\\\\Omega":"Ω",
-    "\\\\nabla":"∇","\\\\partial":"∂","\\\\infty":"∞","\\\\cdot":"·","\\\\times":"×","\\\\pm":"±","\\\\circ":"°",
-    "\\\\le":"≤","\\\\ge":"≥","\\\\approx":"≈","\\\\ne":"≠","\\\\propto":"∝","\\\\implies":"⇒","\\\\to":"→",
-    "\\\\leftarrow":"←","\\\\leftrightarrow":"↔","\\\\uparrow":"↑","\\\\downarrow":"↓","\\\\in":"∈","\\\\sum":"∑","\\\\int":"∫",
-    "\\\\dots":"…","\\\\bmod":"mod","\\\\exp":"exp","\\\\ln":"ln","\\\\log":"log","\\\\sin":"sin","\\\\cos":"cos","\\\\tanh":"tanh",
-    "\\\\max":"max","\\\\min":"min","\\\\sqrt":"√","\\\\mathrm":"","\\\\mathbf":"","\\\\boldsymbol":"",
-    "\\\\text":"","\\\\left":"","\\\\right":"","\\\\!":"","\\\\,":" ","\\\\;":" ","\\\\quad":"  ","\\\\qquad":"    ",
-    "\\\\begin\\{aligned\\}":"","\\\\end\\{aligned\\}":"","\\\\begin\\{cases\\}":"","\\\\end\\{cases\\}":"",
-    "\\\\widetilde\\{([^{}]+)\\}":"$1\u0303","\\\\tilde\\{([^{}]+)\\}":"$1\u0303",
-    "\\\\overline\\{([^{}]+)\\}":"$1\u0304","\\\\bar\\{([^{}]+)\\}":"$1\u0304",
-    "\\\\hat\\{([^{}]+)\\}":"$1\u0302","\\\\dot\\{([^{}]+)\\}":"$1\u0307"
-  };
-  for (const [pat, rep] of Object.entries(greek)) s = s.replace(new RegExp(pat, "g"), rep);
-  s = _replaceSupSub(s);
-  s = s.replace(/&amp;/g, "&nbsp;&nbsp;").replace(/\\\\/g, "<br/>").replace(/[{}]/g, "");
-  return s;
+  return _parseLatex(String(tex || "").trim());
 }
+
+function renderMathBlock(tex) {
+  let raw = String(tex || "").trim();
+  let tagText = "";
+  raw = raw.replace(/\\tag\{([^{}]+)\}/g, (_, t) => { tagText = t.trim(); return ""; }).trim();
+  const eqHtml = _parseLatex(raw);
+  const tagHtml = tagText ? `<div class="math-tag">(${escHtml(tagText)})</div>` : "";
+  return `<div class="math-block"><div class="math-block-eq">${eqHtml}</div>${tagHtml}</div>`;
+}
+
+function _resolveDocAssetUrl(href) {
+  const clean = href.replace(/^\.\//, "");
+  if (clean.startsWith("assets/")) return "/docs/" + clean;
+  if (clean.startsWith("docs/assets/")) return "/" + clean;
+  if (clean.startsWith("../docs/assets/")) return "/docs/assets/" + clean.slice("../docs/assets/".length);
+  return href;
+}
+
 function renderInlineMd(line) {
-  const mathSlots = [];
-  let s = line.replace(/\$([^$\n]+?)\$/g, (_, m) => {
-    const idx = mathSlots.length;
-    mathSlots.push(`<span class="math-inline">${renderLatexPretty(m)}</span>`);
-    return `@@M${idx}@@`;
+  const slots = [];
+  const stash = (html) => { const idx = slots.length; slots.push(html); return `@@S${idx}@@`; };
+
+  // 1. Protect inline code spans first so `$` inside backticks is never parsed as math
+  let s = line.replace(/`([^`]+)`/g, (_, code) => stash(`<code>${escHtml(code)}</code>`));
+  // 2. Protect inline images ![alt](href)
+  s = s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, href) => {
+    const src = _resolveDocAssetUrl(href.trim());
+    return stash(`<figure class="doc-fig"><img src="${escHtml(src)}" alt="${escHtml(alt)}" loading="lazy"/>${alt ? `<figcaption>${escHtml(alt)}</figcaption>` : ""}</figure>`);
   });
+  // 3. Protect inline math $...$ and \(...\)
+  s = s.replace(/\\\((.+?)\\\)/g, (_, m) => stash(`<span class="math-inline">${renderLatexPretty(m)}</span>`));
+  s = s.replace(/(^|[^\\])\$([^$\n]+?)\$/g, (_, pre, m) => pre + stash(`<span class="math-inline">${renderLatexPretty(m)}</span>`));
+  s = s.replace(/\\\$/g, "$");
+
   s = escHtml(s);
-  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
   s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
   s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, txt, href) =>
     href.startsWith("#") ? `<a href="${href}" style="color:var(--accent)">${txt}</a>` : `<span style="color:var(--accent)">${txt}</span>`
   );
-  s = s.replace(/@@M(\d+)@@/g, (_, idx) => mathSlots[Number(idx)]);
+  // Restore stashed HTML (may be nested once)
+  for (let p = 0; p < 2; p++) {
+    s = s.replace(/@@S(\d+)@@/g, (_, idx) => slots[Number(idx)]);
+  }
   return s;
 }
+
 function renderMarkdownWithMath(md) {
   const lines = md.replace(/\r\n/g, "\n").split("\n");
   let html = "", inCode = false, inMath = false, mathBuf = [], inList = false, inTable = false, toc = [];
@@ -2771,38 +2999,48 @@ function renderMarkdownWithMath(md) {
 
   for (let i = 0; i < lines.length; i++) {
     const ln = lines[i];
-    if (ln.trim().startsWith("```")) {
+    const trimmed = ln.trim();
+    if (trimmed.startsWith("```")) {
       flushList(); flushTable();
       if (!inCode) { html += "<pre><code>"; inCode = true; } else { html += "</code></pre>"; inCode = false; }
       continue;
     }
     if (inCode) { html += escHtml(ln) + "\n"; continue; }
 
-    if (ln.trim() === "$$") {
+    if (trimmed === "$$" || trimmed === "\\[" || trimmed === "\\]") {
       flushList(); flushTable();
-      if (!inMath) { inMath = true; mathBuf = []; }
-      else { html += `<div class="math-block">${renderLatexPretty(mathBuf.join("\n"))}</div>`; inMath = false; }
+      if (!inMath && trimmed !== "\\]") { inMath = true; mathBuf = []; }
+      else { html += renderMathBlock(mathBuf.join("\n")); inMath = false; }
       continue;
     }
     if (inMath) { mathBuf.push(ln); continue; }
-    if (ln.trim().startsWith("$$") && ln.trim().endsWith("$$") && ln.trim().length > 4) {
+    if (trimmed.startsWith("$$") && trimmed.endsWith("$$") && trimmed.length > 4) {
       flushList(); flushTable();
-      html += `<div class="math-block">${renderLatexPretty(ln.trim().slice(2, -2))}</div>`; continue;
+      html += renderMathBlock(trimmed.slice(2, -2)); continue;
+    }
+
+    // Standalone image line -> full textbook figure card
+    const imgM = trimmed.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
+    if (imgM) {
+      flushList(); flushTable();
+      const alt = imgM[1], src = _resolveDocAssetUrl(imgM[2].trim());
+      html += `<figure class="doc-fig"><img src="${escHtml(src)}" alt="${escHtml(alt)}" loading="lazy"/>${alt ? `<figcaption>${escHtml(alt)}</figcaption>` : ""}</figure>`;
+      continue;
     }
 
     const hm = ln.match(/^(#{1,4})\s+(.+)$/);
     if (hm) {
       flushList(); flushTable();
-      const lvl = hm[1].length, rawTitle = hm[2].replace(/`([^`]+)`/g, "$1");
+      const lvl = hm[1].length, rawTitle = hm[2].replace(/`([^`]+)`/g, "$1").replace(/\$([^$]+)\$/g, "$1");
       const id = "sec-" + toc.length;
       if (lvl === 2 || lvl === 3) toc.push({ id, lvl, text: rawTitle });
       html += `<h${lvl} id="${id}">${renderInlineMd(hm[2])}</h${lvl}>`;
       continue;
     }
-    if (ln.trim() === "---") { flushList(); flushTable(); html += "<hr style='border:none;border-top:1px solid var(--border);margin:16px 0;'/>"; continue; }
-    if (ln.trim().startsWith("|") && ln.includes("|")) {
+    if (trimmed === "---") { flushList(); flushTable(); html += "<hr style='border:none;border-top:1px solid var(--border);margin:16px 0;'/>"; continue; }
+    if (trimmed.startsWith("|") && ln.includes("|")) {
       flushList();
-      const cells = ln.trim().slice(1, -1).split("|").map(c => c.trim());
+      const cells = trimmed.slice(1, -1).split("|").map(c => c.trim());
       if (cells.every(c => /^:?-{2,}:?$/.test(c))) continue;
       if (!inTable) {
         inTable = true;
@@ -2813,7 +3051,7 @@ function renderMarkdownWithMath(md) {
       continue;
     } else { flushTable(); }
 
-    if (ln.trim().startsWith("> ")) { flushList(); html += `<blockquote>${renderInlineMd(ln.trim().slice(2))}</blockquote>`; continue; }
+    if (trimmed.startsWith("> ")) { flushList(); html += `<blockquote>${renderInlineMd(trimmed.slice(2))}</blockquote>`; continue; }
     const lm = ln.match(/^\s*(?:[-*]|\d+\.)\s+(.+)$/);
     if (lm) {
       if (!inList) { html += "<ul style='padding-left:20px;margin:6px 0;'>"; inList = true; }
@@ -2821,7 +3059,7 @@ function renderMarkdownWithMath(md) {
       continue;
     } else { flushList(); }
 
-    if (ln.trim() === "") { html += "<div style='height:6px'></div>"; continue; }
+    if (trimmed === "") { html += "<div style='height:6px'></div>"; continue; }
     html += `<p style='margin:6px 0;'>${renderInlineMd(ln)}</p>`;
   }
   flushList(); flushTable();
@@ -3198,6 +3436,7 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
                 "defaults": defaults,
                 "config": cur,
                 "section_meta": SECTION_META,
+                "param_docs": PARAM_DOCS,
                 "toml_path": str(self.server.toml_path),  # type: ignore[attr-defined]
                 "param_count": sum(len(v) for v in defaults.values()),
                 "hardware": detect_hardware_profile().to_dict(),
@@ -3276,6 +3515,23 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
             raw = svg_p.read_bytes()
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+
+        if parsed.path.startswith("/docs/assets/"):
+            fname = Path(parsed.path).name
+            asset_p = (_REPO_ROOT / "docs" / "assets" / fname).resolve()
+            assets_root = (_REPO_ROOT / "docs" / "assets").resolve()
+            if not str(asset_p).startswith(str(assets_root)) or not asset_p.is_file():
+                self._send_json({"error": "Asset not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            ext = asset_p.suffix.lower()
+            ctype = "image/svg+xml; charset=utf-8" if ext == ".svg" else ("image/png" if ext == ".png" else "application/octet-stream")
+            raw = asset_p.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)

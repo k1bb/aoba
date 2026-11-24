@@ -13,6 +13,8 @@ orbital insolation `S_0`, and well-mixed `CO2` / `O2`):
 8. 5-Layer Freeze-Thaw Permafrost Soil, Snow-Burial Albedo, & Glacier Calving (`surface.py`)
 9. Zero-Q-Flux 1.5-Layer Wind-Driven Voronoi Ekman Ocean & Fractional-Lead Sea Ice (`ocean_ekman.py`)
 10. Emergent 30-Class Köppen-Geiger Climate Diagnostics (`koppen.py`)
+
+AOBA Formulation Reference: Sec. 8.4 Eq. (8.8) & Sec. 9.4 Eq. (9.8) (Unified SP/CRM & Current-Relative Coupling).
 """
 
 from __future__ import annotations
@@ -975,6 +977,7 @@ def _coupled_post_crm_accum_core(
     )
 
 
+# AOBA Formulation Eqs. (8.8), (9.8)
 def step_aoba_model(
     model: AOBAState,
     compute_diagnostics: bool = True,

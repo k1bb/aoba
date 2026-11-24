@@ -485,10 +485,78 @@ def test_nonorographic_gwd_and_stratosphere_high_top() -> None:
         assert torch.isfinite(t_hi).all() and float(t_hi[-1].min().item()) > 180.0 and float(t_hi[-1].max().item()) < 310.0
 
 
+def test_textbook_docs_param_coverage_and_studio_math() -> None:
+    """Enforce 100% bilingual PARAM_DOCS coverage, synced EN/JA equation numbers, SVG assets & Studio LaTeX rendering."""
+    import re
+    import shutil
+    import xml.etree.ElementTree as ET
+    from aoba.param_docs import PARAM_DOCS
+
+    defaults = default_config_dict()
+    all_keys = {k for sec in defaults.values() for k in sec}
+    assert set(PARAM_DOCS.keys()) == all_keys, f"PARAM_DOCS mismatch: missing={all_keys - set(PARAM_DOCS)}"
+    for k in all_keys:
+        assert PARAM_DOCS[k].get("ja", "").strip(), f"Empty JA doc for {k}"
+        assert PARAM_DOCS[k].get("en", "").strip(), f"Empty EN doc for {k}"
+
+    # Verify synchronized equation tags across EN and JA textbook manuals
+    en_md = (_REPO_ROOT / "docs" / "formulation.md").read_text(encoding="utf-8")
+    ja_md = (_REPO_ROOT / "docs" / "formulation_ja.md").read_text(encoding="utf-8")
+    en_tags = re.findall(r"\\tag\{(\d+\.\d+)\}", en_md)
+    ja_tags = re.findall(r"\\tag\{(\d+\.\d+)\}", ja_md)
+    assert len(en_tags) >= 90 and en_tags == ja_tags, "EN/JA equation tag numbering mismatch"
+
+    # Verify all 7 conceptual SVG diagrams exist and are valid XML
+    svg_files = sorted((_REPO_ROOT / "docs" / "assets").glob("fig_0*.svg"))
+    assert len(svg_files) == 7
+    for sp in svg_files:
+        ET.parse(sp)
+
+    # Verify Studio HTTP server exposes param_docs, all enum dropdowns, and /docs/assets/*.svg
+    server = create_gui_server(default_toml_path(), host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        st = json.loads(urllib.request.urlopen(f"{base}/api/state").read().decode("utf-8"))
+        assert set(st["param_docs"].keys()) == all_keys
+        html = urllib.request.urlopen(f"{base}/").read().decode("utf-8")
+        for opt in ("ckd_hd", "rrtmgp", "six_class_2m", "prognostic", "trappist1e", "snowball_earth"):
+            assert f'value="{opt}"' in html, f"Missing Studio dropdown option: {opt}"
+        svg_resp = urllib.request.urlopen(f"{base}/docs/assets/{svg_files[0].name}").read().decode("utf-8")
+        assert "<svg" in svg_resp
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    # If Node.js is available, render full EN/JA docs through Studio's JS engine and assert 0 unrendered LaTeX
+    if shutil.which("node"):
+        gui_src = (_REPO_ROOT / "scripts" / "aoba_config_gui.py").read_text(encoding="utf-8")
+        m = re.search(
+            r"/\* --- OFFLINE MARKDOWN \+ RECURSIVE-DESCENT LATEX DOCUMENTATION VIEWER --- \*/(.*?)async function loadDoc",
+            gui_src,
+            re.S,
+        )
+        assert m is not None
+        js = m.group(1) + r"""
+const fs = require("fs");
+for (const p of ["docs/formulation.md", "docs/formulation_ja.md"]) {
+  const r = renderMarkdownWithMath(fs.readFileSync(p, "utf8"));
+  const stripped = r.html.replace(/<pre><code>[\s\S]*?<\/code><\/pre>/g, "").replace(/<code>[\s\S]*?<\/code>/g, "");
+  const stray = stripped.match(/\\[A-Za-z]+/g);
+  if (stray) { console.error("Stray LaTeX:", p, stray.slice(0, 5)); process.exit(1); }
+}
+"""
+        proc = subprocess.run(["node", "-e", js], cwd=str(_REPO_ROOT), capture_output=True, text=True)
+        assert proc.returncode == 0, f"Studio JS LaTeX render failed: {proc.stderr}"
+
+
 if __name__ == "__main__":
     test_toml_roundtrip_and_module_sync()
     test_snapshot_variable_filtering()
     test_gui_server_endpoints()
+    test_textbook_docs_param_coverage_and_studio_math()
     test_co2_forcing_modes_and_calendar()
     test_ozone_forcing_modes_and_high_top()
     test_nonorographic_gwd_and_stratosphere_high_top()

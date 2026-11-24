@@ -7,6 +7,8 @@ Every constant explicitly cites its published reference:
 - Stocker et al. (2020, Geosci. Model Dev., 13, 1545-1581, Table 1)
 - Weaver & Ramanathan (1995, J. Geophys. Res., 100, 11585-11591)
 - Semtner (1976, J. Phys. Oceanogr., 6, 379-389)
+
+AOBA Formulation Reference: Sec. 1.2 (Table of Fundamental Physical Constants).
 """
 
 from __future__ import annotations

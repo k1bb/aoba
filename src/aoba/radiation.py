@@ -25,6 +25,8 @@ All vertical inputs and outputs follow AOBA's bottom-up convention:
     k = N_z - 1 is the topmost layer (interface N_z = top of atmosphere).
 Internally, arrays are flipped to Toon et al. (1989)'s top-down convention (`n = 0` at TOA)
 and flipped back upon return.
+
+AOBA Formulation Reference: Sec. 1.3 Eqs. (1.1)-(1.4) & Sec. 4.2-4.3 Eqs. (4.1)-(4.6) (Two-Stream & Four-Band).
 """
 
 from __future__ import annotations

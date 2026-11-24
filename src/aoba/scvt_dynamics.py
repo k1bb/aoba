@@ -19,6 +19,8 @@ References
   Smoothed terrain-following (STF) vertical coordinate and horizontal pressure-gradient metric.
 - Held & Suarez (1994, Bull. Amer. Meteor. Soc., 75, 1825-1830, Eqs. 1-4):
   Dry global dynamical-core benchmark Newtonian relaxation and boundary-layer Rayleigh drag.
+
+AOBA Formulation Reference: Sec. 8.2, Eqs. (8.1)-(8.4) (Global SCVT Nonhydrostatic RK3-HEVI Core & Zalesak FCT).
 """
 
 from __future__ import annotations

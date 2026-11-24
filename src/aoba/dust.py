@@ -16,6 +16,8 @@ References
   (1995) clay-dependent sandblasting efficiency.
 - Balkanski, Schulz, Claquin, & Guibert (2007, Atmos. Chem. Phys., 7, 81-95):
   Broadband shortwave & longwave mineral dust optical properties.
+
+AOBA Formulation Reference: Sec. 10.3, Eqs. (10.4)-(10.5) (Map-Free Mineral Dust Mobilization & Scavenging).
 """
 
 from __future__ import annotations

@@ -21,6 +21,8 @@ atmospheric boundary layer, and embedded 3D CRM (`enable_wave_coupling = true`):
    - Activates smoothly above `U_10 > 12 m s^-1` (storm/tropical-cyclone regime), injecting
      wave-breaking spume-droplet latent evaporation (`LH_spray`) and compensating sensible cooling
      (`SH_spray`) directly into the CRM marine boundary layer!
+
+AOBA Formulation Reference: Sec. 9.5, Eqs. (9.9)-(9.11) (Prognostic Waves Hs/Tp, Langmuir KPP & Sea-Spray Enthalpy).
 """
 
 from __future__ import annotations
@@ -68,6 +70,7 @@ def init_ocean_wave_state(
     )
 
 
+# AOBA Formulation Eqs. (9.9)-(9.11)
 def step_ocean_waves(
     waves: OceanWaveState,
     u10_ocn: torch.Tensor,

@@ -24,6 +24,8 @@ Every parameterization cites its exact source equations:
      SCALE-RM (Nishizawa et al., 2025, Sec. 8.1.2 Eqs. 8.25-8.40):
      Richardson-dependent eddy viscosity `nu_SGS` and scalar diffusivity `D_SGS` with
      grid-aspect-ratio filter length correction `f(a)`.
+
+AOBA Formulation Reference: Sec. 6.2-6.3, Eqs. (6.1)-(6.7) (Roughness, De Ridder RSL, MYNN 2.5 PBL & 3D SGS).
 """
 
 from __future__ import annotations

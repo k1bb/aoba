@@ -38,6 +38,8 @@ with zero external PFT, soil-texture, or albedo lookup maps:
    - Semtner (1976, J. Phys. Oceanogr., 6, 379-389), Codron (2012, Clim. Dyn., 38, 379-389),
      & SCALE-RM (2025, Sec. 8.6 Eqs. 8.328-8.358):
      Slab ocean mixed layer with snowfall fusion cooling and fractional-lead sea ice `f_i`.
+
+AOBA Formulation Reference: Sec. 7.3, Eqs. (7.7)-(7.10) (3-Source Energy Balance, Snow/SNICAR & 5-Layer Soil).
 """
 
 from __future__ import annotations
