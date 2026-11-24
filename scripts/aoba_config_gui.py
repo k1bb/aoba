@@ -904,11 +904,15 @@ _HTML_PAGE = r"""<!DOCTYPE html>
     font-size: 15.5px; color: #f1f5f9;
     display: flex; align-items: center; justify-content: space-between; gap: 16px;
   }
-  .math-block-eq { flex: 1; text-align: center; line-height: 1.55; }
-  .math-tag { flex-shrink: 0; font-family: var(--mono); font-size: 12.5px; color: #94a3b8; user-select: text; }
+  .math-block-eq { flex: 1; text-align: center; line-height: 1.6; font-style: italic; }
+  .math-tag { flex-shrink: 0; font-family: var(--mono); font-size: 12.5px; font-style: normal; color: #94a3b8; user-select: text; }
   .math-inline { font-family: "STIX Two Math", "Cambria Math", "Times New Roman", Georgia, serif; font-style: italic; color: #e0f2fe; padding: 0 1px; }
   .math-rm { font-style: normal; }
+  .math-it { font-style: italic; }
   .math-bf { font-style: normal; font-weight: 700; }
+  .math-block sup, .math-block sub, .math-inline sup, .math-inline sub { font-size: 0.72em; line-height: 0; position: relative; vertical-align: baseline; }
+  .math-block sup, .math-inline sup { top: -0.45em; }
+  .math-block sub, .math-inline sub { bottom: -0.25em; }
   .math-frac { display: inline-flex; flex-direction: column; vertical-align: middle; text-align: center; font-size: 0.88em; margin: 0 3px; line-height: 1.15; }
   .math-frac > span:first-child { border-bottom: 1px solid #cbd5e1; padding: 0 4px 2px; }
   .math-frac > span:last-child { padding: 2px 4px 0; }
@@ -2716,6 +2720,11 @@ const _TEX_SYMS = {
   oplus:"⊕", otimes:"⊗", top:"⊤", bot:"⊥", perp:"⊥", angle:"∠",
   quad:"&emsp;", qquad:"&emsp;&emsp;", enspace:"&ensp;", thinspace:"&thinsp;"
 };
+const _TEX_ITALIC_GREEK = new Set([
+  "alpha","beta","gamma","delta","epsilon","varepsilon","zeta","eta","theta","vartheta",
+  "iota","kappa","lambda","mu","nu","xi","pi","varpi","rho","varrho","sigma","varsigma",
+  "tau","upsilon","phi","varphi","chi","psi","omega","ell"
+]);
 const _TEX_FUNCS = new Set([
   "exp","ln","log","sin","cos","tan","cot","sec","csc","arcsin","arccos","arctan",
   "sinh","cosh","tanh","max","min","sup","inf","lim","arg","det","dim","ker",
@@ -2898,7 +2907,9 @@ function _parseLatex(src) {
         return `<span class="math-rm">${cmd}</span>`;
       }
       if (Object.prototype.hasOwnProperty.call(_TEX_SYMS, cmd)) {
-        return `<span class="math-rm">${_TEX_SYMS[cmd]}</span>`;
+        return _TEX_ITALIC_GREEK.has(cmd)
+          ? `<span class="math-it">${_TEX_SYMS[cmd]}</span>`
+          : `<span class="math-rm">${_TEX_SYMS[cmd]}</span>`;
       }
       return `<span class="math-rm">${escHtml(cmd)}</span>`;
     }

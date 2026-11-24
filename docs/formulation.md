@@ -19,11 +19,11 @@
 
 ## 1. System Overview, Physical Constants & Orbital Solar Geometry
 
-### 1.1 Big Picture: How AOBA Simulates a Whole Planet Without Prescribed Maps
+### 1.1 System Architecture and Design Principles
 
 An **Earth System Model (ESM)** predicts how sunlight, air motion, clouds, rain, ocean currents, sea ice, plants, soils, chemistry, and continental ice sheets co-evolve over decades to millennia. Most traditional climate models rely on dozens of present-day geographic lookup maps (prescribed forest types, dust-source maps, ocean heat-flux corrections, or regional aerosol inventories) and empirical cumulus parameterizations. While convenient for today's Earth, those prescribed maps freeze the planet toward modern geography.
 
-**AOBA** takes a clean, first-principles approach designed to be both scientifically universal and easy to study:
+AOBA is structured around three first-principles design invariants:
 1. **Map-Free Universal Physics**: Only planetary elevation, bathymetry, and initial ice-sheet geometry (`Earth2014`) are prescribed. Vegetation biomes, deserts, dust plumes, clouds, lightning, wildfires, ocean circulation, phytoplankton blooms, and wave fields all emerge organically from universal equations.
 2. **Cumulus-Free Explicit Convection**: Instead of parameterized convection, each global column embeds a high-resolution ($\Delta x = 4\ \mathrm{km}$) nonhydrostatic Cloud-Resolving Model (CRM) using the exact same Euler equations as the global host. Turning `enable_superparam = false` smoothly converts AOBA into a standalone global cloud-resolving model.
 3. **Selectable Complexity**: Key physical components—radiation (`rad_scheme`), microphysics (`microphysics_scheme`), ocean (`ocean_mode`), ozone (`o3_mode`), $\mathrm{CO}_2$ (`co2_mode`), and planetary regimes (`planet_preset`)—can be switched cleanly in [`config/aoba_default.toml`](../config/aoba_default.toml) or AOBA Studio.
@@ -75,7 +75,7 @@ When `diurnal_cycle = false`, `src/aoba/calendar.py` replaces Eq. (1.4) with the
 
 ## 2. Spatial Grids: SCVT Voronoi Host, Embedded CRM & Charney–Phillips Levels
 
-### 2.1 Why Icosahedral Voronoi Grids and Superparameterization?
+### 2.1 Overview of Horizontal and Vertical Discretization
 
 A classical longitude–latitude grid converges toward the poles, creating tiny grid cells that force severe time-step restrictions. AOBA instead tiles the sphere quasi-uniformly using a **Spherical Centroidal Voronoi Tessellation (SCVT)** constructed by recursive icosahedral subdivision (`glevel` $g = 0 \dots 6$, yielding $N_{\mathrm{cells}} = 10 \cdot 4^g + 2$: e.g., $G3 = 642$, $G4 = 2562$, $G5 = 10242$ cells) relaxed by Lloyd iterations. Each cell is a hexagon (plus 12 pentagons), with thermodynamic scalars at cell centers and normal winds $u_e$ on orthogonal cell edges (Arakawa C-grid).
 
@@ -111,7 +111,7 @@ The lowest atmospheric reference height $z_1$ above the vegetation canopy displa
 
 ## 3. Moist Compressible Thermodynamics & Mixed-Phase Saturation Adjustment
 
-### 3.1 Physical Intuition: Why Moisture Changes Air Buoyancy and Heating
+### 3.1 Moist Compressible Thermodynamics and Buoyancy
 
 Water vapor molecules ($\mathrm{H}_2\mathrm{O}$, molar mass $18\ \mathrm{g\ mol^{-1}}$) are lighter than dry air ($29\ \mathrm{g\ mol^{-1}}$), so humid air is more buoyant than dry air at the same temperature. Conversely, suspended liquid droplets ($q_c$) and ice crystals ($q_i$) add downward gravitational drag (*condensate loading*). When rising air cools below saturation, excess vapor condenses into droplets or deposits onto ice, releasing huge amounts of latent heat ($L_v \approx 2.5\ \mathrm{MJ\ kg^{-1}}$) that fuels thunderstorms and cyclones.
 
@@ -153,13 +153,13 @@ where $L_{\mathrm{eff}} = \omega_n L_{v0} + (1 - \omega_n)(L_{v0} + L_{f0})$.
 
 ## 4. Atmospheric Radiative Transfer — Selectable Schemes (`rad_scheme`) & 3D TICA
 
-### 4.1 Physical Intuition & Selecting a Radiation Scheme
+### 4.1 Overview and Selectable Schemes (`rad_scheme`)
 
 Radiation is the energy bridge between the planet and outer space. Incoming shortwave (SW) sunlight heats the surface and ozone layer; outgoing longwave (LW) thermal infrared radiation cools the atmosphere and surface to space, while greenhouse gases ($\mathrm{H}_2\mathrm{O}, \mathrm{CO}_2, \mathrm{CH}_4, \mathrm{N}_2\mathrm{O}, \mathrm{O}_3$), clouds, and aerosols trap LW radiation and scatter SW light. Because molecular absorption lines vary violently with wavelength, climate models group wavelengths into bands or cumulative probability bins (**$g$-points**, the *correlated-$k$ distribution* method).
 
 In AOBA, **choose one of four radiation schemes** via `[forcing] rad_scheme` in [`config/aoba_default.toml`](../config/aoba_default.toml) (all four feed into the exact same surface PAR/VIS/NIR energy balance and atmospheric heating rate):
 
-| `rad_scheme` | Spectral Resolution | Greenhouse Gases & Optics | External Files | GPU Acceleration | Best Use Case |
+| `rad_scheme` | Spectral Resolution | Greenhouse Gases & Optics | External Files | GPU Acceleration | Typical Applications |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `"four_band"` | 4 bands (2 SW + 2 LW) | $\mathrm{H}_2\mathrm{O}, \mathrm{CO}_2, \mathrm{O}_3$ + clouds | None | Fused Metal/CUDA | Teaching, aquaplanets, ultra-fast prototyping |
 | `"ckd"` *(Default)* | 16 bands / 50 $g$-pts | $\mathrm{H}_2\mathrm{O}, \mathrm{CO}_2, \mathrm{CH}_4, \mathrm{N}_2\mathrm{O}, \mathrm{O}_3$ + clouds + aerosols | None | Fused Metal/CUDA | Multi-decadal climate & paleoclimate runs |
@@ -250,13 +250,13 @@ $$
 
 ## 5. Cloud Microphysics — Selectable Schemes (`microphysics_scheme`) & Lightning
 
-### 5.1 Physical Intuition & Selecting a Microphysics Scheme
+### 5.1 Overview and Selectable Schemes (`microphysics_scheme`)
 
 Condensation creates microscopic cloud droplets ($r \approx 10\ \mu\mathrm{m}$) that fall too slowly to reach the ground. To produce rain or snow, droplets must collide and coalesce (*autoconversion* and *accretion*), freeze onto ice-nucleating particles (INP, such as mineral dust), or grow rapidly via the **Wegener–Bergeron–Findeisen** process where ice crystals grow at the expense of surrounding supercooled droplets. In strong convective updrafts, supercooled droplets freeze onto snow to form dense **graupel** ($q_g$), whose collisions with ice crystals separate electric charge and spark **lightning**.
 
 **Choose one of three microphysics schemes** via `[forcing] microphysics_scheme`:
 
-| `microphysics_scheme` | Prognostic Hydrometeors | Aerosol–Cloud Coupling | Lightning Coupling | Best Use Case |
+| `microphysics_scheme` | Prognostic Hydrometeors | Aerosol–Cloud Coupling | Lightning Coupling | Typical Applications |
 | :--- | :--- | :--- | :--- | :--- |
 | `"one_moment"` | $q_n, q_p$ (fixed $r_e$) | Fixed $N_c$ (`re_liq_um`, `re_ice_um`) | Diagnostic frozen $q_p$ | Fast conceptual / idealized CRM runs |
 | `"two_moment"` *(Default)* | $q_n, q_p, N_c, N_i$ | Prognostic CCN/INP $\to$ Twomey & lifetime effects | Diagnostic graupel fraction | Standard multi-decadal climate + aerosols |
@@ -332,7 +332,7 @@ Lightning flashes directly ignite SPITFIRE wildfires (Sec. 7.4) and inject nitro
 
 ## 6. Boundary-Layer Turbulence, Roughness Sublayer (RSL) & 3D SGS Mixing
 
-### 6.1 Physical Intuition: Connecting Surface Drag to Atmospheric Mixing
+### 6.1 Overview of Surface-Layer, RSL, and Turbulent Mixing
 
 Friction with trees, buildings, mountains, and ocean waves slows surface winds and generates turbulent eddies that pump heat and water vapor upward through the planetary boundary layer (PBL). Over tall forests, standard Monin–Obukhov similarity breaks down right above the treetops inside the **Roughness Sublayer (RSL)** where coherent canopy wakes enhance mixing. AOBA couples a closed-form RSL similarity theory at the surface to an implicit MYNN Level 2.5 turbulent kinetic energy (TKE) closure vertically and a 3D Smagorinsky–Lilly eddy diffusivity horizontally on the CRM.
 
@@ -384,7 +384,7 @@ $$
 
 ## 7. Land Surface, MAML Hydrology, Autonomous EEO Biosphere & Terrestrial C/N/Fire
 
-### 7.1 Physical Intuition: How Plants and Soils Self-Organize Without Biome Maps
+### 7.1 Overview of Land-Surface, Biosphere, and Hydrological Coupling
 
 Traditional ESMs prescribe static maps saying "Cell 412 is Tropical Broadleaf Evergreen Forest." If $\mathrm{CO}_2$ quadruples or an Ice Age begins, those static maps cannot move forests into thawing tundra or turn drying jungles into savanna. AOBA instead applies **Eco-Evolutionary Optimality (EEO)** (Prentice et al., 2014; Wang et al., 2017; Smith et al., 2019; Cai et al., 2025): natural selection drives plants everywhere to maximize carbon gain per unit cost of maintaining photosynthetic enzymes ($V_{c\max}, J_{\max}$) and losing water through stomata. Combined with **MAML** (every CRM column owns its own independent land patch), rainforests, savannas, deserts, grasslands ($\mathrm{C}_4$), boreal evergreen forests, and tundra emerge autonomously from sunlight, temperature, $\mathrm{CO}_2$, and rainfall.
 
@@ -491,7 +491,7 @@ $$
 
 ## 8. Global Nonhydrostatic SCVT Dynamics, Embedded CRM & Gravity Wave Drag
 
-### 8.1 Physical Intuition: One Dynamical Equation Set Across Every Scale
+### 8.1 Unified Nonhydrostatic Core and Time-Splitting Overview
 
 Unlike traditional ESMs that pair a hydrostatic spectral global model with unrelated convection code, AOBA integrates **the exact same flux-form compressible nonhydrostatic Euler equations** on both the global SCVT host and the embedded 4 km CRM. Sound waves travel much faster ($\sim 340\ \mathrm{m\ s^{-1}}$) than winds, especially vertically across thin $60\ \mathrm{m}$ layers. Therefore, AOBA splits time stepping via **RK3–HEVI** (3-stage Wicker–Skamarock Runge–Kutta with Horizontal-Explicit, Vertical-Implicit acoustic tridiagonal solves), guaranteeing stability without restricting time steps to vertical sound speed. All moisture, chemical, aerosol, $\mathrm{CO}_2$, and isotope tracers are advected conservatively by **Zalesak (1979) Flux-Corrected Transport (FCT)**, preventing negative concentrations or spurious ripples.
 
@@ -547,13 +547,13 @@ Setting `enable_superparam = false` bypasses the embedded curtain and steps the 
 
 ## 9. Ocean Circulation (`ocean_mode`), Fine Ocean Grid, Waves, Sea Ice & Marine BGC
 
-### 9.1 Physical Intuition & Selecting an Ocean Configuration
+### 9.1 Overview and Selectable Ocean Modes (`ocean_mode`)
 
-The ocean holds over 90% of Earth's excess heat and ~50 times more carbon than the atmosphere. Surface winds push upper-ocean gyres and equatorial upwelling; cooling and sea-ice brine rejection at high latitudes sink dense water into the abyss, driving the global overturning circulation (**AMOC** and **ACC**).
+The ocean constitutes the dominant thermal inertia and carbon reservoir of the Earth system, storing over 90% of excess heat and roughly 50 times the atmospheric carbon inventory. Surface winds push upper-ocean gyres and equatorial upwelling; cooling and sea-ice brine rejection at high latitudes sink dense water into the abyss, driving the global overturning circulation (**AMOC** and **ACC**).
 
 **Choose one of two ocean dynamical cores** via `[forcing] ocean_mode`, and optionally pair `ogcm_3d` with an **independent higher-resolution ocean grid** (`ocean_glevel > glevel`, e.g., eddy-permitting G6/G7 ocean coupled to a G4/G5 atmosphere):
 
-| `ocean_mode` | Vertical Structure | Key Physics | Best Use Case |
+| `ocean_mode` | Vertical Structure | Key Physics | Typical Applications |
 | :--- | :--- | :--- | :--- |
 | `"ekman_sw"` | 1.5 layers (mixed layer + reduced-gravity thermocline) | Wind-driven Ekman transport + shallow-water Rossby/Kelvin waves (zero $Q$-fluxes) | Fast conceptual runs, aquaplanets, quick sensitivity sweeps |
 | `"ogcm_3d"` *(Default)* | Multi-layer (`ocean_nz = 18` to abyss) | Full 3D SCVT OGCM, Earth2014 bathymetry, FCT-$z^*$, GM90/Redi, KPP, submeso, tidal mixing, AMOC/ACC | Realistic climate, paleoclimate, carbon & marine BGC |
@@ -666,7 +666,7 @@ $$
 
 ## 10. Atmospheric Chemistry (`o3_mode`), Aerosols, Carbon (`co2_mode`) & Water Isotopes
 
-### 10.1 Physical Intuition: Closing Earth's Chemical and Isotopic Loops
+### 10.1 Overview of Chemistry, Aerosols, Biogeochemical Cycles, and Isotopes
 
 Trace gases and tiny aerosol particles exert outsized control on climate: stratospheric ozone shields life from UV radiation and heats the stratosphere; explosive volcanoes cool the globe for 2–3 years; natural wetlands and ocean OMZs regulate $\mathrm{CH}_4$ and $\mathrm{N}_2\mathrm{O}$; and heavy water molecules ($\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$) record past temperatures inside Greenland and Antarctic ice cores.
 
@@ -676,7 +676,7 @@ Trace gases and tiny aerosol particles exert outsized control on climate: strato
 
 **Choose one of four ozone configurations** via `[forcing] o3_mode`:
 
-| `o3_mode` | Dimensionality | Physics & Source | Best Use Case |
+| `o3_mode` | Dimensionality | Physics & Source | Typical Applications |
 | :--- | :--- | :--- | :--- |
 | `"rcemip"` | 1D ($p$) | Wing et al. (2018) analytic profile | Idealized tropical / RCE benchmarks |
 | `"latitude_seasonal"` *(Default)* | 2D ($\phi, p, t$) | Map-free analytic latitude–season Brewer–Dobson ozone | Fast multi-decadal climate runs |
@@ -733,7 +733,7 @@ $$
 
 **Choose one of four $\mathrm{CO}_2$ modes** via `[forcing] co2_mode`:
 
-| `co2_mode` | Behavior | Best Use Case |
+| `co2_mode` | Behavior | Typical Applications |
 | :--- | :--- | :--- |
 | `"constant"` *(Default)* | Fixed `co2_ppmv` (e.g., 284.3 piControl, 185 LGM, 1137 $4\times\mathrm{CO}_2$) | Equilibrium sensitivity & piControl |
 | `"scenario"` | Interpolates bundled NOAA / CMIP5 RCP / CMIP6 SSP / 800 kyr ice-core table | Historical & SSP concentration-driven runs |
@@ -760,7 +760,7 @@ $$
 
 ### 10.6 Prognostic Stable Water Isotopes ($\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$, `src/aoba/water_isotopes.py`)
 
-Heavy water molecules ($\mathrm{H}_2^{18}\mathrm{O}$ and $\mathrm{HDO}$) have slightly lower vapor pressures than normal $\mathrm{H}_2^{16}\mathrm{O}$, so they condense preferentially into rain and snow, leaving air masses progressively depleted as they travel poleward or upslope. This creates the famous paleoclimate thermometer recorded in polar ice cores!
+Heavy water molecules ($\mathrm{H}_2^{18}\mathrm{O}$ and $\mathrm{HDO}$) have slightly lower vapor pressures than normal $\mathrm{H}_2^{16}\mathrm{O}$, so they condense preferentially into rain and snow, leaving air masses progressively depleted as they travel poleward or upslope. This distillation establishes the temperature-dependent isotopic gradients archived in polar ice cores.
 
 When `enable_water_isotopes = true`, AOBA advects VSMOW-normalized 3D vapor mixing ratios $(q_v^{18}, q_v^{\mathrm{D}})$ via SCVT FCT and reports isotope ratios in standard $\delta$-notation ($\text{‰}$):
 
@@ -794,7 +794,7 @@ $$
 
 ## 11. Dynamic Ice Sheet, Milankovitch Paleoclimate & Universal Planetary Presets
 
-### 11.1 Physical Intuition: From Ice Ages to Exoplanets
+### 11.1 Overview of Ice-Sheet Dynamics, Orbital Forcing, and Planetary Regimes
 
 Over thousands of years, snow piling up faster than summer melt compresses into glacier ice that flows slowly outward under gravity, depressing the underlying bedrock into the viscous mantle. At the same time, slow gravitational tugs from Jupiter and Saturn vary Earth's orbital eccentricity, axial tilt, and precession (**Milankovitch cycles**). Because AOBA uses zero modern geographic maps, the very same equations also simulate completely different worlds—from Snowball Earth to tidally locked exoplanets orbiting red dwarf stars.
 
