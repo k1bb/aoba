@@ -184,12 +184,13 @@ def test_kpp_boundary_layer_and_nonlocal_convection_conservation() -> None:
     is_ocn = ogcm.wet_c[0]
     zeros = torch.zeros(mesh.n_cells)
 
-    # Set weak upper stratification so strong wind + cooling deepens KPP h_BL beyond Layer 0 (50 m)
+    # Set weak upper stratification (uniform salinity) so strong wind + cooling deepens KPP h_BL beyond Layer 0 (50 m)
     ogcm.temp = torch.where(
         ogcm.wet_c,
         286.0 - 0.002 * ogcm.z_c.unsqueeze(1),
         ogcm.temp,
     )
+    ogcm.sal = torch.where(ogcm.wet_c, torch.full_like(ogcm.sal, 34.7), ogcm.sal)
     sfc.t_ocean_ml = ogcm.temp[0].clone() - 0.15  # Strong surface cooling (B_0 < 0 -> convective!)
     tau_x = torch.full((mesh.n_cells,), -0.25)
     tau_y = torch.zeros(mesh.n_cells)

@@ -116,7 +116,7 @@ EMISSIVITY_LAND: float = 0.98      # Thermal IR emissivity of vegetated/bare/sno
 EMISSIVITY_OCEAN: float = 0.985    # Thermal IR emissivity of seawater/sea ice [-]
 
 # Fractional-lead sea-ice constants (Semtner, 1976; SCALE-RM Sec. 8.6.2 Eq. 8.342)
-MC_SEAICE_CRIT: float = 300.0      # Critical sea-ice mass for 100% ice cover (~0.33 m) [kg m^-2]
+MC_SEAICE_CRIT: float = 450.0      # Critical sea-ice mass for 100% ice cover (~0.49 m) [kg m^-2]
 ALB_SEAICE_VIS: float = 0.72       # Bare sea-ice visible albedo [-] (Semtner, 1976; Ebert & Curry, 1993)
 ALB_SEAICE_NIR: float = 0.42       # Bare sea-ice near-IR albedo [-]
 
@@ -1232,9 +1232,9 @@ def _land_newton_jacobian_core(
         dt1 = torch.where(dt1 * prev_dt_sh < 0.0, 0.5 * dt1, dt1)
         dt2 = torch.where(dt2 * prev_dt_gnd < 0.0, 0.5 * dt2, dt2)
 
-    t_sun_new = t_sun_cur + dt0
-    t_sh_new = t_sh_cur + dt1
-    t_gnd_new = t_gnd_cur + dt2
+    t_sun_new = torch.clamp(t_sun_cur + dt0, min=150.0, max=370.0)
+    t_sh_new = torch.clamp(t_sh_cur + dt1, min=150.0, max=370.0)
+    t_gnd_new = torch.clamp(t_gnd_cur + dt2, min=150.0, max=370.0)
 
     melt_excess_t = torch.where(has_snow & (t_gnd_new > C.T_FREEZE), t_gnd_new - C.T_FREEZE, zero_t)
     t_gnd_final = t_gnd_new - melt_excess_t
@@ -1491,8 +1491,15 @@ def _ocean_seaice_post_core(
         + cond_ice
         + 4.0 * EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * t_si_3
     )
-    res_si = sw_abs + lw_down - lw_up_si0 - shf_si0 - C.L_S0 * subl_si0 - g_cond_si0
-    t_si_raw = t_seaice + torch.clamp(res_si / denom_si, -10.0, 10.0)
+    # Exact sea-ice tile absorbed SW using snow-covered sea-ice VIS/NIR albedos (matches compute_surface_albedos
+    # so (1 - f_ice) * sw_abs_ow + f_ice * sw_abs_si == sw_abs and open-water SW never heats sea-ice floes!)
+    f_sn_ice = torch.tanh(torch.clamp(swe_seaice, min=0.0) / 15.0)
+    ice_vis = (1.0 - f_sn_ice) * ALB_SEAICE_VIS + f_sn_ice * ALB_SNOW_VIS_NEW
+    ice_nir = (1.0 - f_sn_ice) * ALB_SEAICE_NIR + f_sn_ice * ALB_SNOW_NIR_NEW
+    sw_abs_si = (sw1_dir_down + sw1_dif_down) * (1.0 - ice_vis) + (sw2_dir_down + sw2_dif_down) * (1.0 - ice_nir)
+
+    res_si = sw_abs_si + lw_down - lw_up_si0 - shf_si0 - C.L_S0 * subl_si0 - g_cond_si0
+    t_si_raw = torch.clamp(t_seaice + torch.clamp(res_si / denom_si, -10.0, 10.0), min=170.0, max=310.0)
     si_melt_excess = torch.clamp(t_si_raw - C.T_FREEZE, min=0.0)
     t_si_new = torch.where(f_ice > 1.0e-4, t_si_raw - si_melt_excess, torch.full_like(t_si_raw, C.T_FREEZE_OCEAN))
     dt_si = t_si_new - t_seaice

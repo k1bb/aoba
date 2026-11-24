@@ -1375,7 +1375,7 @@ kernel void scvt_fast_edge(
 
     float u0 = u_c[gid];
     float dt_ac = f_p.x;
-    float un = u0 + dt_ac * (tend_u_sl[gid] + pgf - sponge_c[k] * u0);
+    float un = (u0 + dt_ac * (tend_u_sl[gid] + pgf)) / (1.0f + dt_ac * sponge_c[k]);
     float uh = m_edge[gid] * (1.10f * un - 0.10f * u0);
 
     u_n[gid] = un;

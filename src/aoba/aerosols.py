@@ -35,7 +35,7 @@ from aoba.surface import SURF_OCEAN
 SEASALT_C0: float = 2.5e-13        # Base mass flux prefactor [kg m^-2 s^-1 (m/s)^-3.41] (~4000 Tg/yr global)
 SEASALT_V_SETTLE: float = 0.004    # Effective gravitational settling speed [m s^-1]
 SEASALT_V_DRY: float = 0.005       # Surface dry deposition velocity [m s^-1]
-SEASALT_WET_SCAV: float = 1200.0   # Wet scavenging coefficient [m^2 kg^-1]
+SEASALT_WET_SCAV: float = 0.80     # Below-cloud wet scavenging [m^2 kg^-1] (Croft et al., 2010; matches dust.py)
 
 # Marine DMS -> SO4 emission & oxidation (Kloster et al., 2006; Orr et al., 2017 Table 1)
 DMS_SC_A: float = 2855.7
@@ -48,13 +48,13 @@ DMS_TO_SO4_YIELD: float = 0.75     # Molar yield of nss-SO4 from oxidized DMS [-
 M_SO4_KG_MOL: float = 0.09606      # Molar mass of SO4^2- [kg mol^-1]
 SO4_V_SETTLE: float = 0.0004       # Fine-mode sulfate settling speed [m s^-1]
 SO4_V_DRY: float = 0.0015          # Sulfate dry deposition velocity [m s^-1]
-SO4_WET_SCAV: float = 950.0        # Hygroscopic sulfate wet scavenging [m^2 kg^-1]
+SO4_WET_SCAV: float = 0.60         # Hygroscopic sulfate wet scavenging [m^2 kg^-1]
 
 # Wildfire BC & OC removal (fine carbonaceous smoke)
 BC_V_SETTLE: float = 0.0002        # Fine BC settling speed [m s^-1]
 BC_V_DRY: float = 0.0010           # BC dry deposition velocity [m s^-1]
-BC_WET_SCAV: float = 500.0         # Hydrophobic->aged BC wet scavenging [m^2 kg^-1]
-OC_WET_SCAV: float = 750.0         # Partially hydrophilic OC wet scavenging [m^2 kg^-1]
+BC_WET_SCAV: float = 0.30          # Hydrophobic->aged BC wet scavenging [m^2 kg^-1]
+OC_WET_SCAV: float = 0.50          # Partially hydrophilic OC wet scavenging [m^2 kg^-1]
 
 # 550 nm Mass Extinction Efficiencies [m^2 kg^-1] (Chin et al., 2002; Kinne et al., 2006)
 MEE_SS_550: float = 2500.0         # Sea salt (hygroscopic scattering, SSA ~ 0.99)
@@ -144,20 +144,44 @@ def _step_single_aerosol_column(
     dz_c: torch.Tensor,
     emis_sfc: torch.Tensor,
     precip_rate: torch.Tensor,
+    u_star_cell: torch.Tensor,
     v_settle: float,
     v_dry: float,
     alpha_wet: float,
     dt: float,
 ) -> torch.Tensor:
-    """Strictly positive implicit emission + settling + dry deposition + exponential wet scavenging."""
+    """Strictly positive implicit emission + PBL mixing + settling + dry dep + wet scavenging."""
     nz = q.shape[0]
     m_k = torch.clamp(rho_d * dz_c, min=1.0e-5)
     q_cur = torch.clamp(q, min=0.0).clone()
 
-    # Inject surface emission into lowest atmospheric layer k = 0
+    # 1. Inject surface emission into lowest atmospheric layer k = 0
     q_cur[0] = q_cur[0] + (dt * torch.clamp(emis_sfc, min=0.0)) / m_k[0]
 
-    # Top-down implicit gravitational settling + surface dry deposition (unconditionally stable)
+    # 2. Mass-conserving PBL turbulent mixing across lowest ~1.2 km (matches dust.py)
+    n_mix = min(6, nz - 1)
+    if n_mix > 0:
+        h_pbl = 1200.0
+        u_st = torch.clamp(u_star_cell, min=0.05)
+        z_rel = [0.5 * dz_c[0]]
+        for k in range(1, n_mix + 1):
+            z_rel.append(z_rel[-1] + 0.5 * (dz_c[k - 1] + dz_c[k]))
+        for k in range(n_mix):
+            z_int = 0.5 * (z_rel[k] + z_rel[k + 1])
+            k_z = torch.where(
+                z_int < h_pbl,
+                0.4 * u_st * z_int * ((1.0 - z_int / h_pbl) ** 2),
+                torch.zeros_like(z_int),
+            )
+            dz_int = torch.clamp(0.5 * (dz_c[k] + dz_c[k + 1]), min=10.0)
+            rho_int = 0.5 * (rho_d[k] + rho_d[k + 1])
+            exch = (dt * rho_int * k_z) / dz_int
+            frac = exch / (1.0 + exch * (1.0 / m_k[k] + 1.0 / m_k[k + 1]))
+            dq_flux = frac * (q_cur[k] - q_cur[k + 1])
+            q_cur[k] = q_cur[k] - dq_flux / m_k[k]
+            q_cur[k + 1] = q_cur[k + 1] + dq_flux / m_k[k + 1]
+
+    # 3. Top-down implicit gravitational settling + surface dry deposition (unconditionally stable)
     flux_above = torch.zeros_like(q_cur[0])
     out_layers: list[torch.Tensor] = [torch.empty(0)] * nz
     for k in range(nz - 1, -1, -1):
@@ -168,7 +192,7 @@ def _step_single_aerosol_column(
         out_layers[k] = q_k
     q_post = torch.stack(out_layers, dim=0)
 
-    # Exponential precipitation wet scavenging
+    # 4. Exponential precipitation wet scavenging
     wash = torch.exp(-torch.clamp(alpha_wet * torch.clamp(precip_rate, min=0.0) * dt, max=20.0))
     return torch.clamp(q_post * wash.unsqueeze(0), min=0.0, max=1.0e-3)
 
@@ -186,13 +210,19 @@ def step_natural_aerosols_column(
     chl_sfc_mg_m3: torch.Tensor | None = None,
     fire_bc_kg_m2s: torch.Tensor | None = None,
     fire_oc_kg_m2s: torch.Tensor | None = None,
+    u_star_cell: torch.Tensor | None = None,
 ) -> None:
-    """Advance natural aerosol columns (emission, settling, wet scavenging) & update AOD/CCN."""
+    """Advance natural aerosol columns (emission, PBL mixing, settling, wet scavenging) & update AOD/CCN."""
     emis_ss, emis_so4 = compute_seasalt_and_dms_emissions(
         surf_type, sst_k, u10_ms, f_seaice, chl_sfc_mg_m3=chl_sfc_mg_m3
     )
     emis_bc = fire_bc_kg_m2s if fire_bc_kg_m2s is not None else torch.zeros_like(emis_ss)
     emis_oc = fire_oc_kg_m2s if fire_oc_kg_m2s is not None else torch.zeros_like(emis_ss)
+    u_st = (
+        torch.clamp(u_star_cell, min=0.05)
+        if u_star_cell is not None
+        else torch.clamp(0.035 * torch.clamp(u10_ms, min=0.0), min=0.05)
+    )
 
     if get_active_gpu_backend(aero.q_ss.device) in ("mps", "cuda"):
         q_in = torch.stack([aero.q_ss, aero.q_so4, aero.q_bc, aero.q_oc], dim=0)
@@ -203,6 +233,7 @@ def step_natural_aerosols_column(
             dz_c=dz_c,
             emis_4=emis_4,
             precip_rate=precip_rate,
+            u_star_cell=u_st,
             v_settle_4=(SEASALT_V_SETTLE, SO4_V_SETTLE, BC_V_SETTLE, BC_V_SETTLE),
             v_dry_4=(SEASALT_V_DRY, SO4_V_DRY, BC_V_DRY, BC_V_DRY),
             alpha_wet_4=(SEASALT_WET_SCAV, SO4_WET_SCAV, BC_WET_SCAV, OC_WET_SCAV),
@@ -213,16 +244,16 @@ def step_natural_aerosols_column(
         aero.aod_ss, aero.aod_so4, aero.aod_bc, aero.aod_oc = aod_out[0], aod_out[1], aod_out[2], aod_out[3]
     else:
         aero.q_ss = _step_single_aerosol_column(
-            aero.q_ss, rho_d, dz_c, emis_ss, precip_rate, SEASALT_V_SETTLE, SEASALT_V_DRY, SEASALT_WET_SCAV, dt
+            aero.q_ss, rho_d, dz_c, emis_ss, precip_rate, u_st, SEASALT_V_SETTLE, SEASALT_V_DRY, SEASALT_WET_SCAV, dt
         )
         aero.q_so4 = _step_single_aerosol_column(
-            aero.q_so4, rho_d, dz_c, emis_so4, precip_rate, SO4_V_SETTLE, SO4_V_DRY, SO4_WET_SCAV, dt
+            aero.q_so4, rho_d, dz_c, emis_so4, precip_rate, u_st, SO4_V_SETTLE, SO4_V_DRY, SO4_WET_SCAV, dt
         )
         aero.q_bc = _step_single_aerosol_column(
-            aero.q_bc, rho_d, dz_c, emis_bc, precip_rate, BC_V_SETTLE, BC_V_DRY, BC_WET_SCAV, dt
+            aero.q_bc, rho_d, dz_c, emis_bc, precip_rate, u_st, BC_V_SETTLE, BC_V_DRY, BC_WET_SCAV, dt
         )
         aero.q_oc = _step_single_aerosol_column(
-            aero.q_oc, rho_d, dz_c, emis_oc, precip_rate, BC_V_SETTLE, BC_V_DRY, OC_WET_SCAV, dt
+            aero.q_oc, rho_d, dz_c, emis_oc, precip_rate, u_st, BC_V_SETTLE, BC_V_DRY, OC_WET_SCAV, dt
         )
         # Diagnose 550 nm column AOD [-]
         mass_c = rho_d * dz_c

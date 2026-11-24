@@ -61,12 +61,12 @@ SOIL_CRYO_DIFF_M2_YR: float = 5.0e-4  # Vertical bioturbation / cryoturbation di
 
 # Autonomous SPITFIRE wildfire parameters (Thonicke et al., 2010)
 FIRE_DI_MAX: float = 5000.0        # Nesterov dryness index saturation cap [K^2]
-FIRE_DI_K: float = 6.0e-4          # Fire danger index FDI = 1 - exp(-k * DI) [K^-2]
+FIRE_DI_K: float = 3.0e-4          # Fire danger index FDI = 1 - exp(-k * DI) [K^-2]
 FIRE_FUEL_MIN_KGC: float = 0.15    # Minimum litter fuel load required to sustain fire [kg C m^-2]
-FIRE_MAX_RATE_YR: float = 0.35     # Maximum annual fractional burned area under extreme drought [yr^-1]
+FIRE_MAX_RATE_YR: float = 0.08     # Maximum annual fractional burned area under extreme drought [yr^-1]
 FIRE_COMBUST_LIT: float = 0.70     # Litter combustion completeness [-]
 FIRE_COMBUST_LEAF: float = 0.50    # Canopy leaf combustion completeness during fire [-]
-FIRE_COMBUST_WOOD: float = 0.15    # Woody stem combustion completeness (crown/surface fire) [-]
+FIRE_COMBUST_WOOD: float = 0.08    # Woody stem combustion completeness (surface/crown fire) [-]
 FIRE_EF_BC: float = 0.0012         # Black carbon emission factor [kg BC / kg C burned] (Andreae & Merlet, 2001)
 FIRE_EF_OC: float = 0.0110         # Organic carbon aerosol emission factor [kg OC / kg C burned]
 

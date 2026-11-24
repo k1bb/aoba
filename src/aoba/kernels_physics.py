@@ -2165,7 +2165,7 @@ kernel void two_leaf_gas_exchange_col(
         float b4 = ip3 + jm4;
         float j_4 = (b4 - sqrt(max(b4 * b4 - 4.0f * THETA_NRH * ip3 * jm4, 0.0f))) / (2.0f * THETA_NRH);
         float sig4 = 1.0f / (1.0f + exp(-0.35f * ((tl - T_FREEZE) - 12.0f)));
-        float al4 = 0.20f * j_4 * sig4;
+        float al4 = 0.20f * (1.0f - PHI_LEAK_C4) * j_4 * sig4;
         float b_cj4 = vc4 + al4;
         float acj4 = (b_cj4 - sqrt(max(b_cj4 * b_cj4 - 4.0f * 0.85f * vc4 * al4, 0.0f))) / (2.0f * 0.85f);
         float rd4 = r25_4 * fr;
@@ -2325,14 +2325,15 @@ kernel void natural_aerosol_4sp_col(
     device const float* dz_c        [[buffer(2)]],  // [nz, dz_cols]
     device const float* emis_4      [[buffer(3)]],  // [4, nc]
     device const float* precip      [[buffer(4)]],  // [nc]
-    device float* q_out             [[buffer(5)]],  // [4, nz, nc]
-    device float* aod_out           [[buffer(6)]],  // [4, nc]
-    constant ulong4& u_dim          [[buffer(7)]],  // [n_sp, nz, nc, dz_cols]
-    constant float4& v_settle_4     [[buffer(8)]],  // [v_ss, v_so4, v_bc, v_oc]
-    constant float4& v_dry_4        [[buffer(9)]],  // [vd_ss, vd_so4, vd_bc, vd_oc]
-    constant float4& alpha_wet_4    [[buffer(10)]], // [aw_ss, aw_so4, aw_bc, aw_oc]
-    constant float4& mee_4          [[buffer(11)]], // [mee_ss, mee_so4, mee_bc, mee_oc]
-    constant float& dt              [[buffer(12)]],
+    device const float* u_star_in   [[buffer(5)]],  // [nc]
+    device float* q_out             [[buffer(6)]],  // [4, nz, nc]
+    device float* aod_out           [[buffer(7)]],  // [4, nc]
+    constant ulong4& u_dim          [[buffer(8)]],  // [n_sp, nz, nc, dz_cols]
+    constant float4& v_settle_4     [[buffer(9)]],  // [v_ss, v_so4, v_bc, v_oc]
+    constant float4& v_dry_4        [[buffer(10)]], // [vd_ss, vd_so4, vd_bc, vd_oc]
+    constant float4& alpha_wet_4    [[buffer(11)]], // [aw_ss, aw_so4, aw_bc, aw_oc]
+    constant float4& mee_4          [[buffer(12)]], // [mee_ss, mee_so4, mee_bc, mee_oc]
+    constant float& dt              [[buffer(13)]],
     uint gid                        [[thread_position_in_grid]])
 {
     uint n_sp = uint(u_dim.x);
@@ -2353,8 +2354,44 @@ kernel void natural_aerosol_4sp_col(
     float pr = max(precip[c], 0.0f);
     float wash = exp(-min(aw * pr * dt, 20.0f));
     float emis = max(emis_4[s * nc + c], 0.0f);
+    float u_st = max(u_star_in[c], 0.05f);
 
     uint sp_base = s * nz * nc;
+
+    // 1. Register-resident emission injection + mass-conserving PBL turbulent mixing (k = 0..n_mix)
+    uint n_mix = (nz > 1u) ? min(6u, nz - 1u) : 0u;
+    float q_pbl[7];
+    float m_pbl[7];
+    float dz_pbl[7];
+    float rho_pbl[7];
+    float z_rel[7];
+    for (uint k = 0u; k <= n_mix; ++k) {
+        uint idx2 = k * nc + c;
+        float rd = rho_d[idx2];
+        float dz = dz_c[k * dz_cols + col_dz];
+        rho_pbl[k] = rd;
+        dz_pbl[k] = dz;
+        m_pbl[k] = max(rd * dz, 1.0e-5f);
+        q_pbl[k] = max(q_in[sp_base + idx2], 0.0f);
+        z_rel[k] = (k == 0u) ? (0.5f * dz) : (z_rel[k - 1u] + 0.5f * (dz_pbl[k - 1u] + dz));
+    }
+    q_pbl[0] += (dt * emis) / m_pbl[0];
+    for (uint k = 0u; k < n_mix; ++k) {
+        float z_int = 0.5f * (z_rel[k] + z_rel[k + 1u]);
+        if (z_int < 1200.0f) {
+            float fz = 1.0f - z_int / 1200.0f;
+            float kz = 0.4f * u_st * z_int * fz * fz;
+            float dz_int = max(0.5f * (dz_pbl[k] + dz_pbl[k + 1u]), 10.0f);
+            float rho_int = 0.5f * (rho_pbl[k] + rho_pbl[k + 1u]);
+            float exch = (dt * rho_int * kz) / dz_int;
+            float frac = exch / (1.0f + exch * (1.0f / m_pbl[k] + 1.0f / m_pbl[k + 1u]));
+            float dq_flux = frac * (q_pbl[k] - q_pbl[k + 1u]);
+            q_pbl[k] -= dq_flux / m_pbl[k];
+            q_pbl[k + 1u] += dq_flux / m_pbl[k + 1u];
+        }
+    }
+
+    // 2. Top-down implicit gravitational settling + surface dry deposition + wet scavenging
     float flux_above = 0.0f;
     float col_mass = 0.0f;
 
@@ -2366,10 +2403,7 @@ kernel void natural_aerosol_4sp_col(
         float dz = dz_c[k * dz_cols + col_dz];
         float mk_raw = rd * dz;
         float mk = max(mk_raw, 1.0e-5f);
-        float q_cur = max(q_in[idx3], 0.0f);
-        if (k == 0u) {
-            q_cur += (dt * emis) / mk;
-        }
+        float q_cur = (k <= n_mix) ? q_pbl[k] : max(q_in[idx3], 0.0f);
         float v_bot = (k == 0u) ? (vs + vd) : vs;
         float sink = dt * rd * v_bot;
         float q_k = (mk * q_cur + dt * flux_above) / (mk + sink);
@@ -2829,7 +2863,7 @@ kernel void ocean_bgc_column_col(
         // 2. FlexPFT optimal quota Q, theta_hat, mu_fl
         float t_safe = clamp(temp_k[idx], 270.0f, 315.0f);
         float f_temp = exp(-ea_over_r * (1.0f / t_safe - inv_tref));
-        float v0 = 2.2f * f_temp;
+        float v0 = 1.4f * f_temp;
 
         float theta_hat = 0.0f;
         if (par_k > i_thresh) {
@@ -2873,7 +2907,7 @@ kernel void ocean_bgc_column_col(
         float dc_up = dn_up * c_to_n;
 
         float p2 = p_pos * p_pos;
-        float g_rate = (1.0f * f_temp) * (p2 / (p2 + 0.64f)) * z_pos;
+        float g_rate = (1.0f * f_temp) * (p2 / (p2 + 0.25f)) * z_pos;
         float m_p_rate = (0.03f * f_temp) * p_pos + 0.05f * p2;
         float tot_p = (g_rate + m_p_rate) * dt_day;
         float sc_p = (tot_p > 0.8f * p_pos) ? ((0.8f * p_pos) / max(tot_p, 1.0e-12f)) : 1.0f;
@@ -2887,7 +2921,7 @@ kernel void ocean_bgc_column_col(
         float dn_zexcr = (z_excr_r * dt_day) * sc_z;
         float dn_zmort = (z_mort_r * dt_day) * sc_z;
 
-        float f_remin = _aoba_neg_expm1_neg(min(0.05f * f_temp * dt_day, 20.0f));
+        float f_remin = _aoba_neg_expm1_neg(min(0.12f * f_temp * dt_day, 20.0f));
         float dn_remin = f_remin * dn_pos;
         float dc_remin = f_remin * dc_pos;
 
@@ -3713,6 +3747,7 @@ def run_natural_aerosol_4sp_metal(
     dz_c: torch.Tensor,
     emis_4: torch.Tensor,
     precip_rate: torch.Tensor,
+    u_star_cell: torch.Tensor,
     v_settle_4: tuple[float, float, float, float],
     v_dry_4: tuple[float, float, float, float],
     alpha_wet_4: tuple[float, float, float, float],
@@ -3729,6 +3764,7 @@ def run_natural_aerosol_4sp_metal(
         dz_2d,
         emis_4.contiguous(),
         precip_rate.contiguous(),
+        u_star_cell.contiguous(),
         q_out,
         aod_out,
         [n_sp, nz, nc, dz_2d.shape[1]],

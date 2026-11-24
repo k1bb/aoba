@@ -224,7 +224,7 @@ def init_ogcm_state(
     sfc: SurfaceState,
     mesh: SCVTMesh,
     nz_ocn: int = 18,
-    t_abyss_k: float = 274.2,
+    t_abyss_k: float = 274.5,
 ) -> OceanOGCMState:
     """Initialize 3D SCVT OGCM from `Earth2014 BED2014` bathymetry and analytic thermocline/halocline."""
     dev = sfc.t_ocean_ml.device
@@ -274,16 +274,16 @@ def init_ogcm_state(
     k_bot = torch.where(wet_c, k_idx, torch.zeros_like(k_idx)).max(dim=0).values
 
     # Smooth map-free initial thermocline & polar halocline:
-    # T(z, lat) decays from SST toward WOA23-scale abyss T_abyss = 274.2 K (+1.05 C),
-    # while a gentle analytical polar halocline (-0.50 psu at poles, sin^6(lat) localized
-    # poleward of ~60 deg, e-folding 200 m, globally volume-normalized to exact S_REF_PSU = 34.7 psu)
-    # stabilizes the cold polar surface (+0.40 kg/m^3 haline > -0.17 kg/m^3 thermal) without
-    # reversing the Southern Ocean ACC meridional density gradient across Drake Passage.
+    # T(z, lat) decays from SST toward WOA23-scale abyss T_abyss = 274.5 K (+1.35 C) with
+    # realistic pycnocline e-folding depth (460 m tropics -> 200 m poles, matching WOA23 global
+    # mean T ~ 3.5 C and avoiding excessive initial baroclinic AMOC overshoot), while a localized
+    # polar halocline (-0.22 psu, sin^8(lat) poleward of ~65 deg, globally normalized to exact
+    # S_REF_PSU = 34.7 psu) stabilizes polar shelves without reversing the Southern Ocean ACC density front.
     lat_c = mesh.lat_cell.to(device=dev, dtype=dtype)
     cos2_lat = torch.cos(lat_c) ** 2
     sin2_lat = torch.sin(lat_c) ** 2
-    sin6_lat = sin2_lat * sin2_lat * sin2_lat
-    d_therm = 250.0 + 550.0 * cos2_lat  # [nc] deeper thermocline in tropics/subtropics
+    sin8_lat = (sin2_lat * sin2_lat) * (sin2_lat * sin2_lat)
+    d_therm = 200.0 + 260.0 * cos2_lat  # [nc] realistic WOA23-scale pycnocline depth
     sst = sfc.t_ocean_ml.clone()
     z_rel = torch.clamp(z_c.unsqueeze(1) - z_c[0], min=0.0)
     decay = torch.exp(-z_rel / d_therm.unsqueeze(0))
@@ -291,7 +291,7 @@ def init_ogcm_state(
     t_init[0] = sst
     t_init = torch.where(wet_c, torch.clamp(t_init, min=C.T_FREEZE_OCEAN), torch.full_like(t_init, t_abyss_k))
 
-    sal_raw = S_REF_PSU - 0.50 * sin6_lat.unsqueeze(0) * torch.exp(-z_rel / 200.0)
+    sal_raw = S_REF_PSU - 0.22 * sin8_lat.unsqueeze(0) * torch.exp(-z_rel / 200.0)
     vol_init = h_c * mesh.area_cell.to(device=dev, dtype=dtype).unsqueeze(0)
     v_sum = torch.clamp(vol_init.sum(), min=1.0)
     sal_shift = S_REF_PSU - (vol_init * sal_raw).sum() / v_sum
@@ -1545,7 +1545,7 @@ def step_ogcm_voronoi(
     if dc_min is None:
         dc_min = float(mesh.dc_edge.min().item())
         setattr(mesh, "_dc_edge_min_m", dc_min)
-    delta_munk = 1.6 * dc_min
+    delta_munk = 0.75 * dc_min
     a_h = min(BETA_MUNK_OGCM * (delta_munk ** 3), 0.06 * (dc_min ** 2) / max(dt, 1.0))
 
     lap_u, _ = compute_vector_laplacian_edge(mesh, u)
@@ -1849,7 +1849,7 @@ def diagnose_ocean_spinup_metrics(
     ice_nh = float((area_ocn * f_ice * (lat_rad >= 0.0).to(torch.float64)).sum().item() * 1.0e-12)
     ice_sh = float((area_ocn * f_ice * (lat_rad < 0.0).to(torch.float64)).sum().item() * 1.0e-12)
 
-    # Meridional overturning streamfunction (AMOC in Atlantic sector) [Sv]
+    # Meridional overturning streamfunction (AMOC in Atlantic sector, barotropic-mean removed) [Sv]
     def _amoc_at_lat(lat_c: float, half_w: float = 2.5) -> float:
         lon_hi = -10.0 if lat_c < 35.0 else 20.0
         band = wet0 & (lat_deg >= (lat_c - half_w)) & (lat_deg <= (lat_c + half_w)) & (lon_deg >= -82.0) & (lon_deg <= lon_hi)
@@ -1857,12 +1857,18 @@ def diagnose_ocean_spinup_metrics(
             return 0.0
         dlat_m = C.EARTH_RADIUS * math.radians(2.0 * half_w)
         # Transport per layer [m^3 s^-1]: sum_{i in band} v_k * h_k * area_i / dlat_m
-        t_layer = (v64[:, band] * h_eff[:, band] * (area[band].unsqueeze(0) / dlat_m)).sum(dim=1)
-        psi_sv = torch.cumsum(t_layer, dim=0) * 1.0e-6
+        w_sec = area[band].unsqueeze(0) / dlat_m
+        t_layer = (v64[:, band] * h_eff[:, band] * w_sec).sum(dim=1)
+        a_layer = (h_eff[:, band] * w_sec).sum(dim=1)
+        a_tot = float(a_layer.sum().item())
+        if a_tot <= 0.0:
+            return 0.0
+        t_oc = t_layer - (t_layer.sum() / a_tot) * a_layer
+        psi_sv = torch.cumsum(t_oc, dim=0) * 1.0e-6
         return float(psi_sv.max().item())
 
     amoc_26n = _amoc_at_lat(26.5, half_w=2.5)
-    amoc_max = max(_amoc_at_lat(lat_c, half_w=2.5) for lat_c in (24.0, 28.0, 32.0, 36.0, 40.0, 44.0, 48.0, 52.0, 56.0))
+    amoc_max = max(_amoc_at_lat(lat_c, half_w=2.5) for lat_c in (24.0, 26.5, 28.0, 32.0, 36.0, 40.0, 44.0, 48.0, 52.0, 56.0))
 
     # Antarctic Circumpolar Current (ACC) eastward volume transport through Drake Passage [Sv]
     drake = wet0 & (lon_deg >= -72.0) & (lon_deg <= -58.0) & (lat_deg >= -66.0) & (lat_deg <= -54.0)

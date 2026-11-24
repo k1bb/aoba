@@ -62,7 +62,7 @@ from aoba.surface import _kahan_add
 # ---------------------------------------------------------------------------
 # 1. FlexPFT Optimality & Ecosystem Constants (Sasai et al., 2022, Table 1; Smith et al., 2016)
 # ---------------------------------------------------------------------------
-FLEXPFT_MU_MAX_D: float = 2.2          # Potential maximum growth rate mu_max [d^-1]
+FLEXPFT_MU_MAX_D: float = 1.4          # Community-mean potential max growth rate mu_max [d^-1] (Sasai et al., 2022)
 FLEXPFT_V0_HAT_D: float = 1.0          # Potential max N uptake rate V_hat_0 [mol N (mol C)^-1 d^-1]
 FLEXPFT_A0_HAT: float = 1.0            # Potential max N affinity A_hat_0 [m^3 (mmol N)^-1 d^-1]
 FLEXPFT_ALPHA_I: float = 2.0           # Chl-specific initial P-I slope [m^2 W^-1 (g Chl)^-1 mol C d^-1]
@@ -82,13 +82,13 @@ PAR_FRAC_SW: float = 0.43              # PAR fraction of net surface shortwave i
 
 # NPZD food-web & detritus export parameters (Aumont et al., 2015; Sasai et al., 2022)
 ZOO_G_MAX_D: float = 1.0               # Max zooplankton grazing rate at T_ref [d^-1]
-ZOO_K_GRAZE: float = 0.8               # Holling Type III half-saturation biomass [mmol N m^-3]
+ZOO_K_GRAZE: float = 0.5               # Holling Type III half-saturation biomass [mmol N m^-3]
 ZOO_ASSIM_EFF: float = 0.70            # Zooplankton N assimilation efficiency [-]
 ZOO_EXCR_D: float = 0.05               # Zooplankton linear excretion to NO3/DIC [d^-1]
 ZOO_MORT_QUAD_D: float = 0.15          # Zooplankton quadratic mortality to detritus [(mmol N m^-3)^-1 d^-1]
 PHY_MORT_LIN_D: float = 0.03           # Phytoplankton linear mortality [d^-1]
 PHY_MORT_QUAD_D: float = 0.05          # Phytoplankton quadratic aggregation mortality [(mmol N m^-3)^-1 d^-1]
-DET_REMIN_D: float = 0.05              # Detritus remineralization rate at T_ref [d^-1]
+DET_REMIN_D: float = 0.12              # Detritus remineralization rate at T_ref (z* ~ 125 m) [d^-1]
 DET_W_SINK_M_D: float = 15.0           # Particulate detritus sinking speed [m d^-1]
 R_CN_ZOO: float = 106.0 / 16.0         # Zooplankton C:N Redfield stoichiometry (6.625 mol C / mol N)
 RAIN_RATIO_CACO3: float = 0.07         # CaCO3 : POC export rain ratio (Aumont et al., 2015; Orr et al., 2017)
@@ -161,11 +161,11 @@ def init_ocean_bgc_state(
 
     # Smooth map-free vertical profiles normalized to WOA/GLODAP global means (no geographic maps)
     z_2d = z_c.to(device=dev, dtype=dtype).unsqueeze(1)
-    nut_shape = 1.0 - torch.exp(-z_2d / 350.0)
+    nut_shape = 1.0 - torch.exp(-z_2d / 400.0)
 
-    no3_raw = 4.0 + 30.0 * nut_shape
+    no3_raw = 0.5 + 33.5 * nut_shape
     no3_shift = NO3_GLOBAL_MEAN - (vol * no3_raw).sum() / v_sum
-    no3 = torch.where(wet_c, torch.clamp(no3_raw + no3_shift, min=0.5), torch.zeros_like(no3_raw))
+    no3 = torch.where(wet_c, torch.clamp(no3_raw + no3_shift, min=0.2), torch.zeros_like(no3_raw))
 
     dic_raw = 2020.0 + 265.0 * nut_shape
     dic_shift = DIC_GLOBAL_MEAN - (vol * dic_raw).sum() / v_sum

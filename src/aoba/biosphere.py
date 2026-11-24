@@ -748,13 +748,15 @@ def update_daily_acclimation_smith(
     chi_m_c4 = torch.clamp(xi_c4 / (xi_c4 + torch.sqrt(d_pa)), 0.05, 0.92)
     cm_c4 = chi_m_c4 * ca_pa
 
-    # C4 RuBP/PEP regeneration requires 5 mol e^- per mol CO2 vs 4 in C3 (4/5 = 0.80; von Caemmerer & Furbank, 1999)
-    # and operates at bundle-sheath partial pressure C_bs >> Gamma^* (Scott & Smith, 2022, Eqs. 6 & 22)
+    # C4 RuBP/PEP regeneration requires 5 mol e^- per mol CO2 (4/5 = 0.80) AND pays the bundle-sheath
+    # CO2 leakage ATP overhead (1 - phi_leak, phi_leak = 0.20 -> effective quantum-yield ratio 0.64;
+    # von Caemmerer, 2000; Scott & Smith, 2022, Eqs. 6 & 22; Ehleringer et al., 1997 crossover ~23-25 C at 284 ppmv).
+    c4_qy_eff = 0.80 * (1.0 - PHI_LEAK_C4)
     chill_c4 = torch.sigmoid(0.35 * ((tg - C.T_FREEZE) - 12.0))
     gbs_canopy = GBS_C4 * torch.clamp(lai_exposed, min=0.1)
     cbs_c4 = cm_c4 + 250.0  # Initial bundle-sheath estimate [Pa], refined by 2 fixed-point steps
     for _ in range(2):
-        m_c4 = 0.80 * chill_c4 * torch.clamp((cbs_c4 - gamma_c4) / torch.clamp(cbs_c4 + 2.0 * gamma_c4, min=0.1), min=0.0)
+        m_c4 = c4_qy_eff * chill_c4 * torch.clamp((cbs_c4 - gamma_c4) / torch.clamp(cbs_c4 + 2.0 * gamma_c4, min=0.1), min=0.0)
         omega_c4, omega_star_c4 = smith_omega(m_c4)
         al_opt_c4 = phi_psii * i_abs * m_c4 * omega_star_c4 / (8.0 * THETA_NRH)  # Scott & Smith (2022, Eq. 5)
         leak_c4 = (PHI_LEAK_C4 / (1.0 - PHI_LEAK_C4)) * al_opt_c4                # Scott & Smith (2022, Eq. 15)
@@ -786,8 +788,8 @@ def update_daily_acclimation_smith(
     an_c3_mid = aj_opt_c3 - B_RESP_REN * vcmax_opt_c3 * (heskel_respiration_scale(tg) / fr_night)
     an_c4_mid = al_opt_c4 - B_RESP_REN * vcmax_opt_c4 * (heskel_respiration_scale(tg) / fr_night)
     adv_c4 = (an_c4_mid - an_c3_mid) / torch.clamp(torch.abs(an_c3_mid) + 1.0, min=1.0)
-    # Tree-shade exclusion of C4 understory in closed-canopy forests (Luo et al., 2024, Methods)
-    herb_openness = torch.clamp(1.15 - 0.18 * bio.lai, 0.02, 1.0)
+    # Beer-Lambert canopy gap transmittance excluding C4 understory beneath closed forests (Luo et al., 2024; Still et al., 2003)
+    herb_openness = torch.exp(-K_BEER_LAI * torch.clamp(bio.lai, min=0.0))
     f4_target = herb_openness * torch.sigmoid(8.0 * adv_c4)
     # Slow ecological turnover (~60-day smoothing)
     alpha_f4 = 0.25 * alpha_ema
@@ -1087,7 +1089,7 @@ def compute_two_leaf_gas_exchange(
         jm4 = ws * jm25_4 * fj
         vp4 = ws * vp25_4 * fp
         j_4 = non_rectangular_hyperbola(phi_g * i_par, jm4, THETA_NRH)
-        al4 = 0.20 * j_4 * torch.sigmoid(0.35 * ((tl - C.T_FREEZE) - 12.0))  # 5 mol e^- / mol CO2 (von Caemmerer, 2000)
+        al4 = 0.20 * (1.0 - PHI_LEAK_C4) * j_4 * torch.sigmoid(0.35 * ((tl - C.T_FREEZE) - 12.0))  # 5 mol e^- + BS leakage (von Caemmerer, 2000)
         ac4 = vc4  # Bundle-sheath CO2-saturated Rubisco limit
         b_cj4 = ac4 + al4
         acj4 = (b_cj4 - torch.sqrt(torch.clamp(b_cj4 * b_cj4 - 4.0 * 0.85 * ac4 * al4, min=0.0))) / (2.0 * 0.85)
@@ -1268,8 +1270,8 @@ def update_daily_lai_root_height(
     _, omega_star3 = smith_omega(m_c3)
 
     lue_c3 = phi_psii_temperature(daily_temp_k) * m_c3 * omega_star3 / (8.0 * THETA_NRH)
-    # Potential daily GPP A_0 (water limitation is handled analytically via fAPAR_w & f_0(AI))
-    cold_gate = torch.sigmoid(0.5 * (daily_temp_k - C.T_FREEZE))
+    # Potential daily GPP A_0 with universal vascular-growth cold sink gate (Körner, 2012; ~5 degC base)
+    cold_gate = torch.sigmoid(0.5 * ((daily_temp_k - C.T_FREEZE) - 5.0))
     a0_day = lue_c3 * torch.clamp(daily_ppfd_mol_m2, min=0.0) * cold_gate
 
     # Update growing-season drydown length D_max & daily PET for Holtzman et al. (2024) tau
@@ -1302,7 +1304,7 @@ def update_daily_lai_root_height(
     a0_day_fav = a0_day * torch.clamp(ws_b, 0.0, 1.0)
     a0_fav_prev = bio.ema_ann_a0_fav if bio.ema_ann_a0_fav is not None else bio.ema_ann_a0.clone()
     bio.ema_ann_a0_fav = (1.0 - alpha_yr) * a0_fav_prev + alpha_yr * (a0_day_fav * 365.2425)
-    is_fav = (daily_temp_k > C.T_FREEZE) & (ws_b > 0.20)
+    is_fav = (daily_temp_k > C.T_FREEZE + 5.0) & (ws_b > 0.20)
     bio.ema_gsl_frac = (1.0 - alpha_yr) * bio.ema_gsl_frac + alpha_yr * is_fav.to(daily_temp_k.dtype)
 
     # Track off-season temperature T_off and climatological annual minimum temperature T_min,yr
@@ -1369,8 +1371,10 @@ def update_daily_lai_root_height(
     f_evg_new = torch.where(veg, (1.0 - alpha_yr) * f_evg_prev + alpha_yr * f_evg_target, torch.zeros_like(f_evg_target))
     bio.f_evg = torch.clamp(f_evg_new, 0.0, 1.0)
 
-    # Effective amortized annual foliage cost z_eff lowers carbon barrier for long-lived evergreen canopies
-    z_eff = (1.0 - bio.f_evg) * c_dec + bio.f_evg * (c_evg / tau_evg)
+    # Effective amortized annual foliage cost z_eff lowers carbon barrier for long-lived evergreen canopies,
+    # floored at 0.55 * c_dec and elevated in permafrost/alpine short-GSL soils (Wang et al., 2023; Körner, 2012).
+    cold_soil_cost = 1.0 + 1.5 * torch.sigmoid(20.0 * (0.28 - f_gsl))
+    z_eff = torch.clamp((1.0 - bio.f_evg) * c_dec + bio.f_evg * (c_evg / tau_evg), min=0.55 * c_dec) * cold_soil_cost
     fapar_c = 1.0 - z_eff / (K_BEER_LAI * a0_yr)
     fapar_max = torch.clamp(_lse_min(fapar_w, fapar_c), 0.0, 0.96)
     lai_max = -torch.log(1.0 - fapar_max) / K_BEER_LAI
@@ -1420,13 +1424,18 @@ def update_daily_lai_root_height(
     )
 
     # 5. Potential canopy height h_c [m] from vascular water-energy scaling (Kempes et al., 2011, Eqs. 2-5)
-    # In Kempes et al. (2011), maximum sustainable height scales positively with available water
-    # capture (P / PET) and annual photosynthetic energy surplus (fAPAR_max * A_0):
-    # yields ~30-40 m in humid tropical forests (Af), ~15-22 m in temperate/boreal forests (Cf/Df),
-    # ~2-6 m in savannas/shrublands (Aw/BS), and < 0.5 m in tundra/deserts (ET/BW).
-    moisture_idx = torch.clamp(bio.ema_ann_precip / torch.clamp(bio.ema_ann_pet, min=50.0), 0.0, 2.5)
+    #    modulated by universal alpine/arctic cambial thermal treeline limitation (Körner, 2012, Ch. 3;
+    #    Paulsen & Körner, 2014: >= ~94 days above 5 degC for woody tree-stem xylogenesis).
+    #    Cap moisture_idx at 1.2 so cold low-PET bogs/plateaus cannot spuriously grow tall forests.
+    moisture_idx = torch.clamp(bio.ema_ann_precip / torch.clamp(bio.ema_ann_pet, min=50.0), 0.0, 1.2)
     prod_idx = torch.clamp((fapar_max * a0_yr) / 180.0, 0.0, 2.0)
-    hc_target = torch.clamp(32.0 * torch.pow(moisture_idx, 0.85) * torch.pow(prod_idx, 0.75), 0.05, 40.0)
+    # Growing-season length (> 5 C) thermal treeline gate (Körner, 2012: treeline at ~90-100 days -> f_gsl ~ 0.30)
+    treeline_gsl = torch.sigmoid(30.0 * (f_gsl - 0.30))
+    hc_target = torch.clamp(
+        34.0 * torch.pow(moisture_idx, 0.85) * torch.pow(prod_idx, 0.75) * treeline_gsl,
+        0.05,
+        40.0,
+    )
     bio.h_canopy = torch.where(
         veg,
         (1.0 - alpha_yr) * bio.h_canopy + alpha_yr * hc_target,

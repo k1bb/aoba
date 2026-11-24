@@ -155,7 +155,13 @@ def init_global_hydrostatic_atmosphere(
         dz_wk = zc64[k] - zc64[k - 1]
         rtot_below = rho64[k - 1] * (1.0 + qv64[k - 1])
         fac_k = (1.0 + qv64[k]) / (C.R_D * temp64[k] * (1.0 + C.RV_OVER_RD * qv64[k]))
-        p64[k] = (p64[k - 1] - 0.5 * dz_wk * C.GRAVITY * rtot_below) / (1.0 + 0.5 * dz_wk * C.GRAVITY * fac_k)
+        p_lin = (p64[k - 1] - 0.5 * dz_wk * C.GRAVITY * rtot_below) / (1.0 + 0.5 * dz_wk * C.GRAVITY * fac_k)
+        tv_mid = 0.5 * (
+            temp64[k - 1] * (1.0 + C.RV_OVER_RD * qv64[k - 1]) / (1.0 + qv64[k - 1])
+            + temp64[k] * (1.0 + C.RV_OVER_RD * qv64[k]) / (1.0 + qv64[k])
+        )
+        p_exp = p64[k - 1] * torch.exp(-C.GRAVITY * dz_wk / (C.R_D * tv_mid))
+        p64[k] = torch.where(p_lin > 0.05 * p64[k - 1], p_lin, p_exp)
         rho64[k] = p64[k] / (C.R_D * temp64[k] * (1.0 + C.RV_OVER_RD * qv64[k]))
 
     thm64 = (C.P_REF / (C.R_D * rho64)) * torch.pow(p64 / C.P_REF, 1.0 / C.GAMMA_D)
@@ -477,7 +483,7 @@ def _scvt_fast_acoustic_hevi_cpu_gpu(
         p_k = pres_s + dp_dThm_s * (Thm_k - Thm_s)
         pgf_e = -(p_k[:, c1] * fac_z1 - p_k[:, c0] * fac_z0) / (rtot_e * dc_e)
 
-        u_next = u_k + dt_ac * (tend_u_slow + pgf_e - sponge_c * u_k)
+        u_next = (u_k + dt_ac * (tend_u_slow + pgf_e)) / (1.0 + dt_ac * sponge_c)
         u_int_next = 0.5 * (u_next[:-1] + u_next[1:])
         uz_next = area_e * u_int_next * zw_slope_e
         udotz_next = (uz_next[:, edges_on_cell] * valid_ce).sum(dim=-1) / area_c
@@ -715,8 +721,8 @@ def step_scvt_rk3_hevi(
     v1_e = mesh.verts_on_edge[:, 1]
     ep_idx = mesh.trisk_edges
     w_trisk = mesh.trisk_weights.unsqueeze(0)
-    # Terrain-following acoustic Courant limit over steep Earth2014 Himalayas/Antarctica (dt_ac <= ~350 s on Glevel-3)
-    dt_ac_max = max(0.16 * dx_min / 350.0, 1.0)
+    # Terrain-following acoustic Courant limit over steep Earth2014 Himalayas/Antarctica (dt_ac <= ~300 s on coarse grids)
+    dt_ac_max = min(max(0.16 * dx_min / 350.0, 1.0), 300.0)
 
     rk_taus = (dt_dyn / 3.0, 0.5 * dt_dyn, dt_dyn)
     prep_fn = maybe_cuda_compile(_scvt_rk3_stage_prep_core, device=u0.device)
@@ -850,7 +856,7 @@ def step_scvt_rk3_hevi(
                 p_k = pres_s + dp_dThm_s * (Thm_k - Thm_s)
                 pgf_e = -(p_k[:, c1] * fac_z1 - p_k[:, c0] * fac_z0) / (rtot_e * dc_e)
 
-                u_next = u_k + dt_ac * (tend_u_slow + pgf_e - sponge_c * u_k)
+                u_next = (u_k + dt_ac * (tend_u_slow + pgf_e)) / (1.0 + dt_ac * sponge_c)
                 u_int_next = 0.5 * (u_next[:-1] + u_next[1:])
                 uz_next = area_e * u_int_next * zw_slope_e
                 udotz_next = (uz_next[:, mesh.edges_on_cell] * valid_ce).sum(dim=-1) / area_c

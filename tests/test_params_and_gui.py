@@ -175,15 +175,17 @@ def test_gui_server_endpoints() -> None:
             run_cfg = default_config_dict()
             run_cfg["grid"]["glevel"] = 0
             run_cfg["grid"]["nz"] = 8
+            run_cfg["grid"]["z_top"] = 16000.0
+            run_cfg["grid"]["z_sponge_base"] = 12000.0
             run_cfg["grid"]["crm_nx"] = 2
             run_cfg["grid"]["crm_ny"] = 1
-            run_cfg["grid"]["dt_host"] = 3600.0
+            run_cfg["grid"]["dt_host"] = 600.0
             run_cfg["grid"]["n_crm_dyn_substeps"] = 2
             run_cfg["grid"]["rad_stride"] = 1
             run_cfg["forcing"]["use_earth2014"] = False
             run_cfg["output"]["out_dir"] = str(run_out)
             run_cfg["output"]["years"] = 1
-            run_cfg["output"]["days_per_year"] = 0.5
+            run_cfg["output"]["days_per_year"] = 0.08333333333333333
 
             req_start = urllib.request.Request(
                 f"{base}/api/run/start",
@@ -228,17 +230,19 @@ def test_runner_cli_with_custom_toml_cpu() -> None:
         cfg = default_config_dict()
         cfg["grid"]["glevel"] = 0
         cfg["grid"]["nz"] = 8
+        cfg["grid"]["z_top"] = 16000.0
+        cfg["grid"]["z_sponge_base"] = 12000.0
         cfg["grid"]["crm_nx"] = 2
         cfg["grid"]["crm_ny"] = 1
         cfg["grid"]["crm_dx"] = 8000.0
-        cfg["grid"]["dt_host"] = 3600.0
+        cfg["grid"]["dt_host"] = 900.0
         cfg["grid"]["n_crm_dyn_substeps"] = 2
         cfg["grid"]["rad_stride"] = 1
         cfg["forcing"]["use_earth2014"] = False
         cfg["icesheet"]["enable_dynamic_icesheet"] = True
         cfg["output"]["out_dir"] = str(out_dir)
         cfg["output"]["years"] = 1
-        cfg["output"]["days_per_year"] = 0.5  # 12 host steps
+        cfg["output"]["days_per_year"] = 0.25  # 24 host steps (6 hours)
         cfg["output"]["zarr_dir_partition"] = "single"
         cfg["output"]["monthly_mean_periods_per_year"] = 2
         cfg["output"]["monthly_mean_sample_hours"] = 3.0

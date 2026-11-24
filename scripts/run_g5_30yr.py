@@ -126,8 +126,125 @@ def _restore_surface(sfc_target, payload: dict, device: torch.device) -> None:
         sfc_target.bio.ema_temp_home = sfc_target.bio.ema_temp_mid.clone()
 
 
+def _inspect_nonfinite_state(model: AOBAState) -> list[str]:
+    """Return human-readable diagnostics for any non-finite prognostic tensors (empty if all finite)."""
+    mesh = model.mesh
+    nc = int(mesh.n_cells)
+    lat_deg = np.rad2deg(mesh.lat_cell.detach().cpu().numpy())
+    lon_deg = np.rad2deg(mesh.lon_cell.detach().cpu().numpy())
+    st_np = mesh.surf_type.detach().cpu().numpy()
+
+    checks: list[tuple[str, torch.Tensor | None]] = [
+        ("atmos.rho_d", model.atmos.rho_d),
+        ("atmos.theta_m", model.atmos.theta_m),
+        ("atmos.u_edge", model.atmos.u_edge),
+        ("atmos.w", model.atmos.w),
+        ("atmos.q_n", model.atmos.q_n),
+        ("crm.rho_d", model.crm.rho_d),
+        ("crm.theta_m", model.crm.theta_m),
+        ("crm.q_n", model.crm.q_n),
+        ("sfc.t_canopy", model.sfc.t_canopy),
+        ("sfc.t_ocean_ml", model.sfc.t_ocean_ml),
+        ("sfc.m_seaice", model.sfc.m_seaice),
+        ("sfc.bio.lai", model.sfc.bio.lai),
+    ]
+    if model.sfc_sub is not None:
+        checks.extend([
+            ("sfc_sub.t_canopy", model.sfc_sub.t_canopy),
+            ("sfc_sub.t_leaf_sun", model.sfc_sub.t_leaf_sun),
+            ("sfc_sub.t_gnd_skin", model.sfc_sub.t_gnd_skin),
+            ("sfc_sub.t_soil", model.sfc_sub.t_soil),
+            ("sfc_sub.t_ocean_ml", model.sfc_sub.t_ocean_ml),
+            ("sfc_sub.m_seaice", model.sfc_sub.m_seaice),
+            ("sfc_sub.bio.lai", model.sfc_sub.bio.lai),
+        ])
+    if model.ogcm is not None:
+        checks.extend([
+            ("ogcm.temp", model.ogcm.temp),
+            ("ogcm.sal", model.ogcm.sal),
+            ("ogcm.u_edge", model.ogcm.u_edge),
+            ("ogcm.eta", model.ogcm.eta),
+            ("ogcm.u_baro", model.ogcm.u_baro),
+        ])
+        if model.ogcm.seaice_evp is not None:
+            checks.extend([
+                ("seaice_evp.a_cat", model.ogcm.seaice_evp.a_cat),
+                ("seaice_evp.v_cat", model.ogcm.seaice_evp.v_cat),
+                ("seaice_evp.u_ice_e", model.ogcm.seaice_evp.u_ice_e),
+            ])
+        if model.ogcm.bgc is not None:
+            checks.extend([
+                ("bgc.no3", model.ogcm.bgc.no3),
+                ("bgc.dic", model.ogcm.bgc.dic),
+                ("bgc.phy", model.ogcm.bgc.phy),
+            ])
+    if model.land_carbon is not None:
+        checks.append(("land_carbon.c_leaf", model.land_carbon.c_leaf))
+    if model.aerosols is not None:
+        checks.append(("aerosols.q_ss", model.aerosols.q_ss))
+
+    n_sub = max(int(model.cfg.crm_ny * model.cfg.crm_nx), 1)
+    bad_lines: list[str] = []
+    for name, ten in checks:
+        if ten is None or not isinstance(ten, torch.Tensor) or not ten.is_floating_point():
+            continue
+        bad_mask = ~torch.isfinite(ten)
+        n_bad = int(bad_mask.sum().item())
+        if n_bad > 0:
+            loc_str = ""
+            # Map first up to 5 offending cells onto (lat, lon, surf_type) when last dim matches nc or nc*n_sub
+            if ten.shape[-1] == nc:
+                cell_bad = bad_mask.reshape(-1, nc).any(dim=0).nonzero(as_tuple=False).squeeze(-1).cpu().tolist()
+                if isinstance(cell_bad, int):
+                    cell_bad = [cell_bad]
+                locs = [f"c={c}(lat={lat_deg[c]:+.1f},lon={lon_deg[c]:+.1f},st={int(st_np[c])})" for c in cell_bad[:5]]
+                loc_str = " | cells: " + ", ".join(locs)
+            elif ten.shape[-1] == nc * n_sub:
+                sub_bad = bad_mask.reshape(-1, nc, n_sub).any(dim=(0, 2)).nonzero(as_tuple=False).squeeze(-1).cpu().tolist()
+                if isinstance(sub_bad, int):
+                    sub_bad = [sub_bad]
+                locs = [f"c={c}(lat={lat_deg[c]:+.1f},lon={lon_deg[c]:+.1f},st={int(st_np[c])})" for c in sub_bad[:5]]
+                loc_str = " | cells: " + ", ".join(locs)
+            bad_lines.append(f"  - {name}: {n_bad}/{ten.numel()} non-finite{loc_str}")
+    return bad_lines
+
+
+def _abort_if_nonfinite(
+    model: AOBAState,
+    year: int,
+    step_in_yr: int,
+    date_str: str,
+    reason: str,
+) -> None:
+    """Dump offending tensors/cells and abort immediately without overwriting any restart checkpoint."""
+    bad = _inspect_nonfinite_state(model)
+    print(
+        f"\n[ABORT: NON-FINITE STATE DETECTED] Y{year:04d} step_in_yr={step_in_yr} "
+        f"(global_step={model.step_count}, date={date_str}) | reason={reason}",
+        flush=True,
+    )
+    if bad:
+        for line in bad:
+            print(line, flush=True)
+    else:
+        print("  (Prognostic core tensors finite; non-finite originated in step diagnostics/radiation.)", flush=True)
+    print("  [Guard] Refusing to overwrite restart_mid.pt / restart.pt. Exiting with code 2.", flush=True)
+    sys.exit(2)
+
+
 def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] | None = None) -> None:
     """Save complete prognostic `AOBAState` (including subgrid `sfc_sub`) via atomic temp file + rename."""
+    bad = _inspect_nonfinite_state(model)
+    if bad:
+        date_s = model.calendar.date_at(model.sim_time_sec).iso_datetime
+        print(
+            f"\n[ABORT: REFUSING TO SAVE NON-FINITE CHECKPOINT -> {path}] "
+            f"(global_step={model.step_count}, date={date_s})",
+            flush=True,
+        )
+        for line in bad:
+            print(line, flush=True)
+        sys.exit(2)
     payload = {
         "cfg": model.cfg,
         "sim_time_sec": model.sim_time_sec,
@@ -968,6 +1085,24 @@ def main() -> None:
                 sync_host_surface=is_sync_step,
             )
 
+            # Zero-overhead immediate NaN/Inf guard on already-synced scalar diagnostics
+            if bool(out_cfg.daily_csv_enabled):
+                _dvals = (
+                    ("Ts", diag.global_mean_t_sfc_k),
+                    ("OLR", diag.global_mean_olr_wm2),
+                    ("ASR", diag.global_mean_asr_wm2),
+                    ("P", diag.global_mean_precip_mm_day),
+                    ("GPP", diag.land_mean_gpp_umol),
+                    ("LAI", diag.land_mean_lai),
+                    ("Ice", diag.seaice_area_million_km2),
+                )
+                _bad_d = [f"{k}={v}" for k, v in _dvals if not math.isfinite(v)]
+                if _bad_d:
+                    _abort_if_nonfinite(
+                        model, year, step_in_yr, diag.date_str,
+                        reason="non-finite step diagnostics: " + ", ".join(_bad_d),
+                    )
+
             day_accum["ts"] += diag.global_mean_t_sfc_k
             day_accum["olr"] += diag.global_mean_olr_wm2
             day_accum["asr"] += diag.global_mean_asr_wm2
@@ -1256,9 +1391,15 @@ def main() -> None:
                 if model.aerosols is not None:
                     a_w = model.mesh.area_cell.detach().cpu().double()
                     a_tot_m2 = float(a_w.sum().item())
-                    aod_tot = float(((model.aerosols.aod_ss + model.aerosols.aod_so4 + model.aerosols.aod_bc + model.aerosols.aod_oc).detach().cpu().double() * a_w).sum().item()) / a_tot_m2
+                    aod_nat = float(((model.aerosols.aod_ss + model.aerosols.aod_so4 + model.aerosols.aod_bc + model.aerosols.aod_oc).detach().cpu().double() * a_w).sum().item()) / a_tot_m2
                     ccn_mean = float((model.aerosols.ccn_aero_m3.detach().cpu().double() * a_w).sum().item()) * 1.0e-6 / a_tot_m2
-                    esm_parts.append(f"Aero(AOD={aod_tot:.4f}, CCN={ccn_mean:.1f} cm^-3)")
+                    if model.atmos.q_dust is not None:
+                        from aoba.dust import DUST_K_EXT_SW1
+                        col_dust = (model.atmos.rho_d * model.atmos.dz_c * torch.clamp(model.atmos.q_dust, min=0.0)).sum(dim=0).detach().cpu().double()
+                        aod_dust = float((DUST_K_EXT_SW1 * col_dust * a_w).sum().item()) / a_tot_m2
+                        esm_parts.append(f"Aero(AOD_nat={aod_nat:.4f}, AOD_dust={aod_dust:.4f}, CCN={ccn_mean:.1f} cm^-3)")
+                    else:
+                        esm_parts.append(f"Aero(AOD={aod_nat:.4f}, CCN={ccn_mean:.1f} cm^-3)")
                 if esm_parts:
                     print(f"[ESM Y{year:03d} M{mon_num:02d} | {diag.date_str}] " + " | ".join(esm_parts), flush=True)
                 for k in mon_accum:

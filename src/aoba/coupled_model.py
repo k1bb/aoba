@@ -484,7 +484,7 @@ def init_aoba_model(
     sfc.t_canopy = t_sfc_lat.clone()
     sfc.t_soil = t_sfc_lat.unsqueeze(0).expand_as(sfc.t_soil).clone()
     polar_cold = (mesh.surf_type == SURF_OCEAN) & (t_sfc_lat < C.T_FREEZE_OCEAN)
-    sfc.m_seaice = torch.where(polar_cold, torch.full_like(t_sfc_lat, 900.0), torch.zeros_like(t_sfc_lat))
+    sfc.m_seaice = torch.where(polar_cold, torch.full_like(t_sfc_lat, 1400.0), torch.zeros_like(t_sfc_lat))
 
     ocn = init_ekman_ocean_state(sfc)
     ogcm = (
@@ -1011,7 +1011,7 @@ def step_aoba_model(
             + sw2_dif_sub * (1.0 - sfc_diag_sub.alb_nir_dif)
         )
         sw_par_ocn = (
-            _sub_to_cell(0.94 * (sw1_dir_sub * (1.0 - sfc_diag_sub.alb_vis_dir) + sw1_dif_sub * (1.0 - sfc_diag_sub.alb_vis_dif)), nc, n_sub)
+            _sub_to_cell(C.PAR_FRAC_OF_SW1 * (sw1_dir_sub * (1.0 - sfc_diag_sub.alb_vis_dir) + sw1_dif_sub * (1.0 - sfc_diag_sub.alb_vis_dif)), nc, n_sub)
             if model.ogcm.bgc is not None
             else None
         )
@@ -1492,6 +1492,7 @@ def step_aoba_model(
             chl_sfc_mg_m3=chl_sfc,
             fire_bc_kg_m2s=fire_bc,
             fire_oc_kg_m2s=fire_oc,
+            u_star_cell=_sub_to_cell(sfc_diag_sub.u_star, nc, n_sub),
         )
     month_idx = model.calendar.date_at(model.sim_time_sec).month - 1
     clim.month_temp_sum_c[month_idx] += (t_air - C.T_FREEZE)
