@@ -440,7 +440,21 @@ def _build_monthly_mean_xarray(
         "w_root": "kg m-2", "lai": "m2 m-2", "precip_mm_day": "mm day-1",
         "olr": "W m-2", "asr": "W m-2", "evap_mm_day": "mm day-1", "gpp": "umol m-2 s-1",
     }
-    units_2d_ocn = {"ocn_eta": "m", "ocn_sss": "psu", "ocn_h_bl": "m"}
+    units_2d_ocn = {
+        "ocn_eta": "m",
+        "ocn_sss": "psu",
+        "ocn_h_bl": "m",
+        "tau_x_sfc": "N m-2",
+        "tau_y_sfc": "N m-2",
+        "runoff_total": "kg m-2 s-1",
+        "runoff_glacier": "kg m-2 s-1",
+        "precip_snow_mm_day": "mm day-1",
+        "sw1_dir_sfc": "W m-2",
+        "sw1_dif_sfc": "W m-2",
+        "sw2_dir_sfc": "W m-2",
+        "sw2_dif_sfc": "W m-2",
+        "lw_dn_sfc": "W m-2",
+    }
     units_3d = {"temp": "K", "pres": "Pa", "q_v": "kg kg-1", "u_zonal": "m s-1", "v_merid": "m s-1"}
     units_3d_ocn = {
         "ocn_temp": "K",
@@ -993,6 +1007,20 @@ def main() -> None:
                         sample["ocn_sss"] = og.sal[0]
                         if og.h_bl is not None:
                             sample["ocn_h_bl"] = og.h_bl
+                        sample["precip_snow_mm_day"] = snow * C.SECONDS_PER_DAY
+                        sample["sw1_dir_sfc"] = model.rad_cache.get("sw1_dir", torch.zeros_like(model.sfc.t_ocean_ml))
+                        sample["sw1_dif_sfc"] = model.rad_cache.get("sw1_dif", torch.zeros_like(model.sfc.t_ocean_ml))
+                        sample["sw2_dir_sfc"] = model.rad_cache.get("sw2_dir", torch.zeros_like(model.sfc.t_ocean_ml))
+                        sample["sw2_dif_sfc"] = model.rad_cache.get("sw2_dif", torch.zeros_like(model.sfc.t_ocean_ml))
+                        sample["lw_dn_sfc"] = model.rad_cache.get("lw_dn", torch.zeros_like(model.sfc.t_ocean_ml))
+                        sd_sub = model.last_sfc_diag_sub
+                        if sd_sub is not None:
+                            n_sub_c = model.cfg.crm_ny * model.cfg.crm_nx
+                            nc_c = model.mesh.n_cells
+                            sample["tau_x_sfc"] = sd_sub.tau_x.reshape(nc_c, n_sub_c).mean(dim=-1)
+                            sample["tau_y_sfc"] = sd_sub.tau_y.reshape(nc_c, n_sub_c).mean(dim=-1)
+                            sample["runoff_total"] = sd_sub.runoff_total.reshape(nc_c, n_sub_c).mean(dim=-1)
+                            sample["runoff_glacier"] = sd_sub.runoff_ice.reshape(nc_c, n_sub_c).mean(dim=-1)
                     if model.icesheet is not None:
                         sample["h_ice"] = model.icesheet.h_ice
                         sample["z_topo_dyn"] = model.mesh.z_topo
