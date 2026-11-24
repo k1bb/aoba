@@ -301,6 +301,33 @@ def compute_optimal_chunks(
     }
 
 
+_CUDA_COMPILED_FN_CACHE: dict[int, object] = {}
+
+
+def maybe_cuda_compile(fn, *, device: torch.device | str | None = None):
+    """Return a lazily `torch.compile`-fused version of pure-tensor `fn` on CUDA (no-op on CPU/MPS).
+
+    Disabled when `AOBA_DISABLE_TORCH_COMPILE=1`. Falls back cleanly to eager `fn` if Inductor/Triton
+    is unavailable on the host system.
+    """
+    if device is not None:
+        dev_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+    else:
+        dev_type = "cuda" if torch.cuda.is_available() else "cpu"
+    if dev_type != "cuda" or os.environ.get("AOBA_DISABLE_TORCH_COMPILE") == "1":
+        return fn
+    fid = id(fn)
+    cached = _CUDA_COMPILED_FN_CACHE.get(fid)
+    if cached is not None:
+        return cached
+    try:
+        compiled = torch.compile(fn, dynamic=False)
+    except Exception:
+        compiled = fn
+    _CUDA_COMPILED_FN_CACHE[fid] = compiled
+    return compiled
+
+
 def apply_runtime_tuning(device: torch.device | str | None = None) -> HardwareProfile:
     """Apply thread-count and backend tuning matched to the host hardware."""
     hw = detect_hardware_profile()

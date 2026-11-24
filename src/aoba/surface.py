@@ -63,6 +63,7 @@ from aoba.kernels import (
     dispatch_surface_albedos_metal,
     solve_tridiagonal_batched,
 )
+from aoba.runtime import maybe_cuda_compile
 from aoba.thermodynamics import esat_ice, esat_liquid, qsat_mixed
 from aoba.turbulence import (
     canopy_roughness_raupach,
@@ -516,6 +517,75 @@ def _get_soil_geom_tensors(
     return cached
 
 
+def _thomas_5layer_pure(
+    dl: torch.Tensor,
+    diag: torch.Tensor,
+    du: torch.Tensor,
+    rhs: torch.Tensor,
+) -> torch.Tensor:
+    """Pure-tensor 5-layer Thomas solver (compiles with zero graph breaks on CUDA Inductor)."""
+    c = []
+    d = []
+    inv0 = 1.0 / diag[0]
+    c.append(du[0] * inv0)
+    d.append(rhs[0] * inv0)
+    for k in range(1, 5):
+        inv_k = 1.0 / (diag[k] - dl[k] * c[k - 1])
+        c.append(du[k] * inv_k if k < 4 else torch.zeros_like(inv_k))
+        d.append((rhs[k] - dl[k] * d[k - 1]) * inv_k)
+    x = [d[4]] * 5
+    for k in range(3, -1, -1):
+        x[k] = d[k] - c[k] * x[k + 1]
+    return torch.stack(x, dim=0)
+
+
+def _soil_thermo_core(
+    t_soil: torch.Tensor,
+    w_liq: torch.Tensor,
+    w_ice: torch.Tensor,
+    g_ground_down: torch.Tensor,
+    dz: torch.Tensor,
+    dt: float,
+    use_pure_thomas: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mw = RHO_WATER * torch.clamp(w_liq, min=0.0)
+    mi = RHO_ICE_SOLID * torch.clamp(w_ice, min=0.0)
+    m_tot = mw + mi
+
+    t0 = C.T_FREEZE
+    c_vol = CS_DRY_SOIL + CP_LIQ_WATER * mw + CP_ICE_SOLID * mi
+    u_int0 = c_vol * (t_soil - t0) - C.L_F0 * mi
+    u_top = u_int0[0] + (dt / dz[0]) * g_ground_down
+    u_int = torch.cat([u_top.unsqueeze(0), u_int0[1:]], dim=0)
+
+    mi_raw = -u_int / C.L_F0
+    mi_new = torch.minimum(torch.clamp(mi_raw, min=0.0), m_tot)
+    mw_new = torch.clamp(m_tot - mi_new, min=0.0)
+
+    w_liq_new = mw_new / RHO_WATER
+    w_ice_new = mi_new / RHO_ICE_SOLID
+    c_vol_new = CS_DRY_SOIL + CP_LIQ_WATER * mw_new + CP_ICE_SOLID * mi_new
+    dt_mid = (u_int + C.L_F0 * mi_new) / c_vol_new
+
+    w_tot_vol = w_liq_new + w_ice_new
+    kappa = KAPPA_DRY_SOIL * (1.0 + 5.5 * torch.tanh(w_tot_vol / 0.25)) + 0.8 * w_ice_new
+
+    dz_int = 0.5 * (dz[1:] + dz[:-1])
+    k_int = 0.5 * (kappa[1:] + kappa[:-1])
+    cond_int = dt * k_int / dz_int
+
+    cap_layer = c_vol_new * dz
+    z0 = torch.zeros_like(dt_mid[0:1])
+    dl = torch.cat([z0, -cond_int / cap_layer[1:]], dim=0)
+    du = torch.cat([-cond_int / cap_layer[:-1], z0], dim=0)
+    diag = 1.0 - dl - du
+    if use_pure_thomas and dt_mid.shape[0] == 5:
+        t_final = t0 + _thomas_5layer_pure(dl, diag, du, dt_mid)
+    else:
+        t_final = t0 + solve_tridiagonal_batched(dl, diag, du, dt_mid)
+    return t_final, w_liq_new, w_ice_new
+
+
 def step_multilayer_soil_thermodynamics(
     t_soil: torch.Tensor,
     w_liq: torch.Tensor,
@@ -537,47 +607,9 @@ def step_multilayer_soil_thermodynamics(
     dtype = t_soil.dtype
     col_shape = t_soil.shape[1:]
     dz, _, _ = _get_soil_geom_tensors(dev, dtype, col_shape)
-
-    mw = RHO_WATER * torch.clamp(w_liq, min=0.0)        # Liquid mass density [kg m^-3]
-    mi = RHO_ICE_SOLID * torch.clamp(w_ice, min=0.0)    # Ice mass density [kg m^-3]
-    m_tot = mw + mi
-
-    # Volumetric heat capacity C_L [J m^-3 K^-1] and internal energy U [J m^-3] relative to T_0 = 273.15 K
-    # (SCALE-RM Eqs. 8.390-8.395; measuring relative to T_0 preserves full float32 precision on MPS GPU!)
-    t0 = C.T_FREEZE
-    c_vol = CS_DRY_SOIL + CP_LIQ_WATER * mw + CP_ICE_SOLID * mi
-    u_int = c_vol * (t_soil - t0) - C.L_F0 * mi
-    u_int = u_int.clone()
-    u_int[0] = u_int[0] + (dt / dz[0]) * g_ground_down
-
-    # Exact 0 degC phase-change partition at T = T_0 (U_all_liq = 0, U_all_ice = -L_f0 * M_tot):
-    mi_raw = -u_int / C.L_F0
-    mi_new = torch.minimum(torch.clamp(mi_raw, min=0.0), m_tot)
-    mw_new = torch.clamp(m_tot - mi_new, min=0.0)
-
-    w_liq_new = mw_new / RHO_WATER
-    w_ice_new = mi_new / RHO_ICE_SOLID
-    c_vol_new = CS_DRY_SOIL + CP_LIQ_WATER * mw_new + CP_ICE_SOLID * mi_new
-    dt_mid = (u_int + C.L_F0 * mi_new) / c_vol_new
-
-    # Moisture-dependent thermal conductivity kappa [W m^-1 K^-1] (MATSIRO6 Eq. 10.4 + ice boost)
-    w_tot_vol = w_liq_new + w_ice_new
-    kappa = KAPPA_DRY_SOIL * (1.0 + 5.5 * torch.tanh(w_tot_vol / 0.25)) + 0.8 * w_ice_new
-
-    # Implicit tridiagonal heat conduction in Celsius anomaly (T - T_0) for optimal float32 precision
-    dz_int = 0.5 * (dz[1:] + dz[:-1])
-    k_int = 0.5 * (kappa[1:] + kappa[:-1])
-    cond_int = dt * k_int / dz_int
-
-    cap_layer = c_vol_new * dz
-    dl = torch.zeros_like(dt_mid)
-    du = torch.zeros_like(dt_mid)
-    dl[1:] = -cond_int / cap_layer[1:]
-    du[:-1] = -cond_int / cap_layer[:-1]
-    diag = 1.0 - dl - du
-    t_final = t0 + solve_tridiagonal_batched(dl, diag, du, dt_mid)
-
-    return t_final, w_liq_new, w_ice_new
+    use_pure = (dev.type == "cuda") and (t_soil.shape[0] == 5)
+    fn = maybe_cuda_compile(_soil_thermo_core, device=dev) if use_pure else _soil_thermo_core
+    return fn(t_soil, w_liq, w_ice, g_ground_down, dz, dt, use_pure)
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +663,125 @@ def compute_root_zone_weights_and_water(
     return w_avail, w_up, alpha_root
 
 
+def _soil_hydro_core(
+    w_liq: torch.Tensor,
+    w_ice: torch.Tensor,
+    rain_thru: torch.Tensor,
+    melt_tot: torch.Tensor,
+    e_soil: torch.Tensor,
+    e_trans: torch.Tensor,
+    dew_ground: torch.Tensor,
+    s_root_cap: torch.Tensor,
+    is_ice: torch.Tensor,
+    dz: torch.Tensor,
+    z_top: torch.Tensor,
+    dz_int: torch.Tensor,
+    dt: float,
+    use_pure_thomas: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    w_l = torch.clamp(w_liq, min=0.0)
+    w_i = torch.clamp(w_ice, min=0.0)
+    theta_max = torch.clamp(SOIL_POROSITY - w_i, min=0.0)
+
+    ice_frac = torch.clamp(w_i / SOIL_POROSITY, 0.0, 1.0)
+    f_ice = torch.pow(10.0, -ICE_IMPEDANCE_OMEGA * ice_frac)
+
+    s_min = 0.02
+    s_eff = torch.clamp(w_l / SOIL_POROSITY, s_min, 1.0)
+    th_safe = torch.clamp(w_l, min=s_min * SOIL_POROSITY)
+    psi = torch.clamp(PSI_SAT_SOIL * torch.pow(s_eff, -B_CLAPP_SOIL), min=-1.0e5)
+    dpsi_dth = torch.clamp(-B_CLAPP_SOIL * psi / th_safe, max=1.0e6)
+
+    exp_k = 2.0 * B_CLAPP_SOIL + 3.0
+    s_int = 0.5 * (s_eff[:-1] + s_eff[1:])
+    f_ice_int = torch.minimum(f_ice[:-1], f_ice[1:])
+    k_int = f_ice_int * K_SAT_SOIL * torch.pow(s_int, exp_k)
+    q_int = k_int * (1.0 + (psi[:-1] - psi[1:]) / dz_int)
+
+    k_bot = f_ice[-1] * K_SAT_SOIL * torch.pow(s_eff[-1], exp_k)
+    dk_bot_dth = exp_k * k_bot / th_safe[-1]
+
+    q_liq_in = torch.clamp(rain_thru + melt_tot + dew_ground, min=0.0)
+    s_top_tot = torch.clamp((w_l[0] + w_i[0]) / SOIL_POROSITY, 0.0, 1.0)
+    f_imp = 1.0 - f_ice[0]
+    f_sat = f_imp + (1.0 - f_imp) * torch.pow(s_top_tot, 4.0)
+    q_infil_cap = RHO_WATER * f_ice[0] * K_SAT_SOIL * torch.clamp(
+        1.0 + (PSI_SAT_SOIL - psi[0]) / (0.5 * SOIL_LAYER_DEPTHS[0]), min=1.0, max=1.0e4
+    )
+    q_infil = torch.minimum((1.0 - f_sat) * q_liq_in, q_infil_cap)
+    q_infil = torch.where(is_ice, torch.zeros_like(q_infil), q_infil)
+    sfc_runoff_0 = torch.where(is_ice, q_liq_in, q_liq_in - q_infil)
+
+    # Inline root-zone uptake weights (same as compute_root_zone_weights_and_water)
+    z_tot = sum(SOIL_LAYER_DEPTHS)
+    theta_fc = SOIL_POROSITY * (abs(PSI_SAT_SOIL) / 3.3) ** (1.0 / B_CLAPP_SOIL)
+    theta_wp = SOIL_POROSITY * (abs(PSI_SAT_SOIL) / 150.0) ** (1.0 / B_CLAPP_SOIL)
+    dtheta_paw = max(theta_fc - theta_wp, 0.05)
+    z_root = torch.clamp(torch.clamp(s_root_cap, min=20.0) / (RHO_WATER * dtheta_paw), min=0.15, max=z_tot)
+    alpha_root = torch.clamp((z_root.unsqueeze(0) - z_top) / dz, 0.0, 1.0)
+    avail_layer = RHO_WATER * dz * alpha_root * torch.clamp(w_l - theta_wp, min=0.0)
+    w_avail = avail_layer.sum(dim=0)
+    root_depth_w = alpha_root * dz
+    root_depth_w = root_depth_w / torch.clamp(root_depth_w.sum(dim=0, keepdim=True), min=1.0e-6)
+    w_up = torch.where(
+        w_avail.unsqueeze(0) > 1.0e-6,
+        avail_layer / torch.clamp(w_avail.unsqueeze(0), min=1.0e-6),
+        root_depth_w,
+    )
+
+    s_trans = (torch.clamp(e_trans, min=0.0) / RHO_WATER).unsqueeze(0) * w_up
+    s_trans = torch.where(is_ice.unsqueeze(0), torch.zeros_like(s_trans), s_trans)
+
+    a_int = (k_int / dz_int) * dpsi_dth[:-1]
+    c_int = (k_int / dz_int) * dpsi_dth[1:]
+    z0 = torch.zeros_like(w_l[0:1])
+    dl = torch.cat([z0, -a_int], dim=0)
+    du = torch.cat([-c_int, z0], dim=0)
+    diag = (dz / dt).expand_as(w_l) + torch.cat([a_int, z0], dim=0) + torch.cat([z0, c_int], dim=0)
+    diag = torch.cat([diag[:-1], (diag[-1] + dk_bot_dth).unsqueeze(0)], dim=0)
+
+    e_soil_ms = torch.where(is_ice, torch.zeros_like(e_soil), torch.clamp(e_soil, min=0.0)) / RHO_WATER
+    rhs0 = (q_infil / RHO_WATER - e_soil_ms) - q_int[0] - s_trans[0]
+    rhs_mid = q_int[:-1] - q_int[1:] - s_trans[1:-1]
+    rhs_bot = q_int[-1] - k_bot - s_trans[-1]
+    rhs = torch.cat([rhs0.unsqueeze(0), rhs_mid, rhs_bot.unsqueeze(0)], dim=0)
+
+    if use_pure_thomas and w_l.shape[0] == 5:
+        dtheta = _thomas_5layer_pure(dl, diag, du, rhs)
+    else:
+        dtheta = solve_tridiagonal_batched(dl, diag, du, rhs)
+    theta_new_raw = w_l + dtheta
+
+    q_drain_raw = k_bot + dk_bot_dth * dtheta[-1]
+    q_drain_neg = torch.clamp(-q_drain_raw, min=0.0)
+    q_drain = torch.clamp(q_drain_raw, min=0.0)
+    th_layers = [theta_new_raw[k] for k in range(N_SOIL_LAYERS)]
+    th_layers[-1] = th_layers[-1] - (dt / SOIL_LAYER_DEPTHS[-1]) * q_drain_neg
+
+    excess_mass = torch.zeros_like(w_l[0])
+    for k in range(N_SOIL_LAYERS - 1, -1, -1):
+        th_k = th_layers[k] + excess_mass / (RHO_WATER * SOIL_LAYER_DEPTHS[k])
+        over = torch.clamp(th_k - theta_max[k], min=0.0)
+        th_layers[k] = th_k - over
+        excess_mass = over * (RHO_WATER * SOIL_LAYER_DEPTHS[k])
+    sfc_runoff = sfc_runoff_0 + excess_mass / dt
+
+    deficit_mass = torch.zeros_like(w_l[0])
+    for k in range(N_SOIL_LAYERS):
+        th_k = th_layers[k] - deficit_mass / (RHO_WATER * SOIL_LAYER_DEPTHS[k])
+        under = torch.clamp(-th_k, min=0.0)
+        th_layers[k] = th_k + under
+        deficit_mass = under * (RHO_WATER * SOIL_LAYER_DEPTHS[k])
+
+    theta_new = torch.stack(th_layers, dim=0)
+    q_drain_mass = RHO_WATER * q_drain * dt
+    reduce_drain = torch.minimum(deficit_mass, q_drain_mass)
+    q_drain_mass = q_drain_mass - reduce_drain
+    sub_runoff = torch.where(is_ice, torch.zeros_like(q_drain_mass), q_drain_mass / dt)
+    w_liq_next = torch.where(is_ice.unsqueeze(0), w_liq, theta_new)
+    return w_liq_next, sfc_runoff, sub_runoff
+
+
 def step_multilayer_soil_hydrology(
     w_liq: torch.Tensor,
     w_ice: torch.Tensor,
@@ -660,105 +811,505 @@ def step_multilayer_soil_hydrology(
     dev = w_liq.device
     dtype = w_liq.dtype
     col_shape = w_liq.shape[1:]
-
-    dz, _, dz_int = _get_soil_geom_tensors(dev, dtype, col_shape)
-
-    w_l = torch.clamp(w_liq, min=0.0)
-    w_i = torch.clamp(w_ice, min=0.0)
-    theta_max = torch.clamp(SOIL_POROSITY - w_i, min=0.0)
-
-    # Ice impedance factor f_ice = 10^(-Omega * (w_ice / phi)) (Swenson et al., 2012; CLM5 Eq. 7.89)
-    ice_frac = torch.clamp(w_i / SOIL_POROSITY, 0.0, 1.0)
-    f_ice = torch.pow(10.0, -ICE_IMPEDANCE_OMEGA * ice_frac)
-
-    # Hydraulic head psi_k [m], derivative dpsi/dtheta > 0, and conductivities (Clapp & Hornberger, 1978)
-    s_min = 0.02
-    s_eff = torch.clamp(w_l / SOIL_POROSITY, s_min, 1.0)
-    th_safe = torch.clamp(w_l, min=s_min * SOIL_POROSITY)
-    psi = torch.clamp(PSI_SAT_SOIL * torch.pow(s_eff, -B_CLAPP_SOIL), min=-1.0e5)
-    dpsi_dth = torch.clamp(-B_CLAPP_SOIL * psi / th_safe, max=1.0e6)
-
-    exp_k = 2.0 * B_CLAPP_SOIL + 3.0
-    s_int = 0.5 * (s_eff[:-1] + s_eff[1:])
-    f_ice_int = torch.minimum(f_ice[:-1], f_ice[1:])
-    k_int = f_ice_int * K_SAT_SOIL * torch.pow(s_int, exp_k)  # [N_SOIL-1, ...] [m s^-1]
-
-    # Explicit Darcy flux q_{k+1/2} [m s^-1], positive downward (CLM5 Eq. 7.91)
-    q_int = k_int * (1.0 + (psi[:-1] - psi[1:]) / dz_int)
-
-    # Bottom free gravitational drainage q_bot = K_bot (CLM5 Sec. 7.5)
-    k_bot = f_ice[-1] * K_SAT_SOIL * torch.pow(s_eff[-1], exp_k)
-    dk_bot_dth = exp_k * k_bot / th_safe[-1]
-
-    # Map-free surface infiltration & saturation/frozen/Hortonian surface runoff [kg m^-2 s^-1]
-    q_liq_in = torch.clamp(rain_thru + melt_tot + dew_ground, min=0.0)
-    s_top_tot = torch.clamp((w_l[0] + w_i[0]) / SOIL_POROSITY, 0.0, 1.0)
-    f_imp = 1.0 - f_ice[0]
-    f_sat = f_imp + (1.0 - f_imp) * torch.pow(s_top_tot, 4.0)
-    q_infil_cap = RHO_WATER * f_ice[0] * K_SAT_SOIL * torch.clamp(
-        1.0 + (PSI_SAT_SOIL - psi[0]) / (0.5 * SOIL_LAYER_DEPTHS[0]), min=1.0, max=1.0e4
+    dz, z_top, dz_int = _get_soil_geom_tensors(dev, dtype, col_shape)
+    use_pure = (dev.type == "cuda") and (w_liq.shape[0] == 5)
+    fn = maybe_cuda_compile(_soil_hydro_core, device=dev) if use_pure else _soil_hydro_core
+    return fn(
+        w_liq, w_ice, rain_thru, melt_tot, e_soil, e_trans, dew_ground,
+        s_root_cap, is_ice, dz, z_top, dz_int, dt, use_pure,
     )
-    q_infil = torch.minimum((1.0 - f_sat) * q_liq_in, q_infil_cap)
-    q_infil = torch.where(is_ice, torch.zeros_like(q_infil), q_infil)
-    sfc_runoff_0 = torch.where(is_ice, q_liq_in, q_liq_in - q_infil)
 
-    # Root-zone transpiration sink weights across layers (Holtzman et al., 2024; Gao et al., 2014)
-    _, w_up, _ = compute_root_zone_weights_and_water(w_l, s_root_cap)
-    s_trans = (torch.clamp(e_trans, min=0.0) / RHO_WATER).unsqueeze(0) * w_up  # [N_SOIL, ...] [m s^-1]
-    s_trans = torch.where(is_ice.unsqueeze(0), torch.zeros_like(s_trans), s_trans)
 
-    # Linearized implicit tridiagonal Richards matrix (strictly diagonally dominant M-matrix; CLM5 Eqs. 7.115-7.129)
-    a_int = (k_int / dz_int) * dpsi_dth[:-1]  # dq_{k+1/2}/dtheta_k >= 0
-    c_int = (k_int / dz_int) * dpsi_dth[1:]   # -dq_{k+1/2}/dtheta_{k+1} >= 0
+def _land_newton_jacobian_core(
+    t_sun_cur: torch.Tensor,
+    t_sh_cur: torch.Tensor,
+    t_gnd_cur: torch.Tensor,
+    t_soil0: torch.Tensor,
+    t_air_sfc: torch.Tensor,
+    qv_1: torch.Tensor,
+    q_af_vpd: torch.Tensor,
+    qsat_sun: torch.Tensor,
+    dq_sun: torch.Tensor,
+    qsat_sh: torch.Tensor,
+    dq_sh: torch.Tensor,
+    qsat_gnd: torch.Tensor,
+    dq_gnd: torch.Tensor,
+    ga_land: torch.Tensor,
+    gb_sun: torch.Tensor,
+    gb_sh: torch.Tensor,
+    gsw_sun: torch.Tensor,
+    gsw_sh: torch.Tensor,
+    r_d_uc: torch.Tensor,
+    r_soil: torch.Tensor,
+    h_soil_base: torch.Tensor,
+    a_sn: torch.Tensor,
+    f_wet: torch.Tensor,
+    w_canopy: torch.Tensor,
+    rho_sfc: torch.Tensor,
+    cp_air: torch.Tensor,
+    has_veg: torch.Tensor,
+    has_sun: torch.Tensor,
+    has_sh: torch.Tensor,
+    has_snow: torch.Tensor,
+    f_veg_rad: torch.Tensor,
+    f_sun_area: torch.Tensor,
+    f_sh_area: torch.Tensor,
+    lw_refl_c: torch.Tensor,
+    lw_emit_c_coef: torch.Tensor,
+    sw_abs_sun: torch.Tensor,
+    sw_abs_sh: torch.Tensor,
+    sw_abs_gnd: torch.Tensor,
+    lw_down: torch.Tensor,
+    g_cond_coeff: torch.Tensor,
+    prev_dt_sun: torch.Tensor,
+    prev_dt_sh: torch.Tensor,
+    prev_dt_gnd: torch.Tensor,
+    dt: float,
+    apply_damping: bool,
+):
+    """Pure-tensor 3-source Newton Jacobian assembly & 3x3 solve (CUDA-compilable)."""
+    e_pot_wet = rho_sfc * (
+        gb_sun * (qsat_sun - q_af_vpd) + gb_sh * (qsat_sh - q_af_vpd)
+    )
+    dew_on_leaf = (e_pot_wet <= 0.0) & has_veg
+    f_wet_eff = torch.where(
+        e_pot_wet > 1.0e-12,
+        torch.minimum(f_wet, torch.clamp(w_canopy, min=0.0) / (dt * torch.clamp(e_pot_wet, min=1.0e-12))),
+        f_wet,
+    )
+    f_wet_eff = torch.where(dew_on_leaf, torch.ones_like(f_wet_eff), f_wet_eff)
 
-    dl = torch.zeros_like(w_l)
-    du = torch.zeros_like(w_l)
-    diag = (dz / dt).expand_as(w_l).clone()
-    dl[1:] = -a_int
-    du[:-1] = -c_int
-    diag[:-1] = diag[:-1] + a_int
-    diag[1:] = diag[1:] + c_int
-    diag[-1] = diag[-1] + dk_bot_dth
+    g_trans_sun = torch.where(
+        dew_on_leaf | (~has_sun),
+        torch.zeros_like(f_wet),
+        (1.0 - f_wet) * (gb_sun * gsw_sun) / torch.clamp(gb_sun + gsw_sun, min=1.0e-6),
+    )
+    g_trans_sh = torch.where(
+        dew_on_leaf | (~has_sh),
+        torch.zeros_like(f_wet),
+        (1.0 - f_wet) * (gb_sh * gsw_sh) / torch.clamp(gb_sh + gsw_sh, min=1.0e-6),
+    )
+    g_inter_sun = torch.where(has_sun, f_wet_eff * gb_sun, torch.zeros_like(f_wet))
+    g_inter_sh = torch.where(has_sh, f_wet_eff * gb_sh, torch.zeros_like(f_wet))
 
-    rhs = torch.zeros_like(w_l)
-    e_soil_ms = torch.where(is_ice, torch.zeros_like(e_soil), torch.clamp(e_soil, min=0.0)) / RHO_WATER
-    rhs[0] = (q_infil / RHO_WATER - e_soil_ms) - q_int[0] - s_trans[0]
-    rhs[1:-1] = q_int[:-1] - q_int[1:] - s_trans[1:-1]
-    rhs[-1] = q_int[-1] - k_bot - s_trans[-1]
+    gw_0 = g_trans_sun + g_inter_sun
+    gw_1 = g_trans_sh + g_inter_sh
 
-    dtheta = solve_tridiagonal_batched(dl, diag, du, rhs)
-    theta_new = w_l + dtheta
+    q_soil_ref = torch.where(has_veg, q_af_vpd, qv_1)
+    dry_soil_cap = (qsat_gnd > q_soil_ref) & (q_soil_ref > h_soil_base * qsat_gnd)
+    h_soil = torch.where(
+        dry_soil_cap,
+        q_soil_ref / torch.clamp(qsat_gnd, min=1.0e-8),
+        h_soil_base,
+    )
+    g_soil_snowfree = (1.0 - a_sn) / torch.clamp(r_d_uc + r_soil, min=1.0e-4)
+    g_snow_subl = a_sn / torch.clamp(r_d_uc, min=1.0e-4)
+    gw_2 = g_soil_snowfree + g_snow_subl
+    h_gnd = torch.where(
+        gw_2 > 1.0e-8,
+        (g_snow_subl + g_soil_snowfree * h_soil) / torch.clamp(gw_2, min=1.0e-8),
+        h_soil,
+    )
+    dhq_gnd_dT = torch.where(
+        gw_2 > 1.0e-8,
+        (g_snow_subl + torch.where(dry_soil_cap, torch.zeros_like(g_soil_snowfree), g_soil_snowfree * h_soil))
+        / torch.clamp(gw_2, min=1.0e-8),
+        torch.where(dry_soil_cap, torch.zeros_like(h_soil), h_soil),
+    ) * dq_gnd
 
-    # Linearized bottom drainage (exact mass closure if raw q_drain < 0)
-    q_drain_raw = k_bot + dk_bot_dth * dtheta[-1]
-    q_drain_neg = torch.clamp(-q_drain_raw, min=0.0)
-    q_drain = torch.clamp(q_drain_raw, min=0.0)
-    theta_new = theta_new.clone()
-    theta_new[-1] = theta_new[-1] - (dt / SOIL_LAYER_DEPTHS[-1]) * q_drain_neg
+    gh_0 = 2.0 * gb_sun
+    gh_1 = 2.0 * gb_sh
+    gh_2 = 1.0 / r_d_uc
 
-    # Exact mass-conserving bounds: (1) bottom-up supersaturation sweep -> sfc_runoff
-    excess_mass = torch.zeros_like(w_l[0])
-    for k in range(N_SOIL_LAYERS - 1, -1, -1):
-        th_k = theta_new[k] + excess_mass / (RHO_WATER * SOIL_LAYER_DEPTHS[k])
-        over = torch.clamp(th_k - theta_max[k], min=0.0)
-        theta_new[k] = th_k - over
-        excess_mass = over * (RHO_WATER * SOIL_LAYER_DEPTHS[k])
-    sfc_runoff = sfc_runoff_0 + excess_mass / dt
+    gh_sum = ga_land + gh_0 + gh_1 + gh_2
+    t_af = torch.where(
+        has_veg,
+        (ga_land * t_air_sfc + gh_0 * t_sun_cur + gh_1 * t_sh_cur + gh_2 * t_gnd_cur) / gh_sum,
+        t_gnd_cur,
+    )
+    gw_sum = ga_land + gw_0 + gw_1 + gw_2
+    q_af = (ga_land * qv_1 + gw_0 * qsat_sun + gw_1 * qsat_sh + gw_2 * h_gnd * qsat_gnd) / gw_sum
 
-    # (2) Top-down non-negativity guard borrowing from neighbor / bottom drainage
-    deficit_mass = torch.zeros_like(w_l[0])
-    for k in range(N_SOIL_LAYERS):
-        th_k = theta_new[k] - deficit_mass / (RHO_WATER * SOIL_LAYER_DEPTHS[k])
-        under = torch.clamp(-th_k, min=0.0)
-        theta_new[k] = th_k + under
-        deficit_mass = under * (RHO_WATER * SOIL_LAYER_DEPTHS[k])
+    wh_0 = torch.where(has_veg, gh_0 / gh_sum, torch.zeros_like(gh_0))
+    wh_1 = torch.where(has_veg, gh_1 / gh_sum, torch.zeros_like(gh_1))
+    wh_2 = torch.where(has_veg, gh_2 / gh_sum, torch.ones_like(gh_2))
+    ww_0 = gw_0 / gw_sum
+    ww_1 = gw_1 / gw_sum
+    ww_2 = gw_2 / gw_sum
 
-    q_drain_mass = RHO_WATER * q_drain * dt
-    reduce_drain = torch.minimum(deficit_mass, q_drain_mass)
-    q_drain_mass = q_drain_mass - reduce_drain
-    sub_runoff = torch.where(is_ice, torch.zeros_like(q_drain_mass), q_drain_mass / dt)
-    w_liq_next = torch.where(is_ice.unsqueeze(0), w_liq, theta_new)
-    return w_liq_next, sfc_runoff, sub_runoff
+    l_vap_sun = torch.where(t_sun_cur < C.T_FREEZE, C.L_S0, C.L_V0)
+    l_vap_sh = torch.where(t_sh_cur < C.T_FREEZE, C.L_S0, C.L_V0)
+    l_vap_gnd = torch.where((a_sn > 0.5) | (t_gnd_cur < C.T_FREEZE), C.L_S0, C.L_V0)
+
+    eps_g = EMISSIVITY_LAND
+    sig = C.STEFAN_BOLTZMANN
+    t0_3 = t_sun_cur * t_sun_cur * t_sun_cur
+    t1_3 = t_sh_cur * t_sh_cur * t_sh_cur
+    t2_3 = t_gnd_cur * t_gnd_cur * t_gnd_cur
+    t0_4 = t0_3 * t_sun_cur
+    t1_4 = t1_3 * t_sh_cur
+    t2_4 = t2_3 * t_gnd_cur
+
+    dc_sun = f_veg_rad * f_sun_area
+    dc_sh = f_veg_rad * f_sh_area
+    r_lw_0 = dc_sun * (lw_refl_c * lw_down + eps_g * sig * t2_4 - lw_emit_c_coef * sig * t0_4)
+    r_lw_1 = dc_sh * (lw_refl_c * lw_down + eps_g * sig * t2_4 - lw_emit_c_coef * sig * t1_4)
+    r_lw_2 = eps_g * (1.0 - f_veg_rad) * lw_down + eps_g * sig * (dc_sun * t0_4 + dc_sh * t1_4) - eps_g * sig * t2_4
+
+    rho_cp = rho_sfc * cp_air
+    h_0 = rho_cp * gh_0 * (t_sun_cur - t_af)
+    h_1 = rho_cp * gh_1 * (t_sh_cur - t_af)
+    h_2 = torch.where(has_veg, rho_cp * gh_2 * (t_gnd_cur - t_af), rho_cp * ga_land * (t_gnd_cur - t_air_sfc))
+
+    e_0 = rho_sfc * gw_0 * (qsat_sun - q_af)
+    e_1 = rho_sfc * gw_1 * (qsat_sh - q_af)
+    e_2 = torch.maximum(rho_sfc * gw_2 * (h_gnd * qsat_gnd - q_af), -rho_sfc * ga_land * qv_1)
+
+    g0_down = g_cond_coeff * (t_gnd_cur - t_soil0)
+    b0 = sw_abs_sun + r_lw_0 - h_0 - l_vap_sun * e_0
+    b1 = sw_abs_sh + r_lw_1 - h_1 - l_vap_sh * e_1
+    b2 = sw_abs_gnd + r_lw_2 - h_2 - l_vap_gnd * e_2 - g0_down
+
+    k_lw_0 = 4.0 * dc_sun * sig
+    k_lw_1 = 4.0 * dc_sh * sig
+    lw_g_3 = 4.0 * eps_g * sig * t2_3
+
+    j00 = rho_cp * gh_0 * (1.0 - wh_0) + l_vap_sun * rho_sfc * gw_0 * dq_sun * (1.0 - ww_0) + k_lw_0 * lw_emit_c_coef * t0_3
+    j01 = -rho_cp * gh_0 * wh_1 - l_vap_sun * rho_sfc * gw_0 * ww_1 * dq_sh
+    j02 = -rho_cp * gh_0 * wh_2 - l_vap_sun * rho_sfc * gw_0 * ww_2 * dhq_gnd_dT - dc_sun * lw_g_3
+
+    j10 = -rho_cp * gh_1 * wh_0 - l_vap_sh * rho_sfc * gw_1 * ww_0 * dq_sun
+    j11 = rho_cp * gh_1 * (1.0 - wh_1) + l_vap_sh * rho_sfc * gw_1 * dq_sh * (1.0 - ww_1) + k_lw_1 * lw_emit_c_coef * t1_3
+    j12 = -rho_cp * gh_1 * wh_2 - l_vap_sh * rho_sfc * gw_1 * ww_2 * dhq_gnd_dT - dc_sh * lw_g_3
+
+    dh2_dt2 = torch.where(has_veg, rho_cp * gh_2 * (1.0 - wh_2), rho_cp * ga_land)
+    j20 = torch.where(has_veg, -rho_cp * gh_2 * wh_0 - l_vap_gnd * rho_sfc * gw_2 * ww_0 * dq_sun - eps_g * k_lw_0 * t0_3, torch.zeros_like(j00))
+    j21 = torch.where(has_veg, -rho_cp * gh_2 * wh_1 - l_vap_gnd * rho_sfc * gw_2 * ww_1 * dq_sh - eps_g * k_lw_1 * t1_3, torch.zeros_like(j00))
+    j22 = dh2_dt2 + l_vap_gnd * rho_sfc * gw_2 * dhq_gnd_dT * (1.0 - ww_2) + g_cond_coeff + lw_g_3
+
+    one_t = torch.ones_like(j00)
+    zero_t = torch.zeros_like(j00)
+    t_pin_sun = torch.where(has_sh, t_sh_cur, t_gnd_cur)
+    t_pin_sh = torch.where(has_sun, t_sun_cur, t_gnd_cur)
+
+    j00_s = torch.where(has_sun, torch.clamp(j00, min=1.0), one_t)
+    j01_s = torch.where(has_sun, j01, zero_t)
+    j02_s = torch.where(has_sun, j02, zero_t)
+    b0_s = torch.where(has_sun, b0, t_pin_sun - t_sun_cur)
+
+    j10_s = torch.where(has_sh, j10, zero_t)
+    j11_s = torch.where(has_sh, torch.clamp(j11, min=1.0), one_t)
+    j12_s = torch.where(has_sh, j12, zero_t)
+    b1_s = torch.where(has_sh, b1, t_pin_sh - t_sh_cur)
+
+    j22_s = torch.clamp(j22, min=1.0)
+    dt0_raw, dt1_raw, dt2_raw = _solve_3x3_batched(
+        j00_s, j01_s, j02_s, j10_s, j11_s, j12_s, j20, j21, j22_s, b0_s, b1_s, b2
+    )
+    dt0 = torch.clamp(dt0_raw, -10.0, 10.0)
+    dt1 = torch.clamp(dt1_raw, -10.0, 10.0)
+    dt2 = torch.clamp(dt2_raw, -10.0, 10.0)
+    if apply_damping:
+        dt0 = torch.where(dt0 * prev_dt_sun < 0.0, 0.5 * dt0, dt0)
+        dt1 = torch.where(dt1 * prev_dt_sh < 0.0, 0.5 * dt1, dt1)
+        dt2 = torch.where(dt2 * prev_dt_gnd < 0.0, 0.5 * dt2, dt2)
+
+    t_sun_new = t_sun_cur + dt0
+    t_sh_new = t_sh_cur + dt1
+    t_gnd_new = t_gnd_cur + dt2
+
+    melt_excess_t = torch.where(has_snow & (t_gnd_new > C.T_FREEZE), t_gnd_new - C.T_FREEZE, zero_t)
+    t_gnd_final = t_gnd_new - melt_excess_t
+    dt2_fin = t_gnd_final - t_gnd_cur
+    q_melt_avail = melt_excess_t * j22_s
+    return (
+        t_sun_new, t_sh_new, t_gnd_new, t_gnd_final, dt0, dt1, dt2, dt2_fin, q_melt_avail,
+        q_af, wh_0, wh_1, wh_2, ww_0, ww_1, ww_2, gh_0, gh_1, gh_2, rho_cp,
+        h_0, h_1, h_2, g_trans_sun, g_trans_sh, g_inter_sun, g_inter_sh,
+        g_soil_snowfree, g_snow_subl, h_soil, dry_soil_cap, dhq_gnd_dT, j22_s,
+    )
+
+
+def _land_post_newton_core(
+    t_sun_cur: torch.Tensor,
+    t_sh_cur: torch.Tensor,
+    t_sun_new: torch.Tensor,
+    t_sh_new: torch.Tensor,
+    t_gnd_new: torch.Tensor,
+    t_gnd_final: torch.Tensor,
+    dt2_fin: torch.Tensor,
+    q_melt_avail: torch.Tensor,
+    q_af: torch.Tensor,
+    wh_0: torch.Tensor,
+    wh_1: torch.Tensor,
+    wh_2: torch.Tensor,
+    ww_0: torch.Tensor,
+    ww_1: torch.Tensor,
+    ww_2: torch.Tensor,
+    gh_0: torch.Tensor,
+    gh_1: torch.Tensor,
+    gh_2: torch.Tensor,
+    ga_land: torch.Tensor,
+    rho_sfc: torch.Tensor,
+    rho_cp: torch.Tensor,
+    h_0: torch.Tensor,
+    h_1: torch.Tensor,
+    h_2: torch.Tensor,
+    g_trans_sun: torch.Tensor,
+    g_trans_sh: torch.Tensor,
+    g_inter_sun: torch.Tensor,
+    g_inter_sh: torch.Tensor,
+    g_soil_snowfree: torch.Tensor,
+    g_snow_subl: torch.Tensor,
+    qsat_sun: torch.Tensor,
+    dq_sun: torch.Tensor,
+    qsat_sh: torch.Tensor,
+    dq_sh: torch.Tensor,
+    qsat_gnd: torch.Tensor,
+    dq_gnd: torch.Tensor,
+    h_soil: torch.Tensor,
+    dry_soil_cap: torch.Tensor,
+    dhq_gnd_dT: torch.Tensor,
+    j22_s: torch.Tensor,
+    qv_1: torch.Tensor,
+    a_sn: torch.Tensor,
+    has_veg: torch.Tensor,
+    has_sun: torch.Tensor,
+    has_sh: torch.Tensor,
+    has_snow: torch.Tensor,
+    is_terrestrial: torch.Tensor,
+    is_ice: torch.Tensor,
+    f_veg_rad: torch.Tensor,
+    f_sun_area: torch.Tensor,
+    f_sh_area: torch.Tensor,
+    lw_refl_c: torch.Tensor,
+    sw_abs: torch.Tensor,
+    lw_down: torch.Tensor,
+    lai_exp: torch.Tensor,
+    wc_cap: torch.Tensor,
+    w_canopy: torch.Tensor,
+    w_avail_root: torch.Tensor,
+    s_root_cap: torch.Tensor,
+    water_stress: torch.Tensor,
+    swe_land: torch.Tensor,
+    swe_max_season: torch.Tensor,
+    snow_age: torch.Tensor,
+    w_liq_soil0: torch.Tensor,
+    t_soil0: torch.Tensor,
+    precip_rain: torch.Tensor,
+    precip_snow: torch.Tensor,
+    dt: float,
+):
+    """Pure-tensor post-Newton land fluxes, canopy water, and snowpack update (CUDA-compilable)."""
+    eps_g = EMISSIVITY_LAND
+    sig = C.STEFAN_BOLTZMANN
+    t_sun_final = torch.where(has_sun, t_sun_new, torch.where(has_sh, t_sh_new, t_gnd_final))
+    t_sh_final = torch.where(has_sh, t_sh_new, torch.where(has_sun, t_sun_new, t_gnd_final))
+    dt0_fin = t_sun_final - t_sun_cur
+    dt1_fin = t_sh_final - t_sh_cur
+
+    dt_af_fin = wh_0 * dt0_fin + wh_1 * dt1_fin + wh_2 * dt2_fin
+    dq_af_fin = ww_0 * dq_sun * dt0_fin + ww_1 * dq_sh * dt1_fin + ww_2 * dhq_gnd_dT * dt2_fin
+
+    shf_0 = h_0 + rho_cp * gh_0 * (dt0_fin - dt_af_fin)
+    shf_1 = h_1 + rho_cp * gh_1 * (dt1_fin - dt_af_fin)
+    shf_2 = torch.where(
+        has_veg,
+        h_2 + rho_cp * gh_2 * (dt2_fin - dt_af_fin),
+        h_2 + rho_cp * ga_land * dt2_fin,
+    )
+    shf_l = shf_0 + shf_1 + shf_2
+
+    dq0_fin = (qsat_sun + dq_sun * dt0_fin) - (q_af + dq_af_fin)
+    dq1_fin = (qsat_sh + dq_sh * dt1_fin) - (q_af + dq_af_fin)
+    dq2_soil_fin = torch.where(
+        dry_soil_cap,
+        torch.zeros_like(qsat_gnd),
+        h_soil * (qsat_gnd + dq_gnd * dt2_fin) - (q_af + dq_af_fin),
+    )
+    dq2_snow_fin = (qsat_gnd + dq_gnd * dt2_fin) - (q_af + dq_af_fin)
+
+    e_trans_raw = rho_sfc * (g_trans_sun * dq0_fin + g_trans_sh * dq1_fin)
+    e_inter_raw_signed = rho_sfc * (g_inter_sun * dq0_fin + g_inter_sh * dq1_fin)
+    e_soil_raw_signed = rho_sfc * g_soil_snowfree * dq2_soil_fin
+    e_snow_raw_signed = rho_sfc * g_snow_subl * dq2_snow_fin
+
+    e_inter_pos = torch.clamp(e_inter_raw_signed, min=0.0)
+    e_trans_pos = torch.clamp(e_trans_raw, min=0.0)
+    e_soil_pos = torch.clamp(e_soil_raw_signed, min=0.0)
+    e_snow_pos = torch.clamp(e_snow_raw_signed, min=0.0)
+    dew_leaf_neg = torch.clamp(e_inter_raw_signed, max=0.0) + torch.clamp(e_trans_raw, max=0.0)
+    dew_gnd_neg = torch.clamp(e_soil_raw_signed, max=0.0) + torch.clamp(e_snow_raw_signed, max=0.0)
+    dew_neg = torch.maximum(dew_leaf_neg + dew_gnd_neg, -rho_sfc * ga_land * qv_1)
+
+    l_vap_land = torch.where((a_sn > 0.5) | (t_gnd_final < C.T_FREEZE), C.L_S0, C.L_V0)
+    e_inter = torch.minimum(e_inter_pos, torch.where(is_terrestrial, w_canopy / dt, e_inter_pos))
+    shf_l = shf_l + l_vap_land * (e_inter_pos - e_inter)
+    sw_max_rate = (1.05 / 3600.0) * water_stress * (s_root_cap / 150.0)
+    e_trans = torch.minimum(
+        torch.minimum(e_trans_pos, sw_max_rate),
+        torch.where(is_terrestrial, w_avail_root / dt, e_trans_pos),
+    )
+    e_snow = torch.minimum(e_snow_pos, torch.where(is_terrestrial, swe_land / dt, e_snow_pos))
+    max_soil_evap = RHO_WATER * SOIL_LAYER_DEPTHS[0] * torch.clamp(w_liq_soil0 - 0.02, min=0.0) / dt
+    e_soil = torch.minimum(e_soil_pos, torch.where(is_terrestrial, max_soil_evap, e_soil_pos))
+
+    evap_l = e_inter + e_trans + e_snow + e_soil + dew_neg
+    lhf_l = l_vap_land * evap_l
+
+    tg4 = (t_gnd_final * t_gnd_final) ** 2
+    ts4 = (t_sun_final * t_sun_final) ** 2
+    tsh4 = (t_sh_final * t_sh_final) ** 2
+    lw_emit_tot_l = (
+        (1.0 - f_veg_rad) * eps_g * sig * tg4
+        + f_veg_rad * lw_refl_c * sig * (f_sun_area * ts4 + f_sh_area * tsh4)
+    )
+    lw_up_l = ((1.0 - f_veg_rad) ** 2) * (1.0 - eps_g) * lw_down + lw_emit_tot_l
+    t_skin_final = torch.pow(torch.clamp(lw_emit_tot_l / (eps_g * sig), min=1.0e4), 0.25)
+    g_into_soil = sw_abs + lw_down - lw_up_l - shf_l - lhf_l - q_melt_avail
+
+    f_int = torch.clamp(ALPHA_INTERCEPT_LIQ * torch.tanh(lai_exp), 0.0, 1.0)
+    wc_mid = w_canopy + dt * (f_int * precip_rain - e_inter - dew_leaf_neg)
+    drip = torch.clamp(wc_mid - wc_cap, min=0.0) / dt
+    wc_next = torch.clamp(wc_mid - drip * dt, min=0.0)
+    rain_thru = (1.0 - f_int) * precip_rain + drip
+    snow_thru = precip_snow
+
+    swe_mid = torch.clamp(swe_land + dt * (snow_thru - e_snow), min=0.0)
+    melt_rate = torch.minimum(q_melt_avail / C.L_F0, swe_mid / dt)
+    warm_ground_melt = torch.where((t_soil0 > C.T_FREEZE + 1.0) & (swe_mid < 2.0), swe_mid / dt, torch.zeros_like(swe_mid))
+    melt_tot = torch.minimum(melt_rate + warm_ground_melt, swe_mid / dt)
+    g_into_soil = g_into_soil - C.L_F0 * (melt_tot - melt_rate)
+    swe_after_melt = torch.clamp(swe_mid - melt_tot * dt, min=0.0)
+
+    glacier_runoff = torch.clamp(swe_after_melt - SWE_GLACIER_MAX, min=0.0) / dt
+    swe_next = swe_after_melt - glacier_runoff * dt
+    bare_ice_melt_pot = torch.where(
+        (~has_snow) & (t_gnd_new > C.T_FREEZE),
+        (t_gnd_new - C.T_FREEZE) * j22_s / C.L_F0,
+        torch.zeros_like(t_gnd_new),
+    )
+    smb_ice_land = torch.where(
+        is_terrestrial,
+        snow_thru - e_snow - melt_tot - bare_ice_melt_pot,
+        torch.zeros_like(snow_thru),
+    )
+
+    swe_max_next = torch.where(
+        swe_next <= 1.0e-2,
+        torch.zeros_like(swe_next),
+        torch.maximum(swe_max_season, swe_next),
+    )
+    t_sn = torch.clamp(t_skin_final, max=C.T_FREEZE)
+    f_age = torch.exp(5000.0 * (1.0 / C.T_FREEZE - 1.0 / torch.clamp(t_sn, min=200.0)))
+    r_dirt = torch.where(is_ice, torch.full_like(f_age, 0.01), torch.full_like(f_age, 0.30))
+    age_inc = (f_age + torch.pow(f_age, 10.0) + r_dirt) * (dt / TAU_SNOW_AGE)
+    fresh_refresh = torch.clamp(snow_thru * dt / 10.0, 0.0, 1.0)
+    snow_age_next = torch.where(
+        swe_next <= 1.0e-3,
+        torch.zeros_like(snow_age),
+        (1.0 - fresh_refresh) * (snow_age + age_inc),
+    )
+    dew_ground = -dew_gnd_neg
+    return (
+        t_sun_final, t_sh_final, t_skin_final, shf_l, lhf_l, evap_l,
+        e_soil, e_trans, g_into_soil, wc_next, rain_thru, melt_tot,
+        dew_ground, glacier_runoff, swe_next, smb_ice_land, swe_max_next, snow_age_next,
+    )
+
+
+def _ocean_seaice_post_core(
+    t_ocean_ml: torch.Tensor,
+    t_ocean_ml_comp: torch.Tensor,
+    h_ocean_ml: torch.Tensor,
+    m_seaice: torch.Tensor,
+    t_seaice: torch.Tensor,
+    swe_seaice: torch.Tensor,
+    f_ice: torch.Tensor,
+    qsat_ow: torch.Tensor,
+    qsat_si: torch.Tensor,
+    ga_h_o: torch.Tensor,
+    ga_q_o: torch.Tensor,
+    rho_sfc: torch.Tensor,
+    cp_air: torch.Tensor,
+    t_air_sfc: torch.Tensor,
+    qv_1: torch.Tensor,
+    sw_abs: torch.Tensor,
+    sw1_dir_down: torch.Tensor,
+    sw1_dif_down: torch.Tensor,
+    sw2_dir_down: torch.Tensor,
+    sw2_dif_down: torch.Tensor,
+    lw_down: torch.Tensor,
+    precip_snow: torch.Tensor,
+    mu0: torch.Tensor,
+    dt: float,
+):
+    """Pure-tensor open-water, sea-ice skin, and Kahan mixed-layer update (CUDA-compilable)."""
+    shf_ow = rho_sfc * cp_air * ga_h_o * (t_ocean_ml - t_air_sfc)
+    evap_ow = rho_sfc * ga_q_o * (qsat_ow - qv_1)
+    lhf_ow = C.L_V0 * evap_ow
+    t_ml_4 = (t_ocean_ml * t_ocean_ml) ** 2
+    lw_up_ow = EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * t_ml_4 + (1.0 - EMISSIVITY_OCEAN) * lw_down
+    alb_ocn_dir = compute_ocean_albedo_briegleb(mu0)[0]
+    sw_abs_ow = (
+        (sw1_dir_down + sw2_dir_down) * (1.0 - alb_ocn_dir)
+        + (sw1_dif_down + sw2_dif_down) * 0.94
+    )
+    g_down_ow = sw_abs_ow + lw_down - lw_up_ow - shf_ow - lhf_ow - C.L_F0 * precip_snow
+
+    h_ice_eff = torch.clamp(m_seaice / (C.RHO_SEAICE * torch.clamp(f_ice, min=0.05)), min=0.05)
+    h_sn_ice = swe_seaice / RHO_SNOWPACK
+    cond_ice = 1.0 / (0.5 * h_ice_eff / C.K_THERM_SEAICE + h_sn_ice / C.K_THERM_SNOW)
+
+    shf_si0 = rho_sfc * cp_air * ga_h_o * (t_seaice - t_air_sfc)
+    subl_si0 = rho_sfc * ga_q_o * (qsat_si - qv_1)
+    t_si_3 = t_seaice * t_seaice * t_seaice
+    lw_up_si0 = EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * (t_si_3 * t_seaice) + (1.0 - EMISSIVITY_OCEAN) * lw_down
+    g_cond_si0 = cond_ice * (t_seaice - C.T_FREEZE_OCEAN)
+    dqsi_dT = qsat_si * (21.8745584 * (C.T_FREEZE - 7.66)) / (torch.clamp(t_seaice, min=180.0) - 7.66) ** 2
+    denom_si = (
+        rho_sfc * cp_air * ga_h_o
+        + C.L_S0 * rho_sfc * ga_q_o * dqsi_dT
+        + cond_ice
+        + 4.0 * EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * t_si_3
+    )
+    res_si = sw_abs + lw_down - lw_up_si0 - shf_si0 - C.L_S0 * subl_si0 - g_cond_si0
+    t_si_raw = t_seaice + torch.clamp(res_si / denom_si, -10.0, 10.0)
+    si_melt_excess = torch.clamp(t_si_raw - C.T_FREEZE, min=0.0)
+    t_si_new = torch.where(f_ice > 1.0e-4, t_si_raw - si_melt_excess, torch.full_like(t_si_raw, C.T_FREEZE_OCEAN))
+    dt_si = t_si_new - t_seaice
+
+    shf_si = shf_si0 + rho_sfc * cp_air * ga_h_o * dt_si
+    subl_si = subl_si0 + rho_sfc * ga_q_o * dqsi_dT * dt_si
+    lhf_si = C.L_S0 * subl_si
+    g_oi_up = cond_ice * (C.T_FREEZE_OCEAN - t_si_new)
+
+    swe_si_mid = torch.clamp(swe_seaice + f_ice * dt * (precip_snow - torch.clamp(subl_si, min=0.0)), min=0.0)
+    q_top_melt = f_ice * si_melt_excess * denom_si
+    sn_si_melt = torch.minimum(q_top_melt * dt / C.L_F0, swe_si_mid)
+    swe_si_next = swe_si_mid - sn_si_melt
+    q_rem_melt = torch.clamp(q_top_melt * dt - C.L_F0 * sn_si_melt, min=0.0)
+
+    cw_ml = C.RHO_SEAWATER * C.CP_SEAWATER * h_ocean_ml
+    dt_ml_flux = (dt / cw_ml) * ((1.0 - f_ice) * g_down_ow - f_ice * g_oi_up)
+    t_ml_prov, comp1 = _kahan_add(t_ocean_ml, dt_ml_flux, t_ocean_ml_comp)
+
+    e_freeze = cw_ml * torch.clamp(C.T_FREEZE_OCEAN - t_ml_prov, min=0.0)
+    e_basal_melt = cw_ml * torch.clamp(t_ml_prov - C.T_FREEZE_OCEAN, min=0.0)
+    m_freeze = e_freeze / C.L_F0
+    m_melt = torch.minimum((e_basal_melt + q_rem_melt) / C.L_F0, m_seaice + m_freeze)
+    m_si_next = torch.clamp(m_seaice + m_freeze - m_melt, min=0.0)
+    dt_ml_lat = (C.L_F0 * m_freeze - C.L_F0 * torch.minimum(e_basal_melt / C.L_F0, m_seaice)) / cw_ml
+    t_ml_next, comp2 = _kahan_add(t_ml_prov, dt_ml_lat, comp1)
+    comp_final = torch.where((e_freeze > 0.0) | (m_melt > 0.0), torch.zeros_like(comp2), comp2)
+
+    shf_o = (1.0 - f_ice) * shf_ow + f_ice * shf_si
+    evap_o = (1.0 - f_ice) * evap_ow + f_ice * subl_si
+    lhf_o = (1.0 - f_ice) * lhf_ow + f_ice * lhf_si
+    lw_emit_o = EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * (
+        (1.0 - f_ice) * t_ml_4 + f_ice * ((t_si_new * t_si_new) ** 2)
+    )
+    return t_ml_next, comp_final, m_si_next, t_si_new, swe_si_next, shf_o, evap_o, lhf_o, lw_emit_o
 
 
 # ---------------------------------------------------------------------------
@@ -1018,303 +1569,51 @@ def step_surface(
             precomputed_alloc=alloc_2l,
         )
 
-        # 6. CLM5 wet-canopy water limitation & 3-source vapor conductances (CLM5 Eqs. 5.109-5.113)
-        e_pot_wet = rho_sfc * (
-            gb_sun * (qsat_sun - q_af_vpd) + gb_sh * (qsat_sh - q_af_vpd)
+        # 6-7. Coupled CLM5 wet-canopy limitation, 3-source conductances, Jacobian & 3x3 solve
+        jac_fn = maybe_cuda_compile(_land_newton_jacobian_core, device=u_1.device)
+        (
+            t_sun_new, t_sh_new, t_gnd_new, t_gnd_final, dt0, dt1, dt2, dt2_fin, q_melt_avail,
+            q_af, wh_0, wh_1, wh_2, ww_0, ww_1, ww_2, gh_0, gh_1, gh_2, rho_cp,
+            h_0, h_1, h_2, g_trans_sun, g_trans_sh, g_inter_sun, g_inter_sh,
+            g_soil_snowfree, g_snow_subl, h_soil, dry_soil_cap, dhq_gnd_dT, j22_s,
+        ) = jac_fn(
+            t_sun_cur, t_sh_cur, t_gnd_cur, t_soil0, t_air_sfc, qv_1, q_af_vpd,
+            qsat_sun, dq_sun, qsat_sh, dq_sh, qsat_gnd, dq_gnd,
+            ga_land, gb_sun, gb_sh, two_leaf.gsw_sun, two_leaf.gsw_sh,
+            r_d_uc, r_soil, h_soil_base, a_sn, f_wet, sfc.w_canopy,
+            rho_sfc, cp_air, has_veg, has_sun, has_sh, has_snow,
+            f_veg_rad, f_sun_area, f_sh_area, lw_refl_c, lw_emit_c_coef,
+            sw_abs_sun, sw_abs_sh, sw_abs_gnd, lw_down, g_cond_coeff,
+            prev_dt_sun, prev_dt_sh, prev_dt_gnd, dt, (_eb_it > 0),
         )
-        dew_on_leaf = (e_pot_wet <= 0.0) & has_veg
-        f_wet_eff = torch.where(
-            e_pot_wet > 1.0e-12,
-            torch.minimum(f_wet, torch.clamp(sfc.w_canopy, min=0.0) / (dt * torch.clamp(e_pot_wet, min=1.0e-12))),
-            f_wet,
-        )
-        f_wet_eff = torch.where(dew_on_leaf, torch.ones_like(f_wet_eff), f_wet_eff)
-
-        g_trans_sun = torch.where(
-            dew_on_leaf | (~has_sun),
-            torch.zeros_like(f_wet),
-            (1.0 - f_wet) * (gb_sun * two_leaf.gsw_sun) / torch.clamp(gb_sun + two_leaf.gsw_sun, min=1.0e-6),
-        )
-        g_trans_sh = torch.where(
-            dew_on_leaf | (~has_sh),
-            torch.zeros_like(f_wet),
-            (1.0 - f_wet) * (gb_sh * two_leaf.gsw_sh) / torch.clamp(gb_sh + two_leaf.gsw_sh, min=1.0e-6),
-        )
-        g_inter_sun = torch.where(has_sun, f_wet_eff * gb_sun, torch.zeros_like(f_wet))
-        g_inter_sh = torch.where(has_sh, f_wet_eff * gb_sh, torch.zeros_like(f_wet))
-
-        gw_0 = g_trans_sun + g_inter_sun
-        gw_1 = g_trans_sh + g_inter_sh
-
-        # CLM5 Sec. 5.2: do not condense atmospheric vapor into very dry soil when q_soil < q_af < q_sat
-        q_soil_ref = torch.where(has_veg, q_af_vpd, qv_1)
-        dry_soil_cap = (qsat_gnd > q_soil_ref) & (q_soil_ref > h_soil_base * qsat_gnd)
-        h_soil = torch.where(
-            dry_soil_cap,
-            q_soil_ref / torch.clamp(qsat_gnd, min=1.0e-8),
-            h_soil_base,
-        )
-        g_soil_snowfree = (1.0 - a_sn) / torch.clamp(r_d_uc + r_soil, min=1.0e-4)
-        g_snow_subl = a_sn / torch.clamp(r_d_uc, min=1.0e-4)
-        gw_2 = g_soil_snowfree + g_snow_subl
-        h_gnd = torch.where(
-            gw_2 > 1.0e-8,
-            (g_snow_subl + g_soil_snowfree * h_soil) / torch.clamp(gw_2, min=1.0e-8),
-            h_soil,
-        )
-        # Effective slope dhq/dT on ground node vanishes on dry-soil-capped fraction (q_soil pinned to q_af)
-        dhq_gnd_dT = torch.where(
-            gw_2 > 1.0e-8,
-            (g_snow_subl + torch.where(dry_soil_cap, torch.zeros_like(g_soil_snowfree), g_soil_snowfree * h_soil))
-            / torch.clamp(gw_2, min=1.0e-8),
-            torch.where(dry_soil_cap, torch.zeros_like(h_soil), h_soil),
-        ) * dq_gnd
-
-        # Sensible heat conductances [m s^-1]: two-sided leaf 2*gb_j (Dai et al., 2004, Eq. 6; Bonan et al., 2018, Eq. 10)
-        gh_0 = 2.0 * gb_sun
-        gh_1 = 2.0 * gb_sh
-        gh_2 = 1.0 / r_d_uc
-
-        # Canopy-air node (T_af, q_af) for vegetated columns; bare ground reduces directly to (T_gnd, q_af)
-        gh_sum = ga_land + gh_0 + gh_1 + gh_2
-        t_af = torch.where(
-            has_veg,
-            (ga_land * t_air_sfc + gh_0 * t_sun_cur + gh_1 * t_sh_cur + gh_2 * t_gnd_cur) / gh_sum,
-            t_gnd_cur,
-        )
-        gw_sum = ga_land + gw_0 + gw_1 + gw_2
-        q_af = (ga_land * qv_1 + gw_0 * qsat_sun + gw_1 * qsat_sh + gw_2 * h_gnd * qsat_gnd) / gw_sum
-
-        wh_0 = torch.where(has_veg, gh_0 / gh_sum, torch.zeros_like(gh_0))
-        wh_1 = torch.where(has_veg, gh_1 / gh_sum, torch.zeros_like(gh_1))
-        wh_2 = torch.where(has_veg, gh_2 / gh_sum, torch.ones_like(gh_2))
-        ww_0 = gw_0 / gw_sum
-        ww_1 = gw_1 / gw_sum
-        ww_2 = gw_2 / gw_sum
-
-        l_vap_sun = torch.where(t_sun_cur < C.T_FREEZE, C.L_S0, C.L_V0)
-        l_vap_sh = torch.where(t_sh_cur < C.T_FREEZE, C.L_S0, C.L_V0)
-        l_vap_gnd = torch.where((a_sn > 0.5) | (t_gnd_cur < C.T_FREEZE), C.L_S0, C.L_V0)
-
-        # 7. Exact 3-source net radiation, sensible/latent fluxes, and 3x3 Jacobian J * dT = b
-        sig = C.STEFAN_BOLTZMANN
-        t0_3 = t_sun_cur ** 3
-        t1_3 = t_sh_cur ** 3
-        t2_3 = t_gnd_cur ** 3
-        t0_4 = t0_3 * t_sun_cur
-        t1_4 = t1_3 * t_sh_cur
-        t2_4 = t2_3 * t_gnd_cur
-
-        dc_sun = f_veg_rad * f_sun_area
-        dc_sh = f_veg_rad * f_sh_area
-        r_lw_0 = dc_sun * (lw_refl_c * lw_down + eps_g * sig * t2_4 - lw_emit_c_coef * sig * t0_4)
-        r_lw_1 = dc_sh * (lw_refl_c * lw_down + eps_g * sig * t2_4 - lw_emit_c_coef * sig * t1_4)
-        r_lw_2 = eps_g * (1.0 - f_veg_rad) * lw_down + eps_g * sig * (dc_sun * t0_4 + dc_sh * t1_4) - eps_g * sig * t2_4
-
-        rho_cp = rho_sfc * cp_air
-        h_0 = rho_cp * gh_0 * (t_sun_cur - t_af)
-        h_1 = rho_cp * gh_1 * (t_sh_cur - t_af)
-        # Bare ground uses direct aerodynamic conductance g_a; vegetated ground exchanges through canopy air via gh_2
-        h_2 = torch.where(has_veg, rho_cp * gh_2 * (t_gnd_cur - t_af), rho_cp * ga_land * (t_gnd_cur - t_air_sfc))
-
-        e_0 = rho_sfc * gw_0 * (qsat_sun - q_af)
-        e_1 = rho_sfc * gw_1 * (qsat_sh - q_af)
-        e_2 = rho_sfc * gw_2 * (h_gnd * qsat_gnd - q_af)
-        # Bound negative dew flux over bare ground by atmospheric humidity store
-        e_2 = torch.maximum(e_2, -rho_sfc * ga_land * qv_1)
-
-        g0_down = g_cond_coeff * (t_gnd_cur - t_soil0)
-
-        b0 = sw_abs_sun + r_lw_0 - h_0 - l_vap_sun * e_0
-        b1 = sw_abs_sh + r_lw_1 - h_1 - l_vap_sh * e_1
-        b2 = sw_abs_gnd + r_lw_2 - h_2 - l_vap_gnd * e_2 - g0_down
-
-        # Jacobian entries J_ij = dH_i/dT_j + d(LE_i)/dT_j + delta_i2*delta_j2*g_cond - dR_lw_i/dT_j
-        k_lw_0 = 4.0 * dc_sun * sig
-        k_lw_1 = 4.0 * dc_sh * sig
-        lw_g_3 = 4.0 * eps_g * sig * t2_3
-
-        j00 = rho_cp * gh_0 * (1.0 - wh_0) + l_vap_sun * rho_sfc * gw_0 * dq_sun * (1.0 - ww_0) + k_lw_0 * lw_emit_c_coef * t0_3
-        j01 = -rho_cp * gh_0 * wh_1 - l_vap_sun * rho_sfc * gw_0 * ww_1 * dq_sh
-        j02 = -rho_cp * gh_0 * wh_2 - l_vap_sun * rho_sfc * gw_0 * ww_2 * dhq_gnd_dT - dc_sun * lw_g_3
-
-        j10 = -rho_cp * gh_1 * wh_0 - l_vap_sh * rho_sfc * gw_1 * ww_0 * dq_sun
-        j11 = rho_cp * gh_1 * (1.0 - wh_1) + l_vap_sh * rho_sfc * gw_1 * dq_sh * (1.0 - ww_1) + k_lw_1 * lw_emit_c_coef * t1_3
-        j12 = -rho_cp * gh_1 * wh_2 - l_vap_sh * rho_sfc * gw_1 * ww_2 * dhq_gnd_dT - dc_sh * lw_g_3
-
-        dh2_dt2 = torch.where(has_veg, rho_cp * gh_2 * (1.0 - wh_2), rho_cp * ga_land)
-        j20 = torch.where(has_veg, -rho_cp * gh_2 * wh_0 - l_vap_gnd * rho_sfc * gw_2 * ww_0 * dq_sun - eps_g * k_lw_0 * t0_3, torch.zeros_like(j00))
-        j21 = torch.where(has_veg, -rho_cp * gh_2 * wh_1 - l_vap_gnd * rho_sfc * gw_2 * ww_1 * dq_sh - eps_g * k_lw_1 * t1_3, torch.zeros_like(j00))
-        j22 = dh2_dt2 + l_vap_gnd * rho_sfc * gw_2 * dhq_gnd_dT * (1.0 - ww_2) + g_cond_coeff + lw_g_3
-
-        # Non-singular identity pinning for inactive leaf nodes (nighttime L_sun = 0 or bare ground)
-        one_t = torch.ones_like(j00)
-        zero_t = torch.zeros_like(j00)
-        t_pin_sun = torch.where(has_sh, t_sh_cur, t_gnd_cur)
-        t_pin_sh = torch.where(has_sun, t_sun_cur, t_gnd_cur)
-
-        j00_s = torch.where(has_sun, torch.clamp(j00, min=1.0), one_t)
-        j01_s = torch.where(has_sun, j01, zero_t)
-        j02_s = torch.where(has_sun, j02, zero_t)
-        b0_s = torch.where(has_sun, b0, t_pin_sun - t_sun_cur)
-
-        j10_s = torch.where(has_sh, j10, zero_t)
-        j11_s = torch.where(has_sh, torch.clamp(j11, min=1.0), one_t)
-        j12_s = torch.where(has_sh, j12, zero_t)
-        b1_s = torch.where(has_sh, b1, t_pin_sh - t_sh_cur)
-
-        j22_s = torch.clamp(j22, min=1.0)
-        dt0_raw, dt1_raw, dt2_raw = _solve_3x3_batched(
-            j00_s, j01_s, j02_s, j10_s, j11_s, j12_s, j20, j21, j22_s, b0_s, b1_s, b2
-        )
-        dt0 = torch.clamp(dt0_raw, -10.0, 10.0)
-        dt1 = torch.clamp(dt1_raw, -10.0, 10.0)
-        dt2 = torch.clamp(dt2_raw, -10.0, 10.0)
-
-        # Under-relax oscillatory sign reversals from positive leaf-heating / stomatal-closure feedback
-        if _eb_it > 0:
-            dt0 = torch.where(dt0 * prev_dt_sun < 0.0, 0.5 * dt0, dt0)
-            dt1 = torch.where(dt1 * prev_dt_sh < 0.0, 0.5 * dt1, dt1)
-            dt2 = torch.where(dt2 * prev_dt_gnd < 0.0, 0.5 * dt2, dt2)
         prev_dt_sun, prev_dt_sh, prev_dt_gnd = dt0, dt1, dt2
-
-        t_sun_new = t_sun_cur + dt0
-        t_sh_new = t_sh_cur + dt1
-        t_gnd_new = t_gnd_cur + dt2
-
-        # Snowmelt cap at T_FREEZE on the ground/snow node (MATSIRO6 Sec. 6.3.3); elevated evergreen foliage may exceed 0 C
-        melt_excess_t = torch.where(has_snow & (t_gnd_new > C.T_FREEZE), t_gnd_new - C.T_FREEZE, zero_t)
-        t_gnd_final = t_gnd_new - melt_excess_t
-        dt2_fin = t_gnd_final - t_gnd_cur
-        q_melt_avail = melt_excess_t * j22_s  # Ground energy [W m^-2] available to melt snow
 
         if _eb_it < n_eb_iter - 1:
             t_sun_cur = torch.where(has_sun, t_sun_new, torch.where(has_sh, t_sh_new, t_gnd_final))
             t_sh_cur = torch.where(has_sh, t_sh_new, torch.where(has_sun, t_sun_new, t_gnd_final))
             t_gnd_cur = t_gnd_final
 
-    # Final converged 3-source temperatures and exact linearized atmosphere-exchange fluxes
-    t_sun_final = torch.where(has_sun, t_sun_new, torch.where(has_sh, t_sh_new, t_gnd_final))
-    t_sh_final = torch.where(has_sh, t_sh_new, torch.where(has_sun, t_sun_new, t_gnd_final))
-    dt0_fin = t_sun_final - t_sun_cur
-    dt1_fin = t_sh_final - t_sh_cur
-
-    dt_af_fin = wh_0 * dt0_fin + wh_1 * dt1_fin + wh_2 * dt2_fin
-    dq_af_fin = ww_0 * dq_sun * dt0_fin + ww_1 * dq_sh * dt1_fin + ww_2 * dhq_gnd_dT * dt2_fin
-
-    shf_0 = h_0 + rho_cp * gh_0 * (dt0_fin - dt_af_fin)
-    shf_1 = h_1 + rho_cp * gh_1 * (dt1_fin - dt_af_fin)
-    shf_2 = torch.where(
-        has_veg,
-        h_2 + rho_cp * gh_2 * (dt2_fin - dt_af_fin),
-        h_2 + rho_cp * ga_land * dt2_fin,
-    )
-    shf_l = shf_0 + shf_1 + shf_2
-
-    dq0_fin = (qsat_sun + dq_sun * dt0_fin) - (q_af + dq_af_fin)
-    dq1_fin = (qsat_sh + dq_sh * dt1_fin) - (q_af + dq_af_fin)
-    dq2_soil_fin = torch.where(
-        dry_soil_cap,
-        torch.zeros_like(qsat_gnd),
-        h_soil * (qsat_gnd + dq_gnd * dt2_fin) - (q_af + dq_af_fin),
-    )
-    dq2_snow_fin = (qsat_gnd + dq_gnd * dt2_fin) - (q_af + dq_af_fin)
-
-    e_trans_raw = rho_sfc * (g_trans_sun * dq0_fin + g_trans_sh * dq1_fin)
-    e_inter_raw_signed = rho_sfc * (g_inter_sun * dq0_fin + g_inter_sh * dq1_fin)
-    e_soil_raw_signed = rho_sfc * g_soil_snowfree * dq2_soil_fin
-    e_snow_raw_signed = rho_sfc * g_snow_subl * dq2_snow_fin
-
-    # Separate positive evaporation from negative dew/frost condensation per pathway
-    e_inter_pos = torch.clamp(e_inter_raw_signed, min=0.0)
-    e_trans_pos = torch.clamp(e_trans_raw, min=0.0)
-    e_soil_pos = torch.clamp(e_soil_raw_signed, min=0.0)
-    e_snow_pos = torch.clamp(e_snow_raw_signed, min=0.0)
-    dew_leaf_neg = torch.clamp(e_inter_raw_signed, max=0.0) + torch.clamp(e_trans_raw, max=0.0)
-    dew_gnd_neg = torch.clamp(e_soil_raw_signed, max=0.0) + torch.clamp(e_snow_raw_signed, max=0.0)
-    dew_neg = torch.maximum(dew_leaf_neg + dew_gnd_neg, -rho_sfc * ga_land * qv_1)
-
-    # Cap wet-canopy evaporation by W_can / dt (shortfall returns as sensible heat; CLM5 Eq. 5.139),
-    # transpiration by root supply S_w & W_avail / dt, snow sublimation by SWE / dt, soil evap by top layer
-    l_vap_land = torch.where((a_sn > 0.5) | (t_gnd_final < C.T_FREEZE), C.L_S0, C.L_V0)
-    e_inter = torch.minimum(e_inter_pos, torch.where(is_terrestrial, sfc.w_canopy / dt, e_inter_pos))
-    shf_l = shf_l + l_vap_land * (e_inter_pos - e_inter)
-    sw_max_rate = (1.05 / 3600.0) * water_stress * (sfc.bio.s_root_cap / 150.0)  # Max supply ~1.05 mm/hr [kg m^-2 s^-1]
-    e_trans = torch.minimum(
-        torch.minimum(e_trans_pos, sw_max_rate),
-        torch.where(is_terrestrial, w_avail_root / dt, e_trans_pos),
-    )
-    e_snow = torch.minimum(e_snow_pos, torch.where(is_terrestrial, sfc.swe_land / dt, e_snow_pos))
-    max_soil_evap = RHO_WATER * SOIL_LAYER_DEPTHS[0] * torch.clamp(sfc.w_liq_soil[0] - 0.02, min=0.0) / dt
-    e_soil = torch.minimum(e_soil_pos, torch.where(is_terrestrial, max_soil_evap, e_soil_pos))
-
-    evap_l = e_inter + e_trans + e_snow + e_soil + dew_neg
-    lhf_l = l_vap_land * evap_l
-
-    # Exact 1-bounce upward LW to atmosphere (conserves R_lw_sun + R_lw_sh + R_lw_gnd == lw_down - lw_up_l)
-    lw_emit_tot_l = (
-        (1.0 - f_veg_rad) * eps_g * sig * (t_gnd_final ** 4)
-        + f_veg_rad * lw_refl_c * sig * (f_sun_area * (t_sun_final ** 4) + f_sh_area * (t_sh_final ** 4))
-    )
-    lw_up_l = ((1.0 - f_veg_rad) ** 2) * (1.0 - eps_g) * lw_down + lw_emit_tot_l
-    t_skin_final = torch.pow(torch.clamp(lw_emit_tot_l / (eps_g * sig), min=1.0e4), 0.25)
-    t_skin_new = t_gnd_new
-    denom_eb = j22_s
-    g_into_soil = sw_abs + lw_down - lw_up_l - shf_l - lhf_l - q_melt_avail
-
-    # Canopy water balance: liquid interception f_pi = alpha_liq * tanh(L), throughfall, and drip (CLM5 Eqs. 7.2-7.10, 7.17)
-    # Snowfall is not stored in the canopy (no canopy-snow reservoir) and falls directly onto the snowpack.
-    f_int = torch.clamp(ALPHA_INTERCEPT_LIQ * torch.tanh(lai_exp), 0.0, 1.0)
-    wc_mid = sfc.w_canopy + dt * (f_int * precip_rain - e_inter - dew_leaf_neg)
-    drip = torch.clamp(wc_mid - wc_cap, min=0.0) / dt
-    wc_next = torch.clamp(wc_mid - drip * dt, min=0.0)
-    rain_thru = (1.0 - f_int) * precip_rain + drip
-    snow_thru = precip_snow
-
-    # Update snowpack SWE, melt, snow aging, and glacier calving cap (MATSIRO6 Ch. 8)
-    swe_mid = torch.clamp(sfc.swe_land + dt * (snow_thru - e_snow), min=0.0)
-    melt_rate = torch.minimum(q_melt_avail / C.L_F0, swe_mid / dt)
-    # Immediate melt of thin snow falling on warm unfrozen ground
-    warm_ground_melt = torch.where((sfc.t_soil[0] > C.T_FREEZE + 1.0) & (swe_mid < 2.0), swe_mid / dt, torch.zeros_like(swe_mid))
-    melt_tot = torch.minimum(melt_rate + warm_ground_melt, swe_mid / dt)
-    g_into_soil = g_into_soil - C.L_F0 * (melt_tot - melt_rate)
-    swe_after_melt = torch.clamp(swe_mid - melt_tot * dt, min=0.0)
-
-    # Glacier calving/runoff cap at 1000 kg m^-2 (MATSIRO6 Sec. 8.6 Eq. 8.44)
-    glacier_runoff = torch.clamp(swe_after_melt - SWE_GLACIER_MAX, min=0.0) / dt
-    swe_next = swe_after_melt - glacier_runoff * dt
-    bare_ice_melt_pot = torch.where(
-        (~has_snow) & (t_skin_new > C.T_FREEZE),
-        (t_skin_new - C.T_FREEZE) * denom_eb / C.L_F0,
-        torch.zeros_like(t_skin_new),
-    )
-    smb_ice_land = torch.where(
-        is_terrestrial,
-        snow_thru - e_snow - melt_tot - bare_ice_melt_pot,
-        torch.zeros_like(snow_thru),
-    )
-
-    # Seasonal peak SWE hysteresis update (Swenson & Lawrence, 2012)
-    swe_max_next = torch.where(
-        swe_next <= 1.0e-2,
-        torch.zeros_like(swe_next),
-        torch.maximum(sfc.swe_max_season, swe_next),
-    )
-    # Snow aging update (Yang et al., 1997; MATSIRO6 Eqs. 8.60-8.61; fresh 10 mm snow resets age)
-    t_sn = torch.clamp(t_skin_final, max=C.T_FREEZE)
-    f_age = torch.exp(5000.0 * (1.0 / C.T_FREEZE - 1.0 / torch.clamp(t_sn, min=200.0)))
-    r_dirt = torch.where(is_ice, torch.full_like(f_age, 0.01), torch.full_like(f_age, 0.30))
-    age_inc = (f_age + torch.pow(f_age, 10.0) + r_dirt) * (dt / TAU_SNOW_AGE)
-    fresh_refresh = torch.clamp(snow_thru * dt / 10.0, 0.0, 1.0)
-    snow_age_next = torch.where(
-        swe_next <= 1.0e-3,
-        torch.zeros_like(sfc.snow_age),
-        (1.0 - fresh_refresh) * (sfc.snow_age + age_inc),
+    # Final converged 3-source temperatures, fluxes, canopy water, and snowpack
+    post_land_fn = maybe_cuda_compile(_land_post_newton_core, device=u_1.device)
+    (
+        t_sun_final, t_sh_final, t_skin_final, shf_l, lhf_l, evap_l,
+        e_soil, e_trans, g_into_soil, wc_next, rain_thru, melt_tot,
+        dew_ground, glacier_runoff, swe_next, smb_ice_land, swe_max_next, snow_age_next,
+    ) = post_land_fn(
+        t_sun_cur, t_sh_cur, t_sun_new, t_sh_new, t_gnd_new, t_gnd_final, dt2_fin,
+        q_melt_avail, q_af, wh_0, wh_1, wh_2, ww_0, ww_1, ww_2, gh_0, gh_1, gh_2,
+        ga_land, rho_sfc, rho_cp, h_0, h_1, h_2, g_trans_sun, g_trans_sh,
+        g_inter_sun, g_inter_sh, g_soil_snowfree, g_snow_subl, qsat_sun, dq_sun,
+        qsat_sh, dq_sh, qsat_gnd, dq_gnd, h_soil, dry_soil_cap, dhq_gnd_dT, j22_s,
+        qv_1, a_sn, has_veg, has_sun, has_sh, has_snow, is_terrestrial, is_ice,
+        f_veg_rad, f_sun_area, f_sh_area, lw_refl_c, sw_abs, lw_down, lai_exp,
+        wc_cap, sfc.w_canopy, w_avail_root, sfc.bio.s_root_cap, water_stress,
+        sfc.swe_land, sfc.swe_max_season, sfc.snow_age, sfc.w_liq_soil[0],
+        sfc.t_soil[0], precip_rain, precip_snow, dt,
     )
 
     # Advance 5-layer implicit Richards soil hydrology with dynamic rooting depth z_root(S_R)
     # (Clapp & Hornberger, 1978; Swenson et al., 2012; CLM5 Sec. 7.3-7.5; Holtzman et al., 2024)
-    dew_ground = -dew_gnd_neg  # Positive downward dew/frost directly onto ground/soil [kg m^-2 s^-1]
     w_liq_hydro, sfc_runoff, sub_runoff = step_multilayer_soil_hydrology(
         sfc.w_liq_soil, sfc.w_ice_soil, rain_thru, melt_tot, e_soil, e_trans, dew_ground,
         sfc.bio.s_root_cap, is_ice, dt,
@@ -1353,78 +1652,13 @@ def step_surface(
     ga_h_o = tr_ocn.c_h * tr_ocn.wind_eff
     ga_q_o = tr_ocn.c_q * tr_ocn.wind_eff
 
-    # Separate fluxes over open water and sea ice (MIROC6 Sec. 3.8.4 & SCALE-RM Sec. 8.6.2)
-    shf_ow = rho_sfc * cp_air * ga_h_o * (sfc.t_ocean_ml - theta_1 * exner_s)
-    evap_ow = rho_sfc * ga_q_o * (qsat_ow - qv_1)
-    lhf_ow = C.L_V0 * evap_ow
-    lw_up_ow = EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * (sfc.t_ocean_ml ** 4) + (1.0 - EMISSIVITY_OCEAN) * lw_down
-    sw_abs_ow = (
-        sw1_dir_down * (1.0 - compute_ocean_albedo_briegleb(mu0)[0])
-        + sw1_dif_down * 0.94
-        + sw2_dir_down * (1.0 - compute_ocean_albedo_briegleb(mu0)[0])
-        + sw2_dif_down * 0.94
-    )
-    # Net downward heat into open water including snowfall fusion cooling -L_f0 * F_snow (SCALE-RM Eq. 8.332)
-    g_down_ow = sw_abs_ow + lw_down - lw_up_ow - shf_ow - lhf_ow - C.L_F0 * precip_snow
-
-    # Sea-ice skin & conductive flux G_oi (Semtner, 1976; SCALE-RM Eqs. 8.340-8.358)
-    h_ice_eff = torch.clamp(sfc.m_seaice / (C.RHO_SEAICE * torch.clamp(f_ice, min=0.05)), min=0.05)
-    h_sn_ice = sfc.swe_seaice / RHO_SNOWPACK
-    cond_ice = 1.0 / (0.5 * h_ice_eff / C.K_THERM_SEAICE + h_sn_ice / C.K_THERM_SNOW)
-
-    shf_si0 = rho_sfc * cp_air * ga_h_o * (sfc.t_seaice - theta_1 * exner_s)
-    subl_si0 = rho_sfc * ga_q_o * (qsat_si - qv_1)
-    lw_up_si0 = EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * (sfc.t_seaice ** 4) + (1.0 - EMISSIVITY_OCEAN) * lw_down
-    g_cond_si0 = cond_ice * (sfc.t_seaice - C.T_FREEZE_OCEAN)
-    # Linearized sea-ice skin update
-    dqsi_dT = qsat_si * (21.8745584 * (C.T_FREEZE - 7.66)) / (torch.clamp(sfc.t_seaice, min=180.0) - 7.66) ** 2
-    denom_si = (
-        rho_sfc * cp_air * ga_h_o
-        + C.L_S0 * rho_sfc * ga_q_o * dqsi_dT
-        + cond_ice
-        + 4.0 * EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * (sfc.t_seaice ** 3)
-    )
-    res_si = sw_abs + lw_down - lw_up_si0 - shf_si0 - C.L_S0 * subl_si0 - g_cond_si0
-    t_si_raw = sfc.t_seaice + torch.clamp(res_si / denom_si, -10.0, 10.0)
-    si_melt_excess = torch.clamp(t_si_raw - C.T_FREEZE, min=0.0)
-    t_si_new = torch.where(f_ice > 1.0e-4, t_si_raw - si_melt_excess, torch.full_like(t_si_raw, C.T_FREEZE_OCEAN))
-    dt_si = t_si_new - sfc.t_seaice
-
-    shf_si = shf_si0 + rho_sfc * cp_air * ga_h_o * dt_si
-    subl_si = subl_si0 + rho_sfc * ga_q_o * dqsi_dT * dt_si
-    lhf_si = C.L_S0 * subl_si
-    g_oi_up = cond_ice * (C.T_FREEZE_OCEAN - t_si_new)  # Upward conductive heat from ocean to ice
-
-    # Snow on sea ice + top/basal sea-ice mass update (SCALE-RM Eqs. 8.345-8.358)
-    swe_si_mid = torch.clamp(sfc.swe_seaice + f_ice * dt * (precip_snow - torch.clamp(subl_si, min=0.0)), min=0.0)
-    q_top_melt = f_ice * si_melt_excess * denom_si
-    sn_si_melt = torch.minimum(q_top_melt * dt / C.L_F0, swe_si_mid)
-    swe_si_next = swe_si_mid - sn_si_melt
-    q_rem_melt = torch.clamp(q_top_melt * dt - C.L_F0 * sn_si_melt, min=0.0)
-
-    # Update ocean mixed-layer temperature T_ocean_ml before basal freeze/melt check
-    cw_ml = C.RHO_SEAWATER * C.CP_SEAWATER * sfc.h_ocean_ml
-    dt_ml_flux = (dt / cw_ml) * ((1.0 - f_ice) * g_down_ow - f_ice * g_oi_up)
     comp0 = sfc.t_ocean_ml_comp if sfc.t_ocean_ml_comp is not None else torch.zeros_like(sfc.t_ocean_ml)
-    t_ml_prov, comp1 = _kahan_add(sfc.t_ocean_ml, dt_ml_flux, comp0)
-
-    # If T_ml_prov < T_FREEZE_OCEAN: form new sea ice; if T_ml_prov > T_FREEZE_OCEAN and M_i > 0: basal melt
-    e_freeze = cw_ml * torch.clamp(C.T_FREEZE_OCEAN - t_ml_prov, min=0.0)
-    e_basal_melt = cw_ml * torch.clamp(t_ml_prov - C.T_FREEZE_OCEAN, min=0.0)
-    m_freeze = e_freeze / C.L_F0
-    m_melt = torch.minimum((e_basal_melt + q_rem_melt) / C.L_F0, sfc.m_seaice + m_freeze)
-
-    m_si_next = torch.clamp(sfc.m_seaice + m_freeze - m_melt, min=0.0)
-    # Net enthalpy adjustment on mixed layer after freeze/melt
-    dt_ml_lat = (C.L_F0 * m_freeze - C.L_F0 * torch.minimum(e_basal_melt / C.L_F0, sfc.m_seaice)) / cw_ml
-    t_ml_next, comp2 = _kahan_add(t_ml_prov, dt_ml_lat, comp1)
-    comp_final = torch.where((e_freeze > 0.0) | (m_melt > 0.0), torch.zeros_like(comp2), comp2)
-
-    shf_o = (1.0 - f_ice) * shf_ow + f_ice * shf_si
-    evap_o = (1.0 - f_ice) * evap_ow + f_ice * subl_si
-    lhf_o = (1.0 - f_ice) * lhf_ow + f_ice * lhf_si
-    lw_emit_o = EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * (
-        (1.0 - f_ice) * (sfc.t_ocean_ml ** 4) + f_ice * (t_si_new ** 4)
+    ocn_post_fn = maybe_cuda_compile(_ocean_seaice_post_core, device=u_1.device)
+    t_ml_next, comp_final, m_si_next, t_si_new, swe_si_next, shf_o, evap_o, lhf_o, lw_emit_o = ocn_post_fn(
+        sfc.t_ocean_ml, comp0, sfc.h_ocean_ml, sfc.m_seaice, sfc.t_seaice, sfc.swe_seaice,
+        f_ice, qsat_ow, qsat_si, ga_h_o, ga_q_o, rho_sfc, cp_air, t_air_sfc, qv_1,
+        sw_abs, sw1_dir_down, sw1_dif_down, sw2_dir_down, sw2_dif_down, lw_down,
+        precip_snow, mu0, dt,
     )
 
     # =========================================================================
