@@ -116,6 +116,20 @@ class AOBAConfig:
     enable_bvoc_soa: bool = True             # EEO forest BVOC (isoprene/monoterpene) -> SOA -> CCN feedback
     enable_prognostic_ch4_n2o: bool = False  # Prognostic natural CH4 (wetland/fire/OH) & N2O (soil/ocean/UV) cycles
     enable_silicate_weathering: bool = False # Carbonate-silicate weathering CO2 thermostat & riverine alkalinity
+    enable_co2_3d_transport: bool = False    # 3D SCVT FCT CO2 transport (Keeling Curve) when co2_mode="prognostic"
+    co2_anthro_pgc_yr: float = 0.0           # Prescribed anthropogenic CO2 emission rate [Pg C yr^-1] (co2_mode="prognostic")
+    enable_ocean_o2_omz: bool = False        # Prognostic 3D dissolved O2, OMZ hypoxia, & marine anaerobic denitrification
+    enable_volcanic_aerosols: bool = False   # Stratospheric SO2 -> H2SO4 volcanic/SAI aerosols coupled to radiation & O3
+    volcanic_eruption_year: float = -1.0     # Simulation year to trigger discrete eruption pulse (< 0 disables pulse)
+    volcanic_so2_tg: float = 0.0             # Discrete eruption SO2 mass [Tg SO2] (e.g. 17.0 for Mt. Pinatubo)
+    volcanic_eruption_lat_deg: float = 15.0  # Eruption latitude [deg N]
+    volcanic_eruption_width_deg: float = 15.0 # Initial meridional plume Gaussian width [deg]
+    sai_so2_tg_yr: float = 0.0               # Continuous stratospheric SO2 injection rate [Tg SO2 yr^-1] (geoengineering)
+    sai_lat_band_deg: float = 20.0           # Meridional band width for continuous SAI injection [deg]
+    enable_solar_cycle: bool = False         # 11-year Schwabe solar cycle modulating TSI & stratospheric UV photolysis
+    solar_cycle_amp_wm2: float = 1.0         # Peak-to-trough TSI solar cycle amplitude [W m^-2] (Lean et al., 2005)
+    solar_cycle_period_yr: float = 11.0      # Solar cycle period [yr]
+    solar_cycle_phase_yr: float = 0.0        # Solar cycle reference phase year [yr]
     volcanic_co2_pgc_yr: float = 0.03        # Volcanic CO2 outgassing for silicate-weathering mode [Pg C yr^-1]
     weathering_accel_factor: float = 1.0     # Optional geological acceleration factor for weathering mode [-]
     enable_milankovitch_orbit: bool = False  # Analytical Berger (1978) / Laskar (2004) Milankovitch orbital evolution
@@ -215,6 +229,8 @@ class AOBAState:
     ozone: object | None = None
     trace_gas: object | None = None
     weathering: object | None = None
+    prognostic_co2: object | None = None
+    volcanic_solar: object | None = None
     sim_time_sec: float = 0.0
     step_count: int = 0
     rad_cache: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -228,6 +244,8 @@ class AOBAState:
 
     def current_co2_ppmv(self, sim_time_sec: float | None = None) -> float:
         """Return active atmospheric CO2 [ppmv] at ``sim_time_sec`` (or ``self.sim_time_sec``)."""
+        if str(self.cfg.co2_mode).strip().lower() == "prognostic" and self.prognostic_co2 is not None:
+            return float(self.prognostic_co2.co2_ppmv_glob)
         if bool(self.cfg.enable_silicate_weathering) and self.weathering is not None:
             return float(self.weathering.co2_ppmv)
         if self.co2_series is None or not self.co2_series.is_time_varying:
@@ -980,9 +998,27 @@ def step_aoba_model(
         sim_yr_now = model.sim_time_sec / yr_sec_trop
         t_kyr = float(cfg.milankovitch_start_kyr) + (sim_yr_now * 1.0e-3) * max(float(cfg.milankovitch_accel_factor), 1.0)
         ecc_now, obl_now, peri_now = compute_milankovitch_orbital_params(t_kyr)
+    # Optional 11-year Schwabe solar cycle modulation of TSI & stratospheric UV
+    s0_eff = float(cfg.solar_constant)
+    uv_j_o2_scale = 1.0
+    if bool(cfg.enable_solar_cycle) or bool(cfg.enable_volcanic_aerosols):
+        from aoba.volcanic_solar import compute_solar_cycle_modulation, init_volcanic_solar_state
+
+        if model.volcanic_solar is None:
+            model.volcanic_solar = init_volcanic_solar_state(nc, atmos.rho_d.device, atmos.rho_d.dtype)
+        if bool(cfg.enable_solar_cycle):
+            tsi_d, uv_j_o2_scale = compute_solar_cycle_modulation(
+                model.sim_time_sec / C.SECONDS_PER_DAY,
+                amp_wm2=cfg.solar_cycle_amp_wm2,
+                period_yr=cfg.solar_cycle_period_yr,
+                phase_yr=cfg.solar_cycle_phase_yr,
+            )
+            model.volcanic_solar.tsi_delta_wm2 = tsi_d
+            model.volcanic_solar.uv_j_o2_scale = uv_j_o2_scale
+            s0_eff = max(100.0, s0_eff + tsi_d)
     mu0, s_toa, hour_angle_cell = compute_orbital_insolation(
         t_seas_next, mesh.lat_cell, mesh.lon_cell,
-        cfg.solar_constant, obl_now, ecc_now, peri_now,
+        s0_eff, obl_now, ecc_now, peri_now,
         t_diurnal_sec=t_diur_next, diurnal_cycle=cfg.diurnal_cycle,
     )
     mu0_sub = _cell_to_sub(mu0, nc, n_sub)
@@ -1051,7 +1087,7 @@ def step_aoba_model(
             qc_rad, qi_rad = apply_3d_tica_cloud_shift(
                 qc_sub, qi_sub, z_rel_c, mu0, hour_angle_cell, nc, ny, nx, float(cfg.crm_dx)
             )
-        # Optional 5-species natural aerosol direct SW+LW radiative optics (BC/OC/SO4/SS)
+        # Optional 5-species natural + stratospheric volcanic aerosol direct SW+LW radiative optics
         aero_opt_rad = None
         if bool(cfg.enable_aerosol_rad_forcing) and bool(cfg.enable_natural_aerosols) and model.aerosols is not None:
             from aoba.aerosols import compute_aerosol_radiative_optics
@@ -1063,6 +1099,23 @@ def step_aoba_model(
                 _cell_to_sub(asym_a, nc, n_sub),
                 _cell_to_sub(lw_a, nc, n_sub),
             )
+        if bool(cfg.enable_volcanic_aerosols) and model.volcanic_solar is not None:
+            from aoba.volcanic_solar import compute_volcanic_rad_optics_and_sad
+
+            pres_host_v, _, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+            (v_tsw, v_ssw, v_asw, v_tlw), _ = compute_volcanic_rad_optics_and_sad(
+                model.volcanic_solar, pres_host_v, atmos.dz_c
+            )
+            v_sub = (
+                _cell_to_sub(v_tsw, nc, n_sub),
+                _cell_to_sub(v_ssw, nc, n_sub),
+                _cell_to_sub(v_asw, nc, n_sub),
+                _cell_to_sub(v_tlw, nc, n_sub),
+            )
+            if aero_opt_rad is None:
+                aero_opt_rad = v_sub
+            else:
+                aero_opt_rad = tuple(a + b for a, b in zip(aero_opt_rad, v_sub))
         o3_vmr_rad = None
         if str(cfg.o3_mode).strip().lower() == "prognostic":
             if model.ozone is None:
@@ -1307,6 +1360,7 @@ def step_aoba_model(
             enable_scale_aware_gm=bool(cfg.enable_ogcm_scale_aware_gm),
             enable_submeso=bool(cfg.enable_ogcm_submeso),
             enable_tidal_mixing=bool(cfg.enable_ogcm_tidal_mixing),
+            enable_o2_omz=bool(cfg.enable_ocean_o2_omz),
         )
         if has_indep_ocn:
             sfc.t_ocean_ml = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.t_ocean_ml, fallback_atm=sfc.t_ocean_ml)
@@ -1416,6 +1470,14 @@ def step_aoba_model(
     has_o3_adv = bool(str(cfg.o3_mode).strip().lower() == "prognostic" and model.ozone is not None)
     if has_o3_adv:
         adv_list.append(model.ozone.o3_vmr)
+    has_co2_adv = bool(
+        str(cfg.co2_mode).strip().lower() == "prognostic"
+        and bool(cfg.enable_co2_3d_transport)
+        and model.prognostic_co2 is not None
+        and model.prognostic_co2.co2_vmr is not None
+    )
+    if has_co2_adv:
+        adv_list.append(model.prognostic_co2.co2_vmr)
     q_adv = fct_advect_scvt_batch(
         mesh, torch.stack(adv_list, dim=0),
         m_old_host, m_new_host, uh_mean, om_mean, dt,
@@ -1434,6 +1496,10 @@ def step_aoba_model(
         idx_q += 4
     if has_o3_adv:
         model.ozone.o3_vmr = torch.clamp(q_adv[idx_q], min=1.0e-10, max=4.0e-5)
+        idx_q += 1
+    if has_co2_adv:
+        model.prognostic_co2.co2_vmr = torch.clamp(q_adv[idx_q], min=1.0e-5, max=0.05)
+        idx_q += 1
 
     dthm_ls = (atmos.theta_m - thm_before_dyn) / dt
     dqn_ls = (atmos.q_n - qn_before_dyn) / dt
@@ -1930,7 +1996,7 @@ def step_aoba_model(
             alk_tot = (alk_bgc * mesh.area_cell).sum()
             alk_bgc = (alk_tot / a_ocn_sum) * w0
         apply_atmospheric_bgc_deposition(model.ogcm.bgc, model.ogcm, du_bgc, ln_bgc, alk_bgc, dt)
-    # 8b-5. Prognostic Natural CH4 & N2O Cycles (Wetland/Permafrost + Fire + Denit/Marine + OH/UV)
+    # 8b-5. Prognostic Natural CH4 & N2O Cycles (Wetland/Permafrost + Fire + Denit/Marine-OMZ + OH/UV)
     if bool(cfg.enable_prognostic_ch4_n2o):
         from aoba.trace_gas_cycle import init_trace_gas_cycle_state, step_trace_gas_cycle
 
@@ -1949,8 +2015,65 @@ def step_aoba_model(
             fire_c_kgc_m2s=model.land_carbon.fire_c_kgc_m2s if model.land_carbon is not None else None,
             n_denit_kgn_m2s=getattr(model.land_carbon, "n_denit_kgn_m2s", None) if model.land_carbon is not None else None,
             ocean_epc100_molc_m2s=model.ogcm.bgc.epc100 if (model.ogcm is not None and model.ogcm.bgc is not None) else None,
+            ocean_denit_moln_m2s=getattr(model.ogcm.bgc, "denit_moln_m2s", None) if (model.ogcm is not None and model.ogcm.bgc is not None) else None,
             ocean_area_cell=ocn_m_tg.area_cell if ocn_m_tg is not None else None,
             mean_tco_du=mean_tco_now,
+        )
+    # 8b-6. Stratospheric Volcanic / SAI Aerosols (SO2 -> H2SO4)
+    volc_sad_3d = None
+    if bool(cfg.enable_volcanic_aerosols) and model.volcanic_solar is not None:
+        from aoba.volcanic_solar import compute_volcanic_rad_optics_and_sad, step_volcanic_aerosols
+
+        step_volcanic_aerosols(
+            vs=model.volcanic_solar,
+            mesh=mesh,
+            sim_time_days=model.sim_time_sec / C.SECONDS_PER_DAY,
+            dt=dt,
+            eruption_year=cfg.volcanic_eruption_year,
+            eruption_so2_tg=cfg.volcanic_so2_tg,
+            eruption_lat_deg=cfg.volcanic_eruption_lat_deg,
+            eruption_width_deg=cfg.volcanic_eruption_width_deg,
+            sai_so2_tg_yr=cfg.sai_so2_tg_yr,
+            sai_lat_band_deg=cfg.sai_lat_band_deg,
+        )
+        pres_host_vs, _, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        _, volc_sad_3d = compute_volcanic_rad_optics_and_sad(model.volcanic_solar, pres_host_vs, atmos.dz_c)
+    # 8b-7. Emissions-Driven Interactive Prognostic Atmospheric CO2 (Closed Land+Ocean+Weath+Anthro Budget)
+    if str(cfg.co2_mode).strip().lower() == "prognostic":
+        from aoba.prognostic_co2 import init_prognostic_co2_state, step_prognostic_co2
+
+        if model.prognostic_co2 is None:
+            model.prognostic_co2 = init_prognostic_co2_state(
+                co2_ppmv_init=cfg.co2_ppmv,
+                nz=nz,
+                n_cells=nc,
+                enable_3d=bool(cfg.enable_co2_3d_transport),
+                device=atmos.rho_d.device,
+                dtype=atmos.rho_d.dtype,
+            )
+        ocn_m_c = model.ocn_mesh if has_indep_ocn else mesh
+        fg_ocn_c = model.ogcm.bgc.fgco2 if (model.ogcm is not None and model.ogcm.bgc is not None) else None
+        fg_host_c = None
+        if fg_ocn_c is not None and has_indep_ocn and model.ocn_coupler is not None:
+            from aoba.ocean_coupler import ocn_to_atm_mean
+
+            fg_host_c = ocn_to_atm_mean(model.ocn_coupler, fg_ocn_c)
+        weath_sink = float(model.weathering.weathering_pgc_yr) if (bool(cfg.enable_silicate_weathering) and model.weathering is not None) else 0.0
+        volc_src = float(cfg.volcanic_co2_pgc_yr) if bool(cfg.enable_silicate_weathering) else 0.0
+        step_prognostic_co2(
+            state=model.prognostic_co2,
+            area_cell=mesh.area_cell,
+            dt=dt,
+            land_nbp_kgc_m2s=model.land_carbon.nbp_kgc_m2s if model.land_carbon is not None else None,
+            ocean_fgco2_molc_m2s=fg_ocn_c,
+            ocean_area_cell=ocn_m_c.area_cell if ocn_m_c is not None else None,
+            ocean_fgco2_host_molc_m2s=fg_host_c,
+            anthro_pgc_yr=float(cfg.co2_anthro_pgc_yr),
+            volcanic_pgc_yr=volc_src,
+            weathering_pgc_yr=weath_sink,
+            rho_d=atmos.rho_d,
+            dz_c=atmos.dz_c,
+            lat_cell=mesh.lat_cell,
         )
     if str(cfg.o3_mode).strip().lower() == "prognostic":
         from aoba.ozone_chemistry import init_prognostic_ozone_state, step_prognostic_ozone
@@ -1987,6 +2110,8 @@ def step_aoba_model(
             ecl_ppbv=cfg.o3_ecl_ppbv,
             lnox_cell_kgn_m2s=lnox_prod_cell,
             fire_c_cell_kgc_m2s=fire_c_cell,
+            uv_j_o2_scale=uv_j_o2_scale,
+            volc_sad_um2_cm3=volc_sad_3d,
         )
     month_idx = model.calendar.date_at(model.sim_time_sec).month - 1
     clim.month_temp_sum_c[month_idx] += (t_air - C.T_FREEZE)

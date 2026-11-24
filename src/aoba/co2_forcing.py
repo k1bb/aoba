@@ -30,7 +30,7 @@ import urllib.request
 import numpy as np
 
 
-VALID_CO2_MODES: tuple[str, ...] = ("constant", "scenario", "csv")
+VALID_CO2_MODES: tuple[str, ...] = ("constant", "scenario", "csv", "prognostic")
 
 NOAA_GML_GLOBAL_URL = "https://gml.noaa.gov/webdata/ccgg/trends/co2/co2_annmean_gl.csv"
 NOAA_GML_MLO_URL = "https://gml.noaa.gov/webdata/ccgg/trends/co2/co2_annmean_mlo.csv"
@@ -373,10 +373,10 @@ def resolve_co2_series(
     if mode not in VALID_CO2_MODES:
         raise ValueError(f"Invalid co2_mode '{co2_mode}'; expected one of {VALID_CO2_MODES}")
 
-    if mode == "constant":
+    if mode in ("constant", "prognostic"):
         return CO2ForcingSeries(
-            mode="constant",
-            name=f"constant:{float(co2_ppmv):.2f}",
+            mode=mode,
+            name=f"{mode}:{float(co2_ppmv):.2f}",
             years=None,
             values=None,
             constant_ppmv=float(co2_ppmv),

@@ -633,6 +633,11 @@ $$
 
 ## 12. 単一 TOML 設定管理・出力仕様・GUI コンフィギュレータ・全パラメータ一覧
 
+### 12.1 閉ループ万能 ESM 拡張（`prognostic_co2.py`, `ocean_bgc.py`, `volcanic_solar.py`）
+- **排出駆動・完全双方向の大気 $\mathrm{CO}_2$ 予報（`co2_mode = "prognostic"`, `enable_co2_3d_transport`）**: 陸域 NBP・海洋 $\mathrm{fgCO}_2$・ケイ酸塩風化・火山・人為排出の収支 $\mathrm{d}C_{\mathrm{CO}_2}/\mathrm{d}t = (E_{\mathrm{anthro}} + E_{\mathrm{volc}} - \mathrm{NBP}_{\mathrm{land}} - F_{\mathrm{ocn}} - F_{\mathrm{weath}}) / 2.124\ \mathrm{PgC\ ppmv}^{-1}$ を倍精度で厳密保存し、オプションで 3 次元 SCVT FCT 移流・PBL 混合によりキーリング曲線と南北勾配を再現する。
+- **海洋溶存酸素 ($\mathrm{O}_2$)・貧酸素水塊 (OMZ)・海洋脱窒（`enable_ocean_o2_omz`）**: Garcia & Gordon (1992) の酸素溶解度、Wanninkhof (2014) の大気海洋交換、$R_{\mathrm{O}_2:\mathrm{C}} = 138/106$ の光合成・再無機化、および貧酸素域（$\mathrm{O}_2 < 20\ \mathrm{mmol\ m}^{-3}$）での嫌気的脱窒を解き、海洋 $\mathrm{N}_2\mathrm{O}$ 放出へ結合する。
+- **成層圏火山性エアロゾル・太陽活動 11 年周期（`enable_volcanic_aerosols`, `enable_solar_cycle`）**: 厳密な 2 段 Bateman 解析解による $\mathrm{SO}_2 \to \mathrm{H}_2\mathrm{SO}_4$ 酸化（$\tau_{\mathrm{ox}} = 35\ \mathrm{日}$）および沈降（$\tau_{\mathrm{set}} = 1.1\ \mathrm{年}$）と SCVT ラプラシアン拡散を放射（SW 散乱・LW 吸収）および成層圏不均一オゾン破壊へ結合し、11 年 Schwabe 周期の TSI・UV 光解離変調を加える。
+
 ### 12.1 一元テキスト管理アーキテクチャと実行・GUI ツール (`src/aoba/params.py`, `src/aoba/co2_forcing.py`, `src/aoba/ozone_forcing.py`, `src/aoba/gravity_wave.py`, `scripts/aoba_config_gui.py`)
 
 モデルの再現性と透明性を保証するため、すべての格子設定（成層圏拡張標準 `nz = 44, z_top = 48 km`、低トップ 24 km 切替可）・強制外力・非地形性重力波・動的氷床設定・出力ストリーム・物理定数（**14セクション・全256項目**）を単一の人間可読な TOML ファイル [`config/aoba_default.toml`](../config/aoba_default.toml) に集約管理する。大気 $\mathrm{CO_2}$ 濃度は `co2_mode` により **固定値 (`constant`)・シナリオ補間 (`scenario`)・独自 CSV (`csv`)** の3通りを選択でき、`scenario` 時はモデルの連続暦年（負の BCE 年を含む）に応じて同梱テーブル `src/aoba/assets/co2_scenarios.csv`（CMIP5 RCP・CMIP6 historical/SSP・南極氷床コア80万年復元・NOAA GML 接続）または `scripts/fetch_co2_data.py`／AOBA Studio から随時更新した最新キャッシュ `data/forcing/co2/co2_latest.csv` を線形補間する。大気オゾン $\mathrm{O_3}$ も同様に `o3_mode` により **解析的2D緯度×季節 (`latitude_seasonal`、既定)・1D RCEMIP (`rcemip`; Wing et al., 2018)・外部帯状平均気候値 (`climatology`; `scripts/fetch_ozone_data.py` で CMIP6/CMIP7 input4MIPs から取得し、高空モデルトップ拡張時はテーブル上端より上で $p^{g_2}$ 減衰外挿)** を選択でき、`o3_lw_coupling = true` で 9.6 μm 窓領域長波吸収およびオーバーヘッド $\mathrm{O_3}$・成層圏 15 μm $\mathrm{CO_2}$ 冷却を有効化する。

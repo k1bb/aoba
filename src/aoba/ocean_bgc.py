@@ -144,6 +144,99 @@ class OceanBGCState:
     intpp: torch.Tensor                # 2D Vertically integrated NPP [mol C m^-2 s^-1]
     epc100: torch.Tensor               # 2D Sinking POC export flux across ~100 m [mol C m^-2 s^-1]
     fe_sfc: torch.Tensor | None = None # 2D Surface dissolved Fe [nM = umol Fe m^-3] (dust fertilization)
+    # Optional prognostic 3D dissolved oxygen (O2), OMZ, & marine denitrification (enable_ocean_o2_omz)
+    o2: torch.Tensor | None = None             # [N_zo, N_cells] dissolved O2 [mmol O2 m^-3]
+    o2_comp: torch.Tensor | None = None        # [N_zo, N_cells] Neumaier/Kahan compensation
+    fgo2: torch.Tensor | None = None           # [N_cells] air-sea O2 flux (pos into ocean) [mol O2 m^-2 s^-1]
+    denit_moln_m2s: torch.Tensor | None = None # [N_cells] column anaerobic denitrification [mol N m^-2 s^-1]
+    omz_col_frac: torch.Tensor | None = None   # [N_cells] fraction of water column with O2 < 20 mmol m^-3
+
+
+O2_GLOBAL_MEAN: float = 205.0          # Reference mean ocean dissolved O2 [mmol m^-3]
+R_O2_TO_C: float = 138.0 / 106.0       # Anderson & Sarmiento (1994) photosynthetic/remin O2:C ratio [-]
+O2_SUBOXIC_MMOL: float = 20.0          # OMZ hypoxia threshold [mmol O2 m^-3] (Paulmier & Ruiz-Pino, 2009)
+O2_HALF_SAT_MMOL: float = 5.0          # Monod half-saturation for aerobic remineralization [mmol m^-3]
+R_DENIT_N_PER_O2: float = 0.8          # Stoichiometric NO3 consumed per O2-equivalent in denitrification [-]
+
+
+def compute_o2_saturation_mmol_m3(temp_k: torch.Tensor, sal_psu: torch.Tensor) -> torch.Tensor:
+    """Exact seawater O2 saturation concentration [mmol m^-3] (Garcia & Gordon, 1992, L&O 37, Table 1)."""
+    tc = torch.clamp(temp_k - 273.15, min=-2.0, max=40.0)
+    ts = torch.log((298.15 - tc) / (273.15 + tc))
+    s = torch.clamp(sal_psu, min=0.0, max=45.0)
+    ln_c = (
+        5.80871 + 3.20291 * ts + 4.17887 * (ts ** 2) + 5.10006 * (ts ** 3)
+        - 9.86643e-2 * (ts ** 4) + 3.80369 * (ts ** 5)
+        + s * (-7.01577e-3 - 7.70028e-3 * ts - 1.13864e-2 * (ts ** 2) - 9.51519e-3 * (ts ** 3))
+        - 2.75915e-7 * (s ** 2)
+    )
+    # umol kg^-1 * (rho_sw / 1000) -> mmol m^-3
+    return torch.clamp(torch.exp(torch.clamp(ln_c, min=4.0, max=6.5)) * (C.RHO_SEAWATER * 1.0e-3), min=120.0, max=450.0)
+
+
+def _step_ocean_o2_omz_column(
+    bgc: OceanBGCState,
+    ogcm,
+    u10_ocn: torch.Tensor,
+    f_seaice: torch.Tensor,
+    h0_new: torch.Tensor,
+    wet_cf: torch.Tensor,
+    dt: float,
+) -> None:
+    """Advance 3D dissolved O2 air-sea exchange, O2 photosynthesis/remineralization, & OMZ denitrification."""
+    assert bgc.o2 is not None and bgc.o2_comp is not None
+    t_c = torch.clamp(ogcm.temp - 273.15, min=-2.0, max=40.0)
+    wet0 = ogcm.wet_c[0].to(bgc.o2.dtype)
+
+    # 1. Surface air-sea O2 gas exchange (Wanninkhof, 2014 Sc_O2 + exact exponential relaxation)
+    o2_sat = compute_o2_saturation_mmol_m3(ogcm.temp[0], ogcm.sal[0])
+    sc_o2 = torch.clamp(1920.4 - 135.6 * t_c[0] + 5.2122 * (t_c[0] ** 2) - 0.10939 * (t_c[0] ** 3) + 0.00093777 * (t_c[0] ** 4), min=150.0, max=2500.0)
+    # k_w [m s^-1] = 0.251 [cm/h / (m/s)^2] * (0.01/3600) * u10^2 * sqrt(660/Sc)
+    kw_o2 = (0.251 * (0.01 / 3600.0)) * (torch.clamp(u10_ocn, min=0.0, max=40.0) ** 2) * torch.sqrt(660.0 / sc_o2) * (1.0 - torch.clamp(f_seaice, 0.0, 1.0)) * wet0
+    h0_safe = torch.clamp(h0_new, min=10.0)
+    k_ex = kw_o2 / h0_safe
+    f_ex = -torch.expm1(-torch.clamp(k_ex * float(dt), min=0.0, max=20.0))
+    do2_sfc = (o2_sat - bgc.o2[0]) * f_ex * wet0
+    # Air-sea O2 flux [mol O2 m^-2 s^-1] (mmol m^-3 * m * 1e-3 / s)
+    bgc.fgo2 = (do2_sfc * h0_safe * 1.0e-3) / max(float(dt), 1.0)
+
+    # 2. 3D biological O2 production (NPP) & aerobic/suboxic remineralization + OMZ denitrification
+    o2_cur = torch.clamp(bgc.o2, min=0.0)
+    o2_prod = (R_O2_TO_C * torch.clamp(bgc.npp_c, min=0.0)) * float(dt) * wet_cf
+
+    # Temperature-dependent detrital remineralization rate [s^-1] matching FlexPFT (0.06 d^-1 at 20 C, Q10 ~ 2)
+    f_t_rem = torch.exp(torch.clamp(0.0693 * (t_c - 20.0), min=-2.0, max=2.0))
+    rem_c = (0.06 / C.SECONDS_PER_DAY) * f_t_rem * torch.clamp(bgc.det_c, min=0.0) * wet_cf  # mmol C m^-3 s^-1
+    o2_dem_rate = R_O2_TO_C * rem_c  # mmol O2 m^-3 s^-1
+
+    # Smooth Monod transition from aerobic respiration to anaerobic denitrification below ~20 mmol m^-3
+    f_ox = o2_cur / (o2_cur + O2_HALF_SAT_MMOL)
+    # Exact bounded exponential O2 consumption (strictly O2 >= 0)
+    k_o2_loss = (o2_dem_rate * f_ox) / torch.clamp(o2_cur, min=1.0e-4)
+    do2_cons = o2_cur * (-torch.expm1(-torch.clamp(k_o2_loss * float(dt), min=0.0, max=20.0)))
+
+    do2_tot = o2_prod - do2_cons
+    do2_tot[0] = do2_tot[0] + do2_sfc
+    o2_new, o2_comp_new = _kahan_add(bgc.o2, do2_tot * wet_cf, bgc.o2_comp)
+    bgc.o2 = torch.clamp(o2_new, min=0.0, max=500.0) * wet_cf
+    bgc.o2_comp = o2_comp_new * wet_cf
+
+    # Anaerobic denitrification in suboxic OMZs (O2 < 20 mmol m^-3): consumes NO3-, produces N2O!
+    omz_gate = torch.clamp((O2_SUBOXIC_MMOL - bgc.o2) / O2_SUBOXIC_MMOL, 0.0, 1.0) * wet_cf
+    no3_pos = torch.clamp(bgc.no3, min=0.0)
+    denit_rate = R_DENIT_N_PER_O2 * o2_dem_rate * (1.0 - f_ox) * omz_gate  # mmol N m^-3 s^-1
+    k_denit = denit_rate / torch.clamp(no3_pos, min=1.0e-4)
+    dno3_denit = no3_pos * (-torch.expm1(-torch.clamp(k_denit * float(dt), min=0.0, max=10.0)))
+    no3_new, no3_comp_new = _kahan_add(bgc.no3, -dno3_denit * wet_cf, bgc.no3_comp)
+    bgc.no3 = torch.clamp(no3_new, min=0.0) * wet_cf
+    bgc.no3_comp = no3_comp_new * wet_cf
+
+    h_eff = ogcm.h_c.clone()
+    h_eff[0] = h0_safe * wet0
+    # Column-integrated marine denitrification [mol N m^-2 s^-1]
+    bgc.denit_moln_m2s = ((dno3_denit * h_eff).sum(dim=0) * 1.0e-3) / max(float(dt), 1.0)
+    h_tot = torch.clamp((h_eff * wet_cf).sum(dim=0), min=1.0)
+    bgc.omz_col_frac = ((bgc.o2 < O2_SUBOXIC_MMOL).to(bgc.o2.dtype) * h_eff * wet_cf).sum(dim=0) / h_tot
 
 
 def apply_atmospheric_bgc_deposition(
@@ -665,8 +758,9 @@ def step_ocean_bgc_flexpft(
     co2_ppmv: float,
     dt: float,
     enable_full_redi: bool = True,
+    enable_o2_omz: bool = False,
 ) -> None:
-    """Advance 3D FlexPFT marine BGC tracers by `dt` [s]: transport + vertical mixing + FlexPFT + CO2."""
+    """Advance 3D FlexPFT marine BGC tracers by `dt` [s]: transport + vertical mixing + FlexPFT + CO2 (+ O2/OMZ)."""
     from aoba.ocean_ogcm import _ogcm_advect_redi_batch
 
     dev = bgc.dic.device
@@ -689,62 +783,80 @@ def step_ocean_bgc_flexpft(
     active_eoc = cache["active_eoc"]
     inv_area_c = cache["inv_area_c"]
 
-    # 1. Batched [7, nzo, nc] Conservative 3D Advection + Full Rotated Redi Diffusion
-    bgc_ref = cache.get("bgc_ref_b")
+    # Lazily allocate 3D dissolved O2 when enable_o2_omz is active (100% map-free vertical profile)
+    if enable_o2_omz and bgc.o2 is None:
+        z_prof = torch.linspace(260.0, 175.0, nzo, device=dev, dtype=dtype).view(nzo, 1)
+        bgc.o2 = z_prof.expand(nzo, nc).contiguous() * wet_cf
+        bgc.o2_comp = torch.zeros((nzo, nc), device=dev, dtype=dtype)
+        bgc.fgo2 = torch.zeros((nc,), device=dev, dtype=dtype)
+        bgc.denit_moln_m2s = torch.zeros((nc,), device=dev, dtype=dtype)
+        bgc.omz_col_frac = torch.zeros((nc,), device=dev, dtype=dtype)
+
+    use_o2 = enable_o2_omz and bgc.o2 is not None and bgc.o2_comp is not None
+    nt = 8 if use_o2 else 7
+
+    # 1. Batched [nt, nzo, nc] Conservative 3D Advection + Full Rotated Redi Diffusion
+    ref_key = f"bgc_ref_b_{nt}"
+    bgc_ref = cache.get(ref_key)
     if bgc_ref is None:
-        bgc_ref = torch.tensor(
-            [NO3_GLOBAL_MEAN, 0.0, 0.0, 0.0, 0.0, DIC_GLOBAL_MEAN, ALK_GLOBAL_MEAN],
-            device=dev, dtype=dtype,
-        ).view(7, 1, 1)
-        cache["bgc_ref_b"] = bgc_ref
-    zero_nl_7 = cache.get("bgc_zero_nl_7")
-    if zero_nl_7 is None or zero_nl_7.shape != (7, nzo - 1, nc):
-        zero_nl_7 = torch.zeros((7, nzo - 1, nc), device=dev, dtype=dtype)
-        cache["bgc_zero_nl_7"] = zero_nl_7
+        ref_vals = [NO3_GLOBAL_MEAN, 0.0, 0.0, 0.0, 0.0, DIC_GLOBAL_MEAN, ALK_GLOBAL_MEAN]
+        if use_o2:
+            ref_vals.append(O2_GLOBAL_MEAN)
+        bgc_ref = torch.tensor(ref_vals, device=dev, dtype=dtype).view(nt, 1, 1)
+        cache[ref_key] = bgc_ref
+    znl_key = f"bgc_zero_nl_{nt}"
+    zero_nl = cache.get(znl_key)
+    if zero_nl is None or zero_nl.shape != (nt, nzo - 1, nc):
+        zero_nl = torch.zeros((nt, nzo - 1, nc), device=dev, dtype=dtype)
+        cache[znl_key] = zero_nl
     zero_c = cache.get("bgc_zero_c")
     if zero_c is None or zero_c.shape != (nzo, nc):
         zero_c = torch.zeros((nzo, nc), device=dev, dtype=dtype)
         cache["bgc_zero_c"] = zero_c
 
-    q7 = torch.stack([bgc.no3, bgc.phy, bgc.zoo, bgc.det_n, bgc.det_c, bgc.dic, bgc.alk], dim=0)
-    c7 = torch.stack([bgc.no3_comp, zero_c, zero_c, zero_c, zero_c, bgc.dic_comp, bgc.alk_comp], dim=0)
+    q_list = [bgc.no3, bgc.phy, bgc.zoo, bgc.det_n, bgc.det_c, bgc.dic, bgc.alk]
+    c_list = [bgc.no3_comp, zero_c, zero_c, zero_c, zero_c, bgc.dic_comp, bgc.alk_comp]
+    if use_o2:
+        q_list.append(bgc.o2)
+        c_list.append(bgc.o2_comp)
+    qt = torch.stack(q_list, dim=0)
+    ct = torch.stack(c_list, dim=0)
 
     adv_b_fn = maybe_cuda_compile(_ogcm_advect_redi_batch, device=dev)
-    q7, c7 = adv_b_fn(
-        q7, c7, zero_nl_7, h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
+    qt, ct = adv_b_fn(
+        qt, ct, zero_nl, h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
         dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
         c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
         bgc_ref, dt, enable_full_redi,
     )
 
-    # 2. Batched [7, nzo, nc] Strictly Conservative Flux-Increment Implicit Vertical Mixing
-    z_row7 = torch.zeros((7, 1, nc), device=dev, dtype=dtype)
-    q_diff = q7[:, 1:] - q7[:, :-1]
+    # 2. Batched [nt, nzo, nc] Strictly Conservative Flux-Increment Implicit Vertical Mixing
+    z_row = torch.zeros((nt, 1, nc), device=dev, dtype=dtype)
+    q_diff = qt[:, 1:] - qt[:, :-1]
     c_dif_b = c_dif.unsqueeze(0)
     h_eff_b = h_eff.unsqueeze(0)
     f_exp = c_dif_b * q_diff
-    rhs7 = (torch.cat([f_exp, z_row7], dim=1) - torch.cat([z_row7, f_exp], dim=1)) / h_eff_b
-    # Permute [7, nzo, nc] -> [nzo, 7*nc] for a single fused batched Thomas solve
-    rhs_flat = rhs7.permute(1, 0, 2).reshape(nzo, 7 * nc)
-    a_7 = a_t.unsqueeze(1).expand(nzo, 7, nc).reshape(nzo, 7 * nc)
-    b_7 = b_t.unsqueeze(1).expand(nzo, 7, nc).reshape(nzo, 7 * nc)
-    d_7 = d_t.unsqueeze(1).expand(nzo, 7, nc).reshape(nzo, 7 * nc)
-    dq_imp = solve_tridiagonal_batched(a_7, b_7, d_7, rhs_flat).view(nzo, 7, nc).permute(1, 0, 2)
+    rhs = (torch.cat([f_exp, z_row], dim=1) - torch.cat([z_row, f_exp], dim=1)) / h_eff_b
+    rhs_flat = rhs.permute(1, 0, 2).reshape(nzo, nt * nc)
+    a_b = a_t.unsqueeze(1).expand(nzo, nt, nc).reshape(nzo, nt * nc)
+    b_b = b_t.unsqueeze(1).expand(nzo, nt, nc).reshape(nzo, nt * nc)
+    d_b = d_t.unsqueeze(1).expand(nzo, nt, nc).reshape(nzo, nt * nc)
+    dq_imp = solve_tridiagonal_batched(a_b, b_b, d_b, rhs_flat).view(nzo, nt, nc).permute(1, 0, 2)
     f_imp = c_dif_b * (q_diff + (dq_imp[:, 1:] - dq_imp[:, :-1]))
-    dq_cons = ((torch.cat([f_imp, z_row7], dim=1) - torch.cat([z_row7, f_imp], dim=1)) / h_eff_b) * wet_cf.unsqueeze(0)
+    dq_cons = ((torch.cat([f_imp, z_row], dim=1) - torch.cat([z_row, f_imp], dim=1)) / h_eff_b) * wet_cf.unsqueeze(0)
 
-    q7_k, c7_k = _kahan_add(q7, dq_cons, c7)
-    bgc.no3, bgc.no3_comp = q7_k[0], c7_k[0]
-    bgc.phy = torch.clamp(q7[1] + dq_cons[1], min=0.0) * wet_cf
-    bgc.zoo = torch.clamp(q7[2] + dq_cons[2], min=0.0) * wet_cf
-    bgc.det_n = torch.clamp(q7[3] + dq_cons[3], min=0.0) * wet_cf
-    bgc.det_c = torch.clamp(q7[4] + dq_cons[4], min=0.0) * wet_cf
-    bgc.dic, bgc.dic_comp = q7_k[5], c7_k[5]
-    bgc.alk, bgc.alk_comp = q7_k[6], c7_k[6]
+    qt_k, ct_k = _kahan_add(qt, dq_cons, ct)
+    bgc.no3, bgc.no3_comp = qt_k[0], ct_k[0]
+    bgc.phy = torch.clamp(qt[1] + dq_cons[1], min=0.0) * wet_cf
+    bgc.zoo = torch.clamp(qt[2] + dq_cons[2], min=0.0) * wet_cf
+    bgc.det_n = torch.clamp(qt[3] + dq_cons[3], min=0.0) * wet_cf
+    bgc.det_c = torch.clamp(qt[4] + dq_cons[4], min=0.0) * wet_cf
+    bgc.dic, bgc.dic_comp = qt_k[5], ct_k[5]
+    bgc.alk, bgc.alk_comp = qt_k[6], ct_k[6]
+    if use_o2:
+        bgc.o2, bgc.o2_comp = torch.clamp(qt_k[7], min=0.0) * wet_cf, ct_k[7] * wet_cf
 
     # 3. FlexPFT Ecosystem Reactions, Implicit Sinking, & OMIP/mocsy Air-Sea CO2 Exchange
-    # Modulate euphotic PAR slightly by dissolved iron availability when dust-Fe coupling is active
-    # (Moore et al., 2004: Michaelis-Menten Fe/(Fe + 0.20 nM), normalized to 1.0 at Fe = 0.60 nM)
     sw_par_eff = sw_par_sfc
     if bgc.fe_sfc is not None:
         fe_lim = torch.clamp((bgc.fe_sfc / (bgc.fe_sfc + 0.20)) / 0.75, min=0.25, max=1.35)
@@ -762,6 +874,8 @@ def step_ocean_bgc_flexpft(
             h0_new=h0_new, sw_par_sfc=sw_par_eff, u10_ocn=u10_ocn, f_seaice=f_seaice,
             co2_ppmv=float(co2_ppmv), dt=float(dt), rho_sw=float(C.RHO_SEAWATER),
         )
+        if use_o2:
+            _step_ocean_o2_omz_column(bgc, ogcm, u10_ocn, f_seaice, h0_new, wet_cf, dt)
         return
 
     # Deepest wet cell mask (CPU fallback)
@@ -785,6 +899,8 @@ def step_ocean_bgc_flexpft(
         ogcm.h_c, h_c_safe, h0_new, wet_c, wet_cf, is_deepest_c,
         float(co2_ppmv), float(dt),
     )
+    if use_o2:
+        _step_ocean_o2_omz_column(bgc, ogcm, u10_ocn, f_seaice, h0_new, wet_cf, dt)
 
 
 def diagnose_ocean_bgc_metrics(bgc: OceanBGCState, ogcm, mesh) -> dict[str, float]:
@@ -823,7 +939,7 @@ def diagnose_ocean_bgc_metrics(bgc: OceanBGCState, ogcm, mesh) -> dict[str, floa
     tot_dic_pgc = float((vol * dic_64).sum().item() * 12.011e-18)
     tot_alk_meq = float((vol * alk_64).sum().item())
 
-    return {
+    out = {
         "ocean_npp_pgc_yr": intpp_pgc_yr,
         "ocean_fgco2_pgc_yr": fgco2_pgc_yr,
         "ocean_epc100_pgc_yr": epc100_pgc_yr,
@@ -837,3 +953,12 @@ def diagnose_ocean_bgc_metrics(bgc: OceanBGCState, ogcm, mesh) -> dict[str, floa
         "ocean_tot_dic_pgc": tot_dic_pgc,
         "ocean_tot_alk_meq": tot_alk_meq,
     }
+    if bgc.o2 is not None and bgc.o2_comp is not None:
+        o2_64 = bgc.o2.detach().cpu().to(torch.float64) + bgc.o2_comp.detach().cpu().to(torch.float64)
+        out["ocean_o2_global_mmol_m3"] = float((vol * o2_64).sum().item() / max(v_tot, 1.0))
+        omz_vol = float((vol * (o2_64 < O2_SUBOXIC_MMOL).to(torch.float64)).sum().item())
+        out["ocean_omz_vol_pct"] = 100.0 * omz_vol / max(v_tot, 1.0)
+        if bgc.denit_moln_m2s is not None:
+            den64 = bgc.denit_moln_m2s.detach().cpu().to(torch.float64)
+            out["ocean_denit_tgn_yr"] = float((area_ocn * den64).sum().item() * 0.014007 * C.DAYS_PER_YEAR * C.SECONDS_PER_DAY * 1.0e-9)
+    return out

@@ -90,7 +90,9 @@ def step_trace_gas_cycle(
     fire_c_kgc_m2s: torch.Tensor | None = None,
     n_denit_kgn_m2s: torch.Tensor | None = None,
     ocean_epc100_molc_m2s: torch.Tensor | None = None,
+    ocean_denit_moln_m2s: torch.Tensor | None = None,
     ocean_area_cell: torch.Tensor | None = None,
+    f_wetland_sub: torch.Tensor | None = None,
     mean_tco_du: float = 300.0,
 ) -> None:
     """Advance global prognostic CH4 & N2O mixing ratios via exact exponential integration (float64)."""
@@ -116,6 +118,11 @@ def step_trace_gas_cycle(
         if sat.shape[0] != rh64.shape[0]:
             sat = sat.unsqueeze(1).expand(a_host.shape[0], rh64.shape[0] // a_host.shape[0]).reshape(-1)
         anoxic = torch.clamp((sat - 0.65) / 0.35, 0.0, 1.0) ** 2
+        if f_wetland_sub is not None:
+            fw64 = torch.clamp(f_wetland_sub.detach().cpu().to(torch.float64), 0.0, 1.0)
+            if fw64.shape[0] != rh64.shape[0]:
+                fw64 = fw64.unsqueeze(1).expand(a_host.shape[0], rh64.shape[0] // a_host.shape[0]).reshape(-1)
+            anoxic = torch.clamp(0.5 * anoxic + 0.5 * fw64, 0.0, 1.0)
         # Convert kg C m^-2 s^-1 -> Tg CH4 yr^-1 (16.0425 / 12.011 = 1.3356)
         emis_wet_tg = float((rh64 * anoxic * a_lc).sum().item() * SEC_PER_YEAR * 1.0e-9 * CH4_WETLAND_FRAC * 1.3356)
     else:
@@ -162,6 +169,10 @@ def step_trace_gas_cycle(
         ao64 = ocean_area_cell.detach().cpu().to(torch.float64)
         # mol C m^-2 s^-1 * 0.012011 kg C / mol -> Tg C/yr * yield -> Tg N/yr
         emis_n2o_ocn = float((epc64 * ao64).sum().item() * 0.012011 * SEC_PER_YEAR * 1.0e-9 * N2O_OCEAN_EXPORT_YIELD)
+        if ocean_denit_moln_m2s is not None:
+            # OMZ anaerobic denitrification N2O hotspot (~3% N2O yield; Battaglia & Joos, 2018)
+            od64 = torch.clamp(ocean_denit_moln_m2s.detach().cpu().to(torch.float64), min=0.0)
+            emis_n2o_ocn += float((od64 * ao64).sum().item() * 0.014007 * SEC_PER_YEAR * 1.0e-9 * 0.030)
     else:
         emis_n2o_ocn = 3.8
 

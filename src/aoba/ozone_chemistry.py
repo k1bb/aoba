@@ -144,6 +144,8 @@ def step_prognostic_ozone(
     ecl_ppbv: float = 0.55,
     lnox_cell_kgn_m2s: torch.Tensor | None = None,
     fire_c_cell_kgc_m2s: torch.Tensor | None = None,
+    uv_j_o2_scale: float = 1.0,
+    volc_sad_um2_cm3: torch.Tensor | None = None,
 ) -> None:
     """Advance 3D prognostic ozone chemistry & dry deposition by one host timestep `dt` [s].
 
@@ -172,10 +174,13 @@ def step_prognostic_ozone(
             surf_ocean_id=int(SURF_OCEAN),
         )
         oz.o3_vmr = o3_new
-        oz.tco_du = tco_du
-        oz.o3_sfc_ppbv = o3_sfc
-        oz.o3_drydep_kgm2s = drydep
-        oz.o3_chem_net_kgm2s = chem_net
+        if volc_sad_um2_cm3 is not None or abs(float(uv_j_o2_scale) - 1.0) > 1.0e-5:
+            _apply_volcanic_solar_ozone_pert(oz, pres_c, temp_c, rho_d, dz_c, mu0, dt, ecl_ppbv, uv_j_o2_scale, volc_sad_um2_cm3)
+        else:
+            oz.tco_du = tco_du
+            oz.o3_sfc_ppbv = o3_sfc
+            oz.o3_drydep_kgm2s = drydep
+            oz.o3_chem_net_kgm2s = chem_net
         return
 
     nz, nc = pres_c.shape
@@ -326,10 +331,50 @@ def step_prognostic_ozone(
     chem_net_kgm2s = ((chi_new - chi0) * M_O3_OVER_AIR * dm).sum(dim=0) / max(dt, 1.0)
 
     oz.o3_vmr = chi_new
-    oz.tco_du = tco_du
-    oz.o3_sfc_ppbv = chi_new[0] * 1.0e9
-    oz.o3_drydep_kgm2s = drydep_kgm2s
-    oz.o3_chem_net_kgm2s = chem_net_kgm2s
+    if volc_sad_um2_cm3 is not None or abs(float(uv_j_o2_scale) - 1.0) > 1.0e-5:
+        _apply_volcanic_solar_ozone_pert(oz, pres_c, temp_c, rho_d, dz_c, mu0, dt, ecl_ppbv, uv_j_o2_scale, volc_sad_um2_cm3)
+    else:
+        oz.tco_du = tco_du
+        oz.o3_sfc_ppbv = chi_new[0] * 1.0e9
+        oz.o3_drydep_kgm2s = drydep_kgm2s
+        oz.o3_chem_net_kgm2s = chem_net_kgm2s
+
+
+def _apply_volcanic_solar_ozone_pert(
+    oz: PrognosticOzoneState,
+    pres_c: torch.Tensor,
+    temp_c: torch.Tensor,
+    rho_d: torch.Tensor,
+    dz_c: torch.Tensor,
+    mu0: torch.Tensor,
+    dt: float,
+    ecl_ppbv: float,
+    uv_j_o2_scale: float,
+    volc_sad_um2_cm3: torch.Tensor | None,
+) -> None:
+    """Apply volcanic sulfate heterogeneous O3 depletion & 11-yr solar UV modulation (exact exponential)."""
+    p_hpa = torch.clamp(pres_c * 0.01, min=0.1)
+    is_day = (mu0 > 1.0e-4).to(pres_c.dtype).unsqueeze(0)
+    chi = oz.o3_vmr
+    if volc_sad_um2_cm3 is not None:
+        # Volcanic sulfate heterogeneous halogen activation (Solomon et al., 1996, JGR):
+        # Accelerates ClOx/BrOx destruction on sunlit cold stratospheric sulfate surfaces (10-150 hPa).
+        ecl_fac = max(float(ecl_ppbv), 0.1) / ECL_REF_PPBV
+        p_win = torch.sigmoid((180.0 - p_hpa) / 20.0) * torch.sigmoid((p_hpa - 8.0) / 3.0)
+        t_cold = torch.sigmoid((215.0 - temp_c) / 6.0)
+        k_volc = (1.0 / (60.0 * C.SECONDS_PER_DAY)) * (ecl_fac * ecl_fac) * torch.clamp(volc_sad_um2_cm3 / 20.0, 0.0, 6.0) * is_day * p_win * t_cold
+        chi = chi * torch.exp(-torch.clamp(k_volc * float(dt), min=0.0, max=5.0))
+    if abs(float(uv_j_o2_scale) - 1.0) > 1.0e-5:
+        # 11-yr Schwabe UV modulation of upper-stratospheric Chapman O2 photolysis (1-30 hPa)
+        p_uv = torch.sigmoid((40.0 - p_hpa) / 8.0) * torch.sigmoid((p_hpa - 0.5) / 0.5)
+        k_uv = (float(uv_j_o2_scale) - 1.0) * (1.0 / (15.0 * C.SECONDS_PER_DAY)) * is_day * p_uv
+        chi = chi * torch.exp(torch.clamp(k_uv * float(dt), min=-0.2, max=0.2))
+    chi = torch.clamp(chi, min=1.0e-10, max=4.0e-5)
+    oz.o3_vmr = chi
+    dm = torch.clamp(rho_d * dz_c, min=1.0e-5)
+    dn_air = (dm / M_AIR_KG_MOLEC) * 1.0e-4
+    oz.tco_du = (chi * dn_air).sum(dim=0) / DU_MOLEC_CM2
+    oz.o3_sfc_ppbv = chi[0] * 1.0e9
 
 
 def diagnose_ozone_metrics(

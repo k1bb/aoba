@@ -1497,6 +1497,7 @@ def step_ogcm_voronoi(
     enable_scale_aware_gm: bool = True,
     enable_submeso: bool = True,
     enable_tidal_mixing: bool = True,
+    enable_o2_omz: bool = False,
 ) -> None:
     """Advance 3D SCVT Voronoi OGCM (`temp`, `sal`, `u_edge`, `eta`) & dynamic sea ice by `dt` [s].
 
@@ -1795,6 +1796,7 @@ def step_ogcm_voronoi(
             co2_ppmv=co2_ppmv,
             dt=dt,
             enable_full_redi=bool(ENABLE_FULL_REDI),
+            enable_o2_omz=bool(enable_o2_omz),
         )
 
     # 11. Dynamic Sea-Ice Drift (after recording thermodynamic mass change, so advection doesn't alias brine!)
