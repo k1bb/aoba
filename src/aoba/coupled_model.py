@@ -186,6 +186,8 @@ class AOBAState:
     co2_series: CO2ForcingSeries | None = None
     o3_provider: OzoneForcingProvider | None = None
     q_conv_diag: torch.Tensor | None = None  # Previous-step 1:1 CRM convective heating [Nz, N_cells] [K s^-1]
+    last_sfc_diag_sub: SurfaceFluxDiagnostics | None = None  # Zero-copy ref for optional CMIP7 diagnostics
+    last_s_toa: torch.Tensor | None = None                   # Zero-copy ref for TOA incident SW (`rsdt`)
 
     def current_co2_ppmv(self, sim_time_sec: float | None = None) -> float:
         """Return active atmospheric CO2 [ppmv] at ``sim_time_sec`` (or ``self.sim_time_sec``)."""
@@ -1292,6 +1294,8 @@ def step_aoba_model(
     model.rad_cache["evap"] = evap_cell
     model.rad_cache["shf"] = shf_cell
     model.rad_cache["gpp"] = gpp_cell
+    model.last_sfc_diag_sub = sfc_diag_sub
+    model.last_s_toa = s_toa
 
     # 8. Subgrid Solar Noon EEO Acclimation, Daily LAI/Root Phenology, Host Sync, & Monthly Köppen
     rho_post_0 = crm.rho_d[0].reshape(m_sub)

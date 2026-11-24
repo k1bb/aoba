@@ -90,6 +90,9 @@ snapshots_include_3d = true
 snapshots_include_subgrid_2d = true
 restart_interval_years = 1
 restart_monthly = true
+cmip7_output_enabled = false
+cmip7_include_plev19 = true
+cmip7_include_ocean_3d = true
 
 # --- Fundamental Physical & Planetary Constants ---
 [constants]

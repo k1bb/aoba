@@ -54,6 +54,9 @@ class OutputConfig:
     snapshots_include_subgrid_2d: bool = True
     restart_interval_years: int = 1
     restart_monthly: bool = True                # Save mid-year restart checkpoint at end of each month
+    cmip7_output_enabled: bool = False          # Optional CMIP7 Data Request v1.2 ESM-BCV monthly Zarr stream (off during spin-up)
+    cmip7_include_plev19: bool = True           # Include 3D atmospheric variables interpolated to CMIP7 plev19
+    cmip7_include_ocean_3d: bool = True         # Include 3D ocean variables on model z-levels (olevel)
 
 
 # Module mapping for `[section]` -> `(module_obj, module_attr_name)`

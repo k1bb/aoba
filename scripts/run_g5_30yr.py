@@ -37,6 +37,7 @@ from aoba.io_zarr import (
     export_scvt_mesh_xarray,
     save_zarr,
 )
+from aoba.cmip7_diag import CMIP7MonthlyAccumulator, export_cmip7_fx_xarray
 from aoba.ocean_ogcm import diagnose_ocean_spinup_metrics
 from aoba.params import (
     OutputConfig,
@@ -597,6 +598,7 @@ def main() -> None:
     parser.add_argument("--icesheet-accel", type=float, default=None)
     parser.add_argument("--icesheet-accel-spinup-years", type=float, default=None)
     parser.add_argument("--icesheet-isostasy-tau-yr", type=float, default=None)
+    parser.add_argument("--cmip7-output", action="store_true", default=None, help="Enable CMIP7 Data Request v1.2 ESM-BCV monthly Zarr stream")
     args = parser.parse_args()
 
     if args.config:
@@ -626,6 +628,8 @@ def main() -> None:
         cfg.icesheet_accel_spinup_years = args.icesheet_accel_spinup_years
     if args.icesheet_isostasy_tau_yr is not None:
         cfg.icesheet_isostasy_tau_yr = args.icesheet_isostasy_tau_yr
+    if args.cmip7_output is not None:
+        out_cfg.cmip7_output_enabled = bool(args.cmip7_output)
 
     years = args.years if args.years is not None else out_cfg.years
     days_per_year = args.days_per_year if args.days_per_year is not None else out_cfg.days_per_year
@@ -660,6 +664,17 @@ def main() -> None:
     mesh_zarr = out_root / "mesh.zarr"
     if not mesh_zarr.exists():
         save_zarr(export_scvt_mesh_xarray(model), mesh_zarr, overwrite=True)
+
+    cmip7_enabled = bool(getattr(out_cfg, "cmip7_output_enabled", False))
+    cmip7_acc: CMIP7MonthlyAccumulator | None = None
+    if cmip7_enabled:
+        cmip7_fx_zarr = out_root / "cmip7_fx.zarr"
+        if not cmip7_fx_zarr.exists():
+            save_zarr(export_cmip7_fx_xarray(model), cmip7_fx_zarr, overwrite=True)
+        cmip7_acc = CMIP7MonthlyAccumulator(
+            include_plev19=bool(getattr(out_cfg, "cmip7_include_plev19", True)),
+            include_ocean_3d=bool(getattr(out_cfg, "cmip7_include_ocean_3d", True)),
+        )
 
     start_year = 1
     resume_step_in_yr = 0
@@ -699,6 +714,8 @@ def main() -> None:
                     resume_m_sums = {k: v.to(device=dev) for k, v in raw_msums.items()}
                     resume_mon_accum = ckpt_mid.get("resume_mon_accum", None)
                     resume_mon_cnt = int(ckpt_mid.get("resume_mon_cnt", 0))
+                    if cmip7_acc is not None and ckpt_mid.get("resume_cmip7_state") is not None:
+                        cmip7_acc.load_state_dict(ckpt_mid["resume_cmip7_state"], dev)
                 break
 
     # Continuous ocean + coupled spin-up monitor CSV across all years & restarts
@@ -806,13 +823,14 @@ def main() -> None:
         y_dir.mkdir(parents=True, exist_ok=True)
         monthly_zarr = (out_root / "monthly.zarr") if single_partition else (y_dir / "monthly.zarr")
         snap_zarr = (out_root / "snapshots.zarr") if single_partition else (y_dir / "snapshots.zarr")
+        cmip7_zarr = (out_root / "cmip7_monthly.zarr") if single_partition else (y_dir / "cmip7_monthly.zarr")
         csv_path = y_dir / "daily_global.csv"
 
         is_mid_resume = (year == start_year and resume_step_in_yr > 0)
 
         # Clean partial current-year Zarr only in yearly-partition mode when starting year fresh
         if not single_partition and not is_mid_resume:
-            for p in (monthly_zarr, snap_zarr):
+            for p in (monthly_zarr, snap_zarr, cmip7_zarr):
                 if p.exists():
                     shutil.rmtree(p)
 
@@ -894,6 +912,11 @@ def main() -> None:
             mon_accum["lai"] += diag.land_mean_lai
             mon_accum["ice"] += diag.seaice_area_million_km2
             mon_cnt += 1
+            if cmip7_acc is not None:
+                cmip7_acc.update_step_extrema(
+                    model,
+                    end_of_day=(step_in_yr % steps_per_day == 0 or step_in_yr == steps_per_year),
+                )
 
             # Accumulate 1-hour-mean 2D preview fields on device
             _, _, temp0_p = diagnose_pressure_temperature(
@@ -1006,6 +1029,8 @@ def main() -> None:
                         else:
                             m_sums[k] = v.clone()
                 m_cnt += 1
+                if cmip7_acc is not None:
+                    cmip7_acc.sample(model)
 
             if step_in_yr % csv_stride_steps == 0 or step_in_yr == steps_per_year:
                 synchronize_device(dev)
@@ -1112,6 +1137,9 @@ def main() -> None:
                 for k in mon_accum:
                     mon_accum[k] = 0.0
                 mon_cnt = 0
+                if cmip7_acc is not None and cmip7_acc.sample_count > 0:
+                    append_zarr(cmip7_acc.to_xarray(model), cmip7_zarr)
+                    cmip7_acc.reset()
                 m_sums.clear()
                 m_cnt = 0
                 m_idx += 1
@@ -1146,6 +1174,7 @@ def main() -> None:
                         "resume_mon_cnt": mon_cnt,
                         "prev_ohc_j": prev_ohc_j,
                         "prev_ohc_time_sec": prev_ohc_time_sec,
+                        "resume_cmip7_state": cmip7_acc.state_dict_cpu() if cmip7_acc is not None else None,
                     },
                 )
                 print(f"[Saved mid-year restart at {diag.date_str} (step {step_in_yr}/{steps_per_year})]", flush=True)
