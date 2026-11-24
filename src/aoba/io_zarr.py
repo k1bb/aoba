@@ -172,15 +172,18 @@ def export_aoba_snapshot_xarray(
             "koppen_code": (("time", "n_cell"), _c1(kg30), {"long_name": "Beck et al. (2018) 1..30 class"}),
             "koppen_major": (("time", "n_cell"), _c1(kg5), {"long_name": "1=A, 2=B, 3=C, 4=D, 5=E"}),
         })
+        if model.ozone is not None:
+            data_vars["o3_tco_du"] = (("time", "n_cell"), _c1(model.ozone.tco_du), {"units": "DU"})
         if model.icesheet is not None:
             data_vars["h_ice"] = (("time", "n_cell"), _c1(model.icesheet.h_ice), {"units": "m"})
             data_vars["z_topo_dyn"] = (("time", "n_cell"), _c1(mesh.z_topo), {"units": "m"})
         if model.ogcm is not None:
             og = model.ogcm
-            data_vars["ocn_eta"] = (("time", "n_cell"), _c1(og.eta), {"units": "m"})
-            data_vars["ocn_sss"] = (("time", "n_cell"), _c1(og.sal[0]), {"units": "psu"})
+            ocn_dim = "n_cell_ocn" if model.ocn_mesh is not None else "n_cell"
+            data_vars["ocn_eta"] = (("time", ocn_dim), _c1(og.eta), {"units": "m"})
+            data_vars["ocn_sss"] = (("time", ocn_dim), _c1(og.sal[0]), {"units": "psu"})
             if og.h_bl is not None:
-                data_vars["ocn_h_bl"] = (("time", "n_cell"), _c1(og.h_bl), {"units": "m"})
+                data_vars["ocn_h_bl"] = (("time", ocn_dim), _c1(og.h_bl), {"units": "m"})
     if include_3d:
         u_c, v_c = reconstruct_cell_winds(mesh, atmos.u_edge)
         pres_c, _, temp_c = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
@@ -191,16 +194,20 @@ def export_aoba_snapshot_xarray(
             "u_zonal": (("time", "nz", "n_cell"), _c2(u_c), {"units": "m s-1"}),
             "v_merid": (("time", "nz", "n_cell"), _c2(v_c), {"units": "m s-1"}),
         })
+        if model.ozone is not None:
+            data_vars["o3_vmr"] = (("time", "nz", "n_cell"), _c2(model.ozone.o3_vmr), {"units": "mol mol-1"})
         if model.ogcm is not None:
             og = model.ogcm
-            uo_c, vo_c = reconstruct_cell_winds(mesh, og.u_edge * og.wet_e.to(og.u_edge.dtype))
+            ocn_mesh_z = model.ocn_mesh if model.ocn_mesh is not None else mesh
+            ocn_dim = "n_cell_ocn" if model.ocn_mesh is not None else "n_cell"
+            uo_c, vo_c = reconstruct_cell_winds(ocn_mesh_z, og.u_edge * og.wet_e.to(og.u_edge.dtype))
             wo_c = 0.5 * (og.w_vel[:-1] + og.w_vel[1:])
             data_vars.update({
-                "ocn_temp": (("time", "nz_ocn", "n_cell"), _c2(og.temp), {"units": "K"}),
-                "ocn_sal": (("time", "nz_ocn", "n_cell"), _c2(og.sal), {"units": "psu"}),
-                "ocn_u_zonal": (("time", "nz_ocn", "n_cell"), _c2(uo_c), {"units": "m s-1"}),
-                "ocn_v_merid": (("time", "nz_ocn", "n_cell"), _c2(vo_c), {"units": "m s-1"}),
-                "ocn_w_vel": (("time", "nz_ocn", "n_cell"), _c2(wo_c), {"units": "m s-1"}),
+                "ocn_temp": (("time", "nz_ocn", ocn_dim), _c2(og.temp), {"units": "K"}),
+                "ocn_sal": (("time", "nz_ocn", ocn_dim), _c2(og.sal), {"units": "psu"}),
+                "ocn_u_zonal": (("time", "nz_ocn", ocn_dim), _c2(uo_c), {"units": "m s-1"}),
+                "ocn_v_merid": (("time", "nz_ocn", ocn_dim), _c2(vo_c), {"units": "m s-1"}),
+                "ocn_w_vel": (("time", "nz_ocn", ocn_dim), _c2(wo_c), {"units": "m s-1"}),
             })
     if include_subgrid_2d:
         for k, (val, unit) in diagnose_subgrid_2d_fields(model).items():
@@ -211,6 +218,9 @@ def export_aoba_snapshot_xarray(
         "lat_cell": ("n_cell", lat_deg, {"units": "degrees_north", "standard_name": "latitude"}),
         "lon_cell": ("n_cell", lon_deg, {"units": "degrees_east", "standard_name": "longitude"}),
     }
+    if model.ocn_mesh is not None:
+        coords["lat_cell_ocn"] = ("n_cell_ocn", np.rad2deg(model.ocn_mesh.lat_cell.detach().cpu().numpy()), {"units": "degrees_north"})
+        coords["lon_cell_ocn"] = ("n_cell_ocn", np.rad2deg(model.ocn_mesh.lon_cell.detach().cpu().numpy()), {"units": "degrees_east"})
     if include_3d:
         coords["nz"] = ("nz", model.vgrid.zeta_c.detach().cpu().numpy(), {"units": "m", "positive": "up"})
         if model.ogcm is not None:
@@ -271,11 +281,16 @@ def export_scvt_mesh_xarray(model: "AOBAState") -> xr.Dataset:
         data_vars["z_bed"] = (("n_cell",), mesh.z_bed.detach().cpu().numpy(), {"units": "m"})
     if model.ogcm is not None:
         og = model.ogcm
-        data_vars["ocn_h_c"] = (("nz_ocn", "n_cell"), og.h_c.detach().cpu().numpy(), {"units": "m"})
-        data_vars["ocn_h_col"] = (("n_cell",), og.h_col.detach().cpu().numpy(), {"units": "m"})
-        data_vars["ocn_wet_c"] = (("nz_ocn", "n_cell"), og.wet_c.detach().cpu().numpy().astype(np.int8))
+        ocn_dim = "n_cell_ocn" if model.ocn_mesh is not None else "n_cell"
+        data_vars["ocn_h_c"] = (("nz_ocn", ocn_dim), og.h_c.detach().cpu().numpy(), {"units": "m"})
+        data_vars["ocn_h_col"] = ((ocn_dim,), og.h_col.detach().cpu().numpy(), {"units": "m"})
+        data_vars["ocn_wet_c"] = (("nz_ocn", ocn_dim), og.wet_c.detach().cpu().numpy().astype(np.int8))
         coords["nz_ocn"] = ("nz_ocn", og.z_c.detach().cpu().numpy(), {"units": "m", "positive": "down"})
         coords["nz_ocn_w"] = ("nz_ocn_w", og.z_w.detach().cpu().numpy(), {"units": "m", "positive": "down"})
+        if model.ocn_mesh is not None:
+            data_vars["area_cell_ocn"] = (("n_cell_ocn",), model.ocn_mesh.area_cell.detach().cpu().numpy(), {"units": "m2"})
+            coords["lat_cell_ocn"] = ("n_cell_ocn", np.rad2deg(model.ocn_mesh.lat_cell.detach().cpu().numpy()), {"units": "degrees_north"})
+            coords["lon_cell_ocn"] = ("n_cell_ocn", np.rad2deg(model.ocn_mesh.lon_cell.detach().cpu().numpy()), {"units": "degrees_east"})
 
     return xr.Dataset(
         data_vars=data_vars,
