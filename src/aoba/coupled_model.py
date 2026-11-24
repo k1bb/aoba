@@ -101,6 +101,7 @@ class AOBAConfig:
     enable_land_carbon: bool = False         # Enable A2 map-free terrestrial C cycle, permafrost C, & SPITFIRE fire (opt-in)
     enable_seaice_evp_itd: bool = False      # Enable A3 MPAS-Seaice Voronoi EVP rheology + 5-category ITD (opt-in)
     enable_ogcm_fct_zstar: bool = False      # Enable A4 FESOM2-style 3D Zalesak FCT advection + exact z* coord (opt-in)
+    enable_natural_aerosols: bool = False    # Enable A5 map-free sea-salt, marine DMS SO4, & wildfire BC/OC (opt-in)
     re_liq_um: float = 10.0                  # Fallback/1M cloud liquid droplet effective radius [um]
     re_ice_um: float = 48.0                  # Fallback/1M cloud ice crystal effective radius [um]
     cloud_sw_inhomog: float = 0.65           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
@@ -186,6 +187,7 @@ class AOBAState:
     icesheet: IceSheetState | None = None
     river: object | None = None
     land_carbon: object | None = None
+    aerosols: object | None = None
     sim_time_sec: float = 0.0
     step_count: int = 0
     rad_cache: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -583,6 +585,13 @@ def init_aoba_model(
                 sfc.surf_type, sfc.bio.lai, sfc.bio.h_canopy, device=dev
             )
             if bool(cfg.enable_land_carbon)
+            else None
+        ),
+        aerosols=(
+            __import__("aoba.aerosols", fromlist=["init_natural_aerosol_state"]).init_natural_aerosol_state(
+                nz, nc, device=dev, dtype=atmos.q_n.dtype
+            )
+            if bool(cfg.enable_natural_aerosols)
             else None
         ),
         calendar=AobaCalendar(
@@ -1134,21 +1143,28 @@ def step_aoba_model(
     m_new_host = atmos.rho_d * atmos.dz_c
     uh_mean = uh_acc * inv_nh
     om_mean = om_acc * inv_nh
-    if cfg.enable_dust and atmos.q_dust is not None:
-        q_adv = fct_advect_scvt_batch(
-            mesh, torch.stack([atmos.q_n, atmos.q_p, atmos.q_dust], dim=0),
-            m_old_host, m_new_host, uh_mean, om_mean, dt,
-        )
-        atmos.q_n = q_adv[0]
-        atmos.q_p = q_adv[1]
-        atmos.q_dust = q_adv[2]
-    else:
-        q_adv = fct_advect_scvt_batch(
-            mesh, torch.stack([atmos.q_n, atmos.q_p], dim=0),
-            m_old_host, m_new_host, uh_mean, om_mean, dt,
-        )
-        atmos.q_n = q_adv[0]
-        atmos.q_p = q_adv[1]
+    adv_list = [atmos.q_n, atmos.q_p]
+    has_dust_adv = bool(cfg.enable_dust and atmos.q_dust is not None)
+    if has_dust_adv:
+        adv_list.append(atmos.q_dust)
+    has_aero_adv = bool(cfg.enable_natural_aerosols and model.aerosols is not None)
+    if has_aero_adv:
+        adv_list.extend([model.aerosols.q_ss, model.aerosols.q_so4, model.aerosols.q_bc, model.aerosols.q_oc])
+    q_adv = fct_advect_scvt_batch(
+        mesh, torch.stack(adv_list, dim=0),
+        m_old_host, m_new_host, uh_mean, om_mean, dt,
+    )
+    atmos.q_n = q_adv[0]
+    atmos.q_p = q_adv[1]
+    idx_q = 2
+    if has_dust_adv:
+        atmos.q_dust = q_adv[idx_q]
+        idx_q += 1
+    if has_aero_adv:
+        model.aerosols.q_ss = q_adv[idx_q]
+        model.aerosols.q_so4 = q_adv[idx_q + 1]
+        model.aerosols.q_bc = q_adv[idx_q + 2]
+        model.aerosols.q_oc = q_adv[idx_q + 3]
 
     dthm_ls = (atmos.theta_m - thm_before_dyn) / dt
     dqn_ls = (atmos.q_n - qn_before_dyn) / dt
@@ -1450,6 +1466,32 @@ def step_aoba_model(
             u10_ms=_sub_to_cell(torch.hypot(u_sub_0, v_sub_0), nc, n_sub),
             precip_kgm2s=precip_tot,
             dt=dt,
+        )
+    if bool(cfg.enable_natural_aerosols):
+        from aoba.aerosols import init_natural_aerosol_state, step_natural_aerosols_column
+
+        if model.aerosols is None:
+            model.aerosols = init_natural_aerosol_state(nz, nc, device=atmos.q_n.device, dtype=atmos.q_n.dtype)
+        chl_sfc = (
+            model.ogcm.bgc.chl[0]
+            if (model.ogcm is not None and model.ogcm.bgc is not None)
+            else None
+        )
+        fire_bc = model.land_carbon.fire_bc_kg_m2s if model.land_carbon is not None else None
+        fire_oc = model.land_carbon.fire_oc_kg_m2s if model.land_carbon is not None else None
+        step_natural_aerosols_column(
+            aero=model.aerosols,
+            rho_d=atmos.rho_d,
+            dz_c=atmos.dz_c,
+            surf_type=sfc.surf_type,
+            sst_k=sfc.t_ocean_ml,
+            u10_ms=_sub_to_cell(torch.hypot(u_sub_0, v_sub_0), nc, n_sub),
+            f_seaice=f_seaice_cell,
+            precip_rate=precip_tot,
+            dt=dt,
+            chl_sfc_mg_m3=chl_sfc,
+            fire_bc_kg_m2s=fire_bc,
+            fire_oc_kg_m2s=fire_oc,
         )
     month_idx = model.calendar.date_at(model.sim_time_sec).month - 1
     clim.month_temp_sum_c[month_idx] += (t_air - C.T_FREEZE)

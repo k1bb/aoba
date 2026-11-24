@@ -60,6 +60,7 @@ enable_river_routing = false
 enable_land_carbon = false
 enable_seaice_evp_itd = false
 enable_ogcm_fct_zstar = false
+enable_natural_aerosols = false
 re_liq_um = 10.0
 re_ice_um = 48.0
 cloud_sw_inhomog = 0.65
