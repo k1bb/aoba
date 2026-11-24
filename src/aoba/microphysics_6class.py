@@ -29,6 +29,7 @@ import math
 import torch
 
 from aoba import constants as C
+from aoba.kernels import can_use_crm_metal, dispatch_microphysics_6class_metal
 from aoba.microphysics import (
     CCN_DUST_SCALE_CM3,
     CCN_LAND_BASE_CM3,
@@ -122,6 +123,33 @@ def step_microphysics_six_class_2m(
 
     Returns `(theta_m, q_v, q_c, q_i, q_r, q_s, q_g, n_c, n_i, n_r, n_s, n_g, precip_rain, precip_snow)`.
     """
+    if can_use_crm_metal(rho_d) and rho_d.numel() > 0:
+        return dispatch_microphysics_6class_metal(
+            rho_d=rho_d,
+            theta_m=theta_m,
+            q_v=q_v,
+            q_c=q_c,
+            q_i=q_i,
+            q_r=q_r,
+            q_s=q_s,
+            q_g=q_g,
+            n_c=n_c,
+            n_i=n_i,
+            n_r=n_r,
+            n_s=n_s,
+            n_g=n_g,
+            dz_c=dz_c,
+            dt=dt,
+            is_ocean_sub=is_ocean_sub,
+            u_sfc_sub=u_sfc_sub,
+            q_dust_sub=q_dust_sub,
+            ccn_aero_sub=ccn_aero_sub,
+            ccn_ocean_cm3=CCN_OCEAN_BASE_CM3,
+            ccn_land_cm3=CCN_LAND_BASE_CM3,
+            ccn_dust_scale_cm3=CCN_DUST_SCALE_CM3,
+            inp_dust_enhance=INP_DUST_ENHANCE,
+        )
+
     nz, nc, ny, nx = rho_d.shape
     dtype = rho_d.dtype
     dz_4d = dz_c.view(nz, nc, 1, 1) if dz_c.ndim == 2 else dz_c.view(nz, 1, 1, 1)

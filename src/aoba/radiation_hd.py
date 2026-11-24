@@ -28,6 +28,7 @@ import math
 import torch
 
 from aoba import constants as C
+from aoba.kernels import can_use_crm_metal, dispatch_rad_ckd_hd_metal
 from aoba.radiation import RadiationOutput, background_ozone_vmr, toon_two_stream_sw
 from aoba.radiation_ckd import (
     CH4_PREIND_PPMV,
@@ -83,49 +84,40 @@ def apply_3d_tica_cloud_shift(
     nx: int,
     crm_dx: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Shift 3D CRM clouds horizontally along the solar slant beam (Várnai & Davies, 1999 TICA).
+    """Shift 3D CRM clouds horizontally along the local solar slant beam (Várnai & Davies, 1999 TICA).
 
-    Strictly conserves parent-cell cloud mass (`sum_{y,x}`) via periodic `torch.roll` across
-    height-stratified altitude slabs (zero per-column loops!).
+    Strictly conserves parent-cell cloud mass (`sum_{y,x}`) via a bijective periodic permutation
+    gather across `(ny, nx)` using each column's local `tan(theta_z)` with ZERO CPU-GPU syncs.
     """
     if ny * nx <= 1:
         return qc_sub, qi_sub
     nz = qc_sub.shape[0]
-    qc4 = qc_sub.reshape(nz, nc, ny, nx).clone()
-    qi4 = qi_sub.reshape(nz, nc, ny, nx).clone()
+    dev = qc_sub.device
 
-    # Global mean daytime zenith tangent & east-west solar direction across sunlit columns
-    sun_mask = mu0_cell > 0.08
-    if not bool(sun_mask.any()):
-        return qc_sub, qi_sub
-    mu_mean = float(mu0_cell[sun_mask].mean().clamp(0.15, 0.99).item())
-    tan_th = min(math.sqrt(max(1.0 - mu_mean * mu_mean, 0.0)) / mu_mean, 2.5)
-    z_1d = z_rel_c.mean(dim=1) if z_rel_c.ndim == 2 else z_rel_c
-    # Eastward (+x) vs westward (-x) shift according to solar hour angle sign (afternoon vs morning)
-    east_sign = torch.where(hour_angle_cell >= 0.0, torch.ones_like(hour_angle_cell), -torch.ones_like(hour_angle_cell))
-    is_east = (east_sign > 0.0).view(1, nc, 1, 1)
+    mu_safe = torch.clamp(mu0_cell, min=0.15, max=1.0)
+    tan_th = torch.where(
+        mu0_cell > 0.08,
+        torch.clamp(torch.sqrt(torch.clamp(1.0 - mu_safe * mu_safe, min=0.0)) / mu_safe, 0.0, 2.5),
+        torch.zeros_like(mu0_cell),
+    )
+    dir_sign = torch.where(hour_angle_cell >= 0.0, torch.ones_like(hour_angle_cell, dtype=torch.long), -torch.ones_like(hour_angle_cell, dtype=torch.long))
+    z_2d = z_rel_c if z_rel_c.ndim == 2 else z_rel_c.unsqueeze(1)
+    k_shift = torch.clamp(torch.round(z_2d * tan_th.unsqueeze(0) / max(float(crm_dx), 100.0)).to(torch.long), 0, 3)
 
-    # Apply integer subcolumn shifts across 4 vertical altitude tiers (periodic roll conserves total cloud mass)
-    for k_shift in (1, 2, 3):
-        z_lo = (k_shift - 0.5) * crm_dx / max(tan_th, 0.2)
-        z_hi = (k_shift + 0.5) * crm_dx / max(tan_th, 0.2) if k_shift < 3 else 1.0e9
-        kmask = (z_1d >= z_lo) & (z_1d < z_hi)
-        if bool(kmask.any()):
-            qc_sl = qc4[kmask]
-            qi_sl = qi4[kmask]
-            qc_pos = torch.roll(qc_sl, shifts=k_shift % nx, dims=-1)
-            qc_neg = torch.roll(qc_sl, shifts=-(k_shift % nx), dims=-1)
-            qi_pos = torch.roll(qi_sl, shifts=k_shift % nx, dims=-1)
-            qi_neg = torch.roll(qi_sl, shifts=-(k_shift % nx), dims=-1)
-            if ny > 1:
-                qc_pos = torch.roll(qc_pos, shifts=(k_shift // 2) % ny, dims=-2)
-                qc_neg = torch.roll(qc_neg, shifts=-(k_shift // 2) % ny, dims=-2)
-                qi_pos = torch.roll(qi_pos, shifts=(k_shift // 2) % ny, dims=-2)
-                qi_neg = torch.roll(qi_neg, shifts=-(k_shift // 2) % ny, dims=-2)
-            qc4[kmask] = torch.where(is_east, qc_pos, qc_neg)
-            qi4[kmask] = torch.where(is_east, qi_pos, qi_neg)
+    sx = (dir_sign.unsqueeze(0) * k_shift).view(nz, nc, 1, 1)
+    ix = torch.arange(nx, device=dev, dtype=torch.long).view(1, 1, 1, nx)
+    src_x = torch.remainder(ix - sx, nx)
+    if ny > 1:
+        sy = (dir_sign.unsqueeze(0) * torch.div(k_shift, 2, rounding_mode="floor")).view(nz, nc, 1, 1)
+        iy = torch.arange(ny, device=dev, dtype=torch.long).view(1, 1, ny, 1)
+        src_y = torch.remainder(iy - sy, ny)
+    else:
+        src_y = torch.zeros((nz, nc, 1, nx), device=dev, dtype=torch.long)
 
-    return qc4.reshape(nz, nc * ny * nx), qi4.reshape(nz, nc * ny * nx)
+    src_flat = (src_y * nx + src_x).reshape(nz, nc, ny * nx)
+    qc_out = torch.gather(qc_sub.reshape(nz, nc, ny * nx), 2, src_flat).reshape(nz, nc * ny * nx)
+    qi_out = torch.gather(qi_sub.reshape(nz, nc, ny * nx), 2, src_flat).reshape(nz, nc * ny * nx)
+    return qc_out, qi_out
 
 
 def apply_aerosol_rad_delta(
@@ -306,6 +298,58 @@ def compute_ckd_hd_radiation(
     aero_opt: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> RadiationOutput:
     """Evaluate 111-g-point (72 LW + 39 SW) MSTRN11-class CKD solver with LW cloud scattering & full aerosols."""
+    if can_use_crm_metal(pres_c) and t_sfc.numel() > 0:
+        sw_up, sw_dn, lw_up, lw_dn, q_rad_3d, sfc_out = dispatch_rad_ckd_hd_metal(
+            pres_c=pres_c,
+            pres_w=pres_w,
+            temp_c=temp_c,
+            temp_w=temp_w,
+            dz_c=dz_c,
+            rho_d_c=rho_d_c,
+            qv_c=qv_c,
+            qc_c=qc_c,
+            qi_c=qi_c,
+            t_sfc=t_sfc,
+            albedo_vis=albedo_vis,
+            albedo_nir=albedo_nir,
+            mu0=mu0,
+            s_toa=s_toa,
+            co2_ppmv=co2_ppmv,
+            ch4_ppmv=ch4_ppmv,
+            n2o_ppmv=n2o_ppmv,
+            emiss_sfc=emiss_sfc,
+            re_liq_um=re_liq_um,
+            re_ice_um=re_ice_um,
+            cloud_sw_inhomog=cloud_sw_inhomog,
+            albedo_vis_dif=albedo_vis_dif,
+            albedo_nir_dif=albedo_nir_dif,
+            q_dust_c=q_dust_c,
+            o3_vmr_c=o3_vmr_c,
+            o3_lw_coupling=o3_lw_coupling,
+            aero_opt=aero_opt,
+        )
+        sfc_par = sfc_out[4]
+        return RadiationOutput(
+            sw_flux_up=sw_up,
+            sw_flux_dn=sw_dn,
+            lw_flux_up=lw_up,
+            lw_flux_dn=lw_dn,
+            q_rad_sw=q_rad_3d[0],
+            q_rad_lw=q_rad_3d[1],
+            q_rad_net=q_rad_3d[2],
+            toa_insolation=sw_dn[-1],
+            toa_asr=sw_dn[-1] - sw_up[-1],
+            toa_olr=lw_up[-1],
+            sfc_sw_net=sw_dn[0] - sw_up[0],
+            sfc_lw_net=lw_dn[0] - lw_up[0],
+            sfc_par_wm2=sfc_par,
+            sfc_ppfd=C.UMOL_PER_JOULE_PAR * sfc_par,
+            sfc_sw1_dir_dn=sfc_out[0],
+            sfc_sw1_dif_dn=sfc_out[1],
+            sfc_sw2_dir_dn=sfc_out[2],
+            sfc_sw2_dif_dn=sfc_out[3],
+        )
+
     p_c = torch.flip(pres_c, dims=[0])
     p_w = torch.flip(pres_w, dims=[0])
     t_c = torch.flip(temp_c, dims=[0])

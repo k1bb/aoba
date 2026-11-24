@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from aoba import constants as C
+from aoba.kernels import can_use_crm_metal, dispatch_rad_rrtmgp_metal
 from aoba.radiation import RadiationOutput, background_ozone_vmr, toon_two_stream_sw
 from aoba.radiation_ckd import CH4_PREIND_PPMV, N2O_PREIND_PPMV
 
@@ -468,6 +469,58 @@ def compute_rrtmgp_radiation(
     dev = pres_c.device
     dtype = pres_c.dtype
     tabs = get_rrtmgp_tables(dev)
+
+    if can_use_crm_metal(pres_c) and M_tot > 0:
+        sw_up, sw_dn, lw_up, lw_dn, q_sw, q_lw, sfc_out = dispatch_rad_rrtmgp_metal(
+            tabs=tabs,
+            pres_c=pres_c,
+            temp_c=temp_c,
+            temp_w=temp_w,
+            dz_c=dz_c,
+            rho_d_c=rho_d_c,
+            qv_c=qv_c,
+            qc_c=qc_c,
+            qi_c=qi_c,
+            t_sfc=t_sfc,
+            albedo_vis=albedo_vis,
+            albedo_nir=albedo_nir,
+            mu0=mu0,
+            s_toa=s_toa,
+            co2_ppmv=co2_ppmv,
+            ch4_ppmv=ch4_ppmv,
+            n2o_ppmv=n2o_ppmv,
+            emiss_sfc=emiss_sfc,
+            re_liq_um=re_liq_um,
+            re_ice_um=re_ice_um,
+            cloud_sw_inhomog=cloud_sw_inhomog,
+            albedo_vis_dif=albedo_vis_dif,
+            albedo_nir_dif=albedo_nir_dif,
+            q_dust_c=q_dust_c,
+            o3_vmr_c=o3_vmr_c,
+            o3_lw_coupling=o3_lw_coupling,
+            aero_opt=aero_opt,
+        )
+        sfc_par = sfc_out[4]
+        return RadiationOutput(
+            sw_flux_up=sw_up,
+            sw_flux_dn=sw_dn,
+            lw_flux_up=lw_up,
+            lw_flux_dn=lw_dn,
+            q_rad_sw=q_sw,
+            q_rad_lw=q_lw,
+            q_rad_net=q_sw + q_lw,
+            toa_insolation=sw_dn[-1],
+            toa_asr=sw_dn[-1] - sw_up[-1],
+            toa_olr=lw_up[-1],
+            sfc_sw_net=sw_dn[0] - sw_up[0],
+            sfc_lw_net=lw_dn[0] - lw_up[0],
+            sfc_par_wm2=sfc_par,
+            sfc_ppfd=C.UMOL_PER_JOULE_PAR * sfc_par,
+            sfc_sw1_dir_dn=sfc_out[0],
+            sfc_sw1_dif_dn=sfc_out[1],
+            sfc_sw2_dir_dn=sfc_out[2],
+            sfc_sw2_dif_dn=sfc_out[3],
+        )
 
     # Flatten column dimensions to [N, M_tot] and flip to top-down [0 = TOA, N-1 = surface]
     p_c_all = torch.flip(pres_c.reshape(N, M_tot), dims=[0])

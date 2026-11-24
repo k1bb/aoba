@@ -45,6 +45,7 @@ import math
 import torch
 
 from aoba import constants as C
+from aoba.kernels import can_use_crm_metal, dispatch_ozone_chem_metal
 from aoba.radiation import background_ozone_vmr
 from aoba.surface import SURF_LAND, SURF_OCEAN
 
@@ -149,6 +150,34 @@ def step_prognostic_ozone(
     Uses exact Riccati-exponential integration (unconditionally stable, positivity-preserving,
     zero Forward Euler, zero GPU-starving Python loops).
     """
+    if can_use_crm_metal(pres_c) and pres_c.numel() > 0:
+        o3_new, tco_du, o3_sfc, drydep, chem_net = dispatch_ozone_chem_metal(
+            o3_vmr=oz.o3_vmr,
+            pres_c=pres_c,
+            temp_c=temp_c,
+            rho_d=rho_d,
+            dz_c=dz_c,
+            q_v=q_v,
+            mu0=mu0,
+            surf_type=surf_type,
+            lai_cell=lai_cell,
+            f_snow_cell=f_snow_cell,
+            dt=dt,
+            n2o_ppmv=n2o_ppmv,
+            ch4_ppmv=ch4_ppmv,
+            ecl_ppbv=ecl_ppbv,
+            lnox_cell_kgn_m2s=lnox_cell_kgn_m2s,
+            fire_c_cell_kgc_m2s=fire_c_cell_kgc_m2s,
+            surf_land_id=int(SURF_LAND),
+            surf_ocean_id=int(SURF_OCEAN),
+        )
+        oz.o3_vmr = o3_new
+        oz.tco_du = tco_du
+        oz.o3_sfc_ppbv = o3_sfc
+        oz.o3_drydep_kgm2s = drydep
+        oz.o3_chem_net_kgm2s = chem_net
+        return
+
     nz, nc = pres_c.shape
     dtype = pres_c.dtype
 

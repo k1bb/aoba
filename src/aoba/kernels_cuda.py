@@ -1,7 +1,7 @@
 """Automatic single-source Metal-to-CUDA transpiler and PyTorch CUDA kernel backend for AOBA.
 
-Translates AOBA's 51 fused Metal compute shaders (`kernels.py`, `kernels_extra.py`,
-`kernels_physics.py`) directly into native NVIDIA CUDA C++17 kernels compiled on demand
+Translates AOBA's 56 fused Metal compute shaders (`kernels.py`, `kernels_extra.py`,
+`kernels_physics.py`, `kernels_esm.py`) directly into native NVIDIA CUDA C++17 kernels compiled on demand
 via `torch.utils.cpp_extension.load_inline`, exposing an identical `lib.<kernel>(...,
 threads=..., group_size=...)` dispatch interface so every physics and dynamics module
 automatically accelerates on both Apple Silicon (`mps`) and NVIDIA GPUs (`cuda`) from a
@@ -48,6 +48,11 @@ _HEAVY_COL_KERNELS: frozenset[str] = frozenset({
     "ocean_bgc_column_col",
     "two_leaf_gas_exchange_col",
     "surface_transfer_col",
+    "rad_rrtmgp_lw_grp",
+    "rad_rrtmgp_sw_grp",
+    "rad_ckd_hd_col",
+    "microphysics_6class_col",
+    "ozone_chem_col",
 })
 
 
@@ -218,8 +223,11 @@ AOBA_DEVICE float clamp(float x, float lo, float hi) { return fminf(fmaxf(x, lo)
 AOBA_DEVICE int clamp(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); }
 AOBA_DEVICE uint clamp(uint x, uint lo, uint hi) { return x < lo ? lo : (x > hi ? hi : x); }
 AOBA_DEVICE float fabs(float x) { return fabsf(x); }
+AOBA_DEVICE float floor(float x) { return floorf(x); }
 AOBA_DEVICE float exp(float x) { return expf(x); }
+AOBA_DEVICE float expm1(float x) { return expm1f(x); }
 AOBA_DEVICE float log(float x) { return logf(x); }
+AOBA_DEVICE float log1p(float x) { return log1pf(x); }
 AOBA_DEVICE float pow(float a, float b) { return powf(a, b); }
 AOBA_DEVICE float sqrt(float x) { return sqrtf(x); }
 AOBA_DEVICE float rsqrt(float x) { return rsqrtf(x); }

@@ -58,6 +58,13 @@ from aoba.kernels_physics import (
     run_surface_transfer_metal,
     run_two_leaf_gas_exchange_metal,
 )
+from aoba.kernels_esm import (
+    ESM_METAL_SHADER_SRC,
+    run_microphysics_6class_metal,
+    run_ozone_chem_metal,
+    run_rad_ckd_hd_metal,
+    run_rad_rrtmgp_metal,
+)
 
 _MAX_METAL_K: int = 128
 _MAX_COL_METAL_K: int = 64
@@ -740,7 +747,7 @@ kernel void crm_stage_w_hevi(
 
 
 def _all_shader_src() -> str:
-    return _METAL_THOMAS_SRC + EXTRA_METAL_SHADER_SRC + PHYSICS_METAL_SHADER_SRC
+    return _METAL_THOMAS_SRC + EXTRA_METAL_SHADER_SRC + PHYSICS_METAL_SHADER_SRC + ESM_METAL_SHADER_SRC
 
 
 def _get_metal_lib():
@@ -971,6 +978,30 @@ def dispatch_crm_microphysics_2m_metal(**kwargs: Any) -> tuple[torch.Tensor, ...
     lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_crm_microphysics_2m_metal(lib, **kwargs)
+
+
+def dispatch_rad_rrtmgp_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_rad_rrtmgp_metal(lib, **kwargs)
+
+
+def dispatch_rad_ckd_hd_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_rad_ckd_hd_metal(lib, **kwargs)
+
+
+def dispatch_microphysics_6class_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_microphysics_6class_metal(lib, **kwargs)
+
+
+def dispatch_ozone_chem_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_ozone_chem_metal(lib, **kwargs)
 
 
 def dispatch_scvt_fast_acoustic_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
