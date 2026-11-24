@@ -637,6 +637,7 @@ $$
 - **排出駆動・完全双方向の大気 $\mathrm{CO}_2$ 予報（`co2_mode = "prognostic"`, `enable_co2_3d_transport`）**: 陸域 NBP・海洋 $\mathrm{fgCO}_2$・ケイ酸塩風化・火山・人為排出の収支 $\mathrm{d}C_{\mathrm{CO}_2}/\mathrm{d}t = (E_{\mathrm{anthro}} + E_{\mathrm{volc}} - \mathrm{NBP}_{\mathrm{land}} - F_{\mathrm{ocn}} - F_{\mathrm{weath}}) / 2.124\ \mathrm{PgC\ ppmv}^{-1}$ を倍精度で厳密保存し、オプションで 3 次元 SCVT FCT 移流・PBL 混合によりキーリング曲線と南北勾配を再現する。
 - **海洋溶存酸素 ($\mathrm{O}_2$)・貧酸素水塊 (OMZ)・海洋脱窒（`enable_ocean_o2_omz`）**: Garcia & Gordon (1992) の酸素溶解度、Wanninkhof (2014) の大気海洋交換、$R_{\mathrm{O}_2:\mathrm{C}} = 138/106$ の光合成・再無機化、および貧酸素域（$\mathrm{O}_2 < 20\ \mathrm{mmol\ m}^{-3}$）での嫌気的脱窒を解き、海洋 $\mathrm{N}_2\mathrm{O}$ 放出へ結合する。
 - **成層圏火山性エアロゾル・太陽活動 11 年周期（`enable_volcanic_aerosols`, `enable_solar_cycle`）**: 厳密な 2 段 Bateman 解析解による $\mathrm{SO}_2 \to \mathrm{H}_2\mathrm{SO}_4$ 酸化（$\tau_{\mathrm{ox}} = 35\ \mathrm{日}$）および沈降（$\tau_{\mathrm{set}} = 1.1\ \mathrm{年}$）と SCVT ラプラシアン拡散を放射（SW 散乱・LW 吸収）および成層圏不均一オゾン破壊へ結合し、11 年 Schwabe 周期の TSI・UV 光解離変調を加える。
+- **MAML サブグリッド山岳微気候・動的湿地湖沼・波浪/ラングミュア/海塩飛沫結合（`maml_land_subgrid.py`, `ocean_waves.py`）**: `Earth2014` の `sigma_topo` から親格子平均ゼロのサブグリッド標高減率・斜面日射を与える微気候ダウンスケーリング（`enable_maml_subgrid_topo`）、地形平坦度と河川流量から冠水率を動的診断して蒸発・湿地 $\mathrm{CH}_4$ へ繋ぐ湿地・湖沼モデル（`enable_maml_wetlands_lakes`）、および有義波高 $H_s$・周期 $T_p$ 予報から Stokes ドリフトのラングミュア KPP 混合強化・波齢依存粗度・強風時海塩飛沫エンタルピーフラックスを結合する波浪モジュール（`enable_wave_coupling`）。
 
 ### 12.1 一元テキスト管理アーキテクチャと実行・GUI ツール (`src/aoba/params.py`, `src/aoba/co2_forcing.py`, `src/aoba/ozone_forcing.py`, `src/aoba/gravity_wave.py`, `scripts/aoba_config_gui.py`)
 

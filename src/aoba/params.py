@@ -290,6 +290,7 @@ _FORCING_KEYS: tuple[str, ...] = (
     "volcanic_eruption_lat_deg", "volcanic_eruption_width_deg", "sai_so2_tg_yr",
     "sai_lat_band_deg", "enable_solar_cycle", "solar_cycle_amp_wm2",
     "solar_cycle_period_yr", "solar_cycle_phase_yr", "volcanic_co2_pgc_yr",
+    "enable_maml_subgrid_topo", "enable_maml_wetlands_lakes", "enable_wave_coupling",
     "weathering_accel_factor", "enable_milankovitch_orbit", "milankovitch_start_kyr",
     "milankovitch_accel_factor",
     "re_liq_um", "re_ice_um", "cloud_sw_inhomog", "microphysics_scheme",

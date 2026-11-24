@@ -130,6 +130,9 @@ class AOBAConfig:
     solar_cycle_amp_wm2: float = 1.0         # Peak-to-trough TSI solar cycle amplitude [W m^-2] (Lean et al., 2005)
     solar_cycle_period_yr: float = 11.0      # Solar cycle period [yr]
     solar_cycle_phase_yr: float = 0.0        # Solar cycle reference phase year [yr]
+    enable_maml_subgrid_topo: bool = False   # MAML subgrid elevation lapse-rate & slope microclimate downscaling
+    enable_maml_wetlands_lakes: bool = False # Dynamic MAML inundated wetlands/floodplains/lakes -> CH4 & evaporation
+    enable_wave_coupling: bool = False       # Prognostic ocean waves H_s/T_p, Stokes Langmuir KPP mixing, & sea-spray flux
     volcanic_co2_pgc_yr: float = 0.03        # Volcanic CO2 outgassing for silicate-weathering mode [Pg C yr^-1]
     weathering_accel_factor: float = 1.0     # Optional geological acceleration factor for weathering mode [-]
     enable_milankovitch_orbit: bool = False  # Analytical Berger (1978) / Laskar (2004) Milankovitch orbital evolution
@@ -231,6 +234,8 @@ class AOBAState:
     weathering: object | None = None
     prognostic_co2: object | None = None
     volcanic_solar: object | None = None
+    maml_land: object | None = None
+    ocean_waves: object | None = None
     sim_time_sec: float = 0.0
     step_count: int = 0
     rad_cache: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -1225,19 +1230,35 @@ def step_aoba_model(
         u_ocn_sub = torch.where(is_ocn_rw, _cell_to_sub(uo_c, nc, n_sub), u_ocn_sub)
         v_ocn_sub = torch.where(is_ocn_rw, _cell_to_sub(vo_c, nc, n_sub), v_ocn_sub)
 
+    # Optional MAML subgrid orographic microclimate downscaling (lapse rate + terrain aspect)
+    temp_sfc_in = temp_sub_0
+    pres_sfc_in = pres_sfc_sub
+    sw1_dir_in = sw1_dir_sub
+    sw2_dir_in = sw2_dir_sub
+    if bool(cfg.enable_maml_subgrid_topo) or bool(cfg.enable_maml_wetlands_lakes):
+        from aoba.maml_land_subgrid import downscale_maml_microclimate, init_maml_subgrid_land_state
+
+        if model.maml_land is None:
+            model.maml_land = init_maml_subgrid_land_state(sfc_sub.surf_type, sfc_sub.sigma_topo, nc, n_sub)
+        if bool(cfg.enable_maml_subgrid_topo):
+            temp_sfc_in, pres_sfc_in, sw1_dir_in = downscale_maml_microclimate(
+                model.maml_land, temp_sub_0, pres_sfc_sub, sw1_dir_sub
+            )
+            sw2_dir_in = torch.clamp(sw2_dir_sub * model.maml_land.slope_sw_fac, min=0.0)
+
     # 4. Subgrid MAML Land/Snow/Soil/Two-Leaf Biosphere & Ocean/Sea-Ice Balance + Host Voronoi Ekman Ocean
     sfc_diag_sub = step_surface(
         sfc=sfc_sub,
         u_1=u_sub_0 - u_ocn_sub,
         v_1=v_sub_0 - v_ocn_sub,
-        temp_1=temp_sub_0,
+        temp_1=temp_sfc_in,
         qv_1=qv_sub[0],
         pres_1=pres_sub_0,
-        pres_sfc=pres_sfc_sub,
+        pres_sfc=pres_sfc_in,
         z_ref_rel=z_ref_rel_sub,
-        sw1_dir_down=sw1_dir_sub,
+        sw1_dir_down=sw1_dir_in,
         sw1_dif_down=sw1_dif_sub,
-        sw2_dir_down=sw2_dir_sub,
+        sw2_dir_down=sw2_dir_in,
         sw2_dif_down=sw2_dif_sub,
         lw_down=lw_dn_sub,
         precip_rain=rain_prev_sub,
@@ -1247,6 +1268,62 @@ def step_aoba_model(
         dt=dt,
         precomputed_albedos=_pre_alb_sub,
     )
+
+    # Optional dynamic MAML wetland/floodplain/lake evaporation boost & coupled wave/sea-spray fluxes
+    if bool(cfg.enable_maml_wetlands_lakes) and model.maml_land is not None:
+        from aoba.maml_land_subgrid import step_maml_wetlands_lakes
+
+        q_riv_c = getattr(model.river, "discharge_m3s", None) if model.river is not None else None
+        step_maml_wetlands_lakes(
+            model.maml_land, sfc_sub.surf_type, sfc_sub.sigma_topo,
+            sfc_sub.w_liq_soil[0], sfc_sub.t_soil[0], mesh.area_cell, nc, n_sub, dt,
+            river_discharge_cell=q_riv_c,
+        )
+        # Inundated wetland/lake tiles have enhanced open-water evaporation
+        wet_boost = 1.0 + 0.35 * model.maml_land.f_wetland
+        sfc_diag_sub.evap = sfc_diag_sub.evap * wet_boost
+        sfc_diag_sub.lhf = sfc_diag_sub.lhf * wet_boost
+
+    langmuir_ocn = None
+    if bool(cfg.enable_wave_coupling):
+        from aoba.ocean_waves import compute_sea_spray_enthalpy_fluxes, init_ocean_wave_state, step_ocean_waves
+
+        is_ocn_wave_sub = (sfc_sub.surf_type == SURF_OCEAN)
+        open_ocn_sub = torch.clamp(1.0 - torch.clamp(sfc_diag_sub.f_seaice, 0.0, 1.0), 0.0, 1.0) * is_ocn_wave_sub.to(temp_sub_0.dtype)
+        u10_rel_sub = torch.hypot(u_sub_0 - u_ocn_sub, v_sub_0 - v_ocn_sub)
+        d_lh_sp, d_sh_sp = compute_sea_spray_enthalpy_fluxes(
+            u10_rel_sub, sfc_sub.t_ocean_ml, temp_sub_0, qv_sub[0], pres_sfc_sub, open_ocn_sub
+        )
+        sfc_diag_sub.lhf = sfc_diag_sub.lhf + d_lh_sp
+        sfc_diag_sub.shf = sfc_diag_sub.shf + d_sh_sp
+        sfc_diag_sub.evap = sfc_diag_sub.evap + d_lh_sp / C.L_V0
+
+        active_w_mesh = model.ocn_mesh if (str(cfg.ocean_mode).strip().lower() == "ogcm_3d" and has_indep_ocn) else mesh
+        active_w_sfc = model.ocn_sfc if (str(cfg.ocean_mode).strip().lower() == "ogcm_3d" and has_indep_ocn) else sfc
+        assert active_w_mesh is not None and active_w_sfc is not None
+        if model.ocean_waves is None:
+            model.ocean_waves = init_ocean_wave_state(active_w_mesh.n_cells, temp_sub_0.device, temp_sub_0.dtype)
+        u10_w_cell = _sub_to_cell(u10_rel_sub, nc, n_sub)
+        fice_w_cell = _sub_to_cell(sfc_diag_sub.f_seaice, nc, n_sub)
+        if active_w_mesh is not mesh and model.ocn_coupler is not None:
+            from aoba.ocean_coupler import atm_to_ocn_intensive
+
+            u10_w_in = atm_to_ocn_intensive(model.ocn_coupler, u10_w_cell)
+            fice_w_in = atm_to_ocn_intensive(model.ocn_coupler, fice_w_cell)
+        else:
+            u10_w_in = u10_w_cell
+            fice_w_in = fice_w_cell
+        step_ocean_waves(model.ocean_waves, u10_w_in, fice_w_in, active_w_sfc.surf_type == SURF_OCEAN, dt)
+        langmuir_ocn = model.ocean_waves.langmuir_fac
+        # Apply wave-age sea-surface drag modulation onto open-ocean subcolumns
+        drag_c = model.ocean_waves.drag_mod
+        if active_w_mesh is not mesh and model.ocn_coupler is not None:
+            from aoba.ocean_coupler import ocn_to_atm_mean
+
+            drag_c = ocn_to_atm_mean(model.ocn_coupler, drag_c, fallback_atm=torch.ones(nc, device=drag_c.device, dtype=drag_c.dtype))
+        drag_sub = 1.0 + open_ocn_sub * (_cell_to_sub(drag_c, nc, n_sub) - 1.0)
+        sfc_diag_sub.tau_x = sfc_diag_sub.tau_x * drag_sub
+        sfc_diag_sub.tau_y = sfc_diag_sub.tau_y * drag_sub
 
     is_ocn_sub = sfc_sub.surf_type == SURF_OCEAN
     t1_cell_before = _sub_to_cell(sfc_sub.t_ocean_ml, nc, n_sub)
@@ -1361,6 +1438,7 @@ def step_aoba_model(
             enable_submeso=bool(cfg.enable_ogcm_submeso),
             enable_tidal_mixing=bool(cfg.enable_ogcm_tidal_mixing),
             enable_o2_omz=bool(cfg.enable_ocean_o2_omz),
+            langmuir_fac=langmuir_ocn,
         )
         if has_indep_ocn:
             sfc.t_ocean_ml = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.t_ocean_ml, fallback_atm=sfc.t_ocean_ml)
@@ -2017,6 +2095,7 @@ def step_aoba_model(
             ocean_epc100_molc_m2s=model.ogcm.bgc.epc100 if (model.ogcm is not None and model.ogcm.bgc is not None) else None,
             ocean_denit_moln_m2s=getattr(model.ogcm.bgc, "denit_moln_m2s", None) if (model.ogcm is not None and model.ogcm.bgc is not None) else None,
             ocean_area_cell=ocn_m_tg.area_cell if ocn_m_tg is not None else None,
+            f_wetland_sub=model.maml_land.f_wetland if (bool(cfg.enable_maml_wetlands_lakes) and model.maml_land is not None) else None,
             mean_tco_du=mean_tco_now,
         )
     # 8b-6. Stratospheric Volcanic / SAI Aerosols (SO2 -> H2SO4)

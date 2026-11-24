@@ -1498,6 +1498,7 @@ def step_ogcm_voronoi(
     enable_submeso: bool = True,
     enable_tidal_mixing: bool = True,
     enable_o2_omz: bool = False,
+    langmuir_fac: torch.Tensor | None = None,
 ) -> None:
     """Advance 3D SCVT Voronoi OGCM (`temp`, `sal`, `u_edge`, `eta`) & dynamic sea ice by `dt` [s].
 
@@ -1579,6 +1580,11 @@ def step_ogcm_voronoi(
         ogcm=ogcm, mesh=mesh, is_ocean=is_ocean, cache=cache,
         enable_tidal_mixing=enable_tidal_mixing,
     )
+    if langmuir_fac is not None:
+        in_bl = (z_int_m < torch.clamp(h_bl.unsqueeze(0), min=1.0)).to(dtype)
+        l_scale = 1.0 + in_bl * (torch.clamp(langmuir_fac.to(device=dev, dtype=dtype), 1.0, 2.2).unsqueeze(0) - 1.0)
+        kv_diag = torch.clamp(kv_diag * l_scale, max=KPP_KV_MAX)
+        av_diag = torch.clamp(av_diag * l_scale, max=KPP_KV_MAX)
     ogcm.h_bl = h_bl
 
     # 4. 3D Baroclinic Momentum Step (WS-RK3 TRiSK Coriolis + Baroclinic PGF + Munk Viscosity + Semi-Implicit Drag)
