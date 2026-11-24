@@ -77,6 +77,13 @@ class CRMState:
     f_coriolis: torch.Tensor | None = None  # Column Coriolis parameter [s^-1], shape [N_col]
     n_c: torch.Tensor | None = None  # 2-moment cloud droplet number mixing ratio [kg^-1], [Nz, N_col, Ny, Nx]
     n_i: torch.Tensor | None = None  # 2-moment cloud ice crystal number mixing ratio [kg^-1], [Nz, N_col, Ny, Nx]
+    # Optional 6-class 2-moment precipitation hydrometeors (microphysics_scheme == "six_class_2m")
+    q_r: torch.Tensor | None = None  # Prognostic rain mass mixing ratio [kg kg^-1]
+    q_s: torch.Tensor | None = None  # Prognostic snow mass mixing ratio [kg kg^-1]
+    q_g: torch.Tensor | None = None  # Prognostic graupel mass mixing ratio [kg kg^-1]
+    n_r: torch.Tensor | None = None  # Prognostic rain number mixing ratio [kg^-1]
+    n_s: torch.Tensor | None = None  # Prognostic snow number mixing ratio [kg^-1]
+    n_g: torch.Tensor | None = None  # Prognostic graupel number mixing ratio [kg^-1]
 
 
 @dataclass
@@ -896,7 +903,13 @@ def step_crm_physics_and_dynamics(
     """
     nz, n_col, ny, nx = crm.rho_d.shape
     m_sub = n_col * ny * nx
-    use_2m_mp = str(microphysics_scheme).strip().lower() == "two_moment"
+    mp_key = str(microphysics_scheme).strip().lower()
+    use_6c_mp = mp_key == "six_class_2m"
+    use_2m_mp = mp_key == "two_moment"
+    if use_6c_mp:
+        from aoba.microphysics_6class import init_six_class_hydrometeors
+
+        init_six_class_hydrometeors(crm)
     if use_2m_mp:
         if crm.n_c is None:
             crm.n_c = torch.zeros_like(crm.q_c)
@@ -1119,50 +1132,83 @@ def step_crm_physics_and_dynamics(
         crm.q_c = qc_f.reshape(nz, n_col, ny, nx)
         crm.q_i = qi_f.reshape(nz, n_col, ny, nx)
 
-    # 4. Mixed-phase microphysics (2-moment Morrison/KK00 or 1-moment SAM KR03) & sedimentation
-    if use_2m_mp and crm.n_c is not None and crm.n_i is not None:
-        w_center = 0.5 * (crm.w[:-1] + crm.w[1:])
-        w_eff = (torch.clamp(w_center, min=0.0) + 0.7 * torch.sqrt(0.5 * torch.clamp(crm.qke, min=0.0))).reshape(nz, m_sub)
-        mp = step_microphysics_two_moment(
-            rho_d=crm.rho_d.reshape(nz, m_sub),
-            theta_m_c=crm.theta_m.reshape(nz, m_sub),
-            q_n=crm.q_n.reshape(nz, m_sub),
-            q_p=crm.q_p.reshape(nz, m_sub),
-            q_v_prev=crm.q_v.reshape(nz, m_sub),
-            n_c_in=crm.n_c.reshape(nz, m_sub),
-            n_i_in=crm.n_i.reshape(nz, m_sub),
-            dz_c=dz_flat,
-            dt=dt_crm,
-            w_eff=w_eff,
-            is_ocean=is_ocean_sub.reshape(m_sub) if is_ocean_sub is not None else None,
-            u_sfc=u_sfc_sub.reshape(m_sub) if u_sfc_sub is not None else None,
-            q_dust=q_dust_sub.reshape(nz, m_sub) if q_dust_sub is not None else None,
-        )
-        if mp.n_c is not None:
-            crm.n_c = mp.n_c.reshape(nz, n_col, ny, nx)
-        if mp.n_i is not None:
-            crm.n_i = mp.n_i.reshape(nz, n_col, ny, nx)
-    else:
-        mp = step_microphysics(
-            rho_d=crm.rho_d.reshape(nz, m_sub),
-            theta_m_c=crm.theta_m.reshape(nz, m_sub),
-            q_n=crm.q_n.reshape(nz, m_sub),
-            q_p=crm.q_p.reshape(nz, m_sub),
-            q_v_prev=crm.q_v.reshape(nz, m_sub),
-            dz_c=dz_flat,
-            dt=dt_crm,
-        )
-    crm.theta_m = mp.theta_m_c.reshape(nz, n_col, ny, nx)
-    crm.q_n = mp.q_n.reshape(nz, n_col, ny, nx)
-    crm.q_p = mp.q_p.reshape(nz, n_col, ny, nx)
-    crm.q_v = mp.q_v.reshape(nz, n_col, ny, nx)
-    crm.q_c = mp.q_c.reshape(nz, n_col, ny, nx)
-    crm.q_i = mp.q_i.reshape(nz, n_col, ny, nx)
+    # 4. Mixed-phase microphysics (6-class 2M Morrison, 2-moment KK00, or 1-moment SAM KR03) & sedimentation
+    if use_6c_mp and crm.q_r is not None and crm.q_s is not None and crm.q_g is not None:
+        from aoba.microphysics_6class import step_microphysics_six_class_2m
 
-    rain_sub = mp.precip_rain.reshape(n_col, ny, nx)
-    snow_sub = mp.precip_snow.reshape(n_col, ny, nx)
-    rain_col = rain_sub.mean(dim=(-2, -1))
-    snow_col = snow_sub.mean(dim=(-2, -1))
+        (
+            crm.theta_m, crm.q_v, crm.q_c, crm.q_i,
+            crm.q_r, crm.q_s, crm.q_g,
+            crm.n_c, crm.n_i, crm.n_r, crm.n_s, crm.n_g,
+            rain_sub, snow_sub,
+        ) = step_microphysics_six_class_2m(
+            rho_d=crm.rho_d,
+            theta_m=crm.theta_m,
+            q_v=crm.q_v,
+            q_c=crm.q_c,
+            q_i=crm.q_i,
+            q_r=crm.q_r,
+            q_s=crm.q_s,
+            q_g=crm.q_g,
+            n_c=crm.n_c,
+            n_i=crm.n_i,
+            n_r=crm.n_r,
+            n_s=crm.n_s,
+            n_g=crm.n_g,
+            dz_c=dz_c_col if dz_c_col is not None else vgrid.dzeta_c,
+            dt=dt_crm,
+            is_ocean_sub=is_ocean_sub,
+            u_sfc_sub=u_sfc_sub,
+            q_dust_sub=q_dust_sub,
+        )
+        crm.q_n = crm.q_v + crm.q_c + crm.q_i
+        crm.q_p = crm.q_r + crm.q_s + crm.q_g
+        rain_col = rain_sub.mean(dim=(-2, -1))
+        snow_col = snow_sub.mean(dim=(-2, -1))
+    else:
+        if use_2m_mp and crm.n_c is not None and crm.n_i is not None:
+            w_center = 0.5 * (crm.w[:-1] + crm.w[1:])
+            w_eff = (torch.clamp(w_center, min=0.0) + 0.7 * torch.sqrt(0.5 * torch.clamp(crm.qke, min=0.0))).reshape(nz, m_sub)
+            mp = step_microphysics_two_moment(
+                rho_d=crm.rho_d.reshape(nz, m_sub),
+                theta_m_c=crm.theta_m.reshape(nz, m_sub),
+                q_n=crm.q_n.reshape(nz, m_sub),
+                q_p=crm.q_p.reshape(nz, m_sub),
+                q_v_prev=crm.q_v.reshape(nz, m_sub),
+                n_c_in=crm.n_c.reshape(nz, m_sub),
+                n_i_in=crm.n_i.reshape(nz, m_sub),
+                dz_c=dz_flat,
+                dt=dt_crm,
+                w_eff=w_eff,
+                is_ocean=is_ocean_sub.reshape(m_sub) if is_ocean_sub is not None else None,
+                u_sfc=u_sfc_sub.reshape(m_sub) if u_sfc_sub is not None else None,
+                q_dust=q_dust_sub.reshape(nz, m_sub) if q_dust_sub is not None else None,
+            )
+            if mp.n_c is not None:
+                crm.n_c = mp.n_c.reshape(nz, n_col, ny, nx)
+            if mp.n_i is not None:
+                crm.n_i = mp.n_i.reshape(nz, n_col, ny, nx)
+        else:
+            mp = step_microphysics(
+                rho_d=crm.rho_d.reshape(nz, m_sub),
+                theta_m_c=crm.theta_m.reshape(nz, m_sub),
+                q_n=crm.q_n.reshape(nz, m_sub),
+                q_p=crm.q_p.reshape(nz, m_sub),
+                q_v_prev=crm.q_v.reshape(nz, m_sub),
+                dz_c=dz_flat,
+                dt=dt_crm,
+            )
+        crm.theta_m = mp.theta_m_c.reshape(nz, n_col, ny, nx)
+        crm.q_n = mp.q_n.reshape(nz, n_col, ny, nx)
+        crm.q_p = mp.q_p.reshape(nz, n_col, ny, nx)
+        crm.q_v = mp.q_v.reshape(nz, n_col, ny, nx)
+        crm.q_c = mp.q_c.reshape(nz, n_col, ny, nx)
+        crm.q_i = mp.q_i.reshape(nz, n_col, ny, nx)
+
+        rain_sub = mp.precip_rain.reshape(n_col, ny, nx)
+        snow_sub = mp.precip_snow.reshape(n_col, ny, nx)
+        rain_col = rain_sub.mean(dim=(-2, -1))
+        snow_col = snow_sub.mean(dim=(-2, -1))
 
     # Diagnose net CRM physics/convective tendencies relative to pre-step + LS forcing
     thm_ls = dtheta_m_ls_dt if dtheta_m_ls_dt is not None else torch.zeros_like(thm_mean_0)

@@ -163,6 +163,32 @@ class SurfaceState:
     t_leaf_sun: torch.Tensor | None = None       # Sunlit leaf equilibrium temperature [K]
     t_leaf_sh: torch.Tensor | None = None        # Shaded leaf equilibrium temperature [K]
     t_gnd_skin: torch.Tensor | None = None       # Ground/snow skin temperature under canopy [K]
+    # Optional SNICAR snow/sea-ice surface light-absorbing impurities (Flanner et al., 2007, 2009)
+    bc_snow: torch.Tensor | None = None          # Top-2cm snow/ice black carbon load [kg BC m^-2]
+    dust_snow: torch.Tensor | None = None        # Top-2cm snow/ice mineral dust load [kg dust m^-2]
+
+
+def step_snow_impurity_darkening(
+    sfc: SurfaceState,
+    bc_dep_kgm2s: torch.Tensor | None,
+    dust_dep_kgm2s: torch.Tensor | None,
+    snow_fall_kgm2s: torch.Tensor,
+    dt: float,
+) -> None:
+    """Update top-layer snow/sea-ice BC & dust impurities via exact exponential burial/scavenging (Flanner et al., 2007)."""
+    has_cover = (sfc.swe_land > 0.5) | (sfc.swe_seaice > 0.5) | (sfc.m_seaice > 10.0)
+    if sfc.bc_snow is None:
+        sfc.bc_snow = torch.zeros_like(sfc.swe_land)
+    if sfc.dust_snow is None:
+        sfc.dust_snow = torch.zeros_like(sfc.swe_land)
+    # Burial by fresh snow (15 kg m^-2 fresh SWE buries surface layer) + 45-day melt/sublimation washout
+    k_bury = torch.clamp(snow_fall_kgm2s, min=0.0) / 15.0 + 1.0 / (45.0 * C.SECONDS_PER_DAY)
+    decay = torch.exp(-torch.clamp(k_bury * dt, max=20.0))
+    int_fac = torch.where(k_bury > 1.0e-12, -torch.expm1(-torch.clamp(k_bury * dt, max=20.0)) / torch.clamp(k_bury, min=1.0e-12), torch.full_like(k_bury, float(dt)))
+    bc_in = torch.clamp(bc_dep_kgm2s, min=0.0) if bc_dep_kgm2s is not None else torch.zeros_like(sfc.swe_land)
+    du_in = torch.clamp(dust_dep_kgm2s, min=0.0) if dust_dep_kgm2s is not None else torch.zeros_like(sfc.swe_land)
+    sfc.bc_snow = torch.where(has_cover, torch.clamp(sfc.bc_snow * decay + bc_in * int_fac, 0.0, 5.0e-5), torch.zeros_like(sfc.bc_snow))
+    sfc.dust_snow = torch.where(has_cover, torch.clamp(sfc.dust_snow * decay + du_in * int_fac, 0.0, 5.0e-2), torch.zeros_like(sfc.dust_snow))
 
 
 def _kahan_add(val: torch.Tensor, delta: torch.Tensor, comp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -430,10 +456,18 @@ def compute_surface_albedos(
                 float(LEAF_SCAT_NIR),
             ),
         )
-        return (
-            out_8[0], out_8[1], out_8[2], out_8[3],
-            out_8[4], out_8[5], out_8[6], out_8[7],
-        )
+        alb_vis_dir, alb_vis_dif, alb_nir_dir, alb_nir_dif = out_8[0], out_8[1], out_8[2], out_8[3]
+        h_exp, lai_exp, a_sn, f_ice = out_8[4], out_8[5], out_8[6], out_8[7]
+        if sfc.bc_snow is not None or sfc.dust_snow is not None:
+            bc_m = torch.clamp(sfc.bc_snow, min=0.0) if sfc.bc_snow is not None else torch.zeros_like(mu0)
+            du_m = torch.clamp(sfc.dust_snow, min=0.0) if sfc.dust_snow is not None else torch.zeros_like(mu0)
+            # SNICAR visible darkening bounded to <= 45% reduction on snow/sea-ice fraction
+            d_frac = torch.clamp(180.0 * torch.sqrt(bc_m) + 3.5 * torch.sqrt(du_m), 0.0, 0.45)
+            f_cov = torch.where(sfc.surf_type == SURF_OCEAN, f_ice, a_sn)
+            mult = 1.0 - f_cov * d_frac
+            alb_vis_dir = alb_vis_dir * mult
+            alb_vis_dif = alb_vis_dif * mult
+        return (alb_vis_dir, alb_vis_dif, alb_nir_dir, alb_nir_dif, h_exp, lai_exp, a_sn, f_ice)
 
     is_ocean = sfc.surf_type == SURF_OCEAN
     is_ice = sfc.surf_type == SURF_ICESHEET
@@ -478,6 +512,15 @@ def compute_surface_albedos(
     alb_vis_dif = torch.where(is_ocean, o_vis_dif, l_vis_dif)
     alb_nir_dir = torch.where(is_ocean, o_nir_dir, l_nir_dir)
     alb_nir_dif = torch.where(is_ocean, o_nir_dif, l_nir_dif)
+
+    if sfc.bc_snow is not None or sfc.dust_snow is not None:
+        bc_m = torch.clamp(sfc.bc_snow, min=0.0) if sfc.bc_snow is not None else torch.zeros_like(mu0)
+        du_m = torch.clamp(sfc.dust_snow, min=0.0) if sfc.dust_snow is not None else torch.zeros_like(mu0)
+        d_frac = torch.clamp(180.0 * torch.sqrt(bc_m) + 3.5 * torch.sqrt(du_m), 0.0, 0.45)
+        f_cov = torch.where(is_ocean, f_ice, a_sn)
+        mult = 1.0 - f_cov * d_frac
+        alb_vis_dir = alb_vis_dir * mult
+        alb_vis_dif = alb_vis_dif * mult
 
     return alb_vis_dir, alb_vis_dif, alb_nir_dir, alb_nir_dif, h_exp, lai_exp, a_sn, f_ice
 

@@ -397,9 +397,18 @@ where $P = 2 J_{\mathrm{O}_2}(s_{\mathrm{O}_2}, s_{\mathrm{O}_3}) f_{\mathrm{O}_
 
 Setting `ocean_glevel > 0` (distinct from atmospheric `glevel`) constructs an independent higher-resolution icosahedral SCVT mesh (`ocn_mesh`, e.g., eddy-permitting `Glevel-7` ~60 km or eddy-resolving `Glevel-8` ~30 km) for the 3D OGCM, FlexPFT marine biogeochemistry, and EVP–ITD sea-ice dynamics. Exploiting exact spherical Voronoi containment $\mathrm{parent}[j] = \arg\max_i (\mathbf{x}_{\mathrm{ocn},j} \cdot \mathbf{x}_{\mathrm{atm},i})$, `OceanAtmosCoupler` transfers intensive forcing (`tau_x`, `tau_y`, `u10`, `PAR`) to fine ocean cells, conserves global extensive freshwater/runoff integrals across mismatched coastal masks, applies atmospheric surface tendencies $(\Delta T_{\mathrm{ml}}, \Delta m_{\mathrm{ice}}, \Delta \mathrm{SWE}_{\mathrm{ice}})$ directly onto fine `ocn_sfc` with exact latent-heat freeze conservation (preventing coarse-grid smearing of SST fronts and mesoscale eddies), and aggregates fine ocean SST, sea ice, and surface chlorophyll back to host atmospheric cells by exact wet-area-weighted averaging.
 
+### 11.6 Toggleable Universal ESM Physics & Biogeochemistry Extensions
+
+All advanced ESM couplings are controlled by explicit `[forcing]` switches/selectors in `config/aoba_default.toml`:
+- **6-Class 2-Moment Cloud Microphysics** (`microphysics_scheme = "six_class_2m"`, `src/aoba/microphysics_6class.py`; Morrison et al., 2005; Seifert & Beheng, 2006): Independently prognoses rain (`q_r, n_r`), snow (`q_s, n_s`), and rimed graupel (`q_g, n_g`) on the embedded CRM and feeds true prognostic `q_g` directly into CRM non-inductive charging lightning.
+- **29-Band / 111-g-Point MSTRN11-Class Radiation & 3D TICA** (`rad_scheme = "ckd_hd"`, `enable_rad_3d_tica`, `src/aoba/radiation_hd.py`; Sekiguchi & Nakajima, 2008; Chou et al., 1999; Várnai & Davies, 1999): Adds 72 LW + 39 SW quadrature points, Chou LW cloud scattering, 5-species aerosol direct radiative forcing (`enable_aerosol_rad_forcing`), and 3D CRM slant-beam cloud shifting.
+- **SNICAR Snow/Sea-Ice Darkening & Land–Ocean BGC Loop** (`enable_snow_bc_darkening`, `enable_bgc_fe_lnox_coupling`, `enable_bvoc_soa`; Flanner et al., 2007; Jickells et al., 2005; Guenther et al., 2012): Couples BC & dust deposition to snow/sea-ice visible albedo, dust soluble Fe & `LNOx` to FlexPFT marine BGC, and EEO forest BVOC to hygroscopic SOA/CCN.
+- **Prognostic Natural CH₄/N₂O, Silicate Weathering, & Milankovitch Orbit** (`enable_prognostic_ch4_n2o`, `enable_silicate_weathering`, `enable_milankovitch_orbit`; `src/aoba/trace_gas_cycle.py`, `src/aoba/planetary_geochem.py`; Prather et al., 2012; Walker et al., 1981; Berger, 1978): Closes wetland/fire CH₄–OH, soil/marine N₂O–UV, carbonate–silicate CO₂–alkalinity thermostat, and analytical orbital evolution.
+- **Ocean Current-Relative Air-Sea Flux & Eddy-Resolving OGCM Switches** (`enable_current_rel_wind`, `enable_ogcm_scale_aware_gm`, `enable_ogcm_submeso`, `enable_ogcm_tidal_mixing`; Renault et al., 2016; Hallberg, 2013; Fox-Kemper et al., 2008; St. Laurent et al., 2002): Computes bulk air-sea fluxes from $\mathbf{u}_a - \mathbf{u}_o$ strictly when 3D CRM (`crm_ny > 1, crm_nx > 1`) or `enable_superparam = false` is active, paired with resolution-aware GM tapering, mixed-layer submesoscale restratification, and subgrid-roughness tidal mixing.
+
 ---
 
-## 12. Unified Single-File TOML Configuration, Output Cadence, GUI, and 270-Parameter Registry
+## 12. Unified Single-File TOML Configuration, Output Cadence, GUI, and 286-Parameter Registry
 
 ### 12.1 TOML Architecture & Interactive Configurator (`src/aoba/params.py`, `src/aoba/co2_forcing.py`, `src/aoba/ozone_forcing.py`, `src/aoba/gravity_wave.py`, `src/aoba/runtime.py`, `scripts/aoba_config_gui.py`)
 

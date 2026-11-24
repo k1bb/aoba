@@ -486,11 +486,26 @@ def _get_ogcm_static_cache(ogcm: OceanOGCMState, mesh: SCVTMesh, is_ocean: torch
     if slope_b is None:
         slope_b = _compute_bathymetric_slope(ogcm.h_col, wet_c[0], mesh)
         ogcm.bathym_slope = slope_b
-    e_tide = TIDAL_E0_WM2 * (torch.clamp(slope_b / TIDAL_SLOPE_REF, 0.0, 4.0) ** 2)
+    # Combine resolved bathymetric slope with subgrid roughness sigma_topo (St. Laurent et al., 2002)
+    rough_fac = 1.0 + 0.5 * torch.clamp(mesh.sigma_topo.to(dtype) / 250.0, 0.0, 4.0)
+    e_tide = TIDAL_E0_WM2 * (torch.clamp(slope_b / TIDAL_SLOPE_REF, 0.0, 4.0) ** 2) * rough_fac
     hab = torch.clamp(ogcm.h_col.unsqueeze(0) - z_int_m, min=0.0)
     norm_f = TIDAL_ZETA_M * torch.clamp(1.0 - torch.exp(-ogcm.h_col.unsqueeze(0) / TIDAL_ZETA_M), min=1.0e-2)
     f_z_tide = torch.exp(-hab / TIDAL_ZETA_M) / norm_f
     kv_tide_num = (0.0667 * e_tide.unsqueeze(0) * f_z_tide) / C.RHO_SEAWATER
+
+    # Hallberg (2013, Ocean Modelling, 72, 92-103) resolution-aware GM scale factor on edges:
+    # R_GM = 1 / (1 + (L_d / dx)^2) using 1st-baroclinic gravity wave speed c1 ~ 2.2 m s^-1
+    f_edge = 0.5 * (mesh.f_cell[mesh.cells_on_edge[:, 0]] + mesh.f_cell[mesh.cells_on_edge[:, 1]]).to(dtype)
+    beta_e = (2.0 * C.OMEGA_EARTH / C.EARTH_RADIUS)
+    c1_bc = 2.2
+    f_eff_ld = torch.maximum(torch.abs(f_edge), torch.full_like(f_edge, math.sqrt(2.0 * beta_e * c1_bc)))
+    ld_edge = c1_bc / torch.clamp(f_eff_ld, min=1.0e-6)
+    gm_scale_e = 1.0 / (1.0 + (ld_edge / torch.clamp(mesh.dc_edge.to(dtype), min=1.0e3)) ** 2)
+    # Fox-Kemper et al. (2008, 2011) submesoscale scaling factor on edges: C_e * min(dx/L_f, 8.0) / sqrt(f^2 + tau^-2)
+    tau_sub_inv = 1.0 / (5.0 * C.SECONDS_PER_DAY)
+    f_sub_e = torch.sqrt(f_edge * f_edge + tau_sub_inv * tau_sub_inv)
+    fk_coef_e = 0.06 * torch.clamp(mesh.dc_edge.to(dtype) / 500.0, min=1.0, max=8.0) / f_sub_e
 
     # Static Voronoi Redi geometric weights & scalar h_max (eliminates per-step CPU-GPU sync!)
     w_vor_edge = 0.5 * mesh.dc_edge * mesh.dv_edge
@@ -527,6 +542,8 @@ def _get_ogcm_static_cache(ogcm: OceanOGCMState, mesh: SCVTMesh, is_ocean: torch
         "frac_out_0": frac_out_0,
         "kv_bg": kv_bg,
         "kv_tide_num": kv_tide_num,
+        "gm_scale_e": gm_scale_e,
+        "fk_coef_e": fk_coef_e,
         "w_vor_edge": w_vor_edge,
         "active_eoc": active_eoc,
         "inv_area_c": inv_area_c,
@@ -843,11 +860,14 @@ def _ogcm_gm_and_w_core(
     inv_area_c: torch.Tensor,
     dt: float,
     enable_full_redi: bool,
+    gm_scale_e: torch.Tensor | None = None,
+    fk_coef_e: torch.Tensor | None = None,
+    enable_submeso: bool = False,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
 ]:
-    """Pure-tensor GM90 bolus + continuity w + free-surface eta + Redi diagonal Kv (CUDA-compilable)."""
+    """Pure-tensor GM90 + Hallberg scale-aware + Fox-Kemper submeso bolus + continuity w + eta."""
     u_new = torch.clamp((u_star + (u_bt_mean - u_star_baro).unsqueeze(0)) * wet_ef, -3.0, 3.0)
 
     drho_dx = ((rho_anom[:, c1] - rho_anom[:, c0]) * inv_dc_edge.unsqueeze(0)) * wet_ef
@@ -859,7 +879,21 @@ def _ogcm_gm_and_w_core(
     taper_bl = torch.clamp(z_int_m / h_bl_e, 0.0, 1.0)
     sx_int = slope_raw * taper_bl
 
-    psi_int = KAPPA_GM * sx_int
+    kappa_gm_eff = (KAPPA_GM * gm_scale_e.unsqueeze(0)) if gm_scale_e is not None else KAPPA_GM
+    psi_int = kappa_gm_eff * sx_int
+    if enable_submeso and fk_coef_e is not None:
+        # Fox-Kemper et al. (2008, JPO, Eq. 5) mixed-layer baroclinic eddy overturning streamfunction
+        db_dx_ml = -(C.GRAVITY / C.RHO_SEAWATER) * drho_dx[0:1]
+        z_norm = z_int_m / torch.clamp(h_bl_e, min=10.0)
+        in_ml = (z_norm > 0.0) & (z_norm < 1.0)
+        xi = 2.0 * torch.clamp(z_norm, 0.0, 1.0) - 1.0
+        mu_fk = torch.where(in_ml, (1.0 - xi * xi) * (1.0 + (5.0 / 21.0) * xi * xi), torch.zeros_like(z_norm))
+        psi_mle = torch.clamp(
+            fk_coef_e.unsqueeze(0) * (h_bl_e * h_bl_e) * db_dx_ml * mu_fk,
+            min=-2.5,
+            max=2.5,
+        ) * wet_int_ef
+        psi_int = psi_int + psi_mle
     z_e = torch.zeros_like(u_new[0:1])
     dpsi = torch.cat([psi_int, z_e], dim=0) - torch.cat([z_e, psi_int], dim=0)
     u_gm = torch.clamp((-dpsi / h_e_safe) * wet_ef, -0.3, 0.3)
@@ -1408,6 +1442,7 @@ def _diagnose_kpp_and_vertical_mixing(
     mesh: SCVTMesh,
     is_ocean: torch.Tensor,
     cache: dict | None = None,
+    enable_tidal_mixing: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Diagnose KPP boundary layer, non-local convective fluxes, Ri shear mixing, and tidal mixing.
 
@@ -1429,13 +1464,14 @@ def _diagnose_kpp_and_vertical_mixing(
     """
     if cache is None:
         cache = _get_ogcm_static_cache(ogcm, mesh, is_ocean)
+    kv_tide_in = cache["kv_tide_num"] if enable_tidal_mixing else torch.zeros_like(cache["kv_tide_num"])
     kpp_fn = maybe_cuda_compile(_ogcm_kpp_mixing_core, device=T.device)
     return kpp_fn(
         T, rho_anom, u_cell, v_cell, u_star_o, b0_sfc, wt_sfc, ws_sfc,
         ogcm.wet_c, cache["wet_int_c"], cache["wet_int_cf"], ogcm.h_c,
         cache["dz_c_int"], ogcm.z_c.unsqueeze(1), ogcm.z_w[1:-1].unsqueeze(1),
         cache["is_ocn_f"], cache["h_col_kpp"], cache["h_col_safe"],
-        cache["f_abs"], cache["kv_bg"], cache["kv_tide_num"],
+        cache["f_abs"], cache["kv_bg"], kv_tide_in,
     )
 
 
@@ -1458,6 +1494,9 @@ def step_ogcm_voronoi(
     co2_ppmv: float = 284.3,
     river_mouth_flux: torch.Tensor | None = None,
     enable_fct_zstar: bool = False,
+    enable_scale_aware_gm: bool = True,
+    enable_submeso: bool = True,
+    enable_tidal_mixing: bool = True,
 ) -> None:
     """Advance 3D SCVT Voronoi OGCM (`temp`, `sal`, `u_edge`, `eta`) & dynamic sea ice by `dt` [s].
 
@@ -1537,6 +1576,7 @@ def step_ogcm_voronoi(
         T=T, S=S, rho_anom=rho_anom, u_cell=u_cell, v_cell=v_cell,
         u_star_o=u_star_o, b0_sfc=b0_sfc, wt_sfc=wt_sfc, ws_sfc=ws_sfc,
         ogcm=ogcm, mesh=mesh, is_ocean=is_ocean, cache=cache,
+        enable_tidal_mixing=enable_tidal_mixing,
     )
     ogcm.h_bl = h_bl
 
@@ -1624,6 +1664,9 @@ def step_ogcm_voronoi(
         wet_cf, wet_ef, wet_int_cf, wet_int_ef, is_ocn_f,
         c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
         dt, bool(ENABLE_FULL_REDI),
+        cache["gm_scale_e"] if enable_scale_aware_gm else None,
+        cache["fk_coef_e"] if enable_submeso else None,
+        bool(enable_submeso),
     )
     ogcm.u_edge = u_new
     ogcm.eta = eta_new

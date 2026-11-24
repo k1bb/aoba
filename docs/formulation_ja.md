@@ -620,6 +620,15 @@ $$
 
 `ocean_glevel > 0`（大気 `glevel` と異なる値）を指定すると、3D OGCM・FlexPFT 海洋生物地球化学・EVP–ITD 海氷力学を独立の高解像度正二十面体 SCVT メッシュ（`ocn_mesh`；例：渦許容 `Glevel-7` ~60 km や渦解像 `Glevel-8` ~30 km）上で実行できる。球面 Voronoi 包含関係 $\mathrm{parent}[j] = \arg\max_i (\mathbf{x}_{\mathrm{ocn},j} \cdot \mathbf{x}_{\mathrm{atm},i})$ に基づく `OceanAtmosCoupler` は、示強外力（風応力・10 m 風速・PAR）を細格子へ写像し、流出・淡水フラックスは海岸線マスク差を跨いで全球積分を厳密保存する。大気地表面ステップの熱・海氷増分 $(\Delta T_{\mathrm{ml}}, \Delta m_{\mathrm{ice}}, \Delta \mathrm{SWE}_{\mathrm{ice}})$ を潜熱凍結保存つきで細格子 `ocn_sfc` へ直接適用することで SST 前線や中規模渦の粗格子拡散を防ぎ、更新後の SST・海氷・表層クロロフィルを厳密な海洋面積重み平均で大気格子へ返す。
 
+### 11.7 スイッチ選択式「万能マップフリー ESM」拡張群
+
+高度な ESM 物理・生物地球化学結合はすべて `config/aoba_default.toml` の `[forcing]` スイッチ／セレクタにより自在に切替可能である：
+- **6 種 2 モーメント雲微物理** (`microphysics_scheme = "six_class_2m"`, `src/aoba/microphysics_6class.py`; Morrison et al., 2005; Seifert & Beheng, 2006)：埋め込み CRM 上で雨 (`q_r, n_r`)・雪 (`q_s, n_s`)・霰 (`q_g, n_g`) を独立予報し、真の予報霰 `q_g` を CRM 非誘導帯電落雷へ直接供給する。
+- **29 バンド／111 g-pt MSTRN11 級放射＆3D CRM 斜め光線 TICA** (`rad_scheme = "ckd_hd"`, `enable_rad_3d_tica`, `src/aoba/radiation_hd.py`; Sekiguchi & Nakajima, 2008; Chou et al., 1999; Várnai & Davies, 1999)：72 LW＋39 SW 積分点・Chou 長波雲散乱・5 種エアロゾル直接放射効果（`enable_aerosol_rad_forcing`）・3D CRM 斜め日射雲シフトを備える。
+- **SNICAR 雪氷 BC/ダスト暗化・陸海 Fe/`LNOx` 結合・森林 BVOC→SOA** (`enable_snow_bc_darkening`, `enable_bgc_fe_lnox_coupling`, `enable_bvoc_soa`; Flanner et al., 2007; Jickells et al., 2005; Guenther et al., 2012)：BC・ダスト沈着による雪氷可視アルベド低下、ダスト可溶 Fe と落雷 `LNOx` の FlexPFT 海洋施肥、および EEO 植生由来 BVOC→SOA→CCN 循環を閉じる。
+- **予報自然 $\mathrm{CH}_4/\mathrm{N}_2\mathrm{O}$・珪酸塩風化サーモスタット・ミランコビッチ軌道** (`enable_prognostic_ch4_n2o`, `enable_silicate_weathering`, `enable_milankovitch_orbit`; `src/aoba/trace_gas_cycle.py`, `src/aoba/planetary_geochem.py`; Prather et al., 2012; Walker et al., 1981; Berger, 1978)：湿地・火災 $\mathrm{CH}_4$–$\mathrm{OH}$、土壌・海洋 $\mathrm{N}_2\mathrm{O}$–UV、岩石風化 $\mathrm{CO}_2$–アルカリ度収支、および解析軌道進化を統合する。
+- **海流相対風速フラックス・渦許容 OGCM 物理** (`enable_current_rel_wind`, `enable_ogcm_scale_aware_gm`, `enable_ogcm_submeso`, `enable_ogcm_tidal_mixing`; Renault et al., 2016; Hallberg, 2013; Fox-Kemper et al., 2008; St. Laurent et al., 2002)：3D CRM（`crm_ny > 1, crm_nx > 1`）または `enable_superparam = false` の場合に限り海面相対風速 $\mathbf{u}_a - \mathbf{u}_o$ で海面フラックスを計算し、解像度適応 GM・サブメソスケール再成層・海底粗さ潮汐混合と連携させる。
+
 ---
 
 ## 12. 単一 TOML 設定管理・出力仕様・GUI コンフィギュレータ・全パラメータ一覧

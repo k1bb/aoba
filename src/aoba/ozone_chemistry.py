@@ -58,10 +58,10 @@ DU_MOLEC_CM2: float = 2.6867e16          # 1 Dobson Unit [molecules cm^-2]
 SEC_PER_YEAR: float = C.DAYS_PER_YEAR * C.SECONDS_PER_DAY
 
 # Photolysis parameters (Brasseur & Solomon, 2005, Ch. 4-5)
-J_O2_HZ_0: float = 7.4e-10               # Herzberg continuum (200-242 nm) unattenuated rate [s^-1]
-SIGMA_O2_HZ: float = 5.5e-24             # O2 Herzberg absorption cross-section [cm^2]
-SIGMA_O3_HZ: float = 9.0e-19             # O3 shielding cross-section in Herzberg window [cm^2]
-J_O2_SR_0: float = 3.2e-10               # Schumann-Runge (175-205 nm) effective rate [s^-1]
+J_O2_HZ_0: float = 1.55e-9               # Herzberg continuum (200-242 nm) unattenuated rate [s^-1]
+SIGMA_O2_HZ: float = 5.0e-24             # O2 Herzberg absorption cross-section [cm^2]
+SIGMA_O3_HZ: float = 7.5e-19             # O3 shielding cross-section in Herzberg window [cm^2]
+J_O2_SR_0: float = 4.2e-10               # Schumann-Runge (175-205 nm) effective rate [s^-1]
 SIGMA_O2_SR: float = 2.5e-22             # O2 Schumann-Runge cross-section [cm^2]
 SIGMA_O3_SR: float = 4.5e-19             # O3 shielding cross-section in SR window [cm^2]
 
@@ -81,7 +81,7 @@ ECL_REF_PPBV: float = 3.5                # Late-20th-century CFC peak equivalent
 PSC_TEMP_K: float = 195.0                # NAT/ice polar stratospheric cloud threshold temperature [K]
 PSC_LOSS_RATE_S: float = 1.0 / (12.0 * C.SECONDS_PER_DAY)  # Sunlit PSC catalytic loss at eCl = 3.5 ppbv [s^-1]
 
-TROP_BG_PROD_S: float = 2.2e-15          # Clean pre-industrial background tropospheric P_O3 at mu0=1 [mol/mol s^-1]
+TROP_BG_PROD_S: float = 1.8e-14          # Clean pre-industrial background tropospheric P_O3 at mu0=1 (~20-35 ppbv) [mol/mol s^-1]
 TROP_HO2_SINK_S: float = 3.5e-7          # Background tropospheric HO2 + O3 loss (~33-day ceiling lifetime) [s^-1]
 LNOX_O3_PROD_EFF: float = 10.0           # Net O3 molecules produced per LNOx N molecule in free troposphere [-]
 FIRE_O3_PROD_EFF: float = 0.04           # Net O3 mol per mol wildfire C (via CO/NOx/VOC precursors) [-]
@@ -199,7 +199,7 @@ def step_prognostic_ozone(
     f_strat = torch.sigmoid((130.0 - p_hpa) / 25.0)
     f_trop = 1.0 - f_strat
     n2o_fac = max(float(n2o_ppmv), 0.01) / N2O_PI_PPMV
-    noy_vmr = 18.0e-9 * n2o_fac * torch.exp(-((torch.log(torch.clamp(p_hpa, min=0.3) / 6.0)) / 1.65) ** 2) * f_strat
+    noy_vmr = 12.0e-9 * n2o_fac * torch.exp(-((torch.log(torch.clamp(p_hpa, min=0.3) / 6.0)) / 1.65) ** 2) * f_strat
     k_no2_o = 5.1e-12 * torch.exp(210.0 / t_k)
     l1_nox = 2.0 * k_no2_o * (0.45 * noy_vmr * m_cm3) * o_over_o3
 
@@ -266,6 +266,29 @@ def step_prognostic_ozone(
     l_eff = l1_with_dep + l2_tot * (chi0 + chi_eq)
     relax = -torch.expm1(-torch.clamp(l_eff * dt, min=0.0, max=50.0))
     chi_new = torch.clamp(chi0 + (chi_eq - chi0) * relax, min=1.0e-10, max=4.0e-5)
+
+    # 7. Mass-conserving PBL turbulent vertical mixing across lowest ~1.5 km (replenishes k=0 dry dep!)
+    n_mix = min(6, nz - 1)
+    if n_mix > 0:
+        z_rel = [0.5 * dz_c[0]]
+        for k in range(1, n_mix + 1):
+            z_rel.append(z_rel[-1] + 0.5 * (dz_c[k - 1] + dz_c[k]))
+        h_pbl = 1500.0
+        for k in range(n_mix):
+            z_int = 0.5 * (z_rel[k] + z_rel[k + 1])
+            k_z = torch.where(
+                z_int < h_pbl,
+                12.0 * (z_int / h_pbl) * ((1.0 - z_int / h_pbl) ** 2) + 2.0,
+                torch.full_like(z_int, 0.5),
+            )
+            dz_int = torch.clamp(0.5 * (dz_c[k] + dz_c[k + 1]), min=10.0)
+            rho_int = 0.5 * (rho_d[k] + rho_d[k + 1])
+            exch = (dt * rho_int * k_z) / dz_int
+            frac = exch / (1.0 + exch * (1.0 / dm[k] + 1.0 / dm[k + 1]))
+            dflux = frac * (chi_new[k] - chi_new[k + 1])
+            chi_new[k] = chi_new[k] - dflux / dm[k]
+            chi_new[k + 1] = chi_new[k + 1] + dflux / dm[k + 1]
+        chi_new = torch.clamp(chi_new, min=1.0e-10, max=4.0e-5)
 
     # Diagnostics: column O3 [DU], surface O3 [ppbv], dry deposition & net chem [kg O3 m^-2 s^-1]
     tco_du = (chi_new * dn_air).sum(dim=0) / DU_MOLEC_CM2

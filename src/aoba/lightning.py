@@ -72,6 +72,8 @@ def compute_crm_lightning_and_lnox(
     dz_c: torch.Tensor,
     area_cell: torch.Tensor,
     cal_factor: float | None = None,
+    q_g_prog: torch.Tensor | None = None,
+    q_s_prog: torch.Tensor | None = None,
 ) -> LightningDiagnostics:
     """Diagnose subcolumn lightning flash rate, CG fraction, and mass-conserving LNOx deposition.
 
@@ -94,13 +96,18 @@ def compute_crm_lightning_and_lnox(
     w_c = 0.5 * (w_stag[:-1] + w_stag[1:])
     w_up = torch.clamp(w_c, min=0.0)
 
-    # Consistent KR03/Morrison precipitating ice & graupel phase split (microphysics.py)
-    f_ice_p = torch.clamp((T0_PRECIP - temp) / max(T0_PRECIP - T00_PRECIP, 1.0), 0.0, 1.0)
-    f_graup = torch.clamp((temp - T00_GRAUPEL) / max(T0_GRAUPEL - T00_GRAUPEL, 1.0), 0.0, 1.0)
-    q_p_pos = torch.clamp(q_p, min=0.0)
+    # Use true prognostic graupel/snow when 6-class 2-moment microphysics is active; else KR03 split
     q_i_pos = torch.clamp(q_i, min=0.0)
-    q_p_ice = f_ice_p * q_p_pos
-    q_g = q_p_ice * f_graup
+    if q_g_prog is not None:
+        q_g = torch.clamp(q_g_prog, min=0.0)
+        q_s = torch.clamp(q_s_prog, min=0.0) if q_s_prog is not None else torch.zeros_like(q_g)
+        q_p_ice = q_g + q_s
+    else:
+        f_ice_p = torch.clamp((T0_PRECIP - temp) / max(T0_PRECIP - T00_PRECIP, 1.0), 0.0, 1.0)
+        f_graup = torch.clamp((temp - T00_GRAUPEL) / max(T0_GRAUPEL - T00_GRAUPEL, 1.0), 0.0, 1.0)
+        q_p_pos = torch.clamp(q_p, min=0.0)
+        q_p_ice = f_ice_p * q_p_pos
+        q_g = q_p_ice * f_graup
 
     # Broadcast vertical metrics to [Nz, N_cells, 1, 1]
     if z_c.ndim == 2:

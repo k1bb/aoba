@@ -143,6 +143,46 @@ class OceanBGCState:
     ph_sfc: torch.Tensor               # 2D Surface ocean pH (total scale) [-]
     intpp: torch.Tensor                # 2D Vertically integrated NPP [mol C m^-2 s^-1]
     epc100: torch.Tensor               # 2D Sinking POC export flux across ~100 m [mol C m^-2 s^-1]
+    fe_sfc: torch.Tensor | None = None # 2D Surface dissolved Fe [nM = umol Fe m^-3] (dust fertilization)
+
+
+def apply_atmospheric_bgc_deposition(
+    bgc: OceanBGCState,
+    ogcm,
+    dust_dep_kgm2s: torch.Tensor | None,
+    lnox_dep_kgn_m2s: torch.Tensor | None,
+    alk_weath_mol_m2s: torch.Tensor | None,
+    dt: float,
+) -> None:
+    """Couple atmospheric dust Fe, lightning LNOx N, and silicate-weathering Alk into surface ocean BGC.
+
+    References: Jickells et al. (2005, Science), Moore et al. (2004, GBC), Schumann & Huntrieser (2007).
+    """
+    wet0 = ogcm.wet_c[0].to(bgc.no3.dtype)
+    h0 = torch.clamp(ogcm.h_c[0], min=10.0)
+    if bgc.fe_sfc is None:
+        bgc.fe_sfc = torch.where(ogcm.wet_c[0], torch.full_like(h0, 0.35), torch.zeros_like(h0))
+    # 1. Surface dissolved Fe [nM = umol m^-3]: dust soluble Fe (3.5% Fe * 2% sol / 55.845 g/mol) + 0.25 nM deep supply vs scavenging
+    fe_bg = 0.25
+    tau_fe = 90.0 * C.SECONDS_PER_DAY
+    k_fe = 1.0 / tau_fe
+    fe_in_nm_s = torch.zeros_like(h0)
+    if dust_dep_kgm2s is not None:
+        # 1 kg dust -> 0.035 * 0.02 = 7e-4 kg Fe = 1.253e4 umol Fe -> / h0 [m] = nM
+        fe_in_nm_s = (torch.clamp(dust_dep_kgm2s, min=0.0) * 1.253e4) / h0
+    fe_eq = fe_bg + fe_in_nm_s * tau_fe
+    fe_new = bgc.fe_sfc + (fe_eq - bgc.fe_sfc) * (-math.expm1(-k_fe * float(dt)))
+    bgc.fe_sfc = torch.clamp(fe_new, min=0.05, max=4.0) * wet0
+
+    # 2. Atmospheric LNOx N deposition -> surface NO3 [mmol N m^-3] via Kahan compensated summation
+    if lnox_dep_kgn_m2s is not None:
+        dno3 = ((torch.clamp(lnox_dep_kgn_m2s, min=0.0) * float(dt) / 0.014007) * 1.0e3 / h0) * wet0
+        bgc.no3[0], bgc.no3_comp[0] = _kahan_add(bgc.no3[0], dno3, bgc.no3_comp[0])
+
+    # 3. Silicate-weathering riverine alkalinity -> surface Alk [mmol eq m^-3] via Kahan summation
+    if alk_weath_mol_m2s is not None:
+        dalk = ((torch.clamp(alk_weath_mol_m2s, min=0.0) * float(dt)) * 1.0e3 / h0) * wet0
+        bgc.alk[0], bgc.alk_comp[0] = _kahan_add(bgc.alk[0], dalk, bgc.alk_comp[0])
 
 
 def init_ocean_bgc_state(
@@ -703,6 +743,13 @@ def step_ocean_bgc_flexpft(
     bgc.alk, bgc.alk_comp = q7_k[6], c7_k[6]
 
     # 3. FlexPFT Ecosystem Reactions, Implicit Sinking, & OMIP/mocsy Air-Sea CO2 Exchange
+    # Modulate euphotic PAR slightly by dissolved iron availability when dust-Fe coupling is active
+    # (Moore et al., 2004: Michaelis-Menten Fe/(Fe + 0.20 nM), normalized to 1.0 at Fe = 0.60 nM)
+    sw_par_eff = sw_par_sfc
+    if bgc.fe_sfc is not None:
+        fe_lim = torch.clamp((bgc.fe_sfc / (bgc.fe_sfc + 0.20)) / 0.75, min=0.25, max=1.35)
+        sw_par_eff = sw_par_sfc * fe_lim
+
     if get_active_gpu_backend(dev) in ("mps", "cuda"):
         (
             bgc.no3, bgc.phy, bgc.zoo, bgc.det_n, bgc.det_c, bgc.dic, bgc.alk,
@@ -712,7 +759,7 @@ def step_ocean_bgc_flexpft(
             no3=bgc.no3, phy=bgc.phy, zoo=bgc.zoo, det_n=bgc.det_n, det_c=bgc.det_c, dic=bgc.dic, alk=bgc.alk,
             no3_comp=bgc.no3_comp, dic_comp=bgc.dic_comp, alk_comp=bgc.alk_comp,
             temp_k=ogcm.temp, sal_psu=ogcm.sal, h_c=ogcm.h_c, wet_cf=wet_cf,
-            h0_new=h0_new, sw_par_sfc=sw_par_sfc, u10_ocn=u10_ocn, f_seaice=f_seaice,
+            h0_new=h0_new, sw_par_sfc=sw_par_eff, u10_ocn=u10_ocn, f_seaice=f_seaice,
             co2_ppmv=float(co2_ppmv), dt=float(dt), rho_sw=float(C.RHO_SEAWATER),
         )
         return
@@ -734,7 +781,7 @@ def step_ocean_bgc_flexpft(
     ) = eco_fn(
         bgc.no3, bgc.phy, bgc.zoo, bgc.det_n, bgc.det_c, bgc.dic, bgc.alk,
         bgc.no3_comp, bgc.dic_comp, bgc.alk_comp,
-        ogcm.temp, ogcm.sal, sw_par_sfc, u10_ocn, f_seaice,
+        ogcm.temp, ogcm.sal, sw_par_eff, u10_ocn, f_seaice,
         ogcm.h_c, h_c_safe, h0_new, wet_c, wet_cf, is_deepest_c,
         float(co2_ppmv), float(dt),
     )

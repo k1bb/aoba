@@ -105,11 +105,26 @@ class AOBAConfig:
     enable_fire_veg_feedback: bool = True    # MAML burnt-patch crown-fire reset of EEO LAI & canopy height
     enable_seaice_evp_itd: bool = True       # MPAS-Seaice Voronoi EVP rheology + 5-category ITD
     enable_ogcm_fct_zstar: bool = True       # FESOM2-style 3D Zalesak FCT advection + exact z* coordinate
+    enable_ogcm_scale_aware_gm: bool = True  # Hallberg (2013) resolution-aware GM eddy scale function
+    enable_ogcm_submeso: bool = True         # Fox-Kemper et al. (2008) mixed-layer submesoscale eddy restratification
+    enable_ogcm_tidal_mixing: bool = True    # St. Laurent et al. (2002) bathymetric roughness internal tidal mixing
+    enable_current_rel_wind: bool = True     # Air-sea fluxes using wind relative to ocean current (active when 3D CRM or SP off)
     enable_natural_aerosols: bool = True     # Map-free sea-salt, marine DMS sulfate, & wildfire BC/OC aerosols
+    enable_aerosol_rad_forcing: bool = True  # Direct SW+LW radiative forcing of BC/OC/SO4/sea-salt aerosols
+    enable_snow_bc_darkening: bool = True    # SNICAR snow & sea-ice visible albedo darkening by BC & dust deposition
+    enable_bgc_fe_lnox_coupling: bool = True # Dust Fe ocean fertilization & LNOx marine NO3 deposition into FlexPFT
+    enable_bvoc_soa: bool = True             # EEO forest BVOC (isoprene/monoterpene) -> SOA -> CCN feedback
+    enable_prognostic_ch4_n2o: bool = False  # Prognostic natural CH4 (wetland/fire/OH) & N2O (soil/ocean/UV) cycles
+    enable_silicate_weathering: bool = False # Carbonate-silicate weathering CO2 thermostat & riverine alkalinity
+    volcanic_co2_pgc_yr: float = 0.03        # Volcanic CO2 outgassing for silicate-weathering mode [Pg C yr^-1]
+    weathering_accel_factor: float = 1.0     # Optional geological acceleration factor for weathering mode [-]
+    enable_milankovitch_orbit: bool = False  # Analytical Berger (1978) / Laskar (2004) Milankovitch orbital evolution
+    milankovitch_start_kyr: float = 0.0      # Starting orbital epoch relative to J2000 [kyr] (e.g. -21.0 for LGM)
+    milankovitch_accel_factor: float = 1.0   # Optional orbital acceleration multiplier for paleoclimate spin-up [-]
     re_liq_um: float = 10.0                  # Fallback/1M cloud liquid droplet effective radius [um]
     re_ice_um: float = 48.0                  # Fallback/1M cloud ice crystal effective radius [um]
     cloud_sw_inhomog: float = 0.65           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
-    microphysics_scheme: str = "two_moment"  # Cloud microphysics: "two_moment" (Morrison/KK00 + prognostic r_e) or "one_moment"
+    microphysics_scheme: str = "two_moment"  # "two_moment" (KK00), "six_class_2m" (Morrison r/s/g), or "one_moment"
     crm_nx: int = 8                          # Embedded CRM x-grid points per SCVT cell (default 2D 8x1 = 32 km curtain)
     crm_ny: int = 1                          # Embedded CRM y-grid points (1 = SP-CAM 2.5D curtain for Mac climate runs)
     crm_dx: float = 4000.0                   # Embedded CRM horizontal spacing [m] (4 km resolves convective cores cleanly)
@@ -125,7 +140,8 @@ class AOBAConfig:
     co2_csv_path: str = ""                   # Custom (year, co2_ppmv) CSV path when co2_mode="csv"
     ch4_ppmv: float = CH4_PREIND_PPMV        # Well-mixed atmospheric CH4 [ppmv] (1850 piControl = 0.80825)
     n2o_ppmv: float = N2O_PREIND_PPMV        # Well-mixed atmospheric N2O [ppmv] (1850 piControl = 0.27302)
-    rad_scheme: str = "ckd"                  # Radiative transfer scheme: "ckd" (16-band 50 g-pt) or "four_band"
+    rad_scheme: str = "ckd"                  # Radiative transfer: "ckd" (16-band), "ckd_hd" (29-band/111 g-pt), or "four_band"
+    enable_rad_3d_tica: bool = False         # 3D CRM tilted solar beam cloud shift (Várnai & Davies, 1999 TICA)
     o3_mode: str = "latitude_seasonal"       # "rcemip", "latitude_seasonal", "climatology", or "prognostic" (3D map-free O3)
     o3_file_path: str = ""                   # Optional external zonal/3D ozone (.npz/.nc) when o3_mode="climatology"
     o3_lw_coupling: bool = True              # Enable 9.6 um O3 absorption in LW2 atmospheric window
@@ -197,6 +213,8 @@ class AOBAState:
     land_carbon: object | None = None
     aerosols: object | None = None
     ozone: object | None = None
+    trace_gas: object | None = None
+    weathering: object | None = None
     sim_time_sec: float = 0.0
     step_count: int = 0
     rad_cache: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -210,10 +228,24 @@ class AOBAState:
 
     def current_co2_ppmv(self, sim_time_sec: float | None = None) -> float:
         """Return active atmospheric CO2 [ppmv] at ``sim_time_sec`` (or ``self.sim_time_sec``)."""
+        if bool(self.cfg.enable_silicate_weathering) and self.weathering is not None:
+            return float(self.weathering.co2_ppmv)
         if self.co2_series is None or not self.co2_series.is_time_varying:
             return float(self.cfg.co2_ppmv)
         t_sec = self.sim_time_sec if sim_time_sec is None else float(sim_time_sec)
         return self.co2_series.evaluate(self.calendar.decimal_year_at(t_sec))
+
+    def current_ch4_ppmv(self) -> float:
+        """Return active atmospheric CH4 [ppmv] (prognostic if enabled, else configured constant)."""
+        if bool(self.cfg.enable_prognostic_ch4_n2o) and self.trace_gas is not None:
+            return float(self.trace_gas.ch4_ppmv)
+        return float(self.cfg.ch4_ppmv)
+
+    def current_n2o_ppmv(self) -> float:
+        """Return active atmospheric N2O [ppmv] (prognostic if enabled, else configured constant)."""
+        if bool(self.cfg.enable_prognostic_ch4_n2o) and self.trace_gas is not None:
+            return float(self.trace_gas.n2o_ppmv)
+        return float(self.cfg.n2o_ppmv)
 
 
 def _cell_to_sub(x: torch.Tensor, nc: int, n_sub: int) -> torch.Tensor:
@@ -292,11 +324,14 @@ def _compute_four_band_radiation_chunked(
     rad_scheme: str = "ckd",
     ch4_ppmv: float = CH4_PREIND_PPMV,
     n2o_ppmv: float = N2O_PREIND_PPMV,
+    aero_opt: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Evaluate 1D ICA radiative transfer across `[nz, m_sub]`, chunking when `m_sub > col_chunk`."""
     nz, m_sub = pres_c.shape
     chunk = max(col_chunk, 1)
-    use_ckd = str(rad_scheme).strip().lower() == "ckd"
+    rkey = str(rad_scheme).strip().lower()
+    use_ckd_hd = rkey == "ckd_hd"
+    use_ckd = rkey == "ckd"
 
     def _eval_slice(sl: slice | None):
         if sl is None:
@@ -307,6 +342,7 @@ def _compute_four_band_radiation_chunked(
             qd, o3 = q_dust_c, o3_vmr_c
             rel = re_liq_um
             rei = re_ice_um
+            ao = aero_opt
         else:
             pc, pw, tc, tw, dz, rh = pres_c[:, sl], pres_w[:, sl], temp_c[:, sl], temp_w[:, sl], dz_c[:, sl], rho_d_c[:, sl]
             qv, qc, qi, ts = qv_c[:, sl], qc_c[:, sl], qi_c[:, sl], t_sfc[sl]
@@ -316,9 +352,21 @@ def _compute_four_band_radiation_chunked(
             o3 = o3_vmr_c[:, sl] if o3_vmr_c is not None else None
             rel = re_liq_um[:, sl] if isinstance(re_liq_um, torch.Tensor) else re_liq_um
             rei = re_ice_um[:, sl] if isinstance(re_ice_um, torch.Tensor) else re_ice_um
+            ao = tuple(t[:, sl] for t in aero_opt) if aero_opt is not None else None
 
+        if use_ckd_hd:
+            from aoba.radiation_hd import compute_ckd_hd_radiation
+
+            return compute_ckd_hd_radiation(
+                pres_c=pc, pres_w=pw, temp_c=tc, temp_w=tw, dz_c=dz, rho_d_c=rh,
+                qv_c=qv, qc_c=qc, qi_c=qi, t_sfc=ts, albedo_vis=av, albedo_nir=an,
+                mu0=m0, s_toa=st, co2_ppmv=co2_ppmv, ch4_ppmv=ch4_ppmv, n2o_ppmv=n2o_ppmv,
+                emiss_sfc=em, re_liq_um=rel, re_ice_um=rei, cloud_sw_inhomog=cloud_sw_inhomog,
+                albedo_vis_dif=avf, albedo_nir_dif=anf, q_dust_c=qd, o3_vmr_c=o3,
+                o3_lw_coupling=o3_lw_coupling, aero_opt=ao,
+            )
         if use_ckd:
-            return compute_ckd_radiation(
+            base = compute_ckd_radiation(
                 pres_c=pc, pres_w=pw, temp_c=tc, temp_w=tw, dz_c=dz, rho_d_c=rh,
                 qv_c=qv, qc_c=qc, qi_c=qi, t_sfc=ts, albedo_vis=av, albedo_nir=an,
                 mu0=m0, s_toa=st, co2_ppmv=co2_ppmv, ch4_ppmv=ch4_ppmv, n2o_ppmv=n2o_ppmv,
@@ -326,16 +374,24 @@ def _compute_four_band_radiation_chunked(
                 albedo_vis_dif=avf, albedo_nir_dif=anf, q_dust_c=qd, o3_vmr_c=o3,
                 o3_lw_coupling=o3_lw_coupling,
             )
-        rel_f = float(rel.mean().item()) if isinstance(rel, torch.Tensor) else float(rel)
-        rei_f = float(rei.mean().item()) if isinstance(rei, torch.Tensor) else float(rei)
-        return compute_four_band_radiation(
-            pres_c=pc, pres_w=pw, temp_c=tc, temp_w=tw, dz_c=dz, rho_d_c=rh,
-            qv_c=qv, qc_c=qc, qi_c=qi, t_sfc=ts, albedo_vis=av, albedo_nir=an,
-            mu0=m0, s_toa=st, co2_ppmv=co2_ppmv, emiss_sfc=em,
-            re_liq_um=rel_f, re_ice_um=rei_f, cloud_sw_inhomog=cloud_sw_inhomog,
-            albedo_vis_dif=avf, albedo_nir_dif=anf, q_dust_c=qd, o3_vmr_c=o3,
-            o3_lw_coupling=o3_lw_coupling,
-        )
+        else:
+            rel_f = float(rel.mean().item()) if isinstance(rel, torch.Tensor) else float(rel)
+            rei_f = float(rei.mean().item()) if isinstance(rei, torch.Tensor) else float(rei)
+            base = compute_four_band_radiation(
+                pres_c=pc, pres_w=pw, temp_c=tc, temp_w=tw, dz_c=dz, rho_d_c=rh,
+                qv_c=qv, qc_c=qc, qi_c=qi, t_sfc=ts, albedo_vis=av, albedo_nir=an,
+                mu0=m0, s_toa=st, co2_ppmv=co2_ppmv, emiss_sfc=em,
+                re_liq_um=rel_f, re_ice_um=rei_f, cloud_sw_inhomog=cloud_sw_inhomog,
+                albedo_vis_dif=avf, albedo_nir_dif=anf, q_dust_c=qd, o3_vmr_c=o3,
+                o3_lw_coupling=o3_lw_coupling,
+            )
+        if ao is not None:
+            from aoba.radiation_hd import apply_aerosol_rad_delta
+
+            return apply_aerosol_rad_delta(
+                base, pc, tc, tw, dz, rh, ts, av, avf, m0, st, ao, emiss_sfc=em
+            )
+        return base
 
     if chunk >= m_sub:
         rad = _eval_slice(None)
@@ -904,9 +960,17 @@ def step_aoba_model(
     h_prev_cpu = torch.atan2(torch.sin(h_raw_prev), torch.cos(h_raw_prev))
     h_next_cpu = torch.atan2(torch.sin(h_raw_next), torch.cos(h_raw_next))
     crossed_noon_cpu = (h_prev_cpu < 0.0) & (h_next_cpu >= 0.0) & ((h_next_cpu - h_prev_cpu) < math.pi)
-    mu0, s_toa, _ = compute_orbital_insolation(
+    # Optional analytical Milankovitch orbital evolution (Berger, 1978; Laskar et al., 2004)
+    obl_now, ecc_now, peri_now = cfg.obliquity_deg, cfg.eccentricity, cfg.perihelion_deg
+    if bool(cfg.enable_milankovitch_orbit):
+        from aoba.planetary_geochem import compute_milankovitch_orbital_params
+
+        sim_yr_now = model.sim_time_sec / yr_sec_trop
+        t_kyr = float(cfg.milankovitch_start_kyr) + (sim_yr_now * 1.0e-3) * max(float(cfg.milankovitch_accel_factor), 1.0)
+        ecc_now, obl_now, peri_now = compute_milankovitch_orbital_params(t_kyr)
+    mu0, s_toa, hour_angle_cell = compute_orbital_insolation(
         t_seas_next, mesh.lat_cell, mesh.lon_cell,
-        cfg.solar_constant, cfg.obliquity_deg, cfg.eccentricity, cfg.perihelion_deg,
+        cfg.solar_constant, obl_now, ecc_now, peri_now,
         t_diurnal_sec=t_diur_next, diurnal_cycle=cfg.diurnal_cycle,
     )
     mu0_sub = _cell_to_sub(mu0, nc, n_sub)
@@ -958,7 +1022,7 @@ def step_aoba_model(
         if cfg.enable_dust and atmos.q_dust is None:
             atmos.q_dust = torch.zeros_like(atmos.q_n)
         q_dust_rad = _cell_to_sub(atmos.q_dust, nc, n_sub) if (cfg.enable_dust and atmos.q_dust is not None) else None
-        if str(cfg.microphysics_scheme).strip().lower() == "two_moment" and crm.n_c is not None and crm.n_i is not None:
+        if str(cfg.microphysics_scheme).strip().lower() in ("two_moment", "six_class_2m") and crm.n_c is not None and crm.n_i is not None:
             re_liq_rad, re_ice_rad = diagnose_cloud_effective_radii(
                 rho_sub, qc_sub, qi_sub,
                 crm.n_c.reshape(nz, m_sub), crm.n_i.reshape(nz, m_sub),
@@ -967,6 +1031,26 @@ def step_aoba_model(
         else:
             re_liq_rad = cfg.re_liq_um
             re_ice_rad = cfg.re_ice_um
+        # Optional 3D CRM Tilted Independent Column Approximation (Várnai & Davies, 1999)
+        qc_rad, qi_rad = qc_sub, qi_sub
+        if bool(cfg.enable_rad_3d_tica) and n_sub > 1:
+            from aoba.radiation_hd import apply_3d_tica_cloud_shift
+
+            qc_rad, qi_rad = apply_3d_tica_cloud_shift(
+                qc_sub, qi_sub, z_rel_c, mu0, hour_angle_cell, nc, ny, nx, float(cfg.crm_dx)
+            )
+        # Optional 5-species natural aerosol direct SW+LW radiative optics (BC/OC/SO4/SS)
+        aero_opt_rad = None
+        if bool(cfg.enable_aerosol_rad_forcing) and bool(cfg.enable_natural_aerosols) and model.aerosols is not None:
+            from aoba.aerosols import compute_aerosol_radiative_optics
+
+            tau_a, scat_a, asym_a, lw_a = compute_aerosol_radiative_optics(model.aerosols, atmos.rho_d, atmos.dz_c)
+            aero_opt_rad = (
+                _cell_to_sub(tau_a, nc, n_sub),
+                _cell_to_sub(scat_a, nc, n_sub),
+                _cell_to_sub(asym_a, nc, n_sub),
+                _cell_to_sub(lw_a, nc, n_sub),
+            )
         o3_vmr_rad = None
         if str(cfg.o3_mode).strip().lower() == "prognostic":
             if model.ozone is None:
@@ -991,8 +1075,8 @@ def step_aoba_model(
                 dz_c=_cell_to_sub(atmos.dz_c, nc, n_sub),
                 rho_d_c=rho_sub,
                 qv_c=qv_sub,
-                qc_c=qc_sub,
-                qi_c=qi_sub,
+                qc_c=qc_rad,
+                qi_c=qi_rad,
                 t_sfc=t_rad_in,
                 albedo_vis=alb_vd,
                 albedo_nir=alb_nd,
@@ -1010,8 +1094,9 @@ def step_aoba_model(
                 o3_vmr_c=o3_vmr_rad,
                 o3_lw_coupling=cfg.o3_lw_coupling,
                 rad_scheme=cfg.rad_scheme,
-                ch4_ppmv=cfg.ch4_ppmv,
-                n2o_ppmv=cfg.n2o_ppmv,
+                ch4_ppmv=model.current_ch4_ppmv(),
+                n2o_ppmv=model.current_n2o_ppmv(),
+                aero_opt=aero_opt_rad,
             )
         )
         model.rad_cache["q_rad_sub"] = q_rad_sub
@@ -1050,11 +1135,36 @@ def step_aoba_model(
         m_ice_pre_sfc = _sub_to_cell(sfc_sub.m_seaice, nc, n_sub)
         swe_ice_pre_sfc = _sub_to_cell(sfc_sub.swe_seaice, nc, n_sub)
 
+    # Ocean-current relative air-sea wind (Renault et al., 2016, 2019; Pacanowski, 1987):
+    # Strictly active ONLY when CRM is 3D (crm_ny > 1 and crm_nx > 1) OR superparameterization is disabled!
+    use_rel_wind = (
+        bool(cfg.enable_current_rel_wind)
+        and model.ogcm is not None
+        and ((not bool(cfg.enable_superparam)) or (ny > 1 and nx > 1))
+    )
+    u_ocn_sub = torch.zeros_like(u_sub_0)
+    v_ocn_sub = torch.zeros_like(v_sub_0)
+    if use_rel_wind:
+        assert model.ogcm is not None
+        ocn_m_rw = model.ocn_mesh if has_indep_ocn else mesh
+        assert ocn_m_rw is not None
+        uo0, vo0 = reconstruct_cell_winds(ocn_m_rw, (model.ogcm.u_edge[0:1] * model.ogcm.wet_e[0:1].to(model.ogcm.u_edge.dtype)))
+        uo_c, vo_c = uo0[0], vo0[0]
+        if has_indep_ocn:
+            from aoba.ocean_coupler import ocn_to_atm_mean
+
+            z_atm = torch.zeros(nc, device=uo_c.device, dtype=uo_c.dtype)
+            uo_c = ocn_to_atm_mean(model.ocn_coupler, uo_c, fallback_atm=z_atm)
+            vo_c = ocn_to_atm_mean(model.ocn_coupler, vo_c, fallback_atm=z_atm)
+        is_ocn_rw = (sfc_sub.surf_type == SURF_OCEAN)
+        u_ocn_sub = torch.where(is_ocn_rw, _cell_to_sub(uo_c, nc, n_sub), u_ocn_sub)
+        v_ocn_sub = torch.where(is_ocn_rw, _cell_to_sub(vo_c, nc, n_sub), v_ocn_sub)
+
     # 4. Subgrid MAML Land/Snow/Soil/Two-Leaf Biosphere & Ocean/Sea-Ice Balance + Host Voronoi Ekman Ocean
     sfc_diag_sub = step_surface(
         sfc=sfc_sub,
-        u_1=u_sub_0,
-        v_1=v_sub_0,
+        u_1=u_sub_0 - u_ocn_sub,
+        v_1=v_sub_0 - v_ocn_sub,
         temp_1=temp_sub_0,
         qv_1=qv_sub[0],
         pres_1=pres_sub_0,
@@ -1182,6 +1292,9 @@ def step_aoba_model(
             co2_ppmv=model.current_co2_ppmv(),
             river_mouth_flux=river_mouth_ocn,
             enable_fct_zstar=bool(cfg.enable_ogcm_fct_zstar),
+            enable_scale_aware_gm=bool(cfg.enable_ogcm_scale_aware_gm),
+            enable_submeso=bool(cfg.enable_ogcm_submeso),
+            enable_tidal_mixing=bool(cfg.enable_ogcm_tidal_mixing),
         )
         if has_indep_ocn:
             sfc.t_ocean_ml = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.t_ocean_ml, fallback_atm=sfc.t_ocean_ml)
@@ -1314,10 +1427,10 @@ def step_aoba_model(
     dqn_ls = (atmos.q_n - qn_before_dyn) / dt
     u_host_new, v_host_new = reconstruct_cell_winds(mesh, atmos.u_edge)
 
-    # Align subcolumn drag with post-dynamics lowest-layer flow shift while retaining subgrid gusts
-    u_sub_post = u_sub_0 + _cell_to_sub(u_host_new[0] - u_cell[0], nc, n_sub)
-    v_sub_post = v_sub_0 + _cell_to_sub(v_host_new[0] - v_cell[0], nc, n_sub)
-    old_spd_sub = torch.sqrt(u_sub_0 * u_sub_0 + v_sub_0 * v_sub_0 + 1.0e-4)
+    # Align subcolumn drag with post-dynamics lowest-layer flow shift while retaining subgrid gusts & current feedback
+    u_sub_post = (u_sub_0 - u_ocn_sub) + _cell_to_sub(u_host_new[0] - u_cell[0], nc, n_sub)
+    v_sub_post = (v_sub_0 - v_ocn_sub) + _cell_to_sub(v_host_new[0] - v_cell[0], nc, n_sub)
+    old_spd_sub = torch.sqrt((u_sub_0 - u_ocn_sub) ** 2 + (v_sub_0 - v_ocn_sub) ** 2 + 1.0e-4)
     tau_mag_sub = torch.sqrt(sfc_diag_sub.tau_x * sfc_diag_sub.tau_x + sfc_diag_sub.tau_y * sfc_diag_sub.tau_y)
     drag_c_sub = tau_mag_sub / old_spd_sub
     sfc_diag_sub.tau_x = -drag_c_sub * u_sub_post
@@ -1498,8 +1611,11 @@ def step_aoba_model(
             z_c=atmos.z_c,
             dz_c=atmos.dz_c,
             area_cell=mesh.area_cell,
+            q_g_prog=getattr(crm, "q_g", None),
+            q_s_prog=getattr(crm, "q_s", None),
         )
         model.last_lightning = light_diag
+    f_dust_dep_cell = None
     if cfg.enable_dust:
         if atmos.q_dust is None:
             atmos.q_dust = torch.zeros_like(atmos.q_n)
@@ -1515,16 +1631,21 @@ def step_aoba_model(
             d_disp=sfc_diag_sub.d_disp,
             dust_emis_factor=cfg.dust_emis_factor,
         )
+        f_dust_emit_c = _sub_to_cell(f_dust_sub, nc, n_sub)
+        dm_dust_c = torch.clamp(atmos.rho_d * atmos.dz_c, min=0.0)
+        dust_col_pre = (dm_dust_c * torch.clamp(atmos.q_dust, min=0.0)).sum(dim=0)
         atmos.q_dust = step_dust_column(
             q_dust=atmos.q_dust,
             rho_d=atmos.rho_d,
             dz_c=atmos.dz_c,
             z_c=atmos.z_c,
-            f_dust_emit=_sub_to_cell(f_dust_sub, nc, n_sub),
+            f_dust_emit=f_dust_emit_c,
             precip_rate=rain_new + snow_new,
             u_star_cell=_sub_to_cell(sfc_diag_sub.u_star, nc, n_sub),
             dt=dt,
         )
+        dust_col_post = (dm_dust_c * torch.clamp(atmos.q_dust, min=0.0)).sum(dim=0)
+        f_dust_dep_cell = torch.clamp((dust_col_pre + dt * f_dust_emit_c - dust_col_post) / max(dt, 1.0), min=0.0)
     evap_cell = _sub_to_cell(sfc_diag_sub.evap, nc, n_sub)
     shf_cell = _sub_to_cell(sfc_diag_sub.shf, nc, n_sub)
     gpp_cell = _sub_to_cell(sfc_diag_sub.gpp, nc, n_sub)
@@ -1713,6 +1834,15 @@ def step_aoba_model(
         else:
             fire_bc = None
             fire_oc = None
+        soa_oc_cell = None
+        if bool(cfg.enable_bvoc_soa):
+            from aoba.aerosols import compute_bvoc_soa_emission
+
+            sw_par_cell = C.PAR_FRAC_OF_SW1 * (
+                model.rad_cache.get("sw1_dir", torch.zeros_like(t_air))
+                + model.rad_cache.get("sw1_dif", torch.zeros_like(t_air))
+            )
+            soa_oc_cell = compute_bvoc_soa_emission(sfc.surf_type, sfc.bio.lai, sfc.t_canopy, sw_par_cell)
         step_natural_aerosols_column(
             aero=model.aerosols,
             rho_d=atmos.rho_d,
@@ -1726,7 +1856,89 @@ def step_aoba_model(
             chl_sfc_mg_m3=chl_sfc,
             fire_bc_kg_m2s=fire_bc,
             fire_oc_kg_m2s=fire_oc,
+            soa_oc_kg_m2s=soa_oc_cell,
             u_star_cell=_sub_to_cell(sfc_diag_sub.u_star, nc, n_sub),
+        )
+    # 8b-2. SNICAR Snow/Sea-Ice BC + Dust Albedo Darkening (Flanner et al., 2007, 2009)
+    if bool(cfg.enable_snow_bc_darkening):
+        from aoba.surface import step_snow_impurity_darkening
+
+        bc_dep_c = model.aerosols.dep_bc_kgm2s if (model.aerosols is not None and getattr(model.aerosols, "dep_bc_kgm2s", None) is not None) else None
+        step_snow_impurity_darkening(
+            sfc_sub,
+            bc_dep_kgm2s=_cell_to_sub(bc_dep_c, nc, n_sub) if bc_dep_c is not None else None,
+            dust_dep_kgm2s=_cell_to_sub(f_dust_dep_cell, nc, n_sub) if f_dust_dep_cell is not None else None,
+            snow_fall_kgm2s=snow_new_sub,
+            dt=dt,
+        )
+    # 8b-3. Silicate Weathering Thermostat (Walker et al., 1981) -> Prognostic CO2 & Riverine Alkalinity
+    alk_weath_cell = None
+    if bool(cfg.enable_silicate_weathering):
+        from aoba.planetary_geochem import init_weathering_state, step_silicate_weathering
+
+        if model.weathering is None:
+            model.weathering = init_weathering_state(model.current_co2_ppmv(), cfg.volcanic_co2_pgc_yr)
+        runoff_liq_w = torch.clamp(_sub_to_cell(sfc_diag_sub.runoff_total - sfc_diag_sub.runoff_ice, nc, n_sub), min=0.0)
+        step_silicate_weathering(
+            ws=model.weathering,
+            area_cell=mesh.area_cell,
+            surf_type=sfc.surf_type,
+            t_sfc_k=t_air,
+            runoff_liq_kgm2s=runoff_liq_w,
+            f_snow_land=_sub_to_cell(sfc_diag_sub.f_snow_land, nc, n_sub),
+            dt=dt,
+            volcanic_co2_pgc_yr=cfg.volcanic_co2_pgc_yr,
+            accel_factor=cfg.weathering_accel_factor,
+        )
+        alk_weath_cell = model.weathering.alk_flux_mol_m2s
+    # 8b-4. Land-Atmosphere-Ocean BGC Deposition (Dust Fe + LNOx NO3 + Weathering Alk -> FlexPFT)
+    if (
+        (bool(cfg.enable_bgc_fe_lnox_coupling) or alk_weath_cell is not None)
+        and model.ogcm is not None
+        and model.ogcm.bgc is not None
+    ):
+        from aoba.ocean_bgc import apply_atmospheric_bgc_deposition
+
+        du_bgc = f_dust_dep_cell if bool(cfg.enable_bgc_fe_lnox_coupling) else None
+        ln_bgc = (light_diag.n_dep_lnox_cell if light_diag is not None else None) if bool(cfg.enable_bgc_fe_lnox_coupling) else None
+        alk_bgc = alk_weath_cell
+        if has_indep_ocn:
+            from aoba.ocean_coupler import atm_to_ocn_conservative_flux, atm_to_ocn_intensive
+
+            if du_bgc is not None:
+                du_bgc = atm_to_ocn_intensive(model.ocn_coupler, du_bgc)
+            if ln_bgc is not None:
+                ln_bgc = atm_to_ocn_intensive(model.ocn_coupler, ln_bgc)
+            if alk_bgc is not None:
+                alk_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, alk_bgc, ocean_only_source=False)
+        elif alk_bgc is not None:
+            # Spread land weathering alkalinity evenly onto wet ocean surface cells
+            w0 = model.ogcm.wet_c[0].to(alk_bgc.dtype)
+            a_ocn_sum = torch.clamp((mesh.area_cell * w0).sum(), min=1.0)
+            alk_tot = (alk_bgc * mesh.area_cell).sum()
+            alk_bgc = (alk_tot / a_ocn_sum) * w0
+        apply_atmospheric_bgc_deposition(model.ogcm.bgc, model.ogcm, du_bgc, ln_bgc, alk_bgc, dt)
+    # 8b-5. Prognostic Natural CH4 & N2O Cycles (Wetland/Permafrost + Fire + Denit/Marine + OH/UV)
+    if bool(cfg.enable_prognostic_ch4_n2o):
+        from aoba.trace_gas_cycle import init_trace_gas_cycle_state, step_trace_gas_cycle
+
+        if model.trace_gas is None:
+            model.trace_gas = init_trace_gas_cycle_state(cfg.ch4_ppmv, cfg.n2o_ppmv)
+        mean_tco_now = float(model.ozone.tco_du.mean().item()) if model.ozone is not None else 300.0
+        ocn_m_tg = model.ocn_mesh if has_indep_ocn else mesh
+        step_trace_gas_cycle(
+            tg=model.trace_gas,
+            area_cell=mesh.area_cell,
+            surf_type=sfc.surf_type,
+            t_sfc_k=t_air,
+            w_liq_soil_top=sfc_sub.w_liq_soil[0],
+            dt=dt,
+            rh_kgc_m2s=model.land_carbon.rh_kgc_m2s if model.land_carbon is not None else None,
+            fire_c_kgc_m2s=model.land_carbon.fire_c_kgc_m2s if model.land_carbon is not None else None,
+            n_denit_kgn_m2s=getattr(model.land_carbon, "n_denit_kgn_m2s", None) if model.land_carbon is not None else None,
+            ocean_epc100_molc_m2s=model.ogcm.bgc.epc100 if (model.ogcm is not None and model.ogcm.bgc is not None) else None,
+            ocean_area_cell=ocn_m_tg.area_cell if ocn_m_tg is not None else None,
+            mean_tco_du=mean_tco_now,
         )
     if str(cfg.o3_mode).strip().lower() == "prognostic":
         from aoba.ozone_chemistry import init_prognostic_ozone_state, step_prognostic_ozone
@@ -1758,8 +1970,8 @@ def step_aoba_model(
             f_snow_cell=_sub_to_cell(sfc_diag_sub.f_snow_land, nc, n_sub),
             f_seaice_cell=f_seaice_cell,
             dt=dt,
-            n2o_ppmv=cfg.n2o_ppmv,
-            ch4_ppmv=cfg.ch4_ppmv,
+            n2o_ppmv=model.current_n2o_ppmv(),
+            ch4_ppmv=model.current_ch4_ppmv(),
             ecl_ppbv=cfg.o3_ecl_ppbv,
             lnox_cell_kgn_m2s=lnox_prod_cell,
             fire_c_cell_kgc_m2s=fire_c_cell,

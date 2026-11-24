@@ -300,6 +300,16 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
             if model.ozone is not None
             else None
         ),
+        "trace_gas": (
+            {k: v for k, v in model.trace_gas.__dict__.items()}
+            if model.trace_gas is not None
+            else None
+        ),
+        "weathering": (
+            {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.weathering.__dict__.items()}
+            if model.weathering is not None
+            else None
+        ),
         "clim": {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.clim.__dict__.items()},
         "clim_sub": (
             {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.clim_sub.__dict__.items()}
@@ -597,6 +607,22 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
                 setattr(model.ozone, k, remapped.to(device=device))
             elif hasattr(model.ozone, k):
                 setattr(model.ozone, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+    if ckpt.get("trace_gas") is not None and bool(model.cfg.enable_prognostic_ch4_n2o):
+        from aoba.trace_gas_cycle import init_trace_gas_cycle_state
+
+        if model.trace_gas is None:
+            model.trace_gas = init_trace_gas_cycle_state()
+        for k, v in ckpt["trace_gas"].items():
+            if hasattr(model.trace_gas, k):
+                setattr(model.trace_gas, k, v)
+    if ckpt.get("weathering") is not None and bool(model.cfg.enable_silicate_weathering):
+        from aoba.planetary_geochem import init_weathering_state
+
+        if model.weathering is None:
+            model.weathering = init_weathering_state()
+        for k, v in ckpt["weathering"].items():
+            if hasattr(model.weathering, k):
+                setattr(model.weathering, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     for k, v in ckpt["clim"].items():
         setattr(model.clim, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     if ckpt.get("clim_sub") is not None and model.clim_sub is not None:
@@ -1525,6 +1551,12 @@ def main() -> None:
                         f"O3={oz_m['o3_tco_du']:.0f} DU (tr={oz_m['o3_tco_trop_du']:.0f}/hi={oz_m['o3_tco_high_du']:.0f}, "
                         f"sfc={oz_m['o3_sfc_ppbv']:.1f} ppbv, dep={dep_tg:.0f} Tg/yr)"
                     )
+                if model.trace_gas is not None:
+                    tg = model.trace_gas
+                    esm_parts.append(f"GHG(CH4={tg.ch4_ppmv:.3f}, N2O={tg.n2o_ppmv:.3f} ppmv)")
+                if model.weathering is not None:
+                    ws = model.weathering
+                    esm_parts.append(f"Weath(CO2={ws.co2_ppmv:.1f} ppmv, W={ws.weath_co2_pgc_yr:.3f} PgC/yr)")
                 if model.ogcm is not None and model.ogcm.seaice_evp is not None:
                     evp_s = model.ogcm.seaice_evp
                     v_ice_kkm3 = float((evp_s.v_cat.sum(dim=0).detach().cpu().double() * ocn_mesh_d.area_cell.detach().cpu().double()).sum().item()) * 1.0e-12

@@ -60,7 +60,24 @@ OC_WET_SCAV: float = 0.50          # Partially hydrophilic OC wet scavenging [m^
 MEE_SS_550: float = 2500.0         # Sea salt (hygroscopic scattering, SSA ~ 0.99)
 MEE_SO4_550: float = 6000.0        # Sulfate (hygroscopic scattering, SSA ~ 0.99)
 MEE_BC_550: float = 10000.0        # Black carbon (strongly absorbing, SSA ~ 0.25)
-MEE_OC_550: float = 4000.0         # Organic carbon (SSA ~ 0.92)
+MEE_OC_550: float = 4000.0         # Organic carbon / SOA (SSA ~ 0.92)
+
+# Single-scattering albedo, asymmetry g, & LW absorption [m^2 kg^-1] (Bond & Bergstrom, 2006; Kinne et al., 2006)
+SSA_SS_SW: float = 0.99
+SSA_SO4_SW: float = 0.99
+SSA_BC_SW: float = 0.25
+SSA_OC_SW: float = 0.92
+G_SS_SW: float = 0.76
+G_SO4_SW: float = 0.70
+G_BC_SW: float = 0.35
+G_OC_SW: float = 0.70
+LW_K_ABS_SS: float = 80.0
+LW_K_ABS_SO4: float = 120.0
+LW_K_ABS_BC: float = 450.0
+LW_K_ABS_OC: float = 180.0
+
+# Biogenic VOC (isoprene + monoterpene) -> SOA yield (Guenther et al., 2012 MEGAN; Tunved et al., 2006)
+BVOC_SOA_BASE_KGM2S: float = 3.2e-11  # Base SOA mass source at 30 C, full canopy, bright PAR (~35-55 Tg SOA/yr)
 
 
 @dataclass
@@ -70,16 +87,18 @@ class NaturalAerosolState:
     q_ss: torch.Tensor             # Sea salt [kg kg^-1]
     q_so4: torch.Tensor            # Marine DMS-derived nss-sulfate [kg kg^-1]
     q_bc: torch.Tensor             # Wildfire black carbon [kg kg^-1]
-    q_oc: torch.Tensor             # Wildfire organic carbon [kg kg^-1]
+    q_oc: torch.Tensor             # Wildfire organic carbon + biogenic SOA [kg kg^-1]
 
     # 2D Diagnostics [N_cells]
     aod_ss: torch.Tensor           # 550 nm Sea-salt AOD [-]
     aod_so4: torch.Tensor          # 550 nm Sulfate AOD [-]
     aod_bc: torch.Tensor           # 550 nm Black-carbon AOD [-]
-    aod_oc: torch.Tensor           # 550 nm Organic-carbon AOD [-]
+    aod_oc: torch.Tensor           # 550 nm Organic-carbon / SOA AOD [-]
     emis_ss_kgm2s: torch.Tensor    # Sea-salt emission flux [kg m^-2 s^-1]
     emis_so4_kgm2s: torch.Tensor   # DMS-derived SO4 source flux [kg m^-2 s^-1]
     ccn_aero_m3: torch.Tensor      # Lowest-layer hygroscopic CCN proxy from SS + SO4 + OC [m^-3]
+    emis_soa_kgm2s: torch.Tensor | None = None  # Biogenic forest BVOC -> SOA mass flux [kg m^-2 s^-1]
+    dep_bc_kgm2s: torch.Tensor | None = None    # Total BC wet+dry deposition flux to surface [kg m^-2 s^-1]
 
 
 def init_natural_aerosol_state(
@@ -103,7 +122,57 @@ def init_natural_aerosol_state(
         emis_ss_kgm2s=z2.clone(),
         emis_so4_kgm2s=z2.clone(),
         ccn_aero_m3=z2.clone(),
+        emis_soa_kgm2s=z2.clone(),
+        dep_bc_kgm2s=z2.clone(),
     )
+
+
+def compute_bvoc_soa_emission(
+    surf_type: torch.Tensor,
+    lai_cell: torch.Tensor,
+    t_canopy_k: torch.Tensor,
+    sw_par_wm2: torch.Tensor,
+) -> torch.Tensor:
+    """Map-free biogenic terpene/isoprene -> SOA mass source (Guenther et al., 2012 MEGAN; Tunved et al., 2006)."""
+    from aoba.surface import SURF_LAND
+
+    is_land = (surf_type == SURF_LAND).to(lai_cell.dtype)
+    f_canopy = 1.0 - torch.exp(-0.5 * torch.clamp(lai_cell, min=0.0))
+    # Monoterpene/isoprene Arrhenius response centered at 303.15 K (clamped to avoid extremes)
+    t_c = torch.clamp(t_canopy_k - 273.15, min=-20.0, max=48.0)
+    f_temp = torch.exp(torch.clamp(0.09 * (t_c - 30.0), min=-5.0, max=2.0))
+    # Light-dependent (isoprene) + dark-pool (monoterpene) blend
+    par_pos = torch.clamp(sw_par_wm2, min=0.0)
+    f_light = 0.35 + 0.65 * (par_pos / (par_pos + 120.0))
+    return is_land * BVOC_SOA_BASE_KGM2S * f_canopy * f_temp * f_light
+
+
+def compute_aerosol_radiative_optics(
+    aero: NaturalAerosolState,
+    rho_d: torch.Tensor,
+    dz_c: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute 3D `[Nz, N_cells]` SW extinction, scattering, asymmetry*scat, & LW absorption for radiation."""
+    dm = torch.clamp(rho_d * dz_c, min=0.0)
+    t_ss = dm * (MEE_SS_550 * torch.clamp(aero.q_ss, min=0.0))
+    t_so4 = dm * (MEE_SO4_550 * torch.clamp(aero.q_so4, min=0.0))
+    t_bc = dm * (MEE_BC_550 * torch.clamp(aero.q_bc, min=0.0))
+    t_oc = dm * (MEE_OC_550 * torch.clamp(aero.q_oc, min=0.0))
+    tau_sw = t_ss + t_so4 + t_bc + t_oc
+    scat_sw = SSA_SS_SW * t_ss + SSA_SO4_SW * t_so4 + SSA_BC_SW * t_bc + SSA_OC_SW * t_oc
+    asym_sw = (
+        G_SS_SW * SSA_SS_SW * t_ss
+        + G_SO4_SW * SSA_SO4_SW * t_so4
+        + G_BC_SW * SSA_BC_SW * t_bc
+        + G_OC_SW * SSA_OC_SW * t_oc
+    )
+    tau_lw = dm * (
+        LW_K_ABS_SS * torch.clamp(aero.q_ss, min=0.0)
+        + LW_K_ABS_SO4 * torch.clamp(aero.q_so4, min=0.0)
+        + LW_K_ABS_BC * torch.clamp(aero.q_bc, min=0.0)
+        + LW_K_ABS_OC * torch.clamp(aero.q_oc, min=0.0)
+    )
+    return tau_sw, scat_sw, asym_sw, tau_lw
 
 
 def compute_seasalt_and_dms_emissions(
@@ -210,6 +279,7 @@ def step_natural_aerosols_column(
     chl_sfc_mg_m3: torch.Tensor | None = None,
     fire_bc_kg_m2s: torch.Tensor | None = None,
     fire_oc_kg_m2s: torch.Tensor | None = None,
+    soa_oc_kg_m2s: torch.Tensor | None = None,
     u_star_cell: torch.Tensor | None = None,
 ) -> None:
     """Advance natural aerosol columns (emission, PBL mixing, settling, wet scavenging) & update AOD/CCN."""
@@ -218,6 +288,13 @@ def step_natural_aerosols_column(
     )
     emis_bc = fire_bc_kg_m2s if fire_bc_kg_m2s is not None else torch.zeros_like(emis_ss)
     emis_oc = fire_oc_kg_m2s if fire_oc_kg_m2s is not None else torch.zeros_like(emis_ss)
+    if soa_oc_kg_m2s is not None:
+        emis_oc = emis_oc + torch.clamp(soa_oc_kg_m2s, min=0.0)
+        aero.emis_soa_kgm2s = torch.clamp(soa_oc_kg_m2s, min=0.0)
+    else:
+        aero.emis_soa_kgm2s = torch.zeros_like(emis_ss)
+    mass_c_pre = torch.clamp(rho_d * dz_c, min=0.0)
+    bc_col_before = (mass_c_pre * torch.clamp(aero.q_bc, min=0.0)).sum(dim=0)
     u_st = (
         torch.clamp(u_star_cell, min=0.05)
         if u_star_cell is not None
@@ -264,6 +341,9 @@ def step_natural_aerosols_column(
 
     aero.emis_ss_kgm2s = emis_ss
     aero.emis_so4_kgm2s = emis_so4
+    # Exact column-conserved BC wet+dry deposition flux [kg BC m^-2 s^-1] for snow/sea-ice darkening
+    bc_col_after = (mass_c_pre * torch.clamp(aero.q_bc, min=0.0)).sum(dim=0)
+    aero.dep_bc_kgm2s = torch.clamp((bc_col_before + float(dt) * emis_bc - bc_col_after) / max(float(dt), 1.0), min=0.0)
 
     # Convert lowest-layer mass concentration [kg m^-3] -> CCN number [m^-3] (typical modal particle masses)
     c_ss_0 = rho_d[0] * aero.q_ss[0]

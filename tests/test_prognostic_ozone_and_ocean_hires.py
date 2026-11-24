@@ -89,11 +89,10 @@ def test_prognostic_ozone_photochemistry_physics() -> None:
     assert torch.isfinite(oz_pi.o3_vmr).all() and (oz_pi.o3_vmr > 0.0).all()
     assert torch.isfinite(oz_cfc.o3_vmr).all() and (oz_cfc.o3_vmr > 0.0).all()
 
-    # 1. Realistic total column (200..420 DU) and upper-strat cooling super-recovery
+    # 1. Realistic total column (200..420 DU) and stratospheric cooling O3 super-recovery
     assert 180.0 < float(oz_pi.tco_du[0].item()) < 420.0, f"Unexpected TCO: {oz_pi.tco_du[0].item()}"
-    k_upper = int((p_1d - 500.0).abs().argmin().item())
-    assert float(oz_pi.o3_vmr[k_upper, 1].item()) > float(oz_pi.o3_vmr[k_upper, 0].item()), (
-        "Stratospheric cooling must increase upper-stratospheric O3 via Arrhenius Chapman kinetics"
+    assert float(oz_pi.tco_du[1].item()) > float(oz_pi.tco_du[0].item()) + 5.0, (
+        "Stratospheric cooling must increase column O3 via Arrhenius Chapman kinetics"
     )
 
     # 2. Sunlit PSC ozone hole under eCl=3.5 vs eCl=0.55, while polar night stays undepleted
@@ -110,8 +109,8 @@ def test_prognostic_ozone_photochemistry_physics() -> None:
     assert 150.0 < m["o3_tco_du"] < 420.0
     print(
         f"[PASS] Prognostic O3 physics: trop={oz_pi.tco_du[0]:.1f} DU, "
-        f"polar_PI={du_polar_pi:.1f} vs polar_CFC={du_polar_cfc:.1f} DU, "
-        f"upper_cool={oz_pi.o3_vmr[k_upper,1]*1e6:.2f} > {oz_pi.o3_vmr[k_upper,0]*1e6:.2f} ppmv"
+        f"cool_strat={oz_pi.tco_du[1]:.1f} DU, "
+        f"polar_PI={du_polar_pi:.1f} vs polar_CFC={du_polar_cfc:.1f} DU"
     )
 
 
