@@ -343,3 +343,40 @@ def test_full_redi_suppresses_veronis_spurious_mixing() -> None:
     # Full Redi cuts spurious Veronis smearing nearly in half even alongside baroclinic advection
     assert drift_redi < drift_zlev * 0.60, f"Full Redi did not suppress Veronis drift: redi={drift_redi:.4e}, zlev={drift_zlev:.4e}"
     assert kv_redi > kv_zlev  # Implicit vertical Redi S^2 diagonal term active
+
+
+def test_ogcm_zero_forcing_float32_conservation() -> None:
+    """Verify multi-step float32 abyssal vertical mixing + Jerlov SW cause < 1e-4 K/yr & < 1e-5 psu/yr drift."""
+    mesh, sfc = _make_basin_mesh_and_sfc("cpu")
+    ogcm = init_ogcm_state(sfc, mesh, nz_ocn=18)
+    zeros = torch.zeros(mesh.n_cells)
+    sw_const = torch.full((mesh.n_cells,), 200.0)
+
+    def _mean_ts() -> tuple[float, float]:
+        heff = ogcm.h_c.clone()
+        heff[0] = torch.where(ogcm.wet_c[0], torch.clamp(ogcm.h_c[0] + ogcm.eta, min=10.0), torch.zeros_like(ogcm.eta))
+        vol = (heff * mesh.area_cell.unsqueeze(0)).double()
+        vsum = vol.sum().item()
+        t_mean = (vol * (ogcm.temp.double() + ogcm.t_comp.double())).sum().item() / vsum
+        s_mean = (vol * (ogcm.sal.double() + ogcm.s_comp.double())).sum().item() / vsum
+        return t_mean, s_mean
+
+    t0, s0 = _mean_ts()
+    n_steps = 120  # 1 full simulated day at dt = 720 s
+    for _ in range(n_steps):
+        step_ogcm_voronoi(
+            ogcm, sfc, mesh, zeros, zeros, zeros, zeros, zeros, zeros, zeros,
+            dt=720.0, enable_seaice_drift=False, sw_net_ocn=sw_const,
+        )
+    t1, s1 = _mean_ts()
+    dt_per_yr = abs(t1 - t0) * 365.0
+    ds_per_yr = abs(s1 - s0) * 365.0
+    assert dt_per_yr < 1.0e-4, f"Float32 OGCM enthalpy drift too large: {dt_per_yr:.3e} K/yr"
+    assert ds_per_yr < 1.0e-5, f"Float32 OGCM salinity drift too large: {ds_per_yr:.3e} psu/yr"
+
+
+if __name__ == "__main__":
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+            print(f"PASS: {name}")

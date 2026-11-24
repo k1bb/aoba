@@ -375,6 +375,107 @@ def step_seaice_drift_voronoi(
     sfc.swe_seaice = torch.where(is_ocean, torch.clamp(s_i + ds, min=0.0), sfc.swe_seaice)
 
 
+def _get_ogcm_static_cache(ogcm: OceanOGCMState, mesh: SCVTMesh, is_ocean: torch.Tensor) -> dict:
+    """Lazily precompute static bathymetry, mask, tidal-base, and Jerlov-SW arrays on device."""
+    cache = getattr(ogcm, "_static_cache", None)
+    dev = ogcm.temp.device
+    dtype = ogcm.temp.dtype
+    if cache is not None and cache.get("device") == dev and cache.get("dtype") == dtype:
+        return cache
+
+    nzo = ogcm.nz_ocn
+    nc = mesh.n_cells
+    wet_c = ogcm.wet_c
+    wet_e = ogcm.wet_e
+    wet_cf = wet_c.to(dtype)
+    wet_ef = wet_e.to(dtype)
+    h_c_safe = torch.clamp(ogcm.h_c, min=1.0)
+    h_e_safe = torch.clamp(ogcm.h_e, min=1.0)
+    wet_int_c = wet_c[:-1] & wet_c[1:]
+    wet_int_e = wet_e[:-1] & wet_e[1:]
+    wet_int_cf = wet_int_c.to(dtype)
+    wet_int_ef = wet_int_e.to(dtype)
+    dz_c_int = 0.5 * (h_c_safe[:-1] + h_c_safe[1:])
+    dz_int_e = 0.5 * (h_e_safe[:-1] + h_e_safe[1:])
+    h_col_safe = torch.clamp(ogcm.h_col, min=1.0)
+    h_col_e_safe = torch.clamp(ogcm.h_col_e, min=1.0)
+    ocn_e0f = wet_e[0].to(dtype)
+    is_ocn_f = is_ocean.to(dtype)
+
+    # Deepest wet edge layer mask (vectorized, no per-step loop)
+    is_bot_e = torch.zeros_like(wet_e)
+    if nzo > 1:
+        is_bot_e[:-1] = wet_e[:-1] & (~wet_e[1:])
+    is_bot_e[-1] = wet_e[-1]
+
+    # Static Jerlov Type I subsurface absorption fractions
+    frac_sub = torch.zeros((nzo, nc), device=dev, dtype=dtype)
+    if nzo >= 2:
+        trans_w = compute_shortwave_transmission(ogcm.z_w)
+        is_deepest_c = torch.zeros_like(wet_c)
+        is_deepest_c[:-1] = wet_c[:-1] & (~wet_c[1:])
+        is_deepest_c[-1] = wet_c[-1]
+        d_trans = trans_w[:-1] - trans_w[1:]
+        f_raw = torch.where(is_deepest_c, trans_w[:-1].unsqueeze(1), d_trans.unsqueeze(1))
+        frac_sub[1:] = torch.where(wet_c[1:], f_raw[1:], torch.zeros_like(f_raw[1:]))
+    frac_out_0 = frac_sub[1:].sum(dim=0)
+
+    # Static Bryan-Lewis background diffusivity & Simmons (2004) tidal energy numerator
+    z_int_m = ogcm.z_w[1:-1].unsqueeze(1)
+    kv_bg = KAPPA_V_BG + 0.5 * (KAPPA_V_ABYSS - KAPPA_V_BG) * (1.0 + torch.tanh((z_int_m - 2000.0) / 800.0))
+
+    slope_b = ogcm.bathym_slope
+    if slope_b is None:
+        slope_b = _compute_bathymetric_slope(ogcm.h_col, wet_c[0], mesh)
+        ogcm.bathym_slope = slope_b
+    e_tide = TIDAL_E0_WM2 * (torch.clamp(slope_b / TIDAL_SLOPE_REF, 0.0, 4.0) ** 2)
+    hab = torch.clamp(ogcm.h_col.unsqueeze(0) - z_int_m, min=0.0)
+    norm_f = TIDAL_ZETA_M * torch.clamp(1.0 - torch.exp(-ogcm.h_col.unsqueeze(0) / TIDAL_ZETA_M), min=1.0e-2)
+    f_z_tide = torch.exp(-hab / TIDAL_ZETA_M) / norm_f
+    kv_tide_num = (0.0667 * e_tide.unsqueeze(0) * f_z_tide) / C.RHO_SEAWATER
+
+    # Static Voronoi Redi geometric weights & scalar h_max (eliminates per-step CPU-GPU sync!)
+    w_vor_edge = 0.5 * mesh.dc_edge * mesh.dv_edge
+    active_eoc = (mesh.edge_sign_on_cell != 0.0).to(dtype)
+    inv_area_c = 1.0 / mesh.area_cell
+    h_max = float(ogcm.h_col.max().item()) if bool(is_ocean.any()) else 100.0
+    f_abs = torch.clamp(torch.abs(mesh.f_cell.to(dtype)), min=1.0e-5)
+    h_col_kpp = torch.clamp(ogcm.h_col, min=50.0, max=500.0)
+
+    cache = {
+        "device": dev,
+        "dtype": dtype,
+        "wet_cf": wet_cf,
+        "wet_ef": wet_ef,
+        "h_c_safe": h_c_safe,
+        "h_e_safe": h_e_safe,
+        "wet_int_c": wet_int_c,
+        "wet_int_e": wet_int_e,
+        "wet_int_cf": wet_int_cf,
+        "wet_int_ef": wet_int_ef,
+        "dz_c_int": dz_c_int,
+        "dz_int_e": dz_int_e,
+        "h_col_safe": h_col_safe,
+        "h_col_e_safe": h_col_e_safe,
+        "ocn_e0f": ocn_e0f,
+        "is_ocn_f": is_ocn_f,
+        "is_bot_e": is_bot_e,
+        "frac_sub": frac_sub,
+        "frac_out_0": frac_out_0,
+        "kv_bg": kv_bg,
+        "kv_tide_num": kv_tide_num,
+        "w_vor_edge": w_vor_edge,
+        "active_eoc": active_eoc,
+        "inv_area_c": inv_area_c,
+        "h_max": h_max,
+        "f_abs": f_abs,
+        "h_col_kpp": h_col_kpp,
+        "inv_dc_edge": 1.0 / mesh.dc_edge,
+    }
+    setattr(ogcm, "_static_cache", cache)
+    return cache
+
+
 def _diagnose_kpp_and_vertical_mixing(
     T: torch.Tensor,
     S: torch.Tensor,
@@ -388,6 +489,7 @@ def _diagnose_kpp_and_vertical_mixing(
     ogcm: OceanOGCMState,
     mesh: SCVTMesh,
     is_ocean: torch.Tensor,
+    cache: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Diagnose KPP boundary layer, non-local convective fluxes, Ri shear mixing, and tidal mixing.
 
@@ -407,37 +509,34 @@ def _diagnose_kpp_and_vertical_mixing(
     f_nl_t   : [N_zo-1, N_cells]  Upward KPP non-local heat flux at interior interfaces [K m s^-1]
     f_nl_s   : [N_zo-1, N_cells]  Upward KPP non-local salt flux at interior interfaces [psu m s^-1]
     """
+    if cache is None:
+        cache = _get_ogcm_static_cache(ogcm, mesh, is_ocean)
     dtype = T.dtype
-    nzo = ogcm.nz_ocn
     wet_c = ogcm.wet_c
-    wet_int_c = wet_c[:-1] & wet_c[1:]
-    h_c_safe = torch.clamp(ogcm.h_c, min=1.0)
-    dz_c_int = 0.5 * (h_c_safe[:-1] + h_c_safe[1:])  # [nzo-1, nc]
+    wet_int_c = cache["wet_int_c"]
+    wet_int_cf = cache["wet_int_cf"]
+    dz_c_int = cache["dz_c_int"]
     z_c_2d = ogcm.z_c.unsqueeze(1)                   # [nzo, 1]
     z_int_m = ogcm.z_w[1:-1].unsqueeze(1)            # [nzo-1, 1]
-    is_ocn_f = is_ocean.to(dtype)
+    is_ocn_f = cache["is_ocn_f"]
 
     # 1. Stratification N^2 [s^-2] and resolved vertical velocity shear S^2 [s^-2] at interior interfaces
-    drho_dz = torch.where(
-        wet_int_c,
-        (rho_anom[1:] - rho_anom[:-1]) / dz_c_int,
-        torch.zeros_like(dz_c_int),
-    )
+    drho_dz = ((rho_anom[1:] - rho_anom[:-1]) / dz_c_int) * wet_int_cf
     n2_int = (C.GRAVITY / C.RHO_SEAWATER) * torch.clamp(drho_dz, min=0.0)
     du_dz = (u_cell[1:] - u_cell[:-1]) / dz_c_int
     dv_dz = (v_cell[1:] - v_cell[:-1]) / dz_c_int
-    s2_int = (du_dz * du_dz + dv_dz * dv_dz) * wet_int_c.to(dtype)
+    s2_int = (du_dz * du_dz + dv_dz * dv_dz) * wet_int_cf
 
     # 2. KPP Boundary-Layer Depth h_BL via Bulk Richardson Number (Large et al., 1994, Eqs. 21-24)
     # Buoyancy difference relative to Layer 0: db_k = (g / rho_0) * (rho_k - rho_0) (>0 when stable)
     db_k = (C.GRAVITY / C.RHO_SEAWATER) * (rho_anom - rho_anom[0:1])  # [nzo, nc]
     dv2_k = (u_cell - u_cell[0:1]) ** 2 + (v_cell - v_cell[0:1]) ** 2  # [nzo, nc]
     # Unresolved turbulent velocity scale V_t^2 (Large et al., 1994, Eq. 23)
-    n2_cell = torch.zeros_like(T)
+    n2_cell = torch.empty_like(T)
     n2_cell[0] = n2_int[0]
     n2_cell[1:-1] = 0.5 * (n2_int[:-1] + n2_int[1:])
     n2_cell[-1] = n2_int[-1]
-    w_star_est = torch.pow(torch.clamp(-b0_sfc, min=0.0) * torch.clamp(ogcm.h_col, min=50.0, max=500.0), 1.0 / 3.0)
+    w_star_est = torch.pow(torch.clamp(-b0_sfc, min=0.0) * cache["h_col_kpp"], 1.0 / 3.0)
     w_s0 = C.VON_KARMAN * torch.pow(u_star_o ** 3 + 2.0 * (w_star_est ** 3) + 1.0e-12, 1.0 / 3.0)
     vt2_k = 0.08 * torch.sqrt(torch.clamp(n2_cell, min=0.0)) * z_c_2d * w_s0.unsqueeze(0)
     ri_b = (db_k * z_c_2d) / (dv2_k + vt2_k + 1.0e-6)
@@ -445,73 +544,49 @@ def _diagnose_kpp_and_vertical_mixing(
     # Deepest contiguous wet layer where Ri_b < KPP_RI_CRIT (or unstable db_k <= 0)
     in_bl = wet_c & ((ri_b < KPP_RI_CRIT) | (db_k <= 0.0))
     # Enforce contiguity downward from Layer 0 so deep inversions don't detach h_BL
-    in_bl_contig = torch.cumprod(in_bl.to(torch.int32), dim=0).to(torch.bool)
-    in_bl_contig[0] = wet_c[0]
+    in_bl_contig = torch.cumprod(in_bl.to(torch.int32), dim=0)
+    in_bl_contig[0] = wet_c[0].to(torch.int32)
     h_bl_ri = (ogcm.h_c * in_bl_contig.to(dtype)).sum(dim=0)
 
     # Under stabilizing surface buoyancy forcing (B_0 > 0), cap by Ekman & Monin-Obukhov scales (Large et al., 1994, Eq. 24)
-    f_abs = torch.clamp(torch.abs(mesh.f_cell.to(dtype)), min=1.0e-5)
-    h_ek = 0.7 * u_star_o / f_abs
+    h_ek = 0.7 * u_star_o / cache["f_abs"]
     h_mo = (u_star_o ** 3) / (C.VON_KARMAN * torch.clamp(b0_sfc, min=1.0e-12))
     h_stab_cap = torch.minimum(h_ek, h_mo)
     h_bl = torch.where(b0_sfc > 1.0e-11, torch.minimum(h_bl_ri, torch.maximum(h_stab_cap, ogcm.h_c[0])), h_bl_ri)
-    h_bl = torch.clamp(h_bl, min=ogcm.h_c[0], max=torch.clamp(ogcm.h_col, min=1.0)) * is_ocn_f
+    h_bl = torch.clamp(h_bl, min=ogcm.h_c[0], max=cache["h_col_safe"]) * is_ocn_f
 
     # 3. KPP Cubic Boundary-Layer Diffusivity K_v,KPP(sigma) & Non-Local Fluxes (Large et al., 1994, Eqs. 19-20)
     sigma = z_int_m / torch.clamp(h_bl.unsqueeze(0), min=1.0)  # [nzo-1, nc]
     inside_bl_int = wet_int_c & (sigma > 0.0) & (sigma < 1.0)
     sig_c = torch.clamp(sigma, 0.0, 1.0)
-    g_shape = sig_c * (1.0 - sig_c) ** 2  # G(0)=0, G(1)=0, peak 4/27 at sigma=1/3
+    g_shape = sig_c * ((1.0 - sig_c) ** 2)  # G(0)=0, G(1)=0, peak 4/27 at sigma=1/3
 
     # Turbulent velocity scale w_s(sigma) (Large et al., 1994, Eq. 13 / convective scaling)
     conv_scale = 16.0 * C.VON_KARMAN * sig_c * torch.clamp(-b0_sfc, min=0.0).unsqueeze(0) * h_bl.unsqueeze(0)
     w_s_int = C.VON_KARMAN * torch.pow(u_star_o.unsqueeze(0) ** 3 + conv_scale + 1.0e-12, 1.0 / 3.0)
-    kv_kpp = torch.where(
-        inside_bl_int,
-        torch.clamp(h_bl.unsqueeze(0) * w_s_int * g_shape, min=0.0, max=KPP_KV_MAX),
-        torch.zeros_like(z_int_m.expand_as(n2_int)),
-    )
+    kv_kpp = torch.clamp(h_bl.unsqueeze(0) * w_s_int * g_shape, min=0.0, max=KPP_KV_MAX) * inside_bl_int.to(dtype)
 
     # Non-local convective transport active ONLY under surface buoyancy loss (B_0 < 0, Large et al., 1994, Eq. 20)
-    # Surface cooling (wt_sfc < 0) drives sinking cold plumes -> positive upward heat flux (-C_s * G * wt_sfc > 0);
-    # brine rejection (ws_sfc > 0) drives sinking salty plumes -> negative upward salt flux (-C_s * G * ws_sfc < 0).
-    is_conv_sfc = (b0_sfc < -1.0e-11).unsqueeze(0) & inside_bl_int
-    nl_weight = torch.where(is_conv_sfc, KPP_CS_NONLOCAL * g_shape, torch.zeros_like(g_shape))
+    is_conv_sfc = ((b0_sfc < -1.0e-11).unsqueeze(0) & inside_bl_int).to(dtype)
+    nl_weight = (KPP_CS_NONLOCAL * g_shape) * is_conv_sfc
     f_nl_t = -nl_weight * wt_sfc.unsqueeze(0)
     f_nl_s = -nl_weight * ws_sfc.unsqueeze(0)
 
     # 4. Interior Gradient-Richardson Shear Instability Mixing (Large et al., 1994, Eq. 28; Pacanowski & Philander, 1981)
     ri_g = n2_int / (s2_int + 1.0e-10)
     ri_ratio = torch.clamp(ri_g / SHEAR_RI_0, 0.0, 1.0)
-    kv_shear = torch.where(
-        wet_int_c,
-        SHEAR_NU_0 * ((1.0 - ri_ratio * ri_ratio) ** 3),
-        torch.zeros_like(n2_int),
-    )
+    one_m_r2 = 1.0 - ri_ratio * ri_ratio
+    kv_shear = (SHEAR_NU_0 * (one_m_r2 * one_m_r2 * one_m_r2)) * wet_int_cf
 
     # 5. Topographic Internal-Tide Abyssal Mixing (St. Laurent et al., 2002; Simmons et al., 2004, Eqs. 3-6)
-    slope_b = ogcm.bathym_slope
-    if slope_b is None:
-        slope_b = _compute_bathymetric_slope(ogcm.h_col, wet_c[0], mesh)
-        ogcm.bathym_slope = slope_b
-    # Energy flux scales with bathymetric roughness (|grad H| / s_ref)^2 (capped at 16x over steep ridges)
-    e_tide = TIDAL_E0_WM2 * (torch.clamp(slope_b / TIDAL_SLOPE_REF, 0.0, 4.0) ** 2)  # [W m^-2]
-    # Vertical structure decaying exponentially upward from local seafloor H_col with scale zeta = 500 m
-    hab = torch.clamp(ogcm.h_col.unsqueeze(0) - z_int_m, min=0.0)  # height above seafloor [m]
-    norm_f = TIDAL_ZETA_M * torch.clamp(1.0 - torch.exp(-ogcm.h_col.unsqueeze(0) / TIDAL_ZETA_M), min=1.0e-2)
-    f_z_tide = torch.exp(-hab / TIDAL_ZETA_M) / norm_f
-    # Gamma * q_loc = 0.20 * (1/3) = 0.0667 (St. Laurent et al., 2002)
-    kv_tide = (0.0667 * e_tide.unsqueeze(0) * f_z_tide) / (C.RHO_SEAWATER * torch.clamp(n2_int, min=1.0e-7))
-    kv_tide = torch.where(wet_int_c, torch.clamp(kv_tide, min=0.0, max=TIDAL_KV_MAX), torch.zeros_like(n2_int))
+    kv_tide = torch.clamp(cache["kv_tide_num"] / torch.clamp(n2_int, min=1.0e-7), min=0.0, max=TIDAL_KV_MAX) * wet_int_cf
 
     # 6. Background Bryan & Lewis (1979) floor + Convective Adjustment whenever drho/dz < 0
-    kv_bg = KAPPA_V_BG + 0.5 * (KAPPA_V_ABYSS - KAPPA_V_BG) * (1.0 + torch.tanh((z_int_m - 2000.0) / 800.0))
-    kv_total = kv_bg + kv_tide + kv_kpp + kv_shear
-    kv_total = torch.where(drho_dz < 0.0, torch.maximum(kv_total, torch.full_like(kv_total, KAPPA_V_CONV)), kv_total)
-    kv_total = torch.where(wet_int_c, kv_total, torch.zeros_like(kv_total))
+    kv_total = cache["kv_bg"] + kv_tide + kv_kpp + kv_shear
+    kv_total = torch.where(drho_dz < 0.0, torch.clamp(kv_total, min=KAPPA_V_CONV), kv_total) * wet_int_cf
 
     # Momentum eddy viscosity A_v (background + KPP + shear; Prandtl ~ 1 in BL, >= A_V_MOM in interior)
-    av_total = torch.where(wet_int_c, A_V_MOM + kv_kpp + kv_shear, torch.zeros_like(kv_total))
+    av_total = (A_V_MOM + kv_kpp + kv_shear) * wet_int_cf
     return kv_total, av_total, h_bl, f_nl_t, f_nl_s
 
 
@@ -543,7 +618,8 @@ def step_ogcm_voronoi(
     ne = mesh.n_edges
 
     is_ocean = sfc.surf_type == SURF_OCEAN
-    is_ocn_f = is_ocean.to(dtype)
+    cache = _get_ogcm_static_cache(ogcm, mesh, is_ocean)
+    is_ocn_f = cache["is_ocn_f"]
     c0 = mesh.cells_on_edge[:, 0]
     c1 = mesh.cells_on_edge[:, 1]
     v0_e = mesh.verts_on_edge[:, 0]
@@ -552,15 +628,18 @@ def step_ogcm_voronoi(
     w_trisk = mesh.trisk_weights
     wet_c = ogcm.wet_c
     wet_e = ogcm.wet_e
-    wet_cf = wet_c.to(dtype)
-    wet_ef = wet_e.to(dtype)
+    wet_cf = cache["wet_cf"]
+    wet_ef = cache["wet_ef"]
     h_c = ogcm.h_c
     h_e = ogcm.h_e
-    h_c_safe = torch.clamp(h_c, min=1.0)
-    h_e_safe = torch.clamp(h_e, min=1.0)
-    wet_int_c = wet_c[:-1] & wet_c[1:]
-    wet_int_e = wet_e[:-1] & wet_e[1:]
-    dz_c_int = 0.5 * (h_c_safe[:-1] + h_c_safe[1:])
+    h_c_safe = cache["h_c_safe"]
+    h_e_safe = cache["h_e_safe"]
+    wet_int_c = cache["wet_int_c"]
+    wet_int_e = cache["wet_int_e"]
+    wet_int_cf = cache["wet_int_cf"]
+    wet_int_ef = cache["wet_int_ef"]
+    dz_c_int = cache["dz_c_int"]
+    inv_dc_edge = cache["inv_dc_edge"]
 
     # 0. Record previous Layer-0 state for KPP surface buoyancy forcing diagnosis, then pull surface update
     t0_prev = ogcm.temp[0].clone()
@@ -568,41 +647,42 @@ def step_ogcm_voronoi(
     T = ogcm.temp.clone()
     T[0] = torch.where(is_ocean, sfc.t_ocean_ml, T[0])
     S = ogcm.sal.clone()
+    t_comp = ogcm.t_comp.clone()
+    s_comp = ogcm.s_comp.clone()
 
     # 1. Surface freshwater, glacier calving cooling & sea-ice brine/melt virtual salt flux (Huang, 1993)
     r_coast = torch.zeros(nc, device=dev, dtype=dtype)
     r_coast.scatter_add_(0, mesh.coastal_ocean_idx, mesh.area_cell * torch.clamp(runoff_total, min=0.0))
-    r_coast = r_coast / mesh.area_cell  # [kg m^-2 s^-1]
+    r_coast = r_coast * cache["inv_area_c"]  # [kg m^-2 s^-1]
 
     q_calve = torch.zeros(nc, device=dev, dtype=dtype)
     q_calve.scatter_add_(0, mesh.coastal_ocean_idx, C.L_F0 * mesh.area_cell * torch.clamp(runoff_glacier, min=0.0))
-    q_calve = q_calve / mesh.area_cell  # [W m^-2]
-    dt_calve = -(dt * q_calve) / (C.CP_SEAWATER * C.RHO_SEAWATER * h_c_safe[0])
-    T[0] = torch.where(is_ocean, T[0] + dt_calve, T[0])
+    q_calve = q_calve * cache["inv_area_c"]  # [W m^-2]
+    dt_calve = (-(dt * q_calve) / (C.CP_SEAWATER * C.RHO_SEAWATER * h_c_safe[0])) * is_ocn_f
+    T0_calv, tc0_calv = _kahan_add(T[0], dt_calve, t_comp[0])
+    T[0] = torch.where(is_ocean, T0_calv, T[0])
+    t_comp[0] = torch.where(is_ocean, tc0_calv, t_comp[0])
 
     dm_ice_thermo = sfc.m_seaice - ogcm.m_seaice_prev  # [kg m^-2]
     fw_evap_minus_p = evap_cell - precip_cell - r_coast  # [kg m^-2 s^-1] (+ = salinification)
     ds_sfc = (
-        S_REF_PSU * (fw_evap_minus_p * dt) + (S_REF_PSU - S_SEAICE_PSU) * dm_ice_thermo
-    ) / (C.RHO_SEAWATER * h_c_safe[0])
-    S[0] = torch.where(is_ocean, torch.clamp(S[0] + ds_sfc, 5.0, 45.0), S[0])
+        (S_REF_PSU * (fw_evap_minus_p * dt) + (S_REF_PSU - S_SEAICE_PSU) * dm_ice_thermo)
+        / (C.RHO_SEAWATER * h_c_safe[0])
+    ) * is_ocn_f
+    S0_next, sc0_next = _kahan_add(S[0], ds_sfc, s_comp[0])
+    S[0] = torch.where(is_ocean, torch.clamp(S0_next, 5.0, 45.0), S[0])
+    s_comp[0] = torch.where(is_ocean, sc0_next, s_comp[0])
 
     # 1b. Conservative Jerlov Type I Shortwave Penetration below Layer 0 (Paulson & Simpson, 1977)
-    # Redistributes `I(z_w[1]) * sw_net_ocn` from Layer 0 into underlying wet layers -> exact column enthalpy conservation!
+    # Redistributes `I(z_w[1]) * sw_net_ocn` from Layer 0 into underlying wet layers via Kahan summation.
     if sw_net_ocn is not None and nzo >= 2:
         sw_pos = torch.clamp(sw_net_ocn, min=0.0) * is_ocn_f
-        trans_w = compute_shortwave_transmission(ogcm.z_w)  # [nzo + 1]
-        # Fraction absorbed in each subsurface wet layer k >= 1
-        frac_sub = torch.zeros((nzo, nc), device=dev, dtype=dtype)
-        for k in range(1, nzo):
-            # If layer k is deepest wet layer, absorb any remaining light reaching seafloor
-            is_deepest = wet_c[k] & (~wet_c[k + 1] if k + 1 < nzo else torch.ones_like(wet_c[k]))
-            f_k = torch.where(is_deepest, trans_w[k], trans_w[k] - trans_w[k + 1])
-            frac_sub[k] = torch.where(wet_c[k], f_k, torch.zeros_like(sw_pos))
-        frac_out_0 = frac_sub[1:].sum(dim=0)  # Exact sum transferred out of Layer 0
         q_to_dt = (dt / (C.CP_SEAWATER * C.RHO_SEAWATER)) * sw_pos
-        T[0] = torch.where(is_ocean, T[0] - (q_to_dt * frac_out_0) / h_c_safe[0], T[0])
-        T[1:] = torch.where(wet_c[1:], T[1:] + (q_to_dt.unsqueeze(0) * frac_sub[1:]) / h_c_safe[1:], T[1:])
+        dt_sw = torch.empty_like(T)
+        dt_sw[0] = -(q_to_dt * cache["frac_out_0"]) / h_c_safe[0]
+        dt_sw[1:] = (q_to_dt.unsqueeze(0) * cache["frac_sub"][1:]) / h_c_safe[1:]
+        dt_sw = dt_sw * wet_cf
+        T, t_comp = _kahan_add(T, dt_sw, t_comp)
 
     # Diagnose exact surface kinematic fluxes & buoyancy flux B_0 [m^2 s^-3] for KPP
     inv_dt = 1.0 / max(dt, 1.0)
@@ -633,7 +713,7 @@ def step_ogcm_voronoi(
     kv_diag, av_diag, h_bl, f_nl_t, f_nl_s = _diagnose_kpp_and_vertical_mixing(
         T=T, S=S, rho_anom=rho_anom, u_cell=u_cell, v_cell=v_cell,
         u_star_o=u_star_o, b0_sfc=b0_sfc, wt_sfc=wt_sfc, ws_sfc=ws_sfc,
-        ogcm=ogcm, mesh=mesh, is_ocean=is_ocean,
+        ogcm=ogcm, mesh=mesh, is_ocean=is_ocean, cache=cache,
     )
     ogcm.h_bl = h_bl
 
@@ -651,40 +731,36 @@ def step_ogcm_voronoi(
     eta_pair = 0.5 * (eta_e.unsqueeze(-1) + eta_e[:, ep_idx])  # [nzo, ne, 10]
     cor_3d = (w_trisk.unsqueeze(0) * eta_pair * u[:, ep_idx]).sum(dim=-1)
 
-    pgf_bc = -(1.0 / C.RHO_SEAWATER) * ((p_baroc[:, c1] - p_baroc[:, c0]) / mesh.dc_edge.unsqueeze(0))
+    pgf_bc = -(1.0 / C.RHO_SEAWATER) * ((p_baroc[:, c1] - p_baroc[:, c0]) * inv_dc_edge.unsqueeze(0))
     lap_u, _ = compute_vector_laplacian_edge(mesh, u)
 
-    # Bottom drag applied on deepest wet layer of each edge
-    is_bot_e = torch.zeros_like(wet_e)
-    for k in range(nzo):
-        is_bot_e[k] = wet_e[k] if k == nzo - 1 else (wet_e[k] & (~wet_e[k + 1]))
-    r_bot = torch.where(is_bot_e, C_DRAG_BOT * torch.abs(u) / h_e_safe, torch.zeros_like(u))
+    # Bottom drag applied on deepest wet layer of each edge (precomputed static mask)
+    r_bot = torch.where(cache["is_bot_e"], C_DRAG_BOT * torch.abs(u) / h_e_safe, torch.zeros_like(u))
 
     du_bc = (cor_3d + pgf_bc + a_h * lap_u - (R_RAYLEIGH_OCN + r_bot) * u) * wet_ef
     du_bc[0] = du_bc[0] + (tau_n_e / (C.RHO_SEAWATER * h_e_safe[0])) * wet_ef[0]
 
     # Explicit baroclinic predictor + implicit KPP/shear vertical momentum viscosity
     u_star = torch.clamp((u + dt * du_bc) * wet_ef, -3.0, 3.0)
-    dz_int_e = 0.5 * (h_e_safe[:-1] + h_e_safe[1:])
+    dz_int_e = cache["dz_int_e"]
     av_e = 0.5 * (av_diag[:, c0] + av_diag[:, c1])
-    c_mom = torch.where(wet_int_e, dt * av_e / dz_int_e, torch.zeros_like(dz_int_e))
+    c_mom = (dt * av_e / dz_int_e) * wet_int_ef
     a_m = torch.zeros((nzo, ne), device=dev, dtype=dtype)
     b_m = torch.ones((nzo, ne), device=dev, dtype=dtype)
     d_m = torch.zeros((nzo, ne), device=dev, dtype=dtype)
     a_m[1:] = -c_mom / h_e_safe[1:]
     d_m[:-1] = -c_mom / h_e_safe[:-1]
-    b_m[:-1] = b_m[:-1] + c_mom / h_e_safe[:-1]
-    b_m[1:] = b_m[1:] + c_mom / h_e_safe[1:]
+    b_m[:-1] = b_m[:-1] - d_m[:-1]
+    b_m[1:] = b_m[1:] - a_m[1:]
     u_star = solve_tridiagonal_batched(a_m, b_m, d_m, u_star) * wet_ef
 
     # 5. Split-Explicit 2D Barotropic Free-Surface Mode (Wicker-Skamarock RK3)
-    h_col_e_safe = torch.clamp(ogcm.h_col_e, min=1.0)
-    ocn_e0 = wet_e[0]
-    ocn_e0f = ocn_e0.to(dtype)
+    h_col_e_safe = cache["h_col_e_safe"]
+    ocn_e0f = cache["ocn_e0f"]
     u_star_baro = (u_star * h_e).sum(dim=0) / h_col_e_safe * ocn_e0f
     f_baro = (u_star_baro - ogcm.u_baro) / max(dt, 1.0)
 
-    h_max = float(ogcm.h_col.max().item()) if bool(is_ocean.any()) else 100.0
+    h_max = cache["h_max"]
     c_bt = math.sqrt(C.GRAVITY * max(h_max, 50.0))
     dt_bt_cfl = 0.35 * dc_min / max(c_bt, 10.0)
     n_bt = max(1, min(int(math.ceil(dt / max(dt_bt_cfl, 1.0))), 24))
@@ -695,13 +771,13 @@ def step_ogcm_voronoi(
     eta_bt = eta_old
     u_bt_acc = torch.zeros_like(u_bt)
 
+    g_inv_dc = -C.GRAVITY * inv_dc_edge
     for _ in range(n_bt):
         u0_bt, eta0_bt = u_bt, eta_bt
         u_stage = u_bt
         for rk_dt in (dt_bt / 3.0, 0.5 * dt_bt, dt_bt):
-            pgf_bt = -C.GRAVITY * ((eta_bt[c1] - eta_bt[c0]) / mesh.dc_edge)
-            du_bt = (pgf_bt + f_baro) * ocn_e0f
-            u_stage = torch.clamp((u0_bt + rk_dt * du_bt) * ocn_e0f, -2.5, 2.5)
+            pgf_bt = g_inv_dc * (eta_bt[c1] - eta_bt[c0])
+            u_stage = torch.clamp((u0_bt + rk_dt * (pgf_bt + f_baro)) * ocn_e0f, -2.5, 2.5)
             deta = -compute_scvt_divergence(mesh, ogcm.h_col_e * u_stage) * is_ocn_f
             eta_bt = torch.clamp((eta0_bt + rk_dt * deta) * is_ocn_f, -5.0, 5.0)
             u_bt = u_stage
@@ -715,19 +791,11 @@ def step_ogcm_voronoi(
     ogcm.u_edge = u_new
 
     # 6. Gent-McWilliams (1990) Eddy Bolus & Neutral Isopycnal Slope (Boundary-Layer Tapered)
-    drho_dx = ((rho_anom[:, c1] - rho_anom[:, c0]) / mesh.dc_edge.unsqueeze(0)) * wet_ef
-    drho_dz_c = torch.where(
-        wet_int_c,
-        (rho_anom[1:] - rho_anom[:-1]) / dz_c_int,
-        torch.zeros_like(dz_c_int),
-    )
+    drho_dx = ((rho_anom[:, c1] - rho_anom[:, c0]) * inv_dc_edge.unsqueeze(0)) * wet_ef
+    drho_dz_c = ((rho_anom[1:] - rho_anom[:-1]) / dz_c_int) * wet_int_cf
     drho_dz_e = 0.5 * (drho_dz_c[:, c0] + drho_dz_c[:, c1])
     drho_dx_int = 0.5 * (drho_dx[:-1] + drho_dx[1:])
-    slope_raw = torch.where(
-        wet_int_e,
-        torch.clamp(-drho_dx_int / torch.clamp(drho_dz_e, min=1.0e-5), -GM_SLOPE_MAX, GM_SLOPE_MAX),
-        torch.zeros_like(drho_dx_int),
-    )
+    slope_raw = torch.clamp(-drho_dx_int / torch.clamp(drho_dz_e, min=1.0e-5), -GM_SLOPE_MAX, GM_SLOPE_MAX) * wet_int_ef
     # Ferrari et al. (2008) / Danabasoglu & McWilliams (1995) linear taper inside KPP boundary layer
     h_bl_e = torch.clamp(0.5 * (h_bl[c0] + h_bl[c1]), min=1.0).unsqueeze(0)
     taper_bl = torch.clamp(ogcm.z_w[1:-1].unsqueeze(1) / h_bl_e, 0.0, 1.0)
@@ -735,7 +803,7 @@ def step_ogcm_voronoi(
 
     psi_gm = torch.zeros((nzo + 1, ne), device=dev, dtype=dtype)
     psi_gm[1:-1] = KAPPA_GM * sx_int  # Psi = 0 at surface and seafloor -> exact zero depth-integral
-    u_gm = torch.where(wet_e, -(psi_gm[1:] - psi_gm[:-1]) / h_e_safe, torch.zeros_like(u_new))
+    u_gm = (-(psi_gm[1:] - psi_gm[:-1]) / h_e_safe) * wet_ef
     u_gm = torch.clamp(u_gm, -0.3, 0.3)
 
     u_adv = (u_new + u_gm) * wet_ef
@@ -744,57 +812,59 @@ def step_ogcm_voronoi(
     h_u_edge = h_e * u_adv
     div_hu = compute_scvt_divergence(mesh, h_u_edge) * wet_cf
     w_vel = torch.zeros((nzo + 1, nc), device=dev, dtype=dtype)
-    for k in range(nzo - 1, -1, -1):
-        w_vel[k] = (w_vel[k + 1] - div_hu[k]) * wet_cf[k]
-    w_sfc_raw = (w_vel[1] - div_hu[0]) * wet_cf[0]
+    # Vectorized bottom-up integration (replaces 18-iteration Python loop)
+    w_up = -torch.flip(torch.cumsum(torch.flip(div_hu, dims=[0]), dim=0), dims=[0]) * wet_cf
+    w_vel[1:-1] = w_up[1:]
+    w_sfc_raw = w_up[0]
     eta_new = torch.clamp((eta_old + dt * w_sfc_raw) * is_ocn_f, -5.0, 5.0)
     ogcm.eta = eta_new
-    w_vel[0] = 0.0
     ogcm.w_vel = w_vel
 
     h0_old = torch.clamp(h_c_safe[0] + eta_old, min=10.0)
     h0_new = torch.clamp(h_c_safe[0] + eta_new, min=10.0)
     dh0_eff = h0_new - h0_old
 
-    # Precompute Voronoi cell geometric weights for exact 2D Redi tensor projection
+    # Precomputed Voronoi cell geometric weights for exact 2D Redi tensor projection
     eoc = mesh.edges_on_cell  # [nc, 6]
-    w_vor_edge = 0.5 * mesh.dc_edge * mesh.dv_edge  # [ne]
-    active_eoc = (mesh.edge_sign_on_cell != 0.0).to(dtype)
-    inv_area_c = 1.0 / mesh.area_cell  # [nc]
+    w_vor_edge = cache["w_vor_edge"]
+    active_eoc = cache["active_eoc"]
+    inv_area_c = cache["inv_area_c"]
 
     if ENABLE_FULL_REDI:
         # Diagonal vertical Redi diffusivity K_v,Redi = kappa_Redi * |S|^2 (folded into implicit tridiagonal!)
         s2_edge_w = (sx_int * sx_int) * w_vor_edge.unsqueeze(0)  # [nzo-1, ne]
         s2_cell = (s2_edge_w[:, eoc] * active_eoc.unsqueeze(0)).sum(dim=-1) * inv_area_c.unsqueeze(0)
-        kv_redi = torch.where(wet_int_c, KAPPA_REDI_HORIZ * s2_cell, torch.zeros_like(s2_cell))
+        kv_redi = (KAPPA_REDI_HORIZ * s2_cell) * wet_int_cf
     else:
         kv_redi = torch.zeros_like(kv_diag)
 
-    # 8. 3D Conservative Flux-Form Tracer Advection + Full Rotated Redi Diffusion + KPP Non-Local Flux
+    # 8. 3D Conservative Flux-Form Tracer Advection (Anomaly Form q' = q - q_ref to minimize float32 cancellation)
+    #    + Full Rotated Redi Diffusion + KPP Non-Local Flux + Neumaier/Kahan Compensated Summation
     def _advect_diffuse_3d(
         q: torch.Tensor,
+        q_ref: float,
         q_comp: torch.Tensor,
         f_nl_q: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        dq_dx = ((q[:, c1] - q[:, c0]) / mesh.dc_edge.unsqueeze(0)) * wet_ef  # [nzo, ne]
-        f_adv = torch.clamp(h_u_edge, min=0.0) * q[:, c0] + torch.clamp(h_u_edge, max=0.0) * q[:, c1]
+        qp = q - q_ref
+        dq_dx = ((qp[:, c1] - qp[:, c0]) * inv_dc_edge.unsqueeze(0)) * wet_ef  # [nzo, ne]
+        f_adv = torch.clamp(h_u_edge, min=0.0) * qp[:, c0] + torch.clamp(h_u_edge, max=0.0) * qp[:, c1]
 
         if ENABLE_FULL_REDI:
             # Griffies et al. (1998) symmetric triad Redi cross-terms (exact zero flux when q = rho!)
-            dq_dz_c = torch.where(wet_int_c, (q[1:] - q[:-1]) / dz_c_int, torch.zeros_like(dz_c_int))
-            dq_dz_e = 0.5 * (dq_dz_c[:, c0] + dq_dz_c[:, c1]) * wet_int_e.to(dtype)
+            dq_dz_c = ((qp[1:] - qp[:-1]) / dz_c_int) * wet_int_cf
+            dq_dz_e = 0.5 * (dq_dz_c[:, c0] + dq_dz_c[:, c1]) * wet_int_ef
             sx_dqdz_int = sx_int * dq_dz_e  # [nzo-1, ne]
-            # Average adjacent upper/lower interface cross-terms onto layer k
             sx_dqdz_lay = torch.zeros_like(dq_dx)
             sx_dqdz_lay[:-1] = sx_dqdz_lay[:-1] + 0.5 * sx_dqdz_int
             sx_dqdz_lay[1:] = sx_dqdz_lay[1:] + 0.5 * sx_dqdz_int
             f_dif = -KAPPA_REDI_HORIZ * h_e * (dq_dx + sx_dqdz_lay) * wet_ef
 
             # Upward vertical Redi cross-flux: +kappa_Redi * (S . grad_h q) at interior interfaces
-            dq_dx_int = 0.5 * (dq_dx[:-1] + dq_dx[1:]) * wet_int_e.to(dtype)
+            dq_dx_int = 0.5 * (dq_dx[:-1] + dq_dx[1:]) * wet_int_ef
             s_dqdx_ew = (sx_int * dq_dx_int) * w_vor_edge.unsqueeze(0)  # [nzo-1, ne]
             s_dot_gradq = (s_dqdx_ew[:, eoc] * active_eoc.unsqueeze(0)).sum(dim=-1) * inv_area_c.unsqueeze(0)
-            f_v_redi_cross = torch.where(wet_int_c, KAPPA_REDI_HORIZ * s_dot_gradq, torch.zeros_like(s_dot_gradq))
+            f_v_redi_cross = (KAPPA_REDI_HORIZ * s_dot_gradq) * wet_int_cf
         else:
             f_dif = -KAPPA_REDI_HORIZ * h_e * dq_dx * wet_ef
             f_v_redi_cross = torch.zeros_like(f_nl_q)
@@ -803,12 +873,11 @@ def step_ogcm_voronoi(
 
         # Vertical upwind advection + Redi cross-flux + KPP non-local convective flux (all interior -> exact conservation!)
         w_int = w_vel[1:-1]
-        f_v_adv = torch.where(w_int >= 0.0, w_int * q[1:], w_int * q[:-1]) * wet_int_c.to(dtype)
-        # Soft limiter on non-local flux to avoid single-step overshoot while preserving exact flux form
+        f_v_adv = torch.where(w_int >= 0.0, w_int * qp[1:], w_int * qp[:-1]) * wet_int_cf
         h_min_int = torch.minimum(h_c_safe[:-1], h_c_safe[1:])
-        q_span = torch.abs(q[1:] - q[:-1]) + 0.5
+        q_span = torch.abs(qp[1:] - qp[:-1]) + 0.5
         f_nl_cap = 0.35 * h_min_int * q_span / max(dt, 1.0)
-        f_nl_lim = torch.clamp(f_nl_q, -f_nl_cap, f_nl_cap) * wet_int_c.to(dtype)
+        f_nl_lim = torch.clamp(f_nl_q, -f_nl_cap, f_nl_cap) * wet_int_cf
 
         f_v_int = f_v_adv + f_v_redi_cross + f_nl_lim
         v_inflow = torch.zeros_like(q)
@@ -816,14 +885,17 @@ def step_ogcm_voronoi(
         v_inflow[1:] = v_inflow[1:] - f_v_int
 
         dq_adv = (dt / h_c_safe) * (-div_h + v_inflow)
-        dq_adv[0] = (dt * (-div_h[0] + v_inflow[0]) - dh0_eff * q[0]) / h0_new
+        dq_adv[0] = (dt * (-div_h[0] + v_inflow[0]) - dh0_eff * qp[0]) / h0_new
         dq_adv = dq_adv * wet_cf
         return _kahan_add(q, dq_adv, q_comp)
 
-    T, ogcm.t_comp = _advect_diffuse_3d(T, ogcm.t_comp, f_nl_t)
-    S, ogcm.s_comp = _advect_diffuse_3d(S, ogcm.s_comp, f_nl_s)
+    T, t_comp = _advect_diffuse_3d(T, T_REF_EOS_K, t_comp, f_nl_t)
+    S, s_comp = _advect_diffuse_3d(S, S_REF_PSU, s_comp, f_nl_s)
 
-    # 9. Implicit Vertical Mixing (KPP + Shear + Tidal + Background + Implicit Redi S^2 + Post-Advection Convective Adj.)
+    # 9. Strictly Conservative Flux-Increment Implicit Vertical Mixing (Float32-Safe!)
+    #    Solving `(I + L) dq = -L q` and reconstructing telescoping fluxes `F_imp = c_dif * d(q + dq)`
+    #    prevents float32 diagonal underflow (`1.0f + c_dif/h == 1.0f` in the abyssal ocean) from
+    #    creating spurious heat/salt, while `_kahan_add` retains sub-ULP deep-ocean tendencies.
     rho_post = compute_seawater_density_anomaly(T, S, ogcm.z_c.unsqueeze(1)) * wet_cf
     drho_dz_post = torch.where(
         wet_int_c,
@@ -831,11 +903,10 @@ def step_ogcm_voronoi(
         torch.ones_like(dz_c_int),
     )
     kv = kv_diag + kv_redi
-    kv = torch.where(drho_dz_post < 0.0, torch.maximum(kv, torch.full_like(kv, KAPPA_V_CONV)), kv)
-    kv = torch.where(wet_int_c, kv, torch.zeros_like(kv))
+    kv = torch.where(drho_dz_post < 0.0, torch.clamp(kv, min=KAPPA_V_CONV), kv) * wet_int_cf
     ogcm.kv_last = kv
 
-    c_dif = dt * kv / dz_c_int
+    c_dif = (dt * kv / dz_c_int) * wet_int_cf
     h_eff = h_c_safe.clone()
     h_eff[0] = h0_new
     a_t = torch.zeros((nzo, nc), device=dev, dtype=dtype)
@@ -843,11 +914,30 @@ def step_ogcm_voronoi(
     d_t = torch.zeros((nzo, nc), device=dev, dtype=dtype)
     a_t[1:] = -c_dif / h_eff[1:]
     d_t[:-1] = -c_dif / h_eff[:-1]
-    b_t[:-1] = b_t[:-1] + c_dif / h_eff[:-1]
-    b_t[1:] = b_t[1:] + c_dif / h_eff[1:]
+    b_t[:-1] = b_t[:-1] - d_t[:-1]
+    b_t[1:] = b_t[1:] - a_t[1:]
 
-    T = solve_tridiagonal_batched(a_t, b_t, d_t, T)
-    S = solve_tridiagonal_batched(a_t, b_t, d_t, S)
+    def _diffuse_vertical_conservative(
+        q: torch.Tensor,
+        q_comp: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q_diff = q[1:] - q[:-1]
+        f_exp = c_dif * q_diff
+        rhs_dq = torch.zeros_like(q)
+        rhs_dq[:-1] = rhs_dq[:-1] + f_exp
+        rhs_dq[1:] = rhs_dq[1:] - f_exp
+        rhs_dq = rhs_dq / h_eff
+        dq_imp = solve_tridiagonal_batched(a_t, b_t, d_t, rhs_dq)
+        # Reconstruct exact telescoping implicit fluxes so sum_k h_eff[k] * dq_cons[k] == 0 identically
+        f_imp = c_dif * (q_diff + (dq_imp[1:] - dq_imp[:-1]))
+        dq_cons = torch.zeros_like(q)
+        dq_cons[:-1] = dq_cons[:-1] + f_imp
+        dq_cons[1:] = dq_cons[1:] - f_imp
+        dq_cons = (dq_cons / h_eff) * wet_cf
+        return _kahan_add(q, dq_cons, q_comp)
+
+    T, t_comp = _diffuse_vertical_conservative(T, t_comp)
+    S, s_comp = _diffuse_vertical_conservative(S, s_comp)
     S = torch.where(wet_c, torch.clamp(S, 5.0, 45.0), S)
 
     # 10. Conservative Freezing Check on Layer 0 (if advection/mixing cools T[0] below T_freeze)
@@ -856,11 +946,15 @@ def step_ogcm_voronoi(
     dm_freeze = (c0_cap * freeze_exc) / C.L_F0
     T[0] = torch.where(is_ocean, T[0] + freeze_exc, T[0])
     ds_brine = ((S_REF_PSU - S_SEAICE_PSU) * dm_freeze) / (C.RHO_SEAWATER * h_c_safe[0])
-    S[0] = torch.where(is_ocean, torch.clamp(S[0] + ds_brine, 5.0, 45.0), S[0])
+    S0_br, sc0_br = _kahan_add(S[0], ds_brine * is_ocn_f, s_comp[0])
+    S[0] = torch.where(is_ocean, torch.clamp(S0_br, 5.0, 45.0), S[0])
+    s_comp[0] = torch.where(is_ocean, sc0_br, s_comp[0])
     T = torch.where(wet_c, torch.clamp(T, min=C.T_FREEZE_OCEAN), T)
 
     ogcm.temp = T
     ogcm.sal = S
+    ogcm.t_comp = t_comp
+    ogcm.s_comp = s_comp
     sfc.t_ocean_ml = torch.where(is_ocean, T[0], sfc.t_ocean_ml)
     sfc.m_seaice = torch.where(is_ocean, torch.clamp(sfc.m_seaice + dm_freeze, min=0.0), sfc.m_seaice)
 
