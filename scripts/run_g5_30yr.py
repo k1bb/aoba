@@ -37,6 +37,7 @@ from aoba.io_zarr import (
     export_scvt_mesh_xarray,
     save_zarr,
 )
+from aoba.ocean_ogcm import diagnose_ocean_spinup_metrics
 from aoba.params import (
     OutputConfig,
     build_configs_from_dict,
@@ -438,23 +439,44 @@ def _build_monthly_mean_xarray(
         "w_root": "kg m-2", "lai": "m2 m-2", "precip_mm_day": "mm day-1",
         "olr": "W m-2", "asr": "W m-2", "evap_mm_day": "mm day-1", "gpp": "umol m-2 s-1",
     }
+    units_2d_ocn = {"ocn_eta": "m", "ocn_sss": "psu", "ocn_h_bl": "m"}
     units_3d = {"temp": "K", "pres": "Pa", "q_v": "kg kg-1", "u_zonal": "m s-1", "v_merid": "m s-1"}
+    units_3d_ocn = {
+        "ocn_temp": "K",
+        "ocn_sal": "psu",
+        "ocn_u_zonal": "m s-1",
+        "ocn_v_merid": "m s-1",
+        "ocn_w_vel": "m s-1",
+    }
 
     if include_2d:
         kg30, kg5 = diagnose_model_koppen_geiger(model)
         for name, unit in units_2d.items():
-            arr = (sums[name] * inv).detach().cpu().numpy()[None, :]
-            data_vars[name] = (("time", "n_cell"), arr, {"units": unit})
+            if name in sums:
+                arr = (sums[name] * inv).detach().cpu().numpy()[None, :]
+                data_vars[name] = (("time", "n_cell"), arr, {"units": unit})
+        if model.ogcm is not None:
+            for name, unit in units_2d_ocn.items():
+                if name in sums:
+                    arr = (sums[name] * inv).detach().cpu().numpy()[None, :]
+                    data_vars[name] = (("time", "n_cell"), arr, {"units": unit})
         if model.icesheet is not None:
             for name in ("h_ice", "z_topo_dyn"):
-                arr = (sums[name] * inv).detach().cpu().numpy()[None, :]
-                data_vars[name] = (("time", "n_cell"), arr, {"units": "m"})
+                if name in sums:
+                    arr = (sums[name] * inv).detach().cpu().numpy()[None, :]
+                    data_vars[name] = (("time", "n_cell"), arr, {"units": "m"})
         data_vars["koppen_code"] = (("time", "n_cell"), kg30.detach().cpu().numpy()[None, :])
         data_vars["koppen_major"] = (("time", "n_cell"), kg5.detach().cpu().numpy()[None, :])
     if include_3d:
         for name, unit in units_3d.items():
-            arr = (sums[name] * inv).detach().cpu().numpy()[None, :, :]
-            data_vars[name] = (("time", "nz", "n_cell"), arr, {"units": unit})
+            if name in sums:
+                arr = (sums[name] * inv).detach().cpu().numpy()[None, :, :]
+                data_vars[name] = (("time", "nz", "n_cell"), arr, {"units": unit})
+        if model.ogcm is not None:
+            for name, unit in units_3d_ocn.items():
+                if name in sums:
+                    arr = (sums[name] * inv).detach().cpu().numpy()[None, :, :]
+                    data_vars[name] = (("time", "nz_ocn", "n_cell"), arr, {"units": unit})
     if include_subgrid_2d:
         for name, unit in _SUBGRID_2D_UNITS.items():
             if name in sums:
@@ -470,6 +492,8 @@ def _build_monthly_mean_xarray(
     }
     if include_3d:
         coords["nz"] = ("nz", model.vgrid.zeta_c.detach().cpu().numpy(), {"units": "m", "positive": "up"})
+        if model.ogcm is not None:
+            coords["nz_ocn"] = ("nz_ocn", model.ogcm.z_c.detach().cpu().numpy(), {"units": "m", "positive": "down"})
     if include_subgrid_2d:
         coords["crm_y"] = ("crm_y", np.arange(ny, dtype=np.float32) * model.crm.dy, {"units": "m"})
         coords["crm_x"] = ("crm_x", np.arange(nx, dtype=np.float32) * model.crm.dx, {"units": "m"})
@@ -642,13 +666,19 @@ def main() -> None:
     resume_m_idx = 0
     resume_m_cnt = 0
     resume_m_sums: dict[str, torch.Tensor] = {}
+    resume_mon_accum: dict[str, float] | None = None
+    resume_mon_cnt = 0
+    prev_ohc_j: float | None = None
+    prev_ohc_time_sec: float | None = None
     resumed_existing = False
     if not args.no_resume:
         for y in range(years, 0, -1):
             y_dir = out_root / f"year_{y:04d}"
             if (y_dir / "_COMPLETE").exists() and (y_dir / "restart.pt").exists():
                 print(f"Resuming from completed Year {y:04d} ({y_dir / 'restart.pt'})...", flush=True)
-                _load_restart_into_model(model, y_dir / "restart.pt", dev)
+                ckpt_yr = _load_restart_into_model(model, y_dir / "restart.pt", dev)
+                prev_ohc_j = ckpt_yr.get("prev_ohc_j", None)
+                prev_ohc_time_sec = ckpt_yr.get("prev_ohc_time_sec", None)
                 start_year = y + 1
                 resumed_existing = True
                 break
@@ -659,13 +689,65 @@ def main() -> None:
                 ckpt_mid = _load_restart_into_model(model, mid_pt, dev)
                 start_year = y
                 resumed_existing = True
+                prev_ohc_j = ckpt_mid.get("prev_ohc_j", None)
+                prev_ohc_time_sec = ckpt_mid.get("prev_ohc_time_sec", None)
                 if not ckpt_mid.get("_vertical_remapped", False):
                     resume_step_in_yr = int(ckpt_mid.get("resume_step_in_yr", 0))
                     resume_m_idx = int(ckpt_mid.get("resume_m_idx", 0))
                     resume_m_cnt = int(ckpt_mid.get("resume_m_cnt", 0))
                     raw_msums = ckpt_mid.get("resume_m_sums", {}) or {}
                     resume_m_sums = {k: v.to(device=dev) for k, v in raw_msums.items()}
+                    resume_mon_accum = ckpt_mid.get("resume_mon_accum", None)
+                    resume_mon_cnt = int(ckpt_mid.get("resume_mon_cnt", 0))
                 break
+
+    # Continuous ocean + coupled spin-up monitor CSV across all years & restarts
+    spinup_csv = out_root / "spinup_monitor.csv"
+    _SPINUP_HEADER = [
+        "year", "month", "date", "sim_days",
+        "ts_k", "olr_wm2", "asr_wm2", "net_toa_wm2", "ohc_flux_wm2",
+        "precip_mm_d", "gpp_umol", "lai", "seaice_mkm2", "seaice_nh_mkm2", "seaice_sh_mkm2",
+        "sst_global_k", "sss_global_psu",
+        "t_ocn_global_k", "t_ocn_0_300m_k", "t_ocn_300_1500m_k", "t_ocn_deep_k",
+        "s_ocn_global_psu", "ohc_zj", "ocn_ke_jm2", "ocn_eta_rms_m",
+        "ocn_hbl_mean_m", "ocn_hbl_max_m", "amoc_26n_sv", "amoc_max_sv", "acc_drake_sv",
+    ]
+    a_earth_m2 = float(model.mesh.area_cell.detach().cpu().to(torch.float64).sum().item())
+    if not spinup_csv.exists() or (start_year == 1 and resume_step_in_yr == 0 and not resumed_existing):
+        with open(spinup_csv, "w", newline="") as f_sp:
+            csv.writer(f_sp).writerow(_SPINUP_HEADER)
+            if model.ogcm is not None:
+                m0 = diagnose_ocean_spinup_metrics(model.ogcm, model.sfc, model.mesh)
+                prev_ohc_j = m0.get("ohc_j", None)
+                prev_ohc_time_sec = model.sim_time_sec
+                date0 = model.calendar.date_at(model.sim_time_sec).iso_date
+                csv.writer(f_sp).writerow([
+                    0, 0, date0, f"{model.sim_time_sec / C.SECONDS_PER_DAY:.2f}",
+                    "nan", "nan", "nan", "nan", "0.000",
+                    "nan", "nan", "nan",
+                    f"{m0.get('seaice_nh_mkm2', 0.0) + m0.get('seaice_sh_mkm2', 0.0):.3f}",
+                    f"{m0.get('seaice_nh_mkm2', float('nan')):.3f}",
+                    f"{m0.get('seaice_sh_mkm2', float('nan')):.3f}",
+                    f"{m0.get('sst_global_k', float('nan')):.4f}",
+                    f"{m0.get('sss_global_psu', float('nan')):.4f}",
+                    f"{m0.get('t_ocn_global_k', float('nan')):.5f}",
+                    f"{m0.get('t_ocn_0_300m_k', float('nan')):.5f}",
+                    f"{m0.get('t_ocn_300_1500m_k', float('nan')):.5f}",
+                    f"{m0.get('t_ocn_deep_k', float('nan')):.5f}",
+                    f"{m0.get('s_ocn_global_psu', float('nan')):.5f}",
+                    f"{m0.get('ohc_zj', float('nan')):.4f}",
+                    f"{m0.get('ocn_ke_jm2', float('nan')):.2f}",
+                    f"{m0.get('ocn_eta_rms_m', float('nan')):.4f}",
+                    f"{m0.get('ocn_hbl_mean_m', float('nan')):.2f}",
+                    f"{m0.get('ocn_hbl_max_m', float('nan')):.1f}",
+                    f"{m0.get('amoc_26n_sv', float('nan')):.2f}",
+                    f"{m0.get('amoc_max_sv', float('nan')):.2f}",
+                    f"{m0.get('acc_drake_sv', float('nan')):.2f}",
+                ])
+    elif prev_ohc_j is None and model.ogcm is not None:
+        m_res = diagnose_ocean_spinup_metrics(model.ogcm, model.sfc, model.mesh)
+        prev_ohc_j = m_res.get("ohc_j", None)
+        prev_ohc_time_sec = model.sim_time_sec
 
     if not resumed_existing and args.init_from_restart:
         init_pt = Path(args.init_from_restart).expanduser()
@@ -743,6 +825,12 @@ def main() -> None:
 
         day_accum = {"ts": 0.0, "olr": 0.0, "asr": 0.0, "p": 0.0, "gpp": 0.0, "lai": 0.0, "ice": 0.0}
         day_cnt = 0
+        mon_accum = (
+            dict(resume_mon_accum)
+            if (is_mid_resume and resume_mon_accum is not None)
+            else {"ts": 0.0, "olr": 0.0, "asr": 0.0, "p": 0.0, "gpp": 0.0, "lai": 0.0, "ice": 0.0}
+        )
+        mon_cnt = resume_mon_cnt if is_mid_resume else 0
         hr_t2_sum: torch.Tensor | None = None
         hr_precip_sum: torch.Tensor | None = None
         hr_olr_sum: torch.Tensor | None = None
@@ -756,6 +844,8 @@ def main() -> None:
         resume_m_idx = 0
         resume_m_cnt = 0
         resume_m_sums = {}
+        resume_mon_accum = None
+        resume_mon_cnt = 0
         t_day0 = time.perf_counter()
         prev_cal_month = model.calendar.date_at(model.sim_time_sec).month
 
@@ -795,6 +885,15 @@ def main() -> None:
             day_accum["lai"] += diag.land_mean_lai
             day_accum["ice"] += diag.seaice_area_million_km2
             day_cnt += 1
+
+            mon_accum["ts"] += diag.global_mean_t_sfc_k
+            mon_accum["olr"] += diag.global_mean_olr_wm2
+            mon_accum["asr"] += diag.global_mean_asr_wm2
+            mon_accum["p"] += diag.global_mean_precip_mm_day
+            mon_accum["gpp"] += diag.land_mean_gpp_umol
+            mon_accum["lai"] += diag.land_mean_lai
+            mon_accum["ice"] += diag.seaice_area_million_km2
+            mon_cnt += 1
 
             # Accumulate 1-hour-mean 2D preview fields on device
             _, _, temp0_p = diagnose_pressure_temperature(
@@ -865,6 +964,12 @@ def main() -> None:
                         "evap_mm_day": evap * C.SECONDS_PER_DAY,
                         "gpp": gpp_c,
                     })
+                    if model.ogcm is not None:
+                        og = model.ogcm
+                        sample["ocn_eta"] = og.eta
+                        sample["ocn_sss"] = og.sal[0]
+                        if og.h_bl is not None:
+                            sample["ocn_h_bl"] = og.h_bl
                     if model.icesheet is not None:
                         sample["h_ice"] = model.icesheet.h_ice
                         sample["z_topo_dyn"] = model.mesh.z_topo
@@ -878,6 +983,17 @@ def main() -> None:
                         "u_zonal": u_c,
                         "v_merid": v_c,
                     })
+                    if model.ogcm is not None:
+                        og = model.ogcm
+                        uo_c, vo_c = reconstruct_cell_winds(model.mesh, og.u_edge * og.wet_e.to(og.u_edge.dtype))
+                        wo_c = 0.5 * (og.w_vel[:-1] + og.w_vel[1:])
+                        sample.update({
+                            "ocn_temp": og.temp,
+                            "ocn_sal": og.sal,
+                            "ocn_u_zonal": uo_c,
+                            "ocn_v_merid": vo_c,
+                            "ocn_w_vel": wo_c,
+                        })
                 if out_cfg.monthly_mean_include_subgrid_2d:
                     sample.update({k: val for k, (val, _) in diagnose_subgrid_2d_fields(model).items()})
 
@@ -885,7 +1001,10 @@ def main() -> None:
                     m_sums = {k: v.clone() for k, v in sample.items()}
                 else:
                     for k, v in sample.items():
-                        m_sums[k] += v
+                        if k in m_sums:
+                            m_sums[k] += v
+                        else:
+                            m_sums[k] = v.clone()
                 m_cnt += 1
 
             if step_in_yr % csv_stride_steps == 0 or step_in_yr == steps_per_year:
@@ -933,6 +1052,66 @@ def main() -> None:
                         ),
                         monthly_zarr,
                     )
+                # Log monthly coupled + 3D OGCM spin-up monitoring metrics
+                inv_m = 1.0 / float(max(mon_cnt, 1))
+                m_ts = mon_accum["ts"] * inv_m
+                m_olr = mon_accum["olr"] * inv_m
+                m_asr = mon_accum["asr"] * inv_m
+                m_net_toa = m_asr - m_olr
+                m_p = mon_accum["p"] * inv_m
+                m_gpp = mon_accum["gpp"] * inv_m
+                m_lai = mon_accum["lai"] * inv_m
+                m_ice = mon_accum["ice"] * inv_m
+                ocn_m = diagnose_ocean_spinup_metrics(model.ogcm, model.sfc, model.mesh) if model.ogcm is not None else {}
+                ohc_now = ocn_m.get("ohc_j", float("nan"))
+                if prev_ohc_j is not None and prev_ohc_time_sec is not None and math.isfinite(ohc_now):
+                    dt_mon = max(model.sim_time_sec - prev_ohc_time_sec, 1.0)
+                    ohc_flux_wm2 = (ohc_now - prev_ohc_j) / (dt_mon * a_earth_m2)
+                else:
+                    ohc_flux_wm2 = float("nan")
+                if math.isfinite(ohc_now):
+                    prev_ohc_j = ohc_now
+                    prev_ohc_time_sec = model.sim_time_sec
+                mon_num = m_idx + 1
+                with open(spinup_csv, "a", newline="") as f_sp:
+                    csv.writer(f_sp).writerow([
+                        year, mon_num, diag.date_str, f"{diag.sim_time_days:.2f}",
+                        f"{m_ts:.3f}", f"{m_olr:.2f}", f"{m_asr:.2f}", f"{m_net_toa:.3f}", f"{ohc_flux_wm2:.3f}",
+                        f"{m_p:.3f}", f"{m_gpp:.3f}", f"{m_lai:.3f}", f"{m_ice:.3f}",
+                        f"{ocn_m.get('seaice_nh_mkm2', float('nan')):.3f}",
+                        f"{ocn_m.get('seaice_sh_mkm2', float('nan')):.3f}",
+                        f"{ocn_m.get('sst_global_k', float('nan')):.4f}",
+                        f"{ocn_m.get('sss_global_psu', float('nan')):.4f}",
+                        f"{ocn_m.get('t_ocn_global_k', float('nan')):.5f}",
+                        f"{ocn_m.get('t_ocn_0_300m_k', float('nan')):.5f}",
+                        f"{ocn_m.get('t_ocn_300_1500m_k', float('nan')):.5f}",
+                        f"{ocn_m.get('t_ocn_deep_k', float('nan')):.5f}",
+                        f"{ocn_m.get('s_ocn_global_psu', float('nan')):.5f}",
+                        f"{ocn_m.get('ohc_zj', float('nan')):.4f}",
+                        f"{ocn_m.get('ocn_ke_jm2', float('nan')):.2f}",
+                        f"{ocn_m.get('ocn_eta_rms_m', float('nan')):.4f}",
+                        f"{ocn_m.get('ocn_hbl_mean_m', float('nan')):.2f}",
+                        f"{ocn_m.get('ocn_hbl_max_m', float('nan')):.1f}",
+                        f"{ocn_m.get('amoc_26n_sv', float('nan')):.2f}",
+                        f"{ocn_m.get('amoc_max_sv', float('nan')):.2f}",
+                        f"{ocn_m.get('acc_drake_sv', float('nan')):.2f}",
+                    ])
+                if ocn_m:
+                    print(
+                        f"[OCEAN Y{year:03d} M{mon_num:02d} | {diag.date_str}] "
+                        f"NetTOA={m_net_toa:+5.2f} dOHC={ohc_flux_wm2:+5.2f} W/m2 | "
+                        f"Tocn(glob/up/mid/deep)={ocn_m['t_ocn_global_k']:.3f}/{ocn_m['t_ocn_0_300m_k']:.2f}/"
+                        f"{ocn_m['t_ocn_300_1500m_k']:.2f}/{ocn_m['t_ocn_deep_k']:.3f} K | "
+                        f"S={ocn_m['s_ocn_global_psu']:.4f} psu | "
+                        f"AMOC(26N/max)={ocn_m['amoc_26n_sv']:.1f}/{ocn_m['amoc_max_sv']:.1f} Sv | "
+                        f"ACC={ocn_m['acc_drake_sv']:.1f} Sv | KE={ocn_m['ocn_ke_jm2']:.0f} J/m2 | "
+                        f"MLD={ocn_m['ocn_hbl_mean_m']:.0f}m(max {ocn_m['ocn_hbl_max_m']:.0f}m) | "
+                        f"Ice(NH/SH)={ocn_m['seaice_nh_mkm2']:.1f}/{ocn_m['seaice_sh_mkm2']:.1f} Mkm2",
+                        flush=True,
+                    )
+                for k in mon_accum:
+                    mon_accum[k] = 0.0
+                mon_cnt = 0
                 m_sums.clear()
                 m_cnt = 0
                 m_idx += 1
@@ -963,9 +1142,18 @@ def main() -> None:
                         "resume_m_idx": m_idx,
                         "resume_m_cnt": m_cnt,
                         "resume_m_sums": {k: v.detach().cpu() for k, v in m_sums.items()},
+                        "resume_mon_accum": dict(mon_accum),
+                        "resume_mon_cnt": mon_cnt,
+                        "prev_ohc_j": prev_ohc_j,
+                        "prev_ohc_time_sec": prev_ohc_time_sec,
                     },
                 )
                 print(f"[Saved mid-year restart at {diag.date_str} (step {step_in_yr}/{steps_per_year})]", flush=True)
+                stop_flag = out_root / "STOP_AFTER_MONTH"
+                if stop_flag.exists():
+                    stop_flag.unlink(missing_ok=True)
+                    print(f"[Graceful STOP_AFTER_MONTH requested; exiting cleanly after saving {y_dir / 'restart_mid.pt'}]", flush=True)
+                    return
             prev_cal_month = cur_cal_month
 
             if max_total_steps is not None and model.step_count >= max_total_steps:
@@ -973,10 +1161,22 @@ def main() -> None:
                 break
 
         if year % max(int(out_cfg.restart_interval_years), 1) == 0 or year == years or stop_by_end_date:
-            _save_restart_atomic(model, y_dir / "restart.pt")
+            _save_restart_atomic(
+                model,
+                y_dir / "restart.pt",
+                extra={
+                    "prev_ohc_j": prev_ohc_j,
+                    "prev_ohc_time_sec": prev_ohc_time_sec,
+                },
+            )
             (y_dir / "_COMPLETE").touch()
             (y_dir / "restart_mid.pt").unlink(missing_ok=True)
         print(f"=== Completed Year {year:04d} / {years:04d} -> {y_dir} ===", flush=True)
+        stop_flag = out_root / "STOP_AFTER_MONTH"
+        if stop_flag.exists():
+            stop_flag.unlink(missing_ok=True)
+            print(f"[Graceful STOP_AFTER_MONTH requested; exiting cleanly after completing Year {year:04d}]", flush=True)
+            return
         if stop_by_end_date:
             print(f"Reached target end_date ({out_cfg.end_date}) at {model.calendar.date_at(model.sim_time_sec).iso_date}.", flush=True)
             break

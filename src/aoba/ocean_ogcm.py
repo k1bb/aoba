@@ -1244,3 +1244,129 @@ def step_ogcm_voronoi(
         step_seaice_drift_voronoi(sfc, mesh, tau_x_sfc, tau_y_sfc, u_new[0], dt, cache=cache)
 
     ogcm.m_seaice_prev = sfc.m_seaice.clone()
+
+
+def diagnose_ocean_spinup_metrics(
+    ogcm: OceanOGCMState,
+    sfc: SurfaceState,
+    mesh: SCVTMesh,
+) -> dict[str, float]:
+    """Compute float64-accumulated 3D OGCM spin-up diagnostics (T/S by depth, OHC, KE, AMOC, ACC, sea ice).
+
+    Purely passive post-step monitoring diagnostics; does not modify model state or physics.
+    """
+    from aoba.surface import MC_SEAICE_CRIT
+
+    # Reconstruct 3D cell winds on device, then transfer compact [nzo, nc] arrays to CPU float64
+    # for exact global integral accumulation across all backends (CUDA, MPS, CPU).
+    u_c_dev, v_c_dev = reconstruct_cell_winds(mesh, ogcm.u_edge * ogcm.wet_e.to(ogcm.u_edge.dtype))
+    u64 = u_c_dev.detach().cpu().to(torch.float64)
+    v64 = v_c_dev.detach().cpu().to(torch.float64)
+
+    area = mesh.area_cell.detach().cpu().to(torch.float64)
+    wet_c = ogcm.wet_c.detach().cpu()
+    wet0 = wet_c[0]
+    area_ocn = torch.where(wet0, area, torch.zeros_like(area))
+    a_ocn_tot = float(area_ocn.sum().item())
+    if a_ocn_tot <= 0.0:
+        return {}
+
+    h_c64 = ogcm.h_c.detach().cpu().to(torch.float64)
+    eta64 = ogcm.eta.detach().cpu().to(torch.float64)
+    h_eff = h_c64.clone()
+    h_eff[0] = torch.where(
+        wet0,
+        torch.clamp(h_c64[0] + eta64, min=10.0),
+        torch.zeros_like(area),
+    )
+    vol = h_eff * area.unsqueeze(0)  # [nzo, nc] [m^3]
+    v_tot = float(vol.sum().item())
+
+    t64 = ogcm.temp.detach().cpu().to(torch.float64) + ogcm.t_comp.detach().cpu().to(torch.float64)
+    s64 = ogcm.sal.detach().cpu().to(torch.float64) + ogcm.s_comp.detach().cpu().to(torch.float64)
+
+    t_global = float((vol * t64).sum().item() / max(v_tot, 1.0))
+    s_global = float((vol * s64).sum().item() / max(v_tot, 1.0))
+    sst_global = float((area_ocn * t64[0]).sum().item() / a_ocn_tot)
+    sss_global = float((area_ocn * s64[0]).sum().item() / a_ocn_tot)
+
+    zc = ogcm.z_c.detach().cpu().to(torch.float64)
+    def _band_mean(mask_z: torch.Tensor) -> float:
+        if not bool(mask_z.any()):
+            return float("nan")
+        vb = vol[mask_z]
+        vsum = float(vb.sum().item())
+        if vsum <= 0.0:
+            return float("nan")
+        return float((vb * t64[mask_z]).sum().item() / vsum)
+
+    t_upper = _band_mean(zc < 300.0)
+    t_mid = _band_mean((zc >= 300.0) & (zc < 1500.0))
+    t_deep = _band_mean(zc >= 1500.0)
+
+    ohc_j = float(C.RHO_SEAWATER * C.CP_SEAWATER * (vol * (t64 - C.T_FREEZE)).sum().item())
+    ohc_zj = ohc_j * 1.0e-21
+
+    ke_jm2 = float(0.5 * C.RHO_SEAWATER * (vol * (u64 * u64 + v64 * v64)).sum().item() / a_ocn_tot)
+    eta_rms = math.sqrt(float((area_ocn * eta64 * eta64).sum().item() / a_ocn_tot))
+
+    if ogcm.h_bl is not None:
+        hbl64 = ogcm.h_bl.detach().cpu().to(torch.float64)
+        hbl_mean = float((area_ocn * hbl64).sum().item() / a_ocn_tot)
+        hbl_max = float(torch.where(wet0, hbl64, torch.zeros_like(hbl64)).max().item())
+    else:
+        hbl_mean = float("nan")
+        hbl_max = float("nan")
+
+    # Hemispheric sea-ice areas [10^6 km^2]
+    m_si64 = sfc.m_seaice.detach().cpu().to(torch.float64)
+    f_ice = torch.clamp(torch.sqrt(torch.clamp(m_si64, min=0.0) / MC_SEAICE_CRIT), 0.0, 1.0)
+    lat_rad = mesh.lat_cell.detach().cpu().to(torch.float64)
+    lon_deg = torch.rad2deg(mesh.lon_cell.detach().cpu().to(torch.float64))
+    lat_deg = torch.rad2deg(lat_rad)
+    ice_nh = float((area_ocn * f_ice * (lat_rad >= 0.0).to(torch.float64)).sum().item() * 1.0e-12)
+    ice_sh = float((area_ocn * f_ice * (lat_rad < 0.0).to(torch.float64)).sum().item() * 1.0e-12)
+
+    # Meridional overturning streamfunction (AMOC in Atlantic sector) [Sv]
+    def _amoc_at_lat(lat_c: float, half_w: float = 2.5) -> float:
+        lon_hi = -10.0 if lat_c < 35.0 else 20.0
+        band = wet0 & (lat_deg >= (lat_c - half_w)) & (lat_deg <= (lat_c + half_w)) & (lon_deg >= -82.0) & (lon_deg <= lon_hi)
+        if not bool(band.any()):
+            return 0.0
+        dlat_m = C.EARTH_RADIUS * math.radians(2.0 * half_w)
+        # Transport per layer [m^3 s^-1]: sum_{i in band} v_k * h_k * area_i / dlat_m
+        t_layer = (v64[:, band] * h_eff[:, band] * (area[band].unsqueeze(0) / dlat_m)).sum(dim=1)
+        psi_sv = torch.cumsum(t_layer, dim=0) * 1.0e-6
+        return float(psi_sv.max().item())
+
+    amoc_26n = _amoc_at_lat(26.5, half_w=2.5)
+    amoc_max = max(_amoc_at_lat(lat_c, half_w=2.5) for lat_c in (24.0, 28.0, 32.0, 36.0, 40.0, 44.0, 48.0, 52.0, 56.0))
+
+    # Antarctic Circumpolar Current (ACC) eastward volume transport through Drake Passage [Sv]
+    drake = wet0 & (lon_deg >= -72.0) & (lon_deg <= -58.0) & (lat_deg >= -66.0) & (lat_deg <= -54.0)
+    if bool(drake.any()):
+        dlon_m = C.EARTH_RADIUS * torch.clamp(torch.cos(lat_rad[drake]), min=0.1) * math.radians(14.0)
+        acc_drake = float((u64[:, drake] * h_eff[:, drake] * (area[drake] / dlon_m).unsqueeze(0)).sum().item() * 1.0e-6)
+    else:
+        acc_drake = 0.0
+
+    return {
+        "t_ocn_global_k": t_global,
+        "t_ocn_0_300m_k": t_upper,
+        "t_ocn_300_1500m_k": t_mid,
+        "t_ocn_deep_k": t_deep,
+        "sst_global_k": sst_global,
+        "s_ocn_global_psu": s_global,
+        "sss_global_psu": sss_global,
+        "ohc_j": ohc_j,
+        "ohc_zj": ohc_zj,
+        "ocn_ke_jm2": ke_jm2,
+        "ocn_eta_rms_m": eta_rms,
+        "ocn_hbl_mean_m": hbl_mean,
+        "ocn_hbl_max_m": hbl_max,
+        "amoc_26n_sv": amoc_26n,
+        "amoc_max_sv": amoc_max,
+        "acc_drake_sv": acc_drake,
+        "seaice_nh_mkm2": ice_nh,
+        "seaice_sh_mkm2": ice_sh,
+    }

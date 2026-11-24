@@ -175,6 +175,12 @@ def export_aoba_snapshot_xarray(
         if model.icesheet is not None:
             data_vars["h_ice"] = (("time", "n_cell"), _c1(model.icesheet.h_ice), {"units": "m"})
             data_vars["z_topo_dyn"] = (("time", "n_cell"), _c1(mesh.z_topo), {"units": "m"})
+        if model.ogcm is not None:
+            og = model.ogcm
+            data_vars["ocn_eta"] = (("time", "n_cell"), _c1(og.eta), {"units": "m"})
+            data_vars["ocn_sss"] = (("time", "n_cell"), _c1(og.sal[0]), {"units": "psu"})
+            if og.h_bl is not None:
+                data_vars["ocn_h_bl"] = (("time", "n_cell"), _c1(og.h_bl), {"units": "m"})
     if include_3d:
         u_c, v_c = reconstruct_cell_winds(mesh, atmos.u_edge)
         pres_c, _, temp_c = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
@@ -185,6 +191,17 @@ def export_aoba_snapshot_xarray(
             "u_zonal": (("time", "nz", "n_cell"), _c2(u_c), {"units": "m s-1"}),
             "v_merid": (("time", "nz", "n_cell"), _c2(v_c), {"units": "m s-1"}),
         })
+        if model.ogcm is not None:
+            og = model.ogcm
+            uo_c, vo_c = reconstruct_cell_winds(mesh, og.u_edge * og.wet_e.to(og.u_edge.dtype))
+            wo_c = 0.5 * (og.w_vel[:-1] + og.w_vel[1:])
+            data_vars.update({
+                "ocn_temp": (("time", "nz_ocn", "n_cell"), _c2(og.temp), {"units": "K"}),
+                "ocn_sal": (("time", "nz_ocn", "n_cell"), _c2(og.sal), {"units": "psu"}),
+                "ocn_u_zonal": (("time", "nz_ocn", "n_cell"), _c2(uo_c), {"units": "m s-1"}),
+                "ocn_v_merid": (("time", "nz_ocn", "n_cell"), _c2(vo_c), {"units": "m s-1"}),
+                "ocn_w_vel": (("time", "nz_ocn", "n_cell"), _c2(wo_c), {"units": "m s-1"}),
+            })
     if include_subgrid_2d:
         for k, (val, unit) in diagnose_subgrid_2d_fields(model).items():
             data_vars[k] = (("time", "n_cell", "crm_y", "crm_x"), _c3(val), {"units": unit})
@@ -196,6 +213,8 @@ def export_aoba_snapshot_xarray(
     }
     if include_3d:
         coords["nz"] = ("nz", model.vgrid.zeta_c.detach().cpu().numpy(), {"units": "m", "positive": "up"})
+        if model.ogcm is not None:
+            coords["nz_ocn"] = ("nz_ocn", model.ogcm.z_c.detach().cpu().numpy(), {"units": "m", "positive": "down"})
     if include_subgrid_2d:
         coords["crm_y"] = ("crm_y", np.arange(ny, dtype=np.float32) * model.crm.dy, {"units": "m"})
         coords["crm_x"] = ("crm_x", np.arange(nx, dtype=np.float32) * model.crm.dx, {"units": "m"})
@@ -233,22 +252,34 @@ def export_scvt_mesh_xarray(model: "AOBAState") -> xr.Dataset:
         mesh.verts_on_edge[e_cell, 1],
     ).detach().cpu().numpy()
 
+    data_vars: dict[str, Any] = {
+        "area_cell": (("n_cell",), mesh.area_cell.detach().cpu().numpy(), {"units": "m2"}),
+        "surf_type": (("n_cell",), mesh.surf_type.detach().cpu().numpy(), {"long_name": "0=Ocean, 1=Land, 2=IceSheet"}),
+        "z_topo": (("n_cell",), mesh.z_topo.detach().cpu().numpy(), {"units": "m"}),
+        "verts_on_cell": (("n_cell", "max_n_vert"), verts_on_cell),
+        "n_edges_on_cell": (("n_cell",), mesh.n_edges_on_cell.detach().cpu().numpy()),
+    }
+    coords: dict[str, Any] = {
+        "lat_cell": ("n_cell", np.rad2deg(mesh.lat_cell.detach().cpu().numpy()), {"units": "degrees_north"}),
+        "lon_cell": ("n_cell", np.rad2deg(mesh.lon_cell.detach().cpu().numpy()), {"units": "degrees_east"}),
+        "lat_vert_deg": ("n_vert", lat_vert_deg, {"units": "degrees_north"}),
+        "lon_vert_deg": ("n_vert", lon_vert_deg, {"units": "degrees_east"}),
+        "zeta_c": ("nz", model.vgrid.zeta_c.detach().cpu().numpy(), {"units": "m"}),
+        "zeta_w": ("nz_w", model.vgrid.zeta_w.detach().cpu().numpy(), {"units": "m"}),
+    }
+    if mesh.z_bed is not None:
+        data_vars["z_bed"] = (("n_cell",), mesh.z_bed.detach().cpu().numpy(), {"units": "m"})
+    if model.ogcm is not None:
+        og = model.ogcm
+        data_vars["ocn_h_c"] = (("nz_ocn", "n_cell"), og.h_c.detach().cpu().numpy(), {"units": "m"})
+        data_vars["ocn_h_col"] = (("n_cell",), og.h_col.detach().cpu().numpy(), {"units": "m"})
+        data_vars["ocn_wet_c"] = (("nz_ocn", "n_cell"), og.wet_c.detach().cpu().numpy().astype(np.int8))
+        coords["nz_ocn"] = ("nz_ocn", og.z_c.detach().cpu().numpy(), {"units": "m", "positive": "down"})
+        coords["nz_ocn_w"] = ("nz_ocn_w", og.z_w.detach().cpu().numpy(), {"units": "m", "positive": "down"})
+
     return xr.Dataset(
-        data_vars={
-            "area_cell": (("n_cell",), mesh.area_cell.detach().cpu().numpy(), {"units": "m2"}),
-            "surf_type": (("n_cell",), mesh.surf_type.detach().cpu().numpy(), {"long_name": "0=Ocean, 1=Land, 2=IceSheet"}),
-            "z_topo": (("n_cell",), mesh.z_topo.detach().cpu().numpy(), {"units": "m"}),
-            "verts_on_cell": (("n_cell", "max_n_vert"), verts_on_cell),
-            "n_edges_on_cell": (("n_cell",), mesh.n_edges_on_cell.detach().cpu().numpy()),
-        },
-        coords={
-            "lat_cell": ("n_cell", np.rad2deg(mesh.lat_cell.detach().cpu().numpy()), {"units": "degrees_north"}),
-            "lon_cell": ("n_cell", np.rad2deg(mesh.lon_cell.detach().cpu().numpy()), {"units": "degrees_east"}),
-            "lat_vert_deg": ("n_vert", lat_vert_deg, {"units": "degrees_north"}),
-            "lon_vert_deg": ("n_vert", lon_vert_deg, {"units": "degrees_east"}),
-            "zeta_c": ("nz", model.vgrid.zeta_c.detach().cpu().numpy(), {"units": "m"}),
-            "zeta_w": ("nz_w", model.vgrid.zeta_w.detach().cpu().numpy(), {"units": "m"}),
-        },
+        data_vars=data_vars,
+        coords=coords,
         attrs={
             "Conventions": "CF-1.11 UGRID-1.0",
             "glevel": model.cfg.glevel,
