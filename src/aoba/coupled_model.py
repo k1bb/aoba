@@ -1146,12 +1146,18 @@ def step_aoba_model(
                 u_sfc_sub=u_sfc_3d,
                 q_dust_sub=q_dust_4d,
             )
-            atmos.theta_m = crm.theta_m.mean(dim=(-2, -1))
-            atmos.q_n = crm.q_n.mean(dim=(-2, -1))
-            atmos.q_p = crm.q_p.mean(dim=(-2, -1))
-            atmos.q_v = crm.q_v.mean(dim=(-2, -1))
-            atmos.q_c = crm.q_c.mean(dim=(-2, -1))
-            atmos.q_i = crm.q_i.mean(dim=(-2, -1))
+            # Sync mass-weighted CRM column mean (including hydrostatic rho_d adjustment!) back to host.
+            # Omitting atmos.rho_d here creates a thermodynamic ratchet when drho_mean lifts cooled mass
+            # back into high-theta upper levels on the next step (~+47 W m^-2 spurious stratospheric heating).
+            rho_crm_mean = crm.rho_d.mean(dim=(-2, -1))
+            inv_rho_crm = 1.0 / torch.clamp(rho_crm_mean, min=1.0e-5)
+            atmos.rho_d = rho_crm_mean
+            atmos.theta_m = (crm.rho_d * crm.theta_m).mean(dim=(-2, -1)) * inv_rho_crm
+            atmos.q_n = (crm.rho_d * crm.q_n).mean(dim=(-2, -1)) * inv_rho_crm
+            atmos.q_p = (crm.rho_d * crm.q_p).mean(dim=(-2, -1)) * inv_rho_crm
+            atmos.q_v = (crm.rho_d * crm.q_v).mean(dim=(-2, -1)) * inv_rho_crm
+            atmos.q_c = (crm.rho_d * crm.q_c).mean(dim=(-2, -1)) * inv_rho_crm
+            atmos.q_i = (crm.rho_d * crm.q_i).mean(dim=(-2, -1)) * inv_rho_crm
             du_crm_c = (crm.u.mean(dim=(-2, -1)) - u_host_new) / dt
             dv_crm_c = (crm.v.mean(dim=(-2, -1)) - v_host_new) / dt
             if sp.precip_rain_sub is not None and sp.precip_snow_sub is not None:
@@ -1227,12 +1233,15 @@ def step_aoba_model(
                         crm.n_i = torch.zeros_like(crm.q_i)
                     crm.n_i[:, sl] = sub_crm.n_i
 
-                atmos.theta_m[:, sl] = sub_crm.theta_m.mean(dim=(-2, -1))
-                atmos.q_n[:, sl] = sub_crm.q_n.mean(dim=(-2, -1))
-                atmos.q_p[:, sl] = sub_crm.q_p.mean(dim=(-2, -1))
-                atmos.q_v[:, sl] = sub_crm.q_v.mean(dim=(-2, -1))
-                atmos.q_c[:, sl] = sub_crm.q_c.mean(dim=(-2, -1))
-                atmos.q_i[:, sl] = sub_crm.q_i.mean(dim=(-2, -1))
+                rho_crm_mean = sub_crm.rho_d.mean(dim=(-2, -1))
+                inv_rho_crm = 1.0 / torch.clamp(rho_crm_mean, min=1.0e-5)
+                atmos.rho_d[:, sl] = rho_crm_mean
+                atmos.theta_m[:, sl] = (sub_crm.rho_d * sub_crm.theta_m).mean(dim=(-2, -1)) * inv_rho_crm
+                atmos.q_n[:, sl] = (sub_crm.rho_d * sub_crm.q_n).mean(dim=(-2, -1)) * inv_rho_crm
+                atmos.q_p[:, sl] = (sub_crm.rho_d * sub_crm.q_p).mean(dim=(-2, -1)) * inv_rho_crm
+                atmos.q_v[:, sl] = (sub_crm.rho_d * sub_crm.q_v).mean(dim=(-2, -1)) * inv_rho_crm
+                atmos.q_c[:, sl] = (sub_crm.rho_d * sub_crm.q_c).mean(dim=(-2, -1)) * inv_rho_crm
+                atmos.q_i[:, sl] = (sub_crm.rho_d * sub_crm.q_i).mean(dim=(-2, -1)) * inv_rho_crm
 
                 du_crm_c[:, sl] = (sub_crm.u.mean(dim=(-2, -1)) - u_host_new[:, sl]) / dt
                 dv_crm_c[:, sl] = (sub_crm.v.mean(dim=(-2, -1)) - v_host_new[:, sl]) / dt

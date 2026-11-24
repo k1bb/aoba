@@ -218,9 +218,9 @@ def init_ogcm_state(
     sfc: SurfaceState,
     mesh: SCVTMesh,
     nz_ocn: int = 18,
-    t_abyss_k: float = 275.0,
+    t_abyss_k: float = 274.2,
 ) -> OceanOGCMState:
-    """Initialize 3D SCVT OGCM from `Earth2014 BED2014` bathymetry and analytic thermocline."""
+    """Initialize 3D SCVT OGCM from `Earth2014 BED2014` bathymetry and analytic thermocline/halocline."""
     dev = sfc.t_ocean_ml.device
     dtype = sfc.t_ocean_ml.dtype
     nc = mesh.n_cells
@@ -267,8 +267,16 @@ def init_ogcm_state(
     k_idx = torch.arange(nzo, device=dev).unsqueeze(1).expand(nzo, nc)
     k_bot = torch.where(wet_c, k_idx, torch.zeros_like(k_idx)).max(dim=0).values
 
-    # Smooth map-free initial thermocline: T(z, lat) decays from SST toward T_abyss = 275 K
-    cos2_lat = torch.cos(mesh.lat_cell.to(device=dev, dtype=dtype)) ** 2
+    # Smooth map-free initial thermocline & polar halocline:
+    # T(z, lat) decays from SST toward WOA23-scale abyss T_abyss = 274.2 K (+1.05 C),
+    # while a gentle analytical polar halocline (-0.50 psu at poles, sin^6(lat) localized
+    # poleward of ~60 deg, e-folding 200 m, globally volume-normalized to exact S_REF_PSU = 34.7 psu)
+    # stabilizes the cold polar surface (+0.40 kg/m^3 haline > -0.17 kg/m^3 thermal) without
+    # reversing the Southern Ocean ACC meridional density gradient across Drake Passage.
+    lat_c = mesh.lat_cell.to(device=dev, dtype=dtype)
+    cos2_lat = torch.cos(lat_c) ** 2
+    sin2_lat = torch.sin(lat_c) ** 2
+    sin6_lat = sin2_lat * sin2_lat * sin2_lat
     d_therm = 250.0 + 550.0 * cos2_lat  # [nc] deeper thermocline in tropics/subtropics
     sst = sfc.t_ocean_ml.clone()
     z_rel = torch.clamp(z_c.unsqueeze(1) - z_c[0], min=0.0)
@@ -277,7 +285,11 @@ def init_ogcm_state(
     t_init[0] = sst
     t_init = torch.where(wet_c, torch.clamp(t_init, min=C.T_FREEZE_OCEAN), torch.full_like(t_init, t_abyss_k))
 
-    sal_init = torch.full((nzo, nc), S_REF_PSU, device=dev, dtype=dtype)
+    sal_raw = S_REF_PSU - 0.50 * sin6_lat.unsqueeze(0) * torch.exp(-z_rel / 200.0)
+    vol_init = h_c * mesh.area_cell.to(device=dev, dtype=dtype).unsqueeze(0)
+    v_sum = torch.clamp(vol_init.sum(), min=1.0)
+    sal_shift = S_REF_PSU - (vol_init * sal_raw).sum() / v_sum
+    sal_init = torch.where(wet_c, sal_raw + sal_shift, torch.full_like(sal_raw, S_REF_PSU))
     bathym_slope = _compute_bathymetric_slope(h_col, wet_c[0], mesh)
 
     return OceanOGCMState(
@@ -479,6 +491,9 @@ def _get_ogcm_static_cache(ogcm: OceanOGCMState, mesh: SCVTMesh, is_ocean: torch
     active_eoc = (mesh.edge_sign_on_cell != 0.0).to(dtype)
     inv_area_c = 1.0 / mesh.area_cell
     div_w = (mesh.edge_sign_on_cell.to(dtype) * mesh.dv_edge[mesh.edges_on_cell].to(dtype)) * inv_area_c.unsqueeze(-1)
+    vort_w = (
+        mesh.edge_sign_on_vert.to(dtype) * mesh.dc_edge[mesh.edges_on_vert].to(dtype)
+    ) / mesh.area_vert.to(dtype).unsqueeze(-1)
     h_max = float(ogcm.h_col.max().item()) if bool(is_ocean.any()) else 100.0
     f_abs = torch.clamp(torch.abs(mesh.f_cell.to(dtype)), min=1.0e-5)
     h_col_kpp = torch.clamp(ogcm.h_col, min=50.0, max=500.0)
@@ -510,6 +525,7 @@ def _get_ogcm_static_cache(ogcm: OceanOGCMState, mesh: SCVTMesh, is_ocean: torch
         "active_eoc": active_eoc,
         "inv_area_c": inv_area_c,
         "div_w": div_w,
+        "vort_w": vort_w,
         "h_max": h_max,
         "f_abs": f_abs,
         "h_col_kpp": h_col_kpp,
@@ -618,6 +634,7 @@ def _ogcm_pre_kpp_core(
     wet_ef: torch.Tensor,
     h_c: torch.Tensor,
     h_c_safe: torch.Tensor,
+    dz_nom_2d: torch.Tensor,
     z_c_2d: torch.Tensor,
     frac_out_0: torch.Tensor,
     frac_sub: torch.Tensor,
@@ -672,10 +689,13 @@ def _ogcm_pre_kpp_core(
     rho0_post = compute_seawater_density_anomaly(T[0], S[0], z_c_2d[0, 0])
     b0_sfc = -(C.GRAVITY / C.RHO_SEAWATER) * ((rho0_post - rho0_prev) * h_c_safe[0] * inv_dt) * is_ocn_f
 
+    # Evaluate baroclinic hydrostatic pressure at fixed nominal z-level centers `z_c[k]`
+    # (Pacanowski & Gnanadesikan, 1998): guarantees exact zero PGF in a resting stratified ocean
+    # over partial-step topography (avoids spurious topographic pressure gradients where h_c differs).
     rho_anom = compute_seawater_density_anomaly(T, S, z_c_2d) * wet_cf
-    g_rho_h = C.GRAVITY * rho_anom * h_c
-    p_cum = torch.cumsum(g_rho_h, dim=0)
-    p_baroc = p_cum - 0.5 * g_rho_h
+    g_rho_dz = C.GRAVITY * rho_anom * dz_nom_2d
+    p_cum = torch.cumsum(g_rho_dz, dim=0)
+    p_baroc = p_cum - 0.5 * g_rho_dz
 
     ice_atten = 1.0 - 0.5 * torch.clamp(f_seaice, 0.0, 1.0)
     tx_ocn = -ice_atten * tau_x_sfc
@@ -687,14 +707,15 @@ def _ogcm_pre_kpp_core(
     return T, S, t_comp, s_comp, wt_sfc, ws_sfc, b0_sfc, rho_anom, p_baroc, u_star_o, tau_n_e
 
 
-def _ogcm_baroclinic_prep_core(
+def _ogcm_baroclinic_rk3_core(
     u: torch.Tensor,
-    zeta_v: torch.Tensor,
     lap_u: torch.Tensor,
     p_baroc: torch.Tensor,
     av_diag: torch.Tensor,
     tau_n_e: torch.Tensor,
     f_vert: torch.Tensor,
+    eov: torch.Tensor,
+    vort_w: torch.Tensor,
     v0_e: torch.Tensor,
     v1_e: torch.Tensor,
     ep_idx: torch.Tensor,
@@ -710,19 +731,31 @@ def _ogcm_baroclinic_prep_core(
     a_h: float,
     dt: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pure-tensor TRiSK Coriolis + baroclinic PGF + bottom drag + momentum tridiagonal assembly."""
-    eta_v = zeta_v + f_vert.unsqueeze(0)
-    eta_e = 0.5 * (eta_v[:, v0_e] + eta_v[:, v1_e])
-    eta_pair = 0.5 * (eta_e.unsqueeze(-1) + eta_e[:, ep_idx])
-    cor_3d = (w_trisk.unsqueeze(0) * eta_pair * u[:, ep_idx]).sum(dim=-1)
+    """3-stage Wicker-Skamarock (2002) RK3 TRiSK Coriolis + baroclinic PGF + semi-implicit drag + tridiag.
 
+    Forward Euler on inertial oscillations `du/dt = -f k x u` is unconditionally unstable
+    (`|G| = sqrt(1 + (f dt)^2) > 1`), causing polar blow-up. 3-stage WS-RK3 is strictly stable
+    and gently damping along the imaginary axis up to `|f dt| <= sqrt(3) ~ 1.73` (covering both
+    coupled `dt = 720 s` and offline spin-up `dt = 3600 s` at the poles with wide margin).
+    """
     pgf_bc = -(1.0 / C.RHO_SEAWATER) * ((p_baroc[:, c1] - p_baroc[:, c0]) * inv_dc_edge.unsqueeze(0))
-    r_bot = torch.where(is_bot_e, C_DRAG_BOT * torch.abs(u) / h_e_safe, torch.zeros_like(u))
+    f_fixed = (pgf_bc + a_h * lap_u) * wet_ef
+    f_fixed_0 = f_fixed[0] + (tau_n_e / (C.RHO_SEAWATER * h_e_safe[0])) * wet_ef[0]
+    f_fixed = torch.cat([f_fixed_0.unsqueeze(0), f_fixed[1:]], dim=0)
 
-    du_bc = (cor_3d + pgf_bc + a_h * lap_u - (R_RAYLEIGH_OCN + r_bot) * u) * wet_ef
-    du_bc_0 = du_bc[0] + (tau_n_e / (C.RHO_SEAWATER * h_e_safe[0])) * wet_ef[0]
-    du_bc_full = torch.cat([du_bc_0.unsqueeze(0), du_bc[1:]], dim=0)
-    u_star = torch.clamp((u + dt * du_bc_full) * wet_ef, -3.0, 3.0)
+    u_s = u
+    vort_w_u = vort_w.unsqueeze(0)
+    f_vert_u = f_vert.unsqueeze(0)
+    w_trisk_u = w_trisk.unsqueeze(0)
+    for rk_dt in (dt / 3.0, 0.5 * dt, dt):
+        zeta_v = (u_s[:, eov] * vort_w_u).sum(dim=-1)
+        eta_v = zeta_v + f_vert_u
+        eta_e = 0.5 * (eta_v[:, v0_e] + eta_v[:, v1_e])
+        eta_pair = 0.5 * (eta_e.unsqueeze(-1) + eta_e[:, ep_idx])
+        cor_3d = (w_trisk_u * eta_pair * u_s[:, ep_idx]).sum(dim=-1)
+        r_drag = R_RAYLEIGH_OCN + torch.where(is_bot_e, C_DRAG_BOT * torch.abs(u_s) / h_e_safe, torch.zeros_like(u_s))
+        u_s = torch.clamp(((u + rk_dt * (cor_3d + f_fixed)) / (1.0 + rk_dt * r_drag)) * wet_ef, -3.0, 3.0)
+    u_star = u_s
 
     av_e = 0.5 * (av_diag[:, c0] + av_diag[:, c1])
     c_mom = (dt * av_e / dz_int_e) * wet_int_ef
@@ -735,6 +768,7 @@ def _ogcm_baroclinic_prep_core(
 
 def _ogcm_barotropic_rk3_core(
     u_star_raw: torch.Tensor,
+    u_prev_baro: torch.Tensor,
     u_baro_prev: torch.Tensor,
     eta_old: torch.Tensor,
     g_inv_dc: torch.Tensor,
@@ -755,7 +789,8 @@ def _ogcm_barotropic_rk3_core(
     """Pure-tensor barotropic mode projection + 2D Wicker-Skamarock RK3 loop (CUDA-compilable)."""
     u_star = u_star_raw * wet_ef
     u_star_baro = (u_star * h_e).sum(dim=0) / h_col_e_safe * ocn_e0f
-    f_baro = (u_star_baro - u_baro_prev) / max(dt, 1.0)
+    # Exact depth-averaged slow tendency from u_prev -> u_star (Ringler et al., 2013, Ocean Modelling, 69)
+    f_baro = (u_star_baro - u_prev_baro) / max(dt, 1.0)
     u_bt = u_baro_prev * ocn_e0f
     eta_bt = eta_old
     u_bt_acc = torch.zeros_like(u_bt)
@@ -1127,7 +1162,7 @@ def step_ogcm_voronoi(
         sfc.t_ocean_ml, sfc.m_seaice, ogcm.m_seaice_prev,
         r_coast, q_calve, evap_cell, precip_cell, sw_in,
         tau_x_sfc, tau_y_sfc, f_seaice,
-        is_ocean, is_ocn_f, wet_cf, wet_ef, h_c, h_c_safe, z_c_2d,
+        is_ocean, is_ocn_f, wet_cf, wet_ef, h_c, h_c_safe, ogcm.dz_nom.unsqueeze(1), z_c_2d,
         cache["frac_out_0"], cache["frac_sub"], c0, c1,
         mesh.east_normal_edge, mesh.north_normal_edge, dt, apply_sw,
     )
@@ -1142,7 +1177,7 @@ def step_ogcm_voronoi(
     )
     ogcm.h_bl = h_bl
 
-    # 4. 3D Baroclinic Momentum Step (TRiSK Coriolis + Baroclinic PGF + Munk Viscosity + Bottom Drag)
+    # 4. 3D Baroclinic Momentum Step (WS-RK3 TRiSK Coriolis + Baroclinic PGF + Munk Viscosity + Semi-Implicit Drag)
     dc_min = getattr(mesh, "_dc_edge_min_m", None)
     if dc_min is None:
         dc_min = float(mesh.dc_edge.min().item())
@@ -1150,13 +1185,13 @@ def step_ogcm_voronoi(
     delta_munk = 1.6 * dc_min
     a_h = min(BETA_MUNK_OGCM * (delta_munk ** 3), 0.06 * (dc_min ** 2) / max(dt, 1.0))
 
-    zeta_v = compute_scvt_vorticity(mesh, u)  # [nzo, n_verts]
     lap_u, _ = compute_vector_laplacian_edge(mesh, u)
 
-    bc_prep_fn = maybe_cuda_compile(_ogcm_baroclinic_prep_core, device=dev)
-    u_star, a_m, b_m, d_m = bc_prep_fn(
-        u, zeta_v, lap_u, p_baroc, av_diag, tau_n_e,
-        mesh.f_vert, v0_e, v1_e, ep_idx, w_trisk, c0, c1, inv_dc_edge,
+    bc_rk3_fn = maybe_cuda_compile(_ogcm_baroclinic_rk3_core, device=dev)
+    u_star, a_m, b_m, d_m = bc_rk3_fn(
+        u, lap_u, p_baroc, av_diag, tau_n_e,
+        mesh.f_vert, mesh.edges_on_vert, cache["vort_w"],
+        v0_e, v1_e, ep_idx, w_trisk, c0, c1, inv_dc_edge,
         cache["is_bot_e"], h_e_safe, cache["dz_int_e"], wet_ef, wet_int_ef, a_h, dt,
     )
     u_star_raw = solve_tridiagonal_batched(a_m, b_m, d_m, u_star)
@@ -1167,9 +1202,10 @@ def step_ogcm_voronoi(
     h_max = cache["h_max"]
     c_bt = math.sqrt(C.GRAVITY * max(h_max, 50.0))
     dt_bt_cfl = 0.35 * dc_min / max(c_bt, 10.0)
-    n_bt = max(1, min(int(math.ceil(dt / max(dt_bt_cfl, 1.0))), 24))
+    n_bt = max(1, min(int(math.ceil(dt / max(dt_bt_cfl, 1.0))), 64))
     dt_bt = dt / float(n_bt)
 
+    u_prev_baro = (u * h_e).sum(dim=0) / h_col_e_safe * ocn_e0f
     eta_old = ogcm.eta * is_ocn_f
     g_inv_dc = -C.GRAVITY * inv_dc_edge
     eoc = mesh.edges_on_cell  # [nc, 6]
@@ -1177,10 +1213,11 @@ def step_ogcm_voronoi(
 
     baro_fn = maybe_cuda_compile(_ogcm_barotropic_rk3_core, device=dev)
     u_star, u_star_baro, u_bt, u_bt_mean = baro_fn(
-        u_star_raw, ogcm.u_baro, eta_old, g_inv_dc, h_e, ogcm.h_col_e, h_col_e_safe,
+        u_star_raw, u_prev_baro, ogcm.u_baro, eta_old, g_inv_dc, h_e, ogcm.h_col_e, h_col_e_safe,
         wet_ef, ocn_e0f, is_ocn_f, c0, c1, eoc, div_w, n_bt, dt_bt, dt,
     )
-    ogcm.u_baro = u_bt
+    # Time-filtered barotropic mode matches u_new depth mean (Ringler et al., 2013; Shchepetkin & McWilliams, 2005)
+    ogcm.u_baro = u_bt_mean
 
     # 6-7. GM90 Eddy Bolus, Mass-Conserving Vertical Velocity `w`, Free Surface `eta` & Redi Kv
     w_vor_edge = cache["w_vor_edge"]

@@ -692,13 +692,15 @@ def step_crm_rk3_hevi(
 
     # Dimension-aware Coriolis handling for embedded periodic CRMs (Khairoutdinov et al., 2005; Yamazaki & Miura, 2024):
     # - 1D (1x1) & 2D (nx==1 or ny==1): disable CRM Coriolis (no cross-plane background PGF; host handles rotation).
-    # - 3D (nx>1 and ny>1): perturbation-only Coriolis on u' = u - u_mean so mean geostrophic flow is never distorted.
-    if nx > 1 and ny > 1 and crm.f_coriolis is not None:
-        f_col = crm.f_coriolis.view(1, -1, 1, 1)
-        u_pert = u0 - u0.mean(dim=(-2, -1), keepdim=True)
-        v_pert = v0 - v0.mean(dim=(-2, -1), keepdim=True)
-        du_sgs = du_sgs + f_col * v_pert
-        dv_sgs = dv_sgs - f_col * u_pert
+    # - 3D (nx>1 and ny>1): perturbation-only Coriolis on u' = u - u_mean evaluated INSIDE each RK3 stage (never Forward Euler!).
+    use_3d_pert_cor = (nx > 1) and (ny > 1) and (crm.f_coriolis is not None)
+    f_col_3d = crm.f_coriolis.view(1, -1, 1, 1) if use_3d_pert_cor else None
+    if use_3d_pert_cor and can_use_crm_metal(rho0):
+        # Metal fast path uses stage-frozen slow tendency; perturbation Coriolis has |f*dt_sub| < 0.008 with SGS damping
+        u_pert0 = u0 - u0.mean(dim=(-2, -1), keepdim=True)
+        v_pert0 = v0 - v0.mean(dim=(-2, -1), keepdim=True)
+        du_sgs = du_sgs + f_col_3d * v_pert0
+        dv_sgs = dv_sgs - f_col_3d * u_pert0
 
     is_2d_crm = (ny == 1) ^ (nx == 1)
     cfl_ac = 0.70 if is_2d_crm else 0.45
@@ -787,8 +789,14 @@ def step_crm_rk3_hevi(
         vadv_u = _upwind_vertical_advect(u_s, w_ux, dz_w_int)
         vadv_v = _upwind_vertical_advect(v_s, w_vy, dz_w_int)
 
-        cor_u = f_cor * 0.5 * (v_c + torch.roll(v_c, -1, -1)) if f_cor is not None else 0.0
-        cor_v = -f_cor * 0.5 * (u_c + torch.roll(u_c, -1, -2)) if f_cor is not None else 0.0
+        if use_3d_pert_cor and f_col_3d is not None:
+            v_c_pert = v_c - v_c.mean(dim=(-2, -1), keepdim=True)
+            u_c_pert = u_c - u_c.mean(dim=(-2, -1), keepdim=True)
+            cor_u = f_col_3d * 0.5 * (v_c_pert + torch.roll(v_c_pert, -1, -1))
+            cor_v = -f_col_3d * 0.5 * (u_c_pert + torch.roll(u_c_pert, -1, -2))
+        else:
+            cor_u = 0.0
+            cor_v = 0.0
 
         u_anom = u_s - u_s.mean(dim=(-2, -1), keepdim=True)
         v_anom = v_s - v_s.mean(dim=(-2, -1), keepdim=True)
