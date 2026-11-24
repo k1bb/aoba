@@ -99,6 +99,9 @@ class AOBAConfig:
     enable_ocean_bgc: bool = True            # FlexPFT marine biogeochemistry & OMIP/mocsy 2.0 carbonate chemistry
     enable_river_routing: bool = True        # Map-free Priority-Flood Voronoi river routing
     enable_land_carbon: bool = True          # Map-free terrestrial carbon cycle, permafrost soil C, & SPITFIRE wildfire
+    enable_land_nitrogen: bool = True        # Stocker & Prentice (2024) CN-model & FUN/Houlton BNF nitrogen cycle
+    enable_lightning: bool = True            # Map-free CRM non-inductive charging lightning & LNOx deposition
+    enable_fire_veg_feedback: bool = True    # MAML burnt-patch crown-fire reset of EEO LAI & canopy height
     enable_seaice_evp_itd: bool = True       # MPAS-Seaice Voronoi EVP rheology + 5-category ITD
     enable_ogcm_fct_zstar: bool = True       # FESOM2-style 3D Zalesak FCT advection + exact z* coordinate
     enable_natural_aerosols: bool = True     # Map-free sea-salt, marine DMS sulfate, & wildfire BC/OC aerosols
@@ -197,6 +200,7 @@ class AOBAState:
     q_conv_diag: torch.Tensor | None = None  # Previous-step 1:1 CRM convective heating [Nz, N_cells] [K s^-1]
     last_sfc_diag_sub: SurfaceFluxDiagnostics | None = None  # Zero-copy ref for optional CMIP7 diagnostics
     last_s_toa: torch.Tensor | None = None                   # Zero-copy ref for TOA incident SW (`rsdt`)
+    last_lightning: object | None = None                     # Latest CRM LightningDiagnostics (CG strikes + LNOx)
 
     def current_co2_ppmv(self, sim_time_sec: float | None = None) -> float:
         """Return active atmospheric CO2 [ppmv] at ``sim_time_sec`` (or ``self.sim_time_sec``)."""
@@ -580,13 +584,7 @@ def init_aoba_model(
             if bool(cfg.enable_river_routing)
             else None
         ),
-        land_carbon=(
-            __import__("aoba.land_carbon", fromlist=["init_land_carbon_state"]).init_land_carbon_state(
-                sfc.surf_type, sfc.bio.lai, sfc.bio.h_canopy, device=dev
-            )
-            if bool(cfg.enable_land_carbon)
-            else None
-        ),
+        land_carbon=None,
         aerosols=(
             __import__("aoba.aerosols", fromlist=["init_natural_aerosol_state"]).init_natural_aerosol_state(
                 nz, nc, device=dev, dtype=atmos.q_n.dtype
@@ -614,6 +612,16 @@ def init_aoba_model(
         ),
     )
     broadcast_host_surface_to_subgrid(model)
+    if bool(cfg.enable_land_carbon):
+        from aoba.land_carbon import init_land_carbon_state
+
+        model.land_carbon = init_land_carbon_state(
+            model.sfc_sub.surf_type,
+            model.sfc_sub.bio.lai,
+            model.sfc_sub.bio.h_canopy,
+            device=dev,
+            maml_n_sub=n_sub,
+        )
     return model
 
 
@@ -1338,6 +1346,24 @@ def step_aoba_model(
 
     rain_new = _sub_to_cell(rain_new_sub, nc, n_sub)
     snow_new = _sub_to_cell(snow_new_sub, nc, n_sub)
+
+    # 7b. Map-free CRM Non-Inductive Charging Lightning & Natural LNOx Deposition
+    light_diag = None
+    if bool(cfg.enable_lightning) and bool(cfg.enable_superparam):
+        from aoba.lightning import compute_crm_lightning_and_lnox
+
+        light_diag = compute_crm_lightning_and_lnox(
+            rho_d=crm.rho_d,
+            theta_m=crm.theta_m,
+            q_v=crm.q_v,
+            q_i=crm.q_i,
+            q_p=crm.q_p,
+            w_stag=crm.w,
+            z_c=atmos.z_c,
+            dz_c=atmos.dz_c,
+            area_cell=mesh.area_cell,
+        )
+        model.last_lightning = light_diag
     if cfg.enable_dust:
         if atmos.q_dust is None:
             atmos.q_dust = torch.zeros_like(atmos.q_n)
@@ -1441,32 +1467,92 @@ def step_aoba_model(
     if bool(cfg.enable_land_carbon):
         from aoba.land_carbon import init_land_carbon_state, step_land_carbon_and_fire
 
-        lai_c = _sub_to_cell(sfc_sub.bio.lai, nc, n_sub)
-        hc_c = _sub_to_cell(sfc_sub.bio.h_canopy, nc, n_sub)
         if model.land_carbon is None:
-            model.land_carbon = init_land_carbon_state(sfc.surf_type, lai_c, hc_c, device=t_air.device)
-        resp_leaf_c = (
-            _sub_to_cell(sfc_diag_sub.resp_leaf, nc, n_sub)
-            if sfc_diag_sub.resp_leaf is not None
-            else torch.zeros_like(gpp_cell)
-        )
-        step_land_carbon_and_fire(
-            lc=model.land_carbon,
-            surf_type=sfc.surf_type,
-            gpp_umol=gpp_cell,
-            resp_leaf_umol=resp_leaf_c,
-            lai=lai_c,
-            h_canopy=hc_c,
-            t_soil=_sub_to_cell(sfc_sub.t_soil, nc, n_sub),
-            w_liq_soil=_sub_to_cell(sfc_sub.w_liq_soil, nc, n_sub),
-            w_ice_soil=_sub_to_cell(sfc_sub.w_ice_soil, nc, n_sub),
-            f_snow=_sub_to_cell(sfc_diag_sub.f_snow_land, nc, n_sub),
-            t_sfc_k=t_air,
-            vpd_pa=_sub_to_cell(vpd_sub, nc, n_sub),
-            u10_ms=_sub_to_cell(torch.hypot(u_sub_0, v_sub_0), nc, n_sub),
-            precip_kgm2s=precip_tot,
-            dt=dt,
-        )
+            model.land_carbon = init_land_carbon_state(
+                sfc_sub.surf_type, sfc_sub.bio.lai, sfc_sub.bio.h_canopy, device=t_air.device, maml_n_sub=n_sub
+            )
+        is_maml_lc = int(model.land_carbon.c_leaf.shape[0]) == m_sub
+        if is_maml_lc:
+            resp_leaf_sub = (
+                sfc_diag_sub.resp_leaf
+                if sfc_diag_sub.resp_leaf is not None
+                else torch.zeros_like(sfc_diag_sub.gpp)
+            )
+            f4_sub = torch.clamp(sfc_sub.bio.f_c4, 0.0, 1.0)
+            vc25_eff_sub = (1.0 - f4_sub) * sfc_sub.bio.vcmax25_c3 + f4_sub * sfc_sub.bio.vcmax25_c4
+            step_land_carbon_and_fire(
+                lc=model.land_carbon,
+                surf_type=sfc_sub.surf_type,
+                gpp_umol=sfc_diag_sub.gpp,
+                resp_leaf_umol=resp_leaf_sub,
+                lai=sfc_sub.bio.lai,
+                h_canopy=sfc_sub.bio.h_canopy,
+                t_soil=sfc_sub.t_soil,
+                w_liq_soil=sfc_sub.w_liq_soil,
+                w_ice_soil=sfc_sub.w_ice_soil,
+                f_snow=sfc_diag_sub.f_snow_land,
+                t_sfc_k=t_air_sub,
+                vpd_pa=vpd_sub,
+                u10_ms=torch.hypot(u_sub_0, v_sub_0),
+                precip_kgm2s=rain_new_sub + snow_new_sub,
+                dt=dt,
+                enable_nitrogen=bool(cfg.enable_land_nitrogen),
+                vcmax25_eff=vc25_eff_sub,
+                f_evg=sfc_sub.bio.f_evg,
+                transp_kgm2s=torch.clamp(sfc_diag_sub.evap, min=0.0),
+                n_dep_kgn_m2s=light_diag.n_dep_lnox_sub.reshape(m_sub) if light_diag is not None else None,
+                flash_cg_m2s=light_diag.flash_cg_sub.reshape(m_sub) if light_diag is not None else None,
+                bio=sfc_sub.bio,
+                enable_fire_veg_feedback=bool(cfg.enable_fire_veg_feedback),
+                maml_shape=(nc, ny, nx),
+                crm_dx_m=float(cfg.crm_dx),
+            )
+            # Mirror updated MAML LAI / canopy height / N availability back to host summary
+            sfc.bio.lai = _sub_to_cell(sfc_sub.bio.lai, nc, n_sub)
+            sfc.bio.h_canopy = _sub_to_cell(sfc_sub.bio.h_canopy, nc, n_sub)
+            if sfc_sub.bio.lai_evg is not None:
+                sfc.bio.lai_evg = _sub_to_cell(sfc_sub.bio.lai_evg, nc, n_sub)
+            if sfc_sub.bio.lai_dec is not None:
+                sfc.bio.lai_dec = _sub_to_cell(sfc_sub.bio.lai_dec, nc, n_sub)
+            if sfc_sub.bio.n_avail_fac is not None:
+                sfc.bio.n_avail_fac = _sub_to_cell(sfc_sub.bio.n_avail_fac, nc, n_sub)
+        else:
+            lai_c = _sub_to_cell(sfc_sub.bio.lai, nc, n_sub)
+            hc_c = _sub_to_cell(sfc_sub.bio.h_canopy, nc, n_sub)
+            resp_leaf_c = (
+                _sub_to_cell(sfc_diag_sub.resp_leaf, nc, n_sub)
+                if sfc_diag_sub.resp_leaf is not None
+                else torch.zeros_like(gpp_cell)
+            )
+            f4_c = torch.clamp(_sub_to_cell(sfc_sub.bio.f_c4, nc, n_sub), 0.0, 1.0)
+            vc25_eff_c = (1.0 - f4_c) * _sub_to_cell(sfc_sub.bio.vcmax25_c3, nc, n_sub) + f4_c * _sub_to_cell(sfc_sub.bio.vcmax25_c4, nc, n_sub)
+            step_land_carbon_and_fire(
+                lc=model.land_carbon,
+                surf_type=sfc.surf_type,
+                gpp_umol=gpp_cell,
+                resp_leaf_umol=resp_leaf_c,
+                lai=lai_c,
+                h_canopy=hc_c,
+                t_soil=_sub_to_cell(sfc_sub.t_soil, nc, n_sub),
+                w_liq_soil=_sub_to_cell(sfc_sub.w_liq_soil, nc, n_sub),
+                w_ice_soil=_sub_to_cell(sfc_sub.w_ice_soil, nc, n_sub),
+                f_snow=_sub_to_cell(sfc_diag_sub.f_snow_land, nc, n_sub),
+                t_sfc_k=t_air,
+                vpd_pa=_sub_to_cell(vpd_sub, nc, n_sub),
+                u10_ms=_sub_to_cell(torch.hypot(u_sub_0, v_sub_0), nc, n_sub),
+                precip_kgm2s=precip_tot,
+                dt=dt,
+                enable_nitrogen=bool(cfg.enable_land_nitrogen),
+                vcmax25_eff=vc25_eff_c,
+                f_evg=_sub_to_cell(sfc_sub.bio.f_evg, nc, n_sub) if sfc_sub.bio.f_evg is not None else None,
+                transp_kgm2s=torch.clamp(evap_cell, min=0.0),
+                n_dep_kgn_m2s=light_diag.n_dep_lnox_cell if light_diag is not None else None,
+                flash_cg_m2s=light_diag.flash_cg_cell if light_diag is not None else None,
+                bio=None,
+                enable_fire_veg_feedback=False,
+                maml_shape=None,
+                crm_dx_m=float(cfg.crm_dx),
+            )
     if bool(cfg.enable_natural_aerosols):
         from aoba.aerosols import init_natural_aerosol_state, step_natural_aerosols_column
 
@@ -1477,8 +1563,16 @@ def step_aoba_model(
             if (model.ogcm is not None and model.ogcm.bgc is not None)
             else None
         )
-        fire_bc = model.land_carbon.fire_bc_kg_m2s if model.land_carbon is not None else None
-        fire_oc = model.land_carbon.fire_oc_kg_m2s if model.land_carbon is not None else None
+        if model.land_carbon is not None:
+            if int(model.land_carbon.fire_bc_kg_m2s.shape[0]) == m_sub:
+                fire_bc = _sub_to_cell(model.land_carbon.fire_bc_kg_m2s, nc, n_sub)
+                fire_oc = _sub_to_cell(model.land_carbon.fire_oc_kg_m2s, nc, n_sub)
+            else:
+                fire_bc = model.land_carbon.fire_bc_kg_m2s
+                fire_oc = model.land_carbon.fire_oc_kg_m2s
+        else:
+            fire_bc = None
+            fire_oc = None
         step_natural_aerosols_column(
             aero=model.aerosols,
             rho_d=atmos.rho_d,

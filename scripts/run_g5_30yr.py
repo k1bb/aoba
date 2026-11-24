@@ -124,6 +124,8 @@ def _restore_surface(sfc_target, payload: dict, device: torch.device) -> None:
         sfc_target.bio.ema_ann_a0_fav = sfc_target.bio.ema_ann_a0.clone()
     if "ema_temp_home" not in bio_payload or sfc_target.bio.ema_temp_home is None:
         sfc_target.bio.ema_temp_home = sfc_target.bio.ema_temp_mid.clone()
+    if "n_avail_fac" not in bio_payload or sfc_target.bio.n_avail_fac is None:
+        sfc_target.bio.n_avail_fac = torch.ones_like(sfc_target.bio.lai)
 
 
 def _inspect_nonfinite_state(model: AOBAState) -> list[str]:
@@ -180,6 +182,8 @@ def _inspect_nonfinite_state(model: AOBAState) -> list[str]:
             ])
     if model.land_carbon is not None:
         checks.append(("land_carbon.c_leaf", model.land_carbon.c_leaf))
+        if getattr(model.land_carbon, "n_min", None) is not None:
+            checks.append(("land_carbon.n_min", model.land_carbon.n_min))
     if model.aerosols is not None:
         checks.append(("aerosols.q_ss", model.aerosols.q_ss))
 
@@ -558,8 +562,12 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         for k, v in ckpt["river"].items():
             setattr(model.river, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     if ckpt.get("land_carbon") is not None and model.land_carbon is not None:
-        for k, v in ckpt["land_carbon"].items():
-            setattr(model.land_carbon, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+        ck_lc = ckpt["land_carbon"]
+        ck_c_leaf = ck_lc.get("c_leaf")
+        if isinstance(ck_c_leaf, torch.Tensor) and ck_c_leaf.shape == model.land_carbon.c_leaf.shape:
+            for k, v in ck_lc.items():
+                if hasattr(model.land_carbon, k):
+                    setattr(model.land_carbon, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     if ckpt.get("aerosols") is not None and model.aerosols is not None:
         for k, v in ckpt["aerosols"].items():
             if isinstance(v, torch.Tensor) and needs_vremap and v.ndim == 2 and v.shape[0] == nz_old:
@@ -1377,11 +1385,26 @@ def main() -> None:
                 if model.land_carbon is not None:
                     from aoba.land_carbon import diagnose_land_carbon_metrics
 
-                    lc_m = diagnose_land_carbon_metrics(model.land_carbon, model.mesh.area_cell)
+                    lc_m = diagnose_land_carbon_metrics(model.land_carbon, model.mesh.area_cell, model.mesh.surf_type)
                     esm_parts.append(
                         f"LandC={lc_m['c_land_total_pgc']:.0f} PgC "
                         f"(Veg={lc_m['c_veg_pgc']:.0f}, Soil={lc_m['c_soil_pgc']:.0f}, "
-                        f"Fire={lc_m['land_fire_pgc_yr']:.2f} PgC/yr)"
+                        f"Fire={lc_m['land_fire_pgc_yr']:.2f} PgC/yr, BA={lc_m['burned_area_mha_yr']:.1f} Mha/yr)"
+                    )
+                    if "n_min_pgn" in lc_m:
+                        esm_parts.append(
+                            f"LandN(Nmin={lc_m['n_min_pgn']:.3f} PgN, BNF={lc_m['bnf_tgn_yr']:.1f} TgN/yr, "
+                            f"Leach={lc_m['n_leach_tgn_yr']:.1f}, phiN={lc_m.get('phi_n_mean', 1.0):.2f}, "
+                            f"froot={lc_m.get('f_root_mean', 0.35):.2f})"
+                        )
+                if model.last_lightning is not None:
+                    from aoba.lightning import diagnose_lightning_metrics
+
+                    lm = diagnose_lightning_metrics(model.last_lightning, model.mesh.area_cell, model.mesh.surf_type)
+                    lo_r = lm.get("land_ocean_flash_ratio", 0.0)
+                    esm_parts.append(
+                        f"Light={lm['flash_tot_per_s']:.1f} fl/s "
+                        f"(CG={lm['cg_frac_pct']:.0f}%, L/O={lo_r:.1f}x, LNOx={lm['lnox_tgn_yr']:.2f} TgN/yr)"
                     )
                 if model.ogcm is not None and model.ogcm.seaice_evp is not None:
                     evp_s = model.ogcm.seaice_evp

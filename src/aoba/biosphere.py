@@ -576,6 +576,8 @@ class BiosphereState:
     ema_ann_a0_fav: torch.Tensor | None = None    # Moisture-gated annual potential GPP for leaf-habit profit [mol C m^-2 yr^-1]
     # Multi-year emergent thermal-home adaptation temperature T_home (Kumarathunge et al., 2019; Schneider et al., 2025)
     ema_temp_home: torch.Tensor | None = None     # Slow (~3-yr) climatological warm-season adaptation temperature [K]
+    # CN-model nitrogen sufficiency factor phi_N in [0.15, 1.0] (Stocker & Prentice, 2024; 1.0 = N-replete / N-off)
+    n_avail_fac: torch.Tensor | None = None       # 15-day EMA nitrogen availability factor [-]
 
 
 def init_biosphere_state(
@@ -626,6 +628,7 @@ def init_biosphere_state(
         ema_tmin_k=_f(278.15),
         ema_ann_a0_fav=_f(180.0),
         ema_temp_home=_f(293.15),
+        n_avail_fac=_f(1.0),
     )
 
 
@@ -1372,9 +1375,16 @@ def update_daily_lai_root_height(
     bio.f_evg = torch.clamp(f_evg_new, 0.0, 1.0)
 
     # Effective amortized annual foliage cost z_eff lowers carbon barrier for long-lived evergreen canopies,
-    # floored at 0.55 * c_dec and elevated in permafrost/alpine short-GSL soils (Wang et al., 2023; Körner, 2012).
+    # floored at 0.55 * c_dec, elevated in permafrost/alpine short-GSL soils (Wang et al., 2023; Körner, 2012),
+    # and modulated by CN-model nitrogen scarcity (Stocker & Prentice, 2024; n_cost_mult = 1.0 when N-replete).
     cold_soil_cost = 1.0 + 1.5 * torch.sigmoid(20.0 * (0.28 - f_gsl))
-    z_eff = torch.clamp((1.0 - bio.f_evg) * c_dec + bio.f_evg * (c_evg / tau_evg), min=0.55 * c_dec) * cold_soil_cost
+    n_fac = torch.clamp(bio.n_avail_fac, 0.25, 1.0) if bio.n_avail_fac is not None else None
+    n_cost_mult = (1.0 + 0.80 * (1.0 - n_fac)) if n_fac is not None else 1.0
+    z_eff = (
+        torch.clamp((1.0 - bio.f_evg) * c_dec + bio.f_evg * (c_evg / tau_evg), min=0.55 * c_dec)
+        * cold_soil_cost
+        * n_cost_mult
+    )
     fapar_c = 1.0 - z_eff / (K_BEER_LAI * a0_yr)
     fapar_max = torch.clamp(_lse_min(fapar_w, fapar_c), 0.0, 0.96)
     lai_max = -torch.log(1.0 - fapar_max) / K_BEER_LAI

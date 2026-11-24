@@ -959,7 +959,7 @@ def step_crm_physics_and_dynamics(
         # midpoint 0.5*(u_max + u_min) cuts peak stratospheric polar-night jet advection speed in half
         # (e.g. 87 m/s -> +-46 m/s, keeping Wicker-Skamarock RK3 CFL << 1.25) with zero extra substeps
         # and zero CPU-GPU synchronizations.
-        use_galilean = is_2d_crm or (ny > 1 and nx > 1 and crm.f_coriolis is None)
+        use_galilean = (nx > 1) or (ny > 1)
         u_gal_shift: torch.Tensor | None = None
         v_gal_shift: torch.Tensor | None = None
         if use_galilean:

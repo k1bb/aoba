@@ -585,16 +585,20 @@ kernel void crm_stage_uv_flux(
 
     float fc = (has_cor != 0u) ? f_cor[col] : 0.0f;
     float sp = sponge_c[k];
-    float damp_u = 0.0f;
-    float damp_v = 0.0f;
-    if (sp > 0.0f && k >= k_sp0) {
+    float um_k = 0.0f;
+    float vm_k = 0.0f;
+    if ((has_cor != 0u || sp > 0.0f) && k >= k_sp0) {
         uint sp_idx = (k - k_sp0) * n_col + col;
-        damp_u = sp * (u0 - u_mean[sp_idx]);
-        damp_v = sp * (v0 - v_mean[sp_idx]);
+        um_k = u_mean[sp_idx];
+        vm_k = v_mean[sp_idx];
     }
+    float damp_u = (sp > 0.0f) ? (sp * (u0 - um_k)) : 0.0f;
+    float damp_v = (sp > 0.0f) ? (sp * (v0 - vm_k)) : 0.0f;
+    float cor_u = (has_cor != 0u) ? (fc * (v_at_u - vm_k)) : 0.0f;
+    float cor_v = (has_cor != 0u) ? (-fc * (u_at_v - um_k)) : 0.0f;
 
-    tend_u_slow[gid] = adv_u + vadv_u + fc * v_at_u + du_sgs[gid] - damp_u;
-    tend_v_slow[gid] = adv_v + vadv_v - fc * u_at_v + dv_sgs[gid] - damp_v;
+    tend_u_slow[gid] = adv_u + vadv_u + cor_u + du_sgs[gid] - damp_u;
+    tend_v_slow[gid] = adv_v + vadv_v + cor_v + dv_sgs[gid] - damp_v;
 }
 
 kernel void crm_stage_w_hevi(
@@ -1305,7 +1309,7 @@ def run_crm_rk3_hevi_metal(
     tend_w_slow, rho_dw, rho_tot_w, thm_w, dl, diag, du = (
         ws["tend_w_slow"], ws["rho_dw"], ws["rho_tot_w"], ws["thm_w"], ws["dl"], ws["diag"], ws["du"]
     )
-    k_sp0 = int(ws["k_sp0"])
+    k_sp0 = 0 if has_cor else int(ws["k_sp0"])
     u_dim4 = [nz, n_col, ny, nx]
     f_th4 = [float(p_ref), float(r_d), float(gamma_d), 0.0]
     u_suv_flg = [dz_cols, has_cor, k_sp0, 0]
