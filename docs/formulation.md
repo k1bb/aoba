@@ -192,7 +192,7 @@ $$
 \left(\frac{\partial T}{\partial t}\right)_{\mathrm{rad}} = -\frac{1}{\rho_d c_{pd}} \frac{\partial (F_{\mathrm{SW}}^{\mathrm{net}} + F_{\mathrm{LW}}^{\mathrm{net}})}{\partial z} \tag{4.3}
 $$
 
-Subgrid cloud optical inhomogeneity (`cloud_sw_inhomog` $\chi_{\mathrm{SW}} = 0.65$; Cahalan et al., 1994) scales effective cloud liquid/ice optical depth cleanly as $\tau_{\mathrm{cld}}^{\mathrm{eff}} = \chi_{\mathrm{SW}}\,\tau_{\mathrm{cld}}$ to account for unresolved sub-4 km cloud-thickness variability:
+Subgrid cloud optical inhomogeneity (`cloud_sw_inhomog` $\chi_{\mathrm{SW}} = 0.62$; Cahalan et al., 1994) scales effective cloud liquid/ice optical depth cleanly as $\tau_{\mathrm{cld}}^{\mathrm{eff}} = \chi_{\mathrm{SW}}\,\tau_{\mathrm{cld}}$ to account for unresolved sub-4 km cloud-thickness variability:
 
 $$
 \tau_{\mathrm{liq}} = \frac{3}{2} \frac{\mathrm{LWP}}{\rho_{\ell}\, r_{e,\ell}}\,\chi_{\mathrm{SW}}, \qquad \tau_{\mathrm{ice}} = \mathrm{IWP}\left(a_i + \frac{b_i}{r_{e,i}}\right)\chi_{\mathrm{SW}} \tag{4.4}

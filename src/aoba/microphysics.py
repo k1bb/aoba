@@ -92,7 +92,7 @@ QC_AUTOCONV_THRESH: float = 1.0e-3 # KR03 fallback threshold cloud liquid water 
 QI_AGGREG_THRESH: float = 1.0e-4   # Threshold cloud ice q_io [kg kg^-1]
 RATE_AUTOCONV: float = 1.0e-3      # KR03 fallback autoconversion rate alpha [s^-1]
 RATE_ICE_AGGREG: float = 1.0e-3    # Ice aggregation rate beta [s^-1]
-VT_CLOUD_ICE: float = 0.40         # Cloud-ice terminal fall velocity V_TI [m s^-1]
+VT_CLOUD_ICE: float = 0.75         # Cloud-ice terminal fall velocity V_TI [m s^-1] (Heymsfield & Iaquinta, 2000)
 CLOUD_DROPLET_CONC_CM3: float = 60.0 # Cloud droplet number conc. N_d [cm^-3] (Tomita 2008 / Berry 1968; <=0 -> KR03)
 
 # Precipitating phase-partition temperature thresholds (KR03 Appendix B, p. 624)
@@ -480,7 +480,7 @@ def step_microphysics(
 # DeMott et al., 2010; Martin et al., 1994; Wyser, 1998)
 # ---------------------------------------------------------------------------
 # Map-free natural pre-industrial CCN & INP activation parameters
-CCN_OCEAN_BASE_CM3: float = 45.0     # Clean pre-industrial marine CCN baseline [cm^-3] (Andreae, 2009)
+CCN_OCEAN_BASE_CM3: float = 30.0     # Clean pre-industrial marine CCN baseline [cm^-3] (Andreae, 2009)
 CCN_LAND_BASE_CM3: float = 95.0      # Clean pre-industrial continental biogenic CCN [cm^-3] (Andreae, 2009)
 CCN_DUST_SCALE_CM3: float = 120.0    # Additional CCN per 10 ug m^-3 mineral dust [cm^-3]
 INP_DUST_ENHANCE: float = 4.0        # DeMott et al. (2010) dust immersion INP enhancement factor [-]

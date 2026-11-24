@@ -192,7 +192,7 @@ $$
 \left(\frac{\partial T}{\partial t}\right)_{\mathrm{rad}} = -\frac{1}{\rho_d c_{pd}} \frac{\partial (F_{\mathrm{SW}}^{\mathrm{net}} + F_{\mathrm{LW}}^{\mathrm{net}})}{\partial z} \tag{4.3}
 $$
 
-4 km 未満の雲厚の空間ムラ（サブグリッド不均一性）は Cahalan et al. (1994) の係数 `cloud_sw_inhomog`（$\chi_{\mathrm{SW}} = 0.65$）で表現する：
+4 km 未満の雲厚の空間ムラ（サブグリッド不均一性）は Cahalan et al. (1994) の係数 `cloud_sw_inhomog`（$\chi_{\mathrm{SW}} = 0.62$）で表現する：
 
 $$
 \tau_{\mathrm{liq}} = \frac{3}{2} \frac{\mathrm{LWP}}{\rho_{\ell}\, r_{e,\ell}}\,\chi_{\mathrm{SW}}, \qquad \tau_{\mathrm{ice}} = \mathrm{IWP}\left(a_i + \frac{b_i}{r_{e,i}}\right)\chi_{\mathrm{SW}} \tag{4.4}

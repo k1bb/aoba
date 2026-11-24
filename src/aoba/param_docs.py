@@ -404,8 +404,8 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "en": "Fallback / 1-moment ice cloud crystal effective radius r_e [μm] (default 48 μm).",
     },
     "cloud_sw_inhomog": {
-        "ja": "雲内部のサブグリッド短波光学的不均一性係数 χ_SW [-]（Cahalan et al., 1994; 既定 0.65）。小さいほど雲アルベド低下。",
-        "en": "Subgrid shortwave cloud optical inhomogeneity factor χ_SW [-] (Cahalan et al., 1994; default 0.65).",
+        "ja": "雲内部のサブグリッド短波光学的不均一性係数 χ_SW [-]（Cahalan et al., 1994; 既定 0.62）。小さいほど雲アルベド低下。",
+        "en": "Subgrid shortwave cloud optical inhomogeneity factor χ_SW [-] (Cahalan et al., 1994; default 0.62).",
     },
     "microphysics_scheme": {
         "ja": "雲微物理スキーム選択: one_moment(1M SAM) / two_moment(標準2M KK00) / six_class_2m(6種2M Morrison雨雪霰)。",
@@ -706,16 +706,16 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "en": "Cloud-ice to snow aggregation rate constant [s⁻¹] (1e-3).",
     },
     "vt_cloud_ice": {
-        "ja": "雲氷（巻雲）の代表沈降速度 v_ti [m s⁻¹]（0.4）。上層雲寿命と OLR を大きく左右する。",
-        "en": "Characteristic cloud-ice sedimentation speed [m s⁻¹] (0.4); strongly affects cirrus lifetime and OLR.",
+        "ja": "雲氷（巻雲）の代表沈降速度 v_ti [m s⁻¹]（既定 0.75; Heymsfield & Iaquinta, 2000）。上層雲寿命と OLR を大きく左右する。",
+        "en": "Characteristic cloud-ice sedimentation speed [m s⁻¹] (0.75; Heymsfield & Iaquinta, 2000); strongly affects cirrus lifetime and OLR.",
     },
     "cloud_droplet_conc_cm3": {
         "ja": "1M/参照雲粒数濃度 N_c [cm⁻³]（既定 60）。2M ではエアロゾルから動的予報される。",
         "en": "Reference cloud droplet number concentration N_c [cm⁻³] (60; prognostic in 2M schemes).",
     },
     "ccn_ocean_base_cm3": {
-        "ja": "清浄な海洋大気の背景雲凝結核 (CCN) 数濃度 [cm⁻³]（既定 45）。",
-        "en": "Background maritime cloud condensation nuclei (CCN) concentration [cm⁻³] (default 45).",
+        "ja": "清浄な海洋大気の背景雲凝結核 (CCN) 数濃度 [cm⁻³]（既定 30; Andreae, 2009）。",
+        "en": "Background maritime cloud condensation nuclei (CCN) concentration [cm⁻³] (default 30; Andreae, 2009).",
     },
     "ccn_land_base_cm3": {
         "ja": "清浄な陸域大気の背景 CCN 数濃度 [cm⁻³]（既定 95）。",

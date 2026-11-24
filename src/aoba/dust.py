@@ -97,7 +97,7 @@ def compute_dust_emission_sub(
     rho_atm: torch.Tensor,
     z0m: torch.Tensor,
     d_disp: torch.Tensor | None = None,
-    dust_emis_factor: float = 1.5e-5,
+    dust_emis_factor: float = 2.5e-6,
 ) -> torch.Tensor:
     """Compute subcolumn mineral dust vertical emission flux `[kg m^-2 s^-1]` (CLM5 Eq. 31.1).
 

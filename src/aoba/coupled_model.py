@@ -146,7 +146,7 @@ class AOBAConfig:
     milankovitch_accel_factor: float = 1.0   # Optional orbital acceleration multiplier for paleoclimate spin-up [-]
     re_liq_um: float = 10.0                  # Fallback/1M cloud liquid droplet effective radius [um]
     re_ice_um: float = 48.0                  # Fallback/1M cloud ice crystal effective radius [um]
-    cloud_sw_inhomog: float = 0.65           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
+    cloud_sw_inhomog: float = 0.62           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
     microphysics_scheme: str = "two_moment"  # "two_moment" (KK00), "six_class_2m" (Morrison r/s/g), or "one_moment"
     crm_nx: int = 8                          # Embedded CRM x-grid points per SCVT cell (default 2D 8x1 = 32 km curtain)
     crm_ny: int = 1                          # Embedded CRM y-grid points (1 = SP-CAM 2.5D curtain for Mac climate runs)
@@ -185,7 +185,7 @@ class AOBAConfig:
     earth2014_stride: int = 2
     enable_superparam: bool = True           # 1:1 embedded 3D CRM in every SCVT cell
     enable_dust: bool = True                 # Map-free global-parameter mineral dust aerosol + radiative coupling
-    dust_emis_factor: float = 1.5e-5         # Global dust emission tuning factor T (map-free S=1 CLM5 Eq. 31.1) [-]
+    dust_emis_factor: float = 2.5e-6         # Global dust emission tuning factor T (map-free S=1 CLM5 Eq. 31.1; AeroCom AOD ~ 0.03) [-]
     enable_dynamic_icesheet: bool = False    # Dynamic SIA + EMA-accelerated ice sheet & vertical grid update
     icesheet_ema_years: float = 5.0          # EMA smoothing timescale for annual SMB [years]
     icesheet_accel_factor: float = 100.0     # Initial ice-sheet spinup acceleration multiplier [-]
