@@ -385,9 +385,21 @@ p(z_c^{\mathrm{new}}) = p_0^{\mathrm{old}} \left[1 - \frac{g (z_c^{\mathrm{new}}
 $$
 and consistently re-diagnoses compressible density $\rho_d^{\mathrm{new}} = p^{\mathrm{new}} / (R_d \theta_m^{\mathrm{new}} \Pi^{\mathrm{new}})$ across both host and all CRM columns.
 
+### 11.4 Map-Free Prognostic 3D Atmospheric Ozone Photochemistry (`src/aoba/ozone_chemistry.py`)
+
+When `o3_mode = "prognostic"`, AOBA eliminates prescribed ozone climatology maps by advancing 3D ozone volume mixing ratio $\chi_{\mathrm{O}_3}(z, c)$ (`[Nz, N_cells]`) via conservative host SCVT Zalesak FCT transport (`fct_advect_scvt_batch`) coupled bidirectionally to shortwave UV/Chappuis and 9.6 μm longwave radiation (`radiation.py`). Chemical tendency obeys the odd-oxygen Riccati balance:
+$$
+\frac{d\chi_{\mathrm{O}_3}}{dt} = P - L_1 \chi_{\mathrm{O}_3} - L_2 \chi_{\mathrm{O}_3}^2,
+$$
+where $P = 2 J_{\mathrm{O}_2}(s_{\mathrm{O}_2}, s_{\mathrm{O}_3}) f_{\mathrm{O}_2} + P_{\mathrm{trop}}(\mathrm{CH}_4, \mathrm{LNO}_x, F_{\mathrm{fire}})$ combines two-band Chapman UV $\mathrm{O}_2$ photolysis (Herzberg + Schumann–Runge with overhead prognostic $\mathrm{O}_3$ self-shielding along spherical-shell slant air-mass $m(\mu_0) = 35/\sqrt{1224\mu_0^2 + 1}$; Brasseur & Solomon, 2005) and tropospheric production from background $\mathrm{CH}_4$, embedded CRM `LNOx`, and wildfire precursors; $L_2 = 2 k_3(T)([\mathrm{O}]/[\mathrm{O}_3]) M$ is JPL Arrhenius Chapman destruction ($k_2(T)=6.0\times 10^{-34}(300/T)^{2.4}$, $k_3(T)=8.0\times 10^{-12}e^{-2060/T}$; Burkholder et al., 2019); and $L_1$ sums stratospheric catalytic $\mathrm{NO}_x(\mathrm{N}_2\mathrm{O})$ and $\mathrm{HO}_x(q_v)$ loss, sunlit Polar Stratospheric Cloud (PSC) heterogeneous halocarbon loss for $T < 195\ \mathrm{K}$ scaled by `(o3_ecl_ppbv / 3.5)^2` (Cariolle & Teyssèdre, 2007), tropospheric $\mathrm{O}(^1\mathrm{D}) + \mathrm{H}_2\mathrm{O}$ / $\mathrm{HO}_2$ sinks, and surface dry deposition coupled to emergent EEO `LAI` and snow/ice cover (Wesely, 1989). Unconditionally stable positivity-preserving integration uses the cancellation-free positive equilibrium root $\chi_+ = 2P / (L_1 + \sqrt{L_1^2 + 4 P L_2})$ and exact exponential relaxation $\chi^{n+1} = \chi^n + (\chi_+ - \chi^n)[-\mathrm{expm1}(-(L_1 + L_2(\chi^n + \chi_+))\Delta t)]$.
+
+### 11.5 Independent High-Resolution Ocean Grid Coupling (`src/aoba/ocean_coupler.py`)
+
+Setting `ocean_glevel > 0` (distinct from atmospheric `glevel`) constructs an independent higher-resolution icosahedral SCVT mesh (`ocn_mesh`, e.g., eddy-permitting `Glevel-7` ~60 km or eddy-resolving `Glevel-8` ~30 km) for the 3D OGCM, FlexPFT marine biogeochemistry, and EVP–ITD sea-ice dynamics. Exploiting exact spherical Voronoi containment $\mathrm{parent}[j] = \arg\max_i (\mathbf{x}_{\mathrm{ocn},j} \cdot \mathbf{x}_{\mathrm{atm},i})$, `OceanAtmosCoupler` transfers intensive forcing (`tau_x`, `tau_y`, `u10`, `PAR`) to fine ocean cells, conserves global extensive freshwater/runoff integrals across mismatched coastal masks, applies atmospheric surface tendencies $(\Delta T_{\mathrm{ml}}, \Delta m_{\mathrm{ice}}, \Delta \mathrm{SWE}_{\mathrm{ice}})$ directly onto fine `ocn_sfc` with exact latent-heat freeze conservation (preventing coarse-grid smearing of SST fronts and mesoscale eddies), and aggregates fine ocean SST, sea ice, and surface chlorophyll back to host atmospheric cells by exact wet-area-weighted averaging.
+
 ---
 
-## 12. Unified Single-File TOML Configuration, Output Cadence, GUI, and 256-Parameter Registry
+## 12. Unified Single-File TOML Configuration, Output Cadence, GUI, and 270-Parameter Registry
 
 ### 12.1 TOML Architecture & Interactive Configurator (`src/aoba/params.py`, `src/aoba/co2_forcing.py`, `src/aoba/ozone_forcing.py`, `src/aoba/gravity_wave.py`, `src/aoba/runtime.py`, `scripts/aoba_config_gui.py`)
 

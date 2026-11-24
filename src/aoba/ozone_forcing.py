@@ -27,7 +27,7 @@ import torch
 from aoba import constants as C
 
 
-VALID_O3_MODES: tuple[str, ...] = ("rcemip", "latitude_seasonal", "climatology")
+VALID_O3_MODES: tuple[str, ...] = ("rcemip", "latitude_seasonal", "climatology", "prognostic")
 
 ESGF_LLNL_SEARCH_URL = "https://esgf-node.llnl.gov/esg-search/search"
 
@@ -251,7 +251,7 @@ def resolve_ozone_provider(
     if mode not in VALID_O3_MODES:
         raise ValueError(f"Invalid o3_mode '{o3_mode}'; expected one of {VALID_O3_MODES}")
 
-    if mode in ("rcemip", "latitude_seasonal"):
+    if mode in ("rcemip", "latitude_seasonal", "prognostic"):
         return OzoneForcingProvider(mode=mode)
 
     custom = str(o3_file_path or "").strip()

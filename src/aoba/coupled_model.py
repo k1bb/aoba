@@ -94,6 +94,7 @@ class AOBAConfig:
     terrain_scale_exp: float = 1.5           # Klemp STF attenuation exponent p [-]
     h_ml_ocean: float = 50.0                 # Ocean mixed-layer depth [m]
     ocean_mode: str = "ogcm_3d"              # Ocean model: "ogcm_3d" (3D multi-layer OGCM) or "ekman_sw" (1.5-layer shallow-water)
+    ocean_glevel: int = 0                    # Independent ocean SCVT glevel (0 = share host glevel; >0 = e.g. G6/G7/G8 high-res OGCM)
     ocean_nz: int = 18                       # Vertical z-levels when ocean_mode="ogcm_3d" (0..6000 m)
     enable_seaice_drift: bool = True         # Enable dynamic wind/current sea-ice drift in 3D OGCM mode
     enable_ocean_bgc: bool = True            # FlexPFT marine biogeochemistry & OMIP/mocsy 2.0 carbonate chemistry
@@ -125,9 +126,10 @@ class AOBAConfig:
     ch4_ppmv: float = CH4_PREIND_PPMV        # Well-mixed atmospheric CH4 [ppmv] (1850 piControl = 0.80825)
     n2o_ppmv: float = N2O_PREIND_PPMV        # Well-mixed atmospheric N2O [ppmv] (1850 piControl = 0.27302)
     rad_scheme: str = "ckd"                  # Radiative transfer scheme: "ckd" (16-band 50 g-pt) or "four_band"
-    o3_mode: str = "latitude_seasonal"       # "rcemip" (1D), "latitude_seasonal" (2D analytical), or "climatology"
+    o3_mode: str = "latitude_seasonal"       # "rcemip", "latitude_seasonal", "climatology", or "prognostic" (3D map-free O3)
     o3_file_path: str = ""                   # Optional external zonal/3D ozone (.npz/.nc) when o3_mode="climatology"
     o3_lw_coupling: bool = True              # Enable 9.6 um O3 absorption in LW2 atmospheric window
+    o3_ecl_ppbv: float = 0.55                # Equivalent stratospheric Cl [ppbv] for PSC loss when o3_mode="prognostic" (0.55=1850, 3.5=2000)
     enable_nonoro_gwd: bool = True           # Map-free flow-dependent convective + frontal non-orographic GWD
     solar_constant: float = C.SOLAR_CONSTANT # Total solar irradiance S_0 [W m^-2]
     omega: float = C.OMEGA_EARTH             # Planetary rotation rate [rad s^-1]
@@ -185,12 +187,16 @@ class AOBAState:
     ocn: EkmanOceanState
     clim: ClimateAccumulator
     ogcm: OceanOGCMState | None = None
+    ocn_mesh: SCVTMesh | None = None
+    ocn_sfc: SurfaceState | None = None
+    ocn_coupler: object | None = None
     sfc_sub: SurfaceState | None = None
     clim_sub: ClimateAccumulator | None = None
     icesheet: IceSheetState | None = None
     river: object | None = None
     land_carbon: object | None = None
     aerosols: object | None = None
+    ozone: object | None = None
     sim_time_sec: float = 0.0
     step_count: int = 0
     rad_cache: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -491,19 +497,68 @@ def init_aoba_model(
     sfc.m_seaice = torch.where(polar_cold, torch.full_like(t_sfc_lat, 1400.0), torch.zeros_like(t_sfc_lat))
 
     ocn = init_ekman_ocean_state(sfc)
-    ogcm = (
-        init_ogcm_state(sfc, mesh, nz_ocn=cfg.ocean_nz)
-        if str(cfg.ocean_mode).strip().lower() == "ogcm_3d"
-        else None
+    ocn_mesh: SCVTMesh | None = None
+    ocn_sfc: SurfaceState | None = None
+    ocn_coupler: object | None = None
+    use_indep_ocn = (
+        str(cfg.ocean_mode).strip().lower() == "ogcm_3d"
+        and int(cfg.ocean_glevel) > 0
+        and int(cfg.ocean_glevel) != int(cfg.glevel)
     )
-    if ogcm is not None and bool(cfg.enable_ocean_bgc):
-        from aoba.ocean_bgc import init_ocean_bgc_state
+    if use_indep_ocn:
+        from aoba.ocean_coupler import build_ocean_atmos_coupler, ocn_to_atm_mean
 
-        ogcm.bgc = init_ocean_bgc_state(ogcm.wet_c, ogcm.h_c, ogcm.z_c, mesh.area_cell)
-    if ogcm is not None and bool(cfg.enable_seaice_evp_itd):
-        from aoba.seaice_evp import init_seaice_evp_state
+        ocn_mesh = build_scvt_mesh(
+            glevel=int(cfg.ocean_glevel),
+            n_lloyd_iter=10,
+            use_earth2014=cfg.use_earth2014,
+            earth2014_dir=cfg.earth2014_dir,
+            earth2014_stride=cfg.earth2014_stride,
+            omega=cfg.omega,
+            device=dev,
+            dtype=dtype,
+        )
+        ocn_coupler = build_ocean_atmos_coupler(mesh, ocn_mesh, device=dev)
+        t_ocn_lat = 301.0 - 40.0 * (torch.sin(ocn_mesh.lat_cell) ** 2) - 0.0065 * torch.clamp(ocn_mesh.z_topo, min=0.0)
+        ocn_sfc = init_surface_state(
+            ocn_mesh.surf_type, z_topo=ocn_mesh.z_topo, t_init=293.15,
+            sigma_topo=ocn_mesh.sigma_topo, h_ml_ocean=cfg.h_ml_ocean,
+        )
+        ocn_sfc.t_ocean_ml = torch.where(
+            ocn_mesh.surf_type == SURF_OCEAN,
+            torch.clamp(301.0 - 34.0 * (torch.sin(ocn_mesh.lat_cell) ** 2), min=C.T_FREEZE_OCEAN + 0.2),
+            ocn_sfc.t_ocean_ml,
+        )
+        polar_ocn = (ocn_mesh.surf_type == SURF_OCEAN) & (t_ocn_lat < C.T_FREEZE_OCEAN)
+        ocn_sfc.m_seaice = torch.where(polar_ocn, torch.full_like(t_ocn_lat, 1400.0), torch.zeros_like(t_ocn_lat))
+        ogcm = init_ogcm_state(ocn_sfc, ocn_mesh, nz_ocn=cfg.ocean_nz)
+        if bool(cfg.enable_ocean_bgc):
+            from aoba.ocean_bgc import init_ocean_bgc_state
 
-        ogcm.seaice_evp = init_seaice_evp_state(sfc, mesh)
+            ogcm.bgc = init_ocean_bgc_state(ogcm.wet_c, ogcm.h_c, ogcm.z_c, ocn_mesh.area_cell)
+        if bool(cfg.enable_seaice_evp_itd):
+            from aoba.seaice_evp import init_seaice_evp_state
+
+            ogcm.seaice_evp = init_seaice_evp_state(ocn_sfc, ocn_mesh)
+        # Synchronize initial host SST & sea ice with exact area-weighted fine-ocean mean
+        sfc.t_ocean_ml = ocn_to_atm_mean(ocn_coupler, ocn_sfc.t_ocean_ml, fallback_atm=sfc.t_ocean_ml)
+        sfc.m_seaice = ocn_to_atm_mean(ocn_coupler, ocn_sfc.m_seaice, fallback_atm=sfc.m_seaice)
+        sfc.swe_seaice = ocn_to_atm_mean(ocn_coupler, ocn_sfc.swe_seaice, fallback_atm=sfc.swe_seaice)
+        sfc.h_ocean_ml = ocn_to_atm_mean(ocn_coupler, ocn_sfc.h_ocean_ml, fallback_atm=sfc.h_ocean_ml)
+    else:
+        ogcm = (
+            init_ogcm_state(sfc, mesh, nz_ocn=cfg.ocean_nz)
+            if str(cfg.ocean_mode).strip().lower() == "ogcm_3d"
+            else None
+        )
+        if ogcm is not None and bool(cfg.enable_ocean_bgc):
+            from aoba.ocean_bgc import init_ocean_bgc_state
+
+            ogcm.bgc = init_ocean_bgc_state(ogcm.wet_c, ogcm.h_c, ogcm.z_c, mesh.area_cell)
+        if ogcm is not None and bool(cfg.enable_seaice_evp_itd):
+            from aoba.seaice_evp import init_seaice_evp_state
+
+            ogcm.seaice_evp = init_seaice_evp_state(sfc, mesh)
 
     sfc_sub = init_surface_state(
         _cell_to_sub(mesh.surf_type, nc, n_sub),
@@ -566,6 +621,13 @@ def init_aoba_model(
             day_steps=0,
         )
 
+    ozone_state = None
+    if str(cfg.o3_mode).strip().lower() == "prognostic":
+        from aoba.ozone_chemistry import init_prognostic_ozone_state
+
+        pres_init_oz, _, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        ozone_state = init_prognostic_ozone_state(pres_init_oz, atmos.rho_d, atmos.dz_c)
+
     model = AOBAState(
         cfg=cfg,
         mesh=mesh,
@@ -575,6 +637,9 @@ def init_aoba_model(
         sfc=sfc,
         ocn=ocn,
         ogcm=ogcm,
+        ocn_mesh=ocn_mesh,
+        ocn_sfc=ocn_sfc,
+        ocn_coupler=ocn_coupler,
         clim=_make_clim(nc, include_monthly=True),
         sfc_sub=sfc_sub,
         clim_sub=_make_clim(m_sub, include_monthly=False),
@@ -592,6 +657,7 @@ def init_aoba_model(
             if bool(cfg.enable_natural_aerosols)
             else None
         ),
+        ozone=ozone_state,
         calendar=AobaCalendar(
             start_date=cfg.start_date,
             calendar_type=cfg.calendar_type,
@@ -902,7 +968,14 @@ def step_aoba_model(
             re_liq_rad = cfg.re_liq_um
             re_ice_rad = cfg.re_ice_um
         o3_vmr_rad = None
-        if model.o3_provider is not None and model.o3_provider.mode != "rcemip":
+        if str(cfg.o3_mode).strip().lower() == "prognostic":
+            if model.ozone is None:
+                from aoba.ozone_chemistry import init_prognostic_ozone_state
+
+                pres_host_oz, _, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+                model.ozone = init_prognostic_ozone_state(pres_host_oz, atmos.rho_d, atmos.dz_c)
+            o3_vmr_rad = _cell_to_sub(model.ozone.o3_vmr, nc, n_sub)
+        elif model.o3_provider is not None and model.o3_provider.mode != "rcemip":
             doy_now = float(model.calendar.date_at(model.sim_time_sec).doy)
             o3_vmr_rad = model.o3_provider.compute_vmr(
                 pres_sub,
@@ -970,6 +1043,13 @@ def step_aoba_model(
     rain_prev_sub = model.rad_cache.get("rain_sub", torch.zeros_like(pres_sfc_sub))
     snow_prev_sub = model.rad_cache.get("snow_sub", torch.zeros_like(pres_sfc_sub))
 
+    # Snapshot pre-surface ocean ML/ice state to extract exact atmospheric surface tendencies when ocean_glevel != glevel
+    has_indep_ocn = model.ocn_coupler is not None and model.ocn_mesh is not None and model.ocn_sfc is not None
+    if has_indep_ocn:
+        t_ml_pre_sfc = _sub_to_cell(sfc_sub.t_ocean_ml, nc, n_sub)
+        m_ice_pre_sfc = _sub_to_cell(sfc_sub.m_seaice, nc, n_sub)
+        swe_ice_pre_sfc = _sub_to_cell(sfc_sub.swe_seaice, nc, n_sub)
+
     # 4. Subgrid MAML Land/Snow/Soil/Two-Leaf Biosphere & Ocean/Sea-Ice Balance + Host Voronoi Ekman Ocean
     sfc_diag_sub = step_surface(
         sfc=sfc_sub,
@@ -1002,16 +1082,19 @@ def step_aoba_model(
     sfc.swe_seaice = swe_ice_cell_before.clone()
     sfc.h_ocean_ml = _sub_to_cell(sfc_sub.h_ocean_ml, nc, n_sub)
     if str(cfg.ocean_mode).strip().lower() == "ogcm_3d":
+        active_ocn_mesh = model.ocn_mesh if has_indep_ocn else mesh
+        active_ocn_sfc = model.ocn_sfc if has_indep_ocn else sfc
+        assert active_ocn_mesh is not None and active_ocn_sfc is not None
         if model.ogcm is None:
-            model.ogcm = init_ogcm_state(sfc, mesh, nz_ocn=cfg.ocean_nz)
+            model.ogcm = init_ogcm_state(active_ocn_sfc, active_ocn_mesh, nz_ocn=cfg.ocean_nz)
         if bool(cfg.enable_ocean_bgc) and model.ogcm.bgc is None:
             from aoba.ocean_bgc import init_ocean_bgc_state
 
-            model.ogcm.bgc = init_ocean_bgc_state(model.ogcm.wet_c, model.ogcm.h_c, model.ogcm.z_c, mesh.area_cell)
+            model.ogcm.bgc = init_ocean_bgc_state(model.ogcm.wet_c, model.ogcm.h_c, model.ogcm.z_c, active_ocn_mesh.area_cell)
         if bool(cfg.enable_seaice_evp_itd) and model.ogcm.seaice_evp is None:
             from aoba.seaice_evp import init_seaice_evp_state
 
-            model.ogcm.seaice_evp = init_seaice_evp_state(sfc, mesh)
+            model.ogcm.seaice_evp = init_seaice_evp_state(active_ocn_sfc, active_ocn_mesh)
         sw_abs_ocn_sub = (1.0 - torch.clamp(sfc_diag_sub.f_seaice, 0.0, 1.0)) * (
             sw1_dir_sub * (1.0 - sfc_diag_sub.alb_vis_dir)
             + sw1_dif_sub * (1.0 - sfc_diag_sub.alb_vis_dif)
@@ -1038,26 +1121,73 @@ def step_aoba_model(
                 model.river = init_river_routing_state(mesh, device=runoff_tot_cell.device)
             runoff_liq_cell = torch.clamp(runoff_tot_cell - runoff_ice_cell, min=0.0)
             river_mouth_flux = step_river_routing_voronoi(model.river, runoff_liq_cell, mesh.area_cell, dt)
+
+        tau_x_ocn = _sub_to_cell(sfc_diag_sub.tau_x, nc, n_sub)
+        tau_y_ocn = _sub_to_cell(sfc_diag_sub.tau_y, nc, n_sub)
+        f_ice_ocn = _sub_to_cell(sfc_diag_sub.f_seaice, nc, n_sub)
+        evap_ocn = _sub_to_cell(sfc_diag_sub.evap, nc, n_sub)
+        precip_ocn = _sub_to_cell(rain_prev_sub + snow_prev_sub, nc, n_sub)
+        sw_net_ocn = _sub_to_cell(sw_abs_ocn_sub, nc, n_sub)
+        runoff_tot_ocn = runoff_tot_cell
+        runoff_ice_ocn = runoff_ice_cell
+        river_mouth_ocn = river_mouth_flux
+
+        if has_indep_ocn:
+            from aoba.ocean_coupler import (
+                apply_atm_surface_increments_to_ocn_sfc,
+                atm_to_ocn_conservative_flux,
+                atm_to_ocn_intensive,
+                ocn_to_atm_mean,
+            )
+
+            coupler = model.ocn_coupler
+            apply_atm_surface_increments_to_ocn_sfc(
+                coupler,
+                active_ocn_sfc,
+                t1_cell_before - t_ml_pre_sfc,
+                m_ice_cell_before - m_ice_pre_sfc,
+                swe_ice_cell_before - swe_ice_pre_sfc,
+            )
+            tau_x_ocn = atm_to_ocn_intensive(coupler, tau_x_ocn)
+            tau_y_ocn = atm_to_ocn_intensive(coupler, tau_y_ocn)
+            f_ice_ocn = atm_to_ocn_intensive(coupler, f_ice_ocn)
+            evap_ocn = atm_to_ocn_intensive(coupler, evap_ocn)
+            precip_ocn = atm_to_ocn_intensive(coupler, precip_ocn)
+            sw_net_ocn = atm_to_ocn_intensive(coupler, sw_net_ocn)
+            if sw_par_ocn is not None:
+                sw_par_ocn = atm_to_ocn_intensive(coupler, sw_par_ocn)
+            if u10_ocn is not None:
+                u10_ocn = atm_to_ocn_intensive(coupler, u10_ocn)
+            runoff_tot_ocn = atm_to_ocn_conservative_flux(coupler, runoff_tot_cell, ocean_only_source=False)
+            runoff_ice_ocn = atm_to_ocn_conservative_flux(coupler, runoff_ice_cell, ocean_only_source=False)
+            if river_mouth_flux is not None:
+                river_mouth_ocn = atm_to_ocn_conservative_flux(coupler, river_mouth_flux, ocean_only_source=True)
+
         step_ogcm_voronoi(
             ogcm=model.ogcm,
-            sfc=sfc,
-            mesh=mesh,
-            tau_x_sfc=_sub_to_cell(sfc_diag_sub.tau_x, nc, n_sub),
-            tau_y_sfc=_sub_to_cell(sfc_diag_sub.tau_y, nc, n_sub),
-            f_seaice=_sub_to_cell(sfc_diag_sub.f_seaice, nc, n_sub),
-            evap_cell=_sub_to_cell(sfc_diag_sub.evap, nc, n_sub),
-            precip_cell=_sub_to_cell(rain_prev_sub + snow_prev_sub, nc, n_sub),
-            runoff_total=runoff_tot_cell,
-            runoff_glacier=runoff_ice_cell,
+            sfc=active_ocn_sfc,
+            mesh=active_ocn_mesh,
+            tau_x_sfc=tau_x_ocn,
+            tau_y_sfc=tau_y_ocn,
+            f_seaice=f_ice_ocn,
+            evap_cell=evap_ocn,
+            precip_cell=precip_ocn,
+            runoff_total=runoff_tot_ocn,
+            runoff_glacier=runoff_ice_ocn,
             dt=dt,
             enable_seaice_drift=bool(cfg.enable_seaice_drift),
-            sw_net_ocn=_sub_to_cell(sw_abs_ocn_sub, nc, n_sub),
+            sw_net_ocn=sw_net_ocn,
             sw_par_ocn=sw_par_ocn,
             u10_ocn=u10_ocn,
             co2_ppmv=model.current_co2_ppmv(),
-            river_mouth_flux=river_mouth_flux,
+            river_mouth_flux=river_mouth_ocn,
             enable_fct_zstar=bool(cfg.enable_ogcm_fct_zstar),
         )
+        if has_indep_ocn:
+            sfc.t_ocean_ml = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.t_ocean_ml, fallback_atm=sfc.t_ocean_ml)
+            sfc.m_seaice = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.m_seaice, fallback_atm=sfc.m_seaice)
+            sfc.swe_seaice = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.swe_seaice, fallback_atm=sfc.swe_seaice)
+            sfc.h_ocean_ml = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.h_ocean_ml, fallback_atm=sfc.h_ocean_ml)
     else:
         step_ekman_ocean_voronoi(
             ocn=model.ocn,
@@ -1158,6 +1288,9 @@ def step_aoba_model(
     has_aero_adv = bool(cfg.enable_natural_aerosols and model.aerosols is not None)
     if has_aero_adv:
         adv_list.extend([model.aerosols.q_ss, model.aerosols.q_so4, model.aerosols.q_bc, model.aerosols.q_oc])
+    has_o3_adv = bool(str(cfg.o3_mode).strip().lower() == "prognostic" and model.ozone is not None)
+    if has_o3_adv:
+        adv_list.append(model.ozone.o3_vmr)
     q_adv = fct_advect_scvt_batch(
         mesh, torch.stack(adv_list, dim=0),
         m_old_host, m_new_host, uh_mean, om_mean, dt,
@@ -1173,6 +1306,9 @@ def step_aoba_model(
         model.aerosols.q_so4 = q_adv[idx_q + 1]
         model.aerosols.q_bc = q_adv[idx_q + 2]
         model.aerosols.q_oc = q_adv[idx_q + 3]
+        idx_q += 4
+    if has_o3_adv:
+        model.ozone.o3_vmr = torch.clamp(q_adv[idx_q], min=1.0e-10, max=4.0e-5)
 
     dthm_ls = (atmos.theta_m - thm_before_dyn) / dt
     dqn_ls = (atmos.q_n - qn_before_dyn) / dt
@@ -1563,6 +1699,10 @@ def step_aoba_model(
             if (model.ogcm is not None and model.ogcm.bgc is not None)
             else None
         )
+        if chl_sfc is not None and has_indep_ocn:
+            from aoba.ocean_coupler import ocn_to_atm_mean
+
+            chl_sfc = ocn_to_atm_mean(model.ocn_coupler, chl_sfc)
         if model.land_carbon is not None:
             if int(model.land_carbon.fire_bc_kg_m2s.shape[0]) == m_sub:
                 fire_bc = _sub_to_cell(model.land_carbon.fire_bc_kg_m2s, nc, n_sub)
@@ -1587,6 +1727,42 @@ def step_aoba_model(
             fire_bc_kg_m2s=fire_bc,
             fire_oc_kg_m2s=fire_oc,
             u_star_cell=_sub_to_cell(sfc_diag_sub.u_star, nc, n_sub),
+        )
+    if str(cfg.o3_mode).strip().lower() == "prognostic":
+        from aoba.ozone_chemistry import init_prognostic_ozone_state, step_prognostic_ozone
+
+        pres_host_oz, _, temp_host_oz = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        if model.ozone is None:
+            model.ozone = init_prognostic_ozone_state(pres_host_oz, atmos.rho_d, atmos.dz_c)
+        lnox_prod_cell = None
+        if light_diag is not None:
+            from aoba.lightning import LNOX_KG_N_PER_FLASH
+
+            lnox_prod_cell = light_diag.flash_tot_cell * LNOX_KG_N_PER_FLASH
+        fire_c_cell = None
+        if model.land_carbon is not None:
+            if int(model.land_carbon.fire_c_kgc_m2s.shape[0]) == m_sub:
+                fire_c_cell = _sub_to_cell(model.land_carbon.fire_c_kgc_m2s, nc, n_sub)
+            else:
+                fire_c_cell = model.land_carbon.fire_c_kgc_m2s
+        step_prognostic_ozone(
+            oz=model.ozone,
+            pres_c=pres_host_oz,
+            temp_c=temp_host_oz,
+            rho_d=atmos.rho_d,
+            dz_c=atmos.dz_c,
+            q_v=atmos.q_v,
+            mu0=mu0,
+            surf_type=sfc.surf_type,
+            lai_cell=sfc.bio.lai,
+            f_snow_cell=_sub_to_cell(sfc_diag_sub.f_snow_land, nc, n_sub),
+            f_seaice_cell=f_seaice_cell,
+            dt=dt,
+            n2o_ppmv=cfg.n2o_ppmv,
+            ch4_ppmv=cfg.ch4_ppmv,
+            ecl_ppbv=cfg.o3_ecl_ppbv,
+            lnox_cell_kgn_m2s=lnox_prod_cell,
+            fire_c_cell_kgc_m2s=fire_c_cell,
         )
     month_idx = model.calendar.date_at(model.sim_time_sec).month - 1
     clim.month_temp_sum_c[month_idx] += (t_air - C.T_FREEZE)

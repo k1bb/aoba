@@ -608,6 +608,18 @@ $$
    $$
 2. **圧縮性状態方程式による密度再診断**: 補間・外挿された新気圧 $p^{\mathrm{new}}$ と $\theta_m^{\mathrm{new}}$ から乾燥空気密度を $\rho_d^{\mathrm{new}} = p^{\mathrm{new}} / (R_d \theta_m^{\mathrm{new}} \Pi^{\mathrm{new}})$ と厳密に再算出し、圧力・浮力バランスの擾乱を最小限に抑えたまま統合を継続する。またホスト大気辺法線風速 $u_e$ は左右セルの新層高度平均を用いて再補間する。
 
+### 11.5 マップフリー 3D 予報大気オゾン光化学・乾性沈着 (`src/aoba/ozone_chemistry.py`)
+
+`o3_mode = "prognostic"` を指定すると、処方オゾン気候値マップを完全に排し、3次元オゾン体積混合比 $\chi_{\mathrm{O}_3}(z, c)$（`[Nz, N_cells]`）をホスト SCVT Zalesak FCT 移流 (`fct_advect_scvt_batch`) により保存移流しつつ短波 UV/Chappuis・9.6 μm 長波放射 (`radiation.py`) と双方向結合する。局所化学収支は奇酸素 Riccati 方程式で記述される：
+$$
+\frac{d\chi_{\mathrm{O}_3}}{dt} = P - L_1 \chi_{\mathrm{O}_3} - L_2 \chi_{\mathrm{O}_3}^2.
+$$
+生成項 $P = 2 J_{\mathrm{O}_2}(s_{\mathrm{O}_2}, s_{\mathrm{O}_3}) f_{\mathrm{O}_2} + P_{\mathrm{trop}}(\mathrm{CH}_4, \mathrm{LNO}_x, F_{\mathrm{fire}})$ は、球殻大気路程 $m(\mu_0) = 35 / \sqrt{1224\mu_0^2 + 1}$ に沿う上空予報 $\mathrm{O}_3$ の UV 自己遮蔽を含む 2 バンド $\mathrm{O}_2$ 光解離（Herzberg 連続帯＋Schumann–Runge 帯；Brasseur & Solomon, 2005）と、背景 $\mathrm{CH}_4$・埋め込み CRM 落雷 `LNOx`・森林火災前駆体による対流圏生成からなる。二次消失 $L_2 = 2 k_3(T)([\mathrm{O}]/[\mathrm{O}_3]) M$ は JPL Arrhenius 速度定数に基づく Chapman 反応（Burkholder et al., 2019）であり、一次消失 $L_1$ は $\mathrm{N}_2\mathrm{O}$ 由来 $\mathrm{NO}_x$・予報水蒸気 $q_v$ 由来 $\mathrm{HO}_x$ の成層圏触媒破壊、$T < 195\ \mathrm{K}$ かつ日照下で `(o3_ecl_ppbv / 3.5)^2` に比例する極成層圏雲 (PSC) 不均一反応（Cariolle & Teyssèdre, 2007）、対流圏 $\mathrm{O}(^1\mathrm{D})+\mathrm{H}_2\mathrm{O}$・$\mathrm{HO}_2$ 消失、および創発 EEO 植生 `LAI`・積雪海氷に連動した地表面乾性沈着（Wesely, 1989）の和である。時間積分には桁落ちのない正平衡根 $\chi_+ = 2P / (L_1 + \sqrt{L_1^2 + 4 P L_2})$ と厳密指数緩和 $\chi^{n+1} = \chi^n + (\chi_+ - \chi^n)[-\mathrm{expm1}(-(L_1 + L_2(\chi^n + \chi_+))\Delta t)]$ を用い、無条件安定・非負保存を保証する。
+
+### 11.6 独立高解像度海洋グリッド結合 (`src/aoba/ocean_coupler.py`)
+
+`ocean_glevel > 0`（大気 `glevel` と異なる値）を指定すると、3D OGCM・FlexPFT 海洋生物地球化学・EVP–ITD 海氷力学を独立の高解像度正二十面体 SCVT メッシュ（`ocn_mesh`；例：渦許容 `Glevel-7` ~60 km や渦解像 `Glevel-8` ~30 km）上で実行できる。球面 Voronoi 包含関係 $\mathrm{parent}[j] = \arg\max_i (\mathbf{x}_{\mathrm{ocn},j} \cdot \mathbf{x}_{\mathrm{atm},i})$ に基づく `OceanAtmosCoupler` は、示強外力（風応力・10 m 風速・PAR）を細格子へ写像し、流出・淡水フラックスは海岸線マスク差を跨いで全球積分を厳密保存する。大気地表面ステップの熱・海氷増分 $(\Delta T_{\mathrm{ml}}, \Delta m_{\mathrm{ice}}, \Delta \mathrm{SWE}_{\mathrm{ice}})$ を潜熱凍結保存つきで細格子 `ocn_sfc` へ直接適用することで SST 前線や中規模渦の粗格子拡散を防ぎ、更新後の SST・海氷・表層クロロフィルを厳密な海洋面積重み平均で大気格子へ返す。
+
 ---
 
 ## 12. 単一 TOML 設定管理・出力仕様・GUI コンフィギュレータ・全パラメータ一覧

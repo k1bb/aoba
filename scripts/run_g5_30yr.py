@@ -186,6 +186,8 @@ def _inspect_nonfinite_state(model: AOBAState) -> list[str]:
             checks.append(("land_carbon.n_min", model.land_carbon.n_min))
     if model.aerosols is not None:
         checks.append(("aerosols.q_ss", model.aerosols.q_ss))
+    if model.ozone is not None:
+        checks.append(("ozone.o3_vmr", model.ozone.o3_vmr))
 
     n_sub = max(int(model.cfg.crm_ny * model.cfg.crm_nx), 1)
     bad_lines: list[str] = []
@@ -263,6 +265,7 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
         ),
         "sfc": _serialize_surface(model.sfc),
         "sfc_sub": _serialize_surface(model.sfc_sub) if model.sfc_sub is not None else None,
+        "ocn_sfc": _serialize_surface(model.ocn_sfc) if model.ocn_sfc is not None else None,
         "ocn": {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.ocn.__dict__.items()},
         "ogcm": (
             {
@@ -290,6 +293,11 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
         "aerosols": (
             {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.aerosols.__dict__.items()}
             if model.aerosols is not None
+            else None
+        ),
+        "ozone": (
+            {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.ozone.__dict__.items()}
+            if model.ozone is not None
             else None
         ),
         "clim": {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.clim.__dict__.items()},
@@ -531,11 +539,17 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
     _restore_surface(model.sfc, ckpt["sfc"], device)
     if ckpt.get("sfc_sub") is not None and model.sfc_sub is not None:
         _restore_surface(model.sfc_sub, ckpt["sfc_sub"], device)
+    if ckpt.get("ocn_sfc") is not None and model.ocn_sfc is not None:
+        _restore_surface(model.ocn_sfc, ckpt["ocn_sfc"], device)
     for k, v in ckpt["ocn"].items():
         setattr(model.ocn, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     if model.ogcm is not None:
-        if ckpt.get("ogcm") is not None and int(ckpt["ogcm"].get("nz_ocn", -1)) == model.ogcm.nz_ocn:
-            for k, v in ckpt["ogcm"].items():
+        ocn_mesh_act = model.ocn_mesh if model.ocn_mesh is not None else model.mesh
+        ocn_sfc_act = model.ocn_sfc if model.ocn_sfc is not None else model.sfc
+        ck_og = ckpt.get("ogcm")
+        ck_og_nc = int(ck_og["eta"].shape[0]) if (ck_og is not None and "eta" in ck_og and isinstance(ck_og["eta"], torch.Tensor)) else -1
+        if ck_og is not None and int(ck_og.get("nz_ocn", -1)) == model.ogcm.nz_ocn and ck_og_nc == ocn_mesh_act.n_cells:
+            for k, v in ck_og.items():
                 if k == "_static_cache":
                     continue
                 if k in ("bgc", "seaice_evp"):
@@ -549,15 +563,15 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         else:
             from aoba.ocean_ogcm import init_ogcm_state
 
-            model.ogcm = init_ogcm_state(model.sfc, model.mesh, nz_ocn=model.cfg.ocean_nz)
+            model.ogcm = init_ogcm_state(ocn_sfc_act, ocn_mesh_act, nz_ocn=model.cfg.ocean_nz)
             if bool(model.cfg.enable_ocean_bgc):
                 from aoba.ocean_bgc import init_ocean_bgc_state
 
-                model.ogcm.bgc = init_ocean_bgc_state(model.ogcm.wet_c, model.ogcm.h_c, model.ogcm.z_c, model.mesh.area_cell)
+                model.ogcm.bgc = init_ocean_bgc_state(model.ogcm.wet_c, model.ogcm.h_c, model.ogcm.z_c, ocn_mesh_act.area_cell)
             if bool(model.cfg.enable_seaice_evp_itd):
                 from aoba.seaice_evp import init_seaice_evp_state
 
-                model.ogcm.seaice_evp = init_seaice_evp_state(model.sfc, model.mesh)
+                model.ogcm.seaice_evp = init_seaice_evp_state(ocn_sfc_act, ocn_mesh_act)
     if ckpt.get("river") is not None and model.river is not None:
         for k, v in ckpt["river"].items():
             setattr(model.river, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
@@ -576,6 +590,13 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
                 setattr(model.aerosols, k, remapped.to(device=device))
             else:
                 setattr(model.aerosols, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+    if ckpt.get("ozone") is not None and model.ozone is not None:
+        for k, v in ckpt["ozone"].items():
+            if isinstance(v, torch.Tensor) and needs_vremap and v.ndim == 2 and v.shape[0] == nz_old:
+                remapped = torch.clamp(_interp_vertical_batch(z_old_c, v.cpu(), z_new_c), min=1.0e-10)
+                setattr(model.ozone, k, remapped.to(device=device))
+            elif hasattr(model.ozone, k):
+                setattr(model.ozone, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     for k, v in ckpt["clim"].items():
         setattr(model.clim, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     if ckpt.get("clim_sub") is not None and model.clim_sub is not None:
@@ -651,11 +672,15 @@ def _build_monthly_mean_xarray(
             if name in sums:
                 arr = (sums[name] * inv).detach().cpu().numpy()[None, :]
                 data_vars[name] = (("time", "n_cell"), arr, {"units": unit})
+        if model.ozone is not None and "o3_tco_du" in sums:
+            data_vars["o3_tco_du"] = (("time", "n_cell"), (sums["o3_tco_du"] * inv).detach().cpu().numpy()[None, :], {"units": "DU"})
         if model.ogcm is not None:
+            ocn_cell_dim = "n_cell_ocn" if model.ocn_mesh is not None else "n_cell"
             for name, unit in units_2d_ocn.items():
                 if name in sums:
                     arr = (sums[name] * inv).detach().cpu().numpy()[None, :]
-                    data_vars[name] = (("time", "n_cell"), arr, {"units": unit})
+                    c_dim = ocn_cell_dim if name in ("ocn_eta", "ocn_sss", "ocn_h_bl") else "n_cell"
+                    data_vars[name] = (("time", c_dim), arr, {"units": unit})
         if model.icesheet is not None:
             for name in ("h_ice", "z_topo_dyn"):
                 if name in sums:
@@ -668,11 +693,14 @@ def _build_monthly_mean_xarray(
             if name in sums:
                 arr = (sums[name] * inv).detach().cpu().numpy()[None, :, :]
                 data_vars[name] = (("time", "nz", "n_cell"), arr, {"units": unit})
+        if model.ozone is not None and "o3_vmr" in sums:
+            data_vars["o3_vmr"] = (("time", "nz", "n_cell"), (sums["o3_vmr"] * inv).detach().cpu().numpy()[None, :, :], {"units": "mol mol-1"})
         if model.ogcm is not None:
+            ocn_cell_dim = "n_cell_ocn" if model.ocn_mesh is not None else "n_cell"
             for name, unit in units_3d_ocn.items():
                 if name in sums:
                     arr = (sums[name] * inv).detach().cpu().numpy()[None, :, :]
-                    data_vars[name] = (("time", "nz_ocn", "n_cell"), arr, {"units": unit})
+                    data_vars[name] = (("time", "nz_ocn", ocn_cell_dim), arr, {"units": unit})
     if include_subgrid_2d:
         for name, unit in _SUBGRID_2D_UNITS.items():
             if name in sums:
@@ -686,6 +714,9 @@ def _build_monthly_mean_xarray(
         "lat_cell": ("n_cell", lat_deg, {"units": "degrees_north"}),
         "lon_cell": ("n_cell", lon_deg, {"units": "degrees_east"}),
     }
+    if model.ocn_mesh is not None:
+        coords["lat_cell_ocn"] = ("n_cell_ocn", np.rad2deg(model.ocn_mesh.lat_cell.detach().cpu().numpy()), {"units": "degrees_north"})
+        coords["lon_cell_ocn"] = ("n_cell_ocn", np.rad2deg(model.ocn_mesh.lon_cell.detach().cpu().numpy()), {"units": "degrees_east"})
     if include_3d:
         coords["nz"] = ("nz", model.vgrid.zeta_c.detach().cpu().numpy(), {"units": "m", "positive": "up"})
         if model.ogcm is not None:
@@ -932,7 +963,9 @@ def main() -> None:
         with open(spinup_csv, "w", newline="") as f_sp:
             csv.writer(f_sp).writerow(_SPINUP_HEADER)
             if model.ogcm is not None:
-                m0 = diagnose_ocean_spinup_metrics(model.ogcm, model.sfc, model.mesh)
+                ocn_mesh_0 = model.ocn_mesh if model.ocn_mesh is not None else model.mesh
+                ocn_sfc_0 = model.ocn_sfc if model.ocn_sfc is not None else model.sfc
+                m0 = diagnose_ocean_spinup_metrics(model.ogcm, ocn_sfc_0, ocn_mesh_0)
                 prev_ohc_j = m0.get("ohc_j", None)
                 prev_ohc_time_sec = model.sim_time_sec
                 date0 = model.calendar.date_at(model.sim_time_sec).iso_date
@@ -1047,6 +1080,8 @@ def main() -> None:
             else {"ts": 0.0, "olr": 0.0, "asr": 0.0, "p": 0.0, "gpp": 0.0, "lai": 0.0, "ice": 0.0}
         )
         mon_cnt = resume_mon_cnt if is_mid_resume else 0
+        mon_esm_sums: dict[str, torch.Tensor] = {}
+        mon_esm_cnt = 0
         hr_t2_sum: torch.Tensor | None = None
         hr_precip_sum: torch.Tensor | None = None
         hr_olr_sum: torch.Tensor | None = None
@@ -1128,6 +1163,32 @@ def main() -> None:
             mon_accum["lai"] += diag.land_mean_lai
             mon_accum["ice"] += diag.seaice_area_million_km2
             mon_cnt += 1
+            # Zero-sync on-device monthly accumulators for intermittent ESM fluxes (MAML fires, lightning, BNF, O3 dep)
+            _esm_step: dict[str, torch.Tensor] = {}
+            if model.land_carbon is not None:
+                _lc = model.land_carbon
+                _esm_step["lc_fire_c"] = _lc.fire_c_kgc_m2s
+                _esm_step["lc_ba_s"] = _lc.burned_frac_s
+                if _lc.bnf_kgn_m2s is not None:
+                    _esm_step["lc_bnf"] = _lc.bnf_kgn_m2s
+                if _lc.n_leach_kgn_m2s is not None:
+                    _esm_step["lc_leach"] = _lc.n_leach_kgn_m2s
+            if model.last_lightning is not None:
+                _esm_step["lgt_tot"] = model.last_lightning.flash_tot_cell
+                _esm_step["lgt_cg"] = model.last_lightning.flash_cg_cell
+                _esm_step["lgt_lnox"] = model.last_lightning.n_dep_lnox_cell
+            if model.ozone is not None:
+                _esm_step["oz_dep"] = model.ozone.o3_drydep_kgm2s
+            if _esm_step:
+                if mon_esm_cnt == 0:
+                    mon_esm_sums = {k: v.detach().clone() for k, v in _esm_step.items()}
+                else:
+                    for k, v in _esm_step.items():
+                        if k in mon_esm_sums:
+                            mon_esm_sums[k] += v.detach()
+                        else:
+                            mon_esm_sums[k] = v.detach().clone()
+                mon_esm_cnt += 1
             if cmip7_acc is not None:
                 cmip7_acc.update_step_extrema(
                     model,
@@ -1223,6 +1284,8 @@ def main() -> None:
                             sample["tau_y_sfc"] = sd_sub.tau_y.reshape(nc_c, n_sub_c).mean(dim=-1)
                             sample["runoff_total"] = sd_sub.runoff_total.reshape(nc_c, n_sub_c).mean(dim=-1)
                             sample["runoff_glacier"] = sd_sub.runoff_ice.reshape(nc_c, n_sub_c).mean(dim=-1)
+                    if model.ozone is not None:
+                        sample["o3_tco_du"] = model.ozone.tco_du
                     if model.icesheet is not None:
                         sample["h_ice"] = model.icesheet.h_ice
                         sample["z_topo_dyn"] = model.mesh.z_topo
@@ -1236,9 +1299,12 @@ def main() -> None:
                         "u_zonal": u_c,
                         "v_merid": v_c,
                     })
+                    if model.ozone is not None:
+                        sample["o3_vmr"] = model.ozone.o3_vmr
                     if model.ogcm is not None:
                         og = model.ogcm
-                        uo_c, vo_c = reconstruct_cell_winds(model.mesh, og.u_edge * og.wet_e.to(og.u_edge.dtype))
+                        ocn_mesh_z = model.ocn_mesh if model.ocn_mesh is not None else model.mesh
+                        uo_c, vo_c = reconstruct_cell_winds(ocn_mesh_z, og.u_edge * og.wet_e.to(og.u_edge.dtype))
                         wo_c = 0.5 * (og.w_vel[:-1] + og.w_vel[1:])
                         sample.update({
                             "ocn_temp": og.temp,
@@ -1317,7 +1383,9 @@ def main() -> None:
                 m_gpp = mon_accum["gpp"] * inv_m
                 m_lai = mon_accum["lai"] * inv_m
                 m_ice = mon_accum["ice"] * inv_m
-                ocn_m = diagnose_ocean_spinup_metrics(model.ogcm, model.sfc, model.mesh) if model.ogcm is not None else {}
+                ocn_mesh_d = model.ocn_mesh if model.ocn_mesh is not None else model.mesh
+                ocn_sfc_d = model.ocn_sfc if model.ocn_sfc is not None else model.sfc
+                ocn_m = diagnose_ocean_spinup_metrics(model.ogcm, ocn_sfc_d, ocn_mesh_d) if model.ogcm is not None else {}
                 ohc_now = ocn_m.get("ohc_j", float("nan"))
                 if prev_ohc_j is not None and prev_ohc_time_sec is not None and math.isfinite(ohc_now):
                     dt_mon = max(model.sim_time_sec - prev_ohc_time_sec, 1.0)
@@ -1367,7 +1435,7 @@ def main() -> None:
                 if model.ogcm is not None and model.ogcm.bgc is not None:
                     from aoba.ocean_bgc import diagnose_ocean_bgc_metrics
 
-                    bgc_m = diagnose_ocean_bgc_metrics(model.ogcm.bgc, model.ogcm, model.mesh)
+                    bgc_m = diagnose_ocean_bgc_metrics(model.ogcm.bgc, model.ogcm, ocn_mesh_d)
                     if bgc_m:
                         print(
                             f"[FlexPFT Y{year:03d} M{mon_num:02d} | {diag.date_str}] "
@@ -1379,40 +1447,91 @@ def main() -> None:
                             flush=True,
                         )
                 esm_parts: list[str] = []
+                inv_esm = 1.0 / float(max(mon_esm_cnt, 1))
+                sec_yr = C.DAYS_PER_YEAR * C.SECONDS_PER_DAY
+                a_host_64 = model.mesh.area_cell.detach().cpu().to(torch.float64)
                 if model.river is not None:
-                    q_riv_sv = float((model.river.mouth_flux_kgm2s.detach().cpu().double() * model.mesh.area_cell.detach().cpu().double()).sum().item()) * 1.0e-9
+                    q_riv_sv = float((model.river.mouth_flux_kgm2s.detach().cpu().double() * a_host_64).sum().item()) * 1.0e-9
                     esm_parts.append(f"River={q_riv_sv:.3f} Sv")
                 if model.land_carbon is not None:
                     from aoba.land_carbon import diagnose_land_carbon_metrics
 
                     lc_m = diagnose_land_carbon_metrics(model.land_carbon, model.mesh.area_cell, model.mesh.surf_type)
+                    # Prefer true monthly-integrated fluxes for intermittent discrete MAML fires & N fluxes
+                    fire_pg_yr = lc_m["land_fire_pgc_yr"]
+                    ba_mha_yr = lc_m["burned_area_mha_yr"]
+                    bnf_tgn_yr = lc_m.get("bnf_tgn_yr", 0.0)
+                    leach_tgn_yr = lc_m.get("n_leach_tgn_yr", 0.0)
+                    if mon_esm_cnt > 0 and "lc_fire_c" in mon_esm_sums:
+                        m_lc = mon_esm_sums["lc_fire_c"].shape[0]
+                        nc_h = a_host_64.shape[0]
+                        if m_lc != nc_h and (m_lc % nc_h == 0):
+                            n_s = m_lc // nc_h
+                            a_lc = (a_host_64 / float(n_s)).unsqueeze(1).expand(nc_h, n_s).reshape(m_lc)
+                        else:
+                            a_lc = a_host_64
+                        fire_pg_yr = float((mon_esm_sums["lc_fire_c"].detach().cpu().double() * inv_esm * a_lc).sum().item() * sec_yr * 1.0e-12)
+                        ba_mha_yr = float((mon_esm_sums["lc_ba_s"].detach().cpu().double() * inv_esm * a_lc).sum().item() * sec_yr * 1.0e-10)
+                        if "lc_bnf" in mon_esm_sums:
+                            bnf_tgn_yr = float((mon_esm_sums["lc_bnf"].detach().cpu().double() * inv_esm * a_lc).sum().item() * sec_yr * 1.0e-9)
+                        if "lc_leach" in mon_esm_sums:
+                            leach_tgn_yr = float((mon_esm_sums["lc_leach"].detach().cpu().double() * inv_esm * a_lc).sum().item() * sec_yr * 1.0e-9)
                     esm_parts.append(
                         f"LandC={lc_m['c_land_total_pgc']:.0f} PgC "
                         f"(Veg={lc_m['c_veg_pgc']:.0f}, Soil={lc_m['c_soil_pgc']:.0f}, "
-                        f"Fire={lc_m['land_fire_pgc_yr']:.2f} PgC/yr, BA={lc_m['burned_area_mha_yr']:.1f} Mha/yr)"
+                        f"Fire={fire_pg_yr:.2f} PgC/yr, BA={ba_mha_yr:.1f} Mha/yr)"
                     )
                     if "n_min_pgn" in lc_m:
                         esm_parts.append(
-                            f"LandN(Nmin={lc_m['n_min_pgn']:.3f} PgN, BNF={lc_m['bnf_tgn_yr']:.1f} TgN/yr, "
-                            f"Leach={lc_m['n_leach_tgn_yr']:.1f}, phiN={lc_m.get('phi_n_mean', 1.0):.2f}, "
+                            f"LandN(Nmin={lc_m['n_min_pgn']:.3f} PgN, BNF={bnf_tgn_yr:.1f} TgN/yr, "
+                            f"Leach={leach_tgn_yr:.1f}, phiN={lc_m.get('phi_n_mean', 1.0):.2f}, "
                             f"froot={lc_m.get('f_root_mean', 0.35):.2f})"
                         )
                 if model.last_lightning is not None:
-                    from aoba.lightning import diagnose_lightning_metrics
+                    if mon_esm_cnt > 0 and "lgt_tot" in mon_esm_sums:
+                        ft_m = mon_esm_sums["lgt_tot"].detach().cpu().double() * inv_esm
+                        fcg_m = mon_esm_sums["lgt_cg"].detach().cpu().double() * inv_esm
+                        lnox_m = mon_esm_sums["lgt_lnox"].detach().cpu().double() * inv_esm
+                        fl_tot_s = float((ft_m * a_host_64).sum().item())
+                        fl_cg_s = float((fcg_m * a_host_64).sum().item())
+                        cg_pct = 100.0 * fl_cg_s / max(fl_tot_s, 1.0e-12)
+                        lnox_tg = float((lnox_m * a_host_64).sum().item() * sec_yr * 1.0e-9)
+                        st_cpu = model.mesh.surf_type.detach().cpu()
+                        m_l = st_cpu == SURF_LAND
+                        m_o = st_cpu == SURF_OCEAN
+                        l_den = float((ft_m[m_l] * a_host_64[m_l]).sum().item()) / max(float(a_host_64[m_l].sum().item()), 1.0)
+                        o_den = float((ft_m[m_o] * a_host_64[m_o]).sum().item()) / max(float(a_host_64[m_o].sum().item()), 1.0)
+                        lo_r = l_den / max(o_den, 1.0e-30)
+                        esm_parts.append(
+                            f"Light={fl_tot_s:.1f} fl/s (CG={cg_pct:.0f}%, L/O={lo_r:.1f}x, LNOx={lnox_tg:.2f} TgN/yr)"
+                        )
+                    else:
+                        from aoba.lightning import diagnose_lightning_metrics
 
-                    lm = diagnose_lightning_metrics(model.last_lightning, model.mesh.area_cell, model.mesh.surf_type)
-                    lo_r = lm.get("land_ocean_flash_ratio", 0.0)
+                        lm = diagnose_lightning_metrics(model.last_lightning, model.mesh.area_cell, model.mesh.surf_type)
+                        lo_r = lm.get("land_ocean_flash_ratio", 0.0)
+                        esm_parts.append(
+                            f"Light={lm['flash_tot_per_s']:.1f} fl/s "
+                            f"(CG={lm['cg_frac_pct']:.0f}%, L/O={lo_r:.1f}x, LNOx={lm['lnox_tgn_yr']:.2f} TgN/yr)"
+                        )
+                if model.ozone is not None:
+                    from aoba.ozone_chemistry import diagnose_ozone_metrics
+
+                    oz_m = diagnose_ozone_metrics(model.ozone, model.mesh.area_cell, model.mesh.lat_cell)
+                    dep_tg = oz_m["o3_drydep_tg_yr"]
+                    if mon_esm_cnt > 0 and "oz_dep" in mon_esm_sums:
+                        dep_tg = float((mon_esm_sums["oz_dep"].detach().cpu().double() * inv_esm * a_host_64).sum().item() * sec_yr * 1.0e-9)
                     esm_parts.append(
-                        f"Light={lm['flash_tot_per_s']:.1f} fl/s "
-                        f"(CG={lm['cg_frac_pct']:.0f}%, L/O={lo_r:.1f}x, LNOx={lm['lnox_tgn_yr']:.2f} TgN/yr)"
+                        f"O3={oz_m['o3_tco_du']:.0f} DU (tr={oz_m['o3_tco_trop_du']:.0f}/hi={oz_m['o3_tco_high_du']:.0f}, "
+                        f"sfc={oz_m['o3_sfc_ppbv']:.1f} ppbv, dep={dep_tg:.0f} Tg/yr)"
                     )
                 if model.ogcm is not None and model.ogcm.seaice_evp is not None:
                     evp_s = model.ogcm.seaice_evp
-                    v_ice_kkm3 = float((evp_s.v_cat.sum(dim=0).detach().cpu().double() * model.mesh.area_cell.detach().cpu().double()).sum().item()) * 1.0e-12
+                    v_ice_kkm3 = float((evp_s.v_cat.sum(dim=0).detach().cpu().double() * ocn_mesh_d.area_cell.detach().cpu().double()).sum().item()) * 1.0e-12
                     u_ice_max = float(evp_s.u_ice_e.abs().max().item())
                     esm_parts.append(f"EVP_Ice={v_ice_kkm3:.1f}e3 km3 (max|u|={u_ice_max:.2f} m/s)")
                 if model.aerosols is not None:
-                    a_w = model.mesh.area_cell.detach().cpu().double()
+                    a_w = a_host_64
                     a_tot_m2 = float(a_w.sum().item())
                     aod_nat = float(((model.aerosols.aod_ss + model.aerosols.aod_so4 + model.aerosols.aod_bc + model.aerosols.aod_oc).detach().cpu().double() * a_w).sum().item()) / a_tot_m2
                     ccn_mean = float((model.aerosols.ccn_aero_m3.detach().cpu().double() * a_w).sum().item()) * 1.0e-6 / a_tot_m2
@@ -1428,6 +1547,8 @@ def main() -> None:
                 for k in mon_accum:
                     mon_accum[k] = 0.0
                 mon_cnt = 0
+                mon_esm_sums.clear()
+                mon_esm_cnt = 0
                 if cmip7_acc is not None and cmip7_acc.sample_count > 0:
                     append_zarr(cmip7_acc.to_xarray(model), cmip7_zarr)
                     cmip7_acc.reset()

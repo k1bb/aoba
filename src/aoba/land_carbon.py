@@ -92,7 +92,7 @@ BNF_MAX_NPP_FRAC: float = 0.15     # Maximum fraction of positive NPP surplus al
 BNF_ASYM_MAX_YR: float = 2.0e-4    # Asymbiotic free-living BNF max rate at 25 C [kg N m^-2 yr^-1] (~15-25 Tg N/yr)
 N_LEACH_RATE_YR: float = 0.60      # Mineral-N leaching rate constant under wet soil drainage [yr^-1]
 N_DENIT_RATE_YR: float = 0.80      # Anaerobic denitrification rate constant under waterlogging [yr^-1]
-N_MIN_INIT: float = 0.015          # Map-free initial soil mineral N stock on vegetated land [kg N m^-2]
+N_MIN_INIT: float = 0.0025         # Map-free initial soil mineral N stock (~2.5 g N m^-2, ~0.3 Pg N globally) [kg N m^-2]
 PHI_N_EMA_DAYS: float = 15.0       # Smoothing timescale for N sufficiency factor phi_N [days]
 
 # Process-based SPITFIRE wildfire parameters (Thonicke et al., 2010; Rothermel, 1972; Byram, 1959)
@@ -679,13 +679,25 @@ def step_land_carbon_and_fire(
     p_mort = torch.clamp(1.0 - (1.0 - p_crown) * (1.0 - p_camb), 0.0, 1.0) * can_sustain
 
     # Cloud-to-ground lightning ignitions [ignitions m^-2] & continuous SPITFIRE burn probability
-    cg_rate = torch.clamp(flash_cg_m2s, min=0.0) if flash_cg_m2s is not None else torch.full_like(fdi, FIRE_BG_CG_FLASH_M2S)
+    # In MAML subgrid mode, thunderstorms emit anvil/gust-front CG strikes ("dry lightning") across
+    # adjacent dry subcolumns of the same parent grid cell, not solely inside the wet rain shaft
+    # where precip > 3 mm/d resets FDI to zero. Blending 50% local + 50% parent-cell mean strictly
+    # conserves total parent-cell CG strikes while enabling realistic dry-lightning ignition.
+    use_maml_patch = (maml_shape is not None) and (maml_shape[1] * maml_shape[2] > 1)
+    cg_raw = torch.clamp(flash_cg_m2s, min=0.0) if flash_cg_m2s is not None else torch.full_like(fdi, FIRE_BG_CG_FLASH_M2S)
+    if use_maml_patch and flash_cg_m2s is not None:
+        assert maml_shape is not None
+        nc_cg, ny_cg, nx_cg = maml_shape
+        cg_3d = cg_raw.view(nc_cg, ny_cg, nx_cg)
+        cg_cell_mean = cg_3d.mean(dim=(-2, -1), keepdim=True).expand_as(cg_3d).reshape(-1)
+        cg_rate = 0.50 * cg_raw + 0.50 * cg_cell_mean
+    else:
+        cg_rate = cg_raw
     n_ig = FIRE_IGNIT_EFF * cg_rate * fdi * dt
     rate_raw_s = torch.minimum(n_ig * a_fire_m2 * inv_dt, torch.full_like(fdi, FIRE_MAX_RATE_YR / SEC_PER_YEAR)) * can_sustain
     p_burn_cont = -torch.expm1(-torch.clamp(rate_raw_s * dt, min=0.0, max=0.25))
 
     # Discrete MAML patch burning + 2D neighbor fire spread when running on subcolumns (nc, ny, nx)
-    use_maml_patch = (maml_shape is not None) and (maml_shape[1] * maml_shape[2] > 1)
     if use_maml_patch:
         assert maml_shape is not None
         nc_m, ny_m, nx_m = maml_shape

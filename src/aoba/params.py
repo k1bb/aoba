@@ -273,12 +273,12 @@ _GRID_KEYS: tuple[str, ...] = (
 _FORCING_KEYS: tuple[str, ...] = (
     "co2_ppmv", "co2_mode", "co2_scenario", "co2_csv_path",
     "ch4_ppmv", "n2o_ppmv", "rad_scheme",
-    "o3_mode", "o3_file_path", "o3_lw_coupling", "enable_nonoro_gwd",
+    "o3_mode", "o3_file_path", "o3_lw_coupling", "o3_ecl_ppbv", "enable_nonoro_gwd",
     "solar_constant", "omega", "obliquity_deg", "eccentricity", "perihelion_deg",
     "start_date", "calendar_type", "insolation_mode", "fixed_insolation_date", "diurnal_cycle",
     "use_earth2014", "earth2014_dir", "earth2014_stride", "enable_superparam",
     "enable_dust", "dust_emis_factor",
-    "h_ml_ocean", "ocean_mode", "ocean_nz", "enable_seaice_drift", "enable_ocean_bgc", "enable_river_routing", "enable_land_carbon", "enable_land_nitrogen", "enable_lightning", "enable_fire_veg_feedback", "enable_seaice_evp_itd", "enable_ogcm_fct_zstar", "enable_natural_aerosols",
+    "h_ml_ocean", "ocean_mode", "ocean_glevel", "ocean_nz", "enable_seaice_drift", "enable_ocean_bgc", "enable_river_routing", "enable_land_carbon", "enable_land_nitrogen", "enable_lightning", "enable_fire_veg_feedback", "enable_seaice_evp_itd", "enable_ogcm_fct_zstar", "enable_natural_aerosols",
     "re_liq_um", "re_ice_um", "cloud_sw_inhomog", "microphysics_scheme",
 )
 _ICESHEET_CFG_KEYS: tuple[str, ...] = (

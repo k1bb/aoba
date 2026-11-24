@@ -33,11 +33,13 @@ from aoba.thermodynamics import diagnose_pressure_temperature
 
 
 # Universal global parameters (ZERO land/ocean or geographic maps)
-LIGHTNING_CAL_FACTOR: float = 0.35      # Single global scaling factor aligning CRM F3 to ~44 fl s^-1 [-]
+LIGHTNING_CAL_FACTOR: float = 3.6       # Single global scaling factor aligning CRM F3 to ~44 fl s^-1 [-]
 LIGHTNING_W1_WEIGHT: float = 0.95       # McCaul et al. (2009, Eq. 3) weight on updraft graupel flux F1 [-]
 LIGHTNING_W2_WEIGHT: float = 0.05       # Weight on vertically integrated total ice path F2 [-]
 LIGHTNING_F1_COEF: float = 0.042        # McCaul et al. (2009, Eq. 1) graupel-flux slope [fl (5 min)^-1 km^-2 / (g m^-2 s^-1)]
 LIGHTNING_F2_COEF: float = 0.20         # McCaul et al. (2009, Eq. 2) total-ice-path slope [fl (5 min)^-1 km^-2 / (kg m^-2)]
+LIGHTNING_UPDRAFT_EXP: float = 1.25     # Superlinear non-inductive riming-velocity charging exponent (Saunders et al., 1991) [-]
+LIGHTNING_CORE_HALF_SAT: float = 1.0    # Half-saturation graupel flux gating F2 so inert cirrus at w=0 sparks strictly 0 [g m^-2 s^-1]
 LIGHTNING_T_CHARGE_K: float = 258.15    # Center of non-inductive charging zone (-15 degC) [K]
 LIGHTNING_T_SIGMA_K: float = 7.0        # Gaussian half-width of charging zone (-22..-8 degC) [K]
 LIGHTNING_ICE_TOP_THRESH: float = 1.0e-5  # Ice mixing ratio defining convective cloud top [kg kg^-1]
@@ -111,13 +113,16 @@ def compute_crm_lightning_and_lnox(
     # 1. McCaul et al. (2009, Eqs. 1-3) non-inductive charging proxies (purely physical, map-free)
     #    F1: upward graupel mass flux [g m^-2 s^-1] weighted around the -15 degC charging zone
     t_wt = torch.exp(-(((temp - LIGHTNING_T_CHARGE_K) / LIGHTNING_T_SIGMA_K) ** 2))
-    gfx_g_m2s = t_wt * rho_d * w_up * (1000.0 * q_g)
-    f1 = LIGHTNING_F1_COEF * gfx_g_m2s.amax(dim=0)  # [N_cells, Ny, Nx]
+    gfx_lin = t_wt * rho_d * w_up * (1000.0 * q_g)
+    gfx_max = gfx_lin.amax(dim=0)  # [N_cells, Ny, Nx]
+    gfx_chg = (t_wt * rho_d * torch.pow(w_up, LIGHTNING_UPDRAFT_EXP) * (1000.0 * q_g)).amax(dim=0)
+    f1 = LIGHTNING_F1_COEF * gfx_chg  # [N_cells, Ny, Nx]
 
     #    F2: vertically integrated total ice-phase hydrometeor mass [kg m^-2]
     iwp_tot = (rho_d * dz_4d * (q_i_pos + q_p_ice)).sum(dim=0)
-    #    Gate F2 smoothly by presence of active mixed-phase convection so inert cirrus never sparks
-    has_active_core = torch.sigmoid(20.0 * (gfx_g_m2s.amax(dim=0) - 0.02))
+    #    Strict zero-at-zero quadratic Hill gate on active mixed-phase graupel flux so inert cirrus
+    #    and weak stratiform clouds (gfx == 0) spark strictly zero lightning
+    has_active_core = (gfx_max / (gfx_max + LIGHTNING_CORE_HALF_SAT)) ** 2
     f2 = LIGHTNING_F2_COEF * iwp_tot * has_active_core
 
     c_scale = LIGHTNING_CAL_FACTOR if cal_factor is None else float(cal_factor)
