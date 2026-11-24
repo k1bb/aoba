@@ -2111,7 +2111,7 @@ kernel void two_leaf_gas_exchange_col(
     float gamma3_g = bio_arrhenius(GAMMA25_C3, DHA_GAMMA, tg, R_GAS) * (p_s / 101325.0f);
     float km3_g = bio_arrhenius(KC25_C3, DHA_KC_C3, tg, R_GAS) * (1.0f + oi_pa / bio_arrhenius(KO25_C3, DHA_KO_C3, tg, R_GAS));
     float xi3 = sqrt(BETA_C3 * (km3_g + gamma3_g) / (1.6f * eta_g));
-    float kp4_g = bio_arrhenius(KP25_UMOL_C4 * 1.0e-6f, DHA_KP_C4, tg, R_GAS) * p_s;
+    float kp4_g = bio_arrhenius(KP25_UMOL_C4 * 1.0e-6f * 101325.0f, DHA_KP_C4, tg, R_GAS);
     float xi4 = sqrt(BETA_C4 * kp4_g / (1.6f * eta_g));
 
     float gpp_tot = 0.0f;
@@ -2158,7 +2158,7 @@ kernel void two_leaf_gas_exchange_col(
         float j_3 = (b3 - sqrt(max(b3 * b3 - 4.0f * THETA_NRH * ip3 * jm3, 0.0f))) / (2.0f * THETA_NRH);
         float rd3 = r25_3 * fr;
 
-        float kp4 = bio_arrhenius(KP25_UMOL_C4 * 1.0e-6f, DHA_KP_C4, tl, R_GAS) * p_s;
+        float kp4 = bio_arrhenius(KP25_UMOL_C4 * 1.0e-6f * 101325.0f, DHA_KP_C4, tl, R_GAS);
         float vc4 = ws * vc25_4 * fv;
         float jm4 = ws * jm25_4 * fj;
         float vp4 = ws * vp25_4 * fp;

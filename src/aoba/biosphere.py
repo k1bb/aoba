@@ -739,7 +739,7 @@ def update_daily_acclimation_smith(
 
     # 4. C4 Non-Rectangular-Hyperbola Optimality (Scott & Smith, 2022, Eqs. 1-25; von Caemmerer & Furbank, 1999)
     gamma_c4 = _arrhenius(GAMMA_STAR25_C4, DHA_GAMMA, tg) * (pres_sfc / 101325.0)
-    kp_pa_c4 = _arrhenius(KP25_UMOL_C4 * 1.0e-6, DHA_KP_C4, tg) * pres_sfc
+    kp_pa_c4 = _arrhenius(KP25_UMOL_C4 * 1.0e-6 * 101325.0, DHA_KP_C4, tg)
     kc_c4 = _arrhenius(KC25_C4, DHA_KC_C4, tg)
     ko_c4 = _arrhenius(KO25_C4, DHA_KO_C4, tg)
     km_c4 = kc_c4 * (1.0 + oi_pa / ko_c4)
@@ -1050,7 +1050,7 @@ def compute_two_leaf_gas_exchange(
     gamma3_g = _arrhenius(GAMMA_STAR25_C3, DHA_GAMMA, tg) * (pres_sfc / 101325.0)
     km3_g = _arrhenius(KC25_C3, DHA_KC_C3, tg) * (1.0 + oi_pa / _arrhenius(KO25_C3, DHA_KO_C3, tg))
     xi3_accl = torch.sqrt(BETA_C3 * (km3_g + gamma3_g) / (1.6 * eta_g))
-    kp4_g = _arrhenius(KP25_UMOL_C4 * 1.0e-6, DHA_KP_C4, tg) * pres_sfc
+    kp4_g = _arrhenius(KP25_UMOL_C4 * 1.0e-6 * 101325.0, DHA_KP_C4, tg)
     xi4_accl = torch.sqrt(BETA_C4 * kp4_g / (1.6 * eta_g))
 
     def _eval_fraction(
@@ -1081,7 +1081,7 @@ def compute_two_leaf_gas_exchange(
         j_3 = non_rectangular_hyperbola(phi_g * i_par, jm3, THETA_NRH)
         rd3 = r25_3 * fr
 
-        kp4 = _arrhenius(KP25_UMOL_C4 * 1.0e-6, DHA_KP_C4, tl) * pres_sfc
+        kp4 = _arrhenius(KP25_UMOL_C4 * 1.0e-6 * 101325.0, DHA_KP_C4, tl)
         xi4 = xi4_accl
         vc4 = ws * vc25_4 * fv
         jm4 = ws * jm25_4 * fj
