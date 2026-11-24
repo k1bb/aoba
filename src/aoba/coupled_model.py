@@ -96,6 +96,7 @@ class AOBAConfig:
     ocean_mode: str = "ogcm_3d"              # Ocean model: "ogcm_3d" (3D multi-layer OGCM) or "ekman_sw" (1.5-layer shallow-water)
     ocean_nz: int = 18                       # Vertical z-levels when ocean_mode="ogcm_3d" (0..6000 m)
     enable_seaice_drift: bool = True         # Enable dynamic wind/current sea-ice drift in 3D OGCM mode
+    enable_ocean_bgc: bool = False           # Enable FlexPFT marine BGC & OMIP/mocsy 2.0 carbonate chemistry (opt-in)
     re_liq_um: float = 10.0                  # Fallback/1M cloud liquid droplet effective radius [um]
     re_ice_um: float = 48.0                  # Fallback/1M cloud ice crystal effective radius [um]
     cloud_sw_inhomog: float = 0.65           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
@@ -483,6 +484,10 @@ def init_aoba_model(
         if str(cfg.ocean_mode).strip().lower() == "ogcm_3d"
         else None
     )
+    if ogcm is not None and bool(cfg.enable_ocean_bgc):
+        from aoba.ocean_bgc import init_ocean_bgc_state
+
+        ogcm.bgc = init_ocean_bgc_state(ogcm.wet_c, ogcm.h_c, ogcm.z_c, mesh.area_cell)
 
     sfc_sub = init_surface_state(
         _cell_to_sub(mesh.surf_type, nc, n_sub),
@@ -960,11 +965,25 @@ def step_aoba_model(
     if str(cfg.ocean_mode).strip().lower() == "ogcm_3d":
         if model.ogcm is None:
             model.ogcm = init_ogcm_state(sfc, mesh, nz_ocn=cfg.ocean_nz)
+        if bool(cfg.enable_ocean_bgc) and model.ogcm.bgc is None:
+            from aoba.ocean_bgc import init_ocean_bgc_state
+
+            model.ogcm.bgc = init_ocean_bgc_state(model.ogcm.wet_c, model.ogcm.h_c, model.ogcm.z_c, mesh.area_cell)
         sw_abs_ocn_sub = (1.0 - torch.clamp(sfc_diag_sub.f_seaice, 0.0, 1.0)) * (
             sw1_dir_sub * (1.0 - sfc_diag_sub.alb_vis_dir)
             + sw1_dif_sub * (1.0 - sfc_diag_sub.alb_vis_dif)
             + sw2_dir_sub * (1.0 - sfc_diag_sub.alb_nir_dir)
             + sw2_dif_sub * (1.0 - sfc_diag_sub.alb_nir_dif)
+        )
+        sw_par_ocn = (
+            _sub_to_cell(0.94 * (sw1_dir_sub * (1.0 - sfc_diag_sub.alb_vis_dir) + sw1_dif_sub * (1.0 - sfc_diag_sub.alb_vis_dif)), nc, n_sub)
+            if model.ogcm.bgc is not None
+            else None
+        )
+        u10_ocn = (
+            _sub_to_cell(torch.hypot(u_sub_0, v_sub_0), nc, n_sub)
+            if model.ogcm.bgc is not None
+            else None
         )
         step_ogcm_voronoi(
             ogcm=model.ogcm,
@@ -980,6 +999,9 @@ def step_aoba_model(
             dt=dt,
             enable_seaice_drift=bool(cfg.enable_seaice_drift),
             sw_net_ocn=_sub_to_cell(sw_abs_ocn_sub, nc, n_sub),
+            sw_par_ocn=sw_par_ocn,
+            u10_ocn=u10_ocn,
+            co2_ppmv=model.current_co2_ppmv(),
         )
     else:
         step_ekman_ocean_voronoi(

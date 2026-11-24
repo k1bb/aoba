@@ -1352,6 +1352,7 @@ const PARAM_DOCS = {
   ocean_mode: { ja: "海洋モデル選択 (ogcm_3d: 3次元多層OGCM+塩分+海氷移流 / ekman_sw: 1.5層浅水エクマン)", en: "Ocean model mode (ogcm_3d 3D multi-layer OGCM / ekman_sw 1.5-layer shallow water)" },
   ocean_nz: { ja: "3D OGCM の鉛直層数 (ocean_mode='ogcm_3d' 時; 既定18層 0〜6000 m)", en: "Number of 3D OGCM vertical z-levels (default 18 covering 0-6000 m)" },
   enable_seaice_drift: { ja: "3D OGCM 時の風・海流による海氷の力学的移流 (Hibler 1979 準拠)", en: "Enable dynamic wind/current sea-ice drift in 3D OGCM mode" },
+  enable_ocean_bgc: { ja: "FlexPFT 最適性海洋生態系＋OMIP/mocsy 2.0 炭酸塩化学・大気海洋CO₂交換を有効化 (既定 false)", en: "Enable FlexPFT optimality marine BGC & OMIP/mocsy 2.0 carbonate chemistry (default false)" },
   microphysics_scheme: { ja: "雲微物理スキーム (two_moment: 2モーメント数濃度+粒径依存放射 / one_moment: 旧SAM 1M)", en: "Cloud microphysics scheme (two_moment prognostic Nc,Ni,re / one_moment legacy KR03)" },
   o3_mode: { ja: "オゾン分布モード (rcemip: 1D一様 / latitude_seasonal: 解析的2D緯度季節 / climatology: 外部帯状平均)", en: "Ozone mode (rcemip 1D / latitude_seasonal 2D / climatology external)" },
   o3_file_path: { ja: "外部オゾン気候値ファイル (.npz / .nc; 空欄時は data/boundary/ozone を参照)", en: "External ozone climatology path (.npz/.nc; blank uses data/boundary/ozone)" },

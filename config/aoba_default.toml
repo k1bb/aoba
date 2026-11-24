@@ -55,6 +55,7 @@ h_ml_ocean = 50.0
 ocean_mode = "ogcm_3d"
 ocean_nz = 18
 enable_seaice_drift = true
+enable_ocean_bgc = false
 re_liq_um = 10.0
 re_ice_um = 48.0
 cloud_sw_inhomog = 0.65

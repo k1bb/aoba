@@ -198,6 +198,7 @@ class OceanOGCMState:
     bathym_slope: torch.Tensor | None = None  # Bathymetric slope `|grad H|` for internal-tide mixing [N_cells] [-]
     h_bl: torch.Tensor | None = None          # Diagnosed KPP surface boundary-layer depth [N_cells] [m]
     kv_last: torch.Tensor | None = None       # Last diagnosed vertical tracer diffusivity [N_zo-1, N_cells] [m^2 s^-1]
+    bgc: object | None = None                 # Optional FlexPFT OceanBGCState (when enable_ocean_bgc=True)
 
 
 def _compute_bathymetric_slope(h_col: torch.Tensor, wet_c0: torch.Tensor, mesh: SCVTMesh) -> torch.Tensor:
@@ -1102,6 +1103,9 @@ def step_ogcm_voronoi(
     dt: float,
     enable_seaice_drift: bool = True,
     sw_net_ocn: torch.Tensor | None = None,
+    sw_par_ocn: torch.Tensor | None = None,
+    u10_ocn: torch.Tensor | None = None,
+    co2_ppmv: float = 284.3,
 ) -> None:
     """Advance 3D SCVT Voronoi OGCM (`temp`, `sal`, `u_edge`, `eta`) & dynamic sea ice by `dt` [s].
 
@@ -1275,6 +1279,44 @@ def step_ogcm_voronoi(
     ogcm.sal = S
     ogcm.t_comp = t_comp
     ogcm.s_comp = s_comp
+
+    # 10b. Optional FlexPFT Marine Biogeochemistry & OMIP/mocsy 2.0 Carbonate Chemistry (opt-in)
+    if ogcm.bgc is not None:
+        from aoba.ocean_bgc import PAR_FRAC_SW, step_ocean_bgc_flexpft
+
+        par_in = (
+            sw_par_ocn
+            if sw_par_ocn is not None
+            else (PAR_FRAC_SW * torch.clamp(sw_net_ocn, min=0.0) if sw_net_ocn is not None else torch.zeros_like(sfc.t_ocean_ml))
+        )
+        if u10_ocn is not None:
+            u10_in = u10_ocn
+        else:
+            # Fallback 10 m wind speed estimate from surface wind stress magnitude |tau| = rho_a * C_d * u10^2
+            tau_mag = torch.sqrt(tau_x_sfc * tau_x_sfc + tau_y_sfc * tau_y_sfc + 1.0e-12)
+            u10_in = torch.sqrt(tau_mag / (1.225 * 1.3e-3))
+        step_ocean_bgc_flexpft(
+            bgc=ogcm.bgc,
+            ogcm=ogcm,
+            mesh=mesh,
+            h_u_edge=h_u_edge,
+            sx_int=sx_int,
+            w_vel=w_vel,
+            h0_new=h0_new,
+            dh0_eff=dh0_eff,
+            a_t=a_t,
+            b_t=b_t,
+            d_t=d_t,
+            c_dif=c_dif,
+            h_eff=h_eff,
+            cache=cache,
+            sw_par_sfc=par_in,
+            u10_ocn=u10_in,
+            f_seaice=f_seaice,
+            co2_ppmv=co2_ppmv,
+            dt=dt,
+            enable_full_redi=bool(ENABLE_FULL_REDI),
+        )
 
     # 11. Dynamic Sea-Ice Drift (after recording thermodynamic mass change, so advection doesn't alias brine!)
     if enable_seaice_drift:
