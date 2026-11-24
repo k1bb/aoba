@@ -953,6 +953,26 @@ def step_crm_physics_and_dynamics(
     sgs_stride = max(1, int(math.floor(120.0 / max(dt_sub, 1.0e-3)))) if is_2d_crm else 1
     use_metal_crm = can_use_crm_metal(crm.rho_d)
     if n_sub > 0:
+        # Exact Galilean co-moving frame shift per column (Grabowski, 2001; Khairoutdinov et al., 2005):
+        # Periodic compressible Euler + Smagorinsky SGS + FCT + perturbation Rayleigh sponge are strictly
+        # invariant under a column-uniform horizontal velocity shift (U_shift, V_shift). Choosing the column
+        # midpoint 0.5*(u_max + u_min) cuts peak stratospheric polar-night jet advection speed in half
+        # (e.g. 87 m/s -> +-46 m/s, keeping Wicker-Skamarock RK3 CFL << 1.25) with zero extra substeps
+        # and zero CPU-GPU synchronizations.
+        use_galilean = is_2d_crm or (ny > 1 and nx > 1 and crm.f_coriolis is None)
+        u_gal_shift: torch.Tensor | None = None
+        v_gal_shift: torch.Tensor | None = None
+        if use_galilean:
+            if nx > 1:
+                u_gal_shift = 0.5 * (
+                    crm.u.amax(dim=(0, 2, 3), keepdim=True) + crm.u.amin(dim=(0, 2, 3), keepdim=True)
+                )
+                crm.u = crm.u - u_gal_shift
+            if ny > 1:
+                v_gal_shift = 0.5 * (
+                    crm.v.amax(dim=(0, 2, 3), keepdim=True) + crm.v.amin(dim=(0, 2, 3), keepdim=True)
+                )
+                crm.v = crm.v - v_gal_shift
         dz_c_sgs = dz_c_col.view(nz, -1, 1, 1) if dz_c_col is not None else vgrid.dzeta_c.view(nz, 1, 1, 1)
         dz_w_sgs = (
             (z_c_col[1:] - z_c_col[:-1]).view(nz - 1, -1, 1, 1)
@@ -1035,6 +1055,10 @@ def step_crm_physics_and_dynamics(
                     crm.n_c = fct_advect_3d(crm.n_c, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
                     crm.n_i = fct_advect_3d(crm.n_i, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
             s_idx += k_cnt
+        if u_gal_shift is not None:
+            crm.u = crm.u + u_gal_shift
+        if v_gal_shift is not None:
+            crm.v = crm.v + v_gal_shift
         crm.theta_m = Thm_cur / crm.rho_d
         q_cond_adv = torch.minimum(crm.q_c + crm.q_i, crm.q_n)
         crm.q_v = torch.clamp(crm.q_n - q_cond_adv, min=0.0)

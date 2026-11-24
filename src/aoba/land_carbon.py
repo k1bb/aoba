@@ -254,8 +254,8 @@ def step_land_carbon_and_fire(
     f_freeze = (1.0 - f_ice_soil) + SOIL_FROZEN_SUPPRESS * f_ice_soil
 
     # Soil moisture scalar: peaks at moderate wetness, drops in desert drought & anoxic saturation
-    # Approximate relative pore wetness from water mass / (0.45 * 1000 * dz)
-    sat_frac = torch.clamp(w_liq_soil / (450.0 * dz), 0.0, 1.0)
+    # w_liq_soil is volumetric liquid water content [m^3 m^-3] (porosity = 0.43)
+    sat_frac = torch.clamp(w_liq_soil / 0.43, 0.0, 1.0)
     f_moist = torch.clamp(0.15 + 0.85 * torch.sin(math.pi * torch.clamp(sat_frac, 0.0, 0.95)), 0.10, 1.0)
     env_soil = f_t_soil * f_freeze * f_moist * is_land.unsqueeze(0)
 
