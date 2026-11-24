@@ -1106,6 +1106,7 @@ def step_ogcm_voronoi(
     sw_par_ocn: torch.Tensor | None = None,
     u10_ocn: torch.Tensor | None = None,
     co2_ppmv: float = 284.3,
+    river_mouth_flux: torch.Tensor | None = None,
 ) -> None:
     """Advance 3D SCVT Voronoi OGCM (`temp`, `sal`, `u_edge`, `eta`) & dynamic sea ice by `dt` [s].
 
@@ -1144,9 +1145,16 @@ def step_ogcm_voronoi(
     inv_dc_edge = cache["inv_dc_edge"]
 
     # 0-3. Surface buoyancy, calving, salinity, Jerlov SW penetration, Roquet EOS & wind stress
-    r_coast = torch.zeros(nc, device=dev, dtype=dtype)
-    r_coast.scatter_add_(0, mesh.coastal_ocean_idx, mesh.area_cell * torch.clamp(runoff_total, min=0.0))
-    r_coast = r_coast * cache["inv_area_c"]  # [kg m^-2 s^-1]
+    if river_mouth_flux is not None:
+        # A1 Priority-Flood Voronoi river routing already delivered liquid runoff to ocean river mouths;
+        # add coastal glacier calving meltwater via coastal_ocean_idx so total freshwater + latent heat closes.
+        r_calve = torch.zeros(nc, device=dev, dtype=dtype)
+        r_calve.scatter_add_(0, mesh.coastal_ocean_idx, mesh.area_cell * torch.clamp(runoff_glacier, min=0.0))
+        r_coast = torch.clamp(river_mouth_flux, min=0.0) + r_calve * cache["inv_area_c"]
+    else:
+        r_coast = torch.zeros(nc, device=dev, dtype=dtype)
+        r_coast.scatter_add_(0, mesh.coastal_ocean_idx, mesh.area_cell * torch.clamp(runoff_total, min=0.0))
+        r_coast = r_coast * cache["inv_area_c"]  # [kg m^-2 s^-1]
 
     q_calve = torch.zeros(nc, device=dev, dtype=dtype)
     q_calve.scatter_add_(0, mesh.coastal_ocean_idx, C.L_F0 * mesh.area_cell * torch.clamp(runoff_glacier, min=0.0))

@@ -97,6 +97,7 @@ class AOBAConfig:
     ocean_nz: int = 18                       # Vertical z-levels when ocean_mode="ogcm_3d" (0..6000 m)
     enable_seaice_drift: bool = True         # Enable dynamic wind/current sea-ice drift in 3D OGCM mode
     enable_ocean_bgc: bool = False           # Enable FlexPFT marine BGC & OMIP/mocsy 2.0 carbonate chemistry (opt-in)
+    enable_river_routing: bool = False       # Enable A1 map-free Priority-Flood Voronoi river routing (opt-in)
     re_liq_um: float = 10.0                  # Fallback/1M cloud liquid droplet effective radius [um]
     re_ice_um: float = 48.0                  # Fallback/1M cloud ice crystal effective radius [um]
     cloud_sw_inhomog: float = 0.65           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
@@ -180,6 +181,7 @@ class AOBAState:
     sfc_sub: SurfaceState | None = None
     clim_sub: ClimateAccumulator | None = None
     icesheet: IceSheetState | None = None
+    river: object | None = None
     sim_time_sec: float = 0.0
     step_count: int = 0
     rad_cache: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -563,6 +565,11 @@ def init_aoba_model(
         sfc_sub=sfc_sub,
         clim_sub=_make_clim(m_sub, include_monthly=False),
         icesheet=init_icesheet_state(mesh) if cfg.enable_dynamic_icesheet else None,
+        river=(
+            __import__("aoba.river_routing", fromlist=["init_river_routing_state"]).init_river_routing_state(mesh, device=dev)
+            if bool(cfg.enable_river_routing)
+            else None
+        ),
         calendar=AobaCalendar(
             start_date=cfg.start_date,
             calendar_type=cfg.calendar_type,
@@ -985,6 +992,16 @@ def step_aoba_model(
             if model.ogcm.bgc is not None
             else None
         )
+        runoff_tot_cell = _sub_to_cell(sfc_diag_sub.runoff_total, nc, n_sub)
+        runoff_ice_cell = _sub_to_cell(sfc_diag_sub.runoff_ice, nc, n_sub)
+        river_mouth_flux = None
+        if bool(cfg.enable_river_routing):
+            from aoba.river_routing import init_river_routing_state, step_river_routing_voronoi
+
+            if model.river is None:
+                model.river = init_river_routing_state(mesh, device=runoff_tot_cell.device)
+            runoff_liq_cell = torch.clamp(runoff_tot_cell - runoff_ice_cell, min=0.0)
+            river_mouth_flux = step_river_routing_voronoi(model.river, runoff_liq_cell, mesh.area_cell, dt)
         step_ogcm_voronoi(
             ogcm=model.ogcm,
             sfc=sfc,
@@ -994,14 +1011,15 @@ def step_aoba_model(
             f_seaice=_sub_to_cell(sfc_diag_sub.f_seaice, nc, n_sub),
             evap_cell=_sub_to_cell(sfc_diag_sub.evap, nc, n_sub),
             precip_cell=_sub_to_cell(rain_prev_sub + snow_prev_sub, nc, n_sub),
-            runoff_total=_sub_to_cell(sfc_diag_sub.runoff_total, nc, n_sub),
-            runoff_glacier=_sub_to_cell(sfc_diag_sub.runoff_ice, nc, n_sub),
+            runoff_total=runoff_tot_cell,
+            runoff_glacier=runoff_ice_cell,
             dt=dt,
             enable_seaice_drift=bool(cfg.enable_seaice_drift),
             sw_net_ocn=_sub_to_cell(sw_abs_ocn_sub, nc, n_sub),
             sw_par_ocn=sw_par_ocn,
             u10_ocn=u10_ocn,
             co2_ppmv=model.current_co2_ppmv(),
+            river_mouth_flux=river_mouth_flux,
         )
     else:
         step_ekman_ocean_voronoi(
