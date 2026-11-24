@@ -99,6 +99,7 @@ class AOBAConfig:
     enable_ocean_bgc: bool = False           # Enable FlexPFT marine BGC & OMIP/mocsy 2.0 carbonate chemistry (opt-in)
     enable_river_routing: bool = False       # Enable A1 map-free Priority-Flood Voronoi river routing (opt-in)
     enable_land_carbon: bool = False         # Enable A2 map-free terrestrial C cycle, permafrost C, & SPITFIRE fire (opt-in)
+    enable_seaice_evp_itd: bool = False      # Enable A3 MPAS-Seaice Voronoi EVP rheology + 5-category ITD (opt-in)
     re_liq_um: float = 10.0                  # Fallback/1M cloud liquid droplet effective radius [um]
     re_ice_um: float = 48.0                  # Fallback/1M cloud ice crystal effective radius [um]
     cloud_sw_inhomog: float = 0.65           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
@@ -492,6 +493,10 @@ def init_aoba_model(
         from aoba.ocean_bgc import init_ocean_bgc_state
 
         ogcm.bgc = init_ocean_bgc_state(ogcm.wet_c, ogcm.h_c, ogcm.z_c, mesh.area_cell)
+    if ogcm is not None and bool(cfg.enable_seaice_evp_itd):
+        from aoba.seaice_evp import init_seaice_evp_state
+
+        ogcm.seaice_evp = init_seaice_evp_state(sfc, mesh)
 
     sfc_sub = init_surface_state(
         _cell_to_sub(mesh.surf_type, nc, n_sub),
@@ -985,6 +990,10 @@ def step_aoba_model(
             from aoba.ocean_bgc import init_ocean_bgc_state
 
             model.ogcm.bgc = init_ocean_bgc_state(model.ogcm.wet_c, model.ogcm.h_c, model.ogcm.z_c, mesh.area_cell)
+        if bool(cfg.enable_seaice_evp_itd) and model.ogcm.seaice_evp is None:
+            from aoba.seaice_evp import init_seaice_evp_state
+
+            model.ogcm.seaice_evp = init_seaice_evp_state(sfc, mesh)
         sw_abs_ocn_sub = (1.0 - torch.clamp(sfc_diag_sub.f_seaice, 0.0, 1.0)) * (
             sw1_dir_sub * (1.0 - sfc_diag_sub.alb_vis_dir)
             + sw1_dif_sub * (1.0 - sfc_diag_sub.alb_vis_dif)

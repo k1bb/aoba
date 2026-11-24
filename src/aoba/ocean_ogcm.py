@@ -199,6 +199,7 @@ class OceanOGCMState:
     h_bl: torch.Tensor | None = None          # Diagnosed KPP surface boundary-layer depth [N_cells] [m]
     kv_last: torch.Tensor | None = None       # Last diagnosed vertical tracer diffusivity [N_zo-1, N_cells] [m^2 s^-1]
     bgc: object | None = None                 # Optional FlexPFT OceanBGCState (when enable_ocean_bgc=True)
+    seaice_evp: object | None = None          # Optional A3 SeaIceEVPState (when enable_seaice_evp_itd=True)
 
 
 def _compute_bathymetric_slope(h_col: torch.Tensor, wet_c0: torch.Tensor, mesh: SCVTMesh) -> torch.Tensor:
@@ -1328,7 +1329,14 @@ def step_ogcm_voronoi(
 
     # 11. Dynamic Sea-Ice Drift (after recording thermodynamic mass change, so advection doesn't alias brine!)
     if enable_seaice_drift:
-        step_seaice_drift_voronoi(sfc, mesh, tau_x_sfc, tau_y_sfc, u_new[0], dt, cache=cache)
+        if ogcm.seaice_evp is not None:
+            from aoba.seaice_evp import step_seaice_evp_itd_voronoi
+
+            step_seaice_evp_itd_voronoi(
+                ogcm.seaice_evp, sfc, mesh, tau_x_sfc, tau_y_sfc, u_new[0], ogcm.eta, dt, cache=cache
+            )
+        else:
+            step_seaice_drift_voronoi(sfc, mesh, tau_x_sfc, tau_y_sfc, u_new[0], dt, cache=cache)
 
     ogcm.m_seaice_prev = sfc.m_seaice.clone()
 

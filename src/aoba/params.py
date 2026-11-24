@@ -278,7 +278,7 @@ _FORCING_KEYS: tuple[str, ...] = (
     "start_date", "calendar_type", "insolation_mode", "fixed_insolation_date", "diurnal_cycle",
     "use_earth2014", "earth2014_dir", "earth2014_stride", "enable_superparam",
     "enable_dust", "dust_emis_factor",
-    "h_ml_ocean", "ocean_mode", "ocean_nz", "enable_seaice_drift", "enable_ocean_bgc", "enable_river_routing", "enable_land_carbon",
+    "h_ml_ocean", "ocean_mode", "ocean_nz", "enable_seaice_drift", "enable_ocean_bgc", "enable_river_routing", "enable_land_carbon", "enable_seaice_evp_itd",
     "re_liq_um", "re_ice_um", "cloud_sw_inhomog", "microphysics_scheme",
 )
 _ICESHEET_CFG_KEYS: tuple[str, ...] = (
