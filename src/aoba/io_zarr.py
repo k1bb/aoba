@@ -174,6 +174,21 @@ def export_aoba_snapshot_xarray(
         })
         if model.ozone is not None:
             data_vars["o3_tco_du"] = (("time", "n_cell"), _c1(model.ozone.tco_du), {"units": "DU"})
+            data_vars["o3_sfc_ppbv"] = (("time", "n_cell"), _c1(model.ozone.o3_sfc_ppbv), {"units": "ppbv"})
+        if getattr(model, "last_lightning", None) is not None:
+            data_vars["lightning_flash_rate"] = (("time", "n_cell"), _c1(model.last_lightning.flash_tot_cell), {"units": "fl m-2 s-1"})
+        if getattr(model, "volcanic_solar", None) is not None:
+            from aoba.volcanic_solar import K_EXT_SW_M2_KG
+
+            data_vars["volc_aod"] = (("time", "n_cell"), _c1(model.volcanic_solar.h2so4_strat_kgm2 * K_EXT_SW_M2_KG), {"units": "1"})
+        if getattr(model, "maml_land", None) is not None:
+            fw_c = model.maml_land.f_wetland.reshape(mesh.n_cells, -1).mean(dim=-1)
+            data_vars["f_wetland"] = (("time", "n_cell"), _c1(fw_c), {"units": "1"})
+        if getattr(model, "water_isotopes", None) is not None:
+            data_vars["d18o_precip_permil"] = (("time", "n_cell"), _c1(model.water_isotopes.d18o_precip_permil), {"units": "permil"})
+            data_vars["d18o_snow_permil"] = (("time", "n_cell"), _c1(model.water_isotopes.d18o_snow_permil), {"units": "permil"})
+        if getattr(model, "prognostic_co2", None) is not None and model.prognostic_co2.co2_vmr is not None:
+            data_vars["co2_sfc_ppmv"] = (("time", "n_cell"), _c1(model.prognostic_co2.co2_vmr[0] * 1.0e6), {"units": "ppmv"})
         if model.icesheet is not None:
             data_vars["h_ice"] = (("time", "n_cell"), _c1(model.icesheet.h_ice), {"units": "m"})
             data_vars["z_topo_dyn"] = (("time", "n_cell"), _c1(mesh.z_topo), {"units": "m"})
@@ -182,6 +197,14 @@ def export_aoba_snapshot_xarray(
             ocn_dim = "n_cell_ocn" if model.ocn_mesh is not None else "n_cell"
             data_vars["ocn_eta"] = (("time", ocn_dim), _c1(og.eta), {"units": "m"})
             data_vars["ocn_sss"] = (("time", ocn_dim), _c1(og.sal[0]), {"units": "psu"})
+            if og.bgc is not None:
+                data_vars["ocn_chl_sfc"] = (("time", ocn_dim), _c1(og.bgc.chl[0]), {"units": "mg m-3"})
+                if og.bgc.o2 is not None:
+                    data_vars["ocn_o2_sfc"] = (("time", ocn_dim), _c1(og.bgc.o2[0]), {"units": "mmol m-3"})
+                if og.bgc.omz_col_frac is not None:
+                    data_vars["ocn_omz_frac"] = (("time", ocn_dim), _c1(og.bgc.omz_col_frac), {"units": "1"})
+            if getattr(model, "ocean_waves", None) is not None:
+                data_vars["wave_hs_m"] = (("time", ocn_dim), _c1(model.ocean_waves.hs_m), {"units": "m"})
             if og.h_bl is not None:
                 data_vars["ocn_h_bl"] = (("time", ocn_dim), _c1(og.h_bl), {"units": "m"})
     if include_3d:

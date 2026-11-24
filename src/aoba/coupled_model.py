@@ -133,6 +133,10 @@ class AOBAConfig:
     enable_maml_subgrid_topo: bool = False   # MAML subgrid elevation lapse-rate & slope microclimate downscaling
     enable_maml_wetlands_lakes: bool = False # Dynamic MAML inundated wetlands/floodplains/lakes -> CH4 & evaporation
     enable_wave_coupling: bool = False       # Prognostic ocean waves H_s/T_p, Stokes Langmuir KPP mixing, & sea-spray flux
+    enable_water_isotopes: bool = False      # Prognostic 3D H2^18O & HDO stable water isotopes + ice-core d18O archive
+    planet_preset: str = "earth"             # "earth", "aquaplanet", "snowball_earth", "tidally_locked", "trappist1e", "mars_like"
+    enable_tidal_lock: bool = False          # Synchronous tidally locked insolation (fixed substellar point)
+    substellar_lon_deg: float = 0.0          # Substellar longitude [deg E] when enable_tidal_lock=True
     volcanic_co2_pgc_yr: float = 0.03        # Volcanic CO2 outgassing for silicate-weathering mode [Pg C yr^-1]
     weathering_accel_factor: float = 1.0     # Optional geological acceleration factor for weathering mode [-]
     enable_milankovitch_orbit: bool = False  # Analytical Berger (1978) / Laskar (2004) Milankovitch orbital evolution
@@ -236,6 +240,7 @@ class AOBAState:
     volcanic_solar: object | None = None
     maml_land: object | None = None
     ocean_waves: object | None = None
+    water_isotopes: object | None = None
     sim_time_sec: float = 0.0
     step_count: int = 0
     rad_cache: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -539,6 +544,10 @@ def init_aoba_model(
     """Initialize global SCVT mesh, Earth2014 boundaries, atmosphere, 1:1 CRM, land, & Ekman ocean."""
     if cfg is None:
         cfg = AOBAConfig()
+    if str(cfg.planet_preset).strip().lower() != "earth":
+        from aoba.planetary_presets import resolve_planet_preset_config
+
+        cfg = resolve_planet_preset_config(cfg)
     dev = torch.device(device)
 
     mesh = build_scvt_mesh(
@@ -586,6 +595,14 @@ def init_aoba_model(
     sfc.t_soil = t_sfc_lat.unsqueeze(0).expand_as(sfc.t_soil).clone()
     polar_cold = (mesh.surf_type == SURF_OCEAN) & (t_sfc_lat < C.T_FREEZE_OCEAN)
     sfc.m_seaice = torch.where(polar_cold, torch.full_like(t_sfc_lat, 1400.0), torch.zeros_like(t_sfc_lat))
+    if str(cfg.planet_preset).strip().lower() != "earth":
+        from aoba.planetary_presets import apply_planet_initial_surface
+
+        apply_planet_initial_surface(sfc, cfg.planet_preset)
+        mesh.surf_type = sfc.surf_type.clone()
+        mesh.ocean_frac = (sfc.surf_type == SURF_OCEAN).to(mesh.ocean_frac.dtype)
+        mesh.z_topo = sfc.z_topo.clone()
+        mesh.sigma_topo = sfc.sigma_topo.clone()
 
     ocn = init_ekman_ocean_state(sfc)
     ocn_mesh: SCVTMesh | None = None
@@ -1021,11 +1038,18 @@ def step_aoba_model(
             model.volcanic_solar.tsi_delta_wm2 = tsi_d
             model.volcanic_solar.uv_j_o2_scale = uv_j_o2_scale
             s0_eff = max(100.0, s0_eff + tsi_d)
-    mu0, s_toa, hour_angle_cell = compute_orbital_insolation(
-        t_seas_next, mesh.lat_cell, mesh.lon_cell,
-        s0_eff, obl_now, ecc_now, peri_now,
-        t_diurnal_sec=t_diur_next, diurnal_cycle=cfg.diurnal_cycle,
-    )
+    if bool(cfg.enable_tidal_lock):
+        from aoba.planetary_presets import compute_tidally_locked_insolation
+
+        mu0, s_toa, hour_angle_cell = compute_tidally_locked_insolation(
+            mesh.lat_cell, mesh.lon_cell, s0_eff, cfg.substellar_lon_deg
+        )
+    else:
+        mu0, s_toa, hour_angle_cell = compute_orbital_insolation(
+            t_seas_next, mesh.lat_cell, mesh.lon_cell,
+            s0_eff, obl_now, ecc_now, peri_now,
+            t_diurnal_sec=t_diur_next, diurnal_cycle=cfg.diurnal_cycle,
+        )
     mu0_sub = _cell_to_sub(mu0, nc, n_sub)
     s_toa_sub = _cell_to_sub(s_toa, nc, n_sub)
 
@@ -1556,6 +1580,9 @@ def step_aoba_model(
     )
     if has_co2_adv:
         adv_list.append(model.prognostic_co2.co2_vmr)
+    has_iso_adv = bool(bool(cfg.enable_water_isotopes) and model.water_isotopes is not None)
+    if has_iso_adv:
+        adv_list.extend([model.water_isotopes.q_v_18o, model.water_isotopes.q_v_hdo])
     q_adv = fct_advect_scvt_batch(
         mesh, torch.stack(adv_list, dim=0),
         m_old_host, m_new_host, uh_mean, om_mean, dt,
@@ -1578,6 +1605,10 @@ def step_aoba_model(
     if has_co2_adv:
         model.prognostic_co2.co2_vmr = torch.clamp(q_adv[idx_q], min=1.0e-5, max=0.05)
         idx_q += 1
+    if has_iso_adv:
+        model.water_isotopes.q_v_18o = torch.clamp(q_adv[idx_q], min=0.0)
+        model.water_isotopes.q_v_hdo = torch.clamp(q_adv[idx_q + 1], min=0.0)
+        idx_q += 2
 
     dthm_ls = (atmos.theta_m - thm_before_dyn) / dt
     dqn_ls = (atmos.q_n - qn_before_dyn) / dt
@@ -2191,6 +2222,26 @@ def step_aoba_model(
             fire_c_cell_kgc_m2s=fire_c_cell,
             uv_j_o2_scale=uv_j_o2_scale,
             volc_sad_um2_cm3=volc_sad_3d,
+        )
+    # 8b-8. Stable Water Isotopes (H2^18O, HDO) Fractionation & Ice-Core Archiving
+    if bool(cfg.enable_water_isotopes):
+        from aoba.water_isotopes import init_water_isotope_state, step_water_isotopes
+
+        if model.water_isotopes is None:
+            model.water_isotopes = init_water_isotope_state(atmos.q_v)
+        _, _, temp_host_iso = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        step_water_isotopes(
+            iso=model.water_isotopes,
+            q_v=atmos.q_v,
+            temp_c=temp_host_iso,
+            rho_d=atmos.rho_d,
+            dz_c=atmos.dz_c,
+            surf_type=sfc.surf_type,
+            t_sfc=t_rad_cell,
+            evap_cell=evap_cell,
+            rain_cell=rain_new,
+            snow_cell=snow_new,
+            dt=dt,
         )
     month_idx = model.calendar.date_at(model.sim_time_sec).month - 1
     clim.month_temp_sum_c[month_idx] += (t_air - C.T_FREEZE)

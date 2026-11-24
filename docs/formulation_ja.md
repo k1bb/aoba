@@ -631,13 +631,14 @@ $$
 
 ---
 
-## 12. 単一 TOML 設定管理・出力仕様・GUI コンフィギュレータ・全パラメータ一覧
+## 12. 単一 TOML 設定管理・出力仕様・GUI コンフィギュレータ・全307パラメータ一覧
 
-### 12.1 閉ループ万能 ESM 拡張（`prognostic_co2.py`, `ocean_bgc.py`, `volcanic_solar.py`）
-- **排出駆動・完全双方向の大気 $\mathrm{CO}_2$ 予報（`co2_mode = "prognostic"`, `enable_co2_3d_transport`）**: 陸域 NBP・海洋 $\mathrm{fgCO}_2$・ケイ酸塩風化・火山・人為排出の収支 $\mathrm{d}C_{\mathrm{CO}_2}/\mathrm{d}t = (E_{\mathrm{anthro}} + E_{\mathrm{volc}} - \mathrm{NBP}_{\mathrm{land}} - F_{\mathrm{ocn}} - F_{\mathrm{weath}}) / 2.124\ \mathrm{PgC\ ppmv}^{-1}$ を倍精度で厳密保存し、オプションで 3 次元 SCVT FCT 移流・PBL 混合によりキーリング曲線と南北勾配を再現する。
-- **海洋溶存酸素 ($\mathrm{O}_2$)・貧酸素水塊 (OMZ)・海洋脱窒（`enable_ocean_o2_omz`）**: Garcia & Gordon (1992) の酸素溶解度、Wanninkhof (2014) の大気海洋交換、$R_{\mathrm{O}_2:\mathrm{C}} = 138/106$ の光合成・再無機化、および貧酸素域（$\mathrm{O}_2 < 20\ \mathrm{mmol\ m}^{-3}$）での嫌気的脱窒を解き、海洋 $\mathrm{N}_2\mathrm{O}$ 放出へ結合する。
-- **成層圏火山性エアロゾル・太陽活動 11 年周期（`enable_volcanic_aerosols`, `enable_solar_cycle`）**: 厳密な 2 段 Bateman 解析解による $\mathrm{SO}_2 \to \mathrm{H}_2\mathrm{SO}_4$ 酸化（$\tau_{\mathrm{ox}} = 35\ \mathrm{日}$）および沈降（$\tau_{\mathrm{set}} = 1.1\ \mathrm{年}$）と SCVT ラプラシアン拡散を放射（SW 散乱・LW 吸収）および成層圏不均一オゾン破壊へ結合し、11 年 Schwabe 周期の TSI・UV 光解離変調を加える。
-- **MAML サブグリッド山岳微気候・動的湿地湖沼・波浪/ラングミュア/海塩飛沫結合（`maml_land_subgrid.py`, `ocean_waves.py`）**: `Earth2014` の `sigma_topo` から親格子平均ゼロのサブグリッド標高減率・斜面日射を与える微気候ダウンスケーリング（`enable_maml_subgrid_topo`）、地形平坦度と河川流量から冠水率を動的診断して蒸発・湿地 $\mathrm{CH}_4$ へ繋ぐ湿地・湖沼モデル（`enable_maml_wetlands_lakes`）、および有義波高 $H_s$・周期 $T_p$ 予報から Stokes ドリフトのラングミュア KPP 混合強化・波齢依存粗度・強風時海塩飛沫エンタルピーフラックスを結合する波浪モジュール（`enable_wave_coupling`）。
+### 12.0 閉ループ万能 ESM・惑星／古気候・AOBA Studio 拡張
+- **排出駆動・完全双方向の大気 $\mathrm{CO}_2$ 予報（`co2_mode = "prognostic"`, `enable_co2_3d_transport`; `src/aoba/prognostic_co2.py`）**: 陸域 NBP・海洋 $\mathrm{fgCO}_2$・ケイ酸塩風化・火山・人為排出の収支 $\mathrm{d}C_{\mathrm{CO}_2}/\mathrm{d}t = (E_{\mathrm{anthro}} + E_{\mathrm{volc}} - \mathrm{NBP}_{\mathrm{land}} - F_{\mathrm{ocn}} - F_{\mathrm{weath}}) / 2.124\ \mathrm{PgC\ ppmv}^{-1}$ を倍精度で厳密保存し、オプションで 3 次元 SCVT FCT 移流・PBL 混合によりキーリング曲線と南北勾配を再現する。
+- **海洋溶存酸素 ($\mathrm{O}_2$)・貧酸素水塊 (OMZ)・海洋脱窒（`enable_ocean_o2_omz`; `src/aoba/ocean_bgc.py`）**: Garcia & Gordon (1992) の酸素溶解度、Wanninkhof (2014) の大気海洋交換、$R_{\mathrm{O}_2:\mathrm{C}} = 138/106$ の光合成・再無機化、および貧酸素域（$\mathrm{O}_2 < 20\ \mathrm{mmol\ m}^{-3}$）での嫌気的脱窒を解き、海洋 $\mathrm{N}_2\mathrm{O}$ 放出へ結合する。
+- **成層圏火山性エアロゾル・太陽活動 11 年周期（`enable_volcanic_aerosols`, `enable_solar_cycle`; `src/aoba/volcanic_solar.py`）**: 厳密な 2 段 Bateman 解析解による $\mathrm{SO}_2 \to \mathrm{H}_2\mathrm{SO}_4$ 酸化（$\tau_{\mathrm{ox}} = 35\ \mathrm{日}$）および沈降（$\tau_{\mathrm{set}} = 1.1\ \mathrm{年}$）と SCVT ラプラシアン拡散を放射（SW 散乱・LW 吸収）および成層圏不均一オゾン破壊へ結合し、11 年 Schwabe 周期の TSI・UV 光解離変調を加える。
+- **MAML サブグリッド山岳微気候・動的湿地湖沼・波浪/ラングミュア/海塩飛沫結合（`src/aoba/maml_land_subgrid.py`, `src/aoba/ocean_waves.py`）**: `Earth2014` の `sigma_topo` から親格子平均ゼロのサブグリッド標高減率・斜面日射を与える微気候ダウンスケーリング（`enable_maml_subgrid_topo`）、地形平坦度と河川流量から冠水率を動的診断して蒸発・湿地 $\mathrm{CH}_4$ へ繋ぐ湿地・湖沼モデル（`enable_maml_wetlands_lakes`）、および有義波高 $H_s$・周期 $T_p$ 予報から Stokes ドリフトのラングミュア KPP 混合強化・波齢依存粗度・強風時海塩飛沫エンタルピーフラックスを結合する波浪モジュール（`enable_wave_coupling`）。
+- **水安定同位体 ($\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$)・汎用惑星／系外惑星プリセット・AOBA Studio Full-ESM 拡張（`src/aoba/water_isotopes.py`, `src/aoba/planetary_presets.py`, `scripts/aoba_config_gui.py`）**: VSMOW 基準の 3 次元重水蒸気（`q_v_18o`, `q_v_hdo`）を SCVT FCT で保存移流し、Majoube (1971)／Merlivat & Nief (1967)／Jouzel & Merlivat (1984) の平衡・動的過飽和分別、Craig & Gordon (1965) の海面蒸発分別、厳密な Rayleigh 凝結蒸留、および積雪・氷床コア $\delta^{18}\mathrm{O}$ アーカイブを解く（`enable_water_isotopes`）。さらに地図フリーの惑星プリセット（`planet_preset` $\in \{\text{earth}, \text{aquaplanet}, \text{snowball\_earth}, \text{tidally\_locked}, \text{trappist1e}, \text{mars\_like}\}$）および潮汐固定日射（`enable_tidal_lock`）を提供し、AOBA Studio にワンクリック Full-ESM／惑星プリセット、10 変数切替型 3D 地球儀、および現代地球観測ベンチマーク比較パネル（ERA5・CERES・GPCP・MODIS・NSIDC）を統合する。
 
 ### 12.1 一元テキスト管理アーキテクチャと実行・GUI ツール (`src/aoba/params.py`, `src/aoba/co2_forcing.py`, `src/aoba/ozone_forcing.py`, `src/aoba/gravity_wave.py`, `scripts/aoba_config_gui.py`)
 

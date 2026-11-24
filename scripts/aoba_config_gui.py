@@ -175,6 +175,8 @@ class CPUGlobePreviewEngine:
         precip: np.ndarray,
         lai: np.ndarray,
         surf_type: np.ndarray,
+        esm_range: tuple[float, float] = (0.0, 7.0),
+        esm_land_only: bool = True,
     ) -> dict[str, Any]:
         """Regrid irregular SCVT cell arrays onto `[180, 360]` on CPU and encode compact Uint8 rasters."""
         t0 = time.perf_counter()
@@ -182,7 +184,7 @@ class CPUGlobePreviewEngine:
 
         t2_grid = (t2_c[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
         precip_grid = (precip[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
-        lai_nn = np.where(surf_type == 1, lai, 0.0)
+        lai_nn = np.where(surf_type == 1, lai, 0.0) if esm_land_only else lai
         lai_grid = (lai_nn[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
         surf_grid = surf_type[nn1].reshape(self.GRID_H, self.GRID_W).astype(np.uint8)
 
@@ -193,23 +195,70 @@ class CPUGlobePreviewEngine:
         diff_y = np.zeros_like(is_land)
         diff_y[1:, :] = is_land[1:, :] != is_land[:-1, :]
         coast[(diff_x | diff_y)] = 1
-        # Crisp land mask forces LAI = 0 over oceans & ice sheets cleanly
-        lai_grid = np.where(surf_grid == 1, lai_grid, 0.0)
+        if esm_land_only:
+            lai_grid = np.where(surf_grid == 1, lai_grid, 0.0)
 
         cpu_ms = (time.perf_counter() - t0) * 1000.0
+        lo3, hi3 = float(esm_range[0]), float(esm_range[1])
         return {
             "width": self.GRID_W,
             "height": self.GRID_H,
             "t2_range": [-45.0, 40.0],
             "precip_range": [0.0, 25.0],
-            "lai_range": [0.0, 7.0],
+            "lai_range": [lo3, hi3],
+            "esm_land_only": bool(esm_land_only),
             "t2_b64": self._quantize_u8(t2_grid, -45.0, 40.0),
             "precip_b64": self._quantize_u8(precip_grid, 0.0, 25.0),
-            "lai_b64": self._quantize_u8(lai_grid, 0.0, 7.0),
+            "lai_b64": self._quantize_u8(lai_grid, lo3, hi3),
             "surf_b64": base64.b64encode(surf_grid.tobytes()).decode("ascii"),
             "coast_b64": base64.b64encode(coast.tobytes()).decode("ascii"),
             "cpu_regrid_ms": round(cpu_ms, 2),
         }
+
+
+_ESM_GLOBE_SPECS: dict[str, tuple[str, float, float, bool]] = {
+    "lai": ("LAI [m² m⁻²]", 0.0, 7.0, True),
+    "o3_tco_du": ("Total Ozone O₃ [DU]", 150.0, 420.0, False),
+    "lightning_flash_rate": ("Lightning [fl km⁻² yr⁻¹]", 0.0, 30.0, False),
+    "volc_aod": ("Volcanic AOD (550nm)", 0.0, 0.4, False),
+    "f_wetland": ("Wetland/Lake Frac [-]", 0.0, 0.85, True),
+    "d18o_precip_permil": ("Precip δ¹⁸O [‰]", -45.0, 2.0, False),
+    "co2_sfc_ppmv": ("Surface CO₂ [ppmv]", 260.0, 460.0, False),
+    "ocn_chl_sfc": ("Ocean Chl [mg m⁻³]", 0.0, 2.0, False),
+    "ocn_o2_sfc": ("Ocean O₂ [mmol m⁻³]", 140.0, 360.0, False),
+    "wave_hs_m": ("Wave Height H_s [m]", 0.0, 8.0, False),
+}
+
+
+def _compute_obs_benchmark(csv_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compare active run's recent global climate means against Earth observational reference ranges."""
+    refs = [
+        ("ts_k", "Surface T_s [K]", "ERA5 (1981–2010)", 286.5, 289.2, 287.8),
+        ("olr_wm2", "TOA OLR [W m⁻²]", "CERES EBAF", 234.0, 245.0, 239.7),
+        ("asr_wm2", "TOA ASR [W m⁻²]", "CERES EBAF", 235.0, 246.0, 240.5),
+        ("precip_mm_d", "Precip [mm d⁻¹]", "GPCP v2.3", 2.45, 3.05, 2.72),
+        ("lai", "Land LAI [m² m⁻²]", "MODIS/GLASS", 1.20, 2.20, 1.65),
+        ("seaice_mkm2", "Sea-Ice [Mkm²]", "NSIDC CDR", 17.0, 27.0, 22.0),
+    ]
+    rows: list[dict[str, Any]] = []
+    for key, label, src, lo, hi, obs_mid in refs:
+        vals = csv_data.get(key) or []
+        if not vals:
+            continue
+        tail = [float(x) for x in vals[-min(len(vals), 365):]]
+        mean_v = sum(tail) / max(len(tail), 1)
+        in_band = (lo <= mean_v <= hi)
+        rows.append({
+            "key": key,
+            "label": label,
+            "obs_source": src,
+            "obs_mid": obs_mid,
+            "obs_range": f"{lo:g}–{hi:g}",
+            "model_mean": round(mean_v, 2),
+            "bias": round(mean_v - obs_mid, 2),
+            "status": "ok" if in_band else "warn",
+        })
+    return rows
 
 
 def _find_zarr_frames(out_root: Path, kind: str) -> list[dict[str, Any]]:
@@ -248,8 +297,9 @@ def _load_zarr_frame_payload(
     out_root: Path,
     frame_info: dict[str, Any],
     kind: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
-    """Extract `(lat, lon, t2_c, olr, lai, surf_type, source_label)` from a Zarr time slice."""
+    esm_field: str = "lai",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str, list[str]]:
+    """Extract `(lat, lon, t2_c, precip, field3, surf_type, source_label, avail_esm_fields)` from a Zarr slice."""
     import xarray as xr
 
     store = Path(frame_info["store"])
@@ -258,6 +308,9 @@ def _load_zarr_frame_payload(
     try:
         lat_deg = np.asarray(ds["lat_cell"].values, dtype=np.float32)
         lon_deg = np.asarray(ds["lon_cell"].values, dtype=np.float32)
+        avail_esm = [k for k in _ESM_GLOBE_SPECS if k in ds and ds[k].shape[-1] == lat_deg.shape[0]]
+        if "lai" not in avail_esm:
+            avail_esm.insert(0, "lai")
 
         surf_type = None
         if "surf_type" in ds:
@@ -288,15 +341,21 @@ def _load_zarr_frame_payload(
         else:
             precip = np.zeros_like(lat_deg, dtype=np.float32)
 
-        if "lai" in ds:
-            lai = np.asarray(ds["lai"].isel(time=idx).values, dtype=np.float32)
+        f3_key = esm_field if (esm_field in ds and ds[esm_field].shape[-1] == lat_deg.shape[0]) else "lai"
+        if f3_key != "lai":
+            f3 = np.asarray(ds[f3_key].isel(time=idx).values, dtype=np.float32)
+            if f3_key == "lightning_flash_rate":
+                # Convert fl m^-2 s^-1 -> fl km^-2 yr^-1
+                f3 = f3 * (1.0e6 * 365.2425 * 86400.0)
+        elif "lai" in ds:
+            f3 = np.asarray(ds["lai"].isel(time=idx).values, dtype=np.float32)
         elif "lai_sub" in ds:
             arr = np.asarray(ds["lai_sub"].isel(time=idx).values, dtype=np.float32)
-            lai = arr.mean(axis=tuple(range(1, arr.ndim)))
+            f3 = arr.mean(axis=tuple(range(1, arr.ndim)))
         else:
-            lai = np.zeros_like(lat_deg, dtype=np.float32)
+            f3 = np.zeros_like(lat_deg, dtype=np.float32)
 
-        return lat_deg, lon_deg, t2_c, precip, lai, surf_type, f"{kind} ({frame_info['label']})"
+        return lat_deg, lon_deg, t2_c, precip, f3, surf_type, f"{kind} ({frame_info['label']})", avail_esm
     finally:
         ds.close()
 
@@ -492,7 +551,13 @@ class RunManager:
                 self.proc.wait(timeout=2.0)
             return {"ok": True, "pid": pid}
 
-    def build_monitor_payload(self, out_dir_str: str, source: str = "auto", frame_req: int = -1) -> dict[str, Any]:
+    def build_monitor_payload(
+        self,
+        out_dir_str: str,
+        source: str = "auto",
+        frame_req: int = -1,
+        esm_field: str = "lai",
+    ) -> dict[str, Any]:
         active_procs = _discover_active_processes()
         managed = self.get_managed_status()
         discovered = _discover_output_dirs(self.last_watch_dir)
@@ -536,7 +601,7 @@ class RunManager:
 
         chosen_mode = source
         if source == "auto":
-            if live_npz.exists():
+            if live_npz.exists() and (esm_field == "lai" or (not snap_frames and not mon_frames)):
                 chosen_mode = "live"
             elif snap_frames:
                 chosen_mode = "snapshots"
@@ -589,6 +654,7 @@ class RunManager:
                 payload["raster"] = cached["raster"]
                 payload["meta"] = cached["meta"]
                 payload["frames"] = snap_frames if snap_frames else mon_frames
+                payload["obs_benchmark"] = _compute_obs_benchmark(payload.get("csv", {}))
                 return payload
             except Exception:
                 pass
@@ -601,14 +667,18 @@ class RunManager:
             finfo = frames[idx]
             store_p = Path(finfo["store"])
             mtime = store_p.stat().st_mtime if store_p.exists() else 0.0
-            cache_key = (str(out_root), kind_used, idx, mtime)
+            cache_key = (str(out_root), kind_used, idx, mtime, esm_field)
             cached = self.engine._frame_cache.get(cache_key)
             if cached is None:
                 try:
-                    lat_deg, lon_deg, t2_c, olr, lai, surf_type, src_lbl = _load_zarr_frame_payload(
-                        out_root, finfo, kind_used
+                    lat_deg, lon_deg, t2_c, precip, f3, surf_type, src_lbl, avail_esm = _load_zarr_frame_payload(
+                        out_root, finfo, kind_used, esm_field=esm_field
                     )
-                    raster = self.engine.regrid_fields(lat_deg, lon_deg, t2_c, precip, lai, surf_type)
+                    spec = _ESM_GLOBE_SPECS.get(esm_field, _ESM_GLOBE_SPECS["lai"])
+                    raster = self.engine.regrid_fields(
+                        lat_deg, lon_deg, t2_c, precip, f3, surf_type,
+                        esm_range=(spec[1], spec[2]), esm_land_only=spec[3],
+                    )
                     sim_d = float(finfo["sim_days"])
                     run_toml_p = out_root / "run_config.toml"
                     rc = load_aoba_toml(run_toml_p) if run_toml_p.exists() else {}
@@ -622,6 +692,9 @@ class RunManager:
                         "sim_days": round(sim_d, 2),
                         "date_str": cal.date_at(sim_d * 86400.0).iso_date,
                         "n_cells": int(lat_deg.size),
+                        "esm_field": esm_field,
+                        "esm_label": spec[0],
+                        "avail_esm_fields": avail_esm,
                     }
                     cached = {"raster": raster, "meta": meta}
                     self.engine._frame_cache[cache_key] = cached
@@ -634,6 +707,7 @@ class RunManager:
         else:
             payload["meta"] = {"source": "waiting_for_first_output"}
 
+        payload["obs_benchmark"] = _compute_obs_benchmark(payload.get("csv", {}))
         return payload
 
 
@@ -908,10 +982,14 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   <div id="tab-forcing" class="tab-pane">
     <div class="preset-bar">
       <button onclick="applyForcingPreset('present')" data-i18n="pre_present">現代気候 (400 ppmv, 1×Ω)</button>
+      <button onclick="applyForcingPreset('full_esm')" style="border-color:var(--accent); color:var(--accent);">🌍 Full-ESM + RRTMGP</button>
       <button onclick="applyForcingPreset('half_omega')" data-i18n="pre_half_w">自転半減実験 (0.5×Ω)</button>
       <button onclick="applyForcingPreset('slow_rot')" data-i18n="pre_slow_w">超低速自転 (0.25×Ω)</button>
       <button onclick="applyForcingPreset('lgm')" data-i18n="pre_lgm">氷期実験 (185 ppmv + 動的氷床)</button>
       <button onclick="applyForcingPreset('4xco2')" data-i18n="pre_4co2">4×CO₂ 温暖化 + 動的氷床</button>
+      <button onclick="applyForcingPreset('aquaplanet')">💧 Aquaplanet</button>
+      <button onclick="applyForcingPreset('snowball')">❄️ Snowball Earth</button>
+      <button onclick="applyForcingPreset('trappist1e')">🪐 TRAPPIST-1e (潮汐固定)</button>
     </div>
     <div class="grid-2">
       <div class="card">
@@ -1080,13 +1158,35 @@ _HTML_PAGE = r"""<!DOCTYPE html>
           <div class="cbar-labels"><span>0</span><span>4</span><span>10</span><span>18</span><span>25+ mm/d</span></div>
         </div>
         <div class="globe-card">
-          <h3 data-i18n="g_lai_title">葉面積指数 LAI [m² m⁻²]</h3>
-          <div class="g-sub" data-i18n="g_lai_sub">自律 EEO バイオーム分布（海＝濃紺・氷床＝白）</div>
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:2px;">
+            <h3 id="g-esm-title" data-i18n="g_lai_title" style="margin:0;">葉面積指数 LAI [m² m⁻²]</h3>
+            <select id="esm-globe-field" onchange="fetchMonitorOnce()" style="font-size:11px; padding:2px 6px; width:auto; max-width:145px;">
+              <option value="lai">LAI (植生)</option>
+              <option value="o3_tco_du">全オゾン O₃ [DU]</option>
+              <option value="lightning_flash_rate">発雷頻度 [fl/km²/yr]</option>
+              <option value="volc_aod">火山エアロゾル AOD</option>
+              <option value="f_wetland">湿地・湖沼被覆率</option>
+              <option value="d18o_precip_permil">降水 δ¹⁸O [‰]</option>
+              <option value="co2_sfc_ppmv">地表 CO₂ [ppmv]</option>
+              <option value="ocn_chl_sfc">海洋 Chl [mg/m³]</option>
+              <option value="ocn_o2_sfc">海洋溶存 O₂ [mmol/m³]</option>
+              <option value="wave_hs_m">有義波高 H_s [m]</option>
+            </select>
+          </div>
+          <div id="g-esm-sub" class="g-sub" data-i18n="g_lai_sub">自律 EEO バイオーム分布（海＝濃紺・氷床＝白）</div>
           <canvas id="globeLAI" class="globe-canvas" width="300" height="300"></canvas>
-          <div class="cbar" style="background:linear-gradient(90deg, #92704a, #a3a332, #4d9e38, #15803d, #064e3b);"></div>
-          <div class="cbar-labels"><span>0</span><span>2</span><span>4</span><span>7 m²/m²</span></div>
+          <div id="g-esm-cbar" class="cbar" style="background:linear-gradient(90deg, #92704a, #a3a332, #4d9e38, #15803d, #064e3b);"></div>
+          <div id="g-esm-cbar-labels" class="cbar-labels"><span>0</span><span>2</span><span>4</span><span>7 m²/m²</span></div>
         </div>
       </div>
+    </div>
+
+    <div class="card" id="obs-benchmark-card" style="margin-bottom:14px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <h2 style="margin:0;">🛰️ 現代地球観測ベンチマーク比較 (ERA5 / CERES / GPCP / MODIS / NSIDC)</h2>
+        <span class="sub" style="margin:0;">直近最大365日平均との対照</span>
+      </div>
+      <div id="obs-benchmark-box" class="sub">日次統計 (daily_global.csv) 待機中...</div>
     </div>
 
     <div class="grid-2">
@@ -1745,13 +1845,29 @@ function applyGridPreset(g, nx, ny, dx, nz, dt, ztop = 48000, zsp = 36000) {
 function applyForcingPreset(kind) {
   const f = STATE.config.forcing, ic = STATE.config.icesheet;
   f.co2_mode = "constant";
-  if (kind === "present") { f.co2_ppmv = 400.0; f.omega = 7.292115e-5; f.obliquity_deg = 23.44; ic.enable_dynamic_icesheet = false; }
-  else if (kind === "half_omega") { f.co2_ppmv = 400.0; f.omega = 7.292115e-5 * 0.5; }
+  f.planet_preset = "earth";
+  f.enable_tidal_lock = false;
+  if (kind === "present") {
+    f.co2_ppmv = 400.0; f.solar_constant = 1361.0; f.omega = 7.292115e-5; f.obliquity_deg = 23.44;
+    ic.enable_dynamic_icesheet = false;
+  } else if (kind === "full_esm") {
+    f.co2_ppmv = 400.0; f.co2_mode = "prognostic"; f.enable_co2_3d_transport = true;
+    f.rad_scheme = "rrtmgp"; f.microphysics_scheme = "six_class_2m"; f.o3_mode = "prognostic";
+    f.enable_ocean_bgc = true; f.enable_ocean_o2_omz = true; f.enable_land_carbon = true; f.enable_land_nitrogen = true;
+    f.enable_lightning = true; f.enable_fire_veg_feedback = true; f.enable_natural_aerosols = true;
+    f.enable_aerosol_rad_forcing = true; f.enable_snow_bc_darkening = true; f.enable_bgc_fe_lnox_coupling = true;
+    f.enable_bvoc_soa = true; f.enable_prognostic_ch4_n2o = true; f.enable_volcanic_aerosols = true;
+    f.enable_solar_cycle = true; f.enable_maml_subgrid_topo = true; f.enable_maml_wetlands_lakes = true;
+    f.enable_wave_coupling = true; f.enable_water_isotopes = true;
+  } else if (kind === "half_omega") { f.co2_ppmv = 400.0; f.omega = 7.292115e-5 * 0.5; }
   else if (kind === "slow_rot") { f.co2_ppmv = 400.0; f.omega = 7.292115e-5 * 0.25; }
   else if (kind === "lgm") { f.co2_ppmv = 185.0; f.obliquity_deg = 22.95; f.eccentricity = 0.018994; ic.enable_dynamic_icesheet = true; ic.icesheet_accel_factor = 100.0; }
   else if (kind === "4xco2") { f.co2_ppmv = 1600.0; ic.enable_dynamic_icesheet = true; ic.icesheet_accel_factor = 50.0; }
+  else if (kind === "aquaplanet") { f.planet_preset = "aquaplanet"; f.obliquity_deg = 0.0; f.eccentricity = 0.0; f.co2_ppmv = 400.0; }
+  else if (kind === "snowball") { f.planet_preset = "snowball_earth"; f.solar_constant = 1280.0; f.co2_ppmv = 100.0; }
+  else if (kind === "trappist1e") { f.planet_preset = "trappist1e"; f.enable_tidal_lock = true; f.solar_constant = 900.0; f.omega = 1.19e-5; f.obliquity_deg = 0.0; f.eccentricity = 0.0; }
   renderAll();
-  showToast("外力・氷床プリセットを適用しました");
+  showToast(`プリセット (${kind}) を適用しました`);
 }
 
 /* --- TAB 1 CANVAS: REAL SCVT VORONOI MESH + CRM + VERTICAL --- */
@@ -2144,14 +2260,42 @@ function b64ToUint8(b64) {
   return arr;
 }
 
+function renderObsBenchmark(rows) {
+  const box = document.getElementById("obs-benchmark-box");
+  if (!box) return;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    box.innerHTML = `<span class="sub">${LANG === "ja" ? "日次統計 (daily_global.csv) 待機中..." : "Waiting for daily_global.csv..."}</span>`;
+    return;
+  }
+  let html = `<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:8px;">`;
+  for (const r of rows) {
+    const ok = r.status === "ok";
+    const badgeColor = ok ? "#22c55e" : "#f59e0b";
+    const sign = r.bias >= 0 ? "+" : "";
+    html += `<div style="background:#0f172a; border:1px solid #1e293b; border-left:3px solid ${badgeColor}; border-radius:8px; padding:7px 9px; font-size:12px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <strong>${escHtml(r.label)}</strong>
+        <span style="color:${badgeColor}; font-weight:700; font-size:11px;">${ok ? "IN BAND" : "BIAS"} (${sign}${r.bias})</span>
+      </div>
+      <div style="color:#cbd5e1; margin-top:2px;">Model: <b>${r.model_mean}</b> &nbsp;|&nbsp; Obs: ${r.obs_mid} (${escHtml(r.obs_range)})</div>
+      <div style="color:#64748b; font-size:10.5px;">Ref: ${escHtml(r.obs_source)}</div>
+    </div>`;
+  }
+  html += `</div>`;
+  box.innerHTML = html;
+}
+
 async function fetchMonitorOnce() {
   const src = document.getElementById("watch-source")?.value || "auto";
   const frm = document.getElementById("watch-frame")?.value || "-1";
-  const qs = new URLSearchParams({ out_dir: MON.outDir || "", source: src, frame: frm });
+  const esmField = document.getElementById("esm-globe-field")?.value || "lai";
+  const qs = new URLSearchParams({ out_dir: MON.outDir || "", source: src, frame: frm, esm_field: esmField });
   try {
     const res = await fetch("/api/monitor/snapshot?" + qs.toString());
     const data = await res.json();
     MON.outDir = data.out_dir || "";
+    MON.esmField = (data.meta && data.meta.esm_field) || esmField;
+    MON.esmLabel = (data.meta && data.meta.esm_label) || "LAI [m² m⁻²]";
 
     // Update directory picker
     const dirSel = document.getElementById("watch-dir-select");
@@ -2231,7 +2375,27 @@ async function fetchMonitorOnce() {
       MON.rawLAI = b64ToUint8(data.raster.lai_b64);
       MON.rawSurf = b64ToUint8(data.raster.surf_b64);
       MON.rawCoast = b64ToUint8(data.raster.coast_b64);
+      const tEl = document.getElementById("g-esm-title");
+      const sEl = document.getElementById("g-esm-sub");
+      const cEl = document.getElementById("g-esm-cbar");
+      const lEl = document.getElementById("g-esm-cbar-labels");
+      const rng = data.raster.lai_range || [0, 7];
+      if (tEl) tEl.textContent = MON.esmLabel || "LAI [m² m⁻²]";
+      if (sEl) sEl.textContent = MON.esmField === "lai"
+        ? (LANG === "ja" ? "自律 EEO バイオーム分布（海＝濃紺・氷床＝白）" : "Emergent EEO biome LAI (ocean=navy, ice=white)")
+        : `ESM 2D Field (${MON.esmField})`;
+      if (cEl) {
+        cEl.style.background = MON.esmField === "lai"
+          ? "linear-gradient(90deg, #92704a, #a3a332, #4d9e38, #15803d, #064e3b)"
+          : "linear-gradient(90deg, #1e1b4b, #1d4ed8, #0ea5e9, #34d399, #facc15, #f97316)";
+      }
+      if (lEl) {
+        const lo = rng[0], hi = rng[1], m1 = lo + (hi - lo) * 0.33, m2 = lo + (hi - lo) * 0.67;
+        const fmt = (v) => Math.abs(hi - lo) < 2 ? v.toFixed(2) : (Math.abs(hi - lo) < 20 ? v.toFixed(1) : v.toFixed(0));
+        lEl.innerHTML = `<span>${fmt(lo)}</span><span>${fmt(m1)}</span><span>${fmt(m2)}</span><span>${fmt(hi)}</span>`;
+      }
     }
+    renderObsBenchmark(data.obs_benchmark || []);
   } catch (e) { /* keep polling calmly */ }
 }
 
@@ -2254,6 +2418,7 @@ function makeColorLUT(stops) {
 const LUT_T2  = makeColorLUT([[0,[30,27,75]],[0.24,[29,78,216]],[0.44,[56,189,248]],[0.60,[253,224,71]],[0.80,[249,115,22]],[1,[185,28,28]]]);
 const LUT_OLR = makeColorLUT([[0,[15,23,42]],[0.04,[30,58,138]],[0.16,[14,165,233]],[0.40,[52,211,153]],[0.68,[250,204,21]],[0.88,[249,115,22]],[1,[236,72,153]]]);
 const LUT_LAI = makeColorLUT([[0,[146,112,74]],[0.20,[163,163,50]],[0.45,[77,158,56]],[0.72,[21,128,61]],[1,[6,78,59]]]);
+const LUT_ESM = makeColorLUT([[0,[30,27,75]],[0.20,[29,78,216]],[0.42,[14,165,233]],[0.65,[52,211,153]],[0.84,[250,204,21]],[1,[249,115,22]]]);
 
 function buildOrthographicCache(lat0Deg) {
   const size = 300, cx = 150, cy = 150, R = 132;
@@ -2357,7 +2522,9 @@ function renderOneGlobe(canvasId, kind, geo) {
   const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
   const lon0 = GLOBE_VIEW.lon0;
   const srcVals = kind === "t2" ? MON.rawT2 : (kind === "olr" ? MON.rawOLR : MON.rawLAI);
-  const lut = kind === "t2" ? LUT_T2 : (kind === "olr" ? LUT_OLR : LUT_LAI);
+  const isLaiMode = (MON.esmField || "lai") === "lai";
+  const landOnly3 = MON.raster.esm_land_only !== false;
+  const lut = kind === "t2" ? LUT_T2 : (kind === "olr" ? LUT_OLR : (isLaiMode ? LUT_LAI : LUT_ESM));
   const surf = MON.rawSurf, coast = MON.rawCoast;
 
   for (let p = 0; p < geo.count; p++) {
@@ -2368,9 +2535,9 @@ function renderOneGlobe(canvasId, kind, geo) {
     const sh = geo.shade[p];
 
     let r, g, b;
-    if (kind === "lai" && surf[gIdx] === 0) {
-      r = 12 * sh; g = 34 * sh; b = 74 * sh; // crisp ocean blue on LAI globe
-    } else if (kind === "lai" && surf[gIdx] === 2) {
+    if (kind === "lai" && landOnly3 && surf[gIdx] === 0) {
+      r = 12 * sh; g = 34 * sh; b = 74 * sh; // crisp ocean blue on land-only globe
+    } else if (kind === "lai" && landOnly3 && surf[gIdx] === 2) {
       r = 228 * sh; g = 242 * sh; b = 250 * sh; // ice sheets crisp white-cyan
     } else {
       const k3 = srcVals[gIdx] * 3;
@@ -2415,7 +2582,7 @@ function animateGlobes(ts) {
     GLOBE_VIEW.lon0 = wrapLonDeg(GLOBE_VIEW.lon0 + spd * dt);
   }
   const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
-  const rKey = `${GLOBE_VIEW.lat0.toFixed(3)}|${GLOBE_VIEW.lon0.toFixed(3)}|${MON.raster?.sim_days ?? "idle"}|${MON.raster?.step ?? ""}|${drawGrid}|${LANG}`;
+  const rKey = `${GLOBE_VIEW.lat0.toFixed(3)}|${GLOBE_VIEW.lon0.toFixed(3)}|${MON.raster?.sim_days ?? "idle"}|${MON.raster?.step ?? ""}|${MON.esmField ?? "lai"}|${drawGrid}|${LANG}`;
   if (rKey === _lastRenderKey) return;
   _lastRenderKey = rKey;
 
@@ -2460,11 +2627,13 @@ function bindGlobeInteractions() {
       const idx = row * 360 + col;
       const t2v = -45 + (MON.rawT2[idx]/255) * 85;
       const precipv = (MON.rawOLR[idx]/255) * 25.0;
-      const laiv = (MON.rawLAI[idx]/255) * 7.0;
+      const r3 = MON.raster.lai_range || [0.0, 7.0];
+      const v3 = r3[0] + (MON.rawLAI[idx]/255) * (r3[1] - r3[0]);
+      const lbl3 = MON.esmLabel || "LAI [m² m⁻²]";
       const stype = MON.rawSurf[idx] === 0 ? (LANG==="ja"?"海洋":"Ocean") : (MON.rawSurf[idx] === 2 ? (LANG==="ja"?"氷床":"IceSheet") : (LANG==="ja"?"陸域":"Land"));
       const ptLbl = LANG === "ja" ? "地点" : "Point";
       document.getElementById("hover-coords").textContent =
-        `${ptLbl} (${lat.toFixed(1)}°, ${lon.toFixed(1)}°, ${stype}) — T₂: ${t2v.toFixed(1)} °C (${(t2v+273.15).toFixed(1)} K) | Precip: ${precipv.toFixed(1)} mm/d | LAI: ${laiv.toFixed(2)} m²/m²`;
+        `${ptLbl} (${lat.toFixed(1)}°, ${lon.toFixed(1)}°, ${stype}) — T₂: ${t2v.toFixed(1)} °C (${(t2v+273.15).toFixed(1)} K) | Precip: ${precipv.toFixed(1)} mm/d | ${lbl3}: ${v3.toFixed(2)}`;
     });
   });
   window.addEventListener("mouseup", () => { GLOBE_VIEW.dragging = false; GRID_VIEW.dragging = false; });
@@ -3049,12 +3218,13 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             out_dir = qs.get("out_dir", [""])[0]
             source = qs.get("source", ["auto"])[0]
+            esm_field = qs.get("esm_field", ["lai"])[0]
             try:
                 frame = int(qs.get("frame", ["-1"])[0])
             except ValueError:
                 frame = -1
             rm = self.server.run_manager  # type: ignore[attr-defined]
-            self._send_json(rm.build_monitor_payload(out_dir, source=source, frame_req=frame))
+            self._send_json(rm.build_monitor_payload(out_dir, source=source, frame_req=frame, esm_field=esm_field))
             return
 
         if parsed.path == "/api/co2_catalog":
