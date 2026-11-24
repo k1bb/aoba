@@ -49,6 +49,7 @@ from aoba.ocean_ogcm import OceanOGCMState, init_ogcm_state, step_ogcm_voronoi
 from aoba.orography import compute_orographic_drag_lott_miller
 from aoba.radiation import compute_four_band_radiation
 from aoba.radiation_ckd import CH4_PREIND_PPMV, N2O_PREIND_PPMV, compute_ckd_radiation
+from aoba.runtime import maybe_cuda_compile
 from aoba.scvt_dynamics import (
     GlobalAtmosState,
     fct_advect_scvt,
@@ -690,6 +691,70 @@ _ACCLIM_BIO_ATTRS: tuple[str, ...] = (
 )
 
 
+def _coupled_post_crm_accum_core(
+    rho_post_0: torch.Tensor,
+    thm_post_0: torch.Tensor,
+    qv_post_0: torch.Tensor,
+    dz0_sub: torch.Tensor,
+    rain_new_sub: torch.Tensor,
+    snow_new_sub: torch.Tensor,
+    sw1_dir_sub: torch.Tensor,
+    sw1_dif_sub: torch.Tensor,
+    sw2_dir_sub: torch.Tensor,
+    sw2_dif_sub: torch.Tensor,
+    lw_dn_sub: torch.Tensor,
+    alb_vis_dir: torch.Tensor,
+    alb_vis_dif: torch.Tensor,
+    alb_nir_dir: torch.Tensor,
+    alb_nir_dif: torch.Tensor,
+    emiss_sfc: torch.Tensor,
+    t_rad_sfc: torch.Tensor,
+    day_precip_mm: torch.Tensor,
+    day_pet_mm: torch.Tensor,
+    day_ppfd_mol: torch.Tensor,
+    day_temp_sum: torch.Tensor,
+    day_vpd_sum: torch.Tensor,
+    day_t_min: torch.Tensor,
+    dt: float,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor,
+]:
+    """Pure-tensor post-CRM lowest-level meteorology, Priestley-Taylor PET & daily accumulators."""
+    pres_post_0, _, t_air_sub = diagnose_pressure_temperature(rho_post_0, thm_post_0, qv_post_0)
+    pres_sfc_post_sub = pres_post_0 + C.GRAVITY * rho_post_0 * (1.0 + qv_post_0) * dz0_sub
+    t_denom = torch.clamp(t_air_sub - 29.65, min=10.0)
+    es_sub = 611.2 * torch.exp(17.67 * (t_air_sub - C.T_FREEZE) / t_denom)
+    e_sub = qv_post_0 * pres_post_0 / (C.EPS_WATER + (1.0 - C.EPS_WATER) * qv_post_0)
+    vpd_sub = torch.clamp(es_sub - e_sub, min=50.0)
+
+    precip_tot_sub = rain_new_sub + snow_new_sub
+    sw_net_sub = (
+        (1.0 - alb_vis_dir) * sw1_dir_sub
+        + (1.0 - alb_vis_dif) * sw1_dif_sub
+        + (1.0 - alb_nir_dir) * sw2_dir_sub
+        + (1.0 - alb_nir_dif) * sw2_dif_sub
+    )
+    lw_net_sub = emiss_sfc * (lw_dn_sub - C.STEFAN_BOLTZMANN * (t_rad_sfc ** 4))
+    rn_pos_sub = torch.clamp(sw_net_sub + lw_net_sub, min=0.0)
+    des_dt_sub = es_sub * (17.67 * 243.5) / (t_denom * t_denom)
+    gamma_psy_sub = (C.CP_D * pres_sfc_post_sub) / (C.EPS_WATER * C.L_V0)
+    pet_pt_sub = 1.26 * (des_dt_sub / (des_dt_sub + gamma_psy_sub)) * rn_pos_sub / C.L_V0
+
+    day_precip_new = day_precip_mm + precip_tot_sub * dt
+    day_pet_new = day_pet_mm + pet_pt_sub * dt
+    day_ppfd_new = day_ppfd_mol + (4.57 * sw1_dir_sub + 4.24 * sw1_dif_sub) * 1.0e-6 * dt
+    day_temp_new = day_temp_sum + t_air_sub
+    day_vpd_new = day_vpd_sum + vpd_sub
+    day_t_min_new = torch.minimum(day_t_min, t_air_sub)
+    return (
+        t_air_sub, pres_sfc_post_sub, vpd_sub,
+        day_precip_new, day_pet_new, day_ppfd_new,
+        day_temp_new, day_vpd_new, day_t_min_new,
+    )
+
+
 def step_aoba_model(
     model: AOBAState,
     compute_diagnostics: bool = True,
@@ -1232,11 +1297,21 @@ def step_aoba_model(
     rho_post_0 = crm.rho_d[0].reshape(m_sub)
     thm_post_0 = crm.theta_m[0].reshape(m_sub)
     qv_post_0 = crm.q_v[0].reshape(m_sub)
-    pres_post_0, _, t_air_sub = diagnose_pressure_temperature(rho_post_0, thm_post_0, qv_post_0)
-    pres_sfc_post_sub = pres_post_0 + C.GRAVITY * rho_post_0 * (1.0 + qv_post_0) * dz0_sub
-    es_sub = 611.2 * torch.exp(17.67 * (t_air_sub - C.T_FREEZE) / torch.clamp(t_air_sub - 29.65, min=10.0))
-    e_sub = qv_post_0 * pres_post_0 / (C.EPS_WATER + (1.0 - C.EPS_WATER) * qv_post_0)
-    vpd_sub = torch.clamp(es_sub - e_sub, min=50.0)
+    post_accum_fn = maybe_cuda_compile(_coupled_post_crm_accum_core, device=rho_post_0.device)
+    (
+        t_air_sub, pres_sfc_post_sub, vpd_sub,
+        day_precip_new, day_pet_new, day_ppfd_new,
+        day_temp_new, day_vpd_new, day_t_min_new,
+    ) = post_accum_fn(
+        rho_post_0, thm_post_0, qv_post_0, dz0_sub,
+        rain_new_sub, snow_new_sub,
+        sw1_dir_sub, sw1_dif_sub, sw2_dir_sub, sw2_dif_sub, lw_dn_sub,
+        sfc_diag_sub.alb_vis_dir, sfc_diag_sub.alb_vis_dif,
+        sfc_diag_sub.alb_nir_dir, sfc_diag_sub.alb_nir_dif,
+        sfc_diag_sub.emiss_sfc, sfc_diag_sub.t_rad_sfc,
+        clim_sub.day_precip_mm, clim_sub.day_pet_mm, clim_sub.day_ppfd_mol,
+        clim_sub.day_temp_sum, clim_sub.day_vpd_sum, clim_sub.day_t_min, dt,
+    )
 
     if bool(crossed_noon_cpu.any()):
         noon_cells = torch.nonzero(crossed_noon_cpu, as_tuple=False).squeeze(-1).to(device=rho_post_0.device)
@@ -1263,27 +1338,12 @@ def step_aoba_model(
             old_sub = full_arr[noon_sub_idx]
             full_arr[noon_sub_idx] = torch.where(land_noon, getattr(sub_bio, a), old_sub)
 
-    precip_tot_sub = rain_new_sub + snow_new_sub
-    clim_sub.day_precip_mm = clim_sub.day_precip_mm + precip_tot_sub * dt
-    # Priestley & Taylor (1972, Mon. Wea. Rev., 100, 81-92) potential evapotranspiration [kg m^-2 s^-1]:
-    # PET = 1.26 * [s / (s + gamma)] * max(R_n, 0) / L_v0 (consistent with Cai et al., 2025; Zhou et al., 2025)
-    sw_net_sub = (
-        (1.0 - sfc_diag_sub.alb_vis_dir) * sw1_dir_sub
-        + (1.0 - sfc_diag_sub.alb_vis_dif) * sw1_dif_sub
-        + (1.0 - sfc_diag_sub.alb_nir_dir) * sw2_dir_sub
-        + (1.0 - sfc_diag_sub.alb_nir_dif) * sw2_dif_sub
-    )
-    lw_net_sub = sfc_diag_sub.emiss_sfc * (lw_dn_sub - C.STEFAN_BOLTZMANN * (sfc_diag_sub.t_rad_sfc ** 4))
-    rn_pos_sub = torch.clamp(sw_net_sub + lw_net_sub, min=0.0)
-    t_denom_pt = torch.clamp(t_air_sub - 29.65, min=10.0)
-    des_dt_sub = es_sub * (17.67 * 243.5) / (t_denom_pt * t_denom_pt)
-    gamma_psy_sub = (C.CP_D * pres_sfc_post_sub) / (C.EPS_WATER * C.L_V0)
-    pet_pt_sub = 1.26 * (des_dt_sub / (des_dt_sub + gamma_psy_sub)) * rn_pos_sub / C.L_V0
-    clim_sub.day_pet_mm = clim_sub.day_pet_mm + pet_pt_sub * dt
-    clim_sub.day_ppfd_mol = clim_sub.day_ppfd_mol + (4.57 * sw1_dir_sub + 4.24 * sw1_dif_sub) * 1.0e-6 * dt
-    clim_sub.day_temp_sum = clim_sub.day_temp_sum + t_air_sub
-    clim_sub.day_vpd_sum = clim_sub.day_vpd_sum + vpd_sub
-    clim_sub.day_t_min = torch.minimum(clim_sub.day_t_min, t_air_sub)
+    clim_sub.day_precip_mm = day_precip_new
+    clim_sub.day_pet_mm = day_pet_new
+    clim_sub.day_ppfd_mol = day_ppfd_new
+    clim_sub.day_temp_sum = day_temp_new
+    clim_sub.day_vpd_sum = day_vpd_new
+    clim_sub.day_t_min = day_t_min_new
     clim_sub.day_steps += 1
 
     # Host monthly Köppen-Geiger accumulators (calendar month index 0..11)

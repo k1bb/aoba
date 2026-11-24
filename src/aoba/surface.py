@@ -820,6 +820,221 @@ def step_multilayer_soil_hydrology(
     )
 
 
+def _surface_land_pre_newton_core(
+    sw1_dir_down: torch.Tensor,
+    sw1_dif_down: torch.Tensor,
+    sw2_dir_down: torch.Tensor,
+    sw2_dif_down: torch.Tensor,
+    alb_vis_dir: torch.Tensor,
+    alb_vis_dif: torch.Tensor,
+    alb_nir_dir: torch.Tensor,
+    alb_nir_dif: torch.Tensor,
+    h_exp: torch.Tensor,
+    lai_exp: torch.Tensor,
+    a_sn: torch.Tensor,
+    temp_1: torch.Tensor,
+    qv_1: torch.Tensor,
+    pres_1: torch.Tensor,
+    pres_sfc: torch.Tensor,
+    mu0: torch.Tensor,
+    l_sun: torch.Tensor,
+    l_sh: torch.Tensor,
+    k_db_inst: torch.Tensor,
+    snow_age: torch.Tensor,
+    w_liq_soil0: torch.Tensor,
+    w_ice_soil0: torch.Tensor,
+    t_soil0: torch.Tensor,
+    w_canopy: torch.Tensor,
+    swe_land: torch.Tensor,
+):
+    """Pure-tensor terrestrial pre-Newton setup (albedo absorption, 3-source SW, soil DSL, RSL)."""
+    sw_abs = (
+        sw1_dir_down * (1.0 - alb_vis_dir)
+        + sw1_dif_down * (1.0 - alb_vis_dif)
+        + sw2_dir_down * (1.0 - alb_nir_dir)
+        + sw2_dif_down * (1.0 - alb_nir_dif)
+    )
+    exner_1 = torch.pow(pres_1 / C.P_REF, C.KAPPA_D)
+    exner_s = torch.pow(pres_sfc / C.P_REF, C.KAPPA_D)
+    theta_1 = temp_1 / exner_1
+    theta_v1 = theta_1 * (1.0 + C.ZVIR * qv_1)
+    rho_sfc = pres_sfc / (C.R_D * temp_1 * (1.0 + C.ZVIR * qv_1))
+    cp_air = C.CP_D + C.CP_V * qv_1
+
+    d_land, z0m_land, _ = canopy_roughness_raupach(h_exp, lai_exp, z0_soil=0.01)
+    z0m_terr = torch.where(lai_exp < 0.05, (1.0 - a_sn) * z0m_land + a_sn * 0.002, z0m_land)
+    has_veg = lai_exp >= 0.01
+    f_veg_rad = torch.where(has_veg, 1.0 - torch.exp(-lai_exp), torch.zeros_like(lai_exp))
+    z0h_terr = torch.where(
+        has_veg,
+        (1.0 - f_veg_rad) * (0.135335 * z0m_terr) + f_veg_rad * z0m_terr,
+        0.135335 * z0m_terr,
+    )
+    rsl_depth = torch.clamp(2.0 * h_exp - d_land, min=0.0)
+
+    has_sun = has_veg & (l_sun > 1.0e-4)
+    has_sh = has_veg & (l_sh > 1.0e-4)
+    f_sun_area = torch.where(has_veg, torch.clamp(l_sun / torch.clamp(lai_exp, min=1.0e-4), 0.0, 1.0), torch.zeros_like(lai_exp))
+    f_sh_area = torch.where(has_veg, 1.0 - f_sun_area, torch.zeros_like(lai_exp))
+
+    sw_tot_vis = sw1_dir_down * (1.0 - alb_vis_dir) + sw1_dif_down * (1.0 - alb_vis_dif)
+    sw_tot_nir = sw2_dir_down * (1.0 - alb_nir_dir) + sw2_dif_down * (1.0 - alb_nir_dif)
+    sn_vis_d, sn_vis_f, sn_nir_d, sn_nir_f = compute_snow_albedo_yang(snow_age, mu0)
+    soil_v, soil_n = compute_bare_soil_albedo_moisture(w_liq_soil0)
+    ag_vis_d = (1.0 - a_sn) * soil_v + a_sn * sn_vis_d
+    ag_vis_f = (1.0 - a_sn) * soil_v + a_sn * sn_vis_f
+    ag_nir_d = (1.0 - a_sn) * soil_n + a_sn * sn_nir_d
+    ag_nir_f = (1.0 - a_sn) * soil_n + a_sn * sn_nir_f
+
+    kb_vis_p = k_db_inst * math.sqrt(1.0 - LEAF_SCAT_VIS)
+    kd_vis_p = 0.78 * math.sqrt(1.0 - LEAF_SCAT_VIS)
+    kb_nir_p = k_db_inst * math.sqrt(1.0 - LEAF_SCAT_NIR)
+    kd_nir_p = 0.78 * math.sqrt(1.0 - LEAF_SCAT_NIR)
+    tr_vis_d = torch.exp(-torch.clamp(kb_vis_p * lai_exp, max=40.0))
+    tr_vis_f = torch.exp(-torch.clamp(kd_vis_p * lai_exp, max=40.0))
+    tr_nir_d = torch.exp(-torch.clamp(kb_nir_p * lai_exp, max=40.0))
+    tr_nir_f = torch.exp(-torch.clamp(kd_nir_p * lai_exp, max=40.0))
+
+    sw_gnd_vis = torch.minimum(
+        sw_tot_vis,
+        tr_vis_d * sw1_dir_down * (1.0 - ag_vis_d) + tr_vis_f * sw1_dif_down * (1.0 - ag_vis_f),
+    )
+    sw_gnd_nir = torch.minimum(
+        sw_tot_nir,
+        tr_nir_d * sw2_dir_down * (1.0 - ag_nir_d) + tr_nir_f * sw2_dif_down * (1.0 - ag_nir_f),
+    )
+    sw_can_vis = torch.where(has_veg, torch.clamp(sw_tot_vis - sw_gnd_vis, min=0.0), torch.zeros_like(sw_tot_vis))
+    sw_can_nir = torch.where(has_veg, torch.clamp(sw_tot_nir - sw_gnd_nir, min=0.0), torch.zeros_like(sw_tot_nir))
+    f_sun_vis = canopy_sunlit_sw_fraction(sw1_dir_down, sw1_dif_down, mu0, lai_exp, LEAF_SCAT_VIS)
+    f_sun_nir = canopy_sunlit_sw_fraction(sw2_dir_down, sw2_dif_down, mu0, lai_exp, LEAF_SCAT_NIR)
+    sw_abs_sun = torch.where(has_sun, f_sun_vis * sw_can_vis + f_sun_nir * sw_can_nir, torch.zeros_like(sw_abs))
+    sw_abs_sh = torch.where(has_sh, (sw_can_vis + sw_can_nir) - sw_abs_sun, torch.zeros_like(sw_abs))
+    sw_abs_gnd = sw_abs - sw_abs_sun - sw_abs_sh
+
+    wc_cap = WC_MAX_PER_LAI * lai_exp
+    f_wet = torch.where(
+        has_veg,
+        torch.clamp(torch.pow(torch.clamp(w_canopy, min=0.0) / torch.clamp(wc_cap, min=1.0e-4), 2.0 / 3.0), 0.0, F_WET_MAX),
+        torch.zeros_like(lai_exp),
+    )
+    sat_top = torch.clamp((w_liq_soil0 + w_ice_soil0) / SOIL_POROSITY, 0.01, 1.0)
+    psi_top = PSI_SAT_SOIL * torch.pow(sat_top, -B_CLAPP_SOIL)
+    h_soil_base = torch.exp(torch.clamp(psi_top * C.GRAVITY / (C.R_V * t_soil0), -10.0, 0.0))
+
+    theta_liq_top = torch.clamp(w_liq_soil0, min=0.0, max=SOIL_POROSITY)
+    theta_air = SOIL_POROSITY * (abs(PSI_SAT_SOIL) * 1.0e3 / PSI_AIR_MM) ** (1.0 / B_CLAPP_SOIL)
+    theta_init = DSL_THETA_INIT_FRAC * SOIL_POROSITY
+    d_sl = DSL_DMAX_MM * 1.0e-3 * torch.clamp((theta_init - theta_liq_top) / max(theta_init - theta_air, 1.0e-3), min=0.0, max=13.0)
+    phi_air = max(SOIL_POROSITY - theta_air, 1.0e-3)
+    tau_soil = (phi_air ** 2) * (phi_air / SOIL_POROSITY) ** (3.0 / B_CLAPP_SOIL)
+    d_vap = 2.12e-5 * torch.pow(t_soil0 / C.T_FREEZE, 1.75)
+    r_soil = d_sl / (d_vap * tau_soil)
+
+    dz_top_half = 0.5 * SOIL_LAYER_DEPTHS[0]
+    k_top = KAPPA_DRY_SOIL * (1.0 + 5.5 * torch.tanh((w_liq_soil0 + w_ice_soil0) / 0.25))
+    r_snow_therm = a_sn * (0.5 * torch.clamp(swe_land / RHO_SNOWPACK, max=1.0) / C.K_THERM_SNOW)
+    g_cond_coeff = 1.0 / (dz_top_half / k_top + r_snow_therm)
+
+    beta_rsl = torch.clamp(torch.sqrt(0.003 + 0.15 * torch.clamp(lai_exp, min=1.0e-4)), 0.12, 0.30)
+    alpha_u_half = 0.5 * torch.clamp(0.20 / (2.0 * beta_rsl * beta_rsl), 0.30, 1.20)
+    t_air_sfc = theta_1 * exner_s
+    has_snow = swe_land > 1.0e-3
+    eps_g = EMISSIVITY_LAND
+    lw_refl_c = 1.0 + (1.0 - f_veg_rad) * (1.0 - eps_g)
+    lw_emit_c_coef = 2.0 - f_veg_rad * (1.0 - eps_g)
+    return (
+        sw_abs, exner_s, theta_1, theta_v1, rho_sfc, cp_air,
+        d_land, z0m_terr, z0h_terr, rsl_depth, has_veg, f_veg_rad,
+        has_sun, has_sh, f_sun_area, f_sh_area,
+        sw_abs_sun, sw_abs_sh, sw_abs_gnd, wc_cap, f_wet,
+        h_soil_base, r_soil, g_cond_coeff, beta_rsl, alpha_u_half,
+        t_air_sfc, has_snow, lw_refl_c, lw_emit_c_coef,
+    )
+
+
+def _surface_land_newton_pre_bio_core(
+    t_sun_cur: torch.Tensor,
+    t_sh_cur: torch.Tensor,
+    t_gnd_cur: torch.Tensor,
+    pres_sfc: torch.Tensor,
+    q_af_in: torch.Tensor,
+    c_h_land: torch.Tensor,
+    wind_eff_land: torch.Tensor,
+    u_star_land: torch.Tensor,
+    beta_rsl: torch.Tensor,
+    alpha_u_half: torch.Tensor,
+    lai_exp: torch.Tensor,
+    k_db_inst: torch.Tensor,
+    h_exp: torch.Tensor,
+    z0m_terr: torch.Tensor,
+    has_veg: torch.Tensor,
+    has_sun: torch.Tensor,
+    has_sh: torch.Tensor,
+    f_veg_rad: torch.Tensor,
+    f_sun_area: torch.Tensor,
+    f_sh_area: torch.Tensor,
+):
+    """Pure-tensor leaf boundary-layer conductances, r_d_uc, qsat, and leaf-surface VPD."""
+    ga_land = c_h_land * wind_eff_land
+    u_can_top = torch.minimum(torch.clamp(u_star_land / beta_rsl, min=0.10), wind_eff_land)
+    gb_top = 0.01 * torch.sqrt(u_can_top / 0.04)
+    gb_tot_can = gb_top * (1.0 - torch.exp(-torch.clamp(alpha_u_half * lai_exp, max=30.0))) / alpha_u_half
+    gb_sun = torch.where(
+        has_sun,
+        torch.clamp(
+            gb_top * (1.0 - torch.exp(-torch.clamp((k_db_inst + alpha_u_half) * lai_exp, max=30.0)))
+            / (k_db_inst + alpha_u_half),
+            min=1.0e-4,
+        ),
+        torch.zeros_like(lai_exp),
+    )
+    gb_sh = torch.where(has_sh, torch.clamp(gb_tot_can - gb_sun, min=1.0e-4), torch.zeros_like(lai_exp))
+
+    t_fol_avg = torch.where(has_veg, f_sun_area * t_sun_cur + f_sh_area * t_sh_cur, t_gnd_cur)
+    stab_uc = C.GRAVITY * h_exp * (t_fol_avg - t_gnd_cur) / (torch.clamp(t_gnd_cur, min=180.0) * (u_star_land * u_star_land + 1.0e-3))
+    c_dense = torch.where(stab_uc > 0.0, 0.004 / (1.0 + 0.5 * torch.clamp(stab_uc, max=10.0)), torch.full_like(stab_uc, 0.004))
+    c_bare = C.VON_KARMAN / (0.13 * torch.pow(torch.clamp(u_star_land * z0m_terr / 1.5e-5, min=1.0), 0.45))
+    c_uv = (1.0 - f_veg_rad) * c_bare + f_veg_rad * c_dense
+    r_d_uc = 1.0 / torch.clamp(c_uv * u_star_land, min=1.0e-3)
+
+    qsat_sun, dq_sun = qsat_mixed(t_sun_cur, pres_sfc)
+    qsat_sh, dq_sh = qsat_mixed(t_sh_cur, pres_sfc)
+    qsat_gnd, dq_gnd = qsat_mixed(t_gnd_cur, pres_sfc)
+
+    q_af_vpd = torch.clamp(q_af_in, min=1.0e-7)
+    e_af_pa = q_af_vpd * pres_sfc / (C.EPS_WATER + (1.0 - C.EPS_WATER) * q_af_vpd)
+    vpd_sun_af = torch.clamp(esat_liquid(t_sun_cur) - e_af_pa, min=20.0)
+    vpd_sh_af = torch.clamp(esat_liquid(t_sh_cur) - e_af_pa, min=20.0)
+    return (
+        ga_land, gb_sun, gb_sh, r_d_uc,
+        qsat_sun, dq_sun, qsat_sh, dq_sh, qsat_gnd, dq_gnd,
+        q_af_vpd, vpd_sun_af, vpd_sh_af,
+    )
+
+
+def _surface_ocean_pre_transfer_core(
+    u_star_ocean: torch.Tensor,
+    f_ice: torch.Tensor,
+    t_ocean_ml: torch.Tensor,
+    t_seaice: torch.Tensor,
+    pres_sfc: torch.Tensor,
+    exner_s: torch.Tensor,
+):
+    """Pure-tensor ocean/sea-ice roughness and surface virtual potential temperature."""
+    z0m_ocn, z0h_ocn, z0q_ocn = ocean_roughness_miller(u_star_ocean)
+    z0m_sea = (1.0 - f_ice) * z0m_ocn + f_ice * 0.001
+    z0h_sea = (1.0 - f_ice) * z0h_ocn + f_ice * 0.0002
+    z0q_sea = (1.0 - f_ice) * z0q_ocn + f_ice * 0.0002
+    esat_ow = esat_liquid(t_ocean_ml)
+    esat_si = esat_ice(t_seaice)
+    qsat_ow = 0.98 * C.EPS_WATER * esat_ow / torch.clamp(pres_sfc - esat_ow, min=0.1 * pres_sfc)
+    qsat_si = C.EPS_WATER * esat_si / torch.clamp(pres_sfc - esat_si, min=0.1 * pres_sfc)
+    t_skin_sea = (1.0 - f_ice) * t_ocean_ml + f_ice * t_seaice
+    q_skin_sea = (1.0 - f_ice) * qsat_ow + f_ice * qsat_si
+    theta_vsfc_o = (t_skin_sea / exner_s) * (1.0 + C.ZVIR * q_skin_sea)
+    return z0m_sea, z0h_sea, z0q_sea, qsat_ow, qsat_si, theta_vsfc_o
+
+
 def _land_newton_jacobian_core(
     t_sun_cur: torch.Tensor,
     t_sh_cur: torch.Tensor,
@@ -1315,6 +1530,122 @@ def _ocean_seaice_post_core(
 # ---------------------------------------------------------------------------
 # 5. Unified Land / Ice-Sheet / Ocean+Sea-Ice Time-Stepping Driver
 # ---------------------------------------------------------------------------
+def _surface_part_c_merge_core(
+    is_terrestrial: torch.Tensor,
+    is_land: torch.Tensor,
+    is_ocean: torch.Tensor,
+    t_soil_new: torch.Tensor,
+    w_liq_new: torch.Tensor,
+    w_ice_new: torch.Tensor,
+    w_root_next: torch.Tensor,
+    wc_next: torch.Tensor,
+    t_skin_final: torch.Tensor,
+    t_sun_final: torch.Tensor,
+    t_sh_final: torch.Tensor,
+    t_gnd_final: torch.Tensor,
+    swe_next: torch.Tensor,
+    swe_max_next: torch.Tensor,
+    snow_age_next: torch.Tensor,
+    t_ml_next: torch.Tensor,
+    comp_final: torch.Tensor,
+    comp0: torch.Tensor,
+    m_si_next: torch.Tensor,
+    t_si_new: torch.Tensor,
+    swe_si_next: torch.Tensor,
+    sfc_t_soil: torch.Tensor,
+    sfc_w_liq_soil: torch.Tensor,
+    sfc_w_ice_soil: torch.Tensor,
+    sfc_w_root: torch.Tensor,
+    sfc_t_canopy: torch.Tensor,
+    sfc_t_ocean_ml: torch.Tensor,
+    sfc_u_star_ocean: torch.Tensor,
+    sfc_t_seaice: torch.Tensor,
+    shf_o: torch.Tensor,
+    shf_l: torch.Tensor,
+    lhf_o: torch.Tensor,
+    lhf_l: torch.Tensor,
+    evap_o: torch.Tensor,
+    evap_l: torch.Tensor,
+    lw_emit_o: torch.Tensor,
+    cm_ocn: torch.Tensor,
+    cm_land: torch.Tensor,
+    wind_ocn: torch.Tensor,
+    wind_land: torch.Tensor,
+    ustar_ocn: torch.Tensor,
+    ustar_land: torch.Tensor,
+    rho_sfc: torch.Tensor,
+    cp_air: torch.Tensor,
+    exner_s: torch.Tensor,
+    theta_1: torch.Tensor,
+    theta_v1: torch.Tensor,
+    qv_1: torch.Tensor,
+    u_1: torch.Tensor,
+    v_1: torch.Tensor,
+    d_land: torch.Tensor,
+    z0m_sea: torch.Tensor,
+    z0m_terr: torch.Tensor,
+    liq_runoff: torch.Tensor,
+    glacier_runoff: torch.Tensor,
+    two_leaf_gpp: torch.Tensor,
+    a_sn: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """Pure-tensor Part C state commit & merged flux diagnostics (CUDA-compilable)."""
+    terr_2d = is_terrestrial.unsqueeze(0)
+    t_soil_out = torch.where(terr_2d, t_soil_new, sfc_t_soil)
+    w_liq_out = torch.where(terr_2d, w_liq_new, sfc_w_liq_soil)
+    w_ice_out = torch.where(terr_2d, w_ice_new, sfc_w_ice_soil)
+    w_root_out = torch.where(is_land, w_root_next, sfc_w_root)
+    z0 = torch.zeros_like(wc_next)
+    wc_out = torch.where(is_land, wc_next, z0)
+    t_can_out = torch.where(is_terrestrial, t_skin_final, sfc_t_canopy)
+    t_sun_out = torch.where(is_terrestrial, t_sun_final, t_can_out)
+    t_sh_out = torch.where(is_terrestrial, t_sh_final, t_can_out)
+    t_gnd_out = torch.where(is_terrestrial, t_gnd_final, t_can_out)
+    swe_out = torch.where(is_terrestrial, swe_next, z0)
+    swe_max_out = torch.where(is_terrestrial, swe_max_next, z0)
+    snow_age_out = torch.where(is_terrestrial, snow_age_next, z0)
+
+    t_ml_out = torch.where(is_ocean, t_ml_next, sfc_t_ocean_ml)
+    comp_out = torch.where(is_ocean, comp_final, comp0)
+    ustar_o_out = torch.where(is_ocean, ustar_ocn, sfc_u_star_ocean)
+    m_si_out = torch.where(is_ocean, m_si_next, z0)
+    t_si_out = torch.where(is_ocean, t_si_new, sfc_t_seaice)
+    swe_si_out = torch.where(is_ocean, swe_si_next, z0)
+
+    shf = torch.where(is_ocean, shf_o, shf_l)
+    lhf = torch.where(is_ocean, lhf_o, lhf_l)
+    evap = torch.where(is_ocean, evap_o, evap_l)
+
+    cm_all = torch.where(is_ocean, cm_ocn, cm_land)
+    wind_all = torch.where(is_ocean, wind_ocn, wind_land)
+    ustar_all = torch.where(is_ocean, ustar_ocn, ustar_land)
+    tau_x = -rho_sfc * cm_all * wind_all * u_1
+    tau_y = -rho_sfc * cm_all * wind_all * v_1
+
+    w_th_sfc = shf / (rho_sfc * cp_air * exner_s)
+    w_qv_sfc = evap / rho_sfc
+    buoy_flux = (C.GRAVITY / theta_v1) * (w_th_sfc * (1.0 + C.ZVIR * qv_1) + C.ZVIR * theta_1 * w_qv_sfc)
+
+    emiss = torch.where(is_ocean, torch.full_like(shf, EMISSIVITY_OCEAN), torch.full_like(shf, EMISSIVITY_LAND))
+    lw_emit_l = EMISSIVITY_LAND * C.STEFAN_BOLTZMANN * (t_skin_final ** 4)
+    t_rad = torch.pow(torch.where(is_ocean, lw_emit_o, lw_emit_l) / (emiss * C.STEFAN_BOLTZMANN), 0.25)
+
+    d_out = torch.where(is_ocean, z0, d_land)
+    z0m_out = torch.where(is_ocean, z0m_sea, z0m_terr)
+    runoff_tot = torch.where(is_terrestrial, liq_runoff + glacier_runoff, z0)
+    runoff_glac = torch.where(is_terrestrial, glacier_runoff, z0)
+    gpp_out = torch.where(is_land, two_leaf_gpp, z0)
+    f_snow_land = torch.where(is_terrestrial, a_sn, z0)
+
+    return (
+        t_soil_out, w_liq_out, w_ice_out, w_root_out, wc_out,
+        t_can_out, t_sun_out, t_sh_out, t_gnd_out, swe_out, swe_max_out, snow_age_out,
+        t_ml_out, comp_out, ustar_o_out, m_si_out, t_si_out, swe_si_out,
+        shf, lhf, evap, tau_x, tau_y, ustar_all, buoy_flux, emiss, t_rad,
+        d_out, z0m_out, runoff_tot, runoff_glac, gpp_out, f_snow_land,
+    )
+
+
 def step_surface(
     sfc: SurfaceState,
     u_1: torch.Tensor,
@@ -1354,41 +1685,6 @@ def step_surface(
         f_ice,
     ) = precomputed_albedos if precomputed_albedos is not None else compute_surface_albedos(sfc, mu0)
 
-    # Absorbed net shortwave [W m^-2]
-    sw_abs = (
-        sw1_dir_down * (1.0 - alb_vis_dir)
-        + sw1_dif_down * (1.0 - alb_vis_dif)
-        + sw2_dir_down * (1.0 - alb_nir_dir)
-        + sw2_dif_down * (1.0 - alb_nir_dif)
-    )
-
-    # Reference-level potential temperature and virtual potential temperature
-    exner_1 = torch.pow(pres_1 / C.P_REF, C.KAPPA_D)
-    exner_s = torch.pow(pres_sfc / C.P_REF, C.KAPPA_D)
-    theta_1 = temp_1 / exner_1
-    theta_v1 = theta_1 * (1.0 + C.ZVIR * qv_1)
-    rho_sfc = pres_sfc / (C.R_D * temp_1 * (1.0 + C.ZVIR * qv_1))
-    cp_air = C.CP_D + C.CP_V * qv_1
-
-    # =========================================================================
-    # PART A: TERRESTRIAL TILES (3-Source Sunlit/Shaded/Ground + RSL + P-Model)
-    # =========================================================================
-    d_land, z0m_land, _ = canopy_roughness_raupach(h_exp, lai_exp, z0_soil=0.01)
-    # Smooth snow roughness when snow-covered and canopy buried
-    z0m_snow = torch.full_like(z0m_land, 0.002)
-    z0m_terr = torch.where(lai_exp < 0.05, (1.0 - a_sn) * z0m_land + a_sn * z0m_snow, z0m_land)
-
-    has_veg = lai_exp >= 0.01
-    f_veg_rad = torch.where(has_veg, 1.0 - torch.exp(-lai_exp), torch.zeros_like(lai_exp))
-    # Avoid kB^-1 double-counting of leaf laminar boundary layer when r_b is explicit on vegetated canopies
-    # (CLM5 Sec. 5.3; Oleson et al., 2013 p. 95; Bonan et al., 2018): z_0h = z_0m for canopy, 0.135335 z_0m bare.
-    z0h_terr = torch.where(
-        has_veg,
-        (1.0 - f_veg_rad) * (0.135335 * z0m_terr) + f_veg_rad * z0m_terr,
-        0.135335 * z0m_terr,
-    )
-    rsl_depth = torch.clamp(2.0 * h_exp - d_land, min=0.0)
-
     # Vertically integrated root-zone plant-available liquid water & optimal stress beta (Holtzman et al., 2024; Gao et al., 2014)
     w_avail_root, _, _ = compute_root_zone_weights_and_water(sfc.w_liq_soil, sfc.bio.s_root_cap)
     water_stress = compute_optimal_soil_water_beta(w_avail_root, sfc.bio)
@@ -1400,102 +1696,32 @@ def step_surface(
     l_sun = alloc_2l.inst_rad.l_sun
     l_sh = alloc_2l.inst_rad.l_sh
     k_db_inst = alloc_2l.inst_rad.k_db
-    has_sun = has_veg & (l_sun > 1.0e-4)
-    has_sh = has_veg & (l_sh > 1.0e-4)
-    f_sun_area = torch.where(has_veg, torch.clamp(l_sun / torch.clamp(lai_exp, min=1.0e-4), 0.0, 1.0), torch.zeros_like(lai_exp))
-    f_sh_area = torch.where(has_veg, 1.0 - f_sun_area, torch.zeros_like(lai_exp))
 
-    # Conservative 3-source shortwave partitioning: S_sun + S_sh + S_gnd == sw_abs (de Pury & Farquhar, 1997; Dai et al., 2004)
-    sw_tot_vis = sw1_dir_down * (1.0 - alb_vis_dir) + sw1_dif_down * (1.0 - alb_vis_dif)
-    sw_tot_nir = sw2_dir_down * (1.0 - alb_nir_dir) + sw2_dif_down * (1.0 - alb_nir_dif)
-    sn_vis_d, sn_vis_f, sn_nir_d, sn_nir_f = compute_snow_albedo_yang(sfc.snow_age, mu0)
-    soil_v, soil_n = compute_bare_soil_albedo_moisture(sfc.w_liq_soil[0])
-    ag_vis_d = (1.0 - a_sn) * soil_v + a_sn * sn_vis_d
-    ag_vis_f = (1.0 - a_sn) * soil_v + a_sn * sn_vis_f
-    ag_nir_d = (1.0 - a_sn) * soil_n + a_sn * sn_nir_d
-    ag_nir_f = (1.0 - a_sn) * soil_n + a_sn * sn_nir_f
-
-    kb_vis_p = k_db_inst * math.sqrt(1.0 - LEAF_SCAT_VIS)
-    kd_vis_p = 0.78 * math.sqrt(1.0 - LEAF_SCAT_VIS)
-    kb_nir_p = k_db_inst * math.sqrt(1.0 - LEAF_SCAT_NIR)
-    kd_nir_p = 0.78 * math.sqrt(1.0 - LEAF_SCAT_NIR)
-    tr_vis_d = torch.exp(-torch.clamp(kb_vis_p * lai_exp, max=40.0))
-    tr_vis_f = torch.exp(-torch.clamp(kd_vis_p * lai_exp, max=40.0))
-    tr_nir_d = torch.exp(-torch.clamp(kb_nir_p * lai_exp, max=40.0))
-    tr_nir_f = torch.exp(-torch.clamp(kd_nir_p * lai_exp, max=40.0))
-
-    sw_gnd_vis = torch.minimum(
-        sw_tot_vis,
-        tr_vis_d * sw1_dir_down * (1.0 - ag_vis_d) + tr_vis_f * sw1_dif_down * (1.0 - ag_vis_f),
+    # =========================================================================
+    # PART A: TERRESTRIAL TILES (3-Source Sunlit/Shaded/Ground + RSL + P-Model)
+    # =========================================================================
+    t_soil0 = sfc.t_soil[0]
+    pre_land_fn = maybe_cuda_compile(_surface_land_pre_newton_core, device=u_1.device)
+    (
+        sw_abs, exner_s, theta_1, theta_v1, rho_sfc, cp_air,
+        d_land, z0m_terr, z0h_terr, rsl_depth, has_veg, f_veg_rad,
+        has_sun, has_sh, f_sun_area, f_sh_area,
+        sw_abs_sun, sw_abs_sh, sw_abs_gnd, wc_cap, f_wet,
+        h_soil_base, r_soil, g_cond_coeff, beta_rsl, alpha_u_half,
+        t_air_sfc, has_snow, lw_refl_c, lw_emit_c_coef,
+    ) = pre_land_fn(
+        sw1_dir_down, sw1_dif_down, sw2_dir_down, sw2_dif_down,
+        alb_vis_dir, alb_vis_dif, alb_nir_dir, alb_nir_dif,
+        h_exp, lai_exp, a_sn, temp_1, qv_1, pres_1, pres_sfc, mu0,
+        l_sun, l_sh, k_db_inst, sfc.snow_age, sfc.w_liq_soil[0],
+        sfc.w_ice_soil[0], t_soil0, sfc.w_canopy, sfc.swe_land,
     )
-    sw_gnd_nir = torch.minimum(
-        sw_tot_nir,
-        tr_nir_d * sw2_dir_down * (1.0 - ag_nir_d) + tr_nir_f * sw2_dif_down * (1.0 - ag_nir_f),
-    )
-    sw_can_vis = torch.where(has_veg, torch.clamp(sw_tot_vis - sw_gnd_vis, min=0.0), torch.zeros_like(sw_tot_vis))
-    sw_can_nir = torch.where(has_veg, torch.clamp(sw_tot_nir - sw_gnd_nir, min=0.0), torch.zeros_like(sw_tot_nir))
-    f_sun_vis = canopy_sunlit_sw_fraction(sw1_dir_down, sw1_dif_down, mu0, lai_exp, LEAF_SCAT_VIS)
-    f_sun_nir = canopy_sunlit_sw_fraction(sw2_dir_down, sw2_dif_down, mu0, lai_exp, LEAF_SCAT_NIR)
-
-    sw_abs_sun = torch.where(has_sun, f_sun_vis * sw_can_vis + f_sun_nir * sw_can_nir, torch.zeros_like(sw_abs))
-    sw_abs_sh = torch.where(
-        has_sh,
-        (sw_can_vis + sw_can_nir) - sw_abs_sun,
-        torch.zeros_like(sw_abs),
-    )
-    sw_abs_gnd = sw_abs - sw_abs_sun - sw_abs_sh
 
     # Warm-start sunlit leaf, shaded leaf, and ground skin temperatures (backward-compatible with older restarts)
-    t_gnd_cur = sfc.t_gnd_skin.clone() if sfc.t_gnd_skin is not None else sfc.t_soil[0].clone()
+    t_gnd_cur = sfc.t_gnd_skin.clone() if sfc.t_gnd_skin is not None else t_soil0.clone()
     t_sun_cur = sfc.t_leaf_sun.clone() if sfc.t_leaf_sun is not None else sfc.t_canopy.clone()
     t_sh_cur = sfc.t_leaf_sh.clone() if sfc.t_leaf_sh is not None else sfc.t_canopy.clone()
-    # Keep bare-ground tiles initialized at their skin/soil temperature
     t_gnd_cur = torch.where(has_veg, t_gnd_cur, sfc.t_canopy)
-
-    # Wetted canopy fraction f_wet = [W_can / (p_liq L)]^(2/3) <= f_wet_max (CLM5 Eq. 7.23; Dickinson et al., 1993)
-    wc_cap = WC_MAX_PER_LAI * lai_exp
-    f_wet = torch.where(
-        has_veg,
-        torch.clamp(
-            torch.pow(torch.clamp(sfc.w_canopy, min=0.0) / torch.clamp(wc_cap, min=1.0e-4), 2.0 / 3.0),
-            0.0,
-            F_WET_MAX,
-        ),
-        torch.zeros_like(lai_exp),
-    )
-
-    # Bare-soil evaporation resistance via the CLM5 dry-surface-layer scheme (Swenson & Lawrence, 2014)
-    sat_top = torch.clamp((sfc.w_liq_soil[0] + sfc.w_ice_soil[0]) / SOIL_POROSITY, 0.01, 1.0)
-    psi_top = PSI_SAT_SOIL * torch.pow(sat_top, -B_CLAPP_SOIL)  # Matric head [m]
-    t_soil0 = sfc.t_soil[0]
-    h_soil_base = torch.exp(torch.clamp(psi_top * C.GRAVITY / (C.R_V * t_soil0), -10.0, 0.0))
-
-    theta_liq_top = torch.clamp(sfc.w_liq_soil[0], min=0.0, max=SOIL_POROSITY)
-    theta_air = SOIL_POROSITY * (abs(PSI_SAT_SOIL) * 1.0e3 / PSI_AIR_MM) ** (1.0 / B_CLAPP_SOIL)
-    theta_init = DSL_THETA_INIT_FRAC * SOIL_POROSITY
-    d_sl = DSL_DMAX_MM * 1.0e-3 * torch.clamp(
-        (theta_init - theta_liq_top) / max(theta_init - theta_air, 1.0e-3), min=0.0, max=13.0
-    )
-    phi_air = max(SOIL_POROSITY - theta_air, 1.0e-3)
-    tau_soil = (phi_air ** 2) * (phi_air / SOIL_POROSITY) ** (3.0 / B_CLAPP_SOIL)
-    d_vap = 2.12e-5 * torch.pow(t_soil0 / C.T_FREEZE, 1.75)
-    r_soil = d_sl / (d_vap * tau_soil)  # [s m^-1]
-
-    # Top-layer soil + snowpack thermal conductance to soil node 0
-    dz_top_half = 0.5 * SOIL_LAYER_DEPTHS[0]
-    k_top = KAPPA_DRY_SOIL * (1.0 + 5.5 * torch.tanh((sfc.w_liq_soil[0] + sfc.w_ice_soil[0]) / 0.25))
-    snow_depth = sfc.swe_land / RHO_SNOWPACK
-    r_snow_therm = a_sn * (0.5 * torch.clamp(snow_depth, max=1.0) / C.K_THERM_SNOW)
-    g_cond_coeff = 1.0 / (dz_top_half / k_top + r_snow_therm)
-
-    # RSL within-canopy wind attenuation parameter alpha_u = c_d / (2 beta^2) (Harman & Finnigan, 2007; Bonan et al., 2018)
-    beta_rsl = torch.clamp(torch.sqrt(0.003 + 0.15 * torch.clamp(lai_exp, min=1.0e-4)), 0.12, 0.30)
-    alpha_u_half = 0.5 * torch.clamp(0.20 / (2.0 * beta_rsl * beta_rsl), 0.30, 1.20)
-    t_air_sfc = theta_1 * exner_s
-    has_snow = sfc.swe_land > 1.0e-3
-    eps_g = EMISSIVITY_LAND
-    lw_refl_c = 1.0 + (1.0 - f_veg_rad) * (1.0 - eps_g)  # Exact 1-bounce canopy-ground LW factor (CLM5 Sec. 4.2)
-    lw_emit_c_coef = 2.0 - f_veg_rad * (1.0 - eps_g)
 
     # Coupled 3-source (sunlit leaf, shaded leaf, ground) + canopy-air + stomatal Newton iteration
     # (Dai et al., 2004, Sec. 2b-c; Bonan et al., 2018, Eqs. 8-13, 21-24; CLM5 Sec. 5.2-5.3)
@@ -1503,6 +1729,8 @@ def step_surface(
     prev_dt_sun = torch.zeros_like(t_sun_cur)
     prev_dt_sh = torch.zeros_like(t_sh_cur)
     prev_dt_gnd = torch.zeros_like(t_gnd_cur)
+    pre_bio_fn = maybe_cuda_compile(_surface_land_newton_pre_bio_core, device=u_1.device)
+    jac_fn = maybe_cuda_compile(_land_newton_jacobian_core, device=u_1.device)
 
     for _eb_it in range(n_eb_iter):
         # 1. Surface-layer RSL aerodynamic transfer g_a evaluated at composite radiative/canopy-air temperature
@@ -1517,48 +1745,19 @@ def step_surface(
             u_1, v_1, theta_v1, theta_vsfc_l, z_ref_rel,
             z0m_terr, z0h_terr, z0h_terr, rsl_depth=rsl_depth,
         )
-        ga_land = tr_land.c_h * tr_land.wind_eff  # [m s^-1]
 
-        # 2. Analytic RSL-consistent sunlit & shaded leaf boundary-layer conductances (Bonan et al., 2018, Eq. 21; CLM5 Eq. 5.122)
-        u_can_top = torch.minimum(torch.clamp(tr_land.u_star / beta_rsl, min=0.10), tr_land.wind_eff)
-        gb_top = 0.01 * torch.sqrt(u_can_top / 0.04)  # Per-unit-LAI top-of-canopy boundary conductance [m s^-1]
-        gb_tot_can = gb_top * (1.0 - torch.exp(-torch.clamp(alpha_u_half * lai_exp, max=30.0))) / alpha_u_half
-        gb_sun = torch.where(
-            has_sun,
-            torch.clamp(
-                gb_top * (1.0 - torch.exp(-torch.clamp((k_db_inst + alpha_u_half) * lai_exp, max=30.0)))
-                / (k_db_inst + alpha_u_half),
-                min=1.0e-4,
-            ),
-            torch.zeros_like(lai_exp),
+        # 2-4. RSL leaf boundary-layer conductances, under-canopy r_d, qsat, & leaf-surface VPD
+        q_af_in = qv_1 if _eb_it == 0 else q_af
+        (
+            ga_land, gb_sun, gb_sh, r_d_uc,
+            qsat_sun, dq_sun, qsat_sh, dq_sh, qsat_gnd, dq_gnd,
+            q_af_vpd, vpd_sun_af, vpd_sh_af,
+        ) = pre_bio_fn(
+            t_sun_cur, t_sh_cur, t_gnd_cur, pres_sfc, q_af_in,
+            tr_land.c_h, tr_land.wind_eff, tr_land.u_star,
+            beta_rsl, alpha_u_half, lai_exp, k_db_inst, h_exp, z0m_terr,
+            has_veg, has_sun, has_sh, f_veg_rad, f_sun_area, f_sh_area,
         )
-        gb_sh = torch.where(
-            has_sh,
-            torch.clamp(gb_tot_can - gb_sun, min=1.0e-4),
-            torch.zeros_like(lai_exp),
-        )
-
-        # 3. Under-canopy stability-corrected aerodynamic resistance r_d (Sakaguchi & Zeng, 2009; CLM5 Eqs. 5.113-5.119)
-        t_fol_avg = torch.where(has_veg, f_sun_area * t_sun_cur + f_sh_area * t_sh_cur, t_gnd_cur)
-        stab_uc = C.GRAVITY * h_exp * (t_fol_avg - t_gnd_cur) / (torch.clamp(t_gnd_cur, min=180.0) * (tr_land.u_star ** 2 + 1.0e-3))
-        c_dense = torch.where(stab_uc > 0.0, 0.004 / (1.0 + 0.5 * torch.clamp(stab_uc, max=10.0)), torch.full_like(stab_uc, 0.004))
-        c_bare = C.VON_KARMAN / (0.13 * torch.pow(torch.clamp(tr_land.u_star * z0m_terr / 1.5e-5, min=1.0), 0.45))
-        c_uv = (1.0 - f_veg_rad) * c_bare + f_veg_rad * c_dense
-        r_d_uc = 1.0 / torch.clamp(c_uv * tr_land.u_star, min=1.0e-3)
-
-        # 4. Saturation humidities & slopes at all 3 nodes
-        qsat_sun, dq_sun = qsat_mixed(t_sun_cur, pres_sfc)
-        qsat_sh, dq_sh = qsat_mixed(t_sh_cur, pres_sfc)
-        qsat_gnd, dq_gnd = qsat_mixed(t_gnd_cur, pres_sfc)
-
-        # Provisional canopy-air humidity q_af for leaf-surface VPD (updated consistently inside the loop)
-        if _eb_it == 0:
-            q_af_vpd = qv_1
-        else:
-            q_af_vpd = torch.clamp(q_af, min=1.0e-7)
-        e_af_pa = q_af_vpd * pres_sfc / (C.EPS_WATER + (1.0 - C.EPS_WATER) * q_af_vpd)
-        vpd_sun_af = torch.clamp(esat_liquid(t_sun_cur) - e_af_pa, min=20.0)
-        vpd_sh_af = torch.clamp(esat_liquid(t_sh_cur) - e_af_pa, min=20.0)
 
         # 5. Iterative leaf-surface (c_s, D_s) P-model photosynthesis & stomatal conductance
         two_leaf = compute_two_leaf_gas_exchange(
@@ -1570,7 +1769,6 @@ def step_surface(
         )
 
         # 6-7. Coupled CLM5 wet-canopy limitation, 3-source conductances, Jacobian & 3x3 solve
-        jac_fn = maybe_cuda_compile(_land_newton_jacobian_core, device=u_1.device)
         (
             t_sun_new, t_sh_new, t_gnd_new, t_gnd_final, dt0, dt1, dt2, dt2_fin, q_melt_avail,
             q_af, wh_0, wh_1, wh_2, ww_0, ww_1, ww_2, gh_0, gh_1, gh_2, rho_cp,
@@ -1630,20 +1828,10 @@ def step_surface(
     # =========================================================================
     # PART B: OCEAN + FRACTIONAL-LEAD SEA ICE (SCALE-RM Sec. 8.6 & MIROC6 Sec. 3.8)
     # =========================================================================
-    z0m_ocn, z0h_ocn, z0q_ocn = ocean_roughness_miller(sfc.u_star_ocean)
-    z0m_ice = torch.full_like(z0m_ocn, 0.001)
-    z0m_sea = (1.0 - f_ice) * z0m_ocn + f_ice * z0m_ice
-    z0h_sea = (1.0 - f_ice) * z0h_ocn + f_ice * (0.2 * z0m_ice)
-    z0q_sea = (1.0 - f_ice) * z0q_ocn + f_ice * (0.2 * z0m_ice)
-
-    # Open-water saturation specific humidity (0.98 salinity reduction; MIROC6) & sea-ice saturation
-    esat_ow = esat_liquid(sfc.t_ocean_ml)
-    esat_si = esat_ice(sfc.t_seaice)
-    qsat_ow = 0.98 * C.EPS_WATER * esat_ow / torch.clamp(pres_sfc - esat_ow, min=0.1 * pres_sfc)
-    qsat_si = C.EPS_WATER * esat_si / torch.clamp(pres_sfc - esat_si, min=0.1 * pres_sfc)
-    t_skin_sea = (1.0 - f_ice) * sfc.t_ocean_ml + f_ice * sfc.t_seaice
-    q_skin_sea = (1.0 - f_ice) * qsat_ow + f_ice * qsat_si
-    theta_vsfc_o = (t_skin_sea / exner_s) * (1.0 + C.ZVIR * q_skin_sea)
+    ocn_pre_fn = maybe_cuda_compile(_surface_ocean_pre_transfer_core, device=u_1.device)
+    z0m_sea, z0h_sea, z0q_sea, qsat_ow, qsat_si, theta_vsfc_o = ocn_pre_fn(
+        sfc.u_star_ocean, f_ice, sfc.t_ocean_ml, sfc.t_seaice, pres_sfc, exner_s,
+    )
 
     tr_ocn = compute_surface_transfer(
         u_1, v_1, theta_v1, theta_vsfc_o, z_ref_rel,
@@ -1664,53 +1852,29 @@ def step_surface(
     # =========================================================================
     # PART C: COMMIT PROGNOSTIC UPDATES BY SURFACE TYPE & MERGE DIAGNOSTICS
     # =========================================================================
-    sfc.t_soil = torch.where(is_terrestrial.unsqueeze(0), t_soil_new, sfc.t_soil)
-    sfc.w_liq_soil = torch.where(is_terrestrial.unsqueeze(0), w_liq_new, sfc.w_liq_soil)
-    sfc.w_ice_soil = torch.where(is_terrestrial.unsqueeze(0), w_ice_new, sfc.w_ice_soil)
-    sfc.w_root = torch.where(is_land, w_root_next, sfc.w_root)
-    sfc.w_canopy = torch.where(is_land, wc_next, torch.zeros_like(wc_next))
-    sfc.t_canopy = torch.where(is_terrestrial, t_skin_final, sfc.t_canopy)
-    sfc.t_leaf_sun = torch.where(is_terrestrial, t_sun_final, sfc.t_canopy)
-    sfc.t_leaf_sh = torch.where(is_terrestrial, t_sh_final, sfc.t_canopy)
-    sfc.t_gnd_skin = torch.where(is_terrestrial, t_gnd_final, sfc.t_canopy)
-    sfc.swe_land = torch.where(is_terrestrial, swe_next, torch.zeros_like(swe_next))
-    sfc.swe_max_season = torch.where(is_terrestrial, swe_max_next, torch.zeros_like(swe_max_next))
-    sfc.snow_age = torch.where(is_terrestrial, snow_age_next, torch.zeros_like(snow_age_next))
-
-    sfc.t_ocean_ml = torch.where(is_ocean, t_ml_next, sfc.t_ocean_ml)
-    sfc.t_ocean_ml_comp = torch.where(is_ocean, comp_final, comp0)
-    sfc.u_star_ocean = torch.where(is_ocean, tr_ocn.u_star, sfc.u_star_ocean)
-    sfc.m_seaice = torch.where(is_ocean, m_si_next, torch.zeros_like(m_si_next))
-    sfc.t_seaice = torch.where(is_ocean, t_si_new, sfc.t_seaice)
-    sfc.swe_seaice = torch.where(is_ocean, swe_si_next, torch.zeros_like(swe_si_next))
-
-    shf = torch.where(is_ocean, shf_o, shf_l)
-    lhf = torch.where(is_ocean, lhf_o, lhf_l)
-    evap = torch.where(is_ocean, evap_o, evap_l)
-
-    cm_all = torch.where(is_ocean, tr_ocn.c_m, tr_land.c_m)
-    wind_all = torch.where(is_ocean, tr_ocn.wind_eff, tr_land.wind_eff)
-    ustar_all = torch.where(is_ocean, tr_ocn.u_star, tr_land.u_star)
-    tau_x = -rho_sfc * cm_all * wind_all * u_1
-    tau_y = -rho_sfc * cm_all * wind_all * v_1
-
-    # Kinematic surface buoyancy flux B_sfc = (g / theta_v1) * [H / (rho c_p Exner) + 0.608 * theta_1 * E / rho]
-    w_th_sfc = shf / (rho_sfc * cp_air * exner_s)
-    w_qv_sfc = evap / rho_sfc
-    buoy_flux = (C.GRAVITY / theta_v1) * (w_th_sfc * (1.0 + C.ZVIR * qv_1) + C.ZVIR * theta_1 * w_qv_sfc)
-
-    emiss = torch.where(is_ocean, torch.full_like(shf, EMISSIVITY_OCEAN), torch.full_like(shf, EMISSIVITY_LAND))
-    lw_emit_l = EMISSIVITY_LAND * C.STEFAN_BOLTZMANN * (t_skin_final ** 4)
-    t_rad = torch.pow(
-        torch.where(is_ocean, lw_emit_o, lw_emit_l) / (emiss * C.STEFAN_BOLTZMANN),
-        0.25,
+    merge_fn = maybe_cuda_compile(_surface_part_c_merge_core, device=u_1.device)
+    (
+        sfc.t_soil, sfc.w_liq_soil, sfc.w_ice_soil, sfc.w_root, sfc.w_canopy,
+        sfc.t_canopy, sfc.t_leaf_sun, sfc.t_leaf_sh, sfc.t_gnd_skin,
+        sfc.swe_land, sfc.swe_max_season, sfc.snow_age,
+        sfc.t_ocean_ml, sfc.t_ocean_ml_comp, sfc.u_star_ocean,
+        sfc.m_seaice, sfc.t_seaice, sfc.swe_seaice,
+        shf, lhf, evap, tau_x, tau_y, ustar_all, buoy_flux, emiss, t_rad,
+        d_out, z0m_out, runoff_tot, runoff_glac, gpp_out, f_snow_land,
+    ) = merge_fn(
+        is_terrestrial, is_land, is_ocean,
+        t_soil_new, w_liq_new, w_ice_new, w_root_next, wc_next,
+        t_skin_final, t_sun_final, t_sh_final, t_gnd_final,
+        swe_next, swe_max_next, snow_age_next,
+        t_ml_next, comp_final, comp0, m_si_next, t_si_new, swe_si_next,
+        sfc.t_soil, sfc.w_liq_soil, sfc.w_ice_soil, sfc.w_root, sfc.t_canopy,
+        sfc.t_ocean_ml, sfc.u_star_ocean, sfc.t_seaice,
+        shf_o, shf_l, lhf_o, lhf_l, evap_o, evap_l, lw_emit_o,
+        tr_ocn.c_m, tr_land.c_m, tr_ocn.wind_eff, tr_land.wind_eff,
+        tr_ocn.u_star, tr_land.u_star,
+        rho_sfc, cp_air, exner_s, theta_1, theta_v1, qv_1, u_1, v_1,
+        d_land, z0m_sea, z0m_terr, liq_runoff, glacier_runoff, two_leaf.gpp, a_sn,
     )
-
-    d_out = torch.where(is_ocean, torch.zeros_like(d_land), d_land)
-    z0m_out = torch.where(is_ocean, z0m_sea, z0m_terr)
-    runoff_tot = torch.where(is_terrestrial, liq_runoff + glacier_runoff, torch.zeros_like(liq_runoff))
-    runoff_glac = torch.where(is_terrestrial, glacier_runoff, torch.zeros_like(glacier_runoff))
-    gpp_out = torch.where(is_land, two_leaf.gpp, torch.zeros_like(two_leaf.gpp))
 
     return SurfaceFluxDiagnostics(
         shf=shf,
@@ -1732,6 +1896,6 @@ def step_surface(
         runoff_ice=runoff_glac,
         gpp=gpp_out,
         f_seaice=f_ice,
-        f_snow_land=torch.where(is_terrestrial, a_sn, torch.zeros_like(a_sn)),
+        f_snow_land=f_snow_land,
         smb_ice_flux=smb_ice_land,
     )

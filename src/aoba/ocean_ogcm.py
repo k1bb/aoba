@@ -307,6 +307,65 @@ def init_ogcm_state(
     )
 
 
+def _ogcm_seaice_drift_core(
+    m_seaice: torch.Tensor,
+    swe_seaice: torch.Tensor,
+    tau_x_sfc: torch.Tensor,
+    tau_y_sfc: torch.Tensor,
+    u_ocn_e: torch.Tensor,
+    is_ocean: torch.Tensor,
+    is_ocn_f: torch.Tensor,
+    mask_e: torch.Tensor,
+    c0: torch.Tensor,
+    c1: torch.Tensor,
+    eoc: torch.Tensor,
+    div_w: torch.Tensor,
+    f_cell: torch.Tensor,
+    east_normal_edge: torch.Tensor,
+    north_normal_edge: torch.Tensor,
+    inv_dc_edge: torch.Tensor,
+    u_cap: float,
+    dt: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure-tensor conservative Voronoi sea-ice free-drift + plastic ridging step (CUDA-compilable)."""
+    tx_i = -tau_x_sfc
+    ty_i = -tau_y_sfc
+    tau_mag = torch.sqrt(tx_i * tx_i + ty_i * ty_i + 1.0e-12)
+    u_scale = torch.sqrt(tau_mag / 5.5)
+    ux_w = (tx_i / tau_mag) * u_scale
+    uy_w = (ty_i / tau_mag) * u_scale
+
+    theta_rad = math.radians(SEAICE_TURN_DEG)
+    sin_t = math.sin(theta_rad) * torch.sign(f_cell)
+    cos_t = math.cos(theta_rad)
+    ux_drift = ux_w * cos_t + uy_w * sin_t
+    uy_drift = -ux_w * sin_t + uy_w * cos_t
+
+    ux_e = 0.5 * (ux_drift[c0] + ux_drift[c1])
+    uy_e = 0.5 * (uy_drift[c0] + uy_drift[c1])
+    u_wind_n = ux_e * east_normal_edge + uy_e * north_normal_edge
+    u_ice_raw = (u_ocn_e + u_wind_n) * mask_e
+
+    h_ice_c = m_seaice / C.RHO_SEAICE
+    h_dst = torch.where(u_ice_raw >= 0.0, h_ice_c[c1], h_ice_c[c0])
+    ridge_fac = 1.0 / (1.0 + (h_dst / SEAICE_H_RIDGE_M) ** 2)
+    u_ice = torch.clamp(u_ice_raw * ridge_fac, -u_cap, u_cap) * mask_e
+
+    m_i = torch.clamp(m_seaice, min=0.0)
+    s_i = torch.clamp(swe_seaice, min=0.0)
+    u_pos = torch.clamp(u_ice, min=0.0)
+    u_neg = torch.clamp(u_ice, max=0.0)
+    f_m_tot = u_pos * m_i[c0] + u_neg * m_i[c1] - SEAICE_DIFF_H * ((m_i[c1] - m_i[c0]) * inv_dc_edge) * mask_e
+    f_s_tot = u_pos * s_i[c0] + u_neg * s_i[c1] - SEAICE_DIFF_H * ((s_i[c1] - s_i[c0]) * inv_dc_edge) * mask_e
+
+    dm = -dt * (f_m_tot[eoc] * div_w).sum(dim=-1) * is_ocn_f
+    ds = -dt * (f_s_tot[eoc] * div_w).sum(dim=-1) * is_ocn_f
+
+    m_new = torch.where(is_ocean, torch.clamp(m_i + dm, min=0.0), m_seaice)
+    s_new = torch.where(is_ocean, torch.clamp(s_i + ds, min=0.0), swe_seaice)
+    return m_new, s_new
+
+
 def step_seaice_drift_voronoi(
     sfc: SurfaceState,
     mesh: SCVTMesh,
@@ -314,6 +373,7 @@ def step_seaice_drift_voronoi(
     tau_y_sfc: torch.Tensor,
     u_ocn_e: torch.Tensor,
     dt: float,
+    cache: dict | None = None,
 ) -> None:
     """Conservatively advect `sfc.m_seaice` & `sfc.swe_seaice` across wet ocean Voronoi edges.
 
@@ -323,57 +383,31 @@ def step_seaice_drift_voronoi(
     is_ocean = sfc.surf_type == SURF_OCEAN
     c0 = mesh.cells_on_edge[:, 0]
     c1 = mesh.cells_on_edge[:, 1]
-    ocn_edge = is_ocean[c0] & is_ocean[c1]
-    mask_e = ocn_edge.to(sfc.m_seaice.dtype)
+    dtype = sfc.m_seaice.dtype
+    if cache is not None:
+        is_ocn_f = cache["is_ocn_f"]
+        mask_e = cache["ocn_e0f"]
+        div_w = cache["div_w"]
+        inv_dc_edge = cache["inv_dc_edge"]
+    else:
+        is_ocn_f = is_ocean.to(dtype)
+        mask_e = (is_ocean[c0] & is_ocean[c1]).to(dtype)
+        div_w = (mesh.edge_sign_on_cell.to(dtype) * mesh.dv_edge[mesh.edges_on_cell].to(dtype)) / mesh.area_cell.unsqueeze(-1)
+        inv_dc_edge = 1.0 / mesh.dc_edge
 
-    # Wind-driven stress on ice [N m^-2] (atmosphere -> ice = -tau_sfc)
-    tx_i = -tau_x_sfc
-    ty_i = -tau_y_sfc
-    # Free-drift velocity from wind stress (drag balance: u_wind ~ sqrt(|tau|/(rho_w C_dw)))
-    tau_mag = torch.sqrt(tx_i * tx_i + ty_i * ty_i + 1.0e-12)
-    u_scale = torch.sqrt(tau_mag / 5.5)
-    ux_w = (tx_i / tau_mag) * u_scale
-    uy_w = (ty_i / tau_mag) * u_scale
-
-    theta_rad = math.radians(SEAICE_TURN_DEG)
-    sin_t = math.sin(theta_rad) * torch.sign(mesh.f_cell)
-    cos_t = math.cos(theta_rad)
-    # Turn right of wind in NH (f > 0): (ux*cos + uy*sin, -ux*sin + uy*cos)
-    ux_drift = ux_w * cos_t + uy_w * sin_t
-    uy_drift = -ux_w * sin_t + uy_w * cos_t
-
-    ux_e = 0.5 * (ux_drift[c0] + ux_drift[c1])
-    uy_e = 0.5 * (uy_drift[c0] + uy_drift[c1])
-    u_wind_n = ux_e * mesh.east_normal_edge + uy_e * mesh.north_normal_edge
-    u_ice_raw = (u_ocn_e + u_wind_n) * mask_e
-
-    # Plastic ridging resistance: smoothly damp convergence into thick ice (> SEAICE_H_RIDGE_M)
-    h_ice_c = sfc.m_seaice / C.RHO_SEAICE
-    h_dst = torch.where(u_ice_raw >= 0.0, h_ice_c[c1], h_ice_c[c0])
-    ridge_fac = 1.0 / (1.0 + (h_dst / SEAICE_H_RIDGE_M) ** 2)
-    # CFL velocity cap
     dc_min = getattr(mesh, "_dc_edge_min_m", None)
     if dc_min is None:
         dc_min = float(mesh.dc_edge.min().item())
         setattr(mesh, "_dc_edge_min_m", dc_min)
     u_cap = min(SEAICE_U_MAX, 0.25 * dc_min / max(dt, 1.0))
-    u_ice = torch.clamp(u_ice_raw * ridge_fac, -u_cap, u_cap) * mask_e
 
-    # Conservative upwind flux + weak lateral smoothing for both m_seaice and swe_seaice
-    m_i = torch.clamp(sfc.m_seaice, min=0.0)
-    s_i = torch.clamp(sfc.swe_seaice, min=0.0)
-    f_m_adv = torch.clamp(u_ice, min=0.0) * m_i[c0] + torch.clamp(u_ice, max=0.0) * m_i[c1]
-    f_s_adv = torch.clamp(u_ice, min=0.0) * s_i[c0] + torch.clamp(u_ice, max=0.0) * s_i[c1]
-
-    f_m_dif = -SEAICE_DIFF_H * ((m_i[c1] - m_i[c0]) / mesh.dc_edge) * mask_e
-    f_s_dif = -SEAICE_DIFF_H * ((s_i[c1] - s_i[c0]) / mesh.dc_edge) * mask_e
-
-    is_ocn_f = is_ocean.to(m_i.dtype)
-    dm = -dt * compute_scvt_divergence(mesh, f_m_adv + f_m_dif) * is_ocn_f
-    ds = -dt * compute_scvt_divergence(mesh, f_s_adv + f_s_dif) * is_ocn_f
-
-    sfc.m_seaice = torch.where(is_ocean, torch.clamp(m_i + dm, min=0.0), sfc.m_seaice)
-    sfc.swe_seaice = torch.where(is_ocean, torch.clamp(s_i + ds, min=0.0), sfc.swe_seaice)
+    drift_fn = maybe_cuda_compile(_ogcm_seaice_drift_core, device=sfc.m_seaice.device)
+    sfc.m_seaice, sfc.swe_seaice = drift_fn(
+        sfc.m_seaice, sfc.swe_seaice, tau_x_sfc, tau_y_sfc, u_ocn_e,
+        is_ocean, is_ocn_f, mask_e, c0, c1, mesh.edges_on_cell, div_w,
+        mesh.f_cell, mesh.east_normal_edge, mesh.north_normal_edge, inv_dc_edge,
+        u_cap, dt,
+    )
 
 
 def _get_ogcm_static_cache(ogcm: OceanOGCMState, mesh: SCVTMesh, is_ocean: torch.Tensor) -> dict:
@@ -562,12 +596,152 @@ def _ogcm_kpp_mixing_core(
     return kv_total, av_total, h_bl, f_nl_t, f_nl_s
 
 
+def _ogcm_pre_kpp_core(
+    ogcm_temp: torch.Tensor,
+    ogcm_sal: torch.Tensor,
+    ogcm_t_comp: torch.Tensor,
+    ogcm_s_comp: torch.Tensor,
+    sfc_t_ocean_ml: torch.Tensor,
+    sfc_m_seaice: torch.Tensor,
+    ogcm_m_seaice_prev: torch.Tensor,
+    r_coast: torch.Tensor,
+    q_calve: torch.Tensor,
+    evap_cell: torch.Tensor,
+    precip_cell: torch.Tensor,
+    sw_net_ocn: torch.Tensor,
+    tau_x_sfc: torch.Tensor,
+    tau_y_sfc: torch.Tensor,
+    f_seaice: torch.Tensor,
+    is_ocean: torch.Tensor,
+    is_ocn_f: torch.Tensor,
+    wet_cf: torch.Tensor,
+    wet_ef: torch.Tensor,
+    h_c: torch.Tensor,
+    h_c_safe: torch.Tensor,
+    z_c_2d: torch.Tensor,
+    frac_out_0: torch.Tensor,
+    frac_sub: torch.Tensor,
+    c0: torch.Tensor,
+    c1: torch.Tensor,
+    east_normal_edge: torch.Tensor,
+    north_normal_edge: torch.Tensor,
+    dt: float,
+    apply_sw: bool,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor,
+]:
+    """Pure-tensor OGCM surface buoyancy, calving, salinity, Jerlov SW, EOS & stress prep (CUDA-compilable)."""
+    t0_prev = ogcm_temp[0]
+    s0_prev = ogcm_sal[0]
+    t0_in = torch.where(is_ocean, sfc_t_ocean_ml, t0_prev)
+
+    dt_calve = (-(dt * q_calve) / (C.CP_SEAWATER * C.RHO_SEAWATER * h_c_safe[0])) * is_ocn_f
+    t0_calv, tc0_calv = _kahan_add(t0_in, dt_calve, ogcm_t_comp[0])
+    t0_cur = torch.where(is_ocean, t0_calv, t0_in)
+    tc0_cur = torch.where(is_ocean, tc0_calv, ogcm_t_comp[0])
+
+    dm_ice_thermo = sfc_m_seaice - ogcm_m_seaice_prev
+    fw_evap_minus_p = evap_cell - precip_cell - r_coast
+    ds_sfc = (
+        (S_REF_PSU * (fw_evap_minus_p * dt) + (S_REF_PSU - S_SEAICE_PSU) * dm_ice_thermo)
+        / (C.RHO_SEAWATER * h_c_safe[0])
+    ) * is_ocn_f
+    s0_next, sc0_next = _kahan_add(s0_prev, ds_sfc, ogcm_s_comp[0])
+    s0_cur = torch.where(is_ocean, torch.clamp(s0_next, 5.0, 45.0), s0_prev)
+    sc0_cur = torch.where(is_ocean, sc0_next, ogcm_s_comp[0])
+
+    T = torch.cat([t0_cur.unsqueeze(0), ogcm_temp[1:]], dim=0)
+    S = torch.cat([s0_cur.unsqueeze(0), ogcm_sal[1:]], dim=0)
+    t_comp = torch.cat([tc0_cur.unsqueeze(0), ogcm_t_comp[1:]], dim=0)
+    s_comp = torch.cat([sc0_cur.unsqueeze(0), ogcm_s_comp[1:]], dim=0)
+
+    if apply_sw:
+        sw_pos = torch.clamp(sw_net_ocn, min=0.0) * is_ocn_f
+        q_to_dt = (dt / (C.CP_SEAWATER * C.RHO_SEAWATER)) * sw_pos
+        dt_sw_0 = -(q_to_dt * frac_out_0) / h_c_safe[0]
+        dt_sw_sub = (q_to_dt.unsqueeze(0) * frac_sub[1:]) / h_c_safe[1:]
+        dt_sw = torch.cat([dt_sw_0.unsqueeze(0), dt_sw_sub], dim=0) * wet_cf
+        T, t_comp = _kahan_add(T, dt_sw, t_comp)
+
+    inv_dt = 1.0 / max(dt, 1.0)
+    wt_sfc = (T[0] - t0_prev) * h_c_safe[0] * inv_dt * is_ocn_f
+    ws_sfc = (S[0] - s0_prev) * h_c_safe[0] * inv_dt * is_ocn_f
+    rho0_prev = compute_seawater_density_anomaly(t0_prev, s0_prev, z_c_2d[0, 0])
+    rho0_post = compute_seawater_density_anomaly(T[0], S[0], z_c_2d[0, 0])
+    b0_sfc = -(C.GRAVITY / C.RHO_SEAWATER) * ((rho0_post - rho0_prev) * h_c_safe[0] * inv_dt) * is_ocn_f
+
+    rho_anom = compute_seawater_density_anomaly(T, S, z_c_2d) * wet_cf
+    g_rho_h = C.GRAVITY * rho_anom * h_c
+    p_cum = torch.cumsum(g_rho_h, dim=0)
+    p_baroc = p_cum - 0.5 * g_rho_h
+
+    ice_atten = 1.0 - 0.5 * torch.clamp(f_seaice, 0.0, 1.0)
+    tx_ocn = -ice_atten * tau_x_sfc
+    ty_ocn = -ice_atten * tau_y_sfc
+    u_star_o = torch.sqrt(torch.sqrt(tx_ocn * tx_ocn + ty_ocn * ty_ocn + 1.0e-12) / C.RHO_SEAWATER)
+    tx_e = 0.5 * (tx_ocn[c0] + tx_ocn[c1])
+    ty_e = 0.5 * (ty_ocn[c0] + ty_ocn[c1])
+    tau_n_e = (tx_e * east_normal_edge + ty_e * north_normal_edge) * wet_ef[0]
+    return T, S, t_comp, s_comp, wt_sfc, ws_sfc, b0_sfc, rho_anom, p_baroc, u_star_o, tau_n_e
+
+
+def _ogcm_baroclinic_prep_core(
+    u: torch.Tensor,
+    zeta_v: torch.Tensor,
+    lap_u: torch.Tensor,
+    p_baroc: torch.Tensor,
+    av_diag: torch.Tensor,
+    tau_n_e: torch.Tensor,
+    f_vert: torch.Tensor,
+    v0_e: torch.Tensor,
+    v1_e: torch.Tensor,
+    ep_idx: torch.Tensor,
+    w_trisk: torch.Tensor,
+    c0: torch.Tensor,
+    c1: torch.Tensor,
+    inv_dc_edge: torch.Tensor,
+    is_bot_e: torch.Tensor,
+    h_e_safe: torch.Tensor,
+    dz_int_e: torch.Tensor,
+    wet_ef: torch.Tensor,
+    wet_int_ef: torch.Tensor,
+    a_h: float,
+    dt: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure-tensor TRiSK Coriolis + baroclinic PGF + bottom drag + momentum tridiagonal assembly."""
+    eta_v = zeta_v + f_vert.unsqueeze(0)
+    eta_e = 0.5 * (eta_v[:, v0_e] + eta_v[:, v1_e])
+    eta_pair = 0.5 * (eta_e.unsqueeze(-1) + eta_e[:, ep_idx])
+    cor_3d = (w_trisk.unsqueeze(0) * eta_pair * u[:, ep_idx]).sum(dim=-1)
+
+    pgf_bc = -(1.0 / C.RHO_SEAWATER) * ((p_baroc[:, c1] - p_baroc[:, c0]) * inv_dc_edge.unsqueeze(0))
+    r_bot = torch.where(is_bot_e, C_DRAG_BOT * torch.abs(u) / h_e_safe, torch.zeros_like(u))
+
+    du_bc = (cor_3d + pgf_bc + a_h * lap_u - (R_RAYLEIGH_OCN + r_bot) * u) * wet_ef
+    du_bc_0 = du_bc[0] + (tau_n_e / (C.RHO_SEAWATER * h_e_safe[0])) * wet_ef[0]
+    du_bc_full = torch.cat([du_bc_0.unsqueeze(0), du_bc[1:]], dim=0)
+    u_star = torch.clamp((u + dt * du_bc_full) * wet_ef, -3.0, 3.0)
+
+    av_e = 0.5 * (av_diag[:, c0] + av_diag[:, c1])
+    c_mom = (dt * av_e / dz_int_e) * wet_int_ef
+    z_row = torch.zeros_like(u[0:1])
+    a_m = torch.cat([z_row, -c_mom / h_e_safe[1:]], dim=0)
+    d_m = torch.cat([-c_mom / h_e_safe[:-1], z_row], dim=0)
+    b_m = 1.0 - a_m - d_m
+    return u_star, a_m, b_m, d_m
+
+
 def _ogcm_barotropic_rk3_core(
-    u_bt: torch.Tensor,
-    eta_bt: torch.Tensor,
-    f_baro: torch.Tensor,
+    u_star_raw: torch.Tensor,
+    u_baro_prev: torch.Tensor,
+    eta_old: torch.Tensor,
     g_inv_dc: torch.Tensor,
+    h_e: torch.Tensor,
     h_col_e: torch.Tensor,
+    h_col_e_safe: torch.Tensor,
+    wet_ef: torch.Tensor,
     ocn_e0f: torch.Tensor,
     is_ocn_f: torch.Tensor,
     c0: torch.Tensor,
@@ -576,8 +750,14 @@ def _ogcm_barotropic_rk3_core(
     div_w: torch.Tensor,
     n_bt: int,
     dt_bt: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pure-tensor 2D barotropic Wicker-Skamarock RK3 loop (fuses all substeps via Inductor on CUDA)."""
+    dt: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure-tensor barotropic mode projection + 2D Wicker-Skamarock RK3 loop (CUDA-compilable)."""
+    u_star = u_star_raw * wet_ef
+    u_star_baro = (u_star * h_e).sum(dim=0) / h_col_e_safe * ocn_e0f
+    f_baro = (u_star_baro - u_baro_prev) / max(dt, 1.0)
+    u_bt = u_baro_prev * ocn_e0f
+    eta_bt = eta_old
     u_bt_acc = torch.zeros_like(u_bt)
     dt1 = dt_bt / 3.0
     dt2 = 0.5 * dt_bt
@@ -593,7 +773,170 @@ def _ogcm_barotropic_rk3_core(
             eta_bt = torch.clamp((eta0_bt + rk_dt * deta) * is_ocn_f, -5.0, 5.0)
             u_bt = u_stage
         u_bt_acc = u_bt_acc + u_bt
-    return u_bt, u_bt_acc / float(n_bt)
+    return u_star, u_star_baro, u_bt, u_bt_acc / float(n_bt)
+
+
+def _ogcm_gm_and_w_core(
+    u_star: torch.Tensor,
+    u_bt_mean: torch.Tensor,
+    u_star_baro: torch.Tensor,
+    rho_anom: torch.Tensor,
+    h_bl: torch.Tensor,
+    eta_old: torch.Tensor,
+    h_e: torch.Tensor,
+    h_e_safe: torch.Tensor,
+    h_c_safe: torch.Tensor,
+    dz_c_int: torch.Tensor,
+    z_int_m: torch.Tensor,
+    inv_dc_edge: torch.Tensor,
+    wet_cf: torch.Tensor,
+    wet_ef: torch.Tensor,
+    wet_int_cf: torch.Tensor,
+    wet_int_ef: torch.Tensor,
+    is_ocn_f: torch.Tensor,
+    c0: torch.Tensor,
+    c1: torch.Tensor,
+    eoc: torch.Tensor,
+    div_w: torch.Tensor,
+    w_vor_edge: torch.Tensor,
+    active_eoc: torch.Tensor,
+    inv_area_c: torch.Tensor,
+    dt: float,
+    enable_full_redi: bool,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+]:
+    """Pure-tensor GM90 bolus + continuity w + free-surface eta + Redi diagonal Kv (CUDA-compilable)."""
+    u_new = torch.clamp((u_star + (u_bt_mean - u_star_baro).unsqueeze(0)) * wet_ef, -3.0, 3.0)
+
+    drho_dx = ((rho_anom[:, c1] - rho_anom[:, c0]) * inv_dc_edge.unsqueeze(0)) * wet_ef
+    drho_dz_c = ((rho_anom[1:] - rho_anom[:-1]) / dz_c_int) * wet_int_cf
+    drho_dz_e = 0.5 * (drho_dz_c[:, c0] + drho_dz_c[:, c1])
+    drho_dx_int = 0.5 * (drho_dx[:-1] + drho_dx[1:])
+    slope_raw = torch.clamp(-drho_dx_int / torch.clamp(drho_dz_e, min=1.0e-5), -GM_SLOPE_MAX, GM_SLOPE_MAX) * wet_int_ef
+    h_bl_e = torch.clamp(0.5 * (h_bl[c0] + h_bl[c1]), min=1.0).unsqueeze(0)
+    taper_bl = torch.clamp(z_int_m / h_bl_e, 0.0, 1.0)
+    sx_int = slope_raw * taper_bl
+
+    psi_int = KAPPA_GM * sx_int
+    z_e = torch.zeros_like(u_new[0:1])
+    dpsi = torch.cat([psi_int, z_e], dim=0) - torch.cat([z_e, psi_int], dim=0)
+    u_gm = torch.clamp((-dpsi / h_e_safe) * wet_ef, -0.3, 0.3)
+
+    h_u_edge = h_e * ((u_new + u_gm) * wet_ef)
+    div_hu = (h_u_edge[:, eoc] * div_w.unsqueeze(0)).sum(dim=-1) * wet_cf
+    w_up = -torch.flip(torch.cumsum(torch.flip(div_hu, dims=[0]), dim=0), dims=[0]) * wet_cf
+    z_c = torch.zeros_like(div_hu[0:1])
+    w_vel = torch.cat([z_c, w_up[1:], z_c], dim=0)
+    eta_new = torch.clamp((eta_old + dt * w_up[0]) * is_ocn_f, -5.0, 5.0)
+
+    h0_old = torch.clamp(h_c_safe[0] + eta_old, min=10.0)
+    h0_new = torch.clamp(h_c_safe[0] + eta_new, min=10.0)
+    dh0_eff = h0_new - h0_old
+
+    if enable_full_redi:
+        s2_edge_w = (sx_int * sx_int) * w_vor_edge.unsqueeze(0)
+        s2_cell = (s2_edge_w[:, eoc] * active_eoc.unsqueeze(0)).sum(dim=-1) * inv_area_c.unsqueeze(0)
+        kv_redi = (KAPPA_REDI_HORIZ * s2_cell) * wet_int_cf
+    else:
+        kv_redi = torch.zeros_like(wet_int_cf)
+
+    return u_new, sx_int, h_u_edge, w_vel, eta_new, h0_new, dh0_eff, kv_redi
+
+
+def _ogcm_vdiff_prep_core(
+    T: torch.Tensor,
+    S: torch.Tensor,
+    kv_diag: torch.Tensor,
+    kv_redi: torch.Tensor,
+    z_c_2d: torch.Tensor,
+    dz_c_int: torch.Tensor,
+    h_c_safe: torch.Tensor,
+    h0_new: torch.Tensor,
+    wet_cf: torch.Tensor,
+    wet_int_c: torch.Tensor,
+    wet_int_cf: torch.Tensor,
+    dt: float,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+]:
+    """Pure-tensor post-advection stability check + conservative flux-increment tridiagonal assembly."""
+    rho_post = compute_seawater_density_anomaly(T, S, z_c_2d) * wet_cf
+    drho_dz_post = torch.where(
+        wet_int_c,
+        (rho_post[1:] - rho_post[:-1]) / dz_c_int,
+        torch.ones_like(dz_c_int),
+    )
+    kv = kv_diag + kv_redi
+    kv = torch.where(drho_dz_post < 0.0, torch.clamp(kv, min=KAPPA_V_CONV), kv) * wet_int_cf
+
+    c_dif = (dt * kv / dz_c_int) * wet_int_cf
+    h_eff = torch.cat([h0_new.unsqueeze(0), h_c_safe[1:]], dim=0)
+    z_row = torch.zeros_like(T[0:1])
+    a_t = torch.cat([z_row, -c_dif / h_eff[1:]], dim=0)
+    d_t = torch.cat([-c_dif / h_eff[:-1], z_row], dim=0)
+    b_t = 1.0 - a_t - d_t
+
+    t_diff = T[1:] - T[:-1]
+    f_exp_t = c_dif * t_diff
+    rhs_t = (torch.cat([f_exp_t, z_row], dim=0) - torch.cat([z_row, f_exp_t], dim=0)) / h_eff
+
+    s_diff = S[1:] - S[:-1]
+    f_exp_s = c_dif * s_diff
+    rhs_s = (torch.cat([f_exp_s, z_row], dim=0) - torch.cat([z_row, f_exp_s], dim=0)) / h_eff
+
+    return kv, c_dif, h_eff, a_t, b_t, d_t, t_diff, s_diff, rhs_t, rhs_s
+
+
+def _ogcm_vdiff_post_freeze_core(
+    T: torch.Tensor,
+    t_comp: torch.Tensor,
+    S: torch.Tensor,
+    s_comp: torch.Tensor,
+    t_diff: torch.Tensor,
+    s_diff: torch.Tensor,
+    dt_imp: torch.Tensor,
+    ds_imp: torch.Tensor,
+    c_dif: torch.Tensor,
+    h_eff: torch.Tensor,
+    h_c_safe: torch.Tensor,
+    wet_c: torch.Tensor,
+    wet_cf: torch.Tensor,
+    is_ocean: torch.Tensor,
+    is_ocn_f: torch.Tensor,
+    sfc_m_seaice: torch.Tensor,
+    sfc_t_ocean_ml: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure-tensor telescoping implicit flux update + Kahan summation + conservative Layer-0 freezing."""
+    z_row = torch.zeros_like(T[0:1])
+    f_imp_t = c_dif * (t_diff + (dt_imp[1:] - dt_imp[:-1]))
+    dt_cons = ((torch.cat([f_imp_t, z_row], dim=0) - torch.cat([z_row, f_imp_t], dim=0)) / h_eff) * wet_cf
+    T, t_comp = _kahan_add(T, dt_cons, t_comp)
+
+    f_imp_s = c_dif * (s_diff + (ds_imp[1:] - ds_imp[:-1]))
+    ds_cons = ((torch.cat([f_imp_s, z_row], dim=0) - torch.cat([z_row, f_imp_s], dim=0)) / h_eff) * wet_cf
+    S, s_comp = _kahan_add(S, ds_cons, s_comp)
+    S = torch.where(wet_c, torch.clamp(S, 5.0, 45.0), S)
+
+    freeze_exc = torch.where(is_ocean, torch.clamp(C.T_FREEZE_OCEAN - T[0], min=0.0), torch.zeros_like(T[0]))
+    c0_cap = C.CP_SEAWATER * C.RHO_SEAWATER * h_c_safe[0]
+    dm_freeze = (c0_cap * freeze_exc) / C.L_F0
+    t0_frz = torch.where(is_ocean, T[0] + freeze_exc, T[0])
+    ds_brine = ((S_REF_PSU - S_SEAICE_PSU) * dm_freeze) / (C.RHO_SEAWATER * h_c_safe[0])
+    s0_br, sc0_br = _kahan_add(S[0], ds_brine * is_ocn_f, s_comp[0])
+    s0_frz = torch.where(is_ocean, torch.clamp(s0_br, 5.0, 45.0), S[0])
+    sc0_frz = torch.where(is_ocean, sc0_br, s_comp[0])
+
+    T_out = torch.cat([t0_frz.unsqueeze(0), T[1:]], dim=0)
+    T_out = torch.where(wet_c, torch.clamp(T_out, min=C.T_FREEZE_OCEAN), T_out)
+    S_out = torch.cat([s0_frz.unsqueeze(0), S[1:]], dim=0)
+    sc_out = torch.cat([sc0_frz.unsqueeze(0), s_comp[1:]], dim=0)
+
+    t_ml_out = torch.where(is_ocean, T_out[0], sfc_t_ocean_ml)
+    m_ice_out = torch.where(is_ocean, torch.clamp(sfc_m_seaice + dm_freeze, min=0.0), sfc_m_seaice)
+    return T_out, t_comp, S_out, sc_out, t_ml_out, m_ice_out
 
 
 def _ogcm_advect_redi_core(
@@ -761,16 +1104,7 @@ def step_ogcm_voronoi(
     dz_c_int = cache["dz_c_int"]
     inv_dc_edge = cache["inv_dc_edge"]
 
-    # 0. Record previous Layer-0 state for KPP surface buoyancy forcing diagnosis, then pull surface update
-    t0_prev = ogcm.temp[0].clone()
-    s0_prev = ogcm.sal[0].clone()
-    T = ogcm.temp.clone()
-    T[0] = torch.where(is_ocean, sfc.t_ocean_ml, T[0])
-    S = ogcm.sal.clone()
-    t_comp = ogcm.t_comp.clone()
-    s_comp = ogcm.s_comp.clone()
-
-    # 1. Surface freshwater, glacier calving cooling & sea-ice brine/melt virtual salt flux (Huang, 1993)
+    # 0-3. Surface buoyancy, calving, salinity, Jerlov SW penetration, Roquet EOS & wind stress
     r_coast = torch.zeros(nc, device=dev, dtype=dtype)
     r_coast.scatter_add_(0, mesh.coastal_ocean_idx, mesh.area_cell * torch.clamp(runoff_total, min=0.0))
     r_coast = r_coast * cache["inv_area_c"]  # [kg m^-2 s^-1]
@@ -778,54 +1112,25 @@ def step_ogcm_voronoi(
     q_calve = torch.zeros(nc, device=dev, dtype=dtype)
     q_calve.scatter_add_(0, mesh.coastal_ocean_idx, C.L_F0 * mesh.area_cell * torch.clamp(runoff_glacier, min=0.0))
     q_calve = q_calve * cache["inv_area_c"]  # [W m^-2]
-    dt_calve = (-(dt * q_calve) / (C.CP_SEAWATER * C.RHO_SEAWATER * h_c_safe[0])) * is_ocn_f
-    T0_calv, tc0_calv = _kahan_add(T[0], dt_calve, t_comp[0])
-    T[0] = torch.where(is_ocean, T0_calv, T[0])
-    t_comp[0] = torch.where(is_ocean, tc0_calv, t_comp[0])
 
-    dm_ice_thermo = sfc.m_seaice - ogcm.m_seaice_prev  # [kg m^-2]
-    fw_evap_minus_p = evap_cell - precip_cell - r_coast  # [kg m^-2 s^-1] (+ = salinification)
-    ds_sfc = (
-        (S_REF_PSU * (fw_evap_minus_p * dt) + (S_REF_PSU - S_SEAICE_PSU) * dm_ice_thermo)
-        / (C.RHO_SEAWATER * h_c_safe[0])
-    ) * is_ocn_f
-    S0_next, sc0_next = _kahan_add(S[0], ds_sfc, s_comp[0])
-    S[0] = torch.where(is_ocean, torch.clamp(S0_next, 5.0, 45.0), S[0])
-    s_comp[0] = torch.where(is_ocean, sc0_next, s_comp[0])
+    apply_sw = (sw_net_ocn is not None) and (nzo >= 2)
+    sw_in = sw_net_ocn if sw_net_ocn is not None else torch.zeros_like(sfc.t_ocean_ml)
+    z_c_2d = ogcm.z_c.unsqueeze(1)
+    z_int_m = ogcm.z_w[1:-1].unsqueeze(1)
 
-    # 1b. Conservative Jerlov Type I Shortwave Penetration below Layer 0 (Paulson & Simpson, 1977)
-    # Redistributes `I(z_w[1]) * sw_net_ocn` from Layer 0 into underlying wet layers via Kahan summation.
-    if sw_net_ocn is not None and nzo >= 2:
-        sw_pos = torch.clamp(sw_net_ocn, min=0.0) * is_ocn_f
-        q_to_dt = (dt / (C.CP_SEAWATER * C.RHO_SEAWATER)) * sw_pos
-        dt_sw = torch.empty_like(T)
-        dt_sw[0] = -(q_to_dt * cache["frac_out_0"]) / h_c_safe[0]
-        dt_sw[1:] = (q_to_dt.unsqueeze(0) * cache["frac_sub"][1:]) / h_c_safe[1:]
-        dt_sw = dt_sw * wet_cf
-        T, t_comp = _kahan_add(T, dt_sw, t_comp)
-
-    # Diagnose exact surface kinematic fluxes & buoyancy flux B_0 [m^2 s^-3] for KPP
-    inv_dt = 1.0 / max(dt, 1.0)
-    wt_sfc = (T[0] - t0_prev) * h_c_safe[0] * inv_dt * is_ocn_f  # [K m s^-1] (<0 = surface cooling)
-    ws_sfc = (S[0] - s0_prev) * h_c_safe[0] * inv_dt * is_ocn_f  # [psu m s^-1] (>0 = brine/evap salinification)
-    rho0_prev = compute_seawater_density_anomaly(t0_prev, s0_prev, ogcm.z_c[0])
-    rho0_post = compute_seawater_density_anomaly(T[0], S[0], ogcm.z_c[0])
-    b0_sfc = -(C.GRAVITY / C.RHO_SEAWATER) * ((rho0_post - rho0_prev) * h_c_safe[0] * inv_dt) * is_ocn_f
-
-    # 2. Nonlinear EOS density anomaly & hydrostatic baroclinic pressure anomaly
-    rho_anom = compute_seawater_density_anomaly(T, S, ogcm.z_c.unsqueeze(1)) * wet_cf
-    g_rho_h = C.GRAVITY * rho_anom * h_c
-    p_cum = torch.cumsum(g_rho_h, dim=0)
-    p_baroc = p_cum - 0.5 * g_rho_h  # [nzo, nc]
-
-    # 3. Wind stress at ocean surface [N m^-2] & ocean friction velocity u_*o
-    ice_atten = 1.0 - 0.5 * torch.clamp(f_seaice, 0.0, 1.0)
-    tx_ocn = -ice_atten * tau_x_sfc
-    ty_ocn = -ice_atten * tau_y_sfc
-    u_star_o = torch.sqrt(torch.sqrt(tx_ocn * tx_ocn + ty_ocn * ty_ocn + 1.0e-12) / C.RHO_SEAWATER)
-    tx_e = 0.5 * (tx_ocn[c0] + tx_ocn[c1])
-    ty_e = 0.5 * (ty_ocn[c0] + ty_ocn[c1])
-    tau_n_e = (tx_e * mesh.east_normal_edge + ty_e * mesh.north_normal_edge) * wet_ef[0]
+    pre_kpp_fn = maybe_cuda_compile(_ogcm_pre_kpp_core, device=dev)
+    (
+        T, S, t_comp, s_comp, wt_sfc, ws_sfc, b0_sfc,
+        rho_anom, p_baroc, u_star_o, tau_n_e,
+    ) = pre_kpp_fn(
+        ogcm.temp, ogcm.sal, ogcm.t_comp, ogcm.s_comp,
+        sfc.t_ocean_ml, sfc.m_seaice, ogcm.m_seaice_prev,
+        r_coast, q_calve, evap_cell, precip_cell, sw_in,
+        tau_x_sfc, tau_y_sfc, f_seaice,
+        is_ocean, is_ocn_f, wet_cf, wet_ef, h_c, h_c_safe, z_c_2d,
+        cache["frac_out_0"], cache["frac_sub"], c0, c1,
+        mesh.east_normal_edge, mesh.north_normal_edge, dt, apply_sw,
+    )
 
     # 3b. Reconstruct 3D cell-centered ocean currents & diagnose KPP / shear / tidal mixing
     u = ogcm.u_edge * wet_ef
@@ -846,110 +1151,52 @@ def step_ogcm_voronoi(
     a_h = min(BETA_MUNK_OGCM * (delta_munk ** 3), 0.06 * (dc_min ** 2) / max(dt, 1.0))
 
     zeta_v = compute_scvt_vorticity(mesh, u)  # [nzo, n_verts]
-    eta_v = zeta_v + mesh.f_vert.unsqueeze(0)
-    eta_e = 0.5 * (eta_v[:, v0_e] + eta_v[:, v1_e])  # [nzo, ne]
-    eta_pair = 0.5 * (eta_e.unsqueeze(-1) + eta_e[:, ep_idx])  # [nzo, ne, 10]
-    cor_3d = (w_trisk.unsqueeze(0) * eta_pair * u[:, ep_idx]).sum(dim=-1)
-
-    pgf_bc = -(1.0 / C.RHO_SEAWATER) * ((p_baroc[:, c1] - p_baroc[:, c0]) * inv_dc_edge.unsqueeze(0))
     lap_u, _ = compute_vector_laplacian_edge(mesh, u)
 
-    # Bottom drag applied on deepest wet layer of each edge (precomputed static mask)
-    r_bot = torch.where(cache["is_bot_e"], C_DRAG_BOT * torch.abs(u) / h_e_safe, torch.zeros_like(u))
-
-    du_bc = (cor_3d + pgf_bc + a_h * lap_u - (R_RAYLEIGH_OCN + r_bot) * u) * wet_ef
-    du_bc[0] = du_bc[0] + (tau_n_e / (C.RHO_SEAWATER * h_e_safe[0])) * wet_ef[0]
-
-    # Explicit baroclinic predictor + implicit KPP/shear vertical momentum viscosity
-    u_star = torch.clamp((u + dt * du_bc) * wet_ef, -3.0, 3.0)
-    dz_int_e = cache["dz_int_e"]
-    av_e = 0.5 * (av_diag[:, c0] + av_diag[:, c1])
-    c_mom = (dt * av_e / dz_int_e) * wet_int_ef
-    a_m = torch.zeros((nzo, ne), device=dev, dtype=dtype)
-    b_m = torch.ones((nzo, ne), device=dev, dtype=dtype)
-    d_m = torch.zeros((nzo, ne), device=dev, dtype=dtype)
-    a_m[1:] = -c_mom / h_e_safe[1:]
-    d_m[:-1] = -c_mom / h_e_safe[:-1]
-    b_m[:-1] = b_m[:-1] - d_m[:-1]
-    b_m[1:] = b_m[1:] - a_m[1:]
-    u_star = solve_tridiagonal_batched(a_m, b_m, d_m, u_star) * wet_ef
+    bc_prep_fn = maybe_cuda_compile(_ogcm_baroclinic_prep_core, device=dev)
+    u_star, a_m, b_m, d_m = bc_prep_fn(
+        u, zeta_v, lap_u, p_baroc, av_diag, tau_n_e,
+        mesh.f_vert, v0_e, v1_e, ep_idx, w_trisk, c0, c1, inv_dc_edge,
+        cache["is_bot_e"], h_e_safe, cache["dz_int_e"], wet_ef, wet_int_ef, a_h, dt,
+    )
+    u_star_raw = solve_tridiagonal_batched(a_m, b_m, d_m, u_star)
 
     # 5. Split-Explicit 2D Barotropic Free-Surface Mode (Wicker-Skamarock RK3)
     h_col_e_safe = cache["h_col_e_safe"]
     ocn_e0f = cache["ocn_e0f"]
-    u_star_baro = (u_star * h_e).sum(dim=0) / h_col_e_safe * ocn_e0f
-    f_baro = (u_star_baro - ogcm.u_baro) / max(dt, 1.0)
-
     h_max = cache["h_max"]
     c_bt = math.sqrt(C.GRAVITY * max(h_max, 50.0))
     dt_bt_cfl = 0.35 * dc_min / max(c_bt, 10.0)
     n_bt = max(1, min(int(math.ceil(dt / max(dt_bt_cfl, 1.0))), 24))
     dt_bt = dt / float(n_bt)
 
-    u_bt = ogcm.u_baro * ocn_e0f
     eta_old = ogcm.eta * is_ocn_f
     g_inv_dc = -C.GRAVITY * inv_dc_edge
     eoc = mesh.edges_on_cell  # [nc, 6]
     div_w = cache["div_w"]
 
     baro_fn = maybe_cuda_compile(_ogcm_barotropic_rk3_core, device=dev)
-    u_bt, u_bt_mean = baro_fn(
-        u_bt, eta_old, f_baro, g_inv_dc, ogcm.h_col_e, ocn_e0f, is_ocn_f,
-        c0, c1, eoc, div_w, n_bt, dt_bt,
+    u_star, u_star_baro, u_bt, u_bt_mean = baro_fn(
+        u_star_raw, ogcm.u_baro, eta_old, g_inv_dc, h_e, ogcm.h_col_e, h_col_e_safe,
+        wet_ef, ocn_e0f, is_ocn_f, c0, c1, eoc, div_w, n_bt, dt_bt, dt,
     )
     ogcm.u_baro = u_bt
 
-    u_new = (u_star + (u_bt_mean - u_star_baro).unsqueeze(0)) * wet_ef
-    u_new = torch.clamp(u_new, -3.0, 3.0)
-    ogcm.u_edge = u_new
-
-    # 6. Gent-McWilliams (1990) Eddy Bolus & Neutral Isopycnal Slope (Boundary-Layer Tapered)
-    drho_dx = ((rho_anom[:, c1] - rho_anom[:, c0]) * inv_dc_edge.unsqueeze(0)) * wet_ef
-    drho_dz_c = ((rho_anom[1:] - rho_anom[:-1]) / dz_c_int) * wet_int_cf
-    drho_dz_e = 0.5 * (drho_dz_c[:, c0] + drho_dz_c[:, c1])
-    drho_dx_int = 0.5 * (drho_dx[:-1] + drho_dx[1:])
-    slope_raw = torch.clamp(-drho_dx_int / torch.clamp(drho_dz_e, min=1.0e-5), -GM_SLOPE_MAX, GM_SLOPE_MAX) * wet_int_ef
-    # Ferrari et al. (2008) / Danabasoglu & McWilliams (1995) linear taper inside KPP boundary layer
-    h_bl_e = torch.clamp(0.5 * (h_bl[c0] + h_bl[c1]), min=1.0).unsqueeze(0)
-    taper_bl = torch.clamp(ogcm.z_w[1:-1].unsqueeze(1) / h_bl_e, 0.0, 1.0)
-    sx_int = slope_raw * taper_bl  # [nzo-1, ne] neutral slope S_x = dz_iso/dx (z downward)
-
-    psi_gm = torch.zeros((nzo + 1, ne), device=dev, dtype=dtype)
-    psi_gm[1:-1] = KAPPA_GM * sx_int  # Psi = 0 at surface and seafloor -> exact zero depth-integral
-    u_gm = (-(psi_gm[1:] - psi_gm[:-1]) / h_e_safe) * wet_ef
-    u_gm = torch.clamp(u_gm, -0.3, 0.3)
-
-    u_adv = (u_new + u_gm) * wet_ef
-
-    # 7. Exact Mass-Conserving Vertical Velocity `w` [nzo + 1, nc] (positive upward; w_bot = 0)
-    h_u_edge = h_e * u_adv
-    div_hu = compute_scvt_divergence(mesh, h_u_edge) * wet_cf
-    w_vel = torch.zeros((nzo + 1, nc), device=dev, dtype=dtype)
-    # Vectorized bottom-up integration (replaces 18-iteration Python loop)
-    w_up = -torch.flip(torch.cumsum(torch.flip(div_hu, dims=[0]), dim=0), dims=[0]) * wet_cf
-    w_vel[1:-1] = w_up[1:]
-    w_sfc_raw = w_up[0]
-    eta_new = torch.clamp((eta_old + dt * w_sfc_raw) * is_ocn_f, -5.0, 5.0)
-    ogcm.eta = eta_new
-    ogcm.w_vel = w_vel
-
-    h0_old = torch.clamp(h_c_safe[0] + eta_old, min=10.0)
-    h0_new = torch.clamp(h_c_safe[0] + eta_new, min=10.0)
-    dh0_eff = h0_new - h0_old
-
-    # Precomputed Voronoi cell geometric weights for exact 2D Redi tensor projection
-    eoc = mesh.edges_on_cell  # [nc, 6]
+    # 6-7. GM90 Eddy Bolus, Mass-Conserving Vertical Velocity `w`, Free Surface `eta` & Redi Kv
     w_vor_edge = cache["w_vor_edge"]
     active_eoc = cache["active_eoc"]
     inv_area_c = cache["inv_area_c"]
-
-    if ENABLE_FULL_REDI:
-        # Diagonal vertical Redi diffusivity K_v,Redi = kappa_Redi * |S|^2 (folded into implicit tridiagonal!)
-        s2_edge_w = (sx_int * sx_int) * w_vor_edge.unsqueeze(0)  # [nzo-1, ne]
-        s2_cell = (s2_edge_w[:, eoc] * active_eoc.unsqueeze(0)).sum(dim=-1) * inv_area_c.unsqueeze(0)
-        kv_redi = (KAPPA_REDI_HORIZ * s2_cell) * wet_int_cf
-    else:
-        kv_redi = torch.zeros_like(kv_diag)
+    gm_w_fn = maybe_cuda_compile(_ogcm_gm_and_w_core, device=dev)
+    u_new, sx_int, h_u_edge, w_vel, eta_new, h0_new, dh0_eff, kv_redi = gm_w_fn(
+        u_star, u_bt_mean, u_star_baro, rho_anom, h_bl, eta_old,
+        h_e, h_e_safe, h_c_safe, dz_c_int, z_int_m, inv_dc_edge,
+        wet_cf, wet_ef, wet_int_cf, wet_int_ef, is_ocn_f,
+        c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
+        dt, bool(ENABLE_FULL_REDI),
+    )
+    ogcm.u_edge = u_new
+    ogcm.eta = eta_new
+    ogcm.w_vel = w_vel
 
     # 8. 3D Conservative Flux-Form Tracer Advection (Anomaly Form q' = q - q_ref to minimize float32 cancellation)
     #    + Full Rotated Redi Diffusion + KPP Non-Local Flux + Neumaier/Kahan Compensated Summation
@@ -967,74 +1214,33 @@ def step_ogcm_voronoi(
         S_REF_PSU, dt, bool(ENABLE_FULL_REDI),
     )
 
-    # 9. Strictly Conservative Flux-Increment Implicit Vertical Mixing (Float32-Safe!)
+    # 9-10. Strictly Conservative Flux-Increment Implicit Vertical Mixing (Float32-Safe!) & Freezing Check
     #    Solving `(I + L) dq = -L q` and reconstructing telescoping fluxes `F_imp = c_dif * d(q + dq)`
     #    prevents float32 diagonal underflow (`1.0f + c_dif/h == 1.0f` in the abyssal ocean) from
     #    creating spurious heat/salt, while `_kahan_add` retains sub-ULP deep-ocean tendencies.
-    rho_post = compute_seawater_density_anomaly(T, S, ogcm.z_c.unsqueeze(1)) * wet_cf
-    drho_dz_post = torch.where(
-        wet_int_c,
-        (rho_post[1:] - rho_post[:-1]) / dz_c_int,
-        torch.ones_like(dz_c_int),
+    vdiff_prep_fn = maybe_cuda_compile(_ogcm_vdiff_prep_core, device=dev)
+    kv, c_dif, h_eff, a_t, b_t, d_t, t_diff, s_diff, rhs_t, rhs_s = vdiff_prep_fn(
+        T, S, kv_diag, kv_redi, z_c_2d, dz_c_int, h_c_safe, h0_new,
+        wet_cf, wet_int_c, wet_int_cf, dt,
     )
-    kv = kv_diag + kv_redi
-    kv = torch.where(drho_dz_post < 0.0, torch.clamp(kv, min=KAPPA_V_CONV), kv) * wet_int_cf
     ogcm.kv_last = kv
 
-    c_dif = (dt * kv / dz_c_int) * wet_int_cf
-    h_eff = h_c_safe.clone()
-    h_eff[0] = h0_new
-    a_t = torch.zeros((nzo, nc), device=dev, dtype=dtype)
-    b_t = torch.ones((nzo, nc), device=dev, dtype=dtype)
-    d_t = torch.zeros((nzo, nc), device=dev, dtype=dtype)
-    a_t[1:] = -c_dif / h_eff[1:]
-    d_t[:-1] = -c_dif / h_eff[:-1]
-    b_t[:-1] = b_t[:-1] - d_t[:-1]
-    b_t[1:] = b_t[1:] - a_t[1:]
+    dt_imp = solve_tridiagonal_batched(a_t, b_t, d_t, rhs_t)
+    ds_imp = solve_tridiagonal_batched(a_t, b_t, d_t, rhs_s)
 
-    def _diffuse_vertical_conservative(
-        q: torch.Tensor,
-        q_comp: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        q_diff = q[1:] - q[:-1]
-        f_exp = c_dif * q_diff
-        rhs_dq = torch.zeros_like(q)
-        rhs_dq[:-1] = rhs_dq[:-1] + f_exp
-        rhs_dq[1:] = rhs_dq[1:] - f_exp
-        rhs_dq = rhs_dq / h_eff
-        dq_imp = solve_tridiagonal_batched(a_t, b_t, d_t, rhs_dq)
-        # Reconstruct exact telescoping implicit fluxes so sum_k h_eff[k] * dq_cons[k] == 0 identically
-        f_imp = c_dif * (q_diff + (dq_imp[1:] - dq_imp[:-1]))
-        dq_cons = torch.zeros_like(q)
-        dq_cons[:-1] = dq_cons[:-1] + f_imp
-        dq_cons[1:] = dq_cons[1:] - f_imp
-        dq_cons = (dq_cons / h_eff) * wet_cf
-        return _kahan_add(q, dq_cons, q_comp)
-
-    T, t_comp = _diffuse_vertical_conservative(T, t_comp)
-    S, s_comp = _diffuse_vertical_conservative(S, s_comp)
-    S = torch.where(wet_c, torch.clamp(S, 5.0, 45.0), S)
-
-    # 10. Conservative Freezing Check on Layer 0 (if advection/mixing cools T[0] below T_freeze)
-    freeze_exc = torch.where(is_ocean, torch.clamp(C.T_FREEZE_OCEAN - T[0], min=0.0), torch.zeros_like(T[0]))
-    c0_cap = C.CP_SEAWATER * C.RHO_SEAWATER * h_c_safe[0]
-    dm_freeze = (c0_cap * freeze_exc) / C.L_F0
-    T[0] = torch.where(is_ocean, T[0] + freeze_exc, T[0])
-    ds_brine = ((S_REF_PSU - S_SEAICE_PSU) * dm_freeze) / (C.RHO_SEAWATER * h_c_safe[0])
-    S0_br, sc0_br = _kahan_add(S[0], ds_brine * is_ocn_f, s_comp[0])
-    S[0] = torch.where(is_ocean, torch.clamp(S0_br, 5.0, 45.0), S[0])
-    s_comp[0] = torch.where(is_ocean, sc0_br, s_comp[0])
-    T = torch.where(wet_c, torch.clamp(T, min=C.T_FREEZE_OCEAN), T)
-
+    vdiff_post_fn = maybe_cuda_compile(_ogcm_vdiff_post_freeze_core, device=dev)
+    T, t_comp, S, s_comp, sfc.t_ocean_ml, sfc.m_seaice = vdiff_post_fn(
+        T, t_comp, S, s_comp, t_diff, s_diff, dt_imp, ds_imp,
+        c_dif, h_eff, h_c_safe, wet_c, wet_cf, is_ocean, is_ocn_f,
+        sfc.m_seaice, sfc.t_ocean_ml,
+    )
     ogcm.temp = T
     ogcm.sal = S
     ogcm.t_comp = t_comp
     ogcm.s_comp = s_comp
-    sfc.t_ocean_ml = torch.where(is_ocean, T[0], sfc.t_ocean_ml)
-    sfc.m_seaice = torch.where(is_ocean, torch.clamp(sfc.m_seaice + dm_freeze, min=0.0), sfc.m_seaice)
 
     # 11. Dynamic Sea-Ice Drift (after recording thermodynamic mass change, so advection doesn't alias brine!)
     if enable_seaice_drift:
-        step_seaice_drift_voronoi(sfc, mesh, tau_x_sfc, tau_y_sfc, u_new[0], dt)
+        step_seaice_drift_voronoi(sfc, mesh, tau_x_sfc, tau_y_sfc, u_new[0], dt, cache=cache)
 
     ogcm.m_seaice_prev = sfc.m_seaice.clone()
