@@ -19,7 +19,7 @@ by default):
    - Prognostic Nesterov dryness index, fuel moisture / fire danger index (FDI), convective
      lightning ignition proxy, wind-assisted spread, combustion of litter & live wood/foliage,
      and pyrogenic CO2, black carbon (BC), and organic carbon (OC) aerosol emission fluxes
-     (coupling directly to A5 `aerosols.py`).
+     (coupling directly to `aerosols.py`).
 
 Strictly conserves total land carbon:
     d(C_leaf + C_wood + C_root + C_lit_fast + C_lit_slow + sum_k C_soil_k) / dt

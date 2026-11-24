@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Fetch compact multi-model/observational climatology benchmarks (mean + std + 95% CI) for AOBA validation.
 
-Downloads ONLY lightweight climatological means and confidence intervals (NOT full raw timeseries)
-into `data/validation/` (strictly local / Google Drive backup; excluded from Git):
+Downloads lightweight climatological means and confidence intervals into `data/validation/`:
 
 1. `cmip6_picontrol_clim.zarr` + `cmip6_picontrol_summary.json`:
    Pangeo CMIP6 1850 `piControl` multi-model ensemble (up to 12 diverse ESMs, last 30 yr each,

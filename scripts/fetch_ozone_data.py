@@ -2,13 +2,12 @@
 
 Downloads a CMIP6 (``UReading-CCMI-1-0``) or CMIP7 (``FZJ-CMIP-ozone-1-1``) monthly ``vmro3``
 NetCDF file from LLNL ESGF, averages over longitude if needed, and saves a compact
-``(12, n_plev, n_lat)`` climatology NPZ to ``data/boundary/ozone/o3_zonal_climatology.npz``
-(gitignored).
+``(12, n_plev, n_lat)`` climatology NPZ to ``data/boundary/ozone/o3_zonal_climatology.npz``.
 
 Usage:
-    /Users/andrew/miniforge/envs/myenv/bin/python scripts/fetch_ozone_data.py --mip CMIP6
-    /Users/andrew/miniforge/envs/myenv/bin/python scripts/fetch_ozone_data.py --mip CMIP7
-    /Users/andrew/miniforge/envs/myenv/bin/python scripts/fetch_ozone_data.py --status
+    python scripts/fetch_ozone_data.py --mip CMIP6
+    python scripts/fetch_ozone_data.py --mip CMIP7
+    python scripts/fetch_ozone_data.py --status
 """
 
 from __future__ import annotations

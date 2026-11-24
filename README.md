@@ -51,10 +51,9 @@ aoba/
 │   ├── architecture_ja.md # Governing architecture & literature traceability (Japanese)
 │   ├── formulation.md     # Full mathematical model description (English)
 │   └── formulation_ja.md  # Full mathematical model description (Japanese)
-├── data/                  # Local boundary (Earth2014) & validation (Köppen-Geiger) data (git-ignored)
-├── references/            # Local literature archive (95 PDFs; strictly git-ignored)
+├── data/                  # Boundary topography (Earth2014) & validation datasets
 ├── src/
-│   └── aoba/              # PyTorch + Metal/CUDA model source packages (37 modules; full ESM A1–A6)
+│   └── aoba/              # PyTorch + Metal/CUDA model source packages (37 modules)
 ├── tests/                 # Unit, physical-forcing, and conservation tests (CPU + MPS)
 ├── scripts/               # RCE, Held-Suarez, Global AOBA runners & Zarr-to-NetCDF tool
 └── pyproject.toml
@@ -86,10 +85,9 @@ python scripts/aoba_config_gui.py --toml config/aoba_default.toml
 python -u scripts/run_g5_30yr.py --config config/aoba_default.toml
 ```
 
-## Storage & Git Protection Policy
+## Simulation Output Format
 
-- **Simulation Outputs (`Zarr v3` Native)**: All model history streams, restart checkpoints, and mesh caches use **CF/UGRID-compliant Zarr v3 (`.zarr`)** exclusively (defaulting to `~/aoba_outputs`, configurable via `AOBA_OUTPUT_DIR`); conversion to NetCDF4 (`.nc`) for external tools (`cdo`, Panoply) is handled strictly by `scripts/zarr_to_netcdf.py`.
-- **Protected Local Directories**: Both `references/` and `data/` are backed up locally via Google Drive and triple-locked (`.gitignore`, `.git/info/exclude`, and `.git/hooks/pre-commit`) so they are never pushed to GitHub.
+- **Native `Zarr v3` I/O**: All model history streams, restart checkpoints, and preprocessed mesh caches use **CF/UGRID-compliant Zarr v3 (`.zarr`)** (defaulting to `~/aoba_outputs`, configurable via `AOBA_OUTPUT_DIR`). Conversion to NetCDF4 (`.nc`) for external post-processing tools (`cdo`, Panoply) is provided by `scripts/zarr_to_netcdf.py`.
 
 ## Validation Benchmarks and Model Hierarchy
 

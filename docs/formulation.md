@@ -2,7 +2,7 @@
 
 > **Language**: English | [日本語 (formulation_ja.md)](formulation_ja.md)
 
-This document presents the complete continuous equations, coordinate transformations, staggered spatial discretizations, time-integration schemes, closed-form physical/ecological/cryospheric/oceanic/ice-sheet closures, and unified TOML parameter registry of **AOBA**, written to the mathematical completeness standard of *Description of MIROC6 AGCM* (2021), *Description of MATSIRO6* (2021), and *Detailed formulation of SCALE-RM* (Nishizawa et al., 2025). Every equation, symbol, and default constant maps 1-to-1 onto `src/aoba/` and `config/aoba_default.toml`.
+This document presents the complete continuous equations, coordinate transformations, staggered spatial discretizations, time-integration schemes, closed-form physical, ecological, cryospheric, oceanic, and ice-sheet closures, and unified TOML parameter registry of **AOBA**. Every equation, symbol, and default constant maps 1-to-1 onto `src/aoba/` and `config/aoba_default.toml`.
 
 ---
 

@@ -99,7 +99,7 @@ def _restore_surface(sfc_target, payload: dict, device: torch.device) -> None:
         sfc_target.t_leaf_sh = sfc_target.t_canopy.clone()
     if "t_gnd_skin" not in payload or sfc_target.t_gnd_skin is None:
         sfc_target.t_gnd_skin = sfc_target.t_soil[0].clone()
-    # Sanitize any legacy pre-fix restarts where soil ice exceeded available pore space
+    # Clamp restored soil ice to available pore space
     from aoba.surface import SOIL_POROSITY
 
     w_ice_cap = torch.clamp(SOIL_POROSITY - sfc_target.w_liq_soil, min=0.0)

@@ -51,10 +51,9 @@ aoba/
 │   ├── architecture_ja.md # 支配構成・根拠文献トレーサビリティ仕様書（日本語）
 │   ├── formulation.md     # 数理定式化モデル記述書（英語）
 │   └── formulation_ja.md  # 数理定式化モデル記述書（日本語）
-├── data/                  # 境界条件（Earth2014）・検証データ（Köppen-Geiger）（Git完全除外）
-├── references/            # 参考文献・論文PDF保管用（計95本；Git完全除外）
+├── data/                  # 境界地形データ（Earth2014）・検証データセット
 ├── src/
-│   └── aoba/              # PyTorch + Metal/CUDA モデル本体パッケージ（全37モジュール；ESM拡張 A1–A6 全標準搭載）
+│   └── aoba/              # PyTorch + Metal/CUDA モデル本体パッケージ（全37モジュール）
 ├── tests/                 # 単体・物理強制力・保存則テスト（CPU + MPS 両対応）
 ├── scripts/               # RCE・Held-Suarez・全球AOBA実行スクリプト ＆ NetCDF変換ツール
 └── pyproject.toml
@@ -86,10 +85,9 @@ python scripts/aoba_config_gui.py --toml config/aoba_default.toml
 python -u scripts/run_g5_30yr.py --config config/aoba_default.toml
 ```
 
-## 出力ファイルとローカルディレクトリの保護方針
+## 計算出力フォーマット
 
-- **計算出力の一本化（`Zarr v3` ネイティブ）**: モデル本体のヒストリ出力・リスタートファイル・事前計算メッシュはすべて **CF/UGRID 準拠の `Zarr v3 (.zarr)` 一本**に統一し、デフォルトで `~/aoba_outputs`（環境変数 `AOBA_OUTPUT_DIR` で変更可）に出力します。外部ツール（`cdo` や Panoply 等）向けの `NetCDF4 (.nc)` 変換は独立した後処理スクリプト `scripts/zarr_to_netcdf.py` で行います。
-- **参考文献・データディレクトリの三重ロック保護**: `references/` と `data/` は Google Drive 上で自動バックアップされつつ、`.gitignore`、`.git/info/exclude`、および Git `pre-commit` フックにより GitHub へは一切アップロードされません。
+- **ネイティブ `Zarr v3` 入出力**: モデル本体のヒストリ出力・リスタートファイル・事前計算メッシュはすべて **CF/UGRID 準拠の `Zarr v3 (.zarr)`** に統一し、デフォルトで `~/aoba_outputs`（環境変数 `AOBA_OUTPUT_DIR` で変更可）に出力します。外部ツール（`cdo` や Panoply 等）向けの `NetCDF4 (.nc)` 変換は後処理スクリプト `scripts/zarr_to_netcdf.py` で行います。
 
 ## 検証ベンチマークとモデル構成階層
 

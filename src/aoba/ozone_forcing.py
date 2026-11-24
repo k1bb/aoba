@@ -33,7 +33,7 @@ ESGF_LLNL_SEARCH_URL = "https://esgf-node.llnl.gov/esg-search/search"
 
 
 def default_ozone_dir() -> Path:
-    """Return local (gitignored) boundary directory ``data/boundary/ozone``."""
+    """Return local ozone boundary directory ``data/boundary/ozone``."""
     return Path(__file__).resolve().parents[2] / "data" / "boundary" / "ozone"
 
 

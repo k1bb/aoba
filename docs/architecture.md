@@ -2,13 +2,11 @@
 
 > **Language**: English | [日本語 (architecture_ja.md)](architecture_ja.md)
 
-## 1. Scientific Objective and Documentation Standard
+## 1. Scientific Objective
 
 AOBA investigates two fundamental questions:
-1. Given **only** external physical boundary conditions—land–sea/ice-sheet geometry and surface elevation from `Earth2014` (Hirt & Rexer, 2015), planetary rotation rate $\Omega$, solar orbital insolation $S_0$, and well-mixed atmospheric gas concentrations ($\mathrm{CO}_2, \mathrm{O}_2$)—can a coupled atmosphere–surface ocean–terrestrial ecosystem autonomously reproduce Earth's climate and biome zones (benchmarked against Beck et al., 2018, 2023)?
+1. Given **only** external physical boundary conditions—land–sea/ice-sheet geometry and surface elevation from `Earth2014` (Hirt & Rexer, 2015), planetary rotation rate $\Omega$, solar orbital insolation $S_0$, and well-mixed atmospheric gas concentrations ($\mathrm{CO}_2, \mathrm{O}_2$)—can a coupled atmosphere–ocean–terrestrial ecosystem autonomously reproduce Earth's climate and biome zones (benchmarked against Beck et al., 2018, 2023)?
 2. How does such a minimally constrained model—free of cumulus parameterizations, prescribed ocean $Q$-fluxes, external soil/albedo maps, and plant-functional-type (PFT) parameter tables—predict future shifts in global climate zones under elevated $\mathrm{CO}_2$?
-
-**Documentation & Traceability Rule**: Following the mathematical completeness of *Description of MIROC6 AGCM* (2021), *Description of MATSIRO6* (2021), and *Detailed formulation of SCALE-RM* (2025), every continuous equation, coordinate transformation, staggered stencil, and constant implemented in `src/aoba/` must be documented explicitly and linked to its supporting source publication (author, year, section, equation number).
 
 ---
 

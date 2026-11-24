@@ -260,7 +260,7 @@ def bundled_co2_table_path() -> Path:
 
 
 def local_co2_cache_dir() -> Path:
-    """Return path to the local (gitignored) updated CO2 forcing directory ``data/forcing/co2``."""
+    """Return path to the local CO2 forcing directory ``data/forcing/co2``."""
     return Path(__file__).resolve().parents[2] / "data" / "forcing" / "co2"
 
 
@@ -514,7 +514,7 @@ def fetch_latest_co2_sources(
 ) -> dict[str, Any]:
     """Download latest CO2 records from NOAA GML, NCEI Paleo, and optionally RCMIP v5.1.0.
 
-    Saves merged annual/paleo tables to ``data/forcing/co2/co2_latest.csv`` (gitignored)
+    Saves merged annual/paleo tables to ``data/forcing/co2/co2_latest.csv``
     and writes status metadata to ``data/forcing/co2/co2_sources_status.json``.
     If ``write_bundled=True``, also updates ``src/aoba/data/co2_scenarios.csv``.
     """

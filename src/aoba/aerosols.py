@@ -13,7 +13,7 @@ aerosol mass mixing ratios `[Nz, N_cells]` [kg kg^-1] (`enable_natural_aerosols 
      exchange and oxidized to hygroscopic nss-SO4 (marine stratocumulus CCN feedback!).
 3. **Wildfire Black Carbon (`q_bc`) & Organic Carbon (`q_oc`)** (Thonicke et al., 2010,
    *Biogeosciences*, 7, 1991-2011):
-   - Directly coupled to A2 autonomous wildfire pyrogenic emission fluxes (`land_carbon.fire_bc_kg_m2s`,
+   - Directly coupled to autonomous wildfire pyrogenic emission fluxes (`land_carbon.fire_bc_kg_m2s`,
      `land_carbon.fire_oc_kg_m2s`).
 
 All 4 tracers are advected conservatively by host SCVT Zalesak FCT (`fct_advect_scvt_batch`),

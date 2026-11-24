@@ -692,7 +692,7 @@ def step_crm_rk3_hevi(
 
     # Dimension-aware Coriolis handling for embedded periodic CRMs (Khairoutdinov et al., 2005; Yamazaki & Miura, 2024):
     # - 1D (1x1) & 2D (nx==1 or ny==1): disable CRM Coriolis (no cross-plane background PGF; host handles rotation).
-    # - 3D (nx>1 and ny>1): perturbation-only Coriolis on u' = u - u_mean evaluated INSIDE each RK3 stage (never Forward Euler!).
+    # - 3D (nx>1 and ny>1): perturbation-only Coriolis on u' = u - u_mean evaluated inside each RK3 stage.
     use_3d_pert_cor = (nx > 1) and (ny > 1) and (crm.f_coriolis is not None)
     f_col_3d = crm.f_coriolis.view(1, -1, 1, 1) if use_3d_pert_cor else None
     if use_3d_pert_cor and can_use_crm_metal(rho0):

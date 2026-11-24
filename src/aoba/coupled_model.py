@@ -96,12 +96,12 @@ class AOBAConfig:
     ocean_mode: str = "ogcm_3d"              # Ocean model: "ogcm_3d" (3D multi-layer OGCM) or "ekman_sw" (1.5-layer shallow-water)
     ocean_nz: int = 18                       # Vertical z-levels when ocean_mode="ogcm_3d" (0..6000 m)
     enable_seaice_drift: bool = True         # Enable dynamic wind/current sea-ice drift in 3D OGCM mode
-    enable_ocean_bgc: bool = True            # Enable A6 FlexPFT marine BGC & OMIP/mocsy 2.0 carbonate chemistry
-    enable_river_routing: bool = True        # Enable A1 map-free Priority-Flood Voronoi river routing
-    enable_land_carbon: bool = True          # Enable A2 map-free terrestrial C cycle, permafrost C, & SPITFIRE fire
-    enable_seaice_evp_itd: bool = True       # Enable A3 MPAS-Seaice Voronoi EVP rheology + 5-category ITD
-    enable_ogcm_fct_zstar: bool = True       # Enable A4 FESOM2-style 3D Zalesak FCT advection + exact z* coord
-    enable_natural_aerosols: bool = True     # Enable A5 map-free sea-salt, marine DMS SO4, & wildfire BC/OC
+    enable_ocean_bgc: bool = True            # FlexPFT marine biogeochemistry & OMIP/mocsy 2.0 carbonate chemistry
+    enable_river_routing: bool = True        # Map-free Priority-Flood Voronoi river routing
+    enable_land_carbon: bool = True          # Map-free terrestrial carbon cycle, permafrost soil C, & SPITFIRE wildfire
+    enable_seaice_evp_itd: bool = True       # MPAS-Seaice Voronoi EVP rheology + 5-category ITD
+    enable_ogcm_fct_zstar: bool = True       # FESOM2-style 3D Zalesak FCT advection + exact z* coordinate
+    enable_natural_aerosols: bool = True     # Map-free sea-salt, marine DMS sulfate, & wildfire BC/OC aerosols
     re_liq_um: float = 10.0                  # Fallback/1M cloud liquid droplet effective radius [um]
     re_ice_um: float = 48.0                  # Fallback/1M cloud ice crystal effective radius [um]
     cloud_sw_inhomog: float = 0.65           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
@@ -142,7 +142,7 @@ class AOBAConfig:
     enable_superparam: bool = True           # 1:1 embedded 3D CRM in every SCVT cell
     enable_dust: bool = True                 # Map-free global-parameter mineral dust aerosol + radiative coupling
     dust_emis_factor: float = 1.5e-5         # Global dust emission tuning factor T (map-free S=1 CLM5 Eq. 31.1) [-]
-    enable_dynamic_icesheet: bool = False    # Opt-in SIA + EMA-accelerated ice sheet & vertical grid update
+    enable_dynamic_icesheet: bool = False    # Dynamic SIA + EMA-accelerated ice sheet & vertical grid update
     icesheet_ema_years: float = 5.0          # EMA smoothing timescale for annual SMB [years]
     icesheet_accel_factor: float = 100.0     # Initial ice-sheet spinup acceleration multiplier [-]
     icesheet_accel_spinup_years: float = 0.0 # Optional e-folding climate timescale for accel decay to 1.0 [yr] (0=const)

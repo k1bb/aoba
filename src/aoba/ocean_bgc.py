@@ -1,7 +1,7 @@
 """FlexPFT Optimality-Based 3D Marine Biogeochemistry & OMIP/mocsy 2.0 Carbonate Chemistry.
 
-Couples seamlessly to AOBA's 3D SCVT Voronoi OGCM (`ocean_ogcm.py`) as an opt-in
-(`enable_ocean_bgc = false` by default) map-free marine carbon and ecosystem module.
+Couples seamlessly to AOBA's 3D SCVT Voronoi OGCM (`ocean_ogcm.py`) as a map-free
+marine carbon and ecosystem module (`enable_ocean_bgc = true` by default).
 Mirrors AOBA's Eco-Evolutionary Optimality (EEO) terrestrial biosphere (`biosphere.py`)
 in the ocean: phytoplankton instantaneously optimize their intracellular resource
 allocation (light-harvesting Chl:C vs. nutrient-uptake machinery vs. carbon fixation)

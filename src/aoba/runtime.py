@@ -46,7 +46,7 @@ def synchronize_device(device: torch.device | str | None = None) -> None:
 
 
 def get_output_dir(run_name: str | None = None) -> Path:
-    """Return local SSD output path outside Google Drive sync by default."""
+    """Return the default local output directory path."""
     base = Path(os.environ.get("AOBA_OUTPUT_DIR", Path.home() / "aoba_outputs")).expanduser()
     target = base / run_name if run_name else base
     target.mkdir(parents=True, exist_ok=True)

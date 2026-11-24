@@ -199,7 +199,7 @@ class OceanOGCMState:
     h_bl: torch.Tensor | None = None          # Diagnosed KPP surface boundary-layer depth [N_cells] [m]
     kv_last: torch.Tensor | None = None       # Last diagnosed vertical tracer diffusivity [N_zo-1, N_cells] [m^2 s^-1]
     bgc: object | None = None                 # Optional FlexPFT OceanBGCState (when enable_ocean_bgc=True)
-    seaice_evp: object | None = None          # Optional A3 SeaIceEVPState (when enable_seaice_evp_itd=True)
+    seaice_evp: object | None = None          # SeaIceEVPState (when enable_seaice_evp_itd=True)
 
 
 def _compute_bathymetric_slope(h_col: torch.Tensor, wet_c0: torch.Tensor, mesh: SCVTMesh) -> torch.Tensor:
@@ -735,10 +735,9 @@ def _ogcm_baroclinic_rk3_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """3-stage Wicker-Skamarock (2002) RK3 TRiSK Coriolis + baroclinic PGF + semi-implicit drag + tridiag.
 
-    Forward Euler on inertial oscillations `du/dt = -f k x u` is unconditionally unstable
-    (`|G| = sqrt(1 + (f dt)^2) > 1`), causing polar blow-up. 3-stage WS-RK3 is strictly stable
-    and gently damping along the imaginary axis up to `|f dt| <= sqrt(3) ~ 1.73` (covering both
-    coupled `dt = 720 s` and offline spin-up `dt = 3600 s` at the poles with wide margin).
+    Three-stage WS-RK3 is strictly stable along the imaginary axis up to `|f dt| <= sqrt(3) ~ 1.73`,
+    ensuring inertial-oscillation stability across both coupled (`dt = 720 s`) and offline (`dt = 3600 s`)
+    timesteps at polar latitudes.
     """
     pgf_bc = -(1.0 / C.RHO_SEAWATER) * ((p_baroc[:, c1] - p_baroc[:, c0]) * inv_dc_edge.unsqueeze(0))
     f_fixed = (pgf_bc + a_h * lap_u) * wet_ef
@@ -1003,7 +1002,7 @@ def _ogcm_advect_fct_zstar_core(
     dt: float,
     enable_full_redi: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """A4 FESOM2-style 3D Zalesak FCT tracer advection + exact z* stretching + Redi + Kahan.
+    """FESOM2-style 3D Zalesak FCT tracer advection + exact z* stretching + Redi + Kahan.
 
     References
     ----------
@@ -1290,7 +1289,7 @@ def step_ogcm_voronoi(
 
     # 0-3. Surface buoyancy, calving, salinity, Jerlov SW penetration, Roquet EOS & wind stress
     if river_mouth_flux is not None:
-        # A1 Priority-Flood Voronoi river routing already delivered liquid runoff to ocean river mouths;
+        # Priority-Flood Voronoi river routing delivers liquid runoff to ocean river mouths;
         # add coastal glacier calving meltwater via coastal_ocean_idx so total freshwater + latent heat closes.
         r_calve = torch.zeros(nc, device=dev, dtype=dtype)
         r_calve.scatter_add_(0, mesh.coastal_ocean_idx, mesh.area_cell * torch.clamp(runoff_glacier, min=0.0))
@@ -1394,7 +1393,7 @@ def step_ogcm_voronoi(
     # 8. 3D Conservative Flux-Form Tracer Advection (Anomaly Form q' = q - q_ref to minimize float32 cancellation)
     #    + Full Rotated Redi Diffusion + KPP Non-Local Flux + Neumaier/Kahan Compensated Summation
     if enable_fct_zstar:
-        # A4 FESOM2-style exact z* proportional column stretching h*_k = h_c * (1 + eta / H) + Zalesak FCT
+        # FESOM2-style exact z* proportional column stretching h*_k = h_c * (1 + eta / H) + Zalesak FCT
         # (Danilov et al., 2017; Adcroft & Campin, 2004). Exact continuity:
         # (h*_new - h*_old)/dt + div_h(h_u_edge) - (w*_below - w*_above) == 0 at EVERY layer k!
         h_col_s = cache["h_col_safe"]
@@ -1466,7 +1465,7 @@ def step_ogcm_voronoi(
     ogcm.t_comp = t_comp
     ogcm.s_comp = s_comp
 
-    # 10b. Optional FlexPFT Marine Biogeochemistry & OMIP/mocsy 2.0 Carbonate Chemistry (opt-in)
+    # 10b. FlexPFT Marine Biogeochemistry & OMIP/mocsy 2.0 Carbonate Chemistry
     if ogcm.bgc is not None:
         from aoba.ocean_bgc import PAR_FRAC_SW, step_ocean_bgc_flexpft
 

@@ -79,7 +79,7 @@ PHI_LEAK_C4: float = 0.20          # Bundle-sheath CO2 leakiness phi_L [-] (Scot
 GBS_C4: float = 0.003              # Bundle-sheath conductance g_bs [mol m^-2 s^-1] (Scott & Smith, 2022, Table 1)
 
 # Peaked Arrhenius enzyme kinetics (Kumarathunge et al., 2019; Schneider et al., 2025, Table 1 & Eq. 7)
-HA_VCMAX: float = 71513.0          # Legacy sentinel / reference V_cmax activation energy [J mol^-1]
+HA_VCMAX: float = 71513.0          # Reference V_cmax activation energy [J mol^-1]
 HA_VCMAX_BASE: float = 42600.0     # V_cmax activation energy intercept at 0 degC [J mol^-1]
 HA_VCMAX_SLOPE: float = 1140.0     # V_cmax activation energy slope dH_a,V/dT_g [J mol^-1 K^-1]
 HA_JMAX: float = 40710.0           # J_max activation energy [J mol^-1] (Kumarathunge et al., 2019)

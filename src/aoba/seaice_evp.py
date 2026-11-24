@@ -1,8 +1,7 @@
 """Unstructured SCVT Voronoi Sea-Ice EVP Rheology & 5-Category Ice Thickness Distribution (ITD).
 
-Upgrades AOBA's free-drift + plastic ridging sea-ice transport (`ocean_ogcm.py`) with an
-opt-in (`enable_seaice_evp_itd = false` by default) Elastic-Viscous-Plastic (EVP) rheology
-and 5-category Ice Thickness Distribution (ITD) on the orthogonal SCVT Voronoi mesh:
+Extends AOBA's sea-ice transport (`ocean_ogcm.py`) with Elastic-Viscous-Plastic (EVP) rheology
+and a 5-category Ice Thickness Distribution (ITD) on the orthogonal SCVT Voronoi mesh:
 
 1. **EVP Internal Stress & Momentum Solver** (Hunke & Dukowicz, 1997, *J. Phys. Oceanogr.*,
    27, 1849-1867; Hibler, 1979, *JPO*, 9, 815-846; Turner et al., 2022, *Geosci. Model Dev.*,
@@ -248,9 +247,8 @@ def _evp_subcycle_core(
         # 2. Internal stress divergence along edge normal: (1/2) * d(s1)/dx + viscous shear damping
         f_int_e = 0.5 * ((s1[c1] - s1[c0]) * inv_dc_edge) * has_ice_e
 
-        # 3. 2-stage semi-implicit midpoint momentum update (no explicit Forward Euler Coriolis!)
-        #    Predictor estimates midpoint u_half; corrector evaluates TRiSK Coriolis at u_half with
-        #    implicit ocean drag, guaranteeing polar inertial stability even under weak water drag.
+        # 3. 2-stage semi-implicit midpoint momentum update with implicit ocean drag
+        #    for inertial stability at high latitudes.
         f_ext_e = a_ice_e * tau_air_e + f_int_e - m_ice_e * C.GRAVITY * grad_eta_e
         u_rel_mag = torch.abs(u_cur - u_ocn_e) + 0.05
         c_drag_o = a_ice_e * C.RHO_SEAWATER * EVP_C_WATER * u_rel_mag  # [kg m^-2 s^-1]

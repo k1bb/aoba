@@ -2,7 +2,7 @@
 
 > **言語 (Language)**: [English (formulation.md)](formulation.md) | 日本語
 
-本書は、結合気候・自律生態系モデル **AOBA** の連続系支配方程式、座標変換、スタガード空間離散化、時間積分法、物理・生態系・雪氷・海洋・動的氷床サブモデルの閉形式定式化、および統合設定・パラメータレジストリの全仕様を、*Description of MIROC6 AGCM* (2021)、*Description of MATSIRO6* (2021)、および *Detailed formulation of SCALE-RM* (Nishizawa et al., 2025) に準拠した完全性で記述したモデル記述書である。各式の定数・記号は `src/aoba/` の実装コードおよび `config/aoba_default.toml` と 1対1 で対応する。
+本書は、結合気候・自律生態系モデル **AOBA** の連続系支配方程式、座標変換、スタガード空間離散化、時間積分法、物理・生態系・雪氷・海洋・動的氷床サブモデルの閉形式定式化、および統合設定・パラメータレジストリの全仕様を記述したモデル記述書である。各式の定数・記号は `src/aoba/` の実装コードおよび `config/aoba_default.toml` と 1対1 で対応する。
 
 ---
 
