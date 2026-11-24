@@ -50,7 +50,9 @@ aoba/
 │   ├── architecture.md    # Governing architecture & literature traceability (English)
 │   ├── architecture_ja.md # Governing architecture & literature traceability (Japanese)
 │   ├── formulation.md     # Full mathematical model description (English)
-│   └── formulation_ja.md  # Full mathematical model description (Japanese)
+│   ├── formulation_ja.md  # Full mathematical model description (Japanese)
+│   ├── roadmap.md         # Future development roadmap (English)
+│   └── roadmap_ja.md      # Future development roadmap (Japanese)
 ├── data/                  # Boundary topography (Earth2014) & validation datasets
 ├── src/
 │   └── aoba/              # PyTorch + Metal/CUDA model source packages (37 modules)

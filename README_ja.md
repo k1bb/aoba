@@ -50,7 +50,9 @@ aoba/
 │   ├── architecture.md    # 支配構成・根拠文献トレーサビリティ仕様書（英語）
 │   ├── architecture_ja.md # 支配構成・根拠文献トレーサビリティ仕様書（日本語）
 │   ├── formulation.md     # 数理定式化モデル記述書（英語）
-│   └── formulation_ja.md  # 数理定式化モデル記述書（日本語）
+│   ├── formulation_ja.md  # 数理定式化モデル記述書（日本語）
+│   ├── roadmap.md         # 将来の開発課題・ロードマップ（英語）
+│   └── roadmap_ja.md      # 将来の開発課題・ロードマップ（日本語）
 ├── data/                  # 境界地形データ（Earth2014）・検証データセット
 ├── src/
 │   └── aoba/              # PyTorch + Metal/CUDA モデル本体パッケージ（全37モジュール）
