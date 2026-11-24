@@ -140,7 +140,7 @@ class AOBAConfig:
     co2_csv_path: str = ""                   # Custom (year, co2_ppmv) CSV path when co2_mode="csv"
     ch4_ppmv: float = CH4_PREIND_PPMV        # Well-mixed atmospheric CH4 [ppmv] (1850 piControl = 0.80825)
     n2o_ppmv: float = N2O_PREIND_PPMV        # Well-mixed atmospheric N2O [ppmv] (1850 piControl = 0.27302)
-    rad_scheme: str = "ckd"                  # Radiative transfer: "ckd" (16-band), "ckd_hd" (29-band/111 g-pt), or "four_band"
+    rad_scheme: str = "ckd"                  # "ckd" (16b), "ckd_hd" (29b/111g), "rrtmgp" (HITRAN 240g), or "four_band"
     enable_rad_3d_tica: bool = False         # 3D CRM tilted solar beam cloud shift (Várnai & Davies, 1999 TICA)
     o3_mode: str = "latitude_seasonal"       # "rcemip", "latitude_seasonal", "climatology", or "prognostic" (3D map-free O3)
     o3_file_path: str = ""                   # Optional external zonal/3D ozone (.npz/.nc) when o3_mode="climatology"
@@ -330,6 +330,7 @@ def _compute_four_band_radiation_chunked(
     nz, m_sub = pres_c.shape
     chunk = max(col_chunk, 1)
     rkey = str(rad_scheme).strip().lower()
+    use_rrtmgp = rkey == "rrtmgp"
     use_ckd_hd = rkey == "ckd_hd"
     use_ckd = rkey == "ckd"
 
@@ -354,6 +355,17 @@ def _compute_four_band_radiation_chunked(
             rei = re_ice_um[:, sl] if isinstance(re_ice_um, torch.Tensor) else re_ice_um
             ao = tuple(t[:, sl] for t in aero_opt) if aero_opt is not None else None
 
+        if use_rrtmgp:
+            from aoba.radiation_rrtmgp import compute_rrtmgp_radiation
+
+            return compute_rrtmgp_radiation(
+                pres_c=pc, pres_w=pw, temp_c=tc, temp_w=tw, dz_c=dz, rho_d_c=rh,
+                qv_c=qv, qc_c=qc, qi_c=qi, t_sfc=ts, albedo_vis=av, albedo_nir=an,
+                mu0=m0, s_toa=st, co2_ppmv=co2_ppmv, ch4_ppmv=ch4_ppmv, n2o_ppmv=n2o_ppmv,
+                emiss_sfc=em, re_liq_um=rel, re_ice_um=rei, cloud_sw_inhomog=cloud_sw_inhomog,
+                albedo_vis_dif=avf, albedo_nir_dif=anf, q_dust_c=qd, o3_vmr_c=o3,
+                o3_lw_coupling=o3_lw_coupling, aero_opt=ao,
+            )
         if use_ckd_hd:
             from aoba.radiation_hd import compute_ckd_hd_radiation
 
