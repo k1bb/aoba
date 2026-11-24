@@ -100,6 +100,7 @@ class AOBAConfig:
     enable_river_routing: bool = False       # Enable A1 map-free Priority-Flood Voronoi river routing (opt-in)
     enable_land_carbon: bool = False         # Enable A2 map-free terrestrial C cycle, permafrost C, & SPITFIRE fire (opt-in)
     enable_seaice_evp_itd: bool = False      # Enable A3 MPAS-Seaice Voronoi EVP rheology + 5-category ITD (opt-in)
+    enable_ogcm_fct_zstar: bool = False      # Enable A4 FESOM2-style 3D Zalesak FCT advection + exact z* coord (opt-in)
     re_liq_um: float = 10.0                  # Fallback/1M cloud liquid droplet effective radius [um]
     re_ice_um: float = 48.0                  # Fallback/1M cloud ice crystal effective radius [um]
     cloud_sw_inhomog: float = 0.65           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
@@ -1038,6 +1039,7 @@ def step_aoba_model(
             u10_ocn=u10_ocn,
             co2_ppmv=model.current_co2_ppmv(),
             river_mouth_flux=river_mouth_flux,
+            enable_fct_zstar=bool(cfg.enable_ogcm_fct_zstar),
         )
     else:
         step_ekman_ocean_voronoi(

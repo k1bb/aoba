@@ -976,6 +976,148 @@ def _ogcm_vdiff_post_freeze_core(
     return T_out, t_comp, S_out, sc_out, t_ml_out, m_ice_out
 
 
+def _ogcm_advect_fct_zstar_core(
+    q: torch.Tensor,
+    q_comp: torch.Tensor,
+    f_nl_q: torch.Tensor,
+    h_u_edge: torch.Tensor,
+    sx_int: torch.Tensor,
+    w_star: torch.Tensor,
+    h_e: torch.Tensor,
+    h_old_z: torch.Tensor,
+    h_new_z: torch.Tensor,
+    dz_c_int: torch.Tensor,
+    inv_dc_edge: torch.Tensor,
+    wet_cf: torch.Tensor,
+    wet_ef: torch.Tensor,
+    wet_int_cf: torch.Tensor,
+    wet_int_ef: torch.Tensor,
+    c0: torch.Tensor,
+    c1: torch.Tensor,
+    eoc: torch.Tensor,
+    div_w: torch.Tensor,
+    w_vor_edge: torch.Tensor,
+    active_eoc: torch.Tensor,
+    inv_area_c: torch.Tensor,
+    q_ref: float,
+    dt: float,
+    enable_full_redi: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A4 FESOM2-style 3D Zalesak FCT tracer advection + exact z* stretching + Redi + Kahan.
+
+    References
+    ----------
+    - Danilov et al. (2017, Geosci. Model Dev., 10, 765-789, FESOM2, Sec. 3.2 & 3.4)
+    - Zalesak (1979, J. Comput. Phys., 31, 335-362)
+    - Adcroft & Campin (2004, Ocean Modelling, 7, 269-284, z* vertical coordinate)
+    """
+    qp = (q - q_ref) * wet_cf
+    h_old_safe = torch.clamp(h_old_z, min=1.0)
+    h_new_safe = torch.clamp(h_new_z, min=1.0)
+    dh_z = h_new_z - h_old_z
+
+    # 1. Low-order monotone upwind fluxes (horizontal & vertical)
+    fl_h = (torch.clamp(h_u_edge, min=0.0) * qp[:, c0] + torch.clamp(h_u_edge, max=0.0) * qp[:, c1]) * wet_ef
+    w_int = w_star[1:-1]
+    fl_v = torch.where(w_int >= 0.0, w_int * qp[1:], w_int * qp[:-1]) * wet_int_cf
+
+    div_fl_h = (fl_h[:, eoc] * div_w.unsqueeze(0)).sum(dim=-1) * wet_cf
+    z_cell = torch.zeros_like(qp[0:1])
+    vin_fl = torch.cat([fl_v, z_cell], dim=0) - torch.cat([z_cell, fl_v], dim=0)
+    # Exact z* continuity-consistent low-order transported-and-diffused field q_td
+    qp_td = ((h_old_safe * qp + dt * (-div_fl_h + vin_fl)) / h_new_safe) * wet_cf
+
+    # 2. High-order 2nd-order centered fluxes & anti-diffusive fluxes A = F^H - F^L
+    fh_h = (0.5 * h_u_edge * (qp[:, c0] + qp[:, c1])) * wet_ef
+    fh_v = (0.5 * w_int * (qp[:-1] + qp[1:])) * wet_int_cf
+    ah_e = (fh_h - fl_h) * wet_ef
+    av_int = (fh_v - fl_v) * wet_int_cf
+
+    # 3. Local Voronoi + vertical neighborhood extrema (q_min, q_max) from (qp, qp_td)
+    q_hi0 = torch.maximum(qp, qp_td)
+    q_lo0 = torch.minimum(qp, qp_td)
+    # Gather neighbor extrema across edges using wet-masked sentinel
+    big_val = 1.0e6
+    e_hi = torch.where(wet_ef > 0.5, torch.maximum(q_hi0[:, c0], q_hi0[:, c1]), torch.full_like(ah_e, -big_val))
+    e_lo = torch.where(wet_ef > 0.5, torch.minimum(q_lo0[:, c0], q_lo0[:, c1]), torch.full_like(ah_e, +big_val))
+    q_max = torch.maximum(q_hi0, e_hi[:, eoc].max(dim=-1).values)
+    q_min = torch.minimum(q_lo0, e_lo[:, eoc].min(dim=-1).values)
+    # Include wet vertical neighbors (k-1, k+1)
+    q_up_hi = torch.cat([torch.where(wet_int_cf > 0.5, q_hi0[1:], q_hi0[:-1]), q_hi0[-1:]], dim=0)
+    q_dn_hi = torch.cat([q_hi0[:1], torch.where(wet_int_cf > 0.5, q_hi0[:-1], q_hi0[1:])], dim=0)
+    q_max = torch.maximum(q_max, torch.maximum(q_up_hi, q_dn_hi))
+    q_up_lo = torch.cat([torch.where(wet_int_cf > 0.5, q_lo0[1:], q_lo0[:-1]), q_lo0[-1:]], dim=0)
+    q_dn_lo = torch.cat([q_lo0[:1], torch.where(wet_int_cf > 0.5, q_lo0[:-1], q_lo0[1:])], dim=0)
+    q_min = torch.minimum(q_min, torch.minimum(q_up_lo, q_dn_lo))
+
+    # 4. Zalesak (1979) P^+, P^-, Q^+, Q^-, R^+, R^- and face limiters C_h, C_v in [0, 1]
+    # Note: div_w > 0 means edge points OUT of cell i, so incoming anti-diffusive flux is -ah_e * div_w > 0
+    a_in_h = -(ah_e[:, eoc] * div_w.unsqueeze(0))
+    p_plus_h = torch.clamp(a_in_h, min=0.0).sum(dim=-1)
+    p_minus_h = torch.clamp(-a_in_h, min=0.0).sum(dim=-1)
+    # Vertical: av_int > 0 flows UPWARD from k+1 into k (into k, out of k+1)
+    p_plus_v = torch.cat([torch.clamp(av_int, min=0.0), z_cell], dim=0) + torch.cat([z_cell, torch.clamp(-av_int, min=0.0)], dim=0)
+    p_minus_v = torch.cat([torch.clamp(-av_int, min=0.0), z_cell], dim=0) + torch.cat([z_cell, torch.clamp(av_int, min=0.0)], dim=0)
+
+    eps = 1.0e-12
+    p_plus = dt * (p_plus_h + p_plus_v) * wet_cf
+    p_minus = dt * (p_minus_h + p_minus_v) * wet_cf
+    q_plus = h_new_safe * torch.clamp(q_max - qp_td, min=0.0)
+    q_minus = h_new_safe * torch.clamp(qp_td - q_min, min=0.0)
+    r_plus = torch.where(p_plus > eps, torch.clamp(q_plus / (p_plus + eps), 0.0, 1.0), torch.ones_like(qp))
+    r_minus = torch.where(p_minus > eps, torch.clamp(q_minus / (p_minus + eps), 0.0, 1.0), torch.ones_like(qp))
+
+    # Edge limiter: ah_e >= 0 flows c0 -> c1 (out of c0, into c1)
+    c_lim_h = torch.where(
+        ah_e >= 0.0,
+        torch.minimum(r_minus[:, c0], r_plus[:, c1]),
+        torch.minimum(r_plus[:, c0], r_minus[:, c1]),
+    ) * wet_ef
+    # Vertical limiter: av_int >= 0 flows k+1 -> k (out of k+1, into k)
+    c_lim_v = torch.where(
+        av_int >= 0.0,
+        torch.minimum(r_minus[1:], r_plus[:-1]),
+        torch.minimum(r_plus[1:], r_minus[:-1]),
+    ) * wet_int_cf
+
+    f_adv_h = fl_h + c_lim_h * ah_e
+    f_adv_v = fl_v + c_lim_v * av_int
+
+    # 5. Full Rotated Redi Diffusion & KPP Non-Local Flux (identical to standard path)
+    dq_dx = ((qp[:, c1] - qp[:, c0]) * inv_dc_edge.unsqueeze(0)) * wet_ef
+    if enable_full_redi:
+        dq_dz_c = ((qp[1:] - qp[:-1]) / dz_c_int) * wet_int_cf
+        dq_dz_e = 0.5 * (dq_dz_c[:, c0] + dq_dz_c[:, c1]) * wet_int_ef
+        sx_dqdz_int = sx_int * dq_dz_e
+        z_row = torch.zeros_like(dq_dx[0:1])
+        sx_dqdz_lay = 0.5 * (torch.cat([sx_dqdz_int, z_row], dim=0) + torch.cat([z_row, sx_dqdz_int], dim=0))
+        f_dif = -KAPPA_REDI_HORIZ * h_e * (dq_dx + sx_dqdz_lay) * wet_ef
+
+        dq_dx_int = 0.5 * (dq_dx[:-1] + dq_dx[1:]) * wet_int_ef
+        s_dqdx_ew = (sx_int * dq_dx_int) * w_vor_edge.unsqueeze(0)
+        s_dot_gradq = (s_dqdx_ew[:, eoc] * active_eoc.unsqueeze(0)).sum(dim=-1) * inv_area_c.unsqueeze(0)
+        f_v_redi_cross = (KAPPA_REDI_HORIZ * s_dot_gradq) * wet_int_cf
+    else:
+        f_dif = -KAPPA_REDI_HORIZ * h_e * dq_dx * wet_ef
+        f_v_redi_cross = torch.zeros_like(f_nl_q)
+
+    f_tot_h = f_adv_h + f_dif
+    div_h = (f_tot_h[:, eoc] * div_w.unsqueeze(0)).sum(dim=-1) * wet_cf
+
+    h_min_int = torch.minimum(h_new_safe[:-1], h_new_safe[1:])
+    q_span = torch.abs(qp[1:] - qp[:-1]) + 0.5
+    f_nl_cap = 0.35 * h_min_int * q_span / max(dt, 1.0)
+    f_nl_lim = torch.clamp(f_nl_q, -f_nl_cap, f_nl_cap) * wet_int_cf
+
+    f_v_tot = f_adv_v + f_v_redi_cross + f_nl_lim
+    v_inflow = torch.cat([f_v_tot, z_cell], dim=0) - torch.cat([z_cell, f_v_tot], dim=0)
+
+    # Exact z* flux-form update: h_new * q_new = h_old * q_old + dt * (-div_h + v_inflow)
+    # -> dq = (dt * (-div_h + v_inflow) - dh_z * qp) / h_new_safe (exact constancy & conservation!)
+    dq_fct = ((dt * (-div_h + v_inflow) - dh_z * qp) / h_new_safe) * wet_cf
+    return _kahan_add(q, dq_fct, q_comp)
+
+
 def _ogcm_advect_redi_core(
     q: torch.Tensor,
     q_comp: torch.Tensor,
@@ -1108,6 +1250,7 @@ def step_ogcm_voronoi(
     u10_ocn: torch.Tensor | None = None,
     co2_ppmv: float = 284.3,
     river_mouth_flux: torch.Tensor | None = None,
+    enable_fct_zstar: bool = False,
 ) -> None:
     """Advance 3D SCVT Voronoi OGCM (`temp`, `sal`, `u_edge`, `eta`) & dynamic sea ice by `dt` [s].
 
@@ -1250,27 +1393,61 @@ def step_ogcm_voronoi(
 
     # 8. 3D Conservative Flux-Form Tracer Advection (Anomaly Form q' = q - q_ref to minimize float32 cancellation)
     #    + Full Rotated Redi Diffusion + KPP Non-Local Flux + Neumaier/Kahan Compensated Summation
-    adv_fn = maybe_cuda_compile(_ogcm_advect_redi_core, device=dev)
-    T, t_comp = adv_fn(
-        T, t_comp, f_nl_t, h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
-        dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
-        c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
-        T_REF_EOS_K, dt, bool(ENABLE_FULL_REDI),
-    )
-    S, s_comp = adv_fn(
-        S, s_comp, f_nl_s, h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
-        dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
-        c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
-        S_REF_PSU, dt, bool(ENABLE_FULL_REDI),
-    )
+    if enable_fct_zstar:
+        # A4 FESOM2-style exact z* proportional column stretching h*_k = h_c * (1 + eta / H) + Zalesak FCT
+        # (Danilov et al., 2017; Adcroft & Campin, 2004). Exact continuity:
+        # (h*_new - h*_old)/dt + div_h(h_u_edge) - (w*_below - w*_above) == 0 at EVERY layer k!
+        h_col_s = cache["h_col_safe"]
+        scale_old = torch.clamp(1.0 + eta_old / h_col_s, min=0.5, max=1.5)
+        scale_new = torch.clamp(1.0 + eta_new / h_col_s, min=0.5, max=1.5)
+        h_old_z = h_c * scale_old.unsqueeze(0)
+        h_new_z = h_c * scale_new.unsqueeze(0)
+        # Exact z* coordinate velocity w*_k at interior interfaces k+1/2 (w_vel[0] = w_vel[-1] = 0):
+        # Cumulative thickness fraction below interface k+1/2 = (cumsum_from_bottom(h_c)[k+1]) / H
+        h_below = torch.flip(torch.cumsum(torch.flip(h_c, dims=[0]), dim=0), dims=[0])
+        frac_below = (h_below[1:] / h_col_s.unsqueeze(0)) * wet_int_cf
+        deta_dt_eff = ((eta_new - eta_old) / max(dt, 1.0)) * is_ocn_f
+        w_star_int = (w_vel[1:-1] - frac_below * deta_dt_eff.unsqueeze(0)) * wet_int_cf
+        z_w0 = torch.zeros_like(w_vel[0:1])
+        w_star = torch.cat([z_w0, w_star_int, z_w0], dim=0)
+
+        fct_fn = maybe_cuda_compile(_ogcm_advect_fct_zstar_core, device=dev)
+        T, t_comp = fct_fn(
+            T, t_comp, f_nl_t, h_u_edge, sx_int, w_star, h_e, h_old_z, h_new_z,
+            dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
+            c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
+            T_REF_EOS_K, dt, bool(ENABLE_FULL_REDI),
+        )
+        S, s_comp = fct_fn(
+            S, s_comp, f_nl_s, h_u_edge, sx_int, w_star, h_e, h_old_z, h_new_z,
+            dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
+            c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
+            S_REF_PSU, dt, bool(ENABLE_FULL_REDI),
+        )
+    else:
+        adv_fn = maybe_cuda_compile(_ogcm_advect_redi_core, device=dev)
+        T, t_comp = adv_fn(
+            T, t_comp, f_nl_t, h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
+            dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
+            c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
+            T_REF_EOS_K, dt, bool(ENABLE_FULL_REDI),
+        )
+        S, s_comp = adv_fn(
+            S, s_comp, f_nl_s, h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
+            dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
+            c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
+            S_REF_PSU, dt, bool(ENABLE_FULL_REDI),
+        )
 
     # 9-10. Strictly Conservative Flux-Increment Implicit Vertical Mixing (Float32-Safe!) & Freezing Check
     #    Solving `(I + L) dq = -L q` and reconstructing telescoping fluxes `F_imp = c_dif * d(q + dq)`
     #    prevents float32 diagonal underflow (`1.0f + c_dif/h == 1.0f` in the abyssal ocean) from
     #    creating spurious heat/salt, while `_kahan_add` retains sub-ULP deep-ocean tendencies.
     vdiff_prep_fn = maybe_cuda_compile(_ogcm_vdiff_prep_core, device=dev)
+    h_c_vdiff = torch.clamp(h_new_z, min=1.0) if enable_fct_zstar else h_c_safe
+    h0_vdiff = h_c_vdiff[0] if enable_fct_zstar else h0_new
     kv, c_dif, h_eff, a_t, b_t, d_t, t_diff, s_diff, rhs_t, rhs_s = vdiff_prep_fn(
-        T, S, kv_diag, kv_redi, z_c_2d, dz_c_int, h_c_safe, h0_new,
+        T, S, kv_diag, kv_redi, z_c_2d, dz_c_int, h_c_vdiff, h0_vdiff,
         wet_cf, wet_int_c, wet_int_cf, dt,
     )
     ogcm.kv_last = kv

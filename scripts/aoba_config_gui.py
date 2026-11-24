@@ -1356,6 +1356,7 @@ const PARAM_DOCS = {
   enable_river_routing: { ja: "Priority-Flood (Barnes 2014)＋運動波遅延 (mizuRoute) によるボロノイ河川ルーティングを有効化 (既定 false)", en: "Enable map-free Priority-Flood Voronoi river routing & kinematic delay (default false)" },
   enable_land_carbon: { ja: "マップフリー陸域炭素循環（木部・リター・5層凍土C・Rh）＋SPITFIRE自律森林火災を有効化 (既定 false)", en: "Enable map-free terrestrial carbon cycle (wood/litter/5-layer permafrost soil C) & autonomous SPITFIRE wildfire (default false)" },
   enable_seaice_evp_itd: { ja: "MPAS-Seaice 準拠の海氷 EVP レオロジー＋5区分氷厚分布 (ITD)・機械的リッジングを有効化 (既定 false)", en: "Enable MPAS-Seaice Voronoi EVP sea-ice rheology & 5-category ITD with mechanical ridging (default false)" },
+  enable_ogcm_fct_zstar: { ja: "FESOM2 準拠の 3D OGCM 高次 Zalesak FCT トレーサー移流＋厳密 z* 体積保存座標を有効化 (既定 false)", en: "Enable FESOM2-style 3D OGCM Zalesak FCT tracer advection & exact z* vertical coordinate (default false)" },
   microphysics_scheme: { ja: "雲微物理スキーム (two_moment: 2モーメント数濃度+粒径依存放射 / one_moment: 旧SAM 1M)", en: "Cloud microphysics scheme (two_moment prognostic Nc,Ni,re / one_moment legacy KR03)" },
   o3_mode: { ja: "オゾン分布モード (rcemip: 1D一様 / latitude_seasonal: 解析的2D緯度季節 / climatology: 外部帯状平均)", en: "Ozone mode (rcemip 1D / latitude_seasonal 2D / climatology external)" },
   o3_file_path: { ja: "外部オゾン気候値ファイル (.npz / .nc; 空欄時は data/boundary/ozone を参照)", en: "External ozone climatology path (.npz/.nc; blank uses data/boundary/ozone)" },
