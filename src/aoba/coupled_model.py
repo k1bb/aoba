@@ -98,6 +98,7 @@ class AOBAConfig:
     enable_seaice_drift: bool = True         # Enable dynamic wind/current sea-ice drift in 3D OGCM mode
     enable_ocean_bgc: bool = False           # Enable FlexPFT marine BGC & OMIP/mocsy 2.0 carbonate chemistry (opt-in)
     enable_river_routing: bool = False       # Enable A1 map-free Priority-Flood Voronoi river routing (opt-in)
+    enable_land_carbon: bool = False         # Enable A2 map-free terrestrial C cycle, permafrost C, & SPITFIRE fire (opt-in)
     re_liq_um: float = 10.0                  # Fallback/1M cloud liquid droplet effective radius [um]
     re_ice_um: float = 48.0                  # Fallback/1M cloud ice crystal effective radius [um]
     cloud_sw_inhomog: float = 0.65           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
@@ -182,6 +183,7 @@ class AOBAState:
     clim_sub: ClimateAccumulator | None = None
     icesheet: IceSheetState | None = None
     river: object | None = None
+    land_carbon: object | None = None
     sim_time_sec: float = 0.0
     step_count: int = 0
     rad_cache: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -568,6 +570,13 @@ def init_aoba_model(
         river=(
             __import__("aoba.river_routing", fromlist=["init_river_routing_state"]).init_river_routing_state(mesh, device=dev)
             if bool(cfg.enable_river_routing)
+            else None
+        ),
+        land_carbon=(
+            __import__("aoba.land_carbon", fromlist=["init_land_carbon_state"]).init_land_carbon_state(
+                sfc.surf_type, sfc.bio.lai, sfc.bio.h_canopy, device=dev
+            )
+            if bool(cfg.enable_land_carbon)
             else None
         ),
         calendar=AobaCalendar(
@@ -1402,6 +1411,35 @@ def step_aoba_model(
     # Host monthly Köppen-Geiger accumulators (calendar month index 0..11)
     precip_tot = rain_new + snow_new
     t_air = _sub_to_cell(t_air_sub, nc, n_sub)
+    if bool(cfg.enable_land_carbon):
+        from aoba.land_carbon import init_land_carbon_state, step_land_carbon_and_fire
+
+        lai_c = _sub_to_cell(sfc_sub.bio.lai, nc, n_sub)
+        hc_c = _sub_to_cell(sfc_sub.bio.h_canopy, nc, n_sub)
+        if model.land_carbon is None:
+            model.land_carbon = init_land_carbon_state(sfc.surf_type, lai_c, hc_c, device=t_air.device)
+        resp_leaf_c = (
+            _sub_to_cell(sfc_diag_sub.resp_leaf, nc, n_sub)
+            if sfc_diag_sub.resp_leaf is not None
+            else torch.zeros_like(gpp_cell)
+        )
+        step_land_carbon_and_fire(
+            lc=model.land_carbon,
+            surf_type=sfc.surf_type,
+            gpp_umol=gpp_cell,
+            resp_leaf_umol=resp_leaf_c,
+            lai=lai_c,
+            h_canopy=hc_c,
+            t_soil=_sub_to_cell(sfc_sub.t_soil, nc, n_sub),
+            w_liq_soil=_sub_to_cell(sfc_sub.w_liq_soil, nc, n_sub),
+            w_ice_soil=_sub_to_cell(sfc_sub.w_ice_soil, nc, n_sub),
+            f_snow=_sub_to_cell(sfc_diag_sub.f_snow_land, nc, n_sub),
+            t_sfc_k=t_air,
+            vpd_pa=_sub_to_cell(vpd_sub, nc, n_sub),
+            u10_ms=_sub_to_cell(torch.hypot(u_sub_0, v_sub_0), nc, n_sub),
+            precip_kgm2s=precip_tot,
+            dt=dt,
+        )
     month_idx = model.calendar.date_at(model.sim_time_sec).month - 1
     clim.month_temp_sum_c[month_idx] += (t_air - C.T_FREEZE)
     clim.month_precip_mm[month_idx] += precip_tot * dt

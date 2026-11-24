@@ -1354,6 +1354,7 @@ const PARAM_DOCS = {
   enable_seaice_drift: { ja: "3D OGCM 時の風・海流による海氷の力学的移流 (Hibler 1979 準拠)", en: "Enable dynamic wind/current sea-ice drift in 3D OGCM mode" },
   enable_ocean_bgc: { ja: "FlexPFT 最適性海洋生態系＋OMIP/mocsy 2.0 炭酸塩化学・大気海洋CO₂交換を有効化 (既定 false)", en: "Enable FlexPFT optimality marine BGC & OMIP/mocsy 2.0 carbonate chemistry (default false)" },
   enable_river_routing: { ja: "Priority-Flood (Barnes 2014)＋運動波遅延 (mizuRoute) によるボロノイ河川ルーティングを有効化 (既定 false)", en: "Enable map-free Priority-Flood Voronoi river routing & kinematic delay (default false)" },
+  enable_land_carbon: { ja: "マップフリー陸域炭素循環（木部・リター・5層凍土C・Rh）＋SPITFIRE自律森林火災を有効化 (既定 false)", en: "Enable map-free terrestrial carbon cycle (wood/litter/5-layer permafrost soil C) & autonomous SPITFIRE wildfire (default false)" },
   microphysics_scheme: { ja: "雲微物理スキーム (two_moment: 2モーメント数濃度+粒径依存放射 / one_moment: 旧SAM 1M)", en: "Cloud microphysics scheme (two_moment prognostic Nc,Ni,re / one_moment legacy KR03)" },
   o3_mode: { ja: "オゾン分布モード (rcemip: 1D一様 / latitude_seasonal: 解析的2D緯度季節 / climatology: 外部帯状平均)", en: "Ozone mode (rcemip 1D / latitude_seasonal 2D / climatology external)" },
   o3_file_path: { ja: "外部オゾン気候値ファイル (.npz / .nc; 空欄時は data/boundary/ozone を参照)", en: "External ozone climatology path (.npz/.nc; blank uses data/boundary/ozone)" },
