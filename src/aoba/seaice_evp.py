@@ -25,6 +25,11 @@ import math
 import torch
 
 from aoba import constants as C
+from aoba.kernels import (
+    dispatch_seaice_evp_subcycle_metal,
+    dispatch_seaice_itd_sync_metal,
+    get_active_gpu_backend,
+)
 from aoba.runtime import maybe_cuda_compile
 from aoba.surface import MC_SEAICE_CRIT, SURF_OCEAN, SurfaceState
 
@@ -67,6 +72,15 @@ def _sync_itd_from_total_mass(
     dtype = m_target.dtype
     dev = m_target.device
     is_ocn_f = is_ocean.to(dtype)
+    if get_active_gpu_backend(dev) in ("mps", "cuda"):
+        return dispatch_seaice_itd_sync_metal(
+            a_cat=a_cat,
+            v_cat=v_cat,
+            m_target=m_target,
+            m_prev=m_prev,
+            is_ocn_f=is_ocn_f,
+            inv_rho_seaice=1.0 / C.RHO_SEAICE,
+        )
     v_target = torch.clamp(m_target / C.RHO_SEAICE, min=0.0) * is_ocn_f
     v_cur = torch.clamp(v_cat, min=0.0).sum(dim=0)
     dv = v_target - v_cur
@@ -321,42 +335,95 @@ def step_seaice_evp_itd_voronoi(
     u_cap = min(EVP_U_MAX_MS, 0.25 * dc_min / max(dt, 1.0))
 
     # 3. Subcycled EVP momentum & internal stress solver
-    evp_fn = maybe_cuda_compile(_evp_subcycle_core, device=sfc.m_seaice.device)
-    evp.u_ice_e, evp.sigma_1, evp.sigma_s = evp_fn(
-        evp.u_ice_e, evp.sigma_1, evp.sigma_s, p_strength, m_ice_e, a_ice_e,
-        tau_air_e, u_ocn_e, grad_eta_e, mesh.f_vert,
-        mesh.verts_on_edge[:, 0], mesh.verts_on_edge[:, 1], mesh.trisk_edges, mesh.trisk_weights,
-        c0, c1, eoc, div_w, inv_dc_edge, mask_e, is_ocn_f, u_cap, float(dt), EVP_N_SUBCYCLES,
-    )
+    dev = sfc.m_seaice.device
+    if get_active_gpu_backend(dev) in ("mps", "cuda"):
+        evp_c = cache if cache is not None else {}
+        c0_i32 = evp_c.get("c0_i32")
+        if c0_i32 is None:
+            c0_i32 = c0.to(torch.int32).contiguous()
+            c1_i32 = c1.to(torch.int32).contiguous()
+            eoc_i32 = eoc.to(torch.int32).contiguous()
+            if cache is not None:
+                cache["c0_i32"] = c0_i32
+                cache["c1_i32"] = c1_i32
+                cache["eoc_i32"] = eoc_i32
+        else:
+            c1_i32 = evp_c["c1_i32"]
+            eoc_i32 = evp_c["eoc_i32"]
+        ep_idx_i32 = evp_c.get("ep_idx_i32")
+        if ep_idx_i32 is None:
+            ep_idx_i32 = mesh.trisk_edges.to(torch.int32).contiguous()
+            f_e = 0.5 * (mesh.f_vert[mesh.verts_on_edge[:, 0]] + mesh.f_vert[mesh.verts_on_edge[:, 1]])
+            f_pair = 0.5 * (f_e.unsqueeze(-1) + f_e[mesh.trisk_edges])
+            cor_w_c = (mesh.trisk_weights * f_pair).contiguous()
+            if cache is not None:
+                cache["ep_idx_i32"] = ep_idx_i32
+                cache["evp_cor_w"] = cor_w_c
+        else:
+            cor_w_c = evp_c["evp_cor_w"]
+        dt_e = float(dt) / float(EVP_N_SUBCYCLES)
+        t_damp = 0.36 * float(dt)
+        alpha_e = dt_e / max(t_damp, 1.0)
+        inv_1pa = 1.0 / (1.0 + alpha_e)
+        e2_inv = 1.0 / (EVP_ECCENT * EVP_ECCENT)
+        has_ice_e = (m_ice_e > 1.0).to(dtype) * mask_e
+        evp.u_ice_e, evp.sigma_1, evp.sigma_s = dispatch_seaice_evp_subcycle_metal(
+            u_ice_e=evp.u_ice_e,
+            sigma_1=evp.sigma_1,
+            sigma_s=evp.sigma_s,
+            p_strength=p_strength,
+            m_ice_e=m_ice_e,
+            a_ice_e=a_ice_e,
+            tau_air_e=tau_air_e,
+            u_ocn_e=u_ocn_e,
+            grad_eta_e=grad_eta_e,
+            cor_w=cor_w_c,
+            ep_idx_i32=ep_idx_i32,
+            c0_i32=c0_i32,
+            c1_i32=c1_i32,
+            eoc_i32=eoc_i32,
+            div_w=div_w,
+            inv_dc_edge=inv_dc_edge,
+            has_ice_e=has_ice_e,
+            is_ocn_f=is_ocn_f,
+            alpha_e=alpha_e,
+            inv_1pa=inv_1pa,
+            e2_inv=e2_inv,
+            delta_min=EVP_DELTA_MIN,
+            dt_e=dt_e,
+            u_cap=u_cap,
+            rho_sw_cw=C.RHO_SEAWATER * EVP_C_WATER,
+            gravity=C.GRAVITY,
+            n_sub=EVP_N_SUBCYCLES,
+        )
+    else:
+        evp_fn = maybe_cuda_compile(_evp_subcycle_core, device=dev)
+        evp.u_ice_e, evp.sigma_1, evp.sigma_s = evp_fn(
+            evp.u_ice_e, evp.sigma_1, evp.sigma_s, p_strength, m_ice_e, a_ice_e,
+            tau_air_e, u_ocn_e, grad_eta_e, mesh.f_vert,
+            mesh.verts_on_edge[:, 0], mesh.verts_on_edge[:, 1], mesh.trisk_edges, mesh.trisk_weights,
+            c0, c1, eoc, div_w, inv_dc_edge, mask_e, is_ocn_f, u_cap, float(dt), EVP_N_SUBCYCLES,
+        )
 
-    # 4. Strictly conservative 2-stage SSP-RK2 (Heun) Voronoi advection of 5 ITD (a_cat, v_cat) + snow
+    # 4. Batched strictly conservative 2-stage SSP-RK2 (Heun) Voronoi advection of [a_cat(5), v_cat(5), swe(1)]
     u_pos = torch.clamp(evp.u_ice_e, min=0.0)
     u_neg = torch.clamp(evp.u_ice_e, max=0.0)
+    diff_w = EVP_DIFF_H * inv_dc_edge * mask_e
+    q_all = torch.cat([evp.a_cat, evp.v_cat, torch.clamp(sfc.swe_seaice, min=0.0).unsqueeze(0)], dim=0)
 
-    def _tend_2d(q: torch.Tensor) -> torch.Tensor:
+    def _tend_b(q: torch.Tensor) -> torch.Tensor:
         f_q = (
             u_pos.unsqueeze(0) * q[:, c0]
             + u_neg.unsqueeze(0) * q[:, c1]
-            - EVP_DIFF_H * ((q[:, c1] - q[:, c0]) * inv_dc_edge.unsqueeze(0)) * mask_e.unsqueeze(0)
+            - (q[:, c1] - q[:, c0]) * diff_w.unsqueeze(0)
         )
         return -(f_q[:, eoc] * div_w.unsqueeze(0)).sum(dim=-1) * is_ocn_f.unsqueeze(0)
 
-    def _advect_2d(q: torch.Tensor) -> torch.Tensor:
-        q1 = torch.clamp(q + dt * _tend_2d(q), min=0.0) * is_ocn_f.unsqueeze(0)
-        q2 = 0.5 * q + 0.5 * (q1 + dt * _tend_2d(q1))
-        return torch.clamp(q2, min=0.0) * is_ocn_f.unsqueeze(0)
-
-    evp.a_cat = _advect_2d(evp.a_cat)
-    evp.v_cat = _advect_2d(evp.v_cat)
-
-    def _tend_1d(q: torch.Tensor) -> torch.Tensor:
-        f_s = u_pos * q[c0] + u_neg * q[c1] - EVP_DIFF_H * ((q[c1] - q[c0]) * inv_dc_edge) * mask_e
-        return -(f_s[eoc] * div_w).sum(dim=-1) * is_ocn_f
-
-    s_i = torch.clamp(sfc.swe_seaice, min=0.0)
-    s_1 = torch.clamp(s_i + dt * _tend_1d(s_i), min=0.0) * is_ocn_f
-    s_2 = torch.clamp(0.5 * s_i + 0.5 * (s_1 + dt * _tend_1d(s_1)), min=0.0) * is_ocn_f
-    sfc.swe_seaice = torch.where(is_ocean, s_2, sfc.swe_seaice)
+    q_1 = torch.clamp(q_all + dt * _tend_b(q_all), min=0.0) * is_ocn_f.unsqueeze(0)
+    q_2 = torch.clamp(0.5 * q_all + 0.5 * (q_1 + dt * _tend_b(q_1)), min=0.0) * is_ocn_f.unsqueeze(0)
+    evp.a_cat = q_2[:N_ITD_CAT]
+    evp.v_cat = q_2[N_ITD_CAT:2 * N_ITD_CAT]
+    sfc.swe_seaice = torch.where(is_ocean, q_2[2 * N_ITD_CAT], sfc.swe_seaice)
 
     # 5. Mechanical ridging & exact ITD rebinning -> write conserved total mass back to sfc.m_seaice
     m_adv = evp.v_cat.sum(dim=0) * C.RHO_SEAICE

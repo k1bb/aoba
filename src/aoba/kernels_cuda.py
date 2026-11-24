@@ -1,6 +1,6 @@
 """Automatic single-source Metal-to-CUDA transpiler and PyTorch CUDA kernel backend for AOBA.
 
-Translates AOBA's 43 fused Metal compute shaders (`kernels.py`, `kernels_extra.py`,
+Translates AOBA's 51 fused Metal compute shaders (`kernels.py`, `kernels_extra.py`,
 `kernels_physics.py`) directly into native NVIDIA CUDA C++17 kernels compiled on demand
 via `torch.utils.cpp_extension.load_inline`, exposing an identical `lib.<kernel>(...,
 threads=..., group_size=...)` dispatch interface so every physics and dynamics module
@@ -44,6 +44,8 @@ _HEAVY_COL_KERNELS: frozenset[str] = frozenset({
     "oro_gwd_col",
     "ngwd_propagate_col",
     "dust_column_col",
+    "natural_aerosol_4sp_col",
+    "ocean_bgc_column_col",
     "two_leaf_gas_exchange_col",
     "surface_transfer_col",
 })

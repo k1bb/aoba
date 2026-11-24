@@ -55,7 +55,11 @@ import math
 import torch
 
 from aoba import constants as C
-from aoba.kernels import solve_tridiagonal_batched
+from aoba.kernels import (
+    dispatch_ogcm_barotropic_rk3_metal,
+    get_active_gpu_backend,
+    solve_tridiagonal_batched,
+)
 from aoba.runtime import maybe_cuda_compile
 from aoba.scvt_dynamics import (
     compute_scvt_divergence,
@@ -1186,6 +1190,210 @@ def _ogcm_advect_redi_core(
     return _kahan_add(q, dq_adv, q_comp)
 
 
+def _ogcm_advect_fct_zstar_batch(
+    q: torch.Tensor,
+    q_comp: torch.Tensor,
+    f_nl_q: torch.Tensor,
+    h_u_edge: torch.Tensor,
+    sx_int: torch.Tensor,
+    w_star: torch.Tensor,
+    h_e: torch.Tensor,
+    h_old_z: torch.Tensor,
+    h_new_z: torch.Tensor,
+    dz_c_int: torch.Tensor,
+    inv_dc_edge: torch.Tensor,
+    wet_cf: torch.Tensor,
+    wet_ef: torch.Tensor,
+    wet_int_cf: torch.Tensor,
+    wet_int_ef: torch.Tensor,
+    c0: torch.Tensor,
+    c1: torch.Tensor,
+    eoc: torch.Tensor,
+    div_w: torch.Tensor,
+    w_vor_edge: torch.Tensor,
+    active_eoc: torch.Tensor,
+    inv_area_c: torch.Tensor,
+    q_ref: torch.Tensor,
+    dt: float,
+    enable_full_redi: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched `[B, nzo, nc]` FESOM2-style 3D Zalesak FCT + exact z* + Redi + Kahan."""
+    wet_cf_b = wet_cf.unsqueeze(0)
+    wet_ef_b = wet_ef.unsqueeze(0)
+    wet_ic_b = wet_int_cf.unsqueeze(0)
+    wet_ie_b = wet_int_ef.unsqueeze(0)
+
+    qp = (q - q_ref) * wet_cf_b
+    h_old_safe = torch.clamp(h_old_z, min=1.0).unsqueeze(0)
+    h_new_safe = torch.clamp(h_new_z, min=1.0).unsqueeze(0)
+    dh_z = (h_new_z - h_old_z).unsqueeze(0)
+    hu_b = h_u_edge.unsqueeze(0)
+    w_int = w_star[1:-1].unsqueeze(0)
+
+    fl_h = (torch.clamp(hu_b, min=0.0) * qp[:, :, c0] + torch.clamp(hu_b, max=0.0) * qp[:, :, c1]) * wet_ef_b
+    fl_v = torch.where(w_int >= 0.0, w_int * qp[:, 1:], w_int * qp[:, :-1]) * wet_ic_b
+
+    div_w_b = div_w.unsqueeze(0).unsqueeze(0)
+    div_fl_h = (fl_h[:, :, eoc] * div_w_b).sum(dim=-1) * wet_cf_b
+    z_cell = torch.zeros_like(qp[:, 0:1])
+    vin_fl = torch.cat([fl_v, z_cell], dim=1) - torch.cat([z_cell, fl_v], dim=1)
+    qp_td = ((h_old_safe * qp + dt * (-div_fl_h + vin_fl)) / h_new_safe) * wet_cf_b
+
+    fh_h = (0.5 * hu_b * (qp[:, :, c0] + qp[:, :, c1])) * wet_ef_b
+    fh_v = (0.5 * w_int * (qp[:, :-1] + qp[:, 1:])) * wet_ic_b
+    ah_e = (fh_h - fl_h) * wet_ef_b
+    av_int = (fh_v - fl_v) * wet_ic_b
+
+    q_hi0 = torch.maximum(qp, qp_td)
+    q_lo0 = torch.minimum(qp, qp_td)
+    big_val = 1.0e6
+    e_hi = torch.where(wet_ef_b > 0.5, torch.maximum(q_hi0[:, :, c0], q_hi0[:, :, c1]), torch.full_like(ah_e, -big_val))
+    e_lo = torch.where(wet_ef_b > 0.5, torch.minimum(q_lo0[:, :, c0], q_lo0[:, :, c1]), torch.full_like(ah_e, +big_val))
+    q_max = torch.maximum(q_hi0, e_hi[:, :, eoc].max(dim=-1).values)
+    q_min = torch.minimum(q_lo0, e_lo[:, :, eoc].min(dim=-1).values)
+
+    q_up_hi = torch.cat([torch.where(wet_ic_b > 0.5, q_hi0[:, 1:], q_hi0[:, :-1]), q_hi0[:, -1:]], dim=1)
+    q_dn_hi = torch.cat([q_hi0[:, :1], torch.where(wet_ic_b > 0.5, q_hi0[:, :-1], q_hi0[:, 1:])], dim=1)
+    q_max = torch.maximum(q_max, torch.maximum(q_up_hi, q_dn_hi))
+    q_up_lo = torch.cat([torch.where(wet_ic_b > 0.5, q_lo0[:, 1:], q_lo0[:, :-1]), q_lo0[:, -1:]], dim=1)
+    q_dn_lo = torch.cat([q_lo0[:, :1], torch.where(wet_ic_b > 0.5, q_lo0[:, :-1], q_lo0[:, 1:])], dim=1)
+    q_min = torch.minimum(q_min, torch.minimum(q_up_lo, q_dn_lo))
+
+    a_in_h = -(ah_e[:, :, eoc] * div_w_b)
+    p_plus_h = torch.clamp(a_in_h, min=0.0).sum(dim=-1)
+    p_minus_h = torch.clamp(-a_in_h, min=0.0).sum(dim=-1)
+    p_plus_v = torch.cat([torch.clamp(av_int, min=0.0), z_cell], dim=1) + torch.cat([z_cell, torch.clamp(-av_int, min=0.0)], dim=1)
+    p_minus_v = torch.cat([torch.clamp(-av_int, min=0.0), z_cell], dim=1) + torch.cat([z_cell, torch.clamp(av_int, min=0.0)], dim=1)
+
+    eps = 1.0e-12
+    p_plus = dt * (p_plus_h + p_plus_v) * wet_cf_b
+    p_minus = dt * (p_minus_h + p_minus_v) * wet_cf_b
+    q_plus = h_new_safe * torch.clamp(q_max - qp_td, min=0.0)
+    q_minus = h_new_safe * torch.clamp(qp_td - q_min, min=0.0)
+    r_plus = torch.where(p_plus > eps, torch.clamp(q_plus / (p_plus + eps), 0.0, 1.0), torch.ones_like(qp))
+    r_minus = torch.where(p_minus > eps, torch.clamp(q_minus / (p_minus + eps), 0.0, 1.0), torch.ones_like(qp))
+
+    c_lim_h = torch.where(
+        ah_e >= 0.0,
+        torch.minimum(r_minus[:, :, c0], r_plus[:, :, c1]),
+        torch.minimum(r_plus[:, :, c0], r_minus[:, :, c1]),
+    ) * wet_ef_b
+    c_lim_v = torch.where(
+        av_int >= 0.0,
+        torch.minimum(r_minus[:, 1:], r_plus[:, :-1]),
+        torch.minimum(r_plus[:, 1:], r_minus[:, :-1]),
+    ) * wet_ic_b
+
+    f_adv_h = fl_h + c_lim_h * ah_e
+    f_adv_v = fl_v + c_lim_v * av_int
+
+    dq_dx = ((qp[:, :, c1] - qp[:, :, c0]) * inv_dc_edge.unsqueeze(0).unsqueeze(0)) * wet_ef_b
+    if enable_full_redi:
+        dq_dz_c = ((qp[:, 1:] - qp[:, :-1]) / dz_c_int.unsqueeze(0)) * wet_ic_b
+        dq_dz_e = 0.5 * (dq_dz_c[:, :, c0] + dq_dz_c[:, :, c1]) * wet_ie_b
+        sx_dqdz_int = sx_int.unsqueeze(0) * dq_dz_e
+        z_row = torch.zeros_like(dq_dx[:, 0:1])
+        sx_dqdz_lay = 0.5 * (torch.cat([sx_dqdz_int, z_row], dim=1) + torch.cat([z_row, sx_dqdz_int], dim=1))
+        f_dif = -KAPPA_REDI_HORIZ * h_e.unsqueeze(0) * (dq_dx + sx_dqdz_lay) * wet_ef_b
+
+        dq_dx_int = 0.5 * (dq_dx[:, :-1] + dq_dx[:, 1:]) * wet_ie_b
+        s_dqdx_ew = (sx_int.unsqueeze(0) * dq_dx_int) * w_vor_edge.unsqueeze(0).unsqueeze(0)
+        s_dot_gradq = (s_dqdx_ew[:, :, eoc] * active_eoc.unsqueeze(0).unsqueeze(0)).sum(dim=-1) * inv_area_c.unsqueeze(0).unsqueeze(0)
+        f_v_redi_cross = (KAPPA_REDI_HORIZ * s_dot_gradq) * wet_ic_b
+    else:
+        f_dif = -KAPPA_REDI_HORIZ * h_e.unsqueeze(0) * dq_dx * wet_ef_b
+        f_v_redi_cross = torch.zeros_like(f_nl_q)
+
+    f_tot_h = f_adv_h + f_dif
+    div_h = (f_tot_h[:, :, eoc] * div_w_b).sum(dim=-1) * wet_cf_b
+
+    h_min_int = torch.minimum(h_new_safe[:, :-1], h_new_safe[:, 1:])
+    q_span = torch.abs(qp[:, 1:] - qp[:, :-1]) + 0.5
+    f_nl_cap = 0.35 * h_min_int * q_span / max(dt, 1.0)
+    f_nl_lim = torch.clamp(f_nl_q, -f_nl_cap, f_nl_cap) * wet_ic_b
+
+    f_v_tot = f_adv_v + f_v_redi_cross + f_nl_lim
+    v_inflow = torch.cat([f_v_tot, z_cell], dim=1) - torch.cat([z_cell, f_v_tot], dim=1)
+
+    dq_fct = ((dt * (-div_h + v_inflow) - dh_z * qp) / h_new_safe) * wet_cf_b
+    return _kahan_add(q, dq_fct, q_comp)
+
+
+def _ogcm_advect_redi_batch(
+    q: torch.Tensor,
+    q_comp: torch.Tensor,
+    f_nl_q: torch.Tensor,
+    h_u_edge: torch.Tensor,
+    sx_int: torch.Tensor,
+    w_vel: torch.Tensor,
+    h_e: torch.Tensor,
+    h_c_safe: torch.Tensor,
+    h0_new: torch.Tensor,
+    dh0_eff: torch.Tensor,
+    dz_c_int: torch.Tensor,
+    inv_dc_edge: torch.Tensor,
+    wet_cf: torch.Tensor,
+    wet_ef: torch.Tensor,
+    wet_int_cf: torch.Tensor,
+    wet_int_ef: torch.Tensor,
+    c0: torch.Tensor,
+    c1: torch.Tensor,
+    eoc: torch.Tensor,
+    div_w: torch.Tensor,
+    w_vor_edge: torch.Tensor,
+    active_eoc: torch.Tensor,
+    inv_area_c: torch.Tensor,
+    q_ref: torch.Tensor,
+    dt: float,
+    enable_full_redi: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched `[B, nzo, nc]` 3D anomaly-form tracer advection + full rotated Redi + KPP non-local + Kahan."""
+    wet_cf_b = wet_cf.unsqueeze(0)
+    wet_ef_b = wet_ef.unsqueeze(0)
+    wet_ic_b = wet_int_cf.unsqueeze(0)
+    wet_ie_b = wet_int_ef.unsqueeze(0)
+    hu_b = h_u_edge.unsqueeze(0)
+
+    qp = q - q_ref
+    dq_dx = ((qp[:, :, c1] - qp[:, :, c0]) * inv_dc_edge.unsqueeze(0).unsqueeze(0)) * wet_ef_b
+    f_adv = torch.clamp(hu_b, min=0.0) * qp[:, :, c0] + torch.clamp(hu_b, max=0.0) * qp[:, :, c1]
+
+    if enable_full_redi:
+        dq_dz_c = ((qp[:, 1:] - qp[:, :-1]) / dz_c_int.unsqueeze(0)) * wet_ic_b
+        dq_dz_e = 0.5 * (dq_dz_c[:, :, c0] + dq_dz_c[:, :, c1]) * wet_ie_b
+        sx_dqdz_int = sx_int.unsqueeze(0) * dq_dz_e
+        z_row = torch.zeros_like(dq_dx[:, 0:1])
+        sx_dqdz_lay = 0.5 * (torch.cat([sx_dqdz_int, z_row], dim=1) + torch.cat([z_row, sx_dqdz_int], dim=1))
+        f_dif = -KAPPA_REDI_HORIZ * h_e.unsqueeze(0) * (dq_dx + sx_dqdz_lay) * wet_ef_b
+
+        dq_dx_int = 0.5 * (dq_dx[:, :-1] + dq_dx[:, 1:]) * wet_ie_b
+        s_dqdx_ew = (sx_int.unsqueeze(0) * dq_dx_int) * w_vor_edge.unsqueeze(0).unsqueeze(0)
+        s_dot_gradq = (s_dqdx_ew[:, :, eoc] * active_eoc.unsqueeze(0).unsqueeze(0)).sum(dim=-1) * inv_area_c.unsqueeze(0).unsqueeze(0)
+        f_v_redi_cross = (KAPPA_REDI_HORIZ * s_dot_gradq) * wet_ic_b
+    else:
+        f_dif = -KAPPA_REDI_HORIZ * h_e.unsqueeze(0) * dq_dx * wet_ef_b
+        f_v_redi_cross = torch.zeros_like(f_nl_q)
+
+    f_tot = f_adv + f_dif
+    div_h = (f_tot[:, :, eoc] * div_w.unsqueeze(0).unsqueeze(0)).sum(dim=-1) * wet_cf_b
+
+    w_int = w_vel[1:-1].unsqueeze(0)
+    f_v_adv = torch.where(w_int >= 0.0, w_int * qp[:, 1:], w_int * qp[:, :-1]) * wet_ic_b
+    h_min_int = torch.minimum(h_c_safe[:-1], h_c_safe[1:]).unsqueeze(0)
+    q_span = torch.abs(qp[:, 1:] - qp[:, :-1]) + 0.5
+    f_nl_cap = 0.35 * h_min_int * q_span / max(dt, 1.0)
+    f_nl_lim = torch.clamp(f_nl_q, -f_nl_cap, f_nl_cap) * wet_ic_b
+
+    f_v_int = f_v_adv + f_v_redi_cross + f_nl_lim
+    z_cell = torch.zeros_like(q[:, 0:1])
+    v_inflow = torch.cat([f_v_int, z_cell], dim=1) - torch.cat([z_cell, f_v_int], dim=1)
+
+    dq_sub = (dt / h_c_safe[1:].unsqueeze(0)) * (-div_h[:, 1:] + v_inflow[:, 1:])
+    dq_0 = (dt * (-div_h[:, 0] + v_inflow[:, 0]) - dh0_eff.unsqueeze(0) * qp[:, 0]) / h0_new.unsqueeze(0)
+    dq_adv = torch.cat([dq_0.unsqueeze(1), dq_sub], dim=1) * wet_cf_b
+    return _kahan_add(q, dq_adv, q_comp)
+
+
 def _diagnose_kpp_and_vertical_mixing(
     T: torch.Tensor,
     S: torch.Tensor,
@@ -1366,11 +1574,42 @@ def step_ogcm_voronoi(
     eoc = mesh.edges_on_cell  # [nc, 6]
     div_w = cache["div_w"]
 
-    baro_fn = maybe_cuda_compile(_ogcm_barotropic_rk3_core, device=dev)
-    u_star, u_star_baro, u_bt, u_bt_mean = baro_fn(
-        u_star_raw, u_prev_baro, ogcm.u_baro, eta_old, g_inv_dc, h_e, ogcm.h_col_e, h_col_e_safe,
-        wet_ef, ocn_e0f, is_ocn_f, c0, c1, eoc, div_w, n_bt, dt_bt, dt,
-    )
+    if get_active_gpu_backend(dev) in ("mps", "cuda"):
+        c0_i32 = cache.get("c0_i32")
+        if c0_i32 is None:
+            c0_i32 = c0.to(torch.int32).contiguous()
+            c1_i32 = c1.to(torch.int32).contiguous()
+            eoc_i32 = eoc.to(torch.int32).contiguous()
+            cache["c0_i32"] = c0_i32
+            cache["c1_i32"] = c1_i32
+            cache["eoc_i32"] = eoc_i32
+        else:
+            c1_i32 = cache["c1_i32"]
+            eoc_i32 = cache["eoc_i32"]
+        u_star = u_star_raw * wet_ef
+        u_star_baro = (u_star * h_e).sum(dim=0) / h_col_e_safe * ocn_e0f
+        f_baro = (u_star_baro - u_prev_baro) / max(dt, 1.0)
+        u_bt, u_bt_mean = dispatch_ogcm_barotropic_rk3_metal(
+            u_bt_init=ogcm.u_baro * ocn_e0f,
+            eta_init=eta_old,
+            f_baro=f_baro,
+            g_inv_dc=g_inv_dc,
+            h_col_e=ogcm.h_col_e,
+            ocn_e0f=ocn_e0f,
+            is_ocn_f=is_ocn_f,
+            c0_i32=c0_i32,
+            c1_i32=c1_i32,
+            eoc_i32=eoc_i32,
+            div_w=div_w,
+            n_bt=n_bt,
+            dt_bt=dt_bt,
+        )
+    else:
+        baro_fn = maybe_cuda_compile(_ogcm_barotropic_rk3_core, device=dev)
+        u_star, u_star_baro, u_bt, u_bt_mean = baro_fn(
+            u_star_raw, u_prev_baro, ogcm.u_baro, eta_old, g_inv_dc, h_e, ogcm.h_col_e, h_col_e_safe,
+            wet_ef, ocn_e0f, is_ocn_f, c0, c1, eoc, div_w, n_bt, dt_bt, dt,
+        )
     # Time-filtered barotropic mode matches u_new depth mean (Ringler et al., 2013; Shchepetkin & McWilliams, 2005)
     ogcm.u_baro = u_bt_mean
 
@@ -1410,33 +1649,39 @@ def step_ogcm_voronoi(
         z_w0 = torch.zeros_like(w_vel[0:1])
         w_star = torch.cat([z_w0, w_star_int, z_w0], dim=0)
 
-        fct_fn = maybe_cuda_compile(_ogcm_advect_fct_zstar_core, device=dev)
-        T, t_comp = fct_fn(
-            T, t_comp, f_nl_t, h_u_edge, sx_int, w_star, h_e, h_old_z, h_new_z,
+        ts_ref = cache.get("ts_ref_b")
+        if ts_ref is None:
+            ts_ref = torch.tensor([T_REF_EOS_K, S_REF_PSU], device=dev, dtype=T.dtype).view(2, 1, 1)
+            cache["ts_ref_b"] = ts_ref
+        fct_b_fn = maybe_cuda_compile(_ogcm_advect_fct_zstar_batch, device=dev)
+        ts_q, ts_c = fct_b_fn(
+            torch.stack([T, S], dim=0),
+            torch.stack([t_comp, s_comp], dim=0),
+            torch.stack([f_nl_t, f_nl_s], dim=0),
+            h_u_edge, sx_int, w_star, h_e, h_old_z, h_new_z,
             dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
             c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
-            T_REF_EOS_K, dt, bool(ENABLE_FULL_REDI),
+            ts_ref, dt, bool(ENABLE_FULL_REDI),
         )
-        S, s_comp = fct_fn(
-            S, s_comp, f_nl_s, h_u_edge, sx_int, w_star, h_e, h_old_z, h_new_z,
-            dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
-            c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
-            S_REF_PSU, dt, bool(ENABLE_FULL_REDI),
-        )
+        T, S = ts_q[0], ts_q[1]
+        t_comp, s_comp = ts_c[0], ts_c[1]
     else:
-        adv_fn = maybe_cuda_compile(_ogcm_advect_redi_core, device=dev)
-        T, t_comp = adv_fn(
-            T, t_comp, f_nl_t, h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
+        ts_ref = cache.get("ts_ref_b")
+        if ts_ref is None:
+            ts_ref = torch.tensor([T_REF_EOS_K, S_REF_PSU], device=dev, dtype=T.dtype).view(2, 1, 1)
+            cache["ts_ref_b"] = ts_ref
+        adv_b_fn = maybe_cuda_compile(_ogcm_advect_redi_batch, device=dev)
+        ts_q, ts_c = adv_b_fn(
+            torch.stack([T, S], dim=0),
+            torch.stack([t_comp, s_comp], dim=0),
+            torch.stack([f_nl_t, f_nl_s], dim=0),
+            h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
             dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
             c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
-            T_REF_EOS_K, dt, bool(ENABLE_FULL_REDI),
+            ts_ref, dt, bool(ENABLE_FULL_REDI),
         )
-        S, s_comp = adv_fn(
-            S, s_comp, f_nl_s, h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
-            dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
-            c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
-            S_REF_PSU, dt, bool(ENABLE_FULL_REDI),
-        )
+        T, S = ts_q[0], ts_q[1]
+        t_comp, s_comp = ts_c[0], ts_c[1]
 
     # 9-10. Strictly Conservative Flux-Increment Implicit Vertical Mixing (Float32-Safe!) & Freezing Check
     #    Solving `(I + L) dq = -L q` and reconstructing telescoping fluxes `F_imp = c_dif * d(q + dq)`
@@ -1451,8 +1696,14 @@ def step_ogcm_voronoi(
     )
     ogcm.kv_last = kv
 
-    dt_imp = solve_tridiagonal_batched(a_t, b_t, d_t, rhs_t)
-    ds_imp = solve_tridiagonal_batched(a_t, b_t, d_t, rhs_s)
+    nc = T.shape[1]
+    dts_imp = solve_tridiagonal_batched(
+        torch.cat([a_t, a_t], dim=1),
+        torch.cat([b_t, b_t], dim=1),
+        torch.cat([d_t, d_t], dim=1),
+        torch.cat([rhs_t, rhs_s], dim=1),
+    )
+    dt_imp, ds_imp = dts_imp[:, :nc], dts_imp[:, nc:]
 
     vdiff_post_fn = maybe_cuda_compile(_ogcm_vdiff_post_freeze_core, device=dev)
     T, t_comp, S, s_comp, sfc.t_ocean_ml, sfc.m_seaice = vdiff_post_fn(

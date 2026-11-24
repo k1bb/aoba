@@ -143,9 +143,9 @@ def host_cuda_sim() -> tuple[_HostCUDASimLib, list[KernelSpec]]:
 
 
 def test_transpiler_and_pytorch_cpp_binding_syntax(host_cuda_sim: tuple[_HostCUDASimLib, list[KernelSpec]]) -> None:
-    """Verify all 43 kernels transpile cleanly and PyTorch pybind11 C++ bindings parse cleanly."""
+    """Verify all 51 kernels transpile cleanly and PyTorch pybind11 C++ bindings parse cleanly."""
     _, specs = host_cuda_sim
-    assert len(specs) == 43
+    assert len(specs) == 51
     names = {s.name for s in specs}
     for required in (
         "batched_thomas",

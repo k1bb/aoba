@@ -51,7 +51,11 @@ import math
 import torch
 
 from aoba import constants as C
-from aoba.kernels import solve_tridiagonal_batched
+from aoba.kernels import (
+    dispatch_ocean_bgc_column_metal,
+    get_active_gpu_backend,
+    solve_tridiagonal_batched,
+)
 from aoba.runtime import maybe_cuda_compile
 from aoba.surface import _kahan_add
 
@@ -623,9 +627,11 @@ def step_ocean_bgc_flexpft(
     enable_full_redi: bool = True,
 ) -> None:
     """Advance 3D FlexPFT marine BGC tracers by `dt` [s]: transport + vertical mixing + FlexPFT + CO2."""
-    from aoba.ocean_ogcm import _ogcm_advect_redi_core
+    from aoba.ocean_ogcm import _ogcm_advect_redi_batch
 
     dev = bgc.dic.device
+    dtype = bgc.dic.dtype
+    nzo, nc = bgc.dic.shape
     c0 = mesh.cells_on_edge[:, 0]
     c1 = mesh.cells_on_edge[:, 1]
     eoc = mesh.edges_on_cell
@@ -643,50 +649,75 @@ def step_ocean_bgc_flexpft(
     active_eoc = cache["active_eoc"]
     inv_area_c = cache["inv_area_c"]
 
-    zero_nl = torch.zeros_like(wet_int_cf)
-    zero_comp = torch.zeros_like(bgc.phy)
-    adv_fn = maybe_cuda_compile(_ogcm_advect_redi_core, device=dev)
+    # 1. Batched [7, nzo, nc] Conservative 3D Advection + Full Rotated Redi Diffusion
+    bgc_ref = cache.get("bgc_ref_b")
+    if bgc_ref is None:
+        bgc_ref = torch.tensor(
+            [NO3_GLOBAL_MEAN, 0.0, 0.0, 0.0, 0.0, DIC_GLOBAL_MEAN, ALK_GLOBAL_MEAN],
+            device=dev, dtype=dtype,
+        ).view(7, 1, 1)
+        cache["bgc_ref_b"] = bgc_ref
+    zero_nl_7 = cache.get("bgc_zero_nl_7")
+    if zero_nl_7 is None or zero_nl_7.shape != (7, nzo - 1, nc):
+        zero_nl_7 = torch.zeros((7, nzo - 1, nc), device=dev, dtype=dtype)
+        cache["bgc_zero_nl_7"] = zero_nl_7
+    zero_c = cache.get("bgc_zero_c")
+    if zero_c is None or zero_c.shape != (nzo, nc):
+        zero_c = torch.zeros((nzo, nc), device=dev, dtype=dtype)
+        cache["bgc_zero_c"] = zero_c
 
-    # 1. Conservative 3D Advection + Full Rotated Redi Diffusion (reusing exact OGCM velocity & slopes)
-    def _adv(q: torch.Tensor, q_comp: torch.Tensor, q_ref: float) -> tuple[torch.Tensor, torch.Tensor]:
-        return adv_fn(
-            q, q_comp, zero_nl, h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
-            dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
-            c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
-            q_ref, dt, enable_full_redi,
+    q7 = torch.stack([bgc.no3, bgc.phy, bgc.zoo, bgc.det_n, bgc.det_c, bgc.dic, bgc.alk], dim=0)
+    c7 = torch.stack([bgc.no3_comp, zero_c, zero_c, zero_c, zero_c, bgc.dic_comp, bgc.alk_comp], dim=0)
+
+    adv_b_fn = maybe_cuda_compile(_ogcm_advect_redi_batch, device=dev)
+    q7, c7 = adv_b_fn(
+        q7, c7, zero_nl_7, h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
+        dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
+        c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
+        bgc_ref, dt, enable_full_redi,
+    )
+
+    # 2. Batched [7, nzo, nc] Strictly Conservative Flux-Increment Implicit Vertical Mixing
+    z_row7 = torch.zeros((7, 1, nc), device=dev, dtype=dtype)
+    q_diff = q7[:, 1:] - q7[:, :-1]
+    c_dif_b = c_dif.unsqueeze(0)
+    h_eff_b = h_eff.unsqueeze(0)
+    f_exp = c_dif_b * q_diff
+    rhs7 = (torch.cat([f_exp, z_row7], dim=1) - torch.cat([z_row7, f_exp], dim=1)) / h_eff_b
+    # Permute [7, nzo, nc] -> [nzo, 7*nc] for a single fused batched Thomas solve
+    rhs_flat = rhs7.permute(1, 0, 2).reshape(nzo, 7 * nc)
+    a_7 = a_t.unsqueeze(1).expand(nzo, 7, nc).reshape(nzo, 7 * nc)
+    b_7 = b_t.unsqueeze(1).expand(nzo, 7, nc).reshape(nzo, 7 * nc)
+    d_7 = d_t.unsqueeze(1).expand(nzo, 7, nc).reshape(nzo, 7 * nc)
+    dq_imp = solve_tridiagonal_batched(a_7, b_7, d_7, rhs_flat).view(nzo, 7, nc).permute(1, 0, 2)
+    f_imp = c_dif_b * (q_diff + (dq_imp[:, 1:] - dq_imp[:, :-1]))
+    dq_cons = ((torch.cat([f_imp, z_row7], dim=1) - torch.cat([z_row7, f_imp], dim=1)) / h_eff_b) * wet_cf.unsqueeze(0)
+
+    q7_k, c7_k = _kahan_add(q7, dq_cons, c7)
+    bgc.no3, bgc.no3_comp = q7_k[0], c7_k[0]
+    bgc.phy = torch.clamp(q7[1] + dq_cons[1], min=0.0) * wet_cf
+    bgc.zoo = torch.clamp(q7[2] + dq_cons[2], min=0.0) * wet_cf
+    bgc.det_n = torch.clamp(q7[3] + dq_cons[3], min=0.0) * wet_cf
+    bgc.det_c = torch.clamp(q7[4] + dq_cons[4], min=0.0) * wet_cf
+    bgc.dic, bgc.dic_comp = q7_k[5], c7_k[5]
+    bgc.alk, bgc.alk_comp = q7_k[6], c7_k[6]
+
+    # 3. FlexPFT Ecosystem Reactions, Implicit Sinking, & OMIP/mocsy Air-Sea CO2 Exchange
+    if get_active_gpu_backend(dev) in ("mps", "cuda"):
+        (
+            bgc.no3, bgc.phy, bgc.zoo, bgc.det_n, bgc.det_c, bgc.dic, bgc.alk,
+            bgc.no3_comp, bgc.dic_comp, bgc.alk_comp,
+            bgc.chl, bgc.npp_c, bgc.c_to_n_phy, bgc.fgco2, bgc.spco2_uatm, bgc.ph_sfc, bgc.intpp, bgc.epc100,
+        ) = dispatch_ocean_bgc_column_metal(
+            no3=bgc.no3, phy=bgc.phy, zoo=bgc.zoo, det_n=bgc.det_n, det_c=bgc.det_c, dic=bgc.dic, alk=bgc.alk,
+            no3_comp=bgc.no3_comp, dic_comp=bgc.dic_comp, alk_comp=bgc.alk_comp,
+            temp_k=ogcm.temp, sal_psu=ogcm.sal, h_c=ogcm.h_c, wet_cf=wet_cf,
+            h0_new=h0_new, sw_par_sfc=sw_par_sfc, u10_ocn=u10_ocn, f_seaice=f_seaice,
+            co2_ppmv=float(co2_ppmv), dt=float(dt), rho_sw=float(C.RHO_SEAWATER),
         )
+        return
 
-    bgc.no3, bgc.no3_comp = _adv(bgc.no3, bgc.no3_comp, NO3_GLOBAL_MEAN)
-    bgc.phy, _ = _adv(bgc.phy, zero_comp, 0.0)
-    bgc.zoo, _ = _adv(bgc.zoo, zero_comp, 0.0)
-    bgc.det_n, _ = _adv(bgc.det_n, zero_comp, 0.0)
-    bgc.det_c, _ = _adv(bgc.det_c, zero_comp, 0.0)
-    bgc.dic, bgc.dic_comp = _adv(bgc.dic, bgc.dic_comp, DIC_GLOBAL_MEAN)
-    bgc.alk, bgc.alk_comp = _adv(bgc.alk, bgc.alk_comp, ALK_GLOBAL_MEAN)
-
-    # 2. Strictly Conservative Flux-Increment Implicit Vertical Mixing (reusing exact OGCM tridiagonal)
-    z_row = torch.zeros_like(bgc.dic[0:1])
-
-    def _vdiff(q: torch.Tensor, q_comp: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor | None]:
-        q_diff = q[1:] - q[:-1]
-        f_exp = c_dif * q_diff
-        rhs = (torch.cat([f_exp, z_row], dim=0) - torch.cat([z_row, f_exp], dim=0)) / h_eff
-        dq_imp = solve_tridiagonal_batched(a_t, b_t, d_t, rhs)
-        f_imp = c_dif * (q_diff + (dq_imp[1:] - dq_imp[:-1]))
-        dq_cons = ((torch.cat([f_imp, z_row], dim=0) - torch.cat([z_row, f_imp], dim=0)) / h_eff) * wet_cf
-        if q_comp is not None:
-            return _kahan_add(q, dq_cons, q_comp)
-        return torch.clamp(q + dq_cons, min=0.0) * wet_cf, None
-
-    bgc.no3, bgc.no3_comp = _vdiff(bgc.no3, bgc.no3_comp)
-    bgc.phy, _ = _vdiff(bgc.phy, None)
-    bgc.zoo, _ = _vdiff(bgc.zoo, None)
-    bgc.det_n, _ = _vdiff(bgc.det_n, None)
-    bgc.det_c, _ = _vdiff(bgc.det_c, None)
-    bgc.dic, bgc.dic_comp = _vdiff(bgc.dic, bgc.dic_comp)
-    bgc.alk, bgc.alk_comp = _vdiff(bgc.alk, bgc.alk_comp)
-
-    # Deepest wet cell mask (cached on static OGCM cache if absent)
+    # Deepest wet cell mask (CPU fallback)
     is_deepest_c = cache.get("is_deepest_c")
     if is_deepest_c is None:
         is_deepest_c = torch.zeros_like(wet_c)
@@ -695,7 +726,6 @@ def step_ocean_bgc_flexpft(
         is_deepest_c[-1] = wet_c[-1]
         cache["is_deepest_c"] = is_deepest_c
 
-    # 3. FlexPFT Ecosystem Reactions, Implicit Sinking, & OMIP/mocsy Air-Sea CO2 Exchange
     eco_fn = maybe_cuda_compile(_bgc_ecosystem_core, device=dev)
     (
         bgc.no3, bgc.phy, bgc.zoo, bgc.det_n, bgc.det_c, bgc.dic, bgc.alk,

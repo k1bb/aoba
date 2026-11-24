@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import torch
 
 from aoba import constants as C
+from aoba.kernels import dispatch_natural_aerosol_4sp_metal, get_active_gpu_backend
 from aoba.surface import SURF_OCEAN
 
 # Sea-salt emission & removal (Jaeglé et al., 2011, Eq. 4)
@@ -193,25 +194,43 @@ def step_natural_aerosols_column(
     emis_bc = fire_bc_kg_m2s if fire_bc_kg_m2s is not None else torch.zeros_like(emis_ss)
     emis_oc = fire_oc_kg_m2s if fire_oc_kg_m2s is not None else torch.zeros_like(emis_ss)
 
-    aero.q_ss = _step_single_aerosol_column(
-        aero.q_ss, rho_d, dz_c, emis_ss, precip_rate, SEASALT_V_SETTLE, SEASALT_V_DRY, SEASALT_WET_SCAV, dt
-    )
-    aero.q_so4 = _step_single_aerosol_column(
-        aero.q_so4, rho_d, dz_c, emis_so4, precip_rate, SO4_V_SETTLE, SO4_V_DRY, SO4_WET_SCAV, dt
-    )
-    aero.q_bc = _step_single_aerosol_column(
-        aero.q_bc, rho_d, dz_c, emis_bc, precip_rate, BC_V_SETTLE, BC_V_DRY, BC_WET_SCAV, dt
-    )
-    aero.q_oc = _step_single_aerosol_column(
-        aero.q_oc, rho_d, dz_c, emis_oc, precip_rate, BC_V_SETTLE, BC_V_DRY, OC_WET_SCAV, dt
-    )
+    if get_active_gpu_backend(aero.q_ss.device) in ("mps", "cuda"):
+        q_in = torch.stack([aero.q_ss, aero.q_so4, aero.q_bc, aero.q_oc], dim=0)
+        emis_4 = torch.stack([emis_ss, emis_so4, emis_bc, emis_oc], dim=0)
+        q_out, aod_out = dispatch_natural_aerosol_4sp_metal(
+            q_in=q_in,
+            rho_d=rho_d,
+            dz_c=dz_c,
+            emis_4=emis_4,
+            precip_rate=precip_rate,
+            v_settle_4=(SEASALT_V_SETTLE, SO4_V_SETTLE, BC_V_SETTLE, BC_V_SETTLE),
+            v_dry_4=(SEASALT_V_DRY, SO4_V_DRY, BC_V_DRY, BC_V_DRY),
+            alpha_wet_4=(SEASALT_WET_SCAV, SO4_WET_SCAV, BC_WET_SCAV, OC_WET_SCAV),
+            mee_4=(MEE_SS_550, MEE_SO4_550, MEE_BC_550, MEE_OC_550),
+            dt=float(dt),
+        )
+        aero.q_ss, aero.q_so4, aero.q_bc, aero.q_oc = q_out[0], q_out[1], q_out[2], q_out[3]
+        aero.aod_ss, aero.aod_so4, aero.aod_bc, aero.aod_oc = aod_out[0], aod_out[1], aod_out[2], aod_out[3]
+    else:
+        aero.q_ss = _step_single_aerosol_column(
+            aero.q_ss, rho_d, dz_c, emis_ss, precip_rate, SEASALT_V_SETTLE, SEASALT_V_DRY, SEASALT_WET_SCAV, dt
+        )
+        aero.q_so4 = _step_single_aerosol_column(
+            aero.q_so4, rho_d, dz_c, emis_so4, precip_rate, SO4_V_SETTLE, SO4_V_DRY, SO4_WET_SCAV, dt
+        )
+        aero.q_bc = _step_single_aerosol_column(
+            aero.q_bc, rho_d, dz_c, emis_bc, precip_rate, BC_V_SETTLE, BC_V_DRY, BC_WET_SCAV, dt
+        )
+        aero.q_oc = _step_single_aerosol_column(
+            aero.q_oc, rho_d, dz_c, emis_oc, precip_rate, BC_V_SETTLE, BC_V_DRY, OC_WET_SCAV, dt
+        )
+        # Diagnose 550 nm column AOD [-]
+        mass_c = rho_d * dz_c
+        aero.aod_ss = MEE_SS_550 * (mass_c * aero.q_ss).sum(dim=0)
+        aero.aod_so4 = MEE_SO4_550 * (mass_c * aero.q_so4).sum(dim=0)
+        aero.aod_bc = MEE_BC_550 * (mass_c * aero.q_bc).sum(dim=0)
+        aero.aod_oc = MEE_OC_550 * (mass_c * aero.q_oc).sum(dim=0)
 
-    # Diagnose 550 nm column AOD [-] and lowest-layer hygroscopic CCN proxy [m^-3]
-    mass_c = rho_d * dz_c
-    aero.aod_ss = MEE_SS_550 * (mass_c * aero.q_ss).sum(dim=0)
-    aero.aod_so4 = MEE_SO4_550 * (mass_c * aero.q_so4).sum(dim=0)
-    aero.aod_bc = MEE_BC_550 * (mass_c * aero.q_bc).sum(dim=0)
-    aero.aod_oc = MEE_OC_550 * (mass_c * aero.q_oc).sum(dim=0)
     aero.emis_ss_kgm2s = emis_ss
     aero.emis_so4_kgm2s = emis_so4
 

@@ -42,13 +42,18 @@ from aoba.kernels_extra import (
 from aoba.kernels_physics import (
     PHYSICS_METAL_SHADER_SRC,
     run_dust_column_metal,
+    run_natural_aerosol_4sp_metal,
     run_ngwd_propagate_metal,
+    run_ocean_bgc_column_metal,
+    run_ogcm_barotropic_rk3_metal,
     run_oro_gwd_metal,
     run_rad_ckd_metal,
     run_rad_four_band_metal,
     run_scvt_fct_advect_metal,
     run_scvt_project_winds_metal,
     run_scvt_reconstruct_winds_metal,
+    run_seaice_evp_subcycle_metal,
+    run_seaice_itd_sync_metal,
     run_surface_albedos_metal,
     run_surface_transfer_metal,
     run_two_leaf_gas_exchange_metal,
@@ -1071,6 +1076,36 @@ def dispatch_two_leaf_gas_exchange_metal(**kwargs: Any) -> torch.Tensor:
     lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_two_leaf_gas_exchange_metal(lib, **kwargs)
+
+
+def dispatch_natural_aerosol_4sp_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_natural_aerosol_4sp_metal(lib, **kwargs)
+
+
+def dispatch_seaice_itd_sync_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_seaice_itd_sync_metal(lib, **kwargs)
+
+
+def dispatch_seaice_evp_subcycle_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_seaice_evp_subcycle_metal(lib, **kwargs)
+
+
+def dispatch_ogcm_barotropic_rk3_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_ogcm_barotropic_rk3_metal(lib, **kwargs)
+
+
+def dispatch_ocean_bgc_column_metal(**kwargs: Any):
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_ocean_bgc_column_metal(lib, **kwargs)
 
 
 def dispatch_scvt_reconstruct_winds_metal(mesh: Any, u_edge: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
