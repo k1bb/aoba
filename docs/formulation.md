@@ -1,8 +1,4 @@
-# AOBA Earth System Model — Complete Physical & Numerical Textbook Formulation
-
-> **How to Read This Document**: This manual is written both as a rigorous scientific reference (following the mathematical completeness of *Description of MIROC6 AGCM*, *Description of MATSIRO6*, and *Detailed Formulation of SCALE-RM*) and as a self-contained **textbook for undergraduates and Earth System Model (ESM) newcomers**. Every chapter opens with an intuitive physical narrative and conceptual diagram before introducing numbered governing equations `(S.N)`. Those exact equation numbers are cited directly inside `src/aoba/*.py` so you can jump seamlessly between theory and code.
-
----
+# AOBA Earth System Model — Physical & Numerical Formulation
 
 ## Contents
 
@@ -883,4 +879,4 @@ All **307 parameters across 14 TOML sections** are centralized in [`config/aoba_
 Launch AOBA Studio locally via `python scripts/aoba_config_gui.py --port 8765` (zero external dependencies):
 - **Full Parameter Workbench**: All 307 TOML keys searchable with complete JA/EN physical explanations (`src/aoba/param_docs.py`), interactive SCVT/CRM/vertical-level geometry plots, and 1-click presets (`Modern`, `Full-ESM + RRTMGP`, `0.5×Ω`, `LGM`, `4×CO₂`, `Aquaplanet`, `Snowball Earth`, `TRAPPIST-1e`).
 - **Live 3-Globe Monitor & Observational Benchmark**: Renders 3 synchronized rotating Orthographic globes (`T₂`, `Precip`, and a **10-variable Full-ESM selector**: `LAI`, `Total O₃`, `Lightning`, `Volcanic AOD`, `Wetlands`, `Precip δ¹⁸O`, `Surface CO₂`, `Ocean Chl`, `Ocean O₂`, `Wave H_s`) alongside a live **Observational Benchmark Panel** comparing global means against ERA5, CERES EBAF, GPCP, MODIS, and NSIDC.
-- **Built-in Textbook Viewer**: Offline recursive-descent LaTeX math + equation-tag renderer and native conceptual SVG diagram viewer for both EN and JA manuals.
+- **Built-in Documentation Viewer**: Offline recursive-descent LaTeX math and equation-tag renderer with native SVG diagram rendering for both English and Japanese documentation.

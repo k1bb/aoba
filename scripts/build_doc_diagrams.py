@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Generate clean, textbook-grade conceptual SVG diagrams for AOBA documentation (EN/JA).
-
-Every figure is self-contained SVG with crisp card framing so it renders cleanly in
-GitHub Markdown, VS Code preview, and AOBA Studio's offline documentation viewer.
-"""
+"""Generate conceptual SVG diagrams for AOBA documentation (EN/JA)."""
 
 from __future__ import annotations
 

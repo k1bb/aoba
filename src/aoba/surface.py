@@ -1,6 +1,6 @@
 """Unified Land-Snow-Ice-Ocean surface coupling, multi-layer freeze-thaw soil, and sea ice.
 
-Implements every surface physical process identified in our MIROC6 / MATSIRO6 / SCALE-RM audit
+Couples terrestrial canopy, snowpack, frozen soil, open ocean, and sea-ice thermodynamics
 with zero external PFT, soil-texture, or albedo lookup maps:
 
 1. Fractional Snow Cover, Snow Burial, Aging Snow Albedo, & Glacier Runoff Cap:

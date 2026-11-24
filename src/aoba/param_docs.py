@@ -1,9 +1,4 @@
-"""Complete bilingual (JA/EN) parameter documentation registry for AOBA Studio and CLI tools.
-
-Every key defined in `config/aoba_default.toml` (`src/aoba/params.py`) is documented here
-with clear physical meaning, units, and guidance for ESM beginners and researchers.
-Coverage of 100% of registered TOML keys is enforced by `tests/test_params_and_gui.py`.
-"""
+"""Bilingual (JA/EN) physical descriptions for all AOBA TOML configuration parameters."""
 
 from __future__ import annotations
 
