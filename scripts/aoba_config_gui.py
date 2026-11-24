@@ -721,6 +721,9 @@ _HTML_PAGE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <link rel="icon" type="image/png" href="/assets/aoba_icon.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&family=Noto+Sans:ital,wght@0,400;0,600;0,700;1,400&family=STIX+Two+Text:ital,wght@0,400;0,700;1,400&family=Source+Code+Pro:wght@400;600&display=swap" rel="stylesheet" />
 <title>AOBA Studio — 設定・実行・監視・3地球リアルタイム可視化</title>
 <style>
   :root {
@@ -734,12 +737,14 @@ _HTML_PAGE = r"""<!DOCTYPE html>
     --accent-2: #34d399;
     --warn: #fbbf24;
     --danger: #f87171;
-    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --sans: "Noto Sans", "Noto Sans JP", "Hiragino Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --mono: "Source Code Pro", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --math: "STIX Two Math", "STIX Two Text", "Cambria Math", "Times New Roman", Georgia, serif;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", "Segoe UI", sans-serif;
+    font-family: var(--sans);
     background: var(--bg);
     color: var(--text);
     line-height: 1.5;
@@ -900,13 +905,13 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   .math-block {
     background: #0d1523; border: 1px solid #24344c; border-radius: 8px;
     padding: 11px 16px; margin: 12px 0; overflow-x: auto;
-    font-family: "STIX Two Math", "Cambria Math", "Times New Roman", Georgia, serif;
-    font-size: 15.5px; color: #f1f5f9;
+    font-family: var(--math);
+    font-size: 16px; color: #f1f5f9;
     display: flex; align-items: center; justify-content: space-between; gap: 16px;
   }
   .math-block-eq { flex: 1; text-align: center; line-height: 1.6; font-style: italic; }
   .math-tag { flex-shrink: 0; font-family: var(--mono); font-size: 12.5px; font-style: normal; color: #94a3b8; user-select: text; }
-  .math-inline { font-family: "STIX Two Math", "Cambria Math", "Times New Roman", Georgia, serif; font-style: italic; color: #e0f2fe; padding: 0 1px; }
+  .math-inline { font-family: var(--math); font-style: italic; color: #e0f2fe; padding: 0 1px; }
   .math-rm { font-style: normal; }
   .math-it { font-style: italic; }
   .math-bf { font-style: normal; font-weight: 700; }
