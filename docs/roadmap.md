@@ -28,9 +28,10 @@ AOBA shares a single spherical centroidal Voronoi tessellation (SCVT) horizontal
 | **Glevel-9** | 2,621,442 | ~14 km (~0.125°) | Mid-latitude eddy-resolving | Realistic Kuroshio/Gulf Stream separation, Southern Ocean eddy heat transport, and seasonal-to-annual global storm-permitting (`1 × 1`) integrations. |
 | **Glevel-10 / 11** | 10.5M / 41.9M | ~7.0 / 3.5 km | Global cloud-resolving (`1 × 1`) | Multi-week MJO / DYAMOND-class global cloud-resolving integrations and high-latitude shelf/eddy dynamics (requires multi-node GPU domain decomposition). |
 
-### Ocean Vertical Refinement (`ocean_nz`)
+### Ocean Vertical Refinement (`ocean_nz`) & High-Resolution Climate Equilibrium Target
 - Increasing `ocean_nz` from `18` to `40–50` layers (with finer upper-500 m spacing) sharpens the thermocline, EUC, deep-water overflows, and euphotic-zone biogeochemistry.
 - Because the coupled atmosphere and embedded CRM account for over 90% of wall-clock runtime, expanding `ocean_nz` adds only a few percent to total compute cost while substantially improving ocean vertical structure.
+- **Primary High-Resolution Climate Equilibrium Target**: **`Glevel-6` (~112 km), `8 × 1` CRM, `nz = 44`, `ocean_nz = 40`** — combining CMIP6 ~1° horizontal scale with a 40-layer ocean while executing on a single GPU for multi-century `30 + 1,000 + 70 yr` equilibrium spin-ups.
 
 ---
 
