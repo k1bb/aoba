@@ -41,3 +41,6 @@ checkpoints/
 *.h5
 *.bin
 *.tif
+
+# Local agent workspace rules
+GEMINI.md
