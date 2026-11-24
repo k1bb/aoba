@@ -52,9 +52,9 @@ aoba/
 │   ├── formulation.md     # Full mathematical model description (English)
 │   └── formulation_ja.md  # Full mathematical model description (Japanese)
 ├── data/                  # Local boundary (Earth2014) & validation (Köppen-Geiger) data (git-ignored)
-├── references/            # Local literature archive (74 PDFs; strictly git-ignored)
+├── references/            # Local literature archive (95 PDFs; strictly git-ignored)
 ├── src/
-│   └── aoba/              # PyTorch + Metal/CUDA model source packages (15 modules)
+│   └── aoba/              # PyTorch + Metal/CUDA model source packages (37 modules; full ESM A1–A6)
 ├── tests/                 # Unit, physical-forcing, and conservation tests (CPU + MPS)
 ├── scripts/               # RCE, Held-Suarez, Global AOBA runners & Zarr-to-NetCDF tool
 └── pyproject.toml

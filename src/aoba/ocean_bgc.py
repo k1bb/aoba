@@ -469,8 +469,8 @@ def _bgc_ecosystem_core(
     dn_zexcr = (z_excr_r * dt_day) * scale_z * wet_cf
     dn_zmort = (z_mort_r * dt_day) * scale_z * wet_cf
 
-    # Detritus remineralization (temperature-dependent; same fractional rate for PON & POC)
-    f_remin = torch.clamp(DET_REMIN_D * f_temp * dt_day, 0.0, 0.5) * wet_cf
+    # Detritus remineralization via exact exponential decay (temperature-dependent; same rate for PON & POC)
+    f_remin = -torch.expm1(-torch.clamp(DET_REMIN_D * f_temp * dt_day, min=0.0, max=20.0)) * wet_cf
     dn_remin = f_remin * dn_pos
     dc_remin = f_remin * dc_pos
 

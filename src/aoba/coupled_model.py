@@ -96,12 +96,12 @@ class AOBAConfig:
     ocean_mode: str = "ogcm_3d"              # Ocean model: "ogcm_3d" (3D multi-layer OGCM) or "ekman_sw" (1.5-layer shallow-water)
     ocean_nz: int = 18                       # Vertical z-levels when ocean_mode="ogcm_3d" (0..6000 m)
     enable_seaice_drift: bool = True         # Enable dynamic wind/current sea-ice drift in 3D OGCM mode
-    enable_ocean_bgc: bool = False           # Enable FlexPFT marine BGC & OMIP/mocsy 2.0 carbonate chemistry (opt-in)
-    enable_river_routing: bool = False       # Enable A1 map-free Priority-Flood Voronoi river routing (opt-in)
-    enable_land_carbon: bool = False         # Enable A2 map-free terrestrial C cycle, permafrost C, & SPITFIRE fire (opt-in)
-    enable_seaice_evp_itd: bool = False      # Enable A3 MPAS-Seaice Voronoi EVP rheology + 5-category ITD (opt-in)
-    enable_ogcm_fct_zstar: bool = False      # Enable A4 FESOM2-style 3D Zalesak FCT advection + exact z* coord (opt-in)
-    enable_natural_aerosols: bool = False    # Enable A5 map-free sea-salt, marine DMS SO4, & wildfire BC/OC (opt-in)
+    enable_ocean_bgc: bool = True            # Enable A6 FlexPFT marine BGC & OMIP/mocsy 2.0 carbonate chemistry
+    enable_river_routing: bool = True        # Enable A1 map-free Priority-Flood Voronoi river routing
+    enable_land_carbon: bool = True          # Enable A2 map-free terrestrial C cycle, permafrost C, & SPITFIRE fire
+    enable_seaice_evp_itd: bool = True       # Enable A3 MPAS-Seaice Voronoi EVP rheology + 5-category ITD
+    enable_ogcm_fct_zstar: bool = True       # Enable A4 FESOM2-style 3D Zalesak FCT advection + exact z* coord
+    enable_natural_aerosols: bool = True     # Enable A5 map-free sea-salt, marine DMS SO4, & wildfire BC/OC
     re_liq_um: float = 10.0                  # Fallback/1M cloud liquid droplet effective radius [um]
     re_ice_um: float = 48.0                  # Fallback/1M cloud ice crystal effective radius [um]
     cloud_sw_inhomog: float = 0.65           # Subgrid SW cloud optical inhomogeneity factor chi_SW (Cahalan et al., 1994) [-]
@@ -724,7 +724,7 @@ class GlobalStepDiagnostics:
 
 _ACCLIM_BIO_ATTRS: tuple[str, ...] = (
     "ema_vis_beam", "ema_vis_diff", "ema_mu0_mid", "ema_temp_mid",
-    "ema_vpd_mid", "ema_temp_night", "vcmax25_c3", "jmax25_c3", "r25_c3",
+    "ema_vpd_mid", "ema_temp_night", "ema_temp_home", "vcmax25_c3", "jmax25_c3", "r25_c3",
     "vcmax25_c4", "jmax25_c4", "vpmax25_c4", "r25_c4", "f_c4",
 )
 

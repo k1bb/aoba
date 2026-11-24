@@ -78,9 +78,11 @@ DHA_KO_C4: float = 10500.0         # Activation energy for C4 K_o [J mol^-1]
 PHI_LEAK_C4: float = 0.20          # Bundle-sheath CO2 leakiness phi_L [-] (Scott & Smith, 2022, Eq. 14)
 GBS_C4: float = 0.003              # Bundle-sheath conductance g_bs [mol m^-2 s^-1] (Scott & Smith, 2022, Table 1)
 
-# Peaked Arrhenius enzyme kinetics (Kattge & Knorr, 2007; Smith et al., 2019, Eq. 20)
-HA_VCMAX: float = 71513.0          # V_cmax activation energy [J mol^-1]
-HA_JMAX: float = 49884.0           # J_max activation energy [J mol^-1]
+# Peaked Arrhenius enzyme kinetics (Kumarathunge et al., 2019; Schneider et al., 2025, Table 1 & Eq. 7)
+HA_VCMAX: float = 71513.0          # Legacy sentinel / reference V_cmax activation energy [J mol^-1]
+HA_VCMAX_BASE: float = 42600.0     # V_cmax activation energy intercept at 0 degC [J mol^-1]
+HA_VCMAX_SLOPE: float = 1140.0     # V_cmax activation energy slope dH_a,V/dT_g [J mol^-1 K^-1]
+HA_JMAX: float = 40710.0           # J_max activation energy [J mol^-1] (Kumarathunge et al., 2019)
 HA_VPMAX: float = 55000.0          # V_pmax activation energy [J mol^-1] (Massad et al., 2007)
 HD_ENZYME: float = 200000.0        # High-temperature deactivation energy [J mol^-1]
 
@@ -150,22 +152,31 @@ def peaked_arrhenius(
     t_growth_k: torch.Tensor,
     ha: float,
     is_jmax: bool = False,
+    t_home_k: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Peaked Arrhenius thermal response relative to 298.15 K with entropy acclimation.
+    """Peaked Arrhenius thermal response relative to 298.15 K with full enzyme acclimation.
 
-    Reference: Kattge & Knorr (2007, Plant Cell Environ., 30, 1176-1190) &
-    Smith et al. (2019, Ecology Letters, 22, Eq. 20):
-        Delta_S_V = 668.39 - 1.07 * T_growth_C
-        Delta_S_J = 659.70 - 0.75 * T_growth_C.
+    Reference: Kumarathunge et al. (2019, New Phytol., 222, 768-784, Table 3) &
+    Schneider, Gessler, & Stocker (2025, JAMES, 17, e2024MS004789, Table 1 & Eq. 7):
+        H_a,V(T_g)           = 42600 + 1140 * T_growth_C  [J mol^-1]
+        Delta_S_V(T_g)       = 645.13 - 0.38 * T_growth_C [J mol^-1 K^-1]
+        H_a,J                = 40710                      [J mol^-1]
+        Delta_S_J(T_g,T_hom) = 658.77 - 0.84 * T_home_C - 0.52 * (T_growth_C - T_home_C).
     """
     t0 = 298.15
     t_s = torch.clamp(temp_k, min=250.0, max=330.0)
     tg_c = torch.clamp(t_growth_k - C.T_FREEZE, 0.0, 40.0)
-    ds = (659.70 - 0.75 * tg_c) if is_jmax else (668.39 - 1.07 * tg_c)
+    if is_jmax:
+        th_c = torch.clamp((t_home_k if t_home_k is not None else t_growth_k) - C.T_FREEZE, 0.0, 40.0)
+        ds = 658.77 - 0.84 * th_c - 0.52 * (tg_c - th_c)
+        ha_eff: float | torch.Tensor = ha
+    else:
+        ds = 645.13 - 0.38 * tg_c
+        ha_eff = (HA_VCMAX_BASE + HA_VCMAX_SLOPE * tg_c) if ha == HA_VCMAX else ha
 
     num = 1.0 + torch.exp((t0 * ds - HD_ENZYME) / (C.R_GAS_UNIVERSAL * t0))
     den = 1.0 + torch.exp((t_s * ds - HD_ENZYME) / (C.R_GAS_UNIVERSAL * t_s))
-    return torch.exp(ha * (t_s - t0) / (C.R_GAS_UNIVERSAL * t0 * t_s)) * (num / den)
+    return torch.exp(ha_eff * (t_s - t0) / (C.R_GAS_UNIVERSAL * t0 * t_s)) * (num / den)
 
 
 def heskel_respiration_scale(temp_k: torch.Tensor) -> torch.Tensor:
@@ -563,6 +574,8 @@ class BiosphereState:
     ann_min_temp_k: torch.Tensor | None = None    # Running annual minimum daily temperature [K]
     ema_tmin_k: torch.Tensor | None = None        # Climatological annual minimum temperature T_min,yr [K]
     ema_ann_a0_fav: torch.Tensor | None = None    # Moisture-gated annual potential GPP for leaf-habit profit [mol C m^-2 yr^-1]
+    # Multi-year emergent thermal-home adaptation temperature T_home (Kumarathunge et al., 2019; Schneider et al., 2025)
+    ema_temp_home: torch.Tensor | None = None     # Slow (~3-yr) climatological warm-season adaptation temperature [K]
 
 
 def init_biosphere_state(
@@ -612,6 +625,7 @@ def init_biosphere_state(
         ann_min_temp_k=_f(278.15),
         ema_tmin_k=_f(278.15),
         ema_ann_a0_fav=_f(180.0),
+        ema_temp_home=_f(293.15),
     )
 
 
@@ -669,6 +683,15 @@ def update_daily_acclimation_smith(
     bio.ema_temp_mid = (1.0 - alpha_ema) * bio.ema_temp_mid + alpha_ema * midday_temp
     bio.ema_vpd_mid = (1.0 - alpha_ema) * bio.ema_vpd_mid + alpha_ema * torch.clamp(midday_vpd, min=50.0)
     bio.ema_temp_night = (1.0 - alpha_ema) * bio.ema_temp_night + alpha_ema * night_temp
+    # Multi-year map-free climatological thermal-home adaptation T_home (Kumarathunge et al., 2019; Schneider et al., 2025)
+    alpha_home = 1.0 / (3.0 * 365.2425)
+    thome_prev = bio.ema_temp_home if bio.ema_temp_home is not None else bio.ema_temp_mid.clone()
+    is_warm_grow = midday_temp > C.T_FREEZE
+    bio.ema_temp_home = torch.where(
+        veg & is_warm_grow,
+        (1.0 - alpha_home) * thome_prev + alpha_home * midday_temp,
+        thome_prev,
+    )
 
     # 2. Compute acclimation canopy light absorption from EMA downward SW at current exposed LAI
     acclim_rad = canopy_light_absorption_depury(
@@ -704,8 +727,9 @@ def update_daily_acclimation_smith(
     aj_opt_c3 = phi_psii * i_abs * m_c3 * omega_star_c3 / (8.0 * THETA_NRH)  # Smith et al. (2019, Eq. 17)
     vcmax_opt_c3 = torch.where(m_c3 > 4.0 * COST_C_SMITH, aj_opt_c3 / mc_c3, torch.zeros_like(i_abs))
 
-    fv_c3 = torch.clamp(peaked_arrhenius(tg, tg, HA_VCMAX, is_jmax=False), min=0.05)
-    fj_c3 = torch.clamp(peaked_arrhenius(tg, tg, HA_JMAX, is_jmax=True), min=0.05)
+    thome = bio.ema_temp_home if bio.ema_temp_home is not None else tg
+    fv_c3 = torch.clamp(peaked_arrhenius(tg, tg, HA_VCMAX, is_jmax=False, t_home_k=thome), min=0.05)
+    fj_c3 = torch.clamp(peaked_arrhenius(tg, tg, HA_JMAX, is_jmax=True, t_home_k=thome), min=0.05)
     fr_night = torch.clamp(heskel_respiration_scale(bio.ema_temp_night), min=0.05)
 
     lai_scale = torch.clamp(lai_exposed, min=1.0)
@@ -940,6 +964,7 @@ def compute_two_leaf_gas_exchange(
     inst_rad = alloc.inst_rad
     l_sun = inst_rad.l_sun
     l_sh = inst_rad.l_sh
+    thome = bio.ema_temp_home if bio.ema_temp_home is not None else bio.ema_temp_mid
     if (
         can_use_elem_metal(lai_exposed)
         and alloc.sun_frac is not None
@@ -964,10 +989,11 @@ def compute_two_leaf_gas_exchange(
             float(KP25_UMOL_C4),
             float(DHA_KP_C4),
             float(PHI_LEAK_C4),
-            float(HA_VCMAX),
+            float(HA_VCMAX_BASE),
             float(HA_JMAX),
             float(HA_VPMAX),
             float(HD_ENZYME),
+            float(HA_VCMAX_SLOPE),
         )
         out_5 = dispatch_two_leaf_gas_exchange_metal(
             i_sun=inst_rad.i_sun,
@@ -983,6 +1009,7 @@ def compute_two_leaf_gas_exchange(
             vp25_c4=bio.vpmax25_c4,
             r25_c4=bio.r25_c4,
             tg_mid=bio.ema_temp_mid,
+            t_home=thome,
             f_c4=bio.f_c4,
             t_sun=temp_sun,
             t_sh=temp_sh,
@@ -1014,6 +1041,18 @@ def compute_two_leaf_gas_exchange(
     ws = torch.clamp(water_stress_beta, 0.0, 1.0)
     f4 = bio.f_c4
 
+    # Acclimated stomatal sensitivity xi'(T_growth) & thermally acclimated quantum yield phi(T_growth)
+    # held constant over the diurnal cycle (Schneider et al., 2025, Eqs. 11-12; Gan et al., 2026, Eq. 18;
+    # Mengoli et al., 2022) so instantaneous leaf-temperature spikes elicit realistic stomatal VPD closure
+    # and emergent T_opt vs. T_growth scaling without PFT tables.
+    eta_g = water_viscosity_rel(tg)
+    phi_g = phi_psii_temperature(tg)
+    gamma3_g = _arrhenius(GAMMA_STAR25_C3, DHA_GAMMA, tg) * (pres_sfc / 101325.0)
+    km3_g = _arrhenius(KC25_C3, DHA_KC_C3, tg) * (1.0 + oi_pa / _arrhenius(KO25_C3, DHA_KO_C3, tg))
+    xi3_accl = torch.sqrt(BETA_C3 * (km3_g + gamma3_g) / (1.6 * eta_g))
+    kp4_g = _arrhenius(KP25_UMOL_C4 * 1.0e-6, DHA_KP_C4, tg) * pres_sfc
+    xi4_accl = torch.sqrt(BETA_C4 * kp4_g / (1.6 * eta_g))
+
     def _eval_fraction(
         i_par: torch.Tensor,
         tl: torch.Tensor,
@@ -1028,28 +1067,26 @@ def compute_two_leaf_gas_exchange(
         gbw_ms: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         d_af = torch.clamp(d_pa, min=20.0)
-        eta_s = water_viscosity_rel(tl)
-        phi_t = phi_psii_temperature(tl)
-        fv = peaked_arrhenius(tl, tg, HA_VCMAX, is_jmax=False)
-        fj = peaked_arrhenius(tl, tg, HA_JMAX, is_jmax=True)
-        fp = peaked_arrhenius(tl, tg, HA_VPMAX, is_jmax=False)
+        fv = peaked_arrhenius(tl, tg, HA_VCMAX, is_jmax=False, t_home_k=thome)
+        fj = peaked_arrhenius(tl, tg, HA_JMAX, is_jmax=True, t_home_k=thome)
+        fp = peaked_arrhenius(tl, tg, HA_VPMAX, is_jmax=False, t_home_k=thome)
         fr = heskel_respiration_scale(tl)
 
         # Temperature-only kinetic and electron-transport terms (invariant across (c_s, D_s) passes)
         gamma3 = _arrhenius(GAMMA_STAR25_C3, DHA_GAMMA, tl) * (pres_sfc / 101325.0)
         km3 = _arrhenius(KC25_C3, DHA_KC_C3, tl) * (1.0 + oi_pa / _arrhenius(KO25_C3, DHA_KO_C3, tl))
-        xi3 = torch.sqrt(BETA_C3 * (km3 + gamma3) / (1.6 * eta_s))
+        xi3 = xi3_accl
         vc3 = ws * vc25_3 * fv
         jm3 = ws * jm25_3 * fj
-        j_3 = non_rectangular_hyperbola(phi_t * i_par, jm3, THETA_NRH)
+        j_3 = non_rectangular_hyperbola(phi_g * i_par, jm3, THETA_NRH)
         rd3 = r25_3 * fr
 
         kp4 = _arrhenius(KP25_UMOL_C4 * 1.0e-6, DHA_KP_C4, tl) * pres_sfc
-        xi4 = torch.sqrt(BETA_C4 * kp4 / (1.6 * eta_s))
+        xi4 = xi4_accl
         vc4 = ws * vc25_4 * fv
         jm4 = ws * jm25_4 * fj
         vp4 = ws * vp25_4 * fp
-        j_4 = non_rectangular_hyperbola(phi_t * i_par, jm4, THETA_NRH)
+        j_4 = non_rectangular_hyperbola(phi_g * i_par, jm4, THETA_NRH)
         al4 = 0.20 * j_4 * torch.sigmoid(0.35 * ((tl - C.T_FREEZE) - 12.0))  # 5 mol e^- / mol CO2 (von Caemmerer, 2000)
         ac4 = vc4  # Bundle-sheath CO2-saturated Rubisco limit
         b_cj4 = ac4 + al4

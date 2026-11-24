@@ -248,12 +248,24 @@ def _evp_subcycle_core(
         # 2. Internal stress divergence along edge normal: (1/2) * d(s1)/dx + viscous shear damping
         f_int_e = 0.5 * ((s1[c1] - s1[c0]) * inv_dc_edge) * has_ice_e
 
-        # 3. Semi-implicit momentum update (wind stress + internal stress + tilt + Coriolis + implicit ocean drag)
-        cor_e = (cor_w * u_cur[ep_idx]).sum(dim=-1) * m_ice_e
+        # 3. 2-stage semi-implicit midpoint momentum update (no explicit Forward Euler Coriolis!)
+        #    Predictor estimates midpoint u_half; corrector evaluates TRiSK Coriolis at u_half with
+        #    implicit ocean drag, guaranteeing polar inertial stability even under weak water drag.
+        f_ext_e = a_ice_e * tau_air_e + f_int_e - m_ice_e * C.GRAVITY * grad_eta_e
         u_rel_mag = torch.abs(u_cur - u_ocn_e) + 0.05
         c_drag_o = a_ice_e * C.RHO_SEAWATER * EVP_C_WATER * u_rel_mag  # [kg m^-2 s^-1]
-        rhs_u = m_safe * u_cur + dt_e * (a_ice_e * tau_air_e + f_int_e - m_ice_e * C.GRAVITY * grad_eta_e + cor_e + c_drag_o * u_ocn_e)
-        u_cur = torch.clamp((rhs_u / (m_safe + dt_e * c_drag_o)) * has_ice_e, -u_cap, u_cap)
+        cor_0 = (cor_w * u_cur[ep_idx]).sum(dim=-1) * m_ice_e
+        u_half = torch.clamp(
+            ((m_safe * u_cur + (0.5 * dt_e) * (f_ext_e + cor_0 + c_drag_o * u_ocn_e))
+             / (m_safe + (0.5 * dt_e) * c_drag_o)) * has_ice_e,
+            -u_cap,
+            u_cap,
+        )
+        cor_half = (cor_w * u_half[ep_idx]).sum(dim=-1) * m_ice_e
+        u_rel_h = torch.abs(u_half - u_ocn_e) + 0.05
+        c_drag_h = a_ice_e * C.RHO_SEAWATER * EVP_C_WATER * u_rel_h
+        rhs_u = m_safe * u_cur + dt_e * (f_ext_e + cor_half + c_drag_h * u_ocn_e)
+        u_cur = torch.clamp((rhs_u / (m_safe + dt_e * c_drag_h)) * has_ice_e, -u_cap, u_cap)
 
     return u_cur, s1, ss
 
@@ -319,26 +331,34 @@ def step_seaice_evp_itd_voronoi(
         c0, c1, eoc, div_w, inv_dc_edge, mask_e, is_ocn_f, u_cap, float(dt), EVP_N_SUBCYCLES,
     )
 
-    # 4. Strictly conservative Voronoi upwind advection of all 5 ITD (a_cat, v_cat) + snow on ice
+    # 4. Strictly conservative 2-stage SSP-RK2 (Heun) Voronoi advection of 5 ITD (a_cat, v_cat) + snow
     u_pos = torch.clamp(evp.u_ice_e, min=0.0)
     u_neg = torch.clamp(evp.u_ice_e, max=0.0)
 
-    def _advect_2d(q: torch.Tensor) -> torch.Tensor:
+    def _tend_2d(q: torch.Tensor) -> torch.Tensor:
         f_q = (
             u_pos.unsqueeze(0) * q[:, c0]
             + u_neg.unsqueeze(0) * q[:, c1]
             - EVP_DIFF_H * ((q[:, c1] - q[:, c0]) * inv_dc_edge.unsqueeze(0)) * mask_e.unsqueeze(0)
         )
-        dq = -dt * (f_q[:, eoc] * div_w.unsqueeze(0)).sum(dim=-1) * is_ocn_f.unsqueeze(0)
-        return torch.clamp(q + dq, min=0.0) * is_ocn_f.unsqueeze(0)
+        return -(f_q[:, eoc] * div_w.unsqueeze(0)).sum(dim=-1) * is_ocn_f.unsqueeze(0)
+
+    def _advect_2d(q: torch.Tensor) -> torch.Tensor:
+        q1 = torch.clamp(q + dt * _tend_2d(q), min=0.0) * is_ocn_f.unsqueeze(0)
+        q2 = 0.5 * q + 0.5 * (q1 + dt * _tend_2d(q1))
+        return torch.clamp(q2, min=0.0) * is_ocn_f.unsqueeze(0)
 
     evp.a_cat = _advect_2d(evp.a_cat)
     evp.v_cat = _advect_2d(evp.v_cat)
 
+    def _tend_1d(q: torch.Tensor) -> torch.Tensor:
+        f_s = u_pos * q[c0] + u_neg * q[c1] - EVP_DIFF_H * ((q[c1] - q[c0]) * inv_dc_edge) * mask_e
+        return -(f_s[eoc] * div_w).sum(dim=-1) * is_ocn_f
+
     s_i = torch.clamp(sfc.swe_seaice, min=0.0)
-    f_s = u_pos * s_i[c0] + u_neg * s_i[c1] - EVP_DIFF_H * ((s_i[c1] - s_i[c0]) * inv_dc_edge) * mask_e
-    ds = -dt * (f_s[eoc] * div_w).sum(dim=-1) * is_ocn_f
-    sfc.swe_seaice = torch.where(is_ocean, torch.clamp(s_i + ds, min=0.0), sfc.swe_seaice)
+    s_1 = torch.clamp(s_i + dt * _tend_1d(s_i), min=0.0) * is_ocn_f
+    s_2 = torch.clamp(0.5 * s_i + 0.5 * (s_1 + dt * _tend_1d(s_1)), min=0.0) * is_ocn_f
+    sfc.swe_seaice = torch.where(is_ocean, s_2, sfc.swe_seaice)
 
     # 5. Mechanical ridging & exact ITD rebinning -> write conserved total mass back to sfc.m_seaice
     m_adv = evp.v_cat.sum(dim=0) * C.RHO_SEAICE

@@ -58,7 +58,7 @@ class Supervisor:
         poll_sec: int,
         max_session_hours: float,
         min_cu_reserve: float,
-        enable_ocean_bgc: bool = False,
+        enable_ocean_bgc: bool = True,
     ) -> None:
         self.session = session
         self.gpu = gpu
@@ -640,7 +640,7 @@ def main() -> None:
     parser.add_argument("--poll-sec", type=int, default=900, help="Sync & monitor interval in seconds (default 15 min)")
     parser.add_argument("--max-session-hours", type=float, default=21.5, help="Graceful VM rotation threshold [hours]")
     parser.add_argument("--min-cu-reserve", type=float, default=100.0, help="Minimum CU balance reserve before halting")
-    parser.add_argument("--enable-ocean-bgc", action="store_true", help="Enable FlexPFT marine BGC & carbonate chemistry")
+    parser.add_argument("--enable-ocean-bgc", action="store_true", default=True, help="Enable FlexPFT marine BGC & carbonate chemistry (default: True)")
     args = parser.parse_args()
 
     sup = Supervisor(

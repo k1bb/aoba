@@ -52,9 +52,9 @@ aoba/
 │   ├── formulation.md     # 数理定式化モデル記述書（英語）
 │   └── formulation_ja.md  # 数理定式化モデル記述書（日本語）
 ├── data/                  # 境界条件（Earth2014）・検証データ（Köppen-Geiger）（Git完全除外）
-├── references/            # 参考文献・論文PDF保管用（計74本；Git完全除外）
+├── references/            # 参考文献・論文PDF保管用（計95本；Git完全除外）
 ├── src/
-│   └── aoba/              # PyTorch + Metal/CUDA モデル本体パッケージ（全15モジュール）
+│   └── aoba/              # PyTorch + Metal/CUDA モデル本体パッケージ（全37モジュール；ESM拡張 A1–A6 全標準搭載）
 ├── tests/                 # 単体・物理強制力・保存則テスト（CPU + MPS 両対応）
 ├── scripts/               # RCE・Held-Suarez・全球AOBA実行スクリプト ＆ NetCDF変換ツール
 └── pyproject.toml

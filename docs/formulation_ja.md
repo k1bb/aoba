@@ -368,12 +368,12 @@ AOBA は PFT 分類・経験的パラメータ表を一切使わず、植物の�
    J_{\max,\mathrm{opt}} &= \varphi_{\mathrm{PSII}}(T_g)\, \tilde{I}_c\, \omega, \qquad V_{c\max,\mathrm{opt}} = \varphi_{\mathrm{PSII}}(T_g)\, \tilde{I}_c\, \frac{m}{m_c}\frac{\omega^*}{8\theta}.
    \end{aligned}
    $$
-   ここで $\varphi_{\mathrm{PSII}}(T_g)$ は Bernacchi et al. (2003) の二次温度応答を Smith et al. (2019) の $20\ ^\circ\mathrm{C}$ 基準値 $0.257$ で正規化した量子収率、$f_P(T, T_g, H_a)$ は Kattge & Knorr (2007) の成長温度 $T_{g,C} = \mathrm{clip}(T_g - 273.15,\ 0,\ 40)\ [^\circ\mathrm{C}]$ に伴うエントロピー順化ピーク型アレニウス関数（$H_d = 200{,}000\ \mathrm{J\ mol^{-1}},\ T_0 = 298.15\ \mathrm{K}$）、$\eta^*(T)$ は水の相対粘性率である：
+   ここで $\varphi_{\mathrm{PSII}}(T_g)$ は Bernacchi et al. (2003) / Schneider et al. (2025, Eq. 12) に基づく生育温度順化量子収率、$f_P(T, T_g, T_{\mathrm{home}})$ は Kumarathunge et al. (2019) / Schneider, Gessler, & Stocker (2025, Table 1 & Eq. 7) に基づく15日生育温度 $T_{g,C} = \mathrm{clip}(T_g - 273.15,\ 0,\ 40)\ [^\circ\mathrm{C}]$ とマップ不要の多年（約3年）気候適応温度 $T_{\mathrm{home},C}$ を分離したピーク型アレニウス関数（$H_d = 200{,}000\ \mathrm{J\ mol^{-1}},\ T_0 = 298.15\ \mathrm{K}$）、$\eta^*(T)$ は水の相対粘性率である。サブデイリー計算では気孔感度 $\xi'_{\mathrm{C3}}(T_g)$ および量子収率 $\varphi_{\mathrm{PSII}}(T_g)$ を15日順化値で日内一定に保ち、瞬時の葉温・VPD 応答と分離する（Schneider et al., 2025, Eq. 11; Gan et al., 2026, Eq. 18）：
    $$
    \begin{aligned}
-   \varphi_{\mathrm{PSII}}(T_C) &= 0.257 \cdot \frac{\max\!\left(0.352 + 0.022 T_C - 3.4\times 10^{-4} T_C^2,\ 0.02\right)}{0.656}, \qquad T_C = \mathrm{clip}(T - 273.15,\ -5,\ 50), \\
-   f_P(T, T_g, H_a) &= \exp\!\left[\frac{H_a (T - T_0)}{R_{\mathrm{gas}} T_0 T}\right]\frac{1 + \exp\!\left(\dfrac{T_0 \Delta S - H_d}{R_{\mathrm{gas}} T_0}\right)}{1 + \exp\!\left(\dfrac{T \Delta S - H_d}{R_{\mathrm{gas}} T}\right)}, \qquad \Delta S = \begin{cases} 668.39 - 1.07\, T_{g,C} & (V_{c\max}, V_{p\max}), \\ 659.70 - 0.75\, T_{g,C} & (J_{\max}), \end{cases} \\
-   \eta^*(T) &= \exp\!\left[\frac{580}{T - 138} - \frac{580}{T_0 - 138}\right], \qquad f_{\mathrm{Arrh}}(T, \Delta H_a) = \exp\!\left[\frac{\Delta H_a (T - T_0)}{R_{\mathrm{gas}} T_0 T}\right].
+   \varphi_{\mathrm{PSII}}(T_{g,C}) &= 0.257 \cdot \frac{\max\!\left(0.352 + 0.022 T_{g,C} - 3.4\times 10^{-4} T_{g,C}^2,\ 0.02\right)}{0.656}, \\
+   f_P(T, T_g, T_{\mathrm{home}}) &= \exp\!\left[\frac{H_a (T - T_0)}{R_{\mathrm{gas}} T_0 T}\right]\frac{1 + \exp\!\left(\dfrac{T_0 \Delta S - H_d}{R_{\mathrm{gas}} T_0}\right)}{1 + \exp\!\left(\dfrac{T \Delta S - H_d}{R_{\mathrm{gas}} T}\right)}, \quad \begin{cases} H_{a,V} = 42{,}600 + 1{,}140\,T_{g,C},\ \Delta S_V = 645.13 - 0.38\, T_{g,C}, \\ H_{a,J} = 40{,}710,\ \Delta S_J = 658.77 - 0.84\, T_{\mathrm{home},C} - 0.52\,(T_{g,C} - T_{\mathrm{home},C}), \end{cases} \\
+   \eta^*(T) &= \exp\!\left[\frac{580}{T - 138} - \frac{580}{T_0 - 138}\right], \qquad \xi'_{\mathrm{C3}} = \sqrt{\frac{\beta_{\mathrm{C3}}(K_m(T_g) + \Gamma^*(T_g))}{1.6\,\eta^*(T_g)}}, \qquad c_i = \frac{\xi'_{\mathrm{C3}}\, c_s + \Gamma^*(T_{\mathrm{leaf}})\sqrt{D_s}}{\xi'_{\mathrm{C3}} + \sqrt{D_s}}.
    \end{aligned}
    $$
    また $25\ ^\circ\mathrm{C}$ 基準容量は $V_{c\max 25} = V_{c\max,\mathrm{opt}} / \max(f_P(T_g, T_g, H_{a,V}),\, 0.05)$ および $J_{\max 25} = J_{\max,\mathrm{opt}} / \max(f_P(T_g, T_g, H_{a,J}),\, 0.05)$ で換算される。

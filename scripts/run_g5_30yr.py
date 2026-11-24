@@ -122,6 +122,8 @@ def _restore_surface(sfc_target, payload: dict, device: torch.device) -> None:
         sfc_target.bio.ema_tmin_k = sfc_target.t_canopy.clone()
     if "ema_ann_a0_fav" not in bio_payload or sfc_target.bio.ema_ann_a0_fav is None:
         sfc_target.bio.ema_ann_a0_fav = sfc_target.bio.ema_ann_a0.clone()
+    if "ema_temp_home" not in bio_payload or sfc_target.bio.ema_temp_home is None:
+        sfc_target.bio.ema_temp_home = sfc_target.bio.ema_temp_mid.clone()
 
 
 def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] | None = None) -> None:
@@ -145,13 +147,28 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
             {
                 k: (
                     {bk: bv.detach().cpu() if isinstance(bv, torch.Tensor) else bv for bk, bv in v.__dict__.items()}
-                    if k == "bgc" and v is not None
+                    if k in ("bgc", "seaice_evp") and v is not None
                     else (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
                 )
                 for k, v in model.ogcm.__dict__.items()
                 if k != "_static_cache"
             }
             if model.ogcm is not None
+            else None
+        ),
+        "river": (
+            {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.river.__dict__.items()}
+            if model.river is not None
+            else None
+        ),
+        "land_carbon": (
+            {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.land_carbon.__dict__.items()}
+            if model.land_carbon is not None
+            else None
+        ),
+        "aerosols": (
+            {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.aerosols.__dict__.items()}
+            if model.aerosols is not None
             else None
         ),
         "clim": {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.clim.__dict__.items()},
@@ -400,11 +417,12 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             for k, v in ckpt["ogcm"].items():
                 if k == "_static_cache":
                     continue
-                if k == "bgc":
-                    if v is not None and model.ogcm.bgc is not None:
-                        bgc_items = v.items() if isinstance(v, dict) else v.__dict__.items()
-                        for bk, bv in bgc_items:
-                            setattr(model.ogcm.bgc, bk, bv.to(device=device) if isinstance(bv, torch.Tensor) else bv)
+                if k in ("bgc", "seaice_evp"):
+                    sub_target = getattr(model.ogcm, k, None)
+                    if v is not None and sub_target is not None:
+                        sub_items = v.items() if isinstance(v, dict) else v.__dict__.items()
+                        for bk, bv in sub_items:
+                            setattr(sub_target, bk, bv.to(device=device) if isinstance(bv, torch.Tensor) else bv)
                     continue
                 setattr(model.ogcm, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
         else:
@@ -415,6 +433,24 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
                 from aoba.ocean_bgc import init_ocean_bgc_state
 
                 model.ogcm.bgc = init_ocean_bgc_state(model.ogcm.wet_c, model.ogcm.h_c, model.ogcm.z_c, model.mesh.area_cell)
+            if bool(model.cfg.enable_seaice_evp_itd):
+                from aoba.seaice_evp import init_seaice_evp_state
+
+                model.ogcm.seaice_evp = init_seaice_evp_state(model.sfc, model.mesh)
+    if ckpt.get("river") is not None and model.river is not None:
+        for k, v in ckpt["river"].items():
+            setattr(model.river, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+    if ckpt.get("land_carbon") is not None and model.land_carbon is not None:
+        for k, v in ckpt["land_carbon"].items():
+            setattr(model.land_carbon, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+    if ckpt.get("aerosols") is not None and model.aerosols is not None:
+        for k, v in ckpt["aerosols"].items():
+            if isinstance(v, torch.Tensor) and needs_vremap and v.ndim == 2 and v.shape[0] == nz_old:
+                remapped = torch.clamp(_interp_vertical_batch(z_old_c, v.cpu(), z_new_c), min=0.0)
+                remapped = torch.where(z_new_c > z_old_c[-1:], torch.zeros_like(remapped), remapped)
+                setattr(model.aerosols, k, remapped.to(device=device))
+            else:
+                setattr(model.aerosols, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     for k, v in ckpt["clim"].items():
         setattr(model.clim, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
     if ckpt.get("clim_sub") is not None and model.clim_sub is not None:
@@ -1199,6 +1235,32 @@ def main() -> None:
                             f"pCO2={bgc_m['ocean_spco2_uatm']:.1f} uatm | pH={bgc_m['ocean_ph_sfc']:.3f}",
                             flush=True,
                         )
+                esm_parts: list[str] = []
+                if model.river is not None:
+                    q_riv_sv = float((model.river.mouth_flux_kgm2s.detach().cpu().double() * model.mesh.area_cell.detach().cpu().double()).sum().item()) * 1.0e-9
+                    esm_parts.append(f"River={q_riv_sv:.3f} Sv")
+                if model.land_carbon is not None:
+                    from aoba.land_carbon import diagnose_land_carbon_metrics
+
+                    lc_m = diagnose_land_carbon_metrics(model.land_carbon, model.mesh.area_cell)
+                    esm_parts.append(
+                        f"LandC={lc_m['c_land_total_pgc']:.0f} PgC "
+                        f"(Veg={lc_m['c_veg_pgc']:.0f}, Soil={lc_m['c_soil_pgc']:.0f}, "
+                        f"Fire={lc_m['land_fire_pgc_yr']:.2f} PgC/yr)"
+                    )
+                if model.ogcm is not None and model.ogcm.seaice_evp is not None:
+                    evp_s = model.ogcm.seaice_evp
+                    v_ice_kkm3 = float((evp_s.v_cat.sum(dim=0).detach().cpu().double() * model.mesh.area_cell.detach().cpu().double()).sum().item()) * 1.0e-12
+                    u_ice_max = float(evp_s.u_ice_e.abs().max().item())
+                    esm_parts.append(f"EVP_Ice={v_ice_kkm3:.1f}e3 km3 (max|u|={u_ice_max:.2f} m/s)")
+                if model.aerosols is not None:
+                    a_w = model.mesh.area_cell.detach().cpu().double()
+                    a_tot_m2 = float(a_w.sum().item())
+                    aod_tot = float(((model.aerosols.aod_ss + model.aerosols.aod_so4 + model.aerosols.aod_bc + model.aerosols.aod_oc).detach().cpu().double() * a_w).sum().item()) / a_tot_m2
+                    ccn_mean = float((model.aerosols.ccn_aero_m3.detach().cpu().double() * a_w).sum().item()) * 1.0e-6 / a_tot_m2
+                    esm_parts.append(f"Aero(AOD={aod_tot:.4f}, CCN={ccn_mean:.1f} cm^-3)")
+                if esm_parts:
+                    print(f"[ESM Y{year:03d} M{mon_num:02d} | {diag.date_str}] " + " | ".join(esm_parts), flush=True)
                 for k in mon_accum:
                     mon_accum[k] = 0.0
                 mon_cnt = 0

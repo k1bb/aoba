@@ -2005,11 +2005,9 @@ inline float bio_arrhenius(float val25, float dha, float t_k, float r_gas) {
     return val25 * exp(dha * (t_s - 298.15f) / (298.15f * r_gas * t_s));
 }
 
-inline float bio_peaked_arrh(float t_k, float tg_k, float ha, float ds0, float ds_slope, float hd, float r_gas) {
+inline float bio_peaked_arrh_ds(float t_k, float ha, float ds, float hd, float r_gas) {
     float t0 = 298.15f;
     float t_s = clamp(t_k, 250.0f, 330.0f);
-    float tg_c = clamp(tg_k - 273.15f, 0.0f, 40.0f);
-    float ds = ds0 - ds_slope * tg_c;
     float num = 1.0f + exp((t0 * ds - hd) / (r_gas * t0));
     float den = 1.0f + exp((t_s * ds - hd) / (r_gas * t_s));
     return exp(ha * (t_s - t0) / (r_gas * t0 * t_s)) * (num / den);
@@ -2029,20 +2027,21 @@ kernel void two_leaf_gas_exchange_col(
     device const float* vp25_c4      [[buffer(10)]],
     device const float* r25_c4       [[buffer(11)]],
     device const float* tg_mid       [[buffer(12)]],
-    device const float* f_c4         [[buffer(13)]],
-    device const float* t_sun        [[buffer(14)]],
-    device const float* t_sh         [[buffer(15)]],
-    device const float* vpd_sun      [[buffer(16)]],
-    device const float* vpd_sh       [[buffer(17)]],
-    device const float* pres_sfc     [[buffer(18)]],
-    device const float* lai_exp      [[buffer(19)]],
-    device const float* ws_beta      [[buffer(20)]],
-    device const float* gbw_sun      [[buffer(21)]],
-    device const float* gbw_sh       [[buffer(22)]],
-    device float* out_5              [[buffer(23)]],
-    device const float* gas_consts   [[buffer(24)]],
-    constant ulong4& u_p             [[buffer(25)]],
-    constant float4& f_p0            [[buffer(26)]],
+    device const float* t_home       [[buffer(13)]],
+    device const float* f_c4         [[buffer(14)]],
+    device const float* t_sun        [[buffer(15)]],
+    device const float* t_sh         [[buffer(16)]],
+    device const float* vpd_sun      [[buffer(17)]],
+    device const float* vpd_sh       [[buffer(18)]],
+    device const float* pres_sfc     [[buffer(19)]],
+    device const float* lai_exp      [[buffer(20)]],
+    device const float* ws_beta      [[buffer(21)]],
+    device const float* gbw_sun      [[buffer(22)]],
+    device const float* gbw_sh       [[buffer(23)]],
+    device float* out_5              [[buffer(24)]],
+    device const float* gas_consts   [[buffer(25)]],
+    constant ulong4& u_p             [[buffer(26)]],
+    constant float4& f_p0            [[buffer(27)]],
     uint col                         [[thread_position_in_grid]]
 ) {
     uint M = uint(u_p.x);
@@ -2059,32 +2058,34 @@ kernel void two_leaf_gas_exchange_col(
         return;
     }
 
-    float R_GAS        = gas_consts[0];
-    float T_FREEZE     = gas_consts[1];
-    float O2_RATIO     = gas_consts[2];
-    float THETA_NRH    = gas_consts[3];
-    float PHI_PSII_REF = gas_consts[4];
-    float BETA_C3      = gas_consts[5];
-    float BETA_C4      = gas_consts[6];
-    float GAMMA25_C3   = gas_consts[7];
-    float KC25_C3      = gas_consts[8];
-    float KO25_C3      = gas_consts[9];
-    float DHA_GAMMA    = gas_consts[10];
-    float DHA_KC_C3    = gas_consts[11];
-    float DHA_KO_C3    = gas_consts[12];
-    float KP25_UMOL_C4 = gas_consts[13];
-    float DHA_KP_C4    = gas_consts[14];
-    float PHI_LEAK_C4  = gas_consts[15];
-    float HA_VCMAX     = gas_consts[16];
-    float HA_JMAX      = gas_consts[17];
-    float HA_VPMAX     = gas_consts[18];
-    float HD_ENZYME    = gas_consts[19];
-    float co2_ppmv     = f_p0.x;
+    float R_GAS          = gas_consts[0];
+    float T_FREEZE       = gas_consts[1];
+    float O2_RATIO       = gas_consts[2];
+    float THETA_NRH      = gas_consts[3];
+    float PHI_PSII_REF   = gas_consts[4];
+    float BETA_C3        = gas_consts[5];
+    float BETA_C4        = gas_consts[6];
+    float GAMMA25_C3     = gas_consts[7];
+    float KC25_C3        = gas_consts[8];
+    float KO25_C3        = gas_consts[9];
+    float DHA_GAMMA      = gas_consts[10];
+    float DHA_KC_C3      = gas_consts[11];
+    float DHA_KO_C3      = gas_consts[12];
+    float KP25_UMOL_C4   = gas_consts[13];
+    float DHA_KP_C4      = gas_consts[14];
+    float PHI_LEAK_C4    = gas_consts[15];
+    float HA_VCMAX_BASE  = gas_consts[16];
+    float HA_JMAX        = gas_consts[17];
+    float HA_VPMAX       = gas_consts[18];
+    float HD_ENZYME      = gas_consts[19];
+    float HA_VCMAX_SLOPE = gas_consts[20];
+    float co2_ppmv       = f_p0.x;
 
     float p_s = pres_sfc[col];
     float ca_pa = (co2_ppmv * 1.0e-6f) * p_s;
     float oi_pa = O2_RATIO * p_s;
     float tg = tg_mid[col];
+    float th = t_home[col];
     float ws = clamp(ws_beta[col], 0.0f, 1.0f);
     float f4 = f_c4[col];
     float sf = sun_frac[col];
@@ -2094,6 +2095,24 @@ kernel void two_leaf_gas_exchange_col(
     float g0_mol = (ls_sun + ls_sh > 0.01f) ? (0.002f * ws) : 0.0f;
     float eta_25 = exp(-3.719f + 580.0f / (298.15f - 138.0f));
     float phi_20 = 0.656f;
+
+    // Acclimated thermal kinetics, quantum yield phi(T_growth), and stomatal sensitivity xi'(T_growth)
+    // (Kumarathunge et al., 2019; Schneider et al., 2025, Table 1 & Eqs. 7, 11-12; Gan et al., 2026, Eq. 18)
+    float tg_c = clamp(tg - T_FREEZE, 0.0f, 40.0f);
+    float th_c = clamp(th - T_FREEZE, 0.0f, 40.0f);
+    float ha_v_eff = HA_VCMAX_BASE + HA_VCMAX_SLOPE * tg_c;
+    float ds_v = 645.13f - 0.38f * tg_c;
+    float ds_j = 658.77f - 0.84f * th_c - 0.52f * (tg_c - th_c);
+
+    float tg_safe = clamp(tg, 253.15f, 333.15f);
+    float eta_g = exp(-3.719f + 580.0f / (tg_safe - 138.0f)) / eta_25;
+    float tc_pg = clamp(tg - T_FREEZE, -5.0f, 50.0f);
+    float phi_g = PHI_PSII_REF * (max(0.352f + 0.022f * tc_pg - 3.4e-4f * tc_pg * tc_pg, 0.02f) / phi_20);
+    float gamma3_g = bio_arrhenius(GAMMA25_C3, DHA_GAMMA, tg, R_GAS) * (p_s / 101325.0f);
+    float km3_g = bio_arrhenius(KC25_C3, DHA_KC_C3, tg, R_GAS) * (1.0f + oi_pa / bio_arrhenius(KO25_C3, DHA_KO_C3, tg, R_GAS));
+    float xi3 = sqrt(BETA_C3 * (km3_g + gamma3_g) / (1.6f * eta_g));
+    float kp4_g = bio_arrhenius(KP25_UMOL_C4 * 1.0e-6f, DHA_KP_C4, tg, R_GAS) * p_s;
+    float xi4 = sqrt(BETA_C4 * kp4_g / (1.6f * eta_g));
 
     float gpp_tot = 0.0f;
     float rd_tot = 0.0f;
@@ -2123,30 +2142,23 @@ kernel void two_leaf_gas_exchange_col(
         float vp25_4 = is_sun ? p4s : max(p4t - p4s, 1.0e-6f);
         float r25_4  = is_sun ? r4s : max(r4t - r4s, 1.0e-6f);
 
-        float t_safe = clamp(tl, 253.15f, 333.15f);
-        float eta_s = exp(-3.719f + 580.0f / (t_safe - 138.0f)) / eta_25;
-        float tc_p = clamp(tl - T_FREEZE, -5.0f, 50.0f);
-        float phi_t = PHI_PSII_REF * (max(0.352f + 0.022f * tc_p - 3.4e-4f * tc_p * tc_p, 0.02f) / phi_20);
-
-        float fv = bio_peaked_arrh(tl, tg, HA_VCMAX, 668.39f, 1.07f, HD_ENZYME, R_GAS);
-        float fj = bio_peaked_arrh(tl, tg, HA_JMAX,  659.70f, 0.75f, HD_ENZYME, R_GAS);
-        float fp = bio_peaked_arrh(tl, tg, HA_VPMAX, 668.39f, 1.07f, HD_ENZYME, R_GAS);
+        float fv = bio_peaked_arrh_ds(tl, ha_v_eff, ds_v, HD_ENZYME, R_GAS);
+        float fj = bio_peaked_arrh_ds(tl, HA_JMAX,  ds_j, HD_ENZYME, R_GAS);
+        float fp = bio_peaked_arrh_ds(tl, HA_VPMAX, ds_v, HD_ENZYME, R_GAS);
 
         float tc_r = clamp(tl - T_FREEZE, -20.0f, 55.0f);
         float fr = exp((0.1012f * tc_r - 0.0005f * tc_r * tc_r) - 2.2175f);
 
         float gamma3 = bio_arrhenius(GAMMA25_C3, DHA_GAMMA, tl, R_GAS) * (p_s / 101325.0f);
         float km3 = bio_arrhenius(KC25_C3, DHA_KC_C3, tl, R_GAS) * (1.0f + oi_pa / bio_arrhenius(KO25_C3, DHA_KO_C3, tl, R_GAS));
-        float xi3 = sqrt(BETA_C3 * (km3 + gamma3) / (1.6f * eta_s));
         float vc3 = ws * vc25_3 * fv;
         float jm3 = ws * jm25_3 * fj;
-        float ip3 = phi_t * i_par;
+        float ip3 = phi_g * i_par;
         float b3 = ip3 + jm3;
         float j_3 = (b3 - sqrt(max(b3 * b3 - 4.0f * THETA_NRH * ip3 * jm3, 0.0f))) / (2.0f * THETA_NRH);
         float rd3 = r25_3 * fr;
 
         float kp4 = bio_arrhenius(KP25_UMOL_C4 * 1.0e-6f, DHA_KP_C4, tl, R_GAS) * p_s;
-        float xi4 = sqrt(BETA_C4 * kp4 / (1.6f * eta_s));
         float vc4 = ws * vc25_4 * fv;
         float jm4 = ws * jm25_4 * fj;
         float vp4 = ws * vp25_4 * fp;
@@ -2434,6 +2446,7 @@ def run_two_leaf_gas_exchange_metal(
     vp25_c4: torch.Tensor,
     r25_c4: torch.Tensor,
     tg_mid: torch.Tensor,
+    t_home: torch.Tensor,
     f_c4: torch.Tensor,
     t_sun: torch.Tensor,
     t_sh: torch.Tensor,
@@ -2482,6 +2495,7 @@ def run_two_leaf_gas_exchange_metal(
         vp25_c4.view(M).contiguous(),
         r25_c4.view(M).contiguous(),
         tg_mid.view(M).contiguous(),
+        t_home.view(M).contiguous(),
         f_c4.view(M).contiguous(),
         t_sun.view(M).contiguous(),
         t_sh.view(M).contiguous(),
