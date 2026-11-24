@@ -111,6 +111,26 @@ CMIP7_META: dict[str, tuple[str, str, str, str, str]] = {
     "tsl": ("soil_temperature", "Temperature of Soil", "K", "", "land"),
     "gpp": ("gross_primary_productivity_of_biomass_expressed_as_carbon", "Carbon Mass Flux out of Atmosphere Due to Gross Primary Production", "kg m-2 s-1", "", "land"),
     "lai": ("leaf_area_index", "Leaf Area Index", "1", "", "land"),
+    "tran": ("transpiration_flux", "Transpiration Water Flux", "kg m-2 s-1", "up", "land"),
+    # AOBA-Specific Autonomous EEO Biosphere Traits & Canopy CO2 Fluxes
+    "rleaf": ("leaf_respiration_carbon_flux", "Canopy Leaf Dark Respiration Carbon Flux (MMRT)", "kg m-2 s-1", "up", "land"),
+    "an_net": ("net_canopy_carbon_assimilation_flux", "Canopy Net CO2 Assimilation Flux (GPP - R_leaf)", "kg m-2 s-1", "down", "land"),
+    "hcanopy": ("canopy_height", "Autonomous EEO Potential Canopy Height", "m", "", "land"),
+    "sroot": ("root_zone_water_storage_capacity", "Optimal Drought-Bridging Root-Zone Storage Capacity S_R", "kg m-2", "", "land"),
+    "fc4": ("c4_plant_area_fraction", "Autonomous C4 Photosynthetic Pathway Fraction", "1", "", "land"),
+    "lai_c3": ("c3_leaf_area_index", "C3 Leaf Area Index ((1 - f_c4) * LAI)", "1", "", "land"),
+    "lai_c4": ("c4_leaf_area_index", "C4 Leaf Area Index (f_c4 * LAI)", "1", "", "land"),
+    "fevg": ("evergreen_plant_area_fraction", "Autonomous Evergreen Leaf-Habit Fraction", "1", "", "land"),
+    "lai_evg": ("evergreen_leaf_area_index", "Evergreen Leaf Area Index", "1", "", "land"),
+    "lai_dec": ("deciduous_leaf_area_index", "Deciduous Leaf Area Index", "1", "", "land"),
+    "vcmax25": ("canopy_vcmax_at_25C", "Canopy-Effective Rubisco Vcmax at 25 degC", "umol m-2 s-1", "", "land"),
+    "jmax25": ("canopy_jmax_at_25C", "Canopy-Effective Electron Transport Jmax at 25 degC", "umol m-2 s-1", "", "land"),
+    "vcmax25_c3": ("c3_vcmax_at_25C", "C3 Acclimated Rubisco Vcmax at 25 degC", "umol m-2 s-1", "", "land"),
+    "jmax25_c3": ("c3_jmax_at_25C", "C3 Acclimated Electron Transport Jmax at 25 degC", "umol m-2 s-1", "", "land"),
+    "vcmax25_c4": ("c4_vcmax_at_25C", "C4 Acclimated Rubisco Vcmax at 25 degC", "umol m-2 s-1", "", "land"),
+    "jmax25_c4": ("c4_jmax_at_25C", "C4 Acclimated Electron Transport Jmax at 25 degC", "umol m-2 s-1", "", "land"),
+    "vpmax25_c4": ("c4_vpmax_at_25C", "C4 Acclimated PEPC Vpmax at 25 degC", "umol m-2 s-1", "", "land"),
+    "r25_leaf": ("canopy_leaf_respiration_capacity_at_25C", "Canopy-Effective Leaf Dark Respiration Capacity Rd25 at 25 degC", "umol m-2 s-1", "", "land"),
 }
 
 CMIP7_PLEV19_VARS: tuple[str, ...] = ("ta", "ua", "va", "wap", "zg", "hus", "hur", "cl")
@@ -320,6 +340,9 @@ def sample_cmip7_fields(
         mrro = _s2c(sd.runoff_total)
         mrros = _s2c(sd.runoff_ice)
         gpp_c = _s2c(sd.gpp) * 12.011e-9  # umol CO2 m^-2 s^-1 -> kg C m^-2 s^-1
+        rleaf_c = (_s2c(sd.resp_leaf) * 12.011e-9) if sd.resp_leaf is not None else torch.zeros_like(tas)
+        an_net_c = (_s2c(sd.an_net) * 12.011e-9) if sd.an_net is not None else (gpp_c - rleaf_c)
+        tran_c = _s2c(sd.transp) if sd.transp is not None else torch.zeros_like(tas)
     else:
         hfls = evap * C.L_V0
         tauu = torch.zeros_like(tas)
@@ -331,6 +354,9 @@ def sample_cmip7_fields(
         mrro = torch.zeros_like(tas)
         mrros = torch.zeros_like(tas)
         gpp_c = rc.get("gpp", torch.zeros_like(tas)) * 12.011e-9
+        rleaf_c = torch.zeros_like(tas)
+        an_net_c = gpp_c
+        tran_c = torch.zeros_like(tas)
 
     fields: dict[str, torch.Tensor] = {
         "tas": tas,
@@ -445,12 +471,46 @@ def sample_cmip7_fields(
     fields["mrro"] = mrro * is_terr_f
     fields["mrros"] = mrros * is_terr_f
     fields["tsl"] = sfc.t_soil * is_terr_f.unsqueeze(0)
+    bio = sfc.bio
+    fc4 = torch.clamp(bio.f_c4, 0.0, 1.0)
+    fevg = torch.clamp(bio.f_evg, 0.0, 1.0) if bio.f_evg is not None else torch.zeros_like(fc4)
+    lai_evg = bio.lai_evg if bio.lai_evg is not None else (fevg * bio.lai)
+    lai_dec = bio.lai_dec if bio.lai_dec is not None else ((1.0 - fevg) * bio.lai)
+    vcmax_eff = (1.0 - fc4) * bio.vcmax25_c3 + fc4 * bio.vcmax25_c4
+    jmax_eff = (1.0 - fc4) * bio.jmax25_c3 + fc4 * bio.jmax25_c4
+    r25_eff = (1.0 - fc4) * bio.r25_c3 + fc4 * bio.r25_c4
+
     fields["gpp"] = gpp_c * is_land_f
-    fields["lai"] = sfc.bio.lai * is_land_f
+    fields["lai"] = bio.lai * is_land_f
+    fields["tran"] = tran_c * is_land_f
+    fields["rleaf"] = rleaf_c * is_land_f
+    fields["an_net"] = an_net_c * is_land_f
+    fields["hcanopy"] = bio.h_canopy * is_land_f
+    fields["sroot"] = bio.s_root_cap * is_land_f
+    fields["fc4"] = fc4 * is_land_f
+    fields["lai_c3"] = ((1.0 - fc4) * bio.lai) * is_land_f
+    fields["lai_c4"] = (fc4 * bio.lai) * is_land_f
+    fields["fevg"] = fevg * is_land_f
+    fields["lai_evg"] = lai_evg * is_land_f
+    fields["lai_dec"] = lai_dec * is_land_f
+    fields["vcmax25"] = vcmax_eff * is_land_f
+    fields["jmax25"] = jmax_eff * is_land_f
+    fields["vcmax25_c3"] = bio.vcmax25_c3 * is_land_f
+    fields["jmax25_c3"] = bio.jmax25_c3 * is_land_f
+    fields["vcmax25_c4"] = bio.vcmax25_c4 * is_land_f
+    fields["jmax25_c4"] = bio.jmax25_c4 * is_land_f
+    fields["vpmax25_c4"] = bio.vpmax25_c4 * is_land_f
+    fields["r25_leaf"] = r25_eff * is_land_f
+
     for k in ("snc", "snw", "mrso", "mrsos", "mrro", "mrros"):
         valid_masks[k] = is_terr_f
     valid_masks["tsl"] = is_terr_f.unsqueeze(0).expand_as(sfc.t_soil)
-    for k in ("gpp", "lai"):
+    for k in (
+        "gpp", "lai", "tran", "rleaf", "an_net", "hcanopy", "sroot",
+        "fc4", "lai_c3", "lai_c4", "fevg", "lai_evg", "lai_dec",
+        "vcmax25", "jmax25", "vcmax25_c3", "jmax25_c3",
+        "vcmax25_c4", "jmax25_c4", "vpmax25_c4", "r25_leaf",
+    ):
         valid_masks[k] = is_land_f
 
     return fields, valid_masks

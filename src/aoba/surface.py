@@ -200,6 +200,9 @@ class SurfaceFluxDiagnostics:
     f_seaice: torch.Tensor        # Diagnosed fractional sea-ice area `f_i` [-]
     f_snow_land: torch.Tensor     # Diagnosed fractional snow cover on land `A_sn` [-]
     smb_ice_flux: torch.Tensor | None = None  # Climatic snow/ice surface mass balance flux [kg m^-2 s^-1]
+    resp_leaf: torch.Tensor | None = None     # Canopy leaf dark respiration R_d [umol CO2 m^-2 s^-1]
+    an_net: torch.Tensor | None = None        # Canopy net CO2 assimilation (GPP - R_d) [umol CO2 m^-2 s^-1]
+    transp: torch.Tensor | None = None        # Canopy transpiration water flux [kg m^-2 s^-1]
 
 
 def init_surface_state(
@@ -1587,6 +1590,9 @@ def _surface_part_c_merge_core(
     liq_runoff: torch.Tensor,
     glacier_runoff: torch.Tensor,
     two_leaf_gpp: torch.Tensor,
+    two_leaf_resp: torch.Tensor,
+    two_leaf_an: torch.Tensor,
+    e_trans: torch.Tensor,
     a_sn: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
     """Pure-tensor Part C state commit & merged flux diagnostics (CUDA-compilable)."""
@@ -1635,6 +1641,9 @@ def _surface_part_c_merge_core(
     runoff_tot = torch.where(is_terrestrial, liq_runoff + glacier_runoff, z0)
     runoff_glac = torch.where(is_terrestrial, glacier_runoff, z0)
     gpp_out = torch.where(is_land, two_leaf_gpp, z0)
+    resp_out = torch.where(is_land, two_leaf_resp, z0)
+    an_out = torch.where(is_land, two_leaf_an, z0)
+    transp_out = torch.where(is_land, e_trans, z0)
     f_snow_land = torch.where(is_terrestrial, a_sn, z0)
 
     return (
@@ -1642,7 +1651,7 @@ def _surface_part_c_merge_core(
         t_can_out, t_sun_out, t_sh_out, t_gnd_out, swe_out, swe_max_out, snow_age_out,
         t_ml_out, comp_out, ustar_o_out, m_si_out, t_si_out, swe_si_out,
         shf, lhf, evap, tau_x, tau_y, ustar_all, buoy_flux, emiss, t_rad,
-        d_out, z0m_out, runoff_tot, runoff_glac, gpp_out, f_snow_land,
+        d_out, z0m_out, runoff_tot, runoff_glac, gpp_out, resp_out, an_out, transp_out, f_snow_land,
     )
 
 
@@ -1860,7 +1869,7 @@ def step_surface(
         sfc.t_ocean_ml, sfc.t_ocean_ml_comp, sfc.u_star_ocean,
         sfc.m_seaice, sfc.t_seaice, sfc.swe_seaice,
         shf, lhf, evap, tau_x, tau_y, ustar_all, buoy_flux, emiss, t_rad,
-        d_out, z0m_out, runoff_tot, runoff_glac, gpp_out, f_snow_land,
+        d_out, z0m_out, runoff_tot, runoff_glac, gpp_out, resp_out, an_out, transp_out, f_snow_land,
     ) = merge_fn(
         is_terrestrial, is_land, is_ocean,
         t_soil_new, w_liq_new, w_ice_new, w_root_next, wc_next,
@@ -1873,7 +1882,8 @@ def step_surface(
         tr_ocn.c_m, tr_land.c_m, tr_ocn.wind_eff, tr_land.wind_eff,
         tr_ocn.u_star, tr_land.u_star,
         rho_sfc, cp_air, exner_s, theta_1, theta_v1, qv_1, u_1, v_1,
-        d_land, z0m_sea, z0m_terr, liq_runoff, glacier_runoff, two_leaf.gpp, a_sn,
+        d_land, z0m_sea, z0m_terr, liq_runoff, glacier_runoff,
+        two_leaf.gpp, two_leaf.resp_leaf, two_leaf.an_net, e_trans, a_sn,
     )
 
     return SurfaceFluxDiagnostics(
@@ -1898,4 +1908,7 @@ def step_surface(
         f_seaice=f_ice,
         f_snow_land=f_snow_land,
         smb_ice_flux=smb_ice_land,
+        resp_leaf=resp_out,
+        an_net=an_out,
+        transp=transp_out,
     )
