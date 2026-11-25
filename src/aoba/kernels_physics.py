@@ -5525,21 +5525,31 @@ kernel void crm_distill_closure_col(
         uint idx = k * N + c;
         float dm = max(rho_d[idx] * dz_c[idx], 1.0e-6f);
         float ex = exner[idx];
-        float s_lin = clamp((ex - 0.42f) / 0.15f, 0.0f, 1.0f);
+        float ex_safe = max(ex, 0.05f);
+        float s_lin = clamp((ex - 0.50f) / 0.14f, 0.0f, 1.0f);
         float s_conv = s_lin * s_lin;
+        float t_env = clamp(thm_post_ls[idx] * ex_safe, 180.0f, 340.0f);
+        float p_env = 100000.0f * pow(ex_safe, 3.5f);
+        float es_arg = (t_env >= 273.15f)
+            ? clamp(17.67f * (t_env - 273.15f) / max(t_env - 29.65f, 20.0f), -25.0f, 12.0f)
+            : clamp(21.875f * (t_env - 273.15f) / max(t_env - 7.66f, 20.0f), -25.0f, 12.0f);
+        float es_env = 611.2f * exp(es_arg);
+        float qsat_env = clamp(0.622f * es_env / max(p_env - es_env, 100.0f), 1.0e-7f, 0.10f);
+
         float qn0 = max(qn_post_ls[idx], 0.0f);
         float qp0 = max(qp_pre[idx], 0.0f);
         dm_sum_m += dm * s_conv;
         w_pre += dm * (qn0 + qp0);
 
         float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
-        float dqn_r = s_conv * tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * 5.0e-3f;
+        float dq_lim = min(1.5f * qsat_env + 0.5f * qnb, 5.0e-3f);
+        float dqn_r = s_conv * tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * dq_lim;
         float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.5f);
         float qn_p = max(qnb + dqn_r, 0.0f);
         float qp_p = s_conv * min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig));
         w_prov += dm * (qn_p + qp_p);
 
-        float d_thm_r = (s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 5.0f) / max(ex, 0.05f);
+        float d_thm_r = (s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 5.0f) / ex_safe;
         dh_raw += cp_d * dm * ex * d_thm_r;
         denom_h += cp_d * dm * ex * ex * s_conv;
 
@@ -5566,12 +5576,22 @@ kernel void crm_distill_closure_col(
         uint idx = k * N + c;
         float dm = max(rho_d[idx] * dz_c[idx], 1.0e-6f);
         float ex = exner[idx];
-        float s_lin = clamp((ex - 0.42f) / 0.15f, 0.0f, 1.0f);
+        float ex_safe = max(ex, 0.05f);
+        float s_lin = clamp((ex - 0.50f) / 0.14f, 0.0f, 1.0f);
         float s_conv = s_lin * s_lin;
+        float t_env = clamp(thm_post_ls[idx] * ex_safe, 180.0f, 340.0f);
+        float p_env = 100000.0f * pow(ex_safe, 3.5f);
+        float es_arg = (t_env >= 273.15f)
+            ? clamp(17.67f * (t_env - 273.15f) / max(t_env - 29.65f, 20.0f), -25.0f, 12.0f)
+            : clamp(21.875f * (t_env - 273.15f) / max(t_env - 7.66f, 20.0f), -25.0f, 12.0f);
+        float es_env = 611.2f * exp(es_arg);
+        float qsat_env = clamp(0.622f * es_env / max(p_env - es_env, 100.0f), 1.0e-7f, 0.10f);
+
         float qn0 = max(qn_post_ls[idx], 0.0f);
         float qp0 = max(qp_pre[idx], 0.0f);
         float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
-        float dqn_r = s_conv * tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * 5.0e-3f;
+        float dq_lim = min(1.5f * qsat_env + 0.5f * qnb, 5.0e-3f);
+        float dqn_r = s_conv * tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * dq_lim;
         float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.5f);
         float qn_n = zero_prov ? qnb : (max(qnb + dqn_r, 0.0f) * scale_w);
         float qp_n = zero_prov ? qp0 : (s_conv * min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig)) * scale_w);
@@ -5611,7 +5631,7 @@ kernel void crm_distill_closure_col(
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * N + c;
         float ex = exner[idx];
-        float s_lin = clamp((ex - 0.42f) / 0.15f, 0.0f, 1.0f);
+        float s_lin = clamp((ex - 0.50f) / 0.14f, 0.0f, 1.0f);
         float s_conv = s_lin * s_lin;
         float d_thm_r = (s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 5.0f) / max(ex, 0.05f);
         float du_r = s_conv * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 8.0f;

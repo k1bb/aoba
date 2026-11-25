@@ -334,15 +334,25 @@ def apply_exact_conservation_closure(
     # Convert [N, 8, nz] -> [nz, N] per field (contiguous for MPS backward kernels)
     rp = raw_prof.permute(1, 2, 0).contiguous()  # [8, nz, N]
     # Universal thermodynamic convective envelope s_conv(exner) in [0, 1]:
-    # 1.0 throughout the troposphere (p >= 140 hPa, exner >= 0.57), tapering smoothly via C^1 quadratic
-    # ramp to 0.0 above 50 hPa (exner <= 0.42) so the stratospheric/mesospheric column obeys pure host
-    # dynamics + radiation + O3 + GWD with zero neural-network temperature, moisture, or wind drift.
-    s_lin = torch.clamp((exner - 0.42) / 0.15, min=0.0, max=1.0)
+    # 1.0 throughout the troposphere (p >= 210 hPa, exner >= 0.64), tapering smoothly via C^1 quadratic
+    # ramp across the tropical anvil zone to 0.0 at/above the 90 hPa tropopause cold point (exner <= 0.50)
+    # so the stratosphere & mesosphere obey pure host dynamics + radiation + O3 + GWD with zero ML drift.
+    s_lin = torch.clamp((exner - 0.50) / 0.14, min=0.0, max=1.0)
     s_conv = s_lin * s_lin
-    # Predict bounded temperature residual dT [K] -> d_theta_m = dT / exner so troposphere & stratosphere share O(1 K) scale
+    # Local Clausius-Clapeyron saturation mixing ratio q_sat(T_env, p_env) bounds d_qn_raw so cold
+    # upper-tropospheric layers (q_sat ~ 0.05 g/kg at 200 hPa) can never receive unphysical multi-g/kg
+    # moisture injections that trigger runaway freezing/latent-heating bias at the tropopause.
+    ex_safe = torch.clamp(exner, min=0.05)
+    t_env = torch.clamp(thm_post_ls * ex_safe, min=180.0, max=340.0)
+    p_env = C.P_REF * torch.pow(ex_safe, 3.5)
+    es_w = 611.2 * torch.exp(torch.clamp(17.67 * (t_env - C.T_FREEZE) / torch.clamp(t_env - 29.65, min=20.0), -25.0, 12.0))
+    es_i = 611.2 * torch.exp(torch.clamp(21.875 * (t_env - C.T_FREEZE) / torch.clamp(t_env - 7.66, min=20.0), -25.0, 12.0))
+    es_env = torch.where(t_env >= C.T_FREEZE, es_w, es_i)
+    qsat_env = torch.clamp(0.622 * es_env / torch.clamp(p_env - es_env, min=100.0), min=1.0e-7, max=0.10)
+
+    # Predict bounded temperature residual dT [K] -> d_theta_m = dT / exner
     d_temp_raw = s_conv * torch.tanh(rp[0] * 0.2) * 5.0
-    d_thm_raw = d_temp_raw / torch.clamp(exner, min=0.05)
-    d_qn_raw = s_conv * torch.tanh(rp[1] * 0.2) * 5.0e-3      # bounded [kg kg^-1] per step
+    d_thm_raw = d_temp_raw / ex_safe
     f_qp_logit = rp[2]
     f_cond_logit = rp[3]
     f_ice_logit = rp[4]
@@ -367,6 +377,8 @@ def apply_exact_conservation_closure(
     # Apply surface evaporation into lowest layer before non-negative rescaling
     qn_base = torch.clamp(qn_post_ls, min=0.0).clone()
     qn_base[0] = torch.clamp(qn_base[0] + (evap * dt) / torch.clamp(dm[0], min=1.0e-4), min=0.0)
+    dq_lim = torch.clamp(1.5 * qsat_env + 0.5 * qn_base, max=5.0e-3)
+    d_qn_raw = s_conv * torch.tanh(rp[1] * 0.2) * dq_lim
     qn_prov = torch.clamp(qn_base + d_qn_raw, min=0.0)
     # Parameterize short-lived falling hydrometeors q_p directly (contractive, <= 3 g/kg ceiling,
     # zero dry-stratosphere bias, zero additive random-walk accumulation).
@@ -1315,6 +1327,10 @@ def _compute_distill_loss(
             F.smooth_l1_loss(lwp_p2, torch.cat([lwp_t, lwp_t], dim=0))
             + F.smooth_l1_loss(iwp_p2, torch.cat([iwp_t, iwp_t], dim=0))
         ) + 0.5 * F.smooth_l1_loss(rwp_p2, torch.cat([rwp_t, rwp_t], dim=0))
+    # Log-scale total water loss ensures accurate thin-cirrus & cold upper-troposphere moisture (1e-5..1e-2 kg/kg)
+    qn_log_t2 = torch.log1p(torch.clamp(torch.cat([tp[1], tp[1]], dim=1), min=0.0) * 1.0e4)
+    qn_log_p2 = torch.log1p(torch.clamp(torch.cat([pred_a["q_n"], pred_b["q_n"]], dim=1), min=0.0) * 1.0e4)
+    loss = loss + 0.6 * F.smooth_l1_loss(qn_log_p2, qn_log_t2, beta=0.2)
 
     with torch.no_grad():
         rmse_t = torch.sqrt(F.mse_loss(0.5 * (pred_a["theta_m"] + pred_b["theta_m"]) * exner, t_tgt))
