@@ -33,7 +33,10 @@ from dataclasses import dataclass
 import math
 import torch
 
+from types import SimpleNamespace
+
 from aoba import constants as C
+from aoba.runtime import can_use_cuda_graph, run_cuda_graph_cached
 from aoba.biosphere import (
     compute_optimal_soil_water_beta,
     update_daily_acclimation_smith,
@@ -921,6 +924,152 @@ def step_crm_physics_and_dynamics(
             crm.n_c = torch.zeros_like(crm.q_c)
         if crm.n_i is None:
             crm.n_i = torch.zeros_like(crm.q_i)
+
+    if can_use_cuda_graph(crm.rho_d.device) and can_use_crm_metal(crm.rho_d):
+        _opt_crm_names = ("f_coriolis", "n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g")
+        _core_crm_names = ("rho_d", "u", "v", "w", "theta_m", "q_n", "q_p", "q_v", "q_c", "q_i", "qke")
+        _opt_crm_present = tuple(k for k in _opt_crm_names if getattr(crm, k, None) is not None)
+        _opt_arg_pairs = (
+            ("u_host_target", u_host_target),
+            ("v_host_target", v_host_target),
+            ("dtheta_m_ls_dt", dtheta_m_ls_dt),
+            ("dq_n_ls_dt", dq_n_ls_dt),
+            ("rad_heating_k_s", rad_heating_k_s),
+            ("z_c_col", z_c_col),
+            ("z_w_col", z_w_col),
+            ("dz_c_col", dz_c_col),
+            ("is_ocean_sub", is_ocean_sub),
+            ("u_sfc_sub", u_sfc_sub),
+            ("q_dust_sub", q_dust_sub),
+        )
+        _opt_arg_present = tuple(k for k, v in _opt_arg_pairs if v is not None)
+        has_sfc = sfc_fluxes is not None
+
+        live_in: list[torch.Tensor] = [getattr(crm, k) for k in _core_crm_names]
+        live_in.extend(getattr(crm, k) for k in _opt_crm_present)
+        live_in.extend(v for _, v in _opt_arg_pairs if v is not None)
+        if has_sfc:
+            assert sfc_fluxes is not None
+            live_in.extend([
+                sfc_fluxes.u_star, sfc_fluxes.buoy_flux, sfc_fluxes.tau_x,
+                sfc_fluxes.tau_y, sfc_fluxes.shf, sfc_fluxes.evap,
+            ])
+
+        key = (
+            "crm_step_3d",
+            id(vgrid),
+            tuple(tuple(t.shape) for t in live_in),
+            tuple(t.dtype for t in live_in),
+            _opt_crm_present,
+            _opt_arg_present,
+            has_sfc,
+            float(dt_crm), int(n_dyn_substeps), float(tau_sp_mom), mp_key,
+            float(crm.dx), float(crm.dy),
+        )
+        n_core = len(_core_crm_names)
+        n_opt_c = len(_opt_crm_present)
+
+        def _crm_body(ins: list[torch.Tensor]) -> list[torch.Tensor]:
+            pos = 0
+            c_kwargs: dict[str, object] = {}
+            for k in _core_crm_names:
+                c_kwargs[k] = ins[pos]
+                pos += 1
+            for k in _opt_crm_present:
+                c_kwargs[k] = ins[pos]
+                pos += 1
+            tmp_crm = CRMState(dx=crm.dx, dy=crm.dy, **c_kwargs)  # type: ignore[arg-type]
+            a_map: dict[str, torch.Tensor | None] = {k: None for k, _ in _opt_arg_pairs}
+            for k in _opt_arg_present:
+                a_map[k] = ins[pos]
+                pos += 1
+            sfc_in = (
+                SimpleNamespace(
+                    u_star=ins[pos], buoy_flux=ins[pos + 1], tau_x=ins[pos + 2],
+                    tau_y=ins[pos + 3], shf=ins[pos + 4], evap=ins[pos + 5],
+                )
+                if has_sfc
+                else None
+            )
+            sp_res = _step_crm_physics_and_dynamics_impl(
+                crm=tmp_crm, vgrid=vgrid, dt_crm=dt_crm, n_dyn_substeps=n_dyn_substeps,
+                u_host_target=a_map["u_host_target"], v_host_target=a_map["v_host_target"],
+                tau_sp_mom=tau_sp_mom,
+                dtheta_m_ls_dt=a_map["dtheta_m_ls_dt"], dq_n_ls_dt=a_map["dq_n_ls_dt"],
+                sfc_fluxes=sfc_in,  # type: ignore[arg-type]
+                rad_heating_k_s=a_map["rad_heating_k_s"],
+                z_c_col=a_map["z_c_col"], z_w_col=a_map["z_w_col"], dz_c_col=a_map["dz_c_col"],
+                microphysics_scheme=microphysics_scheme,
+                is_ocean_sub=a_map["is_ocean_sub"], u_sfc_sub=a_map["u_sfc_sub"],
+                q_dust_sub=a_map["q_dust_sub"],
+            )
+            out_list: list[torch.Tensor] = [getattr(tmp_crm, k) for k in _core_crm_names]
+            out_list.extend(getattr(tmp_crm, k) for k in _opt_crm_present if k != "f_coriolis")
+            out_list.extend([
+                sp_res.dtheta_m_dt, sp_res.dq_n_dt, sp_res.dq_p_dt,
+                sp_res.du_dt, sp_res.dv_dt, sp_res.precip_rain, sp_res.precip_snow,
+            ])
+            if sp_res.precip_rain_sub is not None and sp_res.precip_snow_sub is not None:
+                out_list.extend([sp_res.precip_rain_sub, sp_res.precip_snow_sub])
+            return out_list
+
+        outs = run_cuda_graph_cached(key, live_in, _crm_body, warmup_calls=2, clone_outputs=True)
+        pos = 0
+        for k in _core_crm_names:
+            setattr(crm, k, outs[pos])
+            pos += 1
+        for k in _opt_crm_present:
+            if k != "f_coriolis":
+                setattr(crm, k, outs[pos])
+                pos += 1
+        has_sub_pr = len(outs) > pos + 7
+        return SPTendencies(
+            dtheta_m_dt=outs[pos],
+            dq_n_dt=outs[pos + 1],
+            dq_p_dt=outs[pos + 2],
+            du_dt=outs[pos + 3],
+            dv_dt=outs[pos + 4],
+            precip_rain=outs[pos + 5],
+            precip_snow=outs[pos + 6],
+            precip_rain_sub=(outs[pos + 7] if has_sub_pr else None),
+            precip_snow_sub=(outs[pos + 8] if has_sub_pr else None),
+        )
+
+    return _step_crm_physics_and_dynamics_impl(
+        crm=crm, vgrid=vgrid, dt_crm=dt_crm, n_dyn_substeps=n_dyn_substeps,
+        u_host_target=u_host_target, v_host_target=v_host_target, tau_sp_mom=tau_sp_mom,
+        dtheta_m_ls_dt=dtheta_m_ls_dt, dq_n_ls_dt=dq_n_ls_dt, sfc_fluxes=sfc_fluxes,
+        rad_heating_k_s=rad_heating_k_s, z_c_col=z_c_col, z_w_col=z_w_col, dz_c_col=dz_c_col,
+        microphysics_scheme=microphysics_scheme, is_ocean_sub=is_ocean_sub,
+        u_sfc_sub=u_sfc_sub, q_dust_sub=q_dust_sub,
+    )
+
+
+def _step_crm_physics_and_dynamics_impl(
+    crm: CRMState,
+    vgrid: VerticalGrid,
+    dt_crm: float,
+    n_dyn_substeps: int = 1,
+    u_host_target: torch.Tensor | None = None,
+    v_host_target: torch.Tensor | None = None,
+    tau_sp_mom: float = 600.0,
+    dtheta_m_ls_dt: torch.Tensor | None = None,
+    dq_n_ls_dt: torch.Tensor | None = None,
+    sfc_fluxes: SurfaceFluxDiagnostics | None = None,
+    rad_heating_k_s: torch.Tensor | None = None,
+    z_c_col: torch.Tensor | None = None,
+    z_w_col: torch.Tensor | None = None,
+    dz_c_col: torch.Tensor | None = None,
+    microphysics_scheme: str = "one_moment",
+    is_ocean_sub: torch.Tensor | None = None,
+    u_sfc_sub: torch.Tensor | None = None,
+    q_dust_sub: torch.Tensor | None = None,
+) -> SPTendencies:
+    nz, n_col, ny, nx = crm.rho_d.shape
+    m_sub = n_col * ny * nx
+    mp_key = str(microphysics_scheme).strip().lower()
+    use_6c_mp = mp_key == "six_class_2m"
+    use_2m_mp = mp_key == "two_moment"
 
     # Record initial horizontal-mean profiles before CRM physics + subgrid transport
     thm_mean_0 = mean_2d(crm.theta_m)

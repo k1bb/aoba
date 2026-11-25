@@ -43,7 +43,7 @@ from aoba.kernels import (
     dispatch_scvt_vorticity_metal,
     solve_tridiagonal_batched,
 )
-from aoba.runtime import maybe_cuda_compile
+from aoba.runtime import can_use_cuda_graph, maybe_cuda_compile, run_cuda_graph_cached
 from aoba.scvt_mesh import SCVTMesh, project_cell_vectors_to_edges, reconstruct_cell_winds
 from aoba.thermodynamics import diagnose_pressure_temperature, qsat_mixed, rcemip_analytic_sounding
 from aoba.vertical_grid import VerticalGrid, compute_stf_heights
@@ -665,6 +665,58 @@ def step_scvt_rk3_hevi(
 
     Returns `(uh_final, omega_z_final)` matching `(mass_new - mass_old)` for Zalesak FCT.
     """
+    if can_use_cuda_graph(state.u_edge.device) and can_use_crm_metal(state.u_edge):
+        has_du = du_phys_edge is not None
+        has_dth = dtheta_m_phys is not None
+        live_in: list[torch.Tensor] = [
+            state.rho_d, state.u_edge, state.w, state.theta_m, state.q_n, state.q_p,
+        ]
+        if has_du:
+            assert du_phys_edge is not None
+            live_in.append(du_phys_edge)
+        if has_dth:
+            assert dtheta_m_phys is not None
+            live_in.append(dtheta_m_phys)
+        key = (
+            "scvt_rk3_hevi",
+            id(mesh), id(vgrid), int(state.z_c.data_ptr()),
+            tuple(tuple(t.shape) for t in live_in),
+            tuple(t.dtype for t in live_in),
+            float(dt_dyn), float(beta_hevi), has_du, has_dth,
+        )
+
+        def _body(ins: list[torch.Tensor]) -> list[torch.Tensor]:
+            idx = 6
+            du_in = ins[idx] if has_du else None
+            if has_du:
+                idx += 1
+            dth_in = ins[idx] if has_dth else None
+            tmp_state = GlobalAtmosState(
+                rho_d=ins[0], u_edge=ins[1], w=ins[2], theta_m=ins[3],
+                q_n=ins[4], q_p=ins[5], q_v=state.q_v, q_c=state.q_c, q_i=state.q_i,
+                z_c=state.z_c, z_w=state.z_w, dz_c=state.dz_c,
+            )
+            uh_f, om_f = _step_scvt_rk3_hevi_impl(
+                tmp_state, mesh, vgrid, dt_dyn, beta_hevi, du_in, dth_in,
+            )
+            return [tmp_state.rho_d, tmp_state.u_edge, tmp_state.w, tmp_state.theta_m, uh_f, om_f]
+
+        outs = run_cuda_graph_cached(key, live_in, _body, warmup_calls=2, clone_outputs=True)
+        state.rho_d, state.u_edge, state.w, state.theta_m = outs[0], outs[1], outs[2], outs[3]
+        return outs[4], outs[5]
+
+    return _step_scvt_rk3_hevi_impl(state, mesh, vgrid, dt_dyn, beta_hevi, du_phys_edge, dtheta_m_phys)
+
+
+def _step_scvt_rk3_hevi_impl(
+    state: GlobalAtmosState,
+    mesh: SCVTMesh,
+    vgrid: VerticalGrid,
+    dt_dyn: float,
+    beta_hevi: float = 0.60,
+    du_phys_edge: torch.Tensor | None = None,
+    dtheta_m_phys: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     nz = vgrid.nz
     c0 = mesh.cells_on_edge[:, 0]
     c1 = mesh.cells_on_edge[:, 1]

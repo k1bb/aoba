@@ -1916,23 +1916,55 @@ def select_rad_teacher_indices(
     crm_state: CRMSelfDistillState | None = None,
     allow_sparse_warmup: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Select host-cell `(teacher_idx, student_idx)` for ICA radiation, synced with CRM when active."""
+    """Select host-cell `(teacher_idx, student_idx)` for ICA radiation, synced with CRM when active.
+
+    Caches the selected `(teacher_idx, student_idx)` across dwell windows to eliminate per-rad-step
+    GPU->CPU `torch.nonzero` synchronization stalls.
+    """
     if state.steps_seen < state.warmup_steps and not allow_sparse_warmup:
         return None
     if crm_state is not None and crm_state.stride == state.stride and (
         allow_sparse_warmup or crm_state.steps_seen >= crm_state.warmup_steps
     ):
-        return _select_hybrid_teacher_indices(
+        in_w = crm_state.steps_seen < crm_state.warmup_steps
+        if in_w:
+            dwell_w = max(crm_state.warmup_steps // 4, 1)
+            bucket = ("cw", crm_state.steps_seen // dwell_w, allow_sparse_warmup)
+        else:
+            coh_b = (crm_state.steps_seen - crm_state.warmup_steps) // crm_state.dwell_steps
+            ood_d = min(crm_state.dwell_steps, 12)
+            ood_b = (crm_state.steps_seen - crm_state.warmup_steps) // max(ood_d, 1)
+            bucket = ("cs", coh_b, ood_b, allow_sparse_warmup)
+        cached = getattr(state, "_sel_cache", None)
+        if cached is not None and cached[0] == bucket:
+            return cached[1]
+        res = _select_hybrid_teacher_indices(
             crm_state.cohort_id,
             state.last_uncertainty + 0.5 * crm_state.last_uncertainty,
             state.n_cells, crm_state.stride, crm_state.steps_seen, crm_state.warmup_steps, crm_state.dwell_steps,
             allow_sparse_warmup=allow_sparse_warmup,
         )
-    return _select_hybrid_teacher_indices(
+        state._sel_cache = (bucket, res)  # type: ignore[attr-defined]
+        return res
+    in_w = state.steps_seen < state.warmup_steps
+    if in_w:
+        dwell_w = max(state.warmup_steps // 4, 1)
+        bucket = ("rw", state.steps_seen // dwell_w, allow_sparse_warmup)
+    else:
+        coh_b = (state.steps_seen - state.warmup_steps) // state.dwell_steps
+        ood_d = min(state.dwell_steps, 6)
+        ood_b = (state.steps_seen - state.warmup_steps) // max(ood_d, 1)
+        bucket = ("rs", coh_b, ood_b, allow_sparse_warmup)
+    cached = getattr(state, "_sel_cache", None)
+    if cached is not None and cached[0] == bucket:
+        return cached[1]
+    res = _select_hybrid_teacher_indices(
         state.cohort_id, state.last_uncertainty,
         state.n_cells, state.stride, state.steps_seen, state.warmup_steps, state.dwell_steps,
         allow_sparse_warmup=allow_sparse_warmup,
     )
+    state._sel_cache = (bucket, res)  # type: ignore[attr-defined]
+    return res
 
 
 def _compute_rad_distill_loss(
