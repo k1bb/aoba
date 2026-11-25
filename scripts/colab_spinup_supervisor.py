@@ -58,7 +58,8 @@ class Supervisor:
         poll_sec: int,
         max_session_hours: float,
         min_cu_reserve: float,
-        enable_ocean_bgc: bool = True,
+        config_path: str = "",
+        enable_ocean_bgc: bool = False,
     ) -> None:
         self.session = session
         self.gpu = gpu
@@ -68,6 +69,7 @@ class Supervisor:
         self.poll_sec = poll_sec
         self.max_session_hours = max_session_hours
         self.min_cu_reserve = min_cu_reserve
+        self.config_path = str(config_path).strip()
         self.enable_ocean_bgc = enable_ocean_bgc
         self.log_path = self.out_dir / "supervisor.log"
         self.status_path = self.out_dir / "spinup_status.json"
@@ -287,6 +289,8 @@ cmd = [
     "--out-dir", "{REMOTE_OUT}",
     "--device", "cuda",
 ]
+if {bool(self.config_path)!r}:
+    cmd.extend(["--config", "{self.config_path}"])
 if {bool(self.enable_ocean_bgc)!r}:
     cmd.append("--enable-ocean-bgc")
 p = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, env=env, cwd="{REMOTE_REPO}", start_new_session=True)
@@ -596,7 +600,13 @@ print('MID_TAR_OK')
                         if rotation_triggered:
                             self.log("Clean STOP_AFTER_MONTH handoff completed! Rotating to fresh A100 session...")
                         else:
-                            self.log("Runner exited unexpectedly before target year; will check CU & restart on fresh session.")
+                            tail_txt = "\n".join(info.get("log_tail", []))
+                            if "Traceback" in tail_txt or "Error:" in tail_txt or "Exception" in tail_txt:
+                                self.log(f"FATAL REMOTE ERROR detected — stopping VM immediately:\n{tail_txt}")
+                                self.write_status(info, session_start, "FAILED")
+                                self.stop_requested = True
+                            else:
+                                self.log("Runner exited unexpectedly before target year; will check CU & restart on fresh session.")
                         break
 
                     # Trigger graceful monthly handoff ahead of Colab's 24h limit
@@ -640,7 +650,8 @@ def main() -> None:
     parser.add_argument("--poll-sec", type=int, default=900, help="Sync & monitor interval in seconds (default 15 min)")
     parser.add_argument("--max-session-hours", type=float, default=21.5, help="Graceful VM rotation threshold [hours]")
     parser.add_argument("--min-cu-reserve", type=float, default=100.0, help="Minimum CU balance reserve before halting")
-    parser.add_argument("--enable-ocean-bgc", action="store_true", default=True, help="Enable FlexPFT marine BGC & carbonate chemistry (default: True)")
+    parser.add_argument("--config", type=str, default="", help="Relative path inside repo to TOML preset (e.g. config/presets/earth_g5_3d_8x8_g7ocn.toml)")
+    parser.add_argument("--enable-ocean-bgc", action="store_true", default=False, help="Force-enable FlexPFT marine BGC & carbonate chemistry (overrides TOML)")
     args = parser.parse_args()
 
     sup = Supervisor(
@@ -651,6 +662,7 @@ def main() -> None:
         poll_sec=args.poll_sec,
         max_session_hours=args.max_session_hours,
         min_cu_reserve=args.min_cu_reserve,
+        config_path=args.config,
         enable_ocean_bgc=bool(args.enable_ocean_bgc),
     )
     sup.run_forever()
