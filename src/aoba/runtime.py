@@ -306,6 +306,15 @@ _CUDA_GRAPH_CACHE: dict[tuple, dict[str, object]] = {}
 _CUDA_GRAPH_POOL: object | None = None
 
 
+def clear_cuda_graph_cache() -> None:
+    """Release all captured CUDA Graphs and reset the shared memory pool handle safely."""
+    global _CUDA_GRAPH_POOL
+    _CUDA_GRAPH_CACHE.clear()
+    _CUDA_GRAPH_POOL = None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def can_use_cuda_graph(device: torch.device | str | None) -> bool:
     """Return True when PyTorch CUDA Graph capture/replay is safe and enabled."""
     if os.environ.get("AOBA_DISABLE_CUDA_GRAPH", "0").strip().lower() in ("1", "true", "yes"):
