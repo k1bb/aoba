@@ -1206,41 +1206,57 @@ def _compute_distill_loss(
     exner: torch.Tensor,   # [nz, B]
     dt: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Mass-and-temperature-scaled multi-variable loss across both epistemic heads."""
+    """Mass-and-temperature-scaled multi-variable loss across both epistemic heads (batched)."""
     tp = tgt_p.permute(1, 2, 0).contiguous()  # [8, nz, B]
-    thm_t, qn_t, qp_t, qc_t, qi_t, u_t, v_t, fcld_t = tp[0], tp[1], tp[2], tp[3], tp[4], tp[5], tp[6], tp[7]
-    t_tgt = thm_t * exner  # Temperature space [K] ensures uniform troposphere/stratosphere weighting
-    pr_t = tgt_s[:, 0]
-    ps_t = tgt_s[:, 1]
-    fprec_t = tgt_s[:, 2]
+    t_tgt = tp[0] * exner  # Temperature space [K] ensures uniform troposphere/stratosphere weighting
+    prof_t = torch.stack(
+        [t_tgt, tp[1] * 1.0e3, tp[2] * 2.0e3, tp[3] * 5.0e3, tp[4] * 5.0e3, tp[5] * 0.2, tp[6] * 0.2, tp[7]],
+        dim=0,
+    )  # [8, nz, B]
+    prof_t2 = torch.cat([prof_t, prof_t], dim=2)  # [8, nz, 2*B]
+    ex2 = torch.cat([exner, exner], dim=1)  # [nz, 2*B]
+    prof_p2 = torch.stack(
+        [
+            torch.cat([pred_a["theta_m"], pred_b["theta_m"]], dim=1) * ex2,
+            torch.cat([pred_a["q_n"], pred_b["q_n"]], dim=1) * 1.0e3,
+            torch.cat([pred_a["q_p"], pred_b["q_p"]], dim=1) * 2.0e3,
+            torch.cat([pred_a["q_c"], pred_b["q_c"]], dim=1) * 5.0e3,
+            torch.cat([pred_a["q_i"], pred_b["q_i"]], dim=1) * 5.0e3,
+            torch.cat([pred_a["u"], pred_b["u"]], dim=1) * 0.2,
+            torch.cat([pred_a["v"], pred_b["v"]], dim=1) * 0.2,
+            torch.cat([pred_a["f_cld"], pred_b["f_cld"]], dim=1),
+        ],
+        dim=0,
+    )  # [8, nz, 2*B]
+    w_prof = torch.tensor(
+        [2.0, 2.5, 0.8, 1.5, 1.5, 0.5, 0.5, 1.8], device=tp.device, dtype=tp.dtype
+    ).view(8, 1, 1)
+    l_prof = (F.smooth_l1_loss(prof_p2, prof_t2, reduction="none") * w_prof).mean(dim=(1, 2)).sum()
 
-    def _head_loss(pr: dict[str, torch.Tensor]) -> torch.Tensor:
-        l_temp = F.smooth_l1_loss(pr["theta_m"] * exner, t_tgt)
-        l_qn = F.smooth_l1_loss(pr["q_n"] * 1.0e3, qn_t * 1.0e3)
-        l_qp = F.smooth_l1_loss(pr["q_p"] * 2.0e3, qp_t * 2.0e3)
-        l_qc = F.smooth_l1_loss(pr["q_c"] * 5.0e3, qc_t * 5.0e3)
-        l_qi = F.smooth_l1_loss(pr["q_i"] * 5.0e3, qi_t * 5.0e3)
-        l_u = F.smooth_l1_loss(pr["u"] * 0.2, u_t * 0.2)
-        l_v = F.smooth_l1_loss(pr["v"] * 0.2, v_t * 0.2)
-        l_fcld = F.smooth_l1_loss(pr["f_cld"], fcld_t)
-        l_fprec = F.smooth_l1_loss(pr["f_prec"], fprec_t)
-        l_pr = F.smooth_l1_loss(
-            torch.log1p(torch.clamp(pr["precip_rain"] * 86400.0, min=0.0)),
-            torch.log1p(torch.clamp(pr_t * 86400.0, min=0.0)),
-        )
-        l_ps = F.smooth_l1_loss(
-            torch.log1p(torch.clamp(pr["precip_snow"] * 86400.0, min=0.0)),
-            torch.log1p(torch.clamp(ps_t * 86400.0, min=0.0)),
-        )
-        return (
-            2.0 * l_temp + 2.5 * l_qn + 0.8 * l_qp + 1.5 * (l_qc + l_qi)
-            + 0.5 * (l_u + l_v) + 1.2 * (l_pr + l_ps) + 1.8 * l_fcld + 0.8 * l_fprec
-        )
+    scal_t = torch.stack(
+        [
+            torch.log1p(torch.clamp(tgt_s[:, 0] * 86400.0, min=0.0)),
+            torch.log1p(torch.clamp(tgt_s[:, 1] * 86400.0, min=0.0)),
+            tgt_s[:, 2],
+        ],
+        dim=0,
+    )  # [3, B]
+    scal_t2 = torch.cat([scal_t, scal_t], dim=1)  # [3, 2*B]
+    scal_p2 = torch.stack(
+        [
+            torch.log1p(torch.clamp(torch.cat([pred_a["precip_rain"], pred_b["precip_rain"]], dim=0) * 86400.0, min=0.0)),
+            torch.log1p(torch.clamp(torch.cat([pred_a["precip_snow"], pred_b["precip_snow"]], dim=0) * 86400.0, min=0.0)),
+            torch.cat([pred_a["f_prec"], pred_b["f_prec"]], dim=0),
+        ],
+        dim=0,
+    )  # [3, 2*B]
+    w_scal = torch.tensor([1.2, 1.2, 0.8], device=tp.device, dtype=tp.dtype).view(3, 1)
+    l_scal = (F.smooth_l1_loss(scal_p2, scal_t2, reduction="none") * w_scal).mean(dim=1).sum()
+    loss = l_prof + l_scal
 
-    loss = 0.5 * (_head_loss(pred_a) + _head_loss(pred_b))
     with torch.no_grad():
         rmse_t = torch.sqrt(F.mse_loss(0.5 * (pred_a["theta_m"] + pred_b["theta_m"]) * exner, t_tgt))
-        rmse_qn = torch.sqrt(F.mse_loss(0.5 * (pred_a["q_n"] + pred_b["q_n"]), qn_t))
+        rmse_qn = torch.sqrt(F.mse_loss(0.5 * (pred_a["q_n"] + pred_b["q_n"]), tp[1]))
     return loss, rmse_t, rmse_qn
 
 
