@@ -217,8 +217,8 @@ def step_microphysics_six_class_2m(
 
     # (b) Riming of supercooled droplets onto snow/graupel -> GRAUPEL (Morrison et al., 2005)
     is_supercooled = (temp < C.T_FREEZE).to(dtype)
-    k_rime_s = is_supercooled * 3.5 * torch.pow(torch.clamp(qs, min=0.0), 0.80)
-    k_rime_g = is_supercooled * 5.0 * torch.pow(torch.clamp(qg, min=0.0), 0.80)
+    k_rime_s = is_supercooled * 0.6 * torch.pow(torch.clamp(qs, min=0.0), 0.80)
+    k_rime_g = is_supercooled * 1.2 * torch.pow(torch.clamp(qg, min=0.0), 0.80)
     dq_c2g = torch.where(
         (qc > 1.0e-5) & ((qs + qg) > 1.0e-6) & (temp < C.T_FREEZE),
         (-torch.expm1(-torch.clamp((k_rime_s + k_rime_g) * dt, max=8.0))) * qc,
@@ -241,7 +241,7 @@ def step_microphysics_six_class_2m(
     qr = qr - dq_r2g
     qg = qg + dq_r2g
     ng_cur = ng_cur + dq_r2g / 2.5e-7
-    dtheta_lat = (C.L_F0 / (C.CP_D * torch.clamp(pi_ex, min=0.1))) * (dq_c2g + dq_r2g)
+    dtemp_lat = (C.L_F0 / C.CP_D) * (dq_c2g + dq_r2g)
 
     # (d) Melting of snow & graupel -> rain (T > 273.15 K) with latent cooling
     t_above = torch.clamp(temp - C.T_FREEZE, min=0.0)
@@ -253,42 +253,45 @@ def step_microphysics_six_class_2m(
     qg = qg - dq_g2r
     qr = qr + dq_s2r + dq_g2r
     nr_cur = nr_cur + (dq_s2r + dq_g2r) / 3.0e-7
-    dtheta_lat = dtheta_lat - (C.L_F0 / (C.CP_D * torch.clamp(pi_ex, min=0.1))) * (dq_s2r + dq_g2r)
+    dtemp_lat = dtemp_lat - (C.L_F0 / C.CP_D) * (dq_s2r + dq_g2r)
 
-    # (e) Sub-cloud rain evaporation & snow/graupel sublimation in subsaturated air (cold pool generation!)
-    e_sat = 611.2 * torch.exp(torch.clamp(17.67 * (temp - C.T_FREEZE) / torch.clamp(temp - 29.65, min=20.0), min=-30.0, max=15.0))
-    q_sat = torch.clamp(C.EPS_WATER * e_sat / torch.clamp(pres - e_sat, min=100.0), min=1.0e-6, max=0.15)
-    subsat = torch.clamp(q_sat - qv, min=0.0)
-    sub_rem = 0.5 * subsat
+    # (e) Sub-cloud rain evaporation (over liquid) & snow/graupel sublimation (over ice!)
+    e_sat_w = 611.2 * torch.exp(torch.clamp(17.67 * (temp - C.T_FREEZE) / torch.clamp(temp - 29.65, min=20.0), min=-30.0, max=15.0))
+    q_sat_w = torch.clamp(C.EPS_WATER * e_sat_w / torch.clamp(pres - e_sat_w, min=100.0), min=1.0e-6, max=0.15)
+    subsat_w = torch.clamp(q_sat_w - qv, min=0.0)
     k_evap = 0.004 * torch.pow(torch.clamp(qr * rho_d, min=0.0), 0.55)
     dq_evap = torch.minimum(
         (-torch.expm1(-torch.clamp(k_evap * dt, max=5.0))) * qr,
-        sub_rem,
+        0.5 * subsat_w,
     )
     qr = qr - dq_evap
     qv = qv + dq_evap
-    sub_rem = torch.clamp(sub_rem - dq_evap, min=0.0)
-    dtheta_lat = dtheta_lat - (C.L_V0 / (C.CP_D * torch.clamp(pi_ex, min=0.1))) * dq_evap
+    dtemp_lat = dtemp_lat - (C.L_V0 / C.CP_D) * dq_evap
 
+    e_sat_i = 611.2 * torch.exp(torch.clamp(21.875 * (temp - C.T_FREEZE) / torch.clamp(temp - 7.66, min=20.0), min=-35.0, max=15.0))
+    q_sat_i = torch.clamp(C.EPS_WATER * e_sat_i / torch.clamp(pres - e_sat_i, min=100.0), min=1.0e-6, max=0.15)
+    sub_rem_i = 0.5 * torch.clamp(q_sat_i - qv, min=0.0)
     k_sub_s = 0.003 * torch.pow(torch.clamp(qs * rho_d, min=0.0), 0.55)
     dq_sub_s = torch.minimum(
         (-torch.expm1(-torch.clamp(k_sub_s * dt, max=5.0))) * qs,
-        sub_rem,
+        sub_rem_i,
     )
     qs = qs - dq_sub_s
     qv = qv + dq_sub_s
-    sub_rem = torch.clamp(sub_rem - dq_sub_s, min=0.0)
+    sub_rem_i = torch.clamp(sub_rem_i - dq_sub_s, min=0.0)
 
     k_sub_g = 0.002 * torch.pow(torch.clamp(qg * rho_d, min=0.0), 0.55)
     dq_sub_g = torch.minimum(
         (-torch.expm1(-torch.clamp(k_sub_g * dt, max=5.0))) * qg,
-        sub_rem,
+        sub_rem_i,
     )
     qg = qg - dq_sub_g
     qv = qv + dq_sub_g
-    dtheta_lat = dtheta_lat - ((C.L_V0 + C.L_F0) / (C.CP_D * torch.clamp(pi_ex, min=0.1))) * (dq_sub_s + dq_sub_g)
+    dtemp_lat = dtemp_lat - ((C.L_V0 + C.L_F0) / C.CP_D) * (dq_sub_s + dq_sub_g)
 
-    theta_new = torch.clamp(theta_m + dtheta_lat, min=150.0, max=15000.0)
+    # Exact compressible moist-potential-temperature update preserving cp*T + L_v*q_v - L_f*q_ice
+    temp_new = torch.clamp(temp + dtemp_lat, min=120.0, max=500.0)
+    theta_new = torch.clamp((temp_new / torch.clamp(pi_ex, min=0.05)) * (1.0 + C.RV_OVER_RD * qv), min=150.0, max=15000.0)
 
     # 4. Class-specific terminal velocities [m s^-1] (air-density corrected sqrt(rho_0/rho))
     rho_fac = torch.sqrt(torch.clamp(1.2 / torch.clamp(rho_d, min=0.05), min=0.5, max=6.0))

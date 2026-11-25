@@ -1584,7 +1584,7 @@ kernel void microphysics_6class_col(
         float dq_c2g = 0.0f;
         if (temp < T_FREEZE) {
             if (qc > 1.0e-5f && (qs + qg) > 1.0e-6f) {
-                float k_rm = 3.5f * pow(qs, 0.80f) + 5.0f * pow(qg, 0.80f);
+                float k_rm = 0.6f * pow(qs, 0.80f) + 1.2f * pow(qg, 0.80f);
                 dq_c2g = (-esm_expm1(-min(k_rm * dt, 8.0f))) * qc;
                 qc -= dq_c2g;
             }
@@ -1608,7 +1608,7 @@ kernel void microphysics_6class_col(
             qg += dq_r2g;
             ng_cur += dq_r2g / 2.5e-7f;
         }
-        float dtheta_lat = (L_F0 / (CP_D * pi_safe)) * (dq_c2g + dq_r2g);
+        float dtemp_lat = (L_F0 / CP_D) * (dq_c2g + dq_r2g);
 
         // 3d. Melting of snow & graupel -> rain
         if (temp > T_FREEZE) {
@@ -1619,38 +1619,41 @@ kernel void microphysics_6class_col(
             qg -= dq_g2r;
             qr += dq_s2r + dq_g2r;
             nr_cur += (dq_s2r + dq_g2r) / 3.0e-7f;
-            dtheta_lat -= (L_F0 / (CP_D * pi_safe)) * (dq_s2r + dq_g2r);
+            dtemp_lat -= (L_F0 / CP_D) * (dq_s2r + dq_g2r);
         }
 
-        // 3e. Sub-cloud rain evaporation & snow/graupel sublimation in subsaturated air
-        if (qr > 0.0f || qs > 0.0f || qg > 0.0f) {
-            float e_sat = 611.2f * exp(clamp(17.67f * (temp - T_FREEZE) / max(temp - 29.65f, 20.0f), -30.0f, 15.0f));
-            float q_sat = clamp(EPS_W * e_sat / max(pres - e_sat, 100.0f), 1.0e-6f, 0.15f);
-            float subsat = max(q_sat - qv, 0.0f);
-            if (subsat > 0.0f) {
-                float sub_rem = 0.5f * subsat;
-                if (qr > 0.0f) {
-                    float k_evap = 0.004f * pow(max(qr * rd, 0.0f), 0.55f);
-                    float dq_ev = min((-esm_expm1(-min(k_evap * dt, 5.0f))) * qr, sub_rem);
-                    qr -= dq_ev;
-                    qv += dq_ev;
-                    sub_rem = max(sub_rem - dq_ev, 0.0f);
-                    dtheta_lat -= (L_V0 / (CP_D * pi_safe)) * dq_ev;
-                }
-                if (qs > 0.0f && sub_rem > 0.0f) {
+        // 3e. Sub-cloud rain evaporation (over liquid) & snow/graupel sublimation (over ice!)
+        if (qr > 0.0f) {
+            float e_sat_w = 611.2f * exp(clamp(17.67f * (temp - T_FREEZE) / max(temp - 29.65f, 20.0f), -30.0f, 15.0f));
+            float q_sat_w = clamp(EPS_W * e_sat_w / max(pres - e_sat_w, 100.0f), 1.0e-6f, 0.15f);
+            float subsat_w = max(q_sat_w - qv, 0.0f);
+            if (subsat_w > 0.0f) {
+                float k_evap = 0.004f * pow(max(qr * rd, 0.0f), 0.55f);
+                float dq_ev = min((-esm_expm1(-min(k_evap * dt, 5.0f))) * qr, 0.5f * subsat_w);
+                qr -= dq_ev;
+                qv += dq_ev;
+                dtemp_lat -= (L_V0 / CP_D) * dq_ev;
+            }
+        }
+        if (qs > 0.0f || qg > 0.0f) {
+            float e_sat_i = 611.2f * exp(clamp(21.875f * (temp - T_FREEZE) / max(temp - 7.66f, 20.0f), -35.0f, 15.0f));
+            float q_sat_i = clamp(EPS_W * e_sat_i / max(pres - e_sat_i, 100.0f), 1.0e-6f, 0.15f);
+            float sub_rem_i = 0.5f * max(q_sat_i - qv, 0.0f);
+            if (sub_rem_i > 0.0f) {
+                if (qs > 0.0f) {
                     float k_sub_s = 0.003f * pow(max(qs * rd, 0.0f), 0.55f);
-                    float dq_ss = min((-esm_expm1(-min(k_sub_s * dt, 5.0f))) * qs, sub_rem);
+                    float dq_ss = min((-esm_expm1(-min(k_sub_s * dt, 5.0f))) * qs, sub_rem_i);
                     qs -= dq_ss;
                     qv += dq_ss;
-                    sub_rem = max(sub_rem - dq_ss, 0.0f);
-                    dtheta_lat -= ((L_V0 + L_F0) / (CP_D * pi_safe)) * dq_ss;
+                    sub_rem_i = max(sub_rem_i - dq_ss, 0.0f);
+                    dtemp_lat -= ((L_V0 + L_F0) / CP_D) * dq_ss;
                 }
-                if (qg > 0.0f && sub_rem > 0.0f) {
+                if (qg > 0.0f && sub_rem_i > 0.0f) {
                     float k_sub_g = 0.002f * pow(max(qg * rd, 0.0f), 0.55f);
-                    float dq_sg = min((-esm_expm1(-min(k_sub_g * dt, 5.0f))) * qg, sub_rem);
+                    float dq_sg = min((-esm_expm1(-min(k_sub_g * dt, 5.0f))) * qg, sub_rem_i);
                     qg -= dq_sg;
                     qv += dq_sg;
-                    dtheta_lat -= ((L_V0 + L_F0) / (CP_D * pi_safe)) * dq_sg;
+                    dtemp_lat -= ((L_V0 + L_F0) / CP_D) * dq_sg;
                 }
             }
         }
@@ -1691,7 +1694,8 @@ kernel void microphysics_6class_col(
         ns_new = (qs_new > 1.0e-10f) ? clamp(ns_new, 1.0f, 1.0e6f) : 0.0f;
         ng_new = (qg_new > 1.0e-10f) ? clamp(ng_new, 1.0f, 1.0e5f) : 0.0f;
 
-        theta_m[idx] = clamp(thm + dtheta_lat, 150.0f, 15000.0f);
+        float temp_new = clamp(temp + dtemp_lat, 120.0f, 500.0f);
+        theta_m[idx] = clamp((temp_new / max(pi_ex, 0.05f)) * (1.0f + RV_OVER_RD * qv), 150.0f, 15000.0f);
         q_v[idx] = qv;
         q_c[idx] = qc;
         q_i[idx] = qi_new;
