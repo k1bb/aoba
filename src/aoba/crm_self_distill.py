@@ -364,8 +364,8 @@ def apply_exact_conservation_closure(
     es_env = torch.where(t_env >= C.T_FREEZE, es_w, es_i)
     qsat_env = torch.clamp(C.EPS_WATER * es_env / torch.clamp(p_env - es_env, min=100.0), min=1.0e-7, max=0.10)
 
-    # Predict bounded sensible-temperature residual dT_raw [K] (<= 2.5 K per host step)
-    d_temp_raw = s_conv * torch.tanh(rp[0] * 0.2) * 2.5
+    # Predict bounded sensible-temperature residual dT_raw [K] (<= 1.5 K per host step)
+    d_temp_raw = s_conv * torch.tanh(rp[0] * 0.2) * 1.5
     f_qp_logit = rp[2]
     f_cond_logit = rp[3]
     f_ice_logit = rp[4]
@@ -446,6 +446,30 @@ def apply_exact_conservation_closure(
     denom_h = torch.clamp(C.CP_D * (dm * s_conv).sum(dim=0), min=1.0)
     h_corr = (dh_lat - dh_raw) / denom_h
     d_temp_cons = d_temp_shf + d_temp_raw + h_corr.unsqueeze(0) * s_conv
+
+    # Exact enthalpy-conserving 2-pass red-black dry-convective adjustment within s_conv > 0:
+    # removes statically unstable super-adiabatic 2dz sawtooth pairs (theta_k > theta_{k+1})
+    # while conserving dm_k * T_k + dm_{k+1} * T_{k+1} to float32 machine precision.
+    nz_c = int(t_post_ls.shape[0])
+    t_cur = t_post_ls + d_temp_cons
+    for start in (0, 1):
+        n_p = (nz_c - start) // 2
+        if n_p > 0:
+            i0 = slice(start, start + 2 * n_p, 2)
+            i1 = slice(start + 1, start + 2 * n_p, 2)
+            t0_p = t_cur[i0]
+            t1_p = t_cur[i1]
+            ex0_p = ex_safe[i0]
+            ex1_p = ex_safe[i1]
+            dm0_p = dm[i0]
+            dm1_p = dm[i1]
+            unstab = in_conv[i0] & in_conv[i1] & ((t0_p / ex0_p) > (t1_p / ex1_p))
+            th_eq = (dm0_p * t0_p + dm1_p * t1_p) / torch.clamp(dm0_p * ex0_p + dm1_p * ex1_p, min=1.0e-6)
+            t_next = t_cur.clone()
+            t_next[i0] = torch.where(unstab, th_eq * ex0_p, t0_p)
+            t_next[i1] = torch.where(unstab, th_eq * ex1_p, t1_p)
+            t_cur = t_next
+    d_temp_cons = t_cur - t_post_ls
 
     # Reconstruct exact moist potential temperature theta_m = (T / exner) * (1 + RV_OVER_RD * q_v)
     # via the algebraic increment so stratospheric levels (s_conv == 0, qv_new == qv0) stay bitwise invariant.

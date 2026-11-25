@@ -80,7 +80,7 @@ from aoba.surface import (
     step_surface,
 )
 from aoba.thermodynamics import diagnose_pressure_temperature
-from aoba.turbulence import TKE_MIN
+from aoba.turbulence import TKE_MIN, step_mynn_level25
 from aoba.vertical_grid import VerticalGrid, build_vertical_grid
 
 
@@ -2708,6 +2708,40 @@ def step_aoba_model(
             rain_3d = rain_new_sub.reshape(nc, ny_t, nx_t)
             snow_3d = snow_new_sub.reshape(nc, ny_t, nx_t)
 
+            # Operator-split OSSP baseline: advance stiff 1D vertical MYNN Level 2.5 PBL mixing and
+            # surface flux injection analytically on all host columns (`[nz, nc]`, single fused tridiagonal
+            # kernel) so surrogate columns preserve exact boundary-layer physics and unconditional vertical
+            # stability while the neural surrogate emulates purely 3D convective transport and microphysics.
+            buoy_cell_pre = _sub_to_cell(sfc_diag_sub.buoy_flux, nc, n_sub)
+            qke_host_in = mean_2d(crm.qke)
+            (
+                u_mynn_sd, v_mynn_sd, thm_mynn_sd, qn_mynn_sd, qke_mynn_sd,
+                _, _, qv_mynn_sd, qc_mynn_sd, qi_mynn_sd,
+            ) = step_mynn_level25(
+                rho_d=rho_pre_sd,
+                u=u_host_new,
+                v=v_host_new,
+                theta_m_c=thm_post_ls_sd,
+                q_n=qn_pre_sd,
+                q_v=qv_pre_sd,
+                q_c=qc_pre_sd,
+                q_i=qi_pre_sd,
+                qke=qke_host_in,
+                z_c=atmos.z_c,
+                z_w=atmos.z_w,
+                dz_c=atmos.dz_c,
+                u_star=ustar_cell_pre,
+                sfc_buoy_flux=buoy_cell_pre,
+                tau_x_sfc=tx_cell_pre,
+                tau_y_sfc=ty_cell_pre,
+                shf_sfc=shf_cell_pre,
+                evap_sfc=evap_cell_pre,
+                dt=dt,
+                return_hydrometeors=True,
+            )
+            _, exner_mynn_sd, temp_mynn_sd = diagnose_pressure_temperature(rho_pre_sd, thm_mynn_sd, qv_mynn_sd)
+            zero_sfc_sd = torch.zeros_like(shf_cell_pre)
+
             # 7a-i. Execute genuine 2D/3D CRM strictly on the active teacher subset (`1 / stride` columns)
             if has_pool:
                 n_t = n_pool_act
@@ -2881,10 +2915,10 @@ def step_aoba_model(
             else:
                 f_prec_t = ((sp_t.precip_rain + sp_t.precip_snow) > 1.0e-7).to(atmos.q_n.dtype)
             ctx_p_t, ctx_s_t, tgt_p_t, tgt_s_t = pack_teacher_context_and_targets(
-                rho_pre_sd[:, t_idx], atmos.dz_c[:, t_idx], exner_all_sd[:, t_idx], temp_all_sd[0, t_idx],
-                thm_post_ls_sd[:, t_idx], qn_pre_sd[:, t_idx], qp_pre_sd[:, t_idx],
-                qc_pre_sd[:, t_idx], qi_pre_sd[:, t_idx], u_host_new[:, t_idx], v_host_new[:, t_idx],
-                shf_cell_pre[t_idx], evap_cell_pre[t_idx], tx_cell_pre[t_idx], ty_cell_pre[t_idx],
+                rho_pre_sd[:, t_idx], atmos.dz_c[:, t_idx], exner_mynn_sd[:, t_idx], temp_mynn_sd[0, t_idx],
+                thm_mynn_sd[:, t_idx], qn_mynn_sd[:, t_idx], qp_pre_sd[:, t_idx],
+                qc_mynn_sd[:, t_idx], qi_mynn_sd[:, t_idx], u_mynn_sd[:, t_idx], v_mynn_sd[:, t_idx],
+                zero_sfc_sd[t_idx], zero_sfc_sd[t_idx], zero_sfc_sd[t_idx], zero_sfc_sd[t_idx],
                 thm_t_post, qn_t_post, qp_t_post, qc_t_post, qi_t_post, u_t_post, v_t_post,
                 sp_t.precip_rain, sp_t.precip_snow, f_cld_t, f_prec_t,
             )
@@ -2920,10 +2954,10 @@ def step_aoba_model(
                 stu_out, stu_unc = predict_student_columns(
                     model.crm_distill,
                     x_all_sd,
-                    rho_pre_sd, atmos.dz_c, exner_all_sd, temp_all_sd[0],
-                    thm_post_ls_sd, qn_pre_sd, qp_pre_sd,
-                    qc_pre_sd, qi_pre_sd, u_host_new, v_host_new,
-                    shf_cell_pre, evap_cell_pre, tx_cell_pre, ty_cell_pre,
+                    rho_pre_sd, atmos.dz_c, exner_mynn_sd, temp_mynn_sd[0],
+                    thm_mynn_sd, qn_mynn_sd, qp_pre_sd,
+                    qc_mynn_sd, qi_mynn_sd, u_mynn_sd, v_mynn_sd,
+                    zero_sfc_sd, zero_sfc_sd, zero_sfc_sd, zero_sfc_sd,
                     dt,
                     sub_maps_stu=sub_maps_all_sd,
                 )
@@ -2999,6 +3033,7 @@ def step_aoba_model(
                         dt=dt,
                     )
                     crm.w.mul_(0.85)
+                    crm.qke.copy_(qke_mynn_sd.unsqueeze(-1).unsqueeze(-1))
                 else:
                     all_ids = torch.arange(nc, device=atmos.rho_d.device, dtype=torch.int64)
                     qn_4s, qp_4s, qv_4s, qc_4s, qi_4s, rain_3s, snow_3s = reconstruct_subgrid_heterogeneity(
@@ -3042,6 +3077,7 @@ def step_aoba_model(
                         crm.u[0] = _tile3d_to_crm3d(u0_cp)
                         crm.v[0] = _tile3d_to_crm3d(v0_cp)
                     crm.w.mul_(0.85)
+                    crm.qke.copy_(qke_mynn_sd.unsqueeze(-1).unsqueeze(-1))
 
                 model.crm_distill.last_uncertainty = stu_unc
                 model.crm_distill.last_uncertainty[t_idx] = 0.0
@@ -3049,10 +3085,10 @@ def step_aoba_model(
                 stu_out, stu_unc = predict_student_columns(
                     model.crm_distill,
                     x_all_sd[s_idx],
-                    rho_pre_sd[:, s_idx], atmos.dz_c[:, s_idx], exner_all_sd[:, s_idx], temp_all_sd[0, s_idx],
-                    thm_post_ls_sd[:, s_idx], qn_pre_sd[:, s_idx], qp_pre_sd[:, s_idx],
-                    qc_pre_sd[:, s_idx], qi_pre_sd[:, s_idx], u_host_new[:, s_idx], v_host_new[:, s_idx],
-                    shf_cell_pre[s_idx], evap_cell_pre[s_idx], tx_cell_pre[s_idx], ty_cell_pre[s_idx],
+                    rho_pre_sd[:, s_idx], atmos.dz_c[:, s_idx], exner_mynn_sd[:, s_idx], temp_mynn_sd[0, s_idx],
+                    thm_mynn_sd[:, s_idx], qn_mynn_sd[:, s_idx], qp_pre_sd[:, s_idx],
+                    qc_mynn_sd[:, s_idx], qi_mynn_sd[:, s_idx], u_mynn_sd[:, s_idx], v_mynn_sd[:, s_idx],
+                    zero_sfc_sd[s_idx], zero_sfc_sd[s_idx], zero_sfc_sd[s_idx], zero_sfc_sd[s_idx],
                     dt,
                     sub_maps_stu=(sub_maps_all_sd[s_idx] if sub_maps_all_sd is not None else None),
                 )
@@ -3110,6 +3146,7 @@ def step_aoba_model(
                 crm.u[:, s_idx] = crm_u_upd
                 crm.v[:, s_idx] = crm_v_upd
                 crm.w[:, s_idx] = 0.85 * crm.w[:, s_idx]
+                crm.qke[:, s_idx] = qke_mynn_sd[:, s_idx].unsqueeze(-1).unsqueeze(-1)
 
                 model.crm_distill.last_uncertainty.zero_()
                 model.crm_distill.last_uncertainty[s_idx] = stu_unc

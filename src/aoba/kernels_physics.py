@@ -5571,7 +5571,7 @@ kernel void crm_distill_closure_col(
             float qp_p = s_conv * min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig));
             w_prov_conv += dm * (qn_p + qp_p);
 
-            float d_temp_r = s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 2.5f;
+            float d_temp_r = s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 1.5f;
             dh_raw += cp_d * dm * d_temp_r;
             denom_h += cp_d * dm * s_conv;
 
@@ -5671,39 +5671,99 @@ kernel void crm_distill_closure_col(
     float u_corr = (tau_x * dt - du_imp) / dm_sum_safe;
     float v_corr = (tau_y * dt - dv_imp) / dm_sum_safe;
 
-    // Pass 3: write true-temperature enthalpy-closed moist theta_m and momentum-closed u, v
+    // Pass 3: compute true-temperature profile, apply exact 2-pass red-black dry-convective
+    // adjustment within s_conv > 0, and write moist theta_m plus momentum-closed u, v
+    float t_col[128];
+    float t_pls[128];
+    float dm_col[128];
+    float ex_col[128];
+    float sc_col[128];
+    bool use_adj = (nz <= 128u);
+
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * N + c;
         float ex = exner[idx];
         float ex_safe = max(ex, 0.05f);
         float s_lin = clamp((ex - 0.50f) / 0.14f, 0.0f, 1.0f);
         float s_conv = s_lin * s_lin;
+        float qn0 = max(qn_post_ls[idx], 0.0f);
+        float qc0 = max(qc_pre[idx], 0.0f);
+        float qi0 = max(qi_pre[idx], 0.0f);
+        float qci0 = qc0 + qi0;
+        if (qci0 > qn0) {
+            float sc = qn0 / max(qci0, 1.0e-12f);
+            qc0 *= sc;
+            qi0 *= sc;
+        }
+        float qv0 = max(qn0 - qc0 - qi0, 0.0f);
+        float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
+        float d_temp_cons = 0.0f;
         if (s_conv > 0.0f) {
-            float qn0 = max(qn_post_ls[idx], 0.0f);
-            float qc0 = max(qc_pre[idx], 0.0f);
-            float qi0 = max(qi_pre[idx], 0.0f);
-            float qci0 = qc0 + qi0;
-            if (qci0 > qn0) {
-                float sc = qn0 / max(qci0, 1.0e-12f);
-                qc0 *= sc;
-                qi0 *= sc;
-            }
-            float qv0 = max(qn0 - qc0 - qi0, 0.0f);
-            float qv_n = out_prof[3u * plane + idx];
             float pbl_sh = clamp(1.0f - (ex0 - ex) * inv_pbl_ex, 0.0f, 1.0f) * s_conv;
-            float d_temp_r = s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 2.5f;
-            float d_temp_cons = dT_shf_scale * pbl_sh + d_temp_r + h_corr * s_conv;
-            float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
+            float d_temp_r = s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 1.5f;
+            d_temp_cons = dT_shf_scale * pbl_sh + d_temp_r + h_corr * s_conv;
+        }
+        if (use_adj) {
+            t_pls[k] = t_post_ls;
+            t_col[k] = t_post_ls + d_temp_cons;
+            dm_col[k] = max(rho_d[idx] * dz_c[idx], 1.0e-6f);
+            ex_col[k] = ex_safe;
+            sc_col[k] = s_conv;
+        } else if (s_conv > 0.0f) {
+            float qv_n = out_prof[3u * plane + idx];
             float d_thm_exact = (d_temp_cons * (1.0f + rv_rd * qv_n) + t_post_ls * rv_rd * (qv_n - qv0)) / ex_safe;
+            out_prof[idx] = clamp(thm_post_ls[idx] + d_thm_exact, 150.0f, 10000.0f);
+        } else {
+            out_prof[idx] = clamp(thm_post_ls[idx], 150.0f, 10000.0f);
+        }
+        if (s_conv > 0.0f) {
             float du_r = s_conv * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 8.0f;
             float dv_r = s_conv * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 8.0f;
-            out_prof[idx]              = clamp(thm_post_ls[idx] + d_thm_exact, 150.0f, 10000.0f);
             out_prof[6u * plane + idx] = u_pre[idx] + du_r + u_corr * s_conv;
             out_prof[7u * plane + idx] = v_pre[idx] + dv_r + v_corr * s_conv;
         } else {
-            out_prof[idx]              = clamp(thm_post_ls[idx], 150.0f, 10000.0f);
             out_prof[6u * plane + idx] = u_pre[idx];
             out_prof[7u * plane + idx] = v_pre[idx];
+        }
+    }
+
+    if (use_adj) {
+        for (uint start = 0u; start < 2u; ++start) {
+            for (uint k = start; k + 1u < nz; k += 2u) {
+                if (sc_col[k] > 0.0f && sc_col[k + 1u] > 0.0f) {
+                    float th0 = t_col[k] / ex_col[k];
+                    float th1 = t_col[k + 1u] / ex_col[k + 1u];
+                    if (th0 > th1) {
+                        float dm0_p = dm_col[k];
+                        float dm1_p = dm_col[k + 1u];
+                        float th_eq = (dm0_p * t_col[k] + dm1_p * t_col[k + 1u])
+                                      / max(dm0_p * ex_col[k] + dm1_p * ex_col[k + 1u], 1.0e-6f);
+                        t_col[k]      = th_eq * ex_col[k];
+                        t_col[k + 1u] = th_eq * ex_col[k + 1u];
+                    }
+                }
+            }
+        }
+        for (uint k = 0u; k < nz; ++k) {
+            uint idx = k * N + c;
+            if (sc_col[k] > 0.0f) {
+                float qn0 = max(qn_post_ls[idx], 0.0f);
+                float qc0 = max(qc_pre[idx], 0.0f);
+                float qi0 = max(qi_pre[idx], 0.0f);
+                float qci0 = qc0 + qi0;
+                if (qci0 > qn0) {
+                    float sc = qn0 / max(qci0, 1.0e-12f);
+                    qc0 *= sc;
+                    qi0 *= sc;
+                }
+                float qv0 = max(qn0 - qc0 - qi0, 0.0f);
+                float qv_n = out_prof[3u * plane + idx];
+                float d_temp_adj = t_col[k] - t_pls[k];
+                float d_thm_exact = (d_temp_adj * (1.0f + rv_rd * qv_n) + t_pls[k] * rv_rd * (qv_n - qv0)) / ex_col[k];
+                out_prof[idx] = clamp(thm_post_ls[idx] + d_thm_exact, 150.0f, 10000.0f);
+            } else {
+                out_prof[idx] = clamp(thm_post_ls[idx], 150.0f, 10000.0f);
+            }
         }
     }
 }
