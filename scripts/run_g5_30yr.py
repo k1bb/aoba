@@ -1401,6 +1401,14 @@ def _write_live_preview_atomic(
         olr = olr_override
     lai = model.sfc.bio.lai
     h_ice = model.icesheet.h_ice if model.icesheet is not None else torch.zeros_like(t2_k)
+    sst_c_host = (model.sfc.t_ocean_ml - 273.15)
+    seaice_host = torch.clamp(torch.sqrt(torch.clamp(model.sfc.m_seaice, min=0.0) / 500.0), 0.0, 1.0)
+    # Surface wind speed [m s^-1] on host cells as fallback when OGCM is disabled
+    u0_e = model.atmos.u_edge[0]
+    eoc = mesh.edges_on_cell
+    valid_e = (mesh.edge_sign_on_cell != 0.0).to(u0_e.dtype)
+    ke0_c = 0.5 * ((mesh.area_edge * (u0_e * u0_e))[eoc] * valid_e).sum(dim=-1) / torch.clamp(mesh.area_cell, min=1.0)
+    u10_ms = torch.sqrt(torch.clamp(2.0 * ke0_c, min=0.0))
 
     date_str = model.calendar.date_at(model.sim_time_sec).iso_datetime[:16]
     coords_np = getattr(mesh, "_live_preview_coords", None)
@@ -1412,6 +1420,38 @@ def _write_live_preview_atomic(
         )
         mesh._live_preview_coords = coords_np
     lat_deg_np, lon_deg_np, surf_type_np = coords_np
+
+    extra_arrays: dict[str, Any] = {
+        "sst_c": sst_c_host.detach().cpu().numpy().astype(np.float32),
+        "seaice_frac": seaice_host.detach().cpu().numpy().astype(np.float32),
+        "u10_ms": u10_ms.detach().cpu().numpy().astype(np.float32),
+    }
+    if model.ogcm is not None:
+        omesh = model.ocn_mesh if model.ocn_mesh is not None else mesh
+        ocn_coords = getattr(omesh, "_live_preview_ocn_coords", None)
+        if ocn_coords is None:
+            ocn_coords = (
+                np.rad2deg(omesh.lat_cell.detach().cpu().numpy()).astype(np.float32),
+                np.rad2deg(omesh.lon_cell.detach().cpu().numpy()).astype(np.float32),
+                model.ogcm.wet_c[0].detach().cpu().numpy().astype(np.uint8),
+            )
+            omesh._live_preview_ocn_coords = ocn_coords
+        olat_np, olon_np, owet_np = ocn_coords
+        osst_c = (model.ogcm.temp[0] - 273.15).detach().cpu().numpy().astype(np.float32)
+        ou0 = model.ogcm.u_edge[0]
+        oeoc = omesh.edges_on_cell
+        ov_e = (omesh.edge_sign_on_cell != 0.0).to(ou0.dtype)
+        oke0 = 0.5 * ((omesh.area_edge * (ou0 * ou0))[oeoc] * ov_e).sum(dim=-1) / torch.clamp(omesh.area_cell, min=1.0)
+        ospd = torch.sqrt(torch.clamp(2.0 * oke0, min=0.0)).detach().cpu().numpy().astype(np.float32)
+        osfc = model.ocn_sfc if model.ocn_sfc is not None else model.sfc
+        oice = torch.clamp(torch.sqrt(torch.clamp(osfc.m_seaice, min=0.0) / 500.0), 0.0, 1.0).detach().cpu().numpy().astype(np.float32)
+        extra_arrays["ocn_lat_deg"] = olat_np
+        extra_arrays["ocn_lon_deg"] = olon_np
+        extra_arrays["ocn_wet"] = owet_np
+        extra_arrays["ocn_sst_c"] = osst_c
+        extra_arrays["ocn_speed_ms"] = ospd
+        extra_arrays["ocn_seaice_frac"] = oice
+
     tmp_path = out_path.with_name(f".{out_path.name}.tmp.npz")
     np.savez(
         tmp_path,
@@ -1428,6 +1468,7 @@ def _write_live_preview_atomic(
         sim_days=np.float64(sim_days),
         wall_s_per_day=np.float32(wall_s_per_day),
         date_str=np.array(date_str),
+        **extra_arrays,
     )
     os.replace(tmp_path, out_path)
 

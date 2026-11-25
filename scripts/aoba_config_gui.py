@@ -178,8 +178,17 @@ class CPUGlobePreviewEngine:
         surf_type: np.ndarray,
         esm_range: tuple[float, float] = (0.0, 7.0),
         esm_land_only: bool = True,
+        *,
+        olr: np.ndarray | None = None,
+        sst_c: np.ndarray | None = None,
+        seaice_frac: np.ndarray | None = None,
+        ocn_speed_ms: np.ndarray | None = None,
+        ocn_lat_deg: np.ndarray | None = None,
+        ocn_lon_deg: np.ndarray | None = None,
+        ocn_wet: np.ndarray | None = None,
+        ocn_is_wind: bool = False,
     ) -> dict[str, Any]:
-        """Regrid irregular SCVT cell arrays onto `[180, 360]` on CPU and encode compact Uint8 rasters."""
+        """Regrid irregular SCVT cell arrays onto `[180, 360]` on CPU and encode compact Uint8 rasters for 6 globes."""
         t0 = time.perf_counter()
         idxs, w, nn1 = self._get_interp_weights(lat_deg, lon_deg)
 
@@ -188,6 +197,8 @@ class CPUGlobePreviewEngine:
         lai_nn = np.where(surf_type == 1, lai, 0.0) if esm_land_only else lai
         lai_grid = (lai_nn[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
         surf_grid = surf_type[nn1].reshape(self.GRID_H, self.GRID_W).astype(np.uint8)
+        olr_arr = olr if olr is not None else np.full_like(t2_c, 240.0)
+        olr_grid = (olr_arr[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
 
         # Coastline edge detection directly on CPU raster (`surf_type == 0` vs terrestrial `>= 1`)
         is_land = surf_grid >= 1
@@ -199,20 +210,67 @@ class CPUGlobePreviewEngine:
         if esm_land_only:
             lai_grid = np.where(surf_grid == 1, lai_grid, 0.0)
 
+        # Ocean globes (SST + Sea Ice, Surface Current Speed): use native fine OGCM mesh (e.g. G7 28 km) when present!
+        if (
+            ocn_lat_deg is not None
+            and ocn_lon_deg is not None
+            and sst_c is not None
+            and sst_c.shape[0] == ocn_lat_deg.shape[0]
+        ):
+            o_idxs, o_w, o_nn1 = self._get_interp_weights(ocn_lat_deg, ocn_lon_deg)
+            sst_grid = (sst_c[o_idxs] * o_w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            ice_arr = seaice_frac if (seaice_frac is not None and seaice_frac.shape[0] == ocn_lat_deg.shape[0]) else np.zeros_like(sst_c)
+            ice_grid = (ice_arr[o_idxs] * o_w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            spd_arr = ocn_speed_ms if (ocn_speed_ms is not None and ocn_speed_ms.shape[0] == ocn_lat_deg.shape[0]) else np.zeros_like(sst_c)
+            spd_grid = (spd_arr[o_idxs] * o_w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            if ocn_wet is not None and ocn_wet.shape[0] == ocn_lat_deg.shape[0]:
+                owet_grid = (ocn_wet[o_nn1] > 0).reshape(self.GRID_H, self.GRID_W).astype(np.uint8)
+            else:
+                owet_grid = (surf_grid == 0).astype(np.uint8)
+            ocn_res_lbl = f"Native Ocean ({ocn_lat_deg.shape[0]:,} cells)"
+        else:
+            sst_arr = sst_c if sst_c is not None else t2_c
+            sst_grid = (sst_arr[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            ice_arr = seaice_frac if seaice_frac is not None else np.zeros_like(t2_c)
+            ice_grid = (ice_arr[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            spd_arr = ocn_speed_ms if ocn_speed_ms is not None else np.zeros_like(t2_c)
+            spd_grid = (spd_arr[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            owet_grid = (surf_grid == 0).astype(np.uint8)
+            ocn_res_lbl = f"Host Grid ({lat_deg.shape[0]:,} cells)"
+
+        o_land = owet_grid == 0
+        ocn_coast = np.zeros_like(owet_grid)
+        odx = o_land != np.roll(o_land, 1, axis=1)
+        ody = np.zeros_like(o_land)
+        ody[1:, :] = o_land[1:, :] != o_land[:-1, :]
+        ocn_coast[(odx | ody)] = 1
+
+        spd_max = 25.0 if ocn_is_wind else 1.2
         cpu_ms = (time.perf_counter() - t0) * 1000.0
         lo3, hi3 = float(esm_range[0]), float(esm_range[1])
         return {
             "width": self.GRID_W,
             "height": self.GRID_H,
             "t2_range": [-45.0, 40.0],
+            "ir_range": [110.0, 320.0],
             "precip_range": [0.0, 25.0],
+            "sst_range": [-2.0, 32.0],
+            "ocn_spd_range": [0.0, spd_max],
+            "ocn_is_wind": bool(ocn_is_wind),
+            "ocn_res_lbl": ocn_res_lbl,
             "lai_range": [lo3, hi3],
             "esm_land_only": bool(esm_land_only),
             "t2_b64": self._quantize_u8(t2_grid, -45.0, 40.0),
+            "ir_b64": self._quantize_u8(olr_grid, 110.0, 320.0),
             "precip_b64": self._quantize_u8(precip_grid, 0.0, 25.0),
+            "sst_b64": self._quantize_u8(sst_grid, -2.0, 32.0),
+            "seaice_b64": self._quantize_u8(ice_grid, 0.0, 1.0),
+            "ocn_spd_b64": self._quantize_u8(spd_grid, 0.0, spd_max),
             "lai_b64": self._quantize_u8(lai_grid, lo3, hi3),
             "surf_b64": base64.b64encode(surf_grid.tobytes()).decode("ascii"),
             "coast_b64": base64.b64encode(coast.tobytes()).decode("ascii"),
+            "ocn_wet_b64": base64.b64encode(owet_grid.tobytes()).decode("ascii"),
+            "ocn_coast_b64": base64.b64encode(ocn_coast.tobytes()).decode("ascii"),
             "cpu_regrid_ms": round(cpu_ms, 2),
         }
 
@@ -356,7 +414,16 @@ def _load_zarr_frame_payload(
         else:
             f3 = np.zeros_like(lat_deg, dtype=np.float32)
 
-        return lat_deg, lon_deg, t2_c, precip, f3, surf_type, f"{kind} ({frame_info['label']})", avail_esm
+        olr_arr = np.asarray(ds["olr"].isel(time=idx).values, dtype=np.float32) if "olr" in ds else np.full_like(lat_deg, 240.0)
+        sst_c = t_ocn - 273.15
+        if "m_seaice" in ds:
+            seaice = np.clip(np.sqrt(np.maximum(np.asarray(ds["m_seaice"].isel(time=idx).values, dtype=np.float32), 0.0) / 500.0), 0.0, 1.0)
+        elif "seaice_frac" in ds:
+            seaice = np.clip(np.asarray(ds["seaice_frac"].isel(time=idx).values, dtype=np.float32), 0.0, 1.0)
+        else:
+            seaice = np.zeros_like(lat_deg, dtype=np.float32)
+
+        return lat_deg, lon_deg, t2_c, precip, f3, surf_type, f"{kind} ({frame_info['label']})", avail_esm, olr_arr, sst_c, seaice
     finally:
         ds.close()
 
@@ -624,8 +691,24 @@ class RunManager:
                             if "precip_mm_day" in zf
                             else np.zeros_like(t2_c)
                         )
+                        olr = np.asarray(zf["olr"], dtype=np.float32) if "olr" in zf else np.full_like(t2_c, 240.0)
                         lai = np.asarray(zf["lai"], dtype=np.float32)
                         surf_type = np.asarray(zf["surf_type"], dtype=np.int8)
+                        has_ocn_mesh = "ocn_lat_deg" in zf and "ocn_sst_c" in zf
+                        if has_ocn_mesh:
+                            ocn_lat_deg = np.asarray(zf["ocn_lat_deg"], dtype=np.float32)
+                            ocn_lon_deg = np.asarray(zf["ocn_lon_deg"], dtype=np.float32)
+                            ocn_wet = np.asarray(zf["ocn_wet"], dtype=np.uint8) if "ocn_wet" in zf else None
+                            sst_c = np.asarray(zf["ocn_sst_c"], dtype=np.float32)
+                            ocn_spd = np.asarray(zf["ocn_speed_ms"], dtype=np.float32) if "ocn_speed_ms" in zf else np.zeros_like(sst_c)
+                            seaice = np.asarray(zf["ocn_seaice_frac"], dtype=np.float32) if "ocn_seaice_frac" in zf else np.zeros_like(sst_c)
+                            ocn_is_wind = False
+                        else:
+                            ocn_lat_deg = ocn_lon_deg = ocn_wet = None
+                            sst_c = np.asarray(zf["sst_c"], dtype=np.float32) if "sst_c" in zf else t2_c
+                            seaice = np.asarray(zf["seaice_frac"], dtype=np.float32) if "seaice_frac" in zf else np.zeros_like(t2_c)
+                            ocn_spd = np.asarray(zf["u10_ms"], dtype=np.float32) if "u10_ms" in zf else np.zeros_like(t2_c)
+                            ocn_is_wind = True
                         yr = int(zf["year"])
                         day_yr = float(zf["day_in_yr"])
                         sim_days = float(zf["sim_days"])
@@ -640,7 +723,12 @@ class RunManager:
                             calendar_type=str(fc.get("calendar_type", "gregorian")),
                         )
                         date_str = cal.date_at(sim_days * 86400.0).iso_date
-                    raster = self.engine.regrid_fields(lat_deg, lon_deg, t2_c, precip, lai, surf_type)
+                    raster = self.engine.regrid_fields(
+                        lat_deg, lon_deg, t2_c, precip, lai, surf_type,
+                        olr=olr, sst_c=sst_c, seaice_frac=seaice, ocn_speed_ms=ocn_spd,
+                        ocn_lat_deg=ocn_lat_deg, ocn_lon_deg=ocn_lon_deg, ocn_wet=ocn_wet,
+                        ocn_is_wind=ocn_is_wind,
+                    )
                     meta = {
                         "source": "live_preview.npz",
                         "year": yr,
@@ -672,13 +760,14 @@ class RunManager:
             cached = self.engine._frame_cache.get(cache_key)
             if cached is None:
                 try:
-                    lat_deg, lon_deg, t2_c, precip, f3, surf_type, src_lbl, avail_esm = _load_zarr_frame_payload(
+                    lat_deg, lon_deg, t2_c, precip, f3, surf_type, src_lbl, avail_esm, olr_z, sst_z, ice_z = _load_zarr_frame_payload(
                         out_root, finfo, kind_used, esm_field=esm_field
                     )
                     spec = _ESM_GLOBE_SPECS.get(esm_field, _ESM_GLOBE_SPECS["lai"])
                     raster = self.engine.regrid_fields(
                         lat_deg, lon_deg, t2_c, precip, f3, surf_type,
                         esm_range=(spec[1], spec[2]), esm_land_only=spec[3],
+                        olr=olr_z, sst_c=sst_z, seaice_frac=ice_z, ocn_is_wind=True,
                     )
                     sim_d = float(finfo["sim_days"])
                     run_toml_p = out_root / "run_config.toml"
@@ -1162,12 +1251,12 @@ _HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- 3 ROTATING ORTHOGRAPHIC GLOBES -->
+    <!-- 6 ROTATING ORTHOGRAPHIC GLOBES (3x2: Atmosphere + Native Fine Ocean + Biosphere) -->
     <div class="card">
       <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px;">
         <div>
-          <h2 style="margin:0;" data-i18n="globes_title">3地球 1時間リアルタイム正射図法プレビュー (T<sub>2</sub> ・ 降水量 ・ LAI)</h2>
-          <p class="sub" style="margin:2px 0 0;" data-i18n="globes_sub">ドラッグで任意の緯度経度へ傾け・回転できます。3つの地球儀が同期してゆっくり自転します。</p>
+          <h2 style="margin:0;" data-i18n="globes_title">6地球 リアルタイム正射図法プレビュー (T<sub>2</sub> ・ 赤外雲 OLR ・ 降水 ・ SST ・ 海流 ・ LAI)</h2>
+          <p class="sub" style="margin:2px 0 0;" data-i18n="globes_sub">ドラッグで任意の緯度経度へ傾け・回転できます。6つの地球儀が同期して自転します（SST・海流は高解像海洋格子を直接描画）。</p>
         </div>
         <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
           <label class="switch" style="font-size:12.5px;"><input type="checkbox" id="globe-spin" checked /> <span data-i18n="lbl_spin">自動回転</span></label>
@@ -1182,7 +1271,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div class="hover-banner">
-        <span id="hover-coords" data-i18n="hover_hint">地球儀の上にマウスを置くと、その地点の緯度経度・T₂・降水量・LAI が表示されます</span>
+        <span id="hover-coords" data-i18n="hover_hint">地球儀の上にマウスを置くと、その地点の緯度経度・T₂・赤外雲 OLR・降水・SST・海流・LAI が表示されます</span>
         <span id="view-angles" style="color:var(--muted);">Center: lat +18.0°, lon +140.0°</span>
       </div>
 
@@ -1195,11 +1284,32 @@ _HTML_PAGE = r"""<!DOCTYPE html>
           <div class="cbar-labels"><span>-45°C</span><span>-10°C</span><span>+15°C</span><span>+40°C</span></div>
         </div>
         <div class="globe-card">
+          <h3 data-i18n="g_ir_title">衛星赤外雲 OLR [W m⁻²]</h3>
+          <div class="g-sub" data-i18n="g_ir_sub">ひまわり赤外風（白＝背の高い冷たい雲頂・暗＝晴天域）</div>
+          <canvas id="globeIR" class="globe-canvas" width="300" height="300"></canvas>
+          <div class="cbar" style="background:linear-gradient(90deg, #f8fafc, #cbd5e1, #64748b, #1e3a5f, #0b1120);"></div>
+          <div class="cbar-labels"><span>110 (深対流)</span><span>180</span><span>250</span><span>320 W/m²</span></div>
+        </div>
+        <div class="globe-card">
           <h3 data-i18n="g_olr_title">降水量 Precip [mm d⁻¹]</h3>
           <div class="g-sub" data-i18n="g_olr_sub">ITCZ・モンスーン・前線帯のトレーサ</div>
           <canvas id="globeOLR" class="globe-canvas" width="300" height="300"></canvas>
           <div class="cbar" style="background:linear-gradient(90deg, #0f172a, #1e3a8a, #0ea5e9, #34d399, #facc15, #f97316, #ec4899);"></div>
           <div class="cbar-labels"><span>0</span><span>4</span><span>10</span><span>18</span><span>25+ mm/d</span></div>
+        </div>
+        <div class="globe-card">
+          <h3 data-i18n="g_sst_title">海面水温 SST [°C] &amp; 海氷</h3>
+          <div id="g-sst-sub" class="g-sub" data-i18n="g_sst_sub">黒潮・湾流・中規模渦・極域海氷（白）</div>
+          <canvas id="globeSST" class="globe-canvas" width="300" height="300"></canvas>
+          <div class="cbar" style="background:linear-gradient(90deg, #172554, #1d4ed8, #06b6d4, #22c55e, #facc15, #f97316, #b91c1c);"></div>
+          <div class="cbar-labels"><span>-2°C</span><span>+6°C</span><span>+15°C</span><span>+24°C</span><span>+32°C</span></div>
+        </div>
+        <div class="globe-card">
+          <h3 id="g-ocn-title" data-i18n="g_ocn_title">表層海流速 |u<sub>ocn</sub>| [m s⁻¹]</h3>
+          <div id="g-ocn-sub" class="g-sub" data-i18n="g_ocn_sub">黒潮・メキシコ湾流・南極周極流・渦構造</div>
+          <canvas id="globeOCN" class="globe-canvas" width="300" height="300"></canvas>
+          <div class="cbar" style="background:linear-gradient(90deg, #040d1c, #0c2d5c, #0284c7, #22d3ee, #fde047, #f97316);"></div>
+          <div id="g-ocn-cbar-labels" class="cbar-labels"><span>0.0</span><span>0.3</span><span>0.6</span><span>0.9</span><span>1.2+ m/s</span></div>
         </div>
         <div class="globe-card">
           <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:2px;">
@@ -1361,8 +1471,8 @@ const I18N = {
     mkpi_src: "データソース",
     mkpi_cpu: "CPU 投影処理時間",
     mkpi_latest: "最新全球 T<sub>s</sub> / OLR / LAI",
-    globes_title: "3地球 1時間リアルタイム正射図法プレビュー (T<sub>2</sub> ・ 降水量 ・ LAI)",
-    globes_sub: "ドラッグで任意の緯度経度へ傾け・回転できます。3つの地球儀が同期してゆっくり自転します。",
+    globes_title: "6地球 リアルタイム正射図法プレビュー (T<sub>2</sub> ・ 赤外雲 OLR ・ 降水 ・ SST ・ 海流 ・ LAI)",
+    globes_sub: "ドラッグで任意の緯度経度へ傾け・回転できます。6つの地球儀が同期して自転します（SST・海流は高解像海洋格子を直接描画）。",
     lbl_spin: "自動回転",
     lbl_speed: "速度",
     lbl_grid: "経緯線",
@@ -1448,8 +1558,8 @@ const I18N = {
     mkpi_src: "Active Source",
     mkpi_cpu: "CPU Regrid Time",
     mkpi_latest: "Global Mean T<sub>s</sub> / OLR / LAI",
-    globes_title: "Live Hourly 3-Globe Preview (T<sub>2</sub> · Precip · LAI)",
-    globes_sub: "Drag any globe to tilt or spin synchronously across latitude and longitude.",
+    globes_title: "Live 6-Globe Preview (T<sub>2</sub> · IR Clouds · Precip · SST · Ocean Currents · LAI)",
+    globes_sub: "Drag any globe to tilt or spin synchronously; SST & currents render directly on the fine OGCM mesh.",
     lbl_spin: "Auto Spin",
     lbl_speed: "Speed",
     lbl_grid: "Graticule",
@@ -2433,10 +2543,32 @@ async function fetchMonitorOnce() {
     if (data.raster) {
       MON.raster = data.raster;
       MON.rawT2 = b64ToUint8(data.raster.t2_b64);
+      MON.rawIR = data.raster.ir_b64 ? b64ToUint8(data.raster.ir_b64) : null;
       MON.rawOLR = b64ToUint8(data.raster.precip_b64 || data.raster.olr_b64);
+      MON.rawSST = data.raster.sst_b64 ? b64ToUint8(data.raster.sst_b64) : null;
+      MON.rawSeaIce = data.raster.seaice_b64 ? b64ToUint8(data.raster.seaice_b64) : null;
+      MON.rawOcnSpd = data.raster.ocn_spd_b64 ? b64ToUint8(data.raster.ocn_spd_b64) : null;
+      MON.rawOcnWet = data.raster.ocn_wet_b64 ? b64ToUint8(data.raster.ocn_wet_b64) : null;
+      MON.rawOcnCoast = data.raster.ocn_coast_b64 ? b64ToUint8(data.raster.ocn_coast_b64) : null;
       MON.rawLAI = b64ToUint8(data.raster.lai_b64);
       MON.rawSurf = b64ToUint8(data.raster.surf_b64);
       MON.rawCoast = b64ToUint8(data.raster.coast_b64);
+      const sstSub = document.getElementById("g-sst-sub");
+      if (sstSub && data.raster.ocn_res_lbl) {
+        sstSub.textContent = (LANG === "ja" ? "黒潮・湾流・海氷（白） — " : "Western boundary currents & sea ice — ") + data.raster.ocn_res_lbl;
+      }
+      const ocnT = document.getElementById("g-ocn-title");
+      const ocnS = document.getElementById("g-ocn-sub");
+      const ocnL = document.getElementById("g-ocn-cbar-labels");
+      if (data.raster.ocn_is_wind) {
+        if (ocnT) ocnT.innerHTML = LANG === "ja" ? "地表風速 |u<sub>10</sub>| [m s⁻¹]" : "Surface Wind |u<sub>10</sub>| [m s⁻¹]";
+        if (ocnS) ocnS.textContent = LANG === "ja" ? "貿易風・偏西風・低気圧の強風帯" : "Trades, westerlies & storm wind bands";
+        if (ocnL) ocnL.innerHTML = "<span>0</span><span>6</span><span>12</span><span>18</span><span>25+ m/s</span>";
+      } else {
+        if (ocnT) ocnT.innerHTML = LANG === "ja" ? "表層海流速 |u<sub>ocn</sub>| [m s⁻¹]" : "Ocean Current |u<sub>ocn</sub>| [m s⁻¹]";
+        if (ocnS) ocnS.textContent = (LANG === "ja" ? "黒潮・湾流・ACC・中規模渦 — " : "Kuroshio, Gulf Stream, ACC & eddies — ") + (data.raster.ocn_res_lbl || "");
+        if (ocnL) ocnL.innerHTML = "<span>0.0</span><span>0.3</span><span>0.6</span><span>0.9</span><span>1.2+ m/s</span>";
+      }
       const tEl = document.getElementById("g-esm-title");
       const sEl = document.getElementById("g-esm-sub");
       const cEl = document.getElementById("g-esm-cbar");
@@ -2478,7 +2610,10 @@ function makeColorLUT(stops) {
   return lut;
 }
 const LUT_T2  = makeColorLUT([[0,[30,27,75]],[0.24,[29,78,216]],[0.44,[56,189,248]],[0.60,[253,224,71]],[0.80,[249,115,22]],[1,[185,28,28]]]);
+const LUT_IR  = makeColorLUT([[0,[255,255,255]],[0.22,[226,232,240]],[0.48,[116,138,164]],[0.72,[30,58,95]],[1,[11,17,32]]]);
 const LUT_OLR = makeColorLUT([[0,[15,23,42]],[0.04,[30,58,138]],[0.16,[14,165,233]],[0.40,[52,211,153]],[0.68,[250,204,21]],[0.88,[249,115,22]],[1,[236,72,153]]]);
+const LUT_SST = makeColorLUT([[0,[23,37,84]],[0.22,[29,78,216]],[0.42,[6,182,212]],[0.60,[34,197,94]],[0.76,[250,204,21]],[0.89,[249,115,22]],[1,[185,28,28]]]);
+const LUT_OCN = makeColorLUT([[0,[4,13,28]],[0.14,[12,45,92]],[0.34,[2,132,199]],[0.58,[34,211,238]],[0.82,[253,224,71]],[1,[249,115,22]]]);
 const LUT_LAI = makeColorLUT([[0,[146,112,74]],[0.20,[163,163,50]],[0.45,[77,158,56]],[0.72,[21,128,61]],[1,[6,78,59]]]);
 const LUT_ESM = makeColorLUT([[0,[30,27,75]],[0.20,[29,78,216]],[0.42,[14,165,233]],[0.65,[52,211,153]],[0.84,[250,204,21]],[1,[249,115,22]]]);
 
@@ -2583,11 +2718,25 @@ function renderOneGlobe(canvasId, kind, geo) {
   buf.fill(0);
   const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
   const lon0 = GLOBE_VIEW.lon0;
-  const srcVals = kind === "t2" ? MON.rawT2 : (kind === "olr" ? MON.rawOLR : MON.rawLAI);
+  const isOcnGlobe = (kind === "sst") || (kind === "ocn" && !MON.raster.ocn_is_wind);
+  const srcVals = kind === "t2" ? MON.rawT2
+    : (kind === "ir" ? (MON.rawIR || MON.rawOLR)
+    : (kind === "olr" ? MON.rawOLR
+    : (kind === "sst" ? (MON.rawSST || MON.rawT2)
+    : (kind === "ocn" ? (MON.rawOcnSpd || MON.rawOLR)
+    : MON.rawLAI))));
   const isLaiMode = (MON.esmField || "lai") === "lai";
   const landOnly3 = MON.raster.esm_land_only !== false;
-  const lut = kind === "t2" ? LUT_T2 : (kind === "olr" ? LUT_OLR : (isLaiMode ? LUT_LAI : LUT_ESM));
-  const surf = MON.rawSurf, coast = MON.rawCoast;
+  const lut = kind === "t2" ? LUT_T2
+    : (kind === "ir" ? LUT_IR
+    : (kind === "olr" ? LUT_OLR
+    : (kind === "sst" ? LUT_SST
+    : (kind === "ocn" ? LUT_OCN
+    : (isLaiMode ? LUT_LAI : LUT_ESM)))));
+  const surf = MON.rawSurf;
+  const ocnWet = MON.rawOcnWet;
+  const seaIce = MON.rawSeaIce;
+  const coast = (isOcnGlobe && MON.rawOcnCoast) ? MON.rawOcnCoast : MON.rawCoast;
 
   for (let p = 0; p < geo.count; p++) {
     const row = geo.latRow[p];
@@ -2601,15 +2750,29 @@ function renderOneGlobe(canvasId, kind, geo) {
       r = 12 * sh; g = 34 * sh; b = 74 * sh; // crisp ocean blue on land-only globe
     } else if (kind === "lai" && landOnly3 && surf[gIdx] === 2) {
       r = 228 * sh; g = 242 * sh; b = 250 * sh; // ice sheets crisp white-cyan
+    } else if (isOcnGlobe && (ocnWet ? ocnWet[gIdx] === 0 : surf[gIdx] !== 0)) {
+      if (surf[gIdx] === 2) {
+        r = 185 * sh; g = 200 * sh; b = 215 * sh; // ice sheets soft silver on ocean globes
+      } else {
+        r = 34 * sh; g = 42 * sh; b = 56 * sh; // crisp dark slate land mask on SST / current globes
+      }
     } else {
       const k3 = srcVals[gIdx] * 3;
       r = lut[k3] * sh; g = lut[k3+1] * sh; b = lut[k3+2] * sh;
+      if (kind === "sst" && seaIce && seaIce[gIdx] > 38) {
+        const fIce = Math.min(1.0, (seaIce[gIdx] - 38) / 140.0);
+        r = r * (1 - fIce) + 236 * sh * fIce;
+        g = g * (1 - fIce) + 248 * sh * fIce;
+        b = b * (1 - fIce) + 255 * sh * fIce;
+      }
     }
 
     if (coast[gIdx] === 1) {
-      r = kind === "olr" ? r * 0.45 + 90 : 12;
-      g = kind === "olr" ? g * 0.45 + 100 : 18;
-      b = kind === "olr" ? b * 0.45 + 120 : 28;
+      if (kind === "olr" || kind === "ir" || kind === "ocn") {
+        r = r * 0.45 + 90; g = g * 0.45 + 100; b = b * 0.45 + 120;
+      } else {
+        r = 12; g = 18; b = 28;
+      }
     }
 
     if (drawGrid) {
@@ -2650,7 +2813,10 @@ function animateGlobes(ts) {
 
   const geo = getOrthoGeo();
   renderOneGlobe("globeT2", "t2", geo);
+  renderOneGlobe("globeIR", "ir", geo);
   renderOneGlobe("globeOLR", "olr", geo);
+  renderOneGlobe("globeSST", "sst", geo);
+  renderOneGlobe("globeOCN", "ocn", geo);
   renderOneGlobe("globeLAI", "lai", geo);
   document.getElementById("view-angles").textContent =
     `Center: lat ${GLOBE_VIEW.lat0>=0?"+":""}${GLOBE_VIEW.lat0.toFixed(1)}°, lon ${GLOBE_VIEW.lon0>=0?"+":""}${GLOBE_VIEW.lon0.toFixed(1)}°`;
@@ -2663,7 +2829,7 @@ function resetGlobeView() {
 }
 
 function bindGlobeInteractions() {
-  ["globeT2", "globeOLR", "globeLAI"].forEach(id => {
+  ["globeT2", "globeIR", "globeOLR", "globeSST", "globeOCN", "globeLAI"].forEach(id => {
     const cv = document.getElementById(id);
     if (!cv) return;
     cv.addEventListener("mousedown", e => { GLOBE_VIEW.dragging = true; GLOBE_VIEW.manualOverride = true; GLOBE_VIEW.lastX = e.clientX; GLOBE_VIEW.lastY = e.clientY; });
@@ -2688,14 +2854,20 @@ function bindGlobeInteractions() {
       const col = Math.max(0, Math.min(359, Math.floor(lon + 180)));
       const idx = row * 360 + col;
       const t2v = -45 + (MON.rawT2[idx]/255) * 85;
+      const irv = MON.rawIR ? (110 + (MON.rawIR[idx]/255) * 210) : 240;
       const precipv = (MON.rawOLR[idx]/255) * 25.0;
+      const sstv = MON.rawSST ? (-2 + (MON.rawSST[idx]/255) * 34) : t2v;
+      const spdMax = (MON.raster.ocn_spd_range && MON.raster.ocn_spd_range[1]) || 1.2;
+      const spdv = MON.rawOcnSpd ? ((MON.rawOcnSpd[idx]/255) * spdMax) : 0.0;
+      const spdLbl = MON.raster.ocn_is_wind ? "u₁₀" : "|u_ocn|";
       const r3 = MON.raster.lai_range || [0.0, 7.0];
       const v3 = r3[0] + (MON.rawLAI[idx]/255) * (r3[1] - r3[0]);
       const lbl3 = MON.esmLabel || "LAI [m² m⁻²]";
       const stype = MON.rawSurf[idx] === 0 ? (LANG==="ja"?"海洋":"Ocean") : (MON.rawSurf[idx] === 2 ? (LANG==="ja"?"氷床":"IceSheet") : (LANG==="ja"?"陸域":"Land"));
       const ptLbl = LANG === "ja" ? "地点" : "Point";
+      const sstTxt = MON.rawSurf[idx] === 0 ? ` | SST: ${sstv.toFixed(1)}°C` : "";
       document.getElementById("hover-coords").textContent =
-        `${ptLbl} (${lat.toFixed(1)}°, ${lon.toFixed(1)}°, ${stype}) — T₂: ${t2v.toFixed(1)} °C (${(t2v+273.15).toFixed(1)} K) | Precip: ${precipv.toFixed(1)} mm/d | ${lbl3}: ${v3.toFixed(2)}`;
+        `${ptLbl} (${lat.toFixed(1)}°, ${lon.toFixed(1)}°, ${stype}) — T₂: ${t2v.toFixed(1)}°C | OLR: ${irv.toFixed(0)} W/m² | P: ${precipv.toFixed(1)} mm/d${sstTxt} | ${spdLbl}: ${spdv.toFixed(2)} m/s | ${lbl3}: ${v3.toFixed(2)}`;
     });
   });
   window.addEventListener("mouseup", () => { GLOBE_VIEW.dragging = false; GRID_VIEW.dragging = false; });
