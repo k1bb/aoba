@@ -49,6 +49,8 @@ aoba/
 ├── docs/
 │   ├── architecture.md    # 支配構成・根拠文献トレーサビリティ仕様書（英語）
 │   ├── architecture_ja.md # 支配構成・根拠文献トレーサビリティ仕様書（日本語）
+│   ├── configurations.md  # 用途別実験構成ガイド（英語）
+│   ├── configurations_ja.md # 用途別実験構成ガイド（日本語）
 │   ├── formulation.md     # 数理定式化モデル記述書（英語）
 │   ├── formulation_ja.md  # 数理定式化モデル記述書（日本語）
 │   ├── roadmap.md         # 将来の開発課題・ロードマップ（英語）

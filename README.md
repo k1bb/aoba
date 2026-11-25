@@ -49,6 +49,8 @@ aoba/
 ├── docs/
 │   ├── architecture.md    # Governing architecture & literature traceability (English)
 │   ├── architecture_ja.md # Governing architecture & literature traceability (Japanese)
+│   ├── configurations.md  # Recommended experiment configurations (English)
+│   ├── configurations_ja.md # Recommended experiment configurations (Japanese)
 │   ├── formulation.md     # Full mathematical model description (English)
 │   ├── formulation_ja.md  # Full mathematical model description (Japanese)
 │   ├── roadmap.md         # Future development roadmap (English)

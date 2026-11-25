@@ -1273,6 +1273,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
         <h2 data-i18n="docs_menu_title">モデルドキュメント</h2>
         <div style="display:flex; flex-direction:column; gap:6px; margin-bottom:12px;">
           <button onclick="loadDoc('formulation')" id="docbtn-formulation" class="primary" data-i18n="doc_formulation">数理定式化モデル記述書 (全12章)</button>
+          <button onclick="loadDoc('configurations')" id="docbtn-configurations" data-i18n="doc_configurations">実験構成例 (Configurations)</button>
           <button onclick="loadDoc('architecture')" id="docbtn-architecture" data-i18n="doc_architecture">アーキテクチャ ＆ 根拠文献</button>
           <button onclick="loadDoc('readme')" id="docbtn-readme" data-i18n="doc_readme">概要・クイックスタート (README)</button>
         </div>
@@ -1383,6 +1384,7 @@ const I18N = {
     docs_menu_title: "モデルドキュメント",
     doc_formulation: "数理定式化モデル記述書 (全12章)",
     doc_architecture: "アーキテクチャ ＆ 根拠文献",
+    doc_configurations: "実験構成例 (Configurations)",
     doc_readme: "概要・クイックスタート (README)",
     docs_toc_title: "目次 (クリックで移動)",
   },
@@ -1469,6 +1471,7 @@ const I18N = {
     docs_menu_title: "Model Documentation",
     doc_formulation: "Mathematical Formulation (12 Chapters)",
     doc_architecture: "Architecture & Literature Traceability",
+    doc_configurations: "Experiment Configurations",
     doc_readme: "Overview & Quick Start (README)",
     docs_toc_title: "Table of Contents",
   },
@@ -3123,7 +3126,7 @@ function renderMarkdownWithMath(md) {
 
 async function loadDoc(base) {
   CURRENT_DOC_BASE = base || "formulation";
-  ["formulation","architecture","readme"].forEach(b => {
+  ["formulation","configurations","architecture","readme"].forEach(b => {
     const btn = document.getElementById("docbtn-" + b);
     if (btn) btn.className = b === CURRENT_DOC_BASE ? "primary" : "";
   });
@@ -3445,6 +3448,8 @@ def get_scvt_preview_payload(glevel: int) -> dict[str, Any]:
 _DOC_FILES: dict[str, Path] = {
     "formulation_ja": _REPO_ROOT / "docs" / "formulation_ja.md",
     "formulation_en": _REPO_ROOT / "docs" / "formulation.md",
+    "configurations_ja": _REPO_ROOT / "docs" / "configurations_ja.md",
+    "configurations_en": _REPO_ROOT / "docs" / "configurations.md",
     "architecture_ja": _REPO_ROOT / "docs" / "architecture_ja.md",
     "architecture_en": _REPO_ROOT / "docs" / "architecture.md",
     "readme_ja": _REPO_ROOT / "README_ja.md",
