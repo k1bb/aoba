@@ -120,8 +120,8 @@ enable_milankovitch_orbit = false
 milankovitch_start_kyr = 0.0
 milankovitch_accel_factor = 1.0
 re_liq_um = 10.0
-re_ice_um = 48.0
-cloud_sw_inhomog = 0.62
+re_ice_um = 35.0
+cloud_sw_inhomog = 0.88
 microphysics_scheme = "six_class_2m"
 
 # --- Dynamic Equilibrium / Accelerated SIA Ice-Sheet Options ---

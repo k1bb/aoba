@@ -1571,10 +1571,10 @@ kernel void microphysics_6class_col(
             nr_cur += dq_c2r / 2.5e-7f;
         }
 
-        // 3a. Ice crystal aggregation (q_i -> q_s): excess above qi_thresh = 5e-5 kg/kg (Morrison et al., 2005)
-        if (qi > 5.0e-5f) {
+        // 3a. Ice crystal aggregation (q_i -> q_s): excess above qi_thresh = 8e-5 kg/kg (Morrison et al., 2005)
+        if (qi > 8.0e-5f) {
             float k_agg = 1.5e-3f * exp(clamp(0.025f * (temp - T_FREEZE), -3.0f, 0.0f));
-            float dq_i2s = (-esm_expm1(-min(k_agg * dt, 5.0f))) * (qi - 5.0e-5f);
+            float dq_i2s = (-esm_expm1(-min(k_agg * dt, 5.0f))) * (qi - 8.0e-5f);
             qi -= dq_i2s;
             qs += dq_i2s;
             ns_cur += dq_i2s / 4.0e-8f;
@@ -1660,7 +1660,7 @@ kernel void microphysics_6class_col(
 
         // 4. Class-specific terminal velocities & 5. Top-down implicit sedimentation
         float rho_fac = sqrt(clamp(1.2f / rd_safe, 0.5f, 6.0f));
-        float vi = clamp(0.25f + 0.55f * pow(max(qi / 1.0e-4f, 0.0f), 0.25f), 0.20f, 0.90f);
+        float vi = clamp(0.15f + 0.35f * pow(max(qi / 1.0e-4f, 0.0f), 0.25f), 0.12f, 0.65f);
         float vr = clamp(6.5f * pow(max(rd * qr * 1.0e3f, 1.0e-6f), 0.14f) * rho_fac, 1.0f, 9.5f);
         float vs = clamp(1.1f * pow(max(rd * qs * 1.0e3f, 1.0e-6f), 0.10f) * rho_fac, 0.3f, 2.2f);
         float vg = clamp(4.2f * pow(max(rd * qg * 1.0e3f, 1.0e-6f), 0.18f) * rho_fac, 0.8f, 8.5f);
