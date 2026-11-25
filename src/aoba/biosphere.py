@@ -39,7 +39,7 @@ Implements a fully parameter-table-free terrestrial biosphere combining:
    - Kempes, West, Crowell, & Girvan (2011, PLoS ONE, 6, e20551, Eqs. 2-5):
      Metabolic vs water-limited maximum canopy height `h_c`.
 
-AOBA Formulation Reference: Sec. 7.2, Eqs. (7.1)-(7.6) (Two-Leaf C3/C4 EEO Biosphere & Lambert-W0 LAI).
+AOBA Formulation Reference: Sec. 7.2-7.5, Eqs. (7.1)-(7.29) (Two-Leaf C3/C4 P-Model, Liebig Co-Limitation, Lambert-W0 LAI, Habit, S_R & Canopy Height h_c).
 """
 
 from __future__ import annotations
@@ -953,9 +953,13 @@ def compute_two_leaf_gas_exchange(
 
     1. Uses `precomputed_alloc` (or computes `prepare_two_leaf_allocation`) for sunlit/shaded
        PAR absorption and enzyme pools (Hashimoto, 2026, ATAMI, Eqs. A1.24-A1.25).
-    2. Evaluates non-rectangular-hyperbola `J` (Smith et al., 2019, Eq. 9), hyperbolic
-       co-limitation, MMRT respiration (Heskel et al., 2016), and Medlyn/Prentice/Scott-Smith
-       optimal stomatal conductance in kinematic units [m s^-1] (Dai et al., 2004, Eq. 45).
+    2. Evaluates non-rectangular-hyperbola `J` (Smith et al., 2019, Eq. 9), exact Liebig
+       minimum co-limitation (`min(Ac, Aj)` for C3, `min(Ac, Al, Ap)` for C4; Farquhar et al.,
+       1980; von Caemmerer, 2000; preserving 1.000 coordination parity with Smith/Scott-Smith
+       acclimation while two-leaf sunlit/shaded partitioning and subgrid MAML heterogeneity
+       provide physical canopy-scale smoothness), MMRT respiration (Heskel et al., 2016), and
+       Medlyn/Prentice/Scott-Smith optimal stomatal conductance in kinematic units [m s^-1]
+       (Dai et al., 2004, Eq. 45).
     3. When finite leaf boundary-layer conductances `gbw_sun, gbw_sh` [m s^-1] are provided,
        couples the P-model to the leaf-surface microclimate `(c_s, D_s)` via 2 fixed-point passes:
          c_s = c_af - A_n * P / g_bc   (g_bc = g_bw / 1.37; Dai et al., 2004, Eq. 11),
@@ -1096,8 +1100,7 @@ def compute_two_leaf_gas_exchange(
         j_4 = non_rectangular_hyperbola(phi_g * i_par, jm4, THETA_NRH)
         al4 = 0.20 * (1.0 - PHI_LEAK_C4) * j_4 * torch.sigmoid(0.35 * ((tl - C.T_FREEZE) - 12.0))  # 5 mol e^- + BS leakage (von Caemmerer, 2000)
         ac4 = vc4  # Bundle-sheath CO2-saturated Rubisco limit
-        b_cj4 = ac4 + al4
-        acj4 = (b_cj4 - torch.sqrt(torch.clamp(b_cj4 * b_cj4 - 4.0 * 0.85 * ac4 * al4, min=0.0))) / (2.0 * 0.85)
+        acj4 = torch.minimum(ac4, al4)  # Exact Liebig minimum (no artificial coordination attenuation)
         rd4 = r25_4 * fr
 
         g0_mol = 0.002 * ws * (l_sun + l_sh > 0.01).to(tl.dtype)
@@ -1125,8 +1128,7 @@ def compute_two_leaf_gas_exchange(
             ci3 = chi3 * cs_pa
             ac3 = vc3 * torch.clamp((ci3 - gamma3) / (ci3 + km3), min=0.0)
             aj3 = 0.25 * j_3 * torch.clamp((ci3 - gamma3) / (ci3 + 2.0 * gamma3), min=0.0)
-            b_cj3 = ac3 + aj3
-            gpp3 = (b_cj3 - torch.sqrt(torch.clamp(b_cj3 * b_cj3 - 4.0 * 0.98 * ac3 * aj3, min=0.0))) / (2.0 * 0.98)
+            gpp3 = torch.minimum(ac3, aj3)
             an3_pos = torch.clamp(gpp3 - rd3, min=0.0)
             gsw3_mol = 1.6 * (an3_pos * 1.0e-6) / torch.clamp(cs_mol * (1.0 - chi3), min=1.0e-6)
 
@@ -1134,8 +1136,7 @@ def compute_two_leaf_gas_exchange(
             chi4 = torch.clamp(xi4 / (xi4 + torch.sqrt(d_s)), 0.05, 0.92)
             cm4 = chi4 * cs_pa
             ap4 = (1.0 - PHI_LEAK_C4) * vp4 * cm4 / torch.clamp(cm4 + kp4, min=0.5)
-            b_p4 = acj4 + ap4
-            gpp4 = (b_p4 - torch.sqrt(torch.clamp(b_p4 * b_p4 - 4.0 * 0.85 * acj4 * ap4, min=0.0))) / (2.0 * 0.85)
+            gpp4 = torch.minimum(acj4, ap4)
             an4_pos = torch.clamp(gpp4 - rd4, min=0.0)
             gsw4_mol = 1.6 * (an4_pos * 1.0e-6) / torch.clamp(cs_mol * (1.0 - chi4), min=1.0e-6)
 

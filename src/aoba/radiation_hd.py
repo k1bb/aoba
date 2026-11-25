@@ -21,7 +21,7 @@ Provides two advanced radiative transfer capabilities selectable via `config/aob
    - Enables exact SW+LW direct radiative forcing of prognostic BC/OC/SO4/SS aerosols even when
      running the Metal/CUDA fused 16-band `"ckd"` or `"four_band"` fast paths (`<0.3 ms` overhead).
 
-AOBA Formulation Reference: Sec. 4.5-4.7, Eqs. (4.9) & (4.11) (29-Band / 111 g-pt CKD-HD & 3D TICA).
+AOBA Formulation Reference: Sec. 4.5 Eq. (4.18) & Sec. 4.7 Eq. (4.20) (111 g-pt CKD-HD Aerosol Delta & 3D TICA).
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ from aoba.radiation_ckd import (
 )
 
 
-# AOBA Formulation Eq. (4.11)
+# AOBA Formulation Eqs. (4.18), (4.20)
 def apply_3d_tica_cloud_shift(
     qc_sub: torch.Tensor,
     qi_sub: torch.Tensor,

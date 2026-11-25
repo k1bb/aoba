@@ -23,6 +23,8 @@ References
 - Lott & Miller (1997, Q. J. R. Meteorol. Soc., 123, 101-127, Appendix A):
   Subgrid orographic standard deviation `mu`, RMS slope `sigma`, anisotropy `gamma`, and
   principal ridge angle `psi`.
+
+AOBA Formulation Reference: Sec. 2.1-2.3, Eqs. (2.1)-(2.8) (SCVT Voronoi C-Grid, TRiSK Weights & Earth2014 Tensor).
 """
 
 from __future__ import annotations

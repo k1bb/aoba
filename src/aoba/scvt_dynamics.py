@@ -20,7 +20,7 @@ References
 - Held & Suarez (1994, Bull. Amer. Meteor. Soc., 75, 1825-1830, Eqs. 1-4):
   Dry global dynamical-core benchmark Newtonian relaxation and boundary-layer Rayleigh drag.
 
-AOBA Formulation Reference: Sec. 8.2, Eqs. (8.1)-(8.4) (Global SCVT Nonhydrostatic RK3-HEVI Core & Zalesak FCT).
+AOBA Formulation Reference: Sec. 8.1-8.2, Eqs. (8.1)-(8.7) (Unified Compressible Euler, SCVT RK3-HEVI & Batched Zalesak FCT).
 """
 
 from __future__ import annotations

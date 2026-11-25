@@ -17,7 +17,7 @@ hothouse climates) and planetary habitability experiments from universal physica
      directly driving AOBA's orbital insolation (`compute_orbital_insolation`) and dynamic
      SIA ice sheets (`icesheet.py`).
 
-AOBA Formulation Reference: Sec. 10.5 Eq. (10.11) & Sec. 11.3 Eq. (11.5) (Silicate Weathering & Milankovitch Orbit).
+AOBA Formulation Reference: Sec. 10.6 Eq. (10.8) & Sec. 11.2 Eq. (11.4) (Silicate Weathering & Milankovitch Orbital Evolution).
 """
 
 from __future__ import annotations

@@ -25,7 +25,7 @@ Every parameterization cites its exact source equations:
      Richardson-dependent eddy viscosity `nu_SGS` and scalar diffusivity `D_SGS` with
      grid-aspect-ratio filter length correction `f(a)`.
 
-AOBA Formulation Reference: Sec. 6.2-6.3, Eqs. (6.1)-(6.7) (Roughness, De Ridder RSL, MYNN 2.5 PBL & 3D SGS).
+AOBA Formulation Reference: Sec. 6.1-6.4, Eqs. (6.1)-(6.11) (Raupach/Ocean Roughness, De Ridder RSL, MYNN 2.5 & 3D SGS).
 """
 
 from __future__ import annotations

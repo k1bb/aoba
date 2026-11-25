@@ -15,6 +15,8 @@ External Sources Supported by ``fetch_latest_co2_sources()``:
   800 kyr Composite (``antarctica2015co2composite.txt``, ~803,718 BCE - 1950 CE)
 - RCMIP v5.1.0 (Nicholls et al., 2020, Geosci. Model Dev., 13, 5175-5190;
   Meinshausen et al., 2011, 2017, 2020) for CMIP5 RCPs and CMIP6 Historical/SSPs
+
+AOBA Formulation Reference: Sec. 10.6 (Selectable Atmospheric CO2 Modes: constant, scenario, csv).
 """
 
 from __future__ import annotations

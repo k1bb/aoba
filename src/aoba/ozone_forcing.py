@@ -10,6 +10,8 @@ Supports three modes via ``[forcing] o3_mode``:
    ``data/boundary/ozone/o3_zonal_climatology.npz`` (fetched from ESGF input4MIPs CMIP6/CMIP7) or
    a user-specified ``.npz`` / ``.nc`` file via ``o3_file_path``, bilinearly interpolated in
    ``(month, lat, ln p)``.
+
+AOBA Formulation Reference: Sec. 10.2, Eq. (10.1) (Selectable Ozone Modes: rcemip, latitude_seasonal, climatology).
 """
 
 from __future__ import annotations

@@ -37,7 +37,7 @@ Physical Formulation & References
    root `chi_eq = 2*P / (L1 + sqrt(L1^2 + 4*P*L2))` and exact exponential relaxation
    `chi_new = chi + (chi_eq - chi) * (-expm1(-L_eff * dt))` with `L_eff = L1 + L2*(chi + chi_eq)`.
 
-AOBA Formulation Reference: Sec. 10.2, Eqs. (10.1)-(10.3) (Prognostic 3D Atmospheric Ozone Photochemistry).
+AOBA Formulation Reference: Sec. 10.2, Eq. (10.2) (Prognostic 3D Atmospheric Ozone Photochemistry).
 """
 
 from __future__ import annotations
@@ -127,7 +127,7 @@ def init_prognostic_ozone_state(
     )
 
 
-# AOBA Formulation Eqs. (10.1)-(10.3)
+# AOBA Formulation Eq. (10.2)
 def step_prognostic_ozone(
     oz: PrognosticOzoneState,
     pres_c: torch.Tensor,

@@ -21,7 +21,7 @@ subject to unconditionally stable implicit gravitational settling, exponential w
 and dry deposition, and diagnose both 550 nm Aerosol Optical Depth (AOD) and hygroscopic CCN
 number concentration for 2-moment cloud microphysics.
 
-AOBA Formulation Reference: Sec. 10.3, Eq. (10.5) (Natural Sea-Salt, DMS Sulfate, Wildfire BC/OC & BVOC SOA).
+AOBA Formulation Reference: Sec. 10.4, Eq. (10.4) (Natural Sea-Salt, DMS Sulfate, Wildfire BC/OC & BVOC SOA).
 """
 
 from __future__ import annotations

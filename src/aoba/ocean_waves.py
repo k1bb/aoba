@@ -22,7 +22,7 @@ atmospheric boundary layer, and embedded 3D CRM (`enable_wave_coupling = true`):
      wave-breaking spume-droplet latent evaporation (`LH_spray`) and compensating sensible cooling
      (`SH_spray`) directly into the CRM marine boundary layer!
 
-AOBA Formulation Reference: Sec. 9.5, Eqs. (9.9)-(9.11) (Prognostic Waves Hs/Tp, Langmuir KPP & Sea-Spray Enthalpy).
+AOBA Formulation Reference: Sec. 9.6, Eqs. (9.9)-(9.10) (Prognostic Waves Hs/Tp, Stokes/Langmuir KPP, Wave-Age Drag & Sea Spray).
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def init_ocean_wave_state(
     )
 
 
-# AOBA Formulation Eqs. (9.9)-(9.11)
+# AOBA Formulation Eqs. (9.9)-(9.10)
 def step_ocean_waves(
     waves: OceanWaveState,
     u10_ocn: torch.Tensor,

@@ -16,7 +16,7 @@ References
 - MIROC6 AGCM Document Writing Team (2021, Sec. 4.1.2):
   Conservative coastal routing of terrestrial river & glacier calving freshwater/fusion enthalpy.
 
-AOBA Formulation Reference: Sec. 9.2, Eqs. (9.1)-(9.2) (1.5-Layer Wind-Driven Ekman + Shallow-Water Ocean).
+AOBA Formulation Reference: Sec. 9.3, Eq. (9.2) (1.5-Layer Wind-Driven Ekman + Shallow-Water Ocean).
 """
 
 from __future__ import annotations

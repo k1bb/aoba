@@ -13,7 +13,7 @@ References
   MIROC6 AGCM Document Writing Team (2021, Sec. 3.5):
   Lindzen saturation criterion and upper-boundary momentum conservation.
 
-AOBA Formulation Reference: Sec. 8.3, Eq. (8.5) (Lott & Miller Subgrid Orographic Blocking & Mountain-Wave Drag).
+AOBA Formulation Reference: Sec. 8.4, Eqs. (8.8)-(8.9) (Lott & Miller Subgrid Orographic Blocking & Mountain-Wave Drag).
 """
 
 from __future__ import annotations

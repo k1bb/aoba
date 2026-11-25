@@ -22,7 +22,7 @@ References
 - Seifert, A., & Beheng, K. D. (2006): *Meteorol. Atmos. Phys.*, 92, 45-66.
 - Khairoutdinov, M., & Kogan, Y. (2000): *Mon. Wea. Rev.*, 128, 229-243.
 
-AOBA Formulation Reference: Sec. 5.4, Eqs. (5.8)-(5.9) (Morrison 6-Class 2-Moment Rain/Snow/Graupel).
+AOBA Formulation Reference: Sec. 5.5, Eqs. (5.13)-(5.15) (6-Class 2-Moment Rain/Snow/Graupel).
 """
 
 from __future__ import annotations

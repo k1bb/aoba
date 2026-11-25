@@ -12,6 +12,8 @@ References
 ----------
 - CMIP7 Data Request v1.2 (WCRP-CMIP, 2025): Baseline Climate Variables for Earth System
   Modelling (ESM-BCVs), standardized `plev19` pressure coordinates, and CF-1.11 sign conventions.
+
+AOBA Formulation Reference: Sec. 12.2 (CMIP7 Data Request v1.2 ESM-BCV Zarr v3 Diagnostics).
 """
 
 from __future__ import annotations

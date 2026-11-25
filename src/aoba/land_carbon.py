@@ -38,7 +38,7 @@ Strictly conserves total land carbon and nitrogen via Neumaier/Kahan float32 sum
     d(C_total) / dt == GPP - R_a_eff - R_h - F_fire_C == NBP
     d(N_total) / dt == F_dep + F_BNF - F_leach - F_denit - F_fire_N
 
-AOBA Formulation Reference: Sec. 7.5, Eqs. (7.13)-(7.14) (Terrestrial 6-Pool C/N Model & SPITFIRE Wildfire).
+AOBA Formulation Reference: Sec. 7.8, Eqs. (7.39)-(7.43) (Stocker-Prentice C/N, FUN BNF, 5-Layer Permafrost & MAML SPITFIRE Wildfire).
 """
 
 from __future__ import annotations

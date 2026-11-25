@@ -723,9 +723,18 @@ _HTML_PAGE = r"""<!DOCTYPE html>
 <link rel="icon" type="image/png" href="/assets/aoba_icon.png" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&family=Noto+Sans:ital,wght@0,400;0,600;0,700;1,400&family=STIX+Two+Text:ital,wght@0,400;0,700;1,400&family=Source+Code+Pro:wght@400;600&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+JP:wght@400;500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous" />
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" crossorigin="anonymous" onload="if (typeof CURRENT_DOC_BASE !== 'undefined' && document.getElementById('doc-viewer') && document.getElementById('doc-viewer').innerHTML) loadDoc(CURRENT_DOC_BASE);"></script>
 <title>AOBA Studio — 設定・実行・監視・3地球リアルタイム可視化</title>
 <style>
+  @font-face {
+    font-family: "IBM Plex Math";
+    src: url("https://cdn.jsdelivr.net/npm/@ibm/plex-math@1.1.0/fonts/complete/woff2/IBMPlexMath-Regular.woff2") format("woff2");
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+  }
   :root {
     --bg: #0c1119;
     --panel: #141c27;
@@ -737,9 +746,9 @@ _HTML_PAGE = r"""<!DOCTYPE html>
     --accent-2: #34d399;
     --warn: #fbbf24;
     --danger: #f87171;
-    --sans: "Noto Sans", "Noto Sans JP", "Hiragino Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    --mono: "Source Code Pro", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    --math: "STIX Two Math", "STIX Two Text", "Cambria Math", "Times New Roman", Georgia, serif;
+    --sans: "IBM Plex Sans", "IBM Plex Sans JP", "Hiragino Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --math: "IBM Plex Math", "STIX Two Math", "Cambria Math", Georgia, serif;
   }
   * { box-sizing: border-box; }
   body {
@@ -909,9 +918,13 @@ _HTML_PAGE = r"""<!DOCTYPE html>
     font-size: 16px; color: #f1f5f9;
     display: flex; align-items: center; justify-content: space-between; gap: 16px;
   }
-  .math-block-eq { flex: 1; text-align: center; line-height: 1.6; font-style: italic; }
+  .math-block-eq { flex: 1; text-align: center; line-height: 1.65; font-style: normal; overflow-x: auto; overflow-y: hidden; }
   .math-tag { flex-shrink: 0; font-family: var(--mono); font-size: 12.5px; font-style: normal; color: #94a3b8; user-select: text; }
-  .math-inline { font-family: var(--math); font-style: italic; color: #e0f2fe; padding: 0 1px; }
+  .math-inline { font-family: var(--math); font-style: normal; color: #e0f2fe; padding: 0 1px; }
+  .math-block .katex-display { margin: 0; }
+  .math-block .katex { font-size: 1.04em; color: #f1f5f9; }
+  .math-inline .katex { font-size: 1.01em; color: #e0f2fe; }
+  .katex .text { font-family: var(--sans); }
   .math-rm { font-style: normal; }
   .math-it { font-style: italic; }
   .math-bf { font-style: normal; font-weight: 700; }
@@ -2725,18 +2738,26 @@ const _TEX_SYMS = {
   oplus:"⊕", otimes:"⊗", top:"⊤", bot:"⊥", perp:"⊥", angle:"∠",
   quad:"&emsp;", qquad:"&emsp;&emsp;", enspace:"&ensp;", thinspace:"&thinsp;"
 };
-const _TEX_ITALIC_GREEK = new Set([
-  "alpha","beta","gamma","delta","epsilon","varepsilon","zeta","eta","theta","vartheta",
-  "iota","kappa","lambda","mu","nu","xi","pi","varpi","rho","varrho","sigma","varsigma",
-  "tau","upsilon","phi","varphi","chi","psi","omega","ell"
-]);
+const _TEX_MATH_ITALIC_GREEK = {
+  alpha:"𝛼", beta:"𝛽", gamma:"𝛾", delta:"𝛿", epsilon:"𝜀", varepsilon:"𝜀", zeta:"𝜁",
+  eta:"𝜂", theta:"𝜃", vartheta:"𝜗", iota:"𝜄", kappa:"𝜅", lambda:"𝜆", mu:"𝜇", nu:"𝜈",
+  xi:"𝜉", pi:"𝜋", varpi:"𝜛", rho:"𝜌", varrho:"𝜚", sigma:"𝜎", varsigma:"𝜍", tau:"𝜏",
+  upsilon:"𝜐", phi:"𝜙", varphi:"𝜑", chi:"𝜒", psi:"𝜓", omega:"𝜔", ell:"ℓ"
+};
+function _toMathItalicChar(ch) {
+  const c = ch.charCodeAt(0);
+  if (c >= 65 && c <= 90) return String.fromCodePoint(0x1D434 + (c - 65));
+  if (c === 104) return "\u210E"; // Planck italic h
+  if (c >= 97 && c <= 122) return String.fromCodePoint(0x1D44E + (c - 97));
+  return escHtml(ch);
+}
 const _TEX_FUNCS = new Set([
   "exp","ln","log","sin","cos","tan","cot","sec","csc","arcsin","arccos","arctan",
   "sinh","cosh","tanh","max","min","sup","inf","lim","arg","det","dim","ker",
   "sgn","mod","bmod","gcd","erf","erfc","atan2","expm1","log1p","clamp","clip"
 ]);
 
-function _parseLatex(src) {
+function _parseLatex(src, upright = false) {
   let i = 0;
   const n = src.length;
   const skipWs = () => { while (i < n && /\s/.test(src[i])) i++; };
@@ -2854,10 +2875,11 @@ function _parseLatex(src) {
         if (cmd === "rm") return "";
         const raw = readRawGroup();
         if (cmd === "text" || cmd === "textrm") return `<span class="math-rm">${escHtml(raw)}</span>`;
-        return `<span class="math-rm">${_parseLatex(raw)}</span>`;
+        return `<span class="math-rm">${_parseLatex(raw, true)}</span>`;
       }
       if (cmd === "mathbf" || cmd === "boldsymbol" || cmd === "bm") {
-        return `<span class="math-bf">${readGroup()}</span>`;
+        const raw = readRawGroup();
+        return `<span class="math-bf">${_parseLatex(raw, true)}</span>`;
       }
       if (cmd === "mathcal" || cmd === "mathbb" || cmd === "mathit" || cmd === "mathsf") {
         return `<span class="math-rm">${readGroup()}</span>`;
@@ -2912,15 +2934,17 @@ function _parseLatex(src) {
         return `<span class="math-rm">${cmd}</span>`;
       }
       if (Object.prototype.hasOwnProperty.call(_TEX_SYMS, cmd)) {
-        return _TEX_ITALIC_GREEK.has(cmd)
-          ? `<span class="math-it">${_TEX_SYMS[cmd]}</span>`
-          : `<span class="math-rm">${_TEX_SYMS[cmd]}</span>`;
+        if (!upright && Object.prototype.hasOwnProperty.call(_TEX_MATH_ITALIC_GREEK, cmd)) {
+          return _TEX_MATH_ITALIC_GREEK[cmd];
+        }
+        return `<span class="math-rm">${_TEX_SYMS[cmd]}</span>`;
       }
       return `<span class="math-rm">${escHtml(cmd)}</span>`;
     }
     i++;
     if (ch === "&") return "&emsp;";
     if (/[0-9.,:;()[\]=+\-/*<>|!]/.test(ch)) return `<span class="math-rm">${escHtml(ch)}</span>`;
+    if (!upright && /[A-Za-z]/.test(ch)) return _toMathItalicChar(ch);
     return escHtml(ch);
   }
 
@@ -2957,15 +2981,30 @@ function _parseLatex(src) {
   return parseSeq(null);
 }
 
+function _renderKatexOrFallback(tex, displayMode) {
+  const clean = String(tex || "").trim();
+  if (typeof window !== "undefined" && window.katex && typeof window.katex.renderToString === "function") {
+    try {
+      return window.katex.renderToString(clean, {
+        displayMode: Boolean(displayMode),
+        throwOnError: false,
+        strict: false,
+        trust: false,
+      });
+    } catch (_) { /* fall through to offline renderer */ }
+  }
+  return _parseLatex(clean);
+}
+
 function renderLatexPretty(tex) {
-  return _parseLatex(String(tex || "").trim());
+  return _renderKatexOrFallback(tex, false);
 }
 
 function renderMathBlock(tex) {
   let raw = String(tex || "").trim();
   let tagText = "";
   raw = raw.replace(/\\tag\{([^{}]+)\}/g, (_, t) => { tagText = t.trim(); return ""; }).trim();
-  const eqHtml = _parseLatex(raw);
+  const eqHtml = _renderKatexOrFallback(raw, true);
   const tagHtml = tagText ? `<div class="math-tag">(${escHtml(tagText)})</div>` : "";
   return `<div class="math-block"><div class="math-block-eq">${eqHtml}</div>${tagHtml}</div>`;
 }

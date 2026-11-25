@@ -21,13 +21,13 @@ def _svg_wrap(width: int, height: int, title: str, subtitle: str, body: str) -> 
   <defs>
     <style>
       .bg {{ fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; rx: 14; }}
-      .title {{ font: 700 17px "Noto Sans", "Noto Sans JP", "Hiragino Sans", sans-serif; fill: #0f172a; }}
-      .sub {{ font: 400 12px "Noto Sans", "Noto Sans JP", "Hiragino Sans", sans-serif; fill: #475569; }}
-      .box-t {{ font: 700 13px "Noto Sans", "Noto Sans JP", "Hiragino Sans", sans-serif; fill: #0f172a; }}
-      .box-s {{ font: 400 11px "Noto Sans", "Noto Sans JP", "Hiragino Sans", sans-serif; fill: #334155; }}
-      .mono {{ font: 600 11px "Source Code Pro", ui-monospace, SFMono-Regular, Menlo, monospace; fill: #0f172a; }}
-      .lbl {{ font: 600 11px "Noto Sans", "Noto Sans JP", "Hiragino Sans", sans-serif; fill: #1e293b; }}
-      .badge {{ font: 700 10px "Source Code Pro", ui-monospace, SFMono-Regular, Menlo, monospace; fill: #ffffff; }}
+      .title {{ font: 700 17px "IBM Plex Sans", "IBM Plex Sans JP", "Hiragino Sans", sans-serif; fill: #0f172a; }}
+      .sub {{ font: 400 12px "IBM Plex Sans", "IBM Plex Sans JP", "Hiragino Sans", sans-serif; fill: #475569; }}
+      .box-t {{ font: 700 13px "IBM Plex Sans", "IBM Plex Sans JP", "Hiragino Sans", sans-serif; fill: #0f172a; }}
+      .box-s {{ font: 400 11px "IBM Plex Sans", "IBM Plex Sans JP", "Hiragino Sans", sans-serif; fill: #334155; }}
+      .mono {{ font: 600 11px "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace; fill: #0f172a; }}
+      .lbl {{ font: 600 11px "IBM Plex Sans", "IBM Plex Sans JP", "Hiragino Sans", sans-serif; fill: #1e293b; }}
+      .badge {{ font: 700 10px "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace; fill: #ffffff; }}
     </style>
     <marker id="arr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="#334155"/>
@@ -78,7 +78,7 @@ def build_fig01_overview() -> str:
         # Middle Left: Embedded CRM
         _card(24, 194, 260, 134, "#eff6ff", "#2563eb", "2. Embedded Cloud-Resolving Model", [
             "1:1 Superparameterization (2D/3D CRM)",
-            "Cumulus-free explicit convection (dx=4 km)",
+            "Cumulus-free explicit convection (crm_dx)",
             "Selectable Microphysics: 1M / 2M / 6-Class",
             "MYNN 2.5 PBL + 3D Smagorinsky SGS",
             "CRM Lightning Flash & LNOx Emission",
@@ -162,7 +162,7 @@ def build_fig02_grid() -> str:
         '  <text class="lbl" x="189" y="211" text-anchor="middle">Scalar center (rho, theta_m, q)</text>',
         # Zoom arrow into CRM curtain
         '  <line x1="189" y1="258" x2="189" y2="284" stroke="#2563eb" stroke-width="2" marker-end="url(#arr-blue)"/>',
-        '  <text class="lbl" x="198" y="275">Embedded CRM (nx x ny cols, dx = 4 km)</text>',
+        '  <text class="lbl" x="198" y="275">Embedded CRM (nx x ny cols, configurable crm_dx)</text>',
         # CRM columns + MAML 1:1 surface boxes
         '  <rect x="46" y="290" width="346" height="44" fill="#dbeafe" stroke="#2563eb" stroke-width="1.4"/>',
         *[f'  <line x1="{46 + i * 43.25:.1f}" y1="290" x2="{46 + i * 43.25:.1f}" y2="334" stroke="#60a5fa" stroke-width="1"/>' for i in range(1, 8)],

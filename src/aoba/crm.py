@@ -24,7 +24,7 @@ References
   Yamazaki & Miura (2024, J. Adv. Model. Earth Syst., 16, e2023MS004133):
   3D CRM formulation and large-scale Superparameterization tendency coupling.
 
-AOBA Formulation Reference: Sec. 8.2, Eqs. (8.1)-(8.4) (Embedded 3D Nonhydrostatic RK3-HEVI CRM & Zalesak FCT).
+AOBA Formulation Reference: Sec. 8.1 & 8.3, Eqs. (8.1)-(8.3) (Embedded Nonhydrostatic RK3-HEVI CRM & Standalone RCE).
 """
 
 from __future__ import annotations

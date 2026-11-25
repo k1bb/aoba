@@ -29,7 +29,7 @@ References
 - Richter, Sassi, & Garcia (2010, J. Atmos. Sci., 67, 136-156, Sec. 2, Eqs. 1-10):
   Unified flow-dependent frontal + convective non-orographic GWD in WACCM.
 
-AOBA Formulation Reference: Sec. 8.3, Eqs. (8.6)-(8.7) (Map-Free Frontal & Convective Non-Orographic GWD).
+AOBA Formulation Reference: Sec. 8.5, Eqs. (8.10)-(8.12) (Map-Free Frontal & Convective Non-Orographic GWD).
 """
 
 from __future__ import annotations
@@ -195,7 +195,7 @@ def _propagate_spectral_batched(
     return torch.clamp(du_dt, min=-NGWD_TEND_MAX, max=NGWD_TEND_MAX)
 
 
-# AOBA Formulation Eqs. (8.6)-(8.7)
+# AOBA Formulation Eqs. (8.10)-(8.12)
 def compute_nonorographic_gwd(
     mesh: SCVTMesh,
     rho_d: torch.Tensor,

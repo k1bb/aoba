@@ -39,7 +39,7 @@ with zero external PFT, soil-texture, or albedo lookup maps:
      & SCALE-RM (2025, Sec. 8.6 Eqs. 8.328-8.358):
      Slab ocean mixed layer with snowfall fusion cooling and fractional-lead sea ice `f_i`.
 
-AOBA Formulation Reference: Sec. 7.3, Eqs. (7.7)-(7.10) (3-Source Energy Balance, Snow/SNICAR & 5-Layer Soil).
+AOBA Formulation Reference: Sec. 7.6 Eqs. (7.30)-(7.36) & Sec. 9.2 Eq. (9.1) (3-Source Energy Balance, Snow/SNICAR, 5-Layer Soil & Sea Ice).
 """
 
 from __future__ import annotations

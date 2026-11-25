@@ -15,7 +15,7 @@ References
 - Wing et al. (2018, Geosci. Model Dev., 11, 793-813, Eqs. 2-5):
   Analytic tropical moist hydrostatic sounding for RCEMIP initialization.
 
-AOBA Formulation Reference: Sec. 3.2-3.3, Eqs. (3.1)-(3.5) (Compressible EOS, Mixed-Phase & Saturation Adjustment).
+AOBA Formulation Reference: Sec. 3.1-3.3, Eqs. (3.1)-(3.8) (Compressible EOS, Mixed-Phase, Saturation Adjustment & RCEMIP).
 """
 
 from __future__ import annotations
@@ -104,7 +104,7 @@ def qsat_mixed(temp: torch.Tensor, pres: torch.Tensor) -> tuple[torch.Tensor, to
     return qsat, dqsat_dT
 
 
-# AOBA Formulation Eqs. (3.1)-(3.2)
+# AOBA Formulation Eqs. (3.1)-(3.3)
 def diagnose_pressure_temperature(
     rho_d: torch.Tensor,
     theta_m: torch.Tensor,
@@ -126,7 +126,7 @@ def diagnose_pressure_temperature(
     return pres, exner, temp
 
 
-# AOBA Formulation Eqs. (3.4)-(3.5)
+# AOBA Formulation Eqs. (3.4)-(3.8)
 def saturation_adjustment(
     temp_init: torch.Tensor,
     pres: torch.Tensor,

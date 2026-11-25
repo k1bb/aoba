@@ -23,7 +23,7 @@ Physical Parameterizations & References
      (zero Forward Euler, unconditionally positivity- and ratio-bounded) and archives snowfall
      `d18o_snow_permil` & `dd_snow_permil` for direct proxy comparison with ice cores.
 
-AOBA Formulation Reference: Sec. 10.6, Eqs. (10.12)-(10.16) (Prognostic 3D H2^18O/HDO, Craig-Gordon & Rayleigh).
+AOBA Formulation Reference: Sec. 10.7, Eqs. (10.9)-(10.11) (Prognostic 3D H2^18O/HDO, Craig-Gordon & Rayleigh).
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ class WaterIsotopeState:
     snow_iso_weight: torch.Tensor      # [N_cells] cumulative snowfall mass weight [kg m^-2]
 
 
-# AOBA Formulation Eqs. (10.13)-(10.14)
+# AOBA Formulation Eqs. (10.9)-(10.10)
 def equilibrium_fractionation_factors(
     temp_k: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -105,7 +105,7 @@ def init_water_isotope_state(q_v: torch.Tensor) -> WaterIsotopeState:
     )
 
 
-# AOBA Formulation Eqs. (10.12), (10.15)-(10.16)
+# AOBA Formulation Eqs. (10.10)-(10.11)
 def step_water_isotopes(
     iso: WaterIsotopeState,
     q_v: torch.Tensor,            # [Nz, N_cells] updated atmospheric vapor [kg kg^-1]

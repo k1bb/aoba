@@ -17,7 +17,7 @@ and a 5-category Ice Thickness Distribution (ITD) on the orthogonal SCVT Voronoi
    - Mechanical ridging transfers converging excess area (`sum(a_cat) > 1`) from thin to thick
      categories while strictly conserving total ice volume (`sum(v_cat) * rho_ice == m_seaice`).
 
-AOBA Formulation Reference: Sec. 9.6, Eq. (9.12) (5-Category EVP-ITD Dynamic Sea Ice).
+AOBA Formulation Reference: Sec. 9.7, Eqs. (9.11)-(9.12) (5-Category EVP-ITD Dynamic Sea Ice).
 """
 
 from __future__ import annotations

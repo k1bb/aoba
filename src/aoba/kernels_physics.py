@@ -2166,8 +2166,7 @@ kernel void two_leaf_gas_exchange_col(
         float j_4 = (b4 - sqrt(max(b4 * b4 - 4.0f * THETA_NRH * ip3 * jm4, 0.0f))) / (2.0f * THETA_NRH);
         float sig4 = 1.0f / (1.0f + exp(-0.35f * ((tl - T_FREEZE) - 12.0f)));
         float al4 = 0.20f * (1.0f - PHI_LEAK_C4) * j_4 * sig4;
-        float b_cj4 = vc4 + al4;
-        float acj4 = (b_cj4 - sqrt(max(b_cj4 * b_cj4 - 4.0f * 0.85f * vc4 * al4, 0.0f))) / (2.0f * 0.85f);
+        float acj4 = min(vc4, al4);
         float rd4 = r25_4 * fr;
 
         float molar_vol = R_GAS * tl / p_s;
@@ -2194,16 +2193,14 @@ kernel void two_leaf_gas_exchange_col(
             float ci3 = chi3 * cs_pa;
             float ac3 = vc3 * max((ci3 - gamma3) / (ci3 + km3), 0.0f);
             float aj3 = 0.25f * j_3 * max((ci3 - gamma3) / (ci3 + 2.0f * gamma3), 0.0f);
-            float b_cj3 = ac3 + aj3;
-            float gpp3 = (b_cj3 - sqrt(max(b_cj3 * b_cj3 - 4.0f * 0.98f * ac3 * aj3, 0.0f))) / (2.0f * 0.98f);
+            float gpp3 = min(ac3, aj3);
             float an3_pos = max(gpp3 - rd3, 0.0f);
             float gsw3_mol = 1.6f * (an3_pos * 1.0e-6f) / max(cs_mol * (1.0f - chi3), 1.0e-6f);
 
             float chi4 = clamp(xi4 / (xi4 + sqrt_ds), 0.05f, 0.92f);
             float cm4 = chi4 * cs_pa;
             float ap4 = (1.0f - PHI_LEAK_C4) * vp4 * cm4 / max(cm4 + kp4, 0.5f);
-            float b_p4 = acj4 + ap4;
-            float gpp4 = (b_p4 - sqrt(max(b_p4 * b_p4 - 4.0f * 0.85f * acj4 * ap4, 0.0f))) / (2.0f * 0.85f);
+            float gpp4 = min(acj4, ap4);
             float an4_pos = max(gpp4 - rd4, 0.0f);
             float gsw4_mol = 1.6f * (an4_pos * 1.0e-6f) / max(cs_mol * (1.0f - chi4), 1.0e-6f);
 

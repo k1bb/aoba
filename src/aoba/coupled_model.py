@@ -14,7 +14,7 @@ orbital insolation `S_0`, and well-mixed `CO2` / `O2`):
 9. Zero-Q-Flux 1.5-Layer Wind-Driven Voronoi Ekman Ocean & Fractional-Lead Sea Ice (`ocean_ekman.py`)
 10. Emergent 30-Class Köppen-Geiger Climate Diagnostics (`koppen.py`)
 
-AOBA Formulation Reference: Sec. 8.4 Eq. (8.8) & Sec. 9.4 Eq. (9.8) (Unified SP/CRM & Current-Relative Coupling).
+AOBA Formulation Reference: Sec. 1.1 Eqs. (1.1)-(1.4), Sec. 8.6 Eq. (8.13) & Sec. 9.5 Eq. (9.8) (Coupled Time-Stepping, SP/GCRM & Current-Relative Coupling).
 """
 
 from __future__ import annotations
@@ -977,7 +977,7 @@ def _coupled_post_crm_accum_core(
     )
 
 
-# AOBA Formulation Eqs. (8.8), (9.8)
+# AOBA Formulation Eqs. (8.13), (9.8)
 def step_aoba_model(
     model: AOBAState,
     compute_diagnostics: bool = True,

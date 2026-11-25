@@ -21,7 +21,7 @@ hydrology/river discharge:
    - Feeds directly into surface albedo/evaporation (inundated open water) and anoxic wetland CH4
      emissions (`trace_gas_cycle.py`).
 
-AOBA Formulation Reference: Sec. 7.4, Eqs. (7.11)-(7.12) (MAML Subgrid Orography & Dynamic Wetlands/Lakes).
+AOBA Formulation Reference: Sec. 7.7, Eqs. (7.37)-(7.38) (MAML Subgrid Orography & Dynamic Wetlands/Lakes).
 """
 
 from __future__ import annotations

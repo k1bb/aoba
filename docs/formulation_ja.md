@@ -2,879 +2,1795 @@
 
 ## 目次
 
-1. [モデル全体像・基礎物理定数・天文学的軌道日射幾何](#1-モデル全体像基礎物理定数天文学的軌道日射幾何)
-2. [空間格子：SCVT ボロノイ親格子・埋め込み CRM・Charney–Phillips 鉛直層](#2-空間格子scvt-ボロノイ親格子埋め込み-crmcharneyphillips-鉛直層)
+1. [モデル構成・基礎物理定数・暦法・軌道日射幾何](#1-モデル構成基礎物理定数暦法軌道日射幾何)
+2. [空間離散化：SCVT ボロノイ親格子・埋め込み CRM・鉛直 STF 座標](#2-空間離散化scvt-ボロノイ親格子埋め込み-crm鉛直-stf-座標)
 3. [湿潤圧縮性熱力学と混合相飽和調節](#3-湿潤圧縮性熱力学と混合相飽和調節)
-4. [大気放射伝達 — 選択制スキーム (`rad_scheme`) と 3D TICA](#4-大気放射伝達--選択制スキーム-rad_scheme-と-3d-tica)
-5. [雲微物理 — 選択制スキーム (`microphysics_scheme`) と落雷・$\mathrm{LNO}_x$](#5-雲微物理--選択制スキーム-microphysics_scheme-と落雷lno_x)
-6. [境界層乱流・粗度サブレイヤ (RSL)・3D SGS 混合](#6-境界層乱流粗度サブレイヤ-rsl3d-sgs-混合)
-7. [陸面過程・MAML 水文・自律 EEO 生態系・陸域 C/N・山火事](#7-陸面過程maml-水文自律-eeo-生態系陸域-cn山火事)
-8. [全球非静力学 SCVT 力学・埋め込み CRM・重力波抵抗](#8-全球非静力学-scvt-力学埋め込み-crm重力波抵抗)
-9. [海洋循環 (`ocean_mode`)・独立高解像海洋・波浪・海氷・海洋 BGC](#9-海洋循環-ocean_mode独立高解像海洋波浪海氷海洋-bgc)
-10. [大気化学 (`o3_mode`)・エアロゾル・炭素循環 (`co2_mode`)・水安定同位体](#10-大気化学-o3_modeエアロゾル炭素循環-co2_mode水安定同位体)
-11. [動的氷床モデル・ミランコビッチ古気候・汎用惑星プリセット](#11-動的氷床モデルミランコビッチ古気候汎用惑星プリセット)
-12. [一元 307 パラメータ TOML レジストリ・Zarr v3 出力・AOBA Studio](#12-一元-307-パラメータ-toml-レジストリzarr-v3-出力aoba-studio)
+4. [大気放射伝達：選択制スキーム (`rad_scheme`) と 3D TICA](#4-大気放射伝達選択制スキーム-rad_scheme-と-3d-tica)
+5. [雲微物理：選択制スキーム (`microphysics_scheme`) と非誘導帯電落雷・$\mathrm{LNO}_x$](#5-雲微物理選択制スキーム-microphysics_scheme-と非誘導帯電落雷lno_x)
+6. [境界層乱流・粗度サブレイヤ (RSL)・MYNN 2.5・3D Smagorinsky–Lilly SGS](#6-境界層乱流粗度サブレイヤ-rslmynn-253d-smagorinskylilly-sgs)
+7. [陸面過程・自律 2 葉 $\mathrm{C}_3/\mathrm{C}_4$ EEO 生態系・土壌水文・陸域 C/N・山火事・河川流路](#7-陸面過程自律-2-葉-c_3c_4-eeo-生態系土壌水文陸域-cn山火事河川流路)
+8. [全球非静力学 SCVT 力学・埋め込み CRM・重力波抵抗・SP 結合](#8-全球非静力学-scvt-力学埋め込み-crm重力波抵抗sp-結合)
+9. [海洋循環 (`ocean_mode`)・独立高解像海洋・波浪・EVP–ITD 海氷・FlexPFT 海洋 BGC](#9-海洋循環-ocean_mode独立高解像海洋波浪evpitd-海氷flexpft-海洋-bgc)
+10. [大気化学 (`o3_mode`)・自然/火山エアロゾル・炭素/微量気体循環 (`co2_mode`)・水安定同位体](#10-大気化学-o3_mode自然火山エアロゾル炭素微量気体循環-co2_mode水安定同位体)
+11. [動的氷床モデル・ミランコビッチ軌道進化・汎用惑星プリセット](#11-動的氷床モデルミランコビッチ軌道進化汎用惑星プリセット)
+12. [一元 307 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio](#12-一元-307-パラメータ-toml-レジストリ診断köppengeiger--cmip7zarr-v3aoba-studio)
 
 ---
 
-## 1. モデル全体像・基礎物理定数・天文学的軌道日射幾何
+## 1. モデル構成・基礎物理定数・暦法・軌道日射幾何
 
-### 1.1 モデル構成と設計原則
+### 1.1 モデル構成・設計原則・時間積分シーケンス (`src/aoba/coupled_model.py`)
 
-**地球システムモデル (Earth System Model: ESM)** は、太陽からの日射・大気の大循環・雲と降水・海流と深層循環・海氷・陸上植物・土壌・大気化学・大陸氷床が互いに影響し合いながら数十年〜数万年にわたりどう変化するかを予測する数値結合モデルである。従来の気候モデルの多くは、現代地球の植生分布図（PFT マップ）、砂漠ダスト発生源マップ、海洋熱フラックス補正図、経験的な積雲パラメタリゼーションなどに大きく依存してきた。これらは現代気候の再現には便利だが、氷期・白亜紀・全球凍結（スノーボールアース）や系外惑星のように気候が大きく変わる実験では、現代の地図が物理的な応答を歪めてしまう。
+AOBA は、圧縮性非静力学大気力学、多波長大気放射伝達、選択制雲微物理、境界層乱流・粗度サブレイヤ (RSL)、多層凍土・リチャーズ陸面水文、自律生態進化最適性 (EEO) $\mathrm{C}_3/\mathrm{C}_4$ 陸域生態系、陸域炭素・窒素循環・永久凍土・SPITFIRE 山火事、Priority-Flood 河川流路、選択制海洋大循環 (1.5 層または 3D SCVT OGCM)、予報表面波浪、5 カテゴリ EVP–ITD 力学海氷、FlexPFT 海洋生物地球化学・溶存酸素・OMZ、大気オゾン光化学、自然・成層圏火山エアロゾル、閉ループ $\mathrm{CO}_2/\mathrm{CH}_4/\mathrm{N}_2\mathrm{O}$・ケイ酸塩風化、3D 安定水同位体 ($\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$) および動的 SIA 氷床を単一のコードベースで結合した地球システムモデル (ESM) である。
 
-AOBA は現代気候・古気候・理想化惑星実験を単一のコードベースで扱うため、以下の 3 原則に基づいて設計されている。
-1. **地図不要の普遍物理**：地理的に与えるのは地形・海底地形・初期氷床幾何（`Earth2014`）のみである。熱帯雨林・サバンナ・砂漠・ダスト嵐・積乱雲・雷・山火事・海流・植物プランクトン・海洋波浪は、すべて普遍的な物理・生態最適則から自律的に創発する。
-2. **積雲パラメタリゼーション不要の陽的対流**：各全球格子の中に水平格子幅 $\Delta x = 4\ \mathrm{km}$ の非静力学雲解像モデル (CRM) を埋め込み、親格子と全く同じ圧縮性 Euler 方程式で対流を直接解像する（`enable_superparam = false` で全球単独雲解像モデルへシームレスに切替可能）。
-3. **目的に応じた選択制スキーム**：放射（`rad_scheme`）・雲微物理（`microphysics_scheme`）・海洋（`ocean_mode`）・オゾン（`o3_mode`）・$\mathrm{CO}_2$（`co2_mode`）・惑星プリセット（`planet_preset`）を [`config/aoba_default.toml`](../config/aoba_default.toml) や AOBA Studio から簡単に選択できる。
+空間固定的な現代地球マップ（PFT 植生分布図、地域別ダスト発生源マップ、海洋熱フラックス補正、緯度依存非地形性重力波源テーブル）および積雲パラメタリゼーションを排し、外部地理境界条件は地表面標高・海底地形・初期氷床幾何（`Earth2014`）および選択時のオゾン気候値のみに限定される。全球親格子と埋め込み雲解像モデル (CRM; 水平格子間隔 `crm_dx` は任意設定、既定 $4\ \mathrm{km}$) は同一のフラックス形式圧縮性非静力学 Euler 方程式を共有し、`enable_superparam = true` の超パラメタリゼーション (SP) と `enable_superparam = false` の単独全球雲解像実行を同一離散化で切り替える。主要物理スキーム（`rad_scheme`, `microphysics_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`）は [`config/aoba_default.toml`](../config/aoba_default.toml) から一元選択される。
 
 ![図 1.1: AOBA 統合地球システムモデル全体構造とマルチスケール結合](assets/fig_01_aoba_overview.svg)
 
+親時間ステップ $\Delta t_{\mathrm{host}}$（既定 $720\ \mathrm{s}$）ごとの結合時間積分 `step_aoba_model` は以下の順序で実行される：
+1. 軌道時刻・日射・南中判定：`AobaCalendar` により季節時刻 $t_{\mathrm{seas}}$ と日周時刻 $t_{\mathrm{diur}}$ を算出し、ミランコビッチ軌道要素・11 年太陽周期・潮汐固定日射を評価する。
+2. サブカラム気象抽出：CRM 最下層風速・気温・水蒸気および全層プロファイルを全サブカラム数 $M_{\mathrm{sub}} = N_c N_y N_x$ へ展開し、地表面気圧 $p_{\mathrm{sfc}}$ および地表面参照高度 $z_{\mathrm{ref,rel}}$ を診断する。
+3. 地表面アルベドおよび間引き独立カラム放射（`rad_stride` ステップごと、既定 5 ステップ $= 3600\ \mathrm{s}$）：2 帯域直達・散乱アルベド、複合海洋・海氷放射温度 $T_{\mathrm{rad,ocn}}$、2M/6C 雲有効半径、3D TICA シフト、エアロゾル・火山光学厚およびオゾン混合比を入力し選択制放射スキームを実行する。
+4. MAML 地表面および海洋・海氷更新：任意で MAML サブグリッド地形ダウンスケーリングおよび海流相対風速を適用したうえで `step_surface` を積分し、湿地蒸発補正・波浪/海塩飛沫フラックスを加算する。続いて `step_ogcm_voronoi`（独立高解像海洋結合・河川流路を含む）または `step_ekman_ocean_voronoi` を進め、海洋増分 $(\Delta T_{\mathrm{ml}}, \Delta m_{\mathrm{ice}}, \Delta\mathrm{SWE}_{\mathrm{ice}})$ を凍結エンタルピー保存条件付きで地表面へ反映する。
+5. 山岳および非地形性重力波抵抗：親セル風速を再構成し、Lott–Miller 山岳抵抗および任意で前線・対流起源非地形性重力波抵抗（前ステップの $Q_{\mathrm{conv}}$ 駆動）を評価してエッジ傾向 `du_oro_edge` へ射影する。
+6. 親格子 SCVT RK3–HEVI 力学およびバッチ Zalesak FCT 移流：CFL 判定で決定した $n_{\mathrm{hdyn}}$ サブステップで `step_scvt_rk3_hevi` を積分し、時間平均質量フラックスを用いて全スカラー・トレーサ（$q_n, q_p, q_{\mathrm{dust}}, q_{\mathrm{ss}}, q_{\mathrm{so4}}, q_{\mathrm{bc}}, q_{\mathrm{oc}}, \chi_{\mathrm{O_3}}, \chi_{\mathrm{CO_2}}, q_v^{18}, q_v^{\mathrm{D}}$）を単一の `fct_advect_scvt_batch` で移流する。力学前後の差分から大規模強制傾向 $(\partial\theta_m/\partial t)_{\mathrm{LS}}, (\partial q_n/\partial t)_{\mathrm{LS}}$ を得る。
+7. 1 対 1 超パラメタリゼーション結合（`enable_superparam = true` 時）：CRM 密度を親格子平均に整合させたのち、`step_crm_physics_and_dynamics`（RK3–HEVI + 3D SGS + MYNN 2.5 + 選択制雲微物理）を積分し、質量加重平均で親格子状態量とエッジ風速へ還元して対流加熱率 $Q_{\mathrm{conv}}$ を診断する。
+8. 化学・物質循環・生態系順化：CRM 発雷・$\mathrm{LNO}_x$、鉱物ダスト、Priestley–Taylor 潜在蒸発散量 $\mathrm{PET}$、南中時 EEO 酵素順化、陸域 C/N・SPITFIRE 山火事、自然エアロゾル・BVOC SOA、SNICAR 積雪暗化、ケイ酸塩風化、海洋 BGC 大気沈着、予報 $\mathrm{CH}_4/\mathrm{N}_2\mathrm{O}$、成層圏火山エアロゾル、予報 $\mathrm{CO}_2$、予報 3D $\mathrm{O}_3$、3D 水安定同位体、日次 LAI・根圏・樹高更新および月次 Köppen–Geiger 積算を実行する。
+9. 年次動的氷床更新および鉛直再補間：年次境界で Glen SIA 氷床およびアイソスタシーを更新し、地形変化が $0.05\ \mathrm{m}$ を超えた場合に静水圧測高外挿による STF 鉛直格子再構築を行う。
+
+上記手順 2・3・8 で評価される地表面静水圧外挿気圧 $p_{\mathrm{sfc}}$、植生樹冠高さ $h_c$ によるゼロ面変位を考慮した参照高度 $z_{\mathrm{ref,rel}}$、開水面と海氷を放射平衡で合成した海洋表面有効放射温度 $T_{\mathrm{rad,ocn}}$、および陸面水収支・植生最適化に用いる Priestley–Taylor (1972) 潜在蒸発散量 $\mathrm{PET}$ は次式で与えられる：
+
+$$
+p_{\mathrm{sfc}} = p_0 + g\,\rho_{d,0}(1 + q_{v,0})(z_{c,0} - z_{w,0}) \tag{1.1}
+$$
+
+$$
+z_{\mathrm{ref,rel}} = \max\!\big(z_{\mathrm{rel},0} - 0.65\,h_c,\ 5.0\ \mathrm{m}\big) \tag{1.2}
+$$
+
+$$
+T_{\mathrm{rad,ocn}} = \Big[(1 - f_{\mathrm{ice}})T_{\mathrm{ml}}^4 + f_{\mathrm{ice}}T_{\mathrm{ice}}^4\Big]^{1/4} \tag{1.3}
+$$
+
+$$
+\mathrm{PET} = 1.26\,\frac{s}{s + \gamma_{\mathrm{psy}}}\,\frac{R_n^+}{L_{v0}} \tag{1.4}
+$$
+
+ここで $p_0, \rho_{d,0}, q_{v,0}$ は大気最下層中心（高度 $z_{c,0}$、地表界面 $z_{w,0}$、地上高度 $z_{\mathrm{rel},0} = z_{c,0} - z_{w,0}$）の気圧・乾燥空気密度・水蒸気混合比、$f_{\mathrm{ice}}, T_{\mathrm{ml}}, T_{\mathrm{ice}}$ は海氷面積率・海洋混合層水温・海氷表面温度、$s = de_{sw}/dT$ は飽和水蒸気圧曲線の温度勾配、$\gamma_{\mathrm{psy}} = c_{pd} p_{\mathrm{sfc}} / (\varepsilon_w L_{v0})$ は乾湿計定数、$R_n^+ = \max(R_n, 0)$ は地表正味放射エネルギーである。式 (1.1) は最下層半分厚の静水圧荷重を加えて正確な地表気圧を復元し、式 (1.3) は Stefan–Boltzmann 則の 4 乗平均により開水面と海氷の混在セルからの上向き長波放射を厳密に保存する。
+
 ### 1.2 基礎物理定数 (`src/aoba/constants.py`)
 
-全モジュールが参照する基礎物理定数は `src/aoba/constants.py` および TOML の `[constants]` セクションに一元化されており、惑星半径・重力・自転速度・1 日の長さを変更しても全物理過程が自動的に整合する。
+全モジュールが参照する基礎定数は `src/aoba/constants.py` および TOML `[constants]` に集約され、惑星プリセット適用時に `recompute_derived_constants()` が従属定数（$c_{vd}, \kappa_d, \gamma_d, \varepsilon_w, R_v/R_d, \delta_v, L_{s0}$）を自動再計算する。
 
-| 記号 | 標準値 | 単位 | 物理的意味 |
+| 記号 | 標準値 | 単位 | 物理的定義 |
 | :--- | :--- | :--- | :--- |
 | $R_E$ | $6.371 \times 10^6$ | $\mathrm{m}$ | 惑星平均半径 (`earth_radius`) |
 | $g$ | $9.79764$ | $\mathrm{m\ s^{-2}}$ | 表面重力加速度 (`gravity`) |
-| $\Omega_E$ | $7.292115 \times 10^{-5}$ | $\mathrm{rad\ s^{-1}}$ | 地球基準自転角速度 (`omega_earth`) |
-| $R_d, c_{pd}$ | $287.04,\ 1004.64$ | $\mathrm{J\ kg^{-1}\ K^{-1}}$ | 乾燥空気の気体定数・定圧比熱 |
-| $R_v, c_{pv}$ | $461.5,\ 1846.0$ | $\mathrm{J\ kg^{-1}\ K^{-1}}$ | 水蒸気の気体定数・定圧比熱 |
-| $p_0$ | $1.0 \times 10^5$ | $\mathrm{Pa}$ | 温位計算の基準気圧 ($1000\ \mathrm{hPa}$) |
-| $L_{v0}, L_{f0}$ | $2.501 \times 10^6,\ 3.337 \times 10^5$ | $\mathrm{J\ kg^{-1}}$ | $273.15\ \mathrm{K}$ における蒸発潜熱・融解潜熱 |
-| $\sigma$ | $5.670374419 \times 10^{-8}$ | $\mathrm{W\ m^{-2}\ K^{-4}}$ | シュテファン・ボルツマン定数 |
-| $\rho_{\mathrm{sw}}, c_{p,\mathrm{sw}}$ | $1025.0,\ 3990.0$ | $\mathrm{kg\ m^{-3}},\ \mathrm{J\ kg^{-1}\ K^{-1}}$ | 海水の基準密度・定圧比熱 |
-| $T_{f,\mathrm{ocn}}$ | $271.35$ | $\mathrm{K}$ | 海水の凝固点 ($-1.8^\circ\mathrm{C}$) |
+| $\Omega_E$ | $7.292115 \times 10^{-5}$ | $\mathrm{rad\ s^{-1}}$ | 基準恒星自転角速度 (`omega_earth`) |
+| $T_{\mathrm{day}}, N_{\mathrm{yr}}$ | $86400.0,\ 365.2425$ | $\mathrm{s},\ \mathrm{d}$ | 1 太陽日長および回帰年日数 |
+| $S_0, \varepsilon, e, \varpi$ | $1361.0,\ 23.44^\circ,\ 0.0167,\ 283.0^\circ$ | $\mathrm{W\ m^{-2}}, ^\circ, -, ^\circ$ | 基準太陽定数・黄道傾斜角・離心率・近日点黄経 |
+| $R_d, c_{pd}, c_{vd}$ | $287.04,\ 1004.64,\ 717.60$ | $\mathrm{J\ kg^{-1}\ K^{-1}}$ | 乾燥空気の気体定数・定圧比熱・定積比熱 |
+| $R_v, c_{pv}$ | $461.50,\ 1846.0$ | $\mathrm{J\ kg^{-1}\ K^{-1}}$ | 水蒸気の気体定数・定圧比熱 |
+| $\varepsilon_w, \delta_v$ | $0.62197,\ 0.60779$ | $-$ | $R_d/R_v$ および仮温度係数 $R_v/R_d - 1$ |
+| $p_0, T_{\mathrm{freeze}}, T_0, e_0$ | $10^5,\ 273.15,\ 273.16,\ 611.2$ | $\mathrm{Pa},\ \mathrm{K},\ \mathrm{K},\ \mathrm{Pa}$ | 基準気圧・氷点・三重点温度・三重点飽和蒸気圧 |
+| $L_{v0}, L_{f0}, L_{s0}$ | $2.501\times 10^6,\ 3.337\times 10^5,\ 2.8347\times 10^6$ | $\mathrm{J\ kg^{-1}}$ | 蒸発潜熱・融解潜熱・昇華潜熱 |
+| $\sigma_{\mathrm{SB}}, R^*$ | $5.670374419\times 10^{-8},\ 8.314462618$ | $\mathrm{W\ m^{-2}\ K^{-4}},\ \mathrm{J\ mol^{-1}\ K^{-1}}$ | シュテファン・ボルツマン定数・普遍気体定数 |
+| $\kappa, X_{\mathrm{O}_2}$ | $0.40,\ 0.20946$ | $-,\ \mathrm{mol\ mol^{-1}}$ | カルマン定数・大気酸素体積混合比 |
+| $\rho_{\mathrm{sw}}, c_{p,\mathrm{sw}}, T_{f,\mathrm{ocn}}$ | $1025.0,\ 3990.0,\ 271.35$ | $\mathrm{kg\ m^{-3}},\ \mathrm{J\ kg^{-1}\ K^{-1}},\ \mathrm{K}$ | 海水基準密度・定圧比熱・凝固点 |
+| $\rho_{\mathrm{ice}}, k_{\mathrm{ice}}, k_{\mathrm{snow}}$ | $917.0,\ 2.034,\ 0.3096$ | $\mathrm{kg\ m^{-3}},\ \mathrm{W\ m^{-1}\ K^{-1}}$ | 海氷/氷床密度・海氷および積雪熱伝導率 |
 
-### 1.3 天文学的軌道要素・太陽天頂角・暦法 (`src/aoba/radiation.py`, `src/aoba/calendar.py`)
+### 1.3 暦法および軌道時刻写像 (`src/aoba/calendar.py`)
 
-気候システムのエネルギー源は太陽放射である。惑星は離心率 $e$ の楕円軌道を描き、自転軸が傾斜角（黄道傾斜角）$\varepsilon$ だけ傾いているため、季節に応じて太陽距離 $r$ と太陽赤緯 $\delta$ が変化する。春分点からの平均近点角 $M$ とケプラー方程式の展開から真黄経 $\lambda_s$ および大気上端入射フラックス $S_{\mathrm{TOA}}$ を求める：
-
-$$
-M = \frac{2\pi t_{\mathrm{seas}}}{P_{\mathrm{yr}}} - \varpi_{\mathrm{eq}}, \qquad \lambda_s = M + 2e\sin M + \frac{5}{4}e^2 \sin(2M) + \varpi_{\mathrm{eq}} \tag{1.1}
-$$
-
-$$
-\left(\frac{a}{r}\right)^2 = \left[\frac{1 + e\cos(\lambda_s - \varpi)}{1 - e^2}\right]^2, \qquad S_{\mathrm{TOA}} = S_0 \left(\frac{a}{r}\right)^2 \tag{1.2}
-$$
-
-太陽赤緯 $\delta$ と緯度 $\phi$・経度 $\lambda$・時角 $H$ における太陽天頂角余弦 $\mu_0 = \cos\theta_0$ は球面三角法により次式で与えられる：
+暦法は `gregorian`（負の紀元前暦年を含む先発グレゴリオ暦：4 で割り切れかつ 100 で割り切れないか 400 で割り切れる年を閏年 366 日とする）、`noleap`（一律 365 日）および `360_day`（$12\times 30 = 360$ 日）に対応する。経過時間 $t\ [\mathrm{s}]$ に対する日内端数 $f_{\mathrm{day}}$、10 進暦年 $Y_{\mathrm{dec}}$ および春分点基準の年端数 $f_{\mathrm{yr}}$ は次式で定義される：
 
 $$
-\sin\delta = \sin\varepsilon \sin\lambda_s \tag{1.3}
+\begin{aligned}
+f_{\mathrm{day}} &= \frac{t \bmod T_{\mathrm{day}}}{T_{\mathrm{day}}}, \\
+Y_{\mathrm{dec}} &= Y + \frac{(\mathrm{doy} - 1) + f_{\mathrm{day}}}{N_{\mathrm{days}}(Y)}, \\
+f_{\mathrm{yr}} &= \frac{(\mathrm{doy} - 1 + f_{\mathrm{day}} - d_{\mathrm{VE}}) \bmod N_{\mathrm{days}}(Y)}{N_{\mathrm{days}}(Y)}
+\end{aligned} \tag{1.5}
+$$
+
+ここで $Y$ は暦年、$\mathrm{doy}$ は年初からの通日（1 始まり）、$N_{\mathrm{days}}(Y)$ は年日数、$d_{\mathrm{VE}}$ は春分点通日（`360_day` で 80、閏グレゴリオ年で 79、平年で 78）である。$f_{\mathrm{yr}}$ は暦日と太陽黄経の基準点（春分）を結合する無次元軌道位相を表す。`insolation_mode = "perpetual_date"` では指定日付の正午（$f_{\mathrm{day}} = 0.5$）に季節時刻を固定する。
+
+### 1.4 軌道日射幾何と太陽天頂角 (`src/aoba/radiation.py`, `src/aoba/coupled_model.py`)
+
+Berger (1978) および Davis et al. (2017) に基づき、春分点（真近点角 $\nu_0 = -\varpi$）における離心近点角 $E_0$ を起点として、季節端数 $f_{\mathrm{yr}}$ における平均近点角 $M$、離心率 $e$ に関する 3 次中心差展開による真近点角 $\nu$ および真太陽黄経 $\lambda_s$ を求める：
+
+$$
+\begin{aligned}
+E_0 &= 2\arctan\!\left(\sqrt{\frac{1-e}{1+e}}\tan\frac{-\varpi}{2}\right), \\
+M &= E_0 - e\sin E_0 + 2\pi f_{\mathrm{yr}}
+\end{aligned} \tag{1.6}
 $$
 
 $$
-\mu_0(\phi, \lambda, t) = \max\!\Big(0,\ \sin\phi\sin\delta + \cos\phi\cos\delta\cos H(\lambda, t)\Big) \tag{1.4}
+\begin{aligned}
+\nu &= M + \left(2e - \frac{1}{4}e^3\right)\sin M + \frac{5}{4}e^2\sin(2M) + \frac{13}{12}e^3\sin(3M), \\
+\lambda_s &= \nu + \varpi
+\end{aligned} \tag{1.7}
 $$
 
-`diurnal_cycle = false` とすると、`src/aoba/calendar.py` が式 (1.4) の代わりに 1 日の日照平均天頂角 $\bar{\mu}_0$ を解析的に与える。また暦法（`gregorian` / `noleap` / `360_day`）や日付固定日射（`perpetual_date`）も選択できる。
+ケプラー楕円軌道に伴う太陽距離逆二乗因子 $(a/r)^2$、大気上端入射フラックス $S_{\mathrm{TOA}}$ および太陽赤緯 $\delta$ は次式で与えられる：
+
+$$
+\begin{aligned}
+\left(\frac{a}{r}\right)^2 &= \left[\frac{1 + e\cos\nu}{1 - e^2}\right]^2, \\
+S_{\mathrm{TOA}} &= S_0\left(\frac{a}{r}\right)^2, \\
+\sin\delta &= \sin\varepsilon\sin\lambda_s
+\end{aligned} \tag{1.8}
+$$
+
+緯度 $\phi$・経度 $\lambda$ における地方時角 $H$（正午で $0$、東西対称に $[-\pi, \pi]$ へ折り返す）および瞬間太陽天頂角余弦 $\mu_0$（`diurnal_cycle = true`）は次式で評価する：
+
+$$
+\begin{aligned}
+H &= \operatorname{atan2}\!\Big(\sin(2\pi f_{\mathrm{day}} + \lambda - \pi),\ \cos(2\pi f_{\mathrm{day}} + \lambda - \pi)\Big), \\
+\mu_0(\phi, \lambda, t) &= \max\!\big(0,\ \sin\phi\sin\delta + \cos\phi\cos\delta\cos H\big)
+\end{aligned} \tag{1.9}
+$$
+
+日周変化を無効化した場合（`diurnal_cycle = false`）には、日出・日没の半日長時角 $h_0$（極昼で $\pi$、極夜で $0$）を用いて 24 時間平均の太陽天頂角余弦 $\bar{\mu}_0$ を解析積分で与える：
+
+$$
+\begin{aligned}
+h_0 &= \arccos\!\big(\operatorname{clamp}(-\tan\phi\tan\delta, -1, 1)\big), \\
+\bar{\mu}_0(\phi, t) &= \max\!\left(0,\ \frac{h_0\sin\phi\sin\delta + \cos\phi\cos\delta\sin h_0}{\pi}\right)
+\end{aligned} \tag{1.10}
+$$
 
 ---
 
-## 2. 空間格子：SCVT ボロノイ親格子・埋め込み CRM・Charney–Phillips 鉛直層
+## 2. 空間離散化：SCVT ボロノイ親格子・埋め込み CRM・鉛直 STF 座標
 
-### 2.1 水平・鉛直空間離散化の概要
+### 2.1 正二十面体 SCVT ボロノイ格子と Arakawa C-Grid 幾何 (`src/aoba/scvt_mesh.py`)
 
-通常の緯度・経度格子は北極・南極に向かって格子幅が極端に狭くなる「極特異点」を持ち、数値安定性のために時間刻みを非常に小さくしなければならない。AOBA では正二十面体を再帰的に分割して Lloyd 反復で均一化した**球面重心ボロノイ格子 (SCVT)** を採用する（分割レベル `glevel` $g = 0 \dots 6$ に対しセル数は $N_{\mathrm{cells}} = 10\cdot 4^g + 2$：G3 = 642, G4 = 2562, G5 = 10242）。セルはほぼ均一な六角形（と 12 個の五角形）で構成され、スカラー量をセル中心に、法線風速 $u_e$ を直交エッジ上に配置する Arakawa C-grid を採る。
+水平親格子には極特異点のない準一様球面重心ボロノイ格子 (Spherical Centroidal Voronoi Tessellation: SCVT; Ringler et al., 2008, 2010) を採用する。正二十面体を単位球面上で細分化レベル `glevel` $= g$ 回再帰分割し、Lloyd 反復（既定 10〜12 回）により母点を各ボロノイ多角形の球面重心へ収束させる。総セル数 $N_c$（12 個の五角形と $N_c - 12$ 個の六角形）、双対三角形数 $N_v$、エッジ数 $N_e$ および単位球面三角形 $(\mathbf{a}, \mathbf{b}, \mathbf{c})$ の厳密面積 $A_\triangle$（Eriksson の公式）は次式で与えられる：
 
-さらに各全球親セルの内部に水平解像度 $\Delta x = 4\ \mathrm{km}$ の**埋め込み雲解像モデル (CRM)**（`crm_nx` $\times$ `crm_ny` カラム）を配置し、各 CRM カラム直下に独立した陸面パッチを 1 対 1 で結合する（**MAML**: Multiple Atmosphere–Multiple Land）。鉛直方向は親格子・CRM 共通の **Charney–Phillips スタッガード格子**とし、鉛直流 $w$ を半レベル $z_{k+1/2}$ に、温位・密度・水平風を全レベル $z_k$ に置くことで鉛直方向の偽の振動モードを除去している。
+$$
+\begin{aligned}
+N_c &= 10\cdot 4^g + 2, \qquad N_v = 2N_c - 4, \qquad N_e = 3N_c - 6, \\
+A_\triangle(\mathbf{a},\mathbf{b},\mathbf{c}) &= 2\operatorname{atan2}\!\Big(|\mathbf{a}\cdot(\mathbf{b}\times\mathbf{c})|,\ \max\big(1 + \mathbf{a}\cdot\mathbf{b} + \mathbf{b}\cdot\mathbf{c} + \mathbf{c}\cdot\mathbf{a},\ 10^{-15}\big)\Big)
+\end{aligned} \tag{2.1}
+$$
+
+各エッジ $e$ は隣接セル $(c_0, c_1)$ と双対頂点 $(v_0, v_1)$ を結び、単位法線 $\mathbf{n}_e$（$c_0\to c_1$）と単位接線 $\mathbf{t}_e = \mathbf{r}_e\times\mathbf{n}_e$ が厳密に直交する。セル中心間の大円距離 $d_e$、ボロノイ辺長 $l_e$、およびエッジ菱形面積 $A_e$ は次式で定義される：
+
+$$
+\begin{aligned}
+d_e &= R_E\arccos(\mathbf{r}_{c_0}\cdot\mathbf{r}_{c_1}), \\
+l_e &= R_E\arccos(\mathbf{v}_0\cdot\mathbf{v}_1), \\
+A_e &= \frac{1}{2}\,d_e l_e
+\end{aligned} \tag{2.2}
+$$
+
+スカラー量および質量はセル中心に、法線風速 $u_e$ はエッジ中点に配置する直交 Arakawa C-grid を採る。超パラメタリゼーション構成では各親セル内に任意の水平格子間隔 $\Delta x = \Delta y$（`crm_dx`、既定 $4\ \mathrm{km}$）およびカラム数（`crm_nx` $\times$ `crm_ny`）をもつ 2D/3D 周期 CRM を埋め込み、各 CRM カラム直下に独立した陸面サブグリッドを 1 対 1 で対応付ける（MAML）。
+
+SCVT ボロノイ格子上の Arakawa C-grid には以下の利点と数値的制約があり、AOBA ではそれぞれの制約に対応する数値安定化策を組み込んでいる。
+- 利点：
+  1. 極特異点の排除と準一様解像度：緯度経度格子のような極域での子午線収束が存在しないため、極フィルタを要さず全球で均一な CFL 時間刻みを維持できる。
+  2. 厳密直交性と大域保存性：ボロノイ辺と母点間線分が直交するため、有限体積発散および水平気圧傾度力が 2 次精度で簡潔に記述でき、離散ガウスの発散定理（$\sum_i A_i (\nabla\cdot F)_i \equiv 0$）が厳密に成立する。
+  3. 重力波分散特性と厳密エネルギー保存：Arakawa C-grid はロスビー変形半径に対して良好な等方重力波分散特性を持ち、歪対称 TRiSK コリオリ重み（式 2.5）により定常地衡流モードと運動エネルギー保存を両立できる（Thuburn et al., 2009; Ringler et al., 2010）。
+  4. 局所細分化への拡張性：重心ボロノイ分割は密度関数の導入によりハンギングノードなしに滑らかな可変解像度格子へ拡張できる。
+- 欠点および AOBA における対処：
+  1. 自由度比不整合に伴う数値計算モード（Thuburn, 2008; Gassmann, 2011）：六角形格子では質量自由度 $N_c$ に対しエッジ速度自由度が $N_e \approx 3 N_c$、双対三角形の渦度自由度が $N_v \approx 2 N_c$ と 2 倍過剰になり、格子スケールに偽の慣性重力・ロスビー計算モード（Hollingsworth 型の不安定や停滞渦度モード）が生じ得る。AOBA では厳密歪対称 TRiSK 重みの採用に加え、力学ステップでスケール選択的な 4 階超粘性拡散および発散減衰（第 8.2 節）を作用させて格子スケール雑音を抑止している。
+  2. 接線風速再構成の局所 1 次精度と五角形インプリンティング（Peixoto, 2016; Gassmann, 2018）：12 個の五角形セル近傍やボロノイ辺中点と母点間線分中点が厳密一致しない箇所では、TRiSK 接線風速再構成の打ち切り誤差が局所的に 1 次精度へ低下する。AOBA では 10〜12 回の Lloyd SCVT 緩和を施して母点とボロノイ重心を一致させ、格子歪みとインプリンティングを最小化している。
+  3. 非構造間接参照によるメモリアクセス負荷：規則構造格子に比べエッジ–セル間や TRiSK 10 近傍ステンシルの間接ギャザー・スキャッタが増加するため、AOBA では全水平演算子をバッチ化テンソル演算および融合 Metal/CUDA カーネルで実装している。
 
 ![図 2.1: 水平 SCVT-CRM マルチスケール格子と鉛直 Charney-Phillips スタッガリング](assets/fig_02_grid_staggering.svg)
 
-### 2.2 ストレッチ鉛直層とレイリースポンジ層 (`src/aoba/vertical_grid.py`)
+### 2.2 離散 SCVT 演算子・厳密歪対称 TRiSK 重み・風速再構成
 
-地表付近では境界層乱流を解像するため薄い層厚（`dz_min = 60 m`）とし、上空に向かって等比級数的に層厚を広げ、成層圏界面（`z_top = 48 km`, `nz = 44`）まで連続的に解像する：
-
-$$
-\Delta z_k = \Delta z_{\min} \, r^k, \qquad \sum_{k=0}^{N_z-1} \Delta z_k = z_{\mathrm{top}}, \qquad z_{c,k} = \frac{1}{2}\left(z_{w,k} + z_{w,k+1}\right) \tag{2.1}
-$$
-
-スポンジ層底面 $z_{\mathrm{sp}}$（`z_sponge_base = 36 km`）より上空では、上方伝播した重力波がモデル上端で反射しないよう滑らかな $\sin^2$ 型レイリー減衰を作用させる：
+SCVT 上のセル中心発散 $(\nabla\cdot F)_i$、双対頂点渦度 $\zeta_v$、エッジ上のベクトルラプラシアン $(\nabla^2 u)_e$ およびセル中心スカラーラプラシアン $(\nabla^2 \phi)_i$ は、球面全域で厳密保存を満たす有限体積形式で定義される（Ringler et al., 2010）：
 
 $$
-\gamma_{\mathrm{sp}}(z) = \frac{1}{\tau_{\mathrm{sp,min}}} \sin^2\!\left(\frac{\pi}{2}\,\frac{\max(z - z_{\mathrm{sp}}, 0)}{z_{\mathrm{top}} - z_{\mathrm{sp}}}\right) \tag{2.2}
+\begin{aligned}
+(\nabla\cdot F)_i &= \frac{1}{A_i}\sum_{e\in E(i)} s_{i,e}\,l_e F_e, \\
+\zeta_v &= \frac{1}{A_v}\sum_{e\in E(v)} s_{v,e}\,d_e u_e
+\end{aligned} \tag{2.3}
 $$
 
-### 2.3 Klemp (2011) 平滑化地形追従座標 (STF)
+$$
+\begin{aligned}
+(\nabla^2 u)_e &= \frac{(\nabla\cdot u)_{c_1} - (\nabla\cdot u)_{c_0}}{d_e} - \frac{\zeta_{v_1} - \zeta_{v_0}}{\max(l_e, 100)}, \\
+(\nabla^2 \phi)_i &= \nabla\cdot\!\left(\frac{\phi_{c_1}-\phi_{c_0}}{d_e}\right)
+\end{aligned} \tag{2.4}
+$$
 
-単純な地形追従座標では急峻な山岳の凹凸が成層圏上空まで残り、水平気圧傾度力に大きな数値誤差を生む。AOBA では高度とともに地形の歪みを急速に減衰させる **Klemp (2011) 平滑化地形追従座標 (STF)** を用いる（指数 $p =$ `terrain_scale_exp` $= 1.5$）：
+ここで $A_i, A_v$ はセルおよび双対三角形の球面面積、$s_{i,e}\in\{+1,-1\}$ はセル外向き法線符号、$s_{v,e}\in\{+1,-1\}$ は頂点周りの反時計回り循環符号である。接線風速を再構成する TRiSK 重み $w_{e,e'}$（Thuburn et al., 2009; Ringler et al., 2010, Eq. 23）は、各セル $i\in\{c_0, c_1\}$ 周りのカイト面積比 $R_{i,v}/A_i$ の累積和 $t_{e,e'}$ から素の重み $w_{e,e'}^{\mathrm{raw}}$ を構築したのち、コリオリ力による運動エネルギー生成が浮動小数点精度まで厳密ゼロ（歪対称性）となるよう次式で反対称化する：
 
 $$
-z(\zeta, x) = \zeta + h_s(x)\left(1 - \frac{\zeta}{z_{\mathrm{top}}}\right)^p, \qquad J = \frac{\partial z}{\partial \zeta} = 1 - \frac{p\,h_s(x)}{z_{\mathrm{top}}}\left(1 - \frac{\zeta}{z_{\mathrm{top}}}\right)^{p-1} \tag{2.3}
+\begin{aligned}
+w_{e,e'}^{\mathrm{raw}} &= s_{i,e}\,s_{i,e'}\,t_{e,e'}\,\frac{l_{e'}}{d_e}, \\
+w_{e_1,e_2} &= \frac{g_{e_1} w_{e_1,e_2}^{\mathrm{raw}} - g_{e_2} w_{e_2,e_1}^{\mathrm{raw}}}{2 g_{e_1}}, \qquad g_e = l_e d_e \implies l_{e_1}d_{e_1}w_{e_1,e_2} + l_{e_2}d_{e_2}w_{e_2,e_1} = 0
+\end{aligned} \tag{2.5}
 $$
 
-最下層大気参照高度は常に植生樹冠高さ $h_c$ より上（$z_{\mathrm{ref}} = \max(z_{c,0} - h_s, h_c + 2\ \mathrm{m})$）に保ち、森林上での接地境界層交換の整合性を保証する。
+セル中心の東西・南北水平風 $(u_i, v_i)$ の再構成（Perot, 2000; Ringler et al., 2010, Eq. 29）およびセル中心風傾向からエッジ法線風速 $v_e$ への射影は次式による：
+
+$$
+\begin{aligned}
+(u_i, v_i) &= \frac{1}{A_i}\sum_{e\in E(i)} \frac{1}{2}\,d_e l_e u_e \big(\mathbf{n}_e\cdot\hat{\mathbf{e}}_\lambda,\ \mathbf{n}_e\cdot\hat{\mathbf{e}}_\phi\big), \\
+v_e &= \frac{1}{2}\Big[(u_{c_0}+u_{c_1})(\mathbf{n}_e\cdot\hat{\mathbf{e}}_\lambda) + (v_{c_0}+v_{c_1})(\mathbf{n}_e\cdot\hat{\mathbf{e}}_\phi)\Big]
+\end{aligned} \tag{2.6}
+$$
+
+### 2.3 `Earth2014` 地形集約と Lott–Miller サブグリッド山岳テンソル
+
+5 分角（$2160\times 4320$）の `Earth2014` データ（`SUR2014`, `ICE2014`, `TBI2014`, `BED2014`; Hirt & Rexer, 2015）を $\cos\phi$ 面積重み付きで最近傍ボロノイセルへ集約する。海洋率 $f_{\mathrm{ocn}} \ge 0.5$ のセルを海洋 (`SURF_OCEAN=0`)、それ以外で氷床率 $f_{\mathrm{ice}} \ge f_{\mathrm{land}}$ を大陸氷床 (`SURF_ICESHEET=2`)、残余を陸面 (`SURF_LAND=1`) と分類する。高解像地形の局所勾配 $(h_x, h_y)$ に対する 2 次勾配テンソル不変量 $(K, M, L)$ から、Lott & Miller (1997, App. A) のサブグリッド山岳標準偏差 $\mu$、山脈主軸方位角 $\psi$、異方性比 $\gamma$（$\gamma=1$ で等方、$\gamma\to 0$ で線状山脈）および平均二乗平方根勾配 $\sigma$ を算出する：
+
+$$
+\begin{aligned}
+K &= \frac{1}{2}\big(\overline{h_x^2} + \overline{h_y^2}\big), \qquad M = \frac{1}{2}\big(\overline{h_x^2} - \overline{h_y^2}\big), \qquad L = \overline{h_x h_y}, \\
+\mu &= \sqrt{\max(\overline{h^2} - \bar{h}^2, 0)}, \qquad \psi = \frac{1}{2}\operatorname{atan2}(L, M), \\
+\gamma &= \sqrt{\frac{\max(K - \sqrt{M^2+L^2},\ 0)}{\max(K + \sqrt{M^2+L^2},\ 10^{-12})}}, \qquad \sigma = \sqrt{\overline{h_x^2} + \overline{h_y^2}}
+\end{aligned} \tag{2.7}
+$$
+
+解像地形 $z_{\mathrm{topo}}$ には格子スケール急勾配による気圧傾度誤差を防ぐため、陸域上で 2 回の加重ラプラシアン平滑化を適用する：
+
+$$
+z_i^{(m+1)} = 0.75\,z_i^{(m)} + \frac{0.25}{\deg(i)}\sum_{j\in N(i)} z_j^{(m)} \qquad (m = 0, 1) \tag{2.8}
+$$
+
+ここで $N(i)$ はセル $i$ の隣接セル集合、$\deg(i) \in \{5, 6\}$ は隣接セル数である。
+
+### 2.4 Charney–Phillips 鉛直格子・ハイブリッド伸長・Klemp STF 座標・スポンジ層 (`src/aoba/vertical_grid.py`)
+
+鉛直方向には親格子・CRM 共通の Charney–Phillips スタッガード格子を採用し、鉛直速度 $w$ および層界面高度 $z_w$ を $N_z + 1$ 半レベルに、密度・気圧・水平風・湿潤仮温位・トレーサを $N_z$ 全レベル中心 $z_{c,k} = \frac{1}{2}(z_{w,k}+z_{w,k+1})$ に配置する。基準計算鉛直座標 $\zeta$ の層厚 $\Delta\zeta_k$（`float64` 初期化、既定 $N_z = 44$, $z_{\mathrm{top}} = 48\ \mathrm{km}$, $\Delta z_{\min} = 60\ \mathrm{m}$）は境界層と対流圏・成層圏の解像度を両立するハイブリッドべき乗則（下層を $s^{1.35}$ で緩やかに、上層を $s^{4.2}$ で急峻に伸長）で決定する：
+
+$$
+\begin{aligned}
+s_k &= \frac{k}{\max(N_z - 1, 1)}, \qquad S_k = 0.38\,s_k^{1.35} + 0.62\,s_k^{4.2}, \\
+\Delta\zeta_k &= \Delta z_{\min} + \frac{z_{\mathrm{top}} - N_z \Delta z_{\min}}{\sum_{j=0}^{N_z-1} S_j}\,S_k
+\end{aligned} \tag{2.9}
+$$
+
+山岳上の水平気圧傾度力誤差を抑えるため、Klemp (2011, Eqs. 4 & 7) の余弦べき乗減衰関数 $A(\zeta_w)$（高度とともに地形起伏を速やかに平坦化）と最小層厚圧縮保護（$\gamma_{\min} = 0.20$）を組み合わせた平滑化地形追従座標 (STF) を構成する（既定指数 $p =$ `terrain_scale_exp` $= 1.5$）：
+
+$$
+\begin{aligned}
+A(\zeta_w) &= \left[\cos\!\left(\frac{\pi}{2}\frac{\zeta_w}{z_{\mathrm{top}}}\right)\right]^{2p}, \\
+z_{w,k} &= \max\!\Big(\zeta_{w,k} + A(\zeta_{w,k})h_s,\ z_{w,k-1} + \gamma_{\min}\Delta\zeta_{c,k-1}\Big)
+\end{aligned} \tag{2.10}
+$$
+
+剛体上端境界での内部重力波反射を抑えるため、スポンジ層底面 $z_{\mathrm{sp}}$（既定 `z_sponge_base = 36 km`）以高に $\sin^2$ 型レイリー減衰率 $\gamma_r(\zeta)$ を適用する（最小減衰時定数 $\tau_{\mathrm{sp,min}} = 300\ \mathrm{s}$）：
+
+$$
+\gamma_r(\zeta) = \frac{1}{\tau_{\mathrm{sp,min}}}\sin^2\!\left(\frac{\pi}{2}\,\operatorname{clamp}\!\left(\frac{\zeta - z_{\mathrm{sp}}}{\max(z_{\mathrm{top}} - z_{\mathrm{sp}}, 1)},\ 0,\ 1\right)\right) \tag{2.11}
+$$
 
 ---
 
 ## 3. 湿潤圧縮性熱力学と混合相飽和調節
 
-### 3.1 湿潤圧縮性大気の熱力学と浮力
+### 3.1 圧縮性状態方程式と凝結物荷重 (`src/aoba/thermodynamics.py`)
 
-水蒸気分子 ($\mathrm{H}_2\mathrm{O}$, 分子量 18) は乾燥空気 (平均分子量 29) より軽いため、同じ温度なら湿った空気ほど浮力が大きく上昇しやすい。反対に、凝結してできた液滴 ($q_c$) や氷晶 ($q_i$) は重力で下向きの荷重（*凝結物荷重*）を与える。空気塊が上昇・断熱冷却して飽和水蒸気量を超えると凝結が起こり、莫大な潜熱（$L_v \approx 2.5\ \mathrm{MJ\ kg^{-1}}$）が放出されて積乱雲や台風を加速する。
-
-### 3.2 状態方程式と湿潤仮温位 (`src/aoba/thermodynamics.py`)
-
-AOBA の圧縮性非静力学力学は、乾燥空気密度 $\rho_d$ と**湿潤仮温位** $\theta_m$ を基本状態量として定式化される：
+圧縮性非静力学力学コアは乾燥空気密度 $\rho_d$ と湿潤仮温位 $\theta_m$ を基本状態量として予報する（Skamarock et al., 2012, Eqs. 5–6）。水蒸気混合比 $q_v$ に対するエクスナー関数 $\Pi$、全気圧 $p$ および絶対温度 $T$ は次式で診断される：
 
 $$
-\theta_m = \theta \left(1 + \frac{R_v}{R_d} q_v\right) = \frac{T}{\Pi}\left(1 + \varepsilon_v q_v\right), \qquad \Pi = \left(\frac{p}{p_0}\right)^{R_d / c_{pd}} \tag{3.1}
+\theta_m = \theta\left(1 + \frac{R_v}{R_d} q_v\right), \qquad \xi = \max\!\left(\frac{R_d\rho_d\theta_m}{p_0},\ 10^{-8}\right), \qquad \Pi = \xi^{R_d / c_{vd}} \tag{3.1}
 $$
 
 $$
-p = p_0 \left(\frac{\rho_d R_d \theta_m}{p_0}\right)^{\gamma}, \qquad \gamma = \frac{c_{pd}}{c_{pd} - R_d} \approx 1.400 \tag{3.2}
+p = p_0\,\xi^{\gamma_d} = p_0\,\xi\,\Pi, \qquad T = \frac{\Pi\,\theta_m}{1 + (R_v / R_d)\max(q_v, 0)}, \qquad \gamma_d = \frac{c_{pd}}{c_{vd}} \approx 1.400 \tag{3.2}
 $$
 
-鉛直浮力に効く総湿潤密度には、水蒸気および全凝結水が含まれる：
+鉛直浮力および気圧傾度項に入る総湿潤密度 $\rho_{\mathrm{tot}}$ には水蒸気および全凝結水（雲水 $q_c$、雲氷 $q_i$、降水 $q_p$）の荷重が含まれる：
 
 $$
-\rho_{\mathrm{tot}} = \rho_d \left(1 + q_v + q_c + q_i + q_p\right) \tag{3.3}
+\rho_{\mathrm{tot}} = \rho_d\left(1 + q_v + q_c + q_i + q_p\right) \tag{3.3}
 $$
 
-### 3.3 混合相分配と Newton–Raphson 飽和調節
+### 3.2 飽和水蒸気圧・混合相分配・飽和微分
 
-$T_{\mathrm{ice}} = 253.15\ \mathrm{K}$ ($-20^\circ\mathrm{C}$) から $T_{\mathrm{liq}} = 273.16\ \mathrm{K}$ ($0^\circ\mathrm{C}$) の間では、過冷却水滴と氷晶が温度の線形関数 $\omega_n(T)$ で滑らかに共存する：
-
-$$
-\omega_n(T) = \operatorname{clamp}\!\left(\frac{T - T_{\mathrm{ice}}}{T_{\mathrm{liq}} - T_{\mathrm{ice}}},\ 0,\ 1\right), \qquad q_s(T, p) = \omega_n q_{s,\ell}(T, p) + (1 - \omega_n) q_{s,i}(T, p) \tag{3.4}
-$$
-
-総非降水水分 $q_n = q_v + q_c + q_i$ を保存したまま、3 回のベクトル化 Newton–Raphson 反復により厳密な飽和平衡温度を求める：
+液面および氷面に対する飽和水蒸気圧 $e_{sw}(T)$（Bolton, 1980, Eq. 10）および $e_{si}(T)$（Murray, 1967）を次式で計算する：
 
 $$
-T^{(m+1)} = T^{(m)} - \frac{T^{(m)} - T_{\mathrm{dry}} - \frac{L_{\mathrm{eff}}}{c_{pd}}\max(q_n - q_s(T^{(m)}), 0)}{1 + \frac{L_{\mathrm{eff}}}{c_{pd}}\frac{\partial q_s}{\partial T}\Big|_{T^{(m)}}} \tag{3.5}
+e_{sw}(T) = 611.2\exp\!\left(\frac{17.67(T - 273.15)}{T - 29.65}\right), \qquad e_{si}(T) = 611.2\exp\!\left(\frac{21.8745584(T - 273.15)}{T - 7.66}\right) \tag{3.4}
 $$
 
-ここで $L_{\mathrm{eff}} = \omega_n L_{v0} + (1 - \omega_n)(L_{v0} + L_{f0})$ は混合相実効潜熱である。
+$T_{00n} = 253.15\ \mathrm{K}$ から $T_{0n} = 273.16\ \mathrm{K}$ の混合相域では区分線形液相割合 $\omega_n(T)$ により混合相飽和混合比 $q_{\mathrm{sat}}(T, p)$ および厳密な温度微分 $\partial q_{\mathrm{sat}}/\partial T$ を与える（Khairoutdinov & Randall, 2003, Eqs. A8–A14）：
+
+$$
+\omega_n(T) = \operatorname{clamp}\!\left(\frac{T - T_{00n}}{T_{0n} - T_{00n}},\ 0,\ 1\right), \qquad q_{sx}(T, p) = \frac{\varepsilon_w e_{sx}(T)}{\max(p - e_{sx}(T),\ 0.05 p)}, \qquad q_{\mathrm{sat}} = \omega_n q_{sw} + (1 - \omega_n) q_{si} \tag{3.5}
+$$
+
+### 3.3 エンタルピー保存 Newton–Raphson 飽和調節と RCEMIP 初期プロファイル
+
+液氷相当温度 $T_{li}$ および総非降水水分 $q_n = q_v + q_c + q_i$ を保存したまま、過飽和格子（$q_n > q_{\mathrm{sat}}(T_{li}, p)$）に対して 4 回のベクトル化 Newton–Raphson 反復で飽和平衡温度 $T$ を解く。混合相遷移帯の潜熱勾配もヤコビアン $f'(T)$ に厳密に含める：
+
+$$
+\begin{aligned}
+T_{li} &= T - \frac{L_{v0} q_c + L_{s0} q_i}{c_{pd}}, \\
+L_{\mathrm{eff}}(T) &= \omega_n(T) L_{v0} + \big(1 - \omega_n(T)\big) L_{s0}, \\
+f(T) &= T - T_{li} - \frac{L_{\mathrm{eff}}(T)}{c_{pd}}\max\!\big(q_n - q_{\mathrm{sat}}(T, p),\ 0\big) = 0
+\end{aligned} \tag{3.6}
+$$
+
+$$
+\begin{aligned}
+f'(T) &= 1 + \frac{L_{\mathrm{eff}}(T)}{c_{pd}}\frac{\partial q_{\mathrm{sat}}}{\partial T} - \frac{\mathbf{1}_{(T_{00n}, T_{0n})}(L_{v0} - L_{s0})}{c_{pd}(T_{0n} - T_{00n})}\,q_{\mathrm{cond}}, \\
+T^{(m+1)} &= T^{(m)} - \frac{f(T^{(m)})}{\max(f'(T^{(m)}), 1)}
+\end{aligned} \tag{3.7}
+$$
+
+収束後、凝結総量 $q_{\mathrm{cond}}$ と各相混合比 $(q_v, q_c, q_i)$ を次式で確定する：
+
+$$
+\begin{aligned}
+q_{\mathrm{cond}} &= \max\!\big(q_n - q_{\mathrm{sat}}(T, p),\ 0\big), \\
+q_v &= q_n - q_{\mathrm{cond}}, \qquad q_c = \omega_n(T)\,q_{\mathrm{cond}}, \qquad q_i = \big(1 - \omega_n(T)\big)\,q_{\mathrm{cond}}
+\end{aligned} \tag{3.8}
+$$
+
+理想化放射対流平衡実験向けには、Wing et al. (2018, Sec. 3.2.3) の RCEMIP 解析初期成層（対流圏界面 $z_t = 15\ \mathrm{km}$、減率 $\Gamma = 6.7\ \mathrm{K\ km^{-1}}$、水蒸気スケールハイト $z_{q1} = 4\ \mathrm{km}, z_{q2} = 7.5\ \mathrm{km}$、地表気圧 $p_{\mathrm{sfc}} = 1014.8\ \mathrm{hPa}$）を `rcemip_analytic_sounding` として実装する。
 
 ---
 
-## 4. 大気放射伝達 — 選択制スキーム (`rad_scheme`) と 3D TICA
+## 4. 大気放射伝達：選択制スキーム (`rad_scheme`) と 3D TICA
 
-### 4.1 放射伝達の概要と選択制スキーム (`rad_scheme`)
+### 4.1 選択制スキーム階層 (`rad_scheme`)
 
-放射伝達は地球と宇宙をつなぐ唯一のエネルギー収支窓口である。太陽からの短波放射 (SW) は地表と成層圏オゾン層を温め、地球が放出する長波熱赤外放射 (LW) は大気を宇宙へ冷却する。温室効果ガス（$\mathrm{H}_2\mathrm{O}, \mathrm{CO}_2, \mathrm{CH}_4, \mathrm{N}_2\mathrm{O}, \mathrm{O}_3$）・雲・エアロゾルは長波を吸収して温室効果をもたらし、短波を散乱して地球のアルベド（反射率）を変える。気体分子の吸収線は波長によって激しく振動するため、高精度モデルでは波長帯を吸収係数の累積分布（**$g$ 点**）に並べ替える **Correlated-$k$ 分布法** を用いる。
+AOBA は `[forcing] rad_scheme` により 4 つの放射伝達スキームを切り替えることができる。全スキームは同一インターフェースで短波直達・散乱（VIS/NIR）・PAR 地表フラックス、長波下向きフラックス、大気上端放射収支（ASR/OLR）および大気放射加熱率を出力する。
 
-AOBA では [`config/aoba_default.toml`](../config/aoba_default.toml) の **`[forcing] rad_scheme` により以下の 4 つのスキームから選択** できる（いずれも地表の可視・近赤外・PAR 収支および大気放射加熱率へ同一インターフェースで結合される）：
-
-| `rad_scheme` | スペクトル解像度 | 気体吸収・光学物理 | 外部ファイル | GPU 高速化 | 主な適用対象 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| `"four_band"` | 4 バンド（SW 2 + LW 2） | $\mathrm{H}_2\mathrm{O}, \mathrm{CO}_2, \mathrm{O}_3$ ＋雲 | 不要 | 融合 Metal/CUDA | 講義・水惑星・超高速プロトタイピング |
-| `"ckd"` *(既定)* | 16 バンド / 50 $g$ 点 | $\mathrm{H}_2\mathrm{O}, \mathrm{CO}_2, \mathrm{CH}_4, \mathrm{N}_2\mathrm{O}, \mathrm{O}_3$ ＋雲＋エアロゾル | 不要 | 融合 Metal/CUDA | 数十年〜数百年規模の標準気候・古気候実験 |
-| `"ckd_hd"` | 29 バンド / 111 $g$ 点 | MSTRN11 級 CKD＋Chou LW 雲散乱＋5 種エアロゾル | 不要 | 融合 Metal/CUDA (15倍) | 外部テーブル不要で高精度な万能 ESM 実験 |
-| `"rrtmgp"` | 30 バンド / 240 $g$ 点 | 公式 HITRAN + MT\_CKD 4.1（128 LW + 112 SW）、2 気体重複 $\eta$ | 自動取得 (BSD-3) | 融合 Metal/CUDA (110〜168倍) | CMIP 準拠の精密放射強制力ベンチマーク |
+| `rad_scheme` | スペクトル解像度 | 気体吸収・光学物理 | 利点 | 制約・留意点 |
+| :--- | :--- | :--- | :--- | :--- |
+| `"four_band"` | 4 バンド（SW 2 + LW 2） | Lacis–Hansen $\mathrm{O}_3/\mathrm{H}_2\mathrm{O}$、解析 $\mathrm{CO}_2/\mathrm{H}_2\mathrm{O}$ LW、雲・ダスト | 計算負荷が最小で外部ファイル不要。理想化水惑星・高速プロトタイピングに最適。 | $\mathrm{CH}_4/\mathrm{N}_2\mathrm{O}$ および非ダスト 4 種エアロゾルの直接効果を含まず、高 $\mathrm{CO}_2$ 域のバンド重複精度は近似的。 |
+| `"ckd"` *(既定)* | 16 バンド / 50 $g$ 点 | 6 SW (18 $g$) + 10 LW (32 $g$)、$\mathrm{H}_2\mathrm{O}, \mathrm{CO}_2, \mathrm{CH}_4, \mathrm{N}_2\mathrm{O}, \mathrm{O}_3, \mathrm{O}_2$、雲・ダスト | 外部テーブル不要で 5 種主要温室効果ガスと水蒸気連続吸収を扱い、速度と精度の均衡が良い。多十年〜多世紀実験の標準。 | 長波雲散乱を省略し、2 気体重複は独立加算近似のため極端な高濃度域では RRTMGP に比べ微小な放射強制力バイアスが残る。 |
+| `"ckd_hd"` | 16 基底 / 111 $g$ 点 | 39 SW + 72 LW $g$ 点、Chou LW 雲散乱補正、5 種自然＋火山エアロゾル | 外部テーブル不要のまま長波雲散乱補正と全自然＋火山エアロゾルの帯域光学特性を直接統合（融合 GPU カーネル対応）。 | `ckd` の約 2 倍の放射計算コストを要し、吸収係数は HITRAN 厳密テーブルではなく基底 $g$ 点細分化に基づく。 |
+| `"rrtmgp"` | 30 バンド / 240 $g$ 点 | 公式 HITRAN + MT\_CKD 4.1（128 LW + 112 SW）、9 気体 $(T, \ln p, \eta)$ 補間 | 公式 HITRAN 分光データと 2 気体重複 $\eta$ 補間により CMIP 準拠の最高精度を実現（融合 GPU で高速化）。 | 初回に BSD-3 係数ファイルの自動取得が必要で、放射計算負荷は 4 スキーム中最大。またテーブル温度範囲（$160\text{–}355\ \mathrm{K}$）外の極端惑星条件ではクランプされる。 |
 
 ![図 4.1: 大気放射伝達の物理過程と 4 つの選択制スキーム階層](assets/fig_03_radiation_schemes.svg)
 
-### 4.2 全スキーム共通の多層 2 ストリーム伝達ソルバ (`src/aoba/radiation.py`, `src/aoba/kernels.py`)
+### 4.2 共通 2 ストリーム伝達ソルバ（Toon et al., 1989）(`src/aoba/radiation.py`)
 
-各バンドまたは $g$ 点ごとに、上向き放射フラックス $F^\uparrow$ と下向きフラックス $F^\downarrow$ を $\delta$-Eddington 2 ストリーム法で解く。まず強い前方散乱ピーク（$f = g_a^2$）をスケーリング除去する：
+全 4 スキームは、短波に Toon et al. (1989) の $\delta$-Quadrature $2N\times 2N$ 三重対角 2 ストリーム法 (`toon_two_stream_sw`) を、長波に純吸収（$\omega_0 = 0$）線形 $\tau$ 非結合 2 ストリーム掃引法 (`toon_two_stream_lw`) を用いる。内部では上端 $n=0$ から地表面 $n=N-1$ へのトップダウン添字に変換して解く。
 
-$$
-\Delta\tau' = (1 - \omega f)\,\Delta\tau, \qquad \omega' = \frac{(1 - f)\omega}{1 - \omega f}, \qquad g' = \frac{g_a}{1 + g_a} \tag{4.1}
-$$
-
-各層の反射率 $R_k$・透過率 $T_k$・直達/プランク湧き出し項を Meador–Weaver (1980) の解析解（$\Delta\tau' \to 0$ では float32 桁落ちを防ぐ Taylor 展開を使用）で計算し、無条件安定な **Adding–Doubling 法** で地表から大気上端まで結合する：
+短波では各層の光学的厚さ $\tau$・単一散乱アルベド $\omega_0$・非対称因子 $g_0$ に対し、前方散乱ピークを直達光へ繰り込む Joseph, Wiscombe & Weinman (1976) の $\delta$ スケーリング（前方散乱率 $f = g_0^2$）および Quadrature 2 ストリーム係数（拡散余弦 $\mu_1 = 1/\sqrt{3}$; Toon et al., 1989, Table 1）を適用する：
 
 $$
-R_{12} = R_1 + \frac{T_1^2 R_2}{1 - R_1 R_2}, \qquad T_{12} = \frac{T_1 T_2}{1 - R_1 R_2} \tag{4.2}
-$$
-
-大気への放射加熱率は正味フラックスの鉛直収束で与えられる：
-
-$$
-\left(\frac{\partial T}{\partial t}\right)_{\mathrm{rad}} = -\frac{1}{\rho_d c_{pd}} \frac{\partial (F_{\mathrm{SW}}^{\mathrm{net}} + F_{\mathrm{LW}}^{\mathrm{net}})}{\partial z} \tag{4.3}
-$$
-
-4 km 未満の雲厚の空間ムラ（サブグリッド不均一性）は Cahalan et al. (1994) の係数 `cloud_sw_inhomog`（$\chi_{\mathrm{SW}} = 0.62$）で表現する：
-
-$$
-\tau_{\mathrm{liq}} = \frac{3}{2} \frac{\mathrm{LWP}}{\rho_{\ell}\, r_{e,\ell}}\,\chi_{\mathrm{SW}}, \qquad \tau_{\mathrm{ice}} = \mathrm{IWP}\left(a_i + \frac{b_i}{r_{e,i}}\right)\chi_{\mathrm{SW}} \tag{4.4}
-$$
-
-### 4.3 選択肢 1：`rad_scheme = "four_band"`（高速解析 4 バンド）
-
-短波を 2 帯域（可視・紫外 SW1 $< 0.7\ \mu\mathrm{m}$ と近赤外 SW2 $> 0.7\ \mu\mathrm{m}$）、長波を 2 帯域（8–12 $\mu\mathrm{m}$ 大気窓と非窓域）に分け、ルックアップテーブル無しで $\mathrm{CO}_2$ 対数飽和と水蒸気連続吸収を解析計算する：
-
-$$
-\Delta\tau_{\mathrm{CO_2,15\mu m}} = k_{\mathrm{CO_2}}\left(1 + c_{\mathrm{log}}\ln\frac{C_{\mathrm{CO_2}}}{284.3}\right)\left(\frac{p}{p_0}\right)^{0.8}\Delta m \tag{4.5}
+\begin{aligned}
+\tau' &= \max\!\big(\tau(1 - \omega_0 g_0^2),\ 10^{-7}\big), \\
+\omega' &= \operatorname{clamp}\!\left(\frac{\omega_0(1 - g_0^2)}{1 - \omega_0 g_0^2},\ 0,\ 0.999999\right), \\
+g' &= \frac{g_0 - g_0^2}{1 - g_0^2}
+\end{aligned} \tag{4.1}
 $$
 
 $$
-\Delta\tau_{\mathrm{H_2O,cont}} = k_{\mathrm{cont}}\, e_{\mathrm{H_2O}} \exp\!\left[1800\left(\frac{1}{T} - \frac{1}{296}\right)\right] q_v\,\Delta m \tag{4.6}
+\begin{aligned}
+\gamma_1 &= \frac{\sqrt{3}}{2}\big[2 - \omega'(1 + g')\big], \qquad \gamma_2 = \frac{\sqrt{3}}{2}\omega'(1 - g'), \\
+\gamma_3 &= \frac{1}{2}\big(1 - \sqrt{3}\,g'\mu_0\big), \qquad \gamma_4 = 1 - \gamma_3
+\end{aligned} \tag{4.2}
 $$
 
-### 4.4 選択肢 2：`rad_scheme = "ckd"`（標準 16 バンド / 50 $g$ 点 Correlated-$k$、`src/aoba/radiation_ckd.py`）
-
-短波 6 バンド・長波 10 バンドの計 50 ガウス–ルジャンドル $g$ 点により、$\mathrm{H}_2\mathrm{O}$（吸収線＋連続吸収）・$\mathrm{CO}_2$・$\mathrm{CH}_4$・$\mathrm{N}_2\mathrm{O}$・$\mathrm{O}_3$ の圧力・温度拡がりを決定論的に計算する：
+2 ストリーム常微分方程式系の固有値 $\lambda_n$、半無限層反射率 $\Gamma_n$、上端からの累積光学的厚さ $\tau_{c,n}$、および各層の同次解基底因子 $(e_{1,n}, e_{2,n}, e_{3,n}, e_{4,n})$ と直達太陽光の特解 $C_n^\pm(\tau)$（共鳴分母 $\lambda_n^2 - \mu_0^{-2}$ は $\pm 10^{-5}$ で正則化）を次式で構成する：
 
 $$
-k_{b,g}(p, T) = k_{b,g}^{\mathrm{ref}} \left(\frac{p}{p_{\mathrm{ref}}}\right)^{\alpha_b} \exp\!\left[\beta_b \left(\frac{1}{T_{\mathrm{ref}}} - \frac{1}{T}\right)\right] \tag{4.7}
+\begin{aligned}
+\lambda_n &= \sqrt{\max(\gamma_{1,n}^2 - \gamma_{2,n}^2,\ 10^{-12})}, \qquad \Gamma_n = \frac{\gamma_{2,n}}{\gamma_{1,n} + \lambda_n}, \qquad \tau_{c,n} = \sum_{j=0}^{n-1}\tau'_j, \\
+e_{1,n} &= 1 + \Gamma_n e^{-\lambda_n\tau'_n}, \qquad e_{2,n} = 1 - \Gamma_n e^{-\lambda_n\tau'_n}, \\
+e_{3,n} &= \Gamma_n + e^{-\lambda_n\tau'_n}, \qquad e_{4,n} = \Gamma_n - e^{-\lambda_n\tau'_n}
+\end{aligned} \tag{4.3}
 $$
 
-全フラックスは各バンド $b$・重み $w_{b,g}$ の和として厳密に集計される：
-
 $$
-F^\pm(z) = \sum_{b} \sum_{g=1}^{N_{g,b}} w_{b,g}\, F_{b,g}^\pm(z), \qquad \sum_{g=1}^{N_{g,b}} w_{b,g} = 1 \tag{4.8}
+C_n^\pm(\tau) = \frac{\omega'_n F_s\big[(\gamma_{1,n} \mp \mu_0^{-1})\gamma_{3/4,n} + \gamma_{4/3,n}\gamma_{2,n}\big]}{\lambda_n^2 - \mu_0^{-2}}\,e^{-(\tau_{c,n}+\tau)/\mu_0} \tag{4.4}
 $$
 
-### 4.5 選択肢 3：`rad_scheme = "ckd_hd"`（29 バンド / 111 $g$ 点 MSTRN11 級、`src/aoba/radiation_hd.py`）
-
-MIROC6 の MSTRN11（Sekiguchi & Nakajima, 2008）と同クラスの **29 バンド / 111 $g$ 点**（LW 15 帯 + SW 14 帯）を外部ファイル不要で実装する。Chou et al. (1999) の長波雲散乱補正および 5 種自然エアロゾル＋火山性 $\mathrm{H}_2\mathrm{SO}_4$ の帯域別光学特性を組み込む：
+上端の散乱下向き入射ゼロ条件 $F_0^-(0) = 0$、層間フラックス連続条件（Toon et al., 1989, Eqs. 39–43）、および直達・散乱別地表アルベド $(r_{\mathrm{dir}}, r_{\mathrm{dif}})$ に対する下端反射境界条件から $2N\times 2N$ 三重対角連立一次方程式を `solve_tridiagonal_batched` で解き、各界面の上向き・下向き直達・下向き散乱フラックスを復元する：
 
 $$
-\Delta\tau_{\mathrm{LW,eff}} = \Delta\tau_{\mathrm{gas}} + (1 - \omega_{\mathrm{cld}} f_{\mathrm{back}})\,\Delta\tau_{\mathrm{cld}} + \sum_{s=1}^{6} (1 - \omega_{s} f_{s})\,\Delta\tau_{s} \tag{4.9}
+F^\uparrow_N = r_{\mathrm{dir}}\,\mu_0 F_s\,e^{-\tau_{c,N}/\mu_0} + r_{\mathrm{dif}}\,F^\downarrow_{\mathrm{dif},N} \tag{4.5}
 $$
 
-単一ソース融合 GPU カーネル `rad_ckd_hd_col`（`src/aoba/kernels_esm.py`）で高速実行される。
+長波では拡散因子 $D$（`four_band` で $D=2$、`ckd`/`ckd_hd` で $D=1.66$、`rrtmgp` で帯域最適セカント角）に対する有効層光学的厚さ $\Delta\tau_{\mathrm{eff}}$ と透過率 $E$ を定義し、層内プランク関数の線形 $\tau$ 分布を仮定した非結合掃引を小 $\Delta\tau$ での桁落ちを回避する形式で解く：
+
+$$
+\begin{aligned}
+\Delta\tau_{\mathrm{eff}} &= \operatorname{clamp}(D\tau,\ 10^{-6},\ 50), \qquad E = e^{-\Delta\tau_{\mathrm{eff}}}, \\
+\alpha &= \begin{cases} -\operatorname{expm1}(-\Delta\tau_{\mathrm{eff}})/\Delta\tau_{\mathrm{eff}}, & \Delta\tau_{\mathrm{eff}} > 10^{-3} \\ 1 - \frac{1}{2}\Delta\tau_{\mathrm{eff}} + \frac{1}{6}\Delta\tau_{\mathrm{eff}}^2, & \Delta\tau_{\mathrm{eff}} \le 10^{-3} \end{cases}, \\
+w_1 &= 1 - \alpha, \qquad w_2 = \max(\alpha - E,\ 0)
+\end{aligned} \tag{4.6}
+$$
+
+$$
+\begin{aligned}
+F^\downarrow_{n+1} &= F^\downarrow_n E_n + w_{2,n} B_{\mathrm{top},n} + w_{1,n} B_{\mathrm{bot},n}, \\
+F^\uparrow_N &= \epsilon_s B_s + (1 - \epsilon_s) F^\downarrow_N, \\
+F^\uparrow_n &= F^\uparrow_{n+1} E_n + w_{1,n} B_{\mathrm{top},n} + w_{2,n} B_{\mathrm{bot},n}
+\end{aligned} \tag{4.7}
+$$
+
+`ckd_hd` および `rrtmgp` ではこれと等価な Fu & Liou (1992) の線形 $\tau$ 重み $w_{\mathrm{lin}}$ を用いる：
+
+$$
+w_{\mathrm{lin}} = \begin{cases} \Delta\tau_{\mathrm{eff}}^{-1} - \dfrac{E}{1 - E}, & \Delta\tau_{\mathrm{eff}} > 10^{-3} \\ \dfrac{1}{2} - \dfrac{\Delta\tau_{\mathrm{eff}}}{12}, & \Delta\tau_{\mathrm{eff}} \le 10^{-3} \end{cases} \tag{4.8}
+$$
+
+大気各層の放射加熱率 $Q_{\mathrm{rad},k}$ は正味上向きフラックス $F^{\mathrm{net}} = F^\uparrow - F^\downarrow$ の鉛直収束を層熱容量 $C_{\mathrm{layer},k}$ で除して与えられる：
+
+$$
+\begin{aligned}
+Q_{\mathrm{rad},k} &= -\frac{F^{\mathrm{net}}_{k+1} - F^{\mathrm{net}}_k}{C_{\mathrm{layer},k}}, \\
+C_{\mathrm{layer},k} &= \begin{cases}(c_{pd} + c_{pv} q_{v,k})\rho_{d,k}\Delta z_k & (\text{four\_band, ckd}) \\ c_{pd}\rho_{d,k}\Delta z_k & (\text{ckd\_hd, rrtmgp})\end{cases}
+\end{aligned} \tag{4.9}
+$$
+
+### 4.3 選択肢 1：`rad_scheme = "four_band"`（4 バンド解析放射、`src/aoba/radiation.py`)
+
+短波を SW1（$0.25\text{–}0.69\ \mu\mathrm{m}$, 太陽重み $f_{\mathrm{SW1}} = 0.459760$）および SW2（$0.69\text{–}4.00\ \mu\mathrm{m}$, $f_{\mathrm{SW2}} = 0.540240$）に、長波を非窓帯 LW1（重み $1-\beta = 0.680$）および $8\text{–}12.5\ \mu\mathrm{m}$ 大気窓帯 LW2（重み $\beta = 0.320$）に分割する。
+
+SW1 では地球曲率を考慮した球殻空気質量因子 $M(\mu_0)$（Rodgers, 1967）、Lacis & Hansen (1974, Eqs. 8–10) のオゾン UV+VIS 吸収率 $A_{\mathrm{oz}}(x)$ およびレイリー散乱光学的厚さ $\Delta\tau_{\mathrm{ray}}$ を、SW2 では圧力・温度スケーリング水蒸気路程 $y$ に対する Lacis & Hansen (1974, Eq. 21) の水蒸気吸収率 $A_{\mathrm{wv}}(y)$ を評価して層別光学的厚さへ変換する：
+
+$$
+\begin{aligned}
+M(\mu_0) &= \frac{35}{\sqrt{1224\mu_0^2 + 1}}, \qquad \Delta\tau_{\mathrm{ray}} = 0.095\,\frac{\Delta p}{p_0}, \\
+A_{\mathrm{wv}}(y) &= \frac{2.9\,y}{(1 + 141.5\,y)^{0.635} + 5.925\,y}
+\end{aligned} \tag{4.10}
+$$
+
+雲の短波光学特性は Slingo (1989) の液雲および Ebert & Curry (1992) の氷雲パラメータに、水平サブグリッド雲不均一性を表す Cahalan et al. (1994) の低減係数 $\chi_{\mathrm{SW}}$（既定 `cloud_sw_inhomog = 0.62`）を乗じて計算する（$W$ は雲水路 $\mathrm{LWP}$ または雲氷路 $\mathrm{IWP}\ [\mathrm{g\ m^{-2}}]$、$r_e$ は有効半径 $[\mu\mathrm{m}]$）：
+
+$$
+\begin{aligned}
+\tau_{\mathrm{cld}} &= \chi_{\mathrm{SW}}\,W\left(a + \frac{b}{r_e}\right), \\
+\omega_0 &= \operatorname{clamp}\big(1 - (c + d\,r_e),\ 0,\ 0.999999\big), \\
+g &= e + f\,r_e
+\end{aligned} \tag{4.11}
+$$
+
+雲長波吸収は Stephens (1978)（$\kappa_{\mathrm{liq}} = 0.090\ \mathrm{m^2\ g^{-1}}$）および Ebert & Curry (1992) に拡散因子比 $1.66/2.0 = 0.83$ を乗じて与え、鉱物ダストは Balkanski et al. (2007)（SW1 $k_{\mathrm{ext}}=600$, SW2 $400$, LW1 $k_{\mathrm{abs}}=100$, LW2 $150\ \mathrm{m^2\ kg^{-1}}$）を結合する。
+
+LW1・LW2 の気体光学的厚さは対数 $\mathrm{CO}_2$ 濃度比 $r_{\mathrm{CO_2}}$、成層圏 $15\ \mu\mathrm{m}$ 冷却項 $c_{\mathrm{strat}}$、Roberts et al. (1976) の水蒸気自己連続吸収および任意で $9.6\ \mu\mathrm{m}$ オゾン吸収（$4.5\,m_{\mathrm{O_3}}$）を含む：
+
+$$
+\begin{aligned}
+r_{\mathrm{CO_2}} &= \frac{\max(C_{\mathrm{CO_2}}, 1)}{284.3}, \\
+\Delta\tau_{\mathrm{CO_2,LW1}} &= \max(0.02,\ 0.85 + 0.22\ln r_{\mathrm{CO_2}})\,\frac{\Delta(p^2)}{p_0^2} + (0.020 + c_{\mathrm{strat}})\,\frac{\Delta p}{p_0}, \\
+\Delta\tau_{\mathrm{wv,LW1}} &= 0.30\left(\frac{p}{p_0}\right)^{0.55} q_v\,\Delta m_d
+\end{aligned} \tag{4.12}
+$$
+
+$$
+\Delta\tau_{\mathrm{wv,LW2}} = \left(0.45\,\frac{e_v}{p_0}\exp\!\left[1800\left(\frac{1}{T} - \frac{1}{296}\right)\right] + 0.0025\,\frac{p}{p_0}\right)q_v\,\Delta m_d \tag{4.13}
+$$
+
+陸域光合成へ渡す地表光合成有効放射 $\mathrm{PAR}$ および光合成有効光量子束密度 $\mathrm{PPFD}$ は SW1 地表下向きフラックスから次式で変換する：
+
+$$
+\mathrm{PAR} = 0.88\,F^\downarrow_{\mathrm{SW1,sfc}}, \qquad \mathrm{PPFD} = 4.57\,\mathrm{PAR} \quad [\mu\mathrm{mol\ m^{-2}\ s^{-1}}] \tag{4.14}
+$$
+
+### 4.4 選択肢 2：`rad_scheme = "ckd"`（16 バンド / 50 $g$ 点 Correlated-$k$、`src/aoba/radiation_ckd.py`）
+
+短波 6 バンド（$0.20\text{–}4.00\ \mu\mathrm{m}$, 計 18 $g$ 点；地表 $\mathrm{PAR} = 0.94\,F^\downarrow_{\mathrm{SW1,sfc}}$）と長波 10 バンド（波数境界 $0, 350, 500, 630, 700, 820, 980, 1080, 1180, 1400, \infty\ \mathrm{cm^{-1}}$, 計 32 $g$ 点）により $\mathrm{H}_2\mathrm{O}, \mathrm{CO}_2, \mathrm{CH}_4, \mathrm{N}_2\mathrm{O}, \mathrm{O}_3, \mathrm{O}_2$ の吸収を扱う。長波バンド別プランク関数は Widger & Woodall (1976) の 6 項級数展開による厳密積分比 $F_{\mathrm{tail}}(\nu, T)$ の差分で求め、全バンド和が恒等的に $\sigma_{\mathrm{SB}} T^4$ へ一致するエネルギー保存性を保証する：
+
+$$
+\begin{aligned}
+F_{\mathrm{tail}}(\nu, T) &= \frac{15}{\pi^4}\sum_{n=1}^{6}\frac{e^{-nx}}{n^4}\Big[(nx)^3 + 3(nx)^2 + 6(nx) + 6\Big], \\
+x &= \frac{c_2 \nu}{\max(T, 100)}, \qquad c_2 = 1.438776877\ \mathrm{cm\ K}, \\
+B_b(T) &= \sigma_{\mathrm{SB}} T^4\big[F_{\mathrm{tail}}(\nu_{b,\mathrm{low}}, T) - F_{\mathrm{tail}}(\nu_{b,\mathrm{high}}, T)\big]
+\end{aligned} \tag{4.15}
+$$
+
+成層圏上部で光解離により減少する $\mathrm{CH}_4$・$\mathrm{N}_2\mathrm{O}$ には圧力減衰因子 $s_{\mathrm{strat}}$ を適用する。各長波 $g$ 点の気体線吸収光学的厚さ $\tau_{g,\mathrm{line}}$ は Voigt 圧力下限および $\mathrm{CO}_2$ ホットバンド・ボルツマン温度補正を含み、さらにバンド別の水蒸気自己・外気連続吸収 $\tau_{b,\mathrm{cont}}$、雲（Hu & Stamnes, 1993; Ebert & Curry, 1992）およびダスト吸収を加算して重み付き和で広帯域フラックスを合成する：
+
+$$
+\begin{aligned}
+s_{\mathrm{strat}}(p) &= \min\!\left(\frac{p}{8000},\ 1\right)^{0.38}, \\
+\tau_{g,\mathrm{line}} &= k_{\mathrm{H_2O}}\!\left(\frac{p+80}{p_0}\right)^{\gamma_h}\!u_{\mathrm{H_2O}} + k_{\mathrm{CO_2}}\!\left(\frac{p+p_{\mathrm{vc}}}{p_0}\right)^{\gamma_c}\!e^{b_{T,c}(260^{-1}-T^{-1})} u_{\mathrm{CO_2}} \\
+&\quad + k_{\mathrm{O_3}}\!\left(\frac{p+120}{p_0}\right)^{\gamma_o}\!u_{\mathrm{O_3}} + k_{\mathrm{CH_4}}\!\left(\frac{p+100}{p_0}\right)^{\gamma_m}\!s_{\mathrm{strat}} u_{\mathrm{CH_4}} + k_{\mathrm{N_2O}}\!\left(\frac{p+100}{p_0}\right)^{\gamma_n}\!s_{\mathrm{strat}} u_{\mathrm{N_2O}}
+\end{aligned} \tag{4.16}
+$$
+
+$$
+\begin{aligned}
+\tau_{b,\mathrm{cont}} &= \Big[C_{\mathrm{self},b}\,e_{\mathrm{atm}}\,e^{1800(T^{-1}-296^{-1})} + C_{\mathrm{for},b}\,p_{\mathrm{atm}}\Big]\,u_{\mathrm{H_2O}}, \\
+F^\pm(z) &= \sum_{b}\sum_{g=1}^{N_{g,b}} w_{b,g}\,F_{b,g}^\pm(z)
+\end{aligned} \tag{4.17}
+$$
+
+### 4.5 選択肢 3：`rad_scheme = "ckd_hd"`（111 $g$ 点 CKD-HD とエアロゾル直接効果、`src/aoba/radiation_hd.py`）
+
+16 バンド基底の各 $g$ 点を平均保存 2 分割 $(0.52w, 0.72k)$ および $(0.48w, 1.30k)$ し、さらに吸収の強い長波 $\mathrm{CO}_2$/$\mathrm{O}_3$ 帯および短波 UV 帯を再細分化することで計 111 $g$ 点（39 SW + 72 LW; Sekiguchi & Nakajima, 2008 MSTRN11 級）を構築する。長波雲吸収係数には Chou et al. (1999) の後方散乱補正係数（$0.91\text{–}0.97$）を乗じ、5 種自然エアロゾルおよび火山性硫酸エアロゾルの短波帯域スケーリング（Ångström 指数 $\alpha \approx 1.1$）と長波光学厚を直接統合する。また他スキームとの高速結合用に、2 回の短波 2 ストリーム差分および長波窓域射出率 $\varepsilon_a$ による広帯域エアロゾル直接放射強制力差分 `apply_aerosol_rad_delta` も備える：
+
+$$
+\varepsilon_a = 1 - \exp(-1.66\,\tau_{a,\mathrm{LW}}) \tag{4.18}
+$$
 
 ### 4.6 選択肢 4：`rad_scheme = "rrtmgp"`（公式 HITRAN / MT\_CKD 4.1 240 $g$ 点、`src/aoba/radiation_rrtmgp.py`）
 
-BSD-3 ライセンスの公式 **RTE+RRTMGP** 気体光学テーブル（`rrtmgp-gas-lw-g128.nc`: 128 LW $g$ 点、`rrtmgp-gas-sw-g112.nc`: 112 SW $g$ 点; Pincus et al., 2019）を初回自動取得し、融合 GPU カーネル `rad_rrtmgp_lw_grp` / `rad_rrtmgp_sw_grp` で $(T, \ln p, \eta)$ の 3 重線形補間を行う：
+BSD-3 公式 RTE+RRTMGP 気体光学係数（`rrtmgp-gas-lw-g128.nc`: 16 バンド / 128 LW $g$ 点、`rrtmgp-gas-sw-g112.nc`: 14 バンド / 112 SW $g$ 点; Pincus et al., 2019）を自動取得し、9 気体（$\mathrm{H}_2\mathrm{O}, \mathrm{CO}_2, \mathrm{O}_3, \mathrm{N}_2\mathrm{O}, \mathrm{CO}, \mathrm{CH}_4, \mathrm{O}_2, \mathrm{N}_2$ ＋連続吸収）を扱う。単精度浮動小数点での桁落ち・アンダーフローを防ぐため乾燥空気分子柱密度 $N_{\mathrm{dry}}$ を $10^{-20}$ スケーリングし、対流圏界面 $p_{\mathrm{ref,trop}}$ の上下で 2 種の主要吸収気体 $(s_1, s_2)$ の相対混合比 $\eta$ に関する $(T, \ln p, \eta)$ の 3 重線形補間を行う：
 
 $$
-\eta = \frac{x_1}{x_1 + r_{\mathrm{ref}}(T, p)\, x_2}, \qquad \Delta\tau_{\mathrm{gas}} = N_{\mathrm{col}} \left(x_1 + r_{\mathrm{ref}} x_2\right) k_{\mathrm{maj}}(T, \ln p, \eta) + \Delta\tau_{\mathrm{min}} + \Delta\tau_{\mathrm{cont}} \tag{4.10}
+\begin{aligned}
+f_{\mathrm{ref}}(j_T) &= \frac{\mathrm{VMR}_{\mathrm{ref}}(j_T, s_1)}{\mathrm{VMR}_{\mathrm{ref}}(j_T, s_2)}, \\
+\eta &= \frac{v_{s_1}}{v_{s_1} + f_{\mathrm{ref}} v_{s_2}}, \\
+\tau_{\mathrm{maj}} &= N_{\mathrm{dry}}\big(v_{s_1} + f_{\mathrm{ref}} v_{s_2}\big)\,k_{\mathrm{maj}}(T, \ln p, \eta)
+\end{aligned} \tag{4.19}
 $$
 
-### 4.7 オプション：3D 傾斜独立カラム近似 (`enable_rad_3d_tica`)
+微量気体および MT\_CKD 4.1 連続吸収には $(T, \eta)$ 双線形補間と密度・希釈スケーリングを適用し、長波プランク源は `totplnk` 表と 3 重線形補間 `plank_fraction` の積、長波拡散因子は帯域最適セカント角 $\operatorname{clamp}(\sec\theta_{\mathrm{opt}}, 1.45, 2.05)$ を用いる。雲・ダスト・エアロゾル光学特性は各バンド中心波数 $\tilde{\nu}_b$ の滑らかな解析関数として与えられる。
 
-通常の 1 次元放射計算では太陽光が真上から差し込む近似になり、太陽高度が低いときの雲側面照明や雲の影が表現されない。`enable_rad_3d_tica = true` にすると、太陽天頂角 $\theta_0$ に応じて CRM カラム上の雲を高度別に水平シフトさせ、総雲量を厳密保存したまま 3 次元放射効果を近似する（Várnai & Davies, 1999）：
+### 4.7 3D 傾斜独立カラム近似 (`enable_rad_3d_tica`, `src/aoba/radiation_hd.py`)
+
+`enable_rad_3d_tica = true` 時、Várnai & Davies (1999) に従い太陽天頂角 $\theta_z$（$\mu_0 > 0.08$）と時角符号 $s = \operatorname{sgn}(H)$ に応じて CRM 周期配列上の雲水・雲氷 $(q_c, q_i)$ を高度別に水平シフトさせ、領域総雲量を厳密保存したまま雲側面照明および斜め雲影効果を近似する：
 
 $$
-\Delta s(z) = \operatorname{round}\!\left(\frac{(z - z_{\mathrm{sfc}})\tan\theta_0}{\Delta x_{\mathrm{CRM}}}\right), \qquad q_{c,i}^{\mathrm{TICA}}(k, x) = q_{c,i}\big(k,\, (x + \Delta s(z_k)) \bmod N_x\big) \tag{4.11}
+\begin{aligned}
+k_{\mathrm{shift}}(z) &= \operatorname{clamp}\!\left(\operatorname{round}\!\left(\frac{z_{\mathrm{rel}}\min(\tan\theta_z, 2.5)}{\max(\Delta x_{\mathrm{CRM}}, 100)}\right),\ 0,\ 3\right), \\
+i_x^{\mathrm{src}} &= (i_x - s\,k_{\mathrm{shift}}) \bmod N_x
+\end{aligned} \tag{4.20}
 $$
 
 ---
 
-## 5. 雲微物理 — 選択制スキーム (`microphysics_scheme`) と落雷・$\mathrm{LNO}_x$
+## 5. 雲微物理：選択制スキーム (`microphysics_scheme`) と非誘導帯電落雷・$\mathrm{LNO}_x$
 
-### 5.1 雲微物理の概要と選択制スキーム (`microphysics_scheme`)
+### 5.1 選択制スキーム階層 (`microphysics_scheme`)
 
-水蒸気が凝結してできたばかりの雲粒は半径約 $10\ \mu\mathrm{m}$ と極めて小さく、上昇気流に乗って浮かび続ける。雨や雪となって地表へ降るには、雲粒同士が衝突併合（*自動変換・捕捉成長*）するか、鉱物ダストなどの氷晶核 (INP) 上で凍結して**ベルジェロン・フィンダイゼン過程**により氷晶が急速成長する必要がある。強い上昇流の中では過冷却水滴が雪に凍り付いて高密度の**霰（あられ, $q_g$）**が成長し、氷晶との衝突による電荷分離が**落雷**を引き起こす。
+`[forcing] microphysics_scheme` により以下の 3 つのバルク雲微物理スキームを選択できる。
 
-AOBA では **`[forcing] microphysics_scheme` により以下の 3 つのスキームから選択** できる：
-
-| `microphysics_scheme` | 予報する雲・降水変数 | エアロゾル–雲相互作用 | 落雷との結合 | 主な適用対象 |
-| :--- | :--- | :--- | :--- | :--- |
-| `"one_moment"` | $q_n, q_p$（固定有効半径） | 固定 $N_c$ (`re_liq_um`, `re_ice_um`) | 診断氷降水 $q_p$ | 超高速な理想化・概念実験 |
-| `"two_moment"` *(既定)* | $q_n, q_p, N_c, N_i$ | 予報 CCN/INP $\to$ Twomey・寿命効果 | 診断霰比率 | 標準的な多十年気候・エアロゾル実験 |
-| `"six_class_2m"` | $(q_c,N_c), (q_i,N_i), (q_r,N_r), (q_s,N_s), (q_g,N_g)$ | 全 6 種の質量・数濃度を完全予報 | 真の予報霰 $q_g$ を直接入力 | 深い対流・霰/雹・精密落雷 $\mathrm{LNO}_x$・Full-ESM |
+| `microphysics_scheme` | 予報水物質変数 | 利点 | 制約・留意点 |
+| :--- | :--- | :--- | :--- |
+| `"one_moment"` | $q_n, q_p$（固定有効半径） | 予報変数が 2 種のみで計算量・メモリ消費が最小。理想化 RCE や力学コア検証に好適。 | 雲粒数濃度と有効半径が固定のためエアロゾル間接効果（Twomey・寿命効果）を表現できず、雨・雪・霰は温度診断分配に依存する。 |
+| `"two_moment"` *(既定)* | $q_n, q_p, n_c, n_i$ | 海塩・ダスト CCN および Cooper–DeMott INP と結合し、エアロゾル間接効果・予報有効半径・粒径依存氷落下を低負荷で実現。 | 降水物質（雨・雪・霰）は単一バルク $q_p$ の温度診断分配であり、過冷却雨や霰の独立滞留・ライミング履歴を直接追跡しない。 |
+| `"six_class_2m"` | $(q_c,n_c),(q_i,n_i),(q_r,n_r),(q_s,n_s),(q_g,n_g)$ | 雨・雪・霰の質量・数濃度・ライミング・過冷却凍結・融解・種別沈降を完全予報し、深対流・霰/雹・非誘導落雷 $\mathrm{LNO}_x$ の物理忠実度が最高。 | 予報水物質が 11 変数へ増加するため CRM メモリ使用量と移流・微物理計算コストが増大する。 |
 
 ![図 5.1: 選択制雲微物理スキームと水物質相変化・降水・帯電経路](assets/fig_04_microphysics_convection.svg)
 
-### 5.2 選択肢 1：`microphysics_scheme = "one_moment"`（SAM 1 モーメント、`src/aoba/microphysics.py`）
+### 5.2 共通降水定数および温度診断分配 (`src/aoba/microphysics.py`)
 
-Khairoutdinov & Randall (2003) に基づき、非降水水分 $q_n$ と総降水 $q_p$ の 2 変数から温度診断で雨・雪・霰へ分配し、指数粒径分布 $n(D) = N_0 e^{-\lambda D}$ と終端落下速度則 $v(D) = a D^b$ を用いる：
-
-$$
-\left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{auto}} = \alpha_{\mathrm{auto}} \max(q_c - q_{c0},\ 0) + \alpha_{\mathrm{agg}} \max(q_i - q_{i0},\ 0) \tag{5.1}
-$$
+Khairoutdinov & Randall (2003, App. A–B) に従い、雨 ($r$)、雪 ($s$)、霰 ($g$) の各降水種 $m$ には指数型粒径分布 $n_m(D)$ および空気密度補正付きべき乗終端落下速度則 $v_m(D)$（基準空気密度 $\rho_0 = 1.29\ \mathrm{kg\ m^{-3}}$）を仮定する：
 
 $$
-\left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{accr}} = \sum_{x \in \{r,s,g\}} \frac{\pi}{4}\, a_x N_{0,x} \Gamma(3 + b_x)\,\lambda_x^{-(3+b_x)} \left(\frac{\rho_0}{\rho_d}\right)^{1/2} \big(E_{xc} q_c + E_{xi} q_i\big) \tag{5.2}
+\begin{aligned}
+n_m(D) &= N_{0m}\,\exp(-\lambda_m D), \\
+v_m(D) &= a_m D^{b_m}\left(\frac{\rho_0}{\rho_d}\right)^{1/2}
+\end{aligned} \tag{5.1}
 $$
 
-雲底下の未飽和空気中では降水蒸発・昇華が冷気プール（下降流）を形成し、降水落下は CFL 条件を満たすサブサイクルで厳密に水分保存する：
+ここで $D$ は粒子径 $[\mathrm{m}]$、$N_{0m}$ は粒径分布切片パラメータ $[\mathrm{m^{-4}}]$、$\lambda_m = (\pi\rho_m N_{0m} / (\rho_d q_m))^{1/4}$ は傾斜パラメータ、$(a_m, b_m)$ は落下速度係数である。
+
+| 降水種 $m$ | $\rho_m\ [\mathrm{kg\ m^{-3}}]$ | $N_{0m}\ [\mathrm{m^{-4}}]$ | $a_m$ | $b_m$ | $a_{fm}$ | $b_{fm}$ | $C_m$ | $E_{mc}$ | $E_{mi}$ |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 雨 ($r$) | $1000$ | $8.0\times 10^6$ | $842.0$ | $0.80$ | $0.78$ | $0.31$ | $1.0$ | $1.0$ | $1.0$ |
+| 雪 ($s$) | $100$ | $3.0\times 10^6$ | $4.84$ | $0.25$ | $0.65$ | $0.44$ | $2/\pi$ | $1.0$ | $0.1$ |
+| 霰 ($g$) | $400$ | $4.0\times 10^6$ | $94.5$ | $0.50$ | $0.78$ | $0.31$ | $1.0$ | $1.0$ | $0.1$ |
+
+`one_moment` および `two_moment` では、総降水混合比 $q_p$ を温度ランプ関数 $\omega_p(T)$（雨・固体降水遷移帯 $T_{00p}=268.16\ \mathrm{K}$〜$T_{0p}=283.16\ \mathrm{K}$）および $\omega_g(T)$（雪・霰遷移帯 $T_{00g}=223.16\ \mathrm{K}$〜$T_{0g}=283.16\ \mathrm{K}$）により診断分配する：
 
 $$
-q_p^{n+1}(k) = q_p^n(k) + \frac{\Delta t_{\mathrm{sub}}}{\rho_d \Delta z_k}\Big(F_{\mathrm{fall}}(k+1/2) - F_{\mathrm{fall}}(k-1/2)\Big) \tag{5.3}
-$$
-
-$$
-F_{\mathrm{fall}}(k-1/2) = \rho_d(k)\, v_{t}(k)\, q_p(k), \qquad \mathrm{CFL}_{\mathrm{sed}} = \frac{v_t \Delta t_{\mathrm{sub}}}{\Delta z_k} \le 0.9 \tag{5.4}
-$$
-
-### 5.3 選択肢 2：`microphysics_scheme = "two_moment"`（標準 2 モーメント KK00）
-
-雲水数濃度 $N_c$ と雲氷数濃度 $N_i$ を予報変数に加え、海塩・硫酸塩・ダスト・SOA から活性化する CCN/INP と結合する。暖かい雨の自動変換には Khairoutdinov & Kogan (2000) の非線形則を用い、**エアロゾル間接効果**（CCN が増えると雲粒が小さく明るくなり、雨が降りにくくなる）を自律的に再現する：
-
-$$
-\left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{auto,KK00}} = 1350\, q_c^{2.47}\, \left(N_c \cdot 10^{-6}\right)^{-1.79} \tag{5.5}
+\begin{aligned}
+\omega_p(T) &= \operatorname{clamp}\!\left(\frac{T - T_{00p}}{T_{0p} - T_{00p}},\ 0,\ 1\right), \\
+\omega_g(T) &= \operatorname{clamp}\!\left(\frac{T - T_{00g}}{T_{0g} - T_{00g}},\ 0,\ 1\right)
+\end{aligned} \tag{5.2}
 $$
 
 $$
-\left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{accr,KK00}} = 67\, \left(q_c q_r\right)^{1.15} \tag{5.6}
+q_r = \omega_p q_p, \qquad q_s = (1 - \omega_p)(1 - \omega_g)q_p, \qquad q_g = (1 - \omega_p)\omega_g q_p \tag{5.3}
 $$
 
-予報された数濃度から液雲・氷雲の有効半径 $r_e$ を診断し、第 4 章の放射スキーム（式 4.4）へ直接渡す：
+### 5.3 選択肢 1：`microphysics_scheme = "one_moment"`（SAM 1 モーメント）
+
+1. 液氷相当温度 $T_{li}$ を保存した第 1 飽和調節により $(T, q_v, q_c, q_i)$ を得る。
+2. 暖雲自動変換は、雲粒数濃度 $N_d > 0$（既定 $60\ \mathrm{cm^{-3}}$）時に Berry (1968) / Tomita (2008; SCALE-RM Eqs. 8.221–8.222) の分散幅 $D_d$ を用いた変換率を適用し（$N_d = 0$ 時は KR03 閾値則 $\alpha\max(q_c - q_{co}, 0)$）、雲氷凝集は KR03 Eq. A31（$\beta = 10^{-3}\ \mathrm{s^{-1}}$, 閾値 $q_{io} = 10^{-4}\ \mathrm{kg\ kg^{-1}}$）を用いる：
 
 $$
-r_{e,\ell} = \kappa_r \left(\frac{3 \rho_d q_c}{4\pi \rho_\ell N_c}\right)^{1/3}, \qquad r_{e,i} = \operatorname{clamp}\!\left(\left(\frac{3 \rho_d q_i}{4\pi \rho_i N_i}\right)^{1/3},\ 10\ \mu\mathrm{m},\ 120\ \mu\mathrm{m}\right) \tag{5.7}
+\begin{aligned}
+D_d &= \max\!\left(0.146 - 5.964\times 10^{-2}\ln\frac{\max(N_d, 1)}{2000},\ 0.05\right), \\
+\left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{auto}} &= \frac{16.7\,D_d(\rho_d q_c)^2 q_c}{5.0\,D_d\rho_d q_c + 3.6\times 10^{-5} N_d}
+\end{aligned} \tag{5.4}
 $$
 
-### 5.4 選択肢 3：`microphysics_scheme = "six_class_2m"`（Morrison 6 種 2 モーメント、`src/aoba/microphysics_6class.py`）
-
-融合 GPU カーネル `microphysics_6class_col` 内で、雨 $(q_r, N_r)$・雪 $(q_s, N_s)$・霰 $(q_g, N_g)$ の質量と数濃度をすべて独立予報する。過冷却雲水による雪のライミングが霰を生成し、$0^\circ\mathrm{C}$ 以上では雪・霰が融解して雨となる：
-
 $$
-\left(\frac{\partial q_g}{\partial t}\right)_{\mathrm{rime}} = E_{sc}\, \rho_d\, q_c\, \frac{\pi}{4} a_s N_{0,s}\Gamma(3+b_s)\lambda_s^{-(3+b_s)} \cdot f_{\mathrm{conv}}(q_c, q_s) \tag{5.8}
+\left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{aggr}} = \beta\,e^{0.025(T - T_0)}\max(q_i - q_{io},\ 0) \tag{5.5}
 $$
 
-各降水種は厳密な指数有界沈降フラックスにより独立落下し、質量・数濃度・潜熱を厳密保存する：
+3. Marshall–Palmer 連続捕捉成長係数 $A_{\mathrm{pref},ml}$（KR03 Eqs. A27–A29; $l\in\{c, i\}$）による捕捉成長率、および未飽和度 $S_{\mathrm{sub}}$ に対する通風補正付き降水蒸発・昇華率 $E_m$（KR03 Eqs. A21–A26）を計算する：
 
 $$
-F_{x,k} = \rho_{d,k} \Delta z_k \frac{q_{x,k}}{\Delta t}\left[1 - \exp\!\left(-\frac{v_{t,x,k}\Delta t}{\Delta z_k}\right)\right], \qquad x \in \{r, s, g\} \tag{5.9}
+\begin{aligned}
+A_{\mathrm{pref},ml} &= \frac{\pi}{4}\,a_m N_{0m} E_{ml}\,\Gamma(3 + b_m)\,\rho_0^{1/2}\big(\pi\rho_m N_{0m}\big)^{-(3+b_m)/4}, \\
+\left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{accr}} &= \rho_d^{-1/2}\sum_{m\in\{r,s,g\}}\Big[A_{\mathrm{pref},mc}\,q_c + e^{0.025(T-T_0)} A_{\mathrm{pref},mi}\,q_i\Big](\rho_d q_m)^{(3+b_m)/4}
+\end{aligned} \tag{5.6}
 $$
 
-### 5.5 埋め込み CRM 非誘導帯電落雷と $\mathrm{LNO}_x$ (`src/aoba/lightning.py`)
+$$
+\begin{aligned}
+S_{\mathrm{sub}} &= \max\!\left(1 - \frac{q_v}{q_{\mathrm{sat}}},\ 0\right), \\
+E_m &= \frac{2\pi C_m N_{0m}}{\rho_d (A+B)_{l/i}}\Big[a_{em}(\rho_d q_m)^{1/2} + b_{em}\rho_d^{-1/4}(\rho_d q_m)^{(5+b_m)/8}\Big]S_{\mathrm{sub}}
+\end{aligned} \tag{5.7}
+$$
 
-埋め込み CRM が上昇流 $w$ と混合相氷・霰粒子を直接解像しているため、$-15^\circ\mathrm{C}$ 付近の霰–氷晶衝突フラックスから発雷頻度を物理的に計算する（McCaul et al., 2009 / Price & Rind, 1992）：
+4. 潜熱変化を $T_{li}$ へ保存的に反映したのち、降水 $q_p$ の鉛直落下質量フラックス $P_0$・実効質量落下速度 $r_{p,k}$ および雲氷 $q_i$（終端速度 $V_{TI} = 0.75\ \mathrm{m\ s^{-1}}$）を無条件安定な陰的ドナーセル上二重対角 Thomas ソルバで鉛直沈降させる：
 
 $$
-F_{\mathrm{flash}} = c_1 \big(w\, q_g\big)_{-15^\circ\mathrm{C}} + c_2 \int_{\mathrm{col}} \rho_d (q_g + q_s + q_i)\,dz \tag{5.10}
+\begin{aligned}
+P_0 &= \rho_d^{-1/2}\sum_{m\in\{r,s,g\}} F_{\mathrm{pref},m}(\rho_d q_m)^{1 + b_m/4}, \\
+r_{p,k} &= \min\!\left(\frac{P_{0,k}}{q_{p,k}},\ 15\,\rho_{d,k}\right), \\
+\left(1 + \frac{\Delta t\,r_k}{m_k}\right) q_k^{n+1} - \frac{\Delta t\,r_{k+1}}{m_k} q_{k+1}^{n+1} &= q_k^n, \qquad m_k = \rho_{d,k}\Delta z_k
+\end{aligned} \tag{5.8}
 $$
 
-落雷は SPITFIRE 山火事（第 7.5 節）の着火源となり、同時に上部対流圏へ雷起源 $\mathrm{NO}_x$ ($\mathrm{LNO}_x$) を放出して対流圏オゾン生成（第 10.2 節）および海洋窒素沈着（第 9.7 節）へ結合する。
+最後に第 2 飽和調節により $(T, q_v, q_c, q_i)$ と $\theta_m$ を更新する。
+
+### 5.4 選択肢 2：`microphysics_scheme = "two_moment"`（エアロゾル結合 2 モーメント KK00）
+
+雲水数混合比 $n_c\ [\mathrm{kg^{-1}}]$ および雲氷数混合比 $n_i\ [\mathrm{kg^{-1}}]$ を予報変数に追加する。自然起源 CCN 活性化数濃度 $N_{\mathrm{act}}$ は海洋風速依存海塩数濃度 $N_{\mathrm{CCN,ocn}}$（陸上背景は $95\ \mathrm{cm^{-3}}$）、鉱物ダスト質量濃度 $D_{\mu\mathrm{g}} = 10^9\rho_d q_{\mathrm{dust}}\ [\mu\mathrm{g\ m^{-3}}]$ および上昇流活性化率 $f_{\mathrm{act}}$ から算出する：
+
+$$
+\begin{aligned}
+N_{\mathrm{CCN,ocn}} &= \operatorname{clamp}\!\big(30\,e^{0.055 U_{10}},\ 30,\ 140\big)\ [\mathrm{cm^{-3}}], \\
+f_{\mathrm{act}} &= \left(\frac{w_+}{w_+ + 0.35}\right)^{0.45}, \\
+N_{\mathrm{act}} &= 10^6\,\operatorname{clamp}\!\left(\left[N_{\mathrm{base}} + 120\left(\frac{D_{\mu\mathrm{g}}}{10}\right)^{0.5}\right]f_{\mathrm{act}},\ 15,\ 450\right)\ [\mathrm{m^{-3}}]
+\end{aligned} \tag{5.9}
+$$
+
+氷晶核 INP 数濃度 $N_{\mathrm{INP}}$ は Cooper (1986) 過冷却曲線と DeMott et al. (2010) ダスト強化項による不均質凍結 $N_{\mathrm{het}}$ に、$238\ \mathrm{K}$ 以下での均質凍結重み $f_{\mathrm{hom}}$ を結合して評価する：
+
+$$
+\begin{aligned}
+f_{\mathrm{hom}} &= \operatorname{clamp}\!\left(\frac{238 - T}{6},\ 0,\ 1\right), \\
+N_{\mathrm{het}} &= \operatorname{clamp}\!\left(5.0\,e^{0.304\,\mathrm{clamp}(273.15 - T,\,0,\,40)}\left[1 + 4.0\left(\frac{D_{\mu\mathrm{g}}}{10}\right)^{0.4}\right],\ 3\times 10^4,\ 5\times 10^5\right), \\
+N_{\mathrm{INP}} &= (1 - f_{\mathrm{hom}})N_{\mathrm{het}} + 2\times 10^5\,f_{\mathrm{hom}}
+\end{aligned} \tag{5.10}
+$$
+
+暖雲自動変換は雲解像格子スケール（既定 `crm_dx = 4 km` 基準）のサブグリッド雲水量分散補正を含む Khairoutdinov & Kogan (2000) 則（$C_{\mathrm{KK00}} = 42000$）へ切り替え、予報数濃度から算出した雲粒・氷晶有効半径 $(r_{e,l}, r_{e,i})$（分散係数 $\kappa_{\mathrm{disp}} = 0.72$, 雲氷密度 $\rho_{i,\mathrm{cld}} = 500\ \mathrm{kg\ m^{-3}}$）を放射スキーム（式 4.11）および粒径依存雲氷終端落下速度 $V_{TI,\mathrm{eff}}$ へ渡す：
+
+$$
+\left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{auto,KK00}} = 42000\,q_c^{2.47}\,N_{c,\mathrm{cm^{-3}}}^{-1.79} \tag{5.11}
+$$
+
+$$
+\begin{aligned}
+r_{e,l} &= \operatorname{clamp}\!\left(10^6\left(\frac{3 q_c}{4\pi\rho_r\kappa_{\mathrm{disp}} n_c}\right)^{1/3},\ 4,\ 25\right)\ [\mu\mathrm{m}], \\
+r_{e,i} &= \operatorname{clamp}\!\left(0.85\times 10^6\left(\frac{3 q_i}{4\pi\rho_{i,\mathrm{cld}} n_i}\right)^{1/3},\ 15,\ 120\right)\ [\mu\mathrm{m}], \\
+V_{TI,\mathrm{eff}} &= \operatorname{clamp}\!\left(0.75\,\frac{r_{e,i}}{48},\ 0.10,\ 1.20\right)\ [\mathrm{m\ s^{-1}}]
+\end{aligned} \tag{5.12}
+$$
+
+### 5.5 選択肢 3：`microphysics_scheme = "six_class_2m"`（6 種 2 モーメント、`src/aoba/microphysics_6class.py`）
+
+雨 $(q_r, n_r)$・雪 $(q_s, n_s)$・霰 $(q_g, n_g)$ を含む全 6 種 11 変数を独立予報し、融合 GPU カーネル `microphysics_6class_col` 内で全変換過程を厳密有界な指数変換因子 $1 - e^{-k\Delta t} = -\operatorname{expm1}(-k\Delta t)$ で積分する（Morrison et al., 2005; Seifert & Beheng, 2006）。暖雲自動変換速度 $k_{\mathrm{auto}}$、雨滴捕捉速度 $k_{\mathrm{accr}}$、$T < 273.15\ \mathrm{K}$ での雪・霰ライミング速度 $k_{\mathrm{rime}}$、重ライミングによる雪 $\to$ 霰変換速度 $k_{s\to g}$、および $T < 268.15\ \mathrm{K}$ での過冷却雨滴凍結速度 $k_{\mathrm{frz}}$ は次式で与えられる：
+
+$$
+\begin{aligned}
+k_{\mathrm{auto}} &= 1350\,q_c^{1.47}\,N_c^{-1.79}, \qquad k_{\mathrm{accr}} = 67\,q_r^{1.15}\,q_c^{0.15}, \\
+k_{\mathrm{rime}} &= 3.5\,q_s^{0.80} + 5.0\,q_g^{0.80}, \qquad k_{s\to g} = 250\,q_c, \\
+k_{\mathrm{frz}} &= 0.015\,\exp\!\big(0.25(268.15 - T)\big)
+\end{aligned} \tag{5.13}
+$$
+
+さらに雲氷凝集（$q_i\to q_s$）、$T > 273.15\ \mathrm{K}$ での雪・霰融解および雲底下雨滴蒸発を処理したのち、空気密度補正 $f_\rho$ 付きの種別終端落下速度 $(v_r, v_s, v_g)$ によりトップダウン陰的上風沈降を実行する：
+
+$$
+\begin{aligned}
+f_\rho &= \sqrt{\operatorname{clamp}\!\left(\frac{1.2}{\rho_d},\ 0.5,\ 6.0\right)}, \\
+v_r &= 6.5\,(10^3\rho_d q_r)^{0.14} f_\rho, \qquad v_s = 1.1\,(10^3\rho_d q_s)^{0.10} f_\rho, \qquad v_g = 4.2\,(10^3\rho_d q_g)^{0.18} f_\rho
+\end{aligned} \tag{5.14}
+$$
+
+$$
+q_{x,k}^{n+1} = \frac{m_k q_{x,k}^n + \Delta t\,F_{x,k+1}}{m_k + \Delta t\,\rho_{d,k} v_{x,k}}, \qquad F_{x,k} = \rho_{d,k} v_{x,k} q_{x,k}^{n+1}, \qquad x\in\{r, s, g\} \tag{5.15}
+$$
+
+### 5.6 CRM 非誘導帯電落雷および $\mathrm{LNO}_x$ 窒素沈着 (`src/aoba/lightning.py`)
+
+CRM が陽的に解像する上昇流 $w_+ = \max(\bar{w}_k, 0)$ と霰混合比 $q_g$ から、氷晶–霰衝突の電荷分離が最も活発な $-15^\circ\mathrm{C}$ 混合相帯ガウス重み $W_T(T)$ を用いて、McCaul et al. (2009) と Saunders et al. (1991) の非誘導帯電指標 $(G_{\max}, G_{\mathrm{chg}})$ および全発雷頻度 $\mathcal{F}_{\mathrm{tot}}$（全球校正係数 $c_{\mathrm{cal}} = 3.6$）を算出する：
+
+$$
+\begin{aligned}
+W_T(T) &= \exp\!\left(-\left(\frac{T - 258.15}{7.0}\right)^2\right), \\
+G_{\max} &= \max_k\!\big[W_T(T_k)\,\rho_{d,k}\,w_{+,k}\,(10^3 q_{g,k})\big], \\
+G_{\mathrm{chg}} &= \max_k\!\big[W_T(T_k)\,\rho_{d,k}\,w_{+,k}^{1.25}\,(10^3 q_{g,k})\big]
+\end{aligned} \tag{5.16}
+$$
+
+$$
+\begin{aligned}
+F_1 &= 0.042\,G_{\mathrm{chg}}, \qquad F_2 = 0.20\,\mathrm{IWP}_{\mathrm{tot}}\left(\frac{G_{\max}}{G_{\max} + 1.0}\right)^2, \\
+\mathcal{F}_{\mathrm{tot}} &= \frac{c_{\mathrm{cal}}(0.95 F_1 + 0.05 F_2)}{300\times 10^6}\ [\mathrm{flashes\ m^{-2}\ s^{-1}}]
+\end{aligned} \tag{5.17}
+$$
+
+雲内放電対対地雷比 $Z$ および対地雷割合 $f_{\mathrm{CG}}$ は Price & Rind (1993, Eq. 1) に従い $0^\circ\mathrm{C}$ 高度から雲頂（$q_i + q_{p,\mathrm{ice}} \ge 10^{-5}$）までの冷雲厚 $H\in[5.5, 14.0]\ \mathrm{km}$ の 4 次多項式で与える。Schumann & Huntrieser (2007) の 1 閃光当たり窒素生成量 $Y_{\mathrm{N}} = 3.5\ \mathrm{kg\ N\ flash^{-1}}$ から局所生成 $S_{\mathrm{N,loc}} = Y_{\mathrm{N}}\mathcal{F}_{\mathrm{tot}}$ を算出し、対流圏輸送による長距離拡散を反映した局所 50%・全球平均 50% の質量保存 $\mathrm{LNO}_x$ 窒素沈着フラックス $D_{\mathrm{N,LNOx}}$ を陸域および海洋 BGC へ供給する：
+
+$$
+\begin{aligned}
+Z &= \operatorname{clamp}\!\big(0.021 H^4 - 0.648 H^3 + 7.493 H^2 - 36.54 H + 63.09,\ 1,\ 19\big), \\
+f_{\mathrm{CG}} &= \frac{1}{1 + Z}, \qquad D_{\mathrm{N,LNOx}} = 0.50\,S_{\mathrm{N,loc}} + 0.50\,\overline{S}_{\mathrm{N,glob}}
+\end{aligned} \tag{5.18}
+$$
 
 ---
 
-## 6. 境界層乱流・粗度サブレイヤ (RSL)・3D SGS 混合
+## 6. 境界層乱流・粗度サブレイヤ (RSL)・MYNN 2.5・3D Smagorinsky–Lilly SGS
 
-### 6.1 接地境界層・粗度サブレイヤ・乱流混合の概要
+### 6.1 植生および海面の空力粗度長 (`src/aoba/turbulence.py`)
 
-樹木・地形・海面波浪との摩擦は地表風を減速させ、大小の乱流渦を生み出して地表面の熱（顕熱）と水蒸気（潜熱）を大気境界層 (PBL) へと混合する。背の高い森林の樹冠直上では通常の Monin–Obukhov 相似則が破綻し、樹冠後流のコヒーレント渦が混合を強める**粗度サブレイヤ (RSL)** が形成される。AOBA は地表で閉形式 RSL 相似則を用い、鉛直方向を陰的 MYNN Level 2.5 乱流運動エネルギー (TKE) クロージャ、CRM 水平方向を 3D Smagorinsky–Lilly 渦拡散で解く。
-
-### 6.2 空力粗度と De Ridder (2010) RSL 相似則 (`src/aoba/turbulence.py`)
-
-自律成長した樹冠高さ $h_c$ からゼロ面変位 $d_0$ と粗度長 $z_{0m}$ を動的に与え、海面では Charnock 則（および第 9.5 節の波齢効果）を用いる：
+植生上のゼロ面変位 $d_0$ および粗度長 $(z_{0m}, z_{0h})$ は、自律成長した樹冠高さ $h_c$ と露出葉面積指数 $\mathrm{LAI}$ から Raupach (1994, Eqs. 8, 10–11) の解析則で決定する（$c_{d1} = 7.5$, $\psi_{cw} = 0.193$, $z_{0,\mathrm{soil}} = 0.01\ \mathrm{m}$）：
 
 $$
-d_0 = 0.67\,h_c, \qquad z_{0m,\mathrm{land}} = \max(0.10\,h_c,\ z_{0,\mathrm{soil}}) \tag{6.1}
+x = \sqrt{7.5\,\max(\mathrm{LAI}, 10^{-4})}, \qquad 1 - \frac{d_0}{h_c} = \frac{1 - e^{-x}}{x}, \qquad \frac{u_*}{U_h} = \min\!\left(\sqrt{0.003 + 0.15\,\mathrm{LAI}},\ 0.30\right) \tag{6.1}
 $$
 
 $$
-z_{0m,\mathrm{ocn}} = \frac{0.11\,\nu_{\mathrm{air}}}{u_*} + \alpha_{\mathrm{Ch}}\frac{u_*^2}{g} \tag{6.2}
+z_{0m,\mathrm{land}} = \max\!\left(h_c\left(1 - \frac{d_0}{h_c}\right)\exp\!\left(-\frac{\kappa}{u_*/U_h} + 0.193\right),\ z_{0,\mathrm{soil}}\right), \qquad z_{0h,\mathrm{land}} = e^{-2} z_{0m,\mathrm{land}} \tag{6.2}
 $$
 
-De Ridder (2010) の解析的 RSL 補正関数 $\psi_{m,h}^*$ を Monin–Obukhov 相似則へ組み込み、摩擦速度 $u_*$・バルク輸送係数 $C_D, C_H$・地表面フラックスを反復なしで高精度に求める：
+海面粗度長は Miller, Beljaars & Palmer (1992, Eqs. 3–5; SCALE-RM Eqs. 8.360–8.362; $\nu_a = 1.5\times 10^{-5}\ \mathrm{m^2\ s^{-1}}$) による滑面粘性項と Charnock 則の和で与える：
 
 $$
-u_* = \frac{\kappa U_1}{\ln\!\left(\frac{z_1 - d_0}{z_{0m}}\right) - \Psi_m(\zeta) + \psi_m^*(\zeta, z_*)}, \qquad C_H = \frac{\kappa^2}{\big[\ln(\frac{z_1-d_0}{z_{0m}}) - \Psi_m + \psi_m^*\big]\big[\ln(\frac{z_1-d_0}{z_{0h}}) - \Psi_h + \psi_h^*\big]} \tag{6.3}
+z_{0m,\mathrm{ocn}} = \frac{0.11\,\nu_a}{u_*} + \frac{0.018\,u_*^2}{g}, \qquad z_{0h,\mathrm{ocn}} = \frac{0.40\,\nu_a}{u_*} + 1.4\times 10^{-5}, \qquad z_{0q,\mathrm{ocn}} = \frac{0.62\,\nu_a}{u_*} + 1.3\times 10^{-4} \tag{6.3}
+$$
+
+### 6.2 Monin–Obukhov 相似則および De Ridder (2010) 解析 RSL 補正
+
+森林樹冠直上の粗度サブレイヤ（RSL 厚さ $z_* = \max(2h_c - d_0, 0)$ 以下の領域、無次元高度 $\chi = z/z_*$）におけるコヒーレント渦による混合強化を、De Ridder (2010, Eq. 22) の解析的 RSL 補正関数 $\psi_i^*(\zeta, \chi)$（$\mu_M = 2.59$, $\mu_H = 0.95$, $\nu_{\mathrm{RSL}} = 0.50$, $\lambda_{\mathrm{RSL}} = 1.50$）で Paulson–Dyer 安定度関数 $(\Phi_i, \Psi_i)$ へ組み込む：
+
+$$
+\psi_i^*(\zeta, \chi) = \Phi_i\!\left(\left(1 + \frac{\nu_{\mathrm{RSL}}}{\mu_i\chi}\right)\zeta\right)\frac{1}{\lambda_{\mathrm{RSL}}}\ln\!\left(1 + \frac{\lambda_{\mathrm{RSL}}}{\mu_i\chi}\right)e^{-\mu_i\chi}, \qquad i\in\{M, H\} \tag{6.4}
+$$
+
+低風速時の対流ガスト下限を含む有効風速 $U_{\mathrm{eff}}$ とバルクリチャードソン数 $\mathrm{Ri}_b$ に対し 4 回の不動点反復で安定度パラメータ $\zeta$ とプロファイル関数 $f_i$ を求め、バルク輸送係数 $(C_M, C_H, C_Q)$ および摩擦速度 $u_*$ を得る：
+
+$$
+\begin{aligned}
+U_{\mathrm{eff}} &= \sqrt{u_1^2 + v_1^2 + 0.25}, \\
+f_i &= \max\!\left(\ln\frac{z}{z_{0i}} - \Psi_i(\zeta) + \Psi_i(\zeta_{0i}) - \big[\psi_i^*(\zeta_{0i}, \chi_{0i}) - \psi_i^*(\zeta, \chi)\big],\ 0.8\right), \\
+\zeta &\leftarrow \operatorname{clamp}\!\left(\mathrm{Ri}_b\frac{f_M^2}{f_H},\ -5,\ 2\right)
+\end{aligned} \tag{6.5}
 $$
 
 $$
-\boldsymbol{\tau}_s = -\rho_1 C_D |\mathbf{U}_1|\mathbf{U}_1, \qquad H_s = \rho_1 c_{pd} C_H |\mathbf{U}_1|(T_s - \theta_1), \qquad E_s = \rho_1 C_H |\mathbf{U}_1|\beta_w(q_s(T_s) - q_{v,1}) \tag{6.4}
+C_M = \frac{\kappa^2}{f_M^2}, \qquad C_H = \frac{\kappa^2}{f_M f_H}, \qquad C_Q = \frac{\kappa^2}{f_M f_Q}, \qquad u_* = \sqrt{C_M}\,U_{\mathrm{eff}} \tag{6.6}
 $$
 
-### 6.3 陰的 MYNN Level 2.5 PBL と 3D Smagorinsky–Lilly SGS
+### 6.3 陰的 MYNN Level 2.5 PBL クロージャ (`step_mynn_level25`)
 
-乱流運動エネルギーの 2 倍量 $q^2 = 2\,\mathrm{TKE}$ はシアー生成・浮力生成/抑制・鉛直輸送・粘性散逸の収支で予報される：
-
-$$
-\frac{\partial q^2}{\partial t} = 2\left(K_m S^2 - K_h N^2\right) + \frac{1}{\rho_d}\frac{\partial}{\partial z}\left(\rho_d K_q \frac{\partial q^2}{\partial z}\right) - \frac{2 q^3}{B_1 \ell} \tag{6.5}
-$$
-
-鉛直乱流拡散は float32 での保存性劣化を完全に防ぐ**増分形式の陰的三重対角 Thomas ソルバ**で解く：
+Nakanishi & Niino (2009) および SCALE-RM v5.5.5（Sec. 8.2.1, Eqs. 8.96–8.176）に準拠し、基礎定数 $B_1 = 24.0, B_2 = 15.0, C_2 = 0.75, C_3 = 0.352, C_5 = 0.20, \gamma_1 = 0.235, \mathrm{Pr}_N = 0.74$（導出定数 $A_1 = 1.180, A_2 = 0.6645, C_1 = 0.1371, \gamma_2 = 0.5525, R_{f1} = 0.3737, R_{f2} = 0.3131, R_{fc} = 0.2984$）を用いる。保存変数として液氷温位 $\theta_l$ をとり、接地層スケール $L_S$・乱流積分長 $L_T$・浮力長 $L_B$ の調和平均からマスター混合距離 $L$ を決定する：
 
 $$
-\left(\mathbf{I} + \Delta t\,\mathbf{L}_K\right)\Delta \phi = -\Delta t\,\mathbf{L}_K \phi^n, \qquad \phi^{n+1} = \phi^n + \Delta\phi \tag{6.6}
+\begin{aligned}
+\theta_l &= \theta - \frac{L_{v0} q_c + L_{s0} q_i}{c_{pd}\Pi}, \\
+L &= \big(L_S^{-1} + L_T^{-1} + L_B^{-1}\big)^{-1}
+\end{aligned} \tag{6.7}
 $$
 
-4 km CRM の水平サブグリッド渦粘性には浮力減衰付きの 3D Smagorinsky–Lilly 拡散を用いる：
+さらにサブグリッドガウス部分凝結スキーム（標準偏差 $\sigma_s$、規格化過飽和度 $Q_1$、部分雲量 $R$、有効雲量 $\tilde{R}$）により湿潤浮力振動数 $N^2$ を評価し、Level-2 平衡強度 $q_2^2$ との比 $\alpha_c$ から Level-2.5 安定度関数 $(S_M, S_H)$ および渦拡散係数 $(K_M, K_H)$ を求める：
 
 $$
-K_{m,h} = (C_s \Delta x)^2 \sqrt{\max\!\left(0,\ S_h^2 - \frac{N^2}{\mathrm{Pr}_n}\right)} \tag{6.7}
+\begin{aligned}
+\sigma_s &= \frac{1}{2}\,a L\sqrt{\frac{B_2}{2}}\left|\frac{\partial q_n}{\partial z} - b\frac{\partial \theta_l}{\partial z}\right|, \qquad Q_1 = \frac{a(q_n - q_{sl})}{2\sigma_s}, \\
+N^2 &= \frac{g}{\theta}\left(\beta_\theta\frac{\partial \theta_l}{\partial z} + \beta_q\frac{\partial q_n}{\partial z}\right), \\
+q_2^2 &= B_1 L^2 S_{M2}(1 - R_f) S^2, \qquad \alpha_c = \min\!\left(\frac{q}{q_2},\ 1\right), \\
+K_M &= L q S_M, \qquad K_H = L q S_H
+\end{aligned} \tag{6.8}
+$$
+
+乱流運動エネルギーの 2 倍量 $q^2 = 2e$ の時間発展は、正の生成項を陽的に、負の浮力減衰および粘性散逸 $2q/(B_1 L)$ と鉛直拡散（拡散係数 $3 K_M$）を陰的三重対角 Thomas ソルバで積分する：
+
+$$
+\frac{\partial q^2}{\partial t} = 2\left(K_M S^2 - K_H N^2\right) + \frac{1}{\rho_d}\frac{\partial}{\partial z}\left(3\rho_d K_M \frac{\partial q^2}{\partial z}\right) - \frac{2 q^3}{B_1 L} \tag{6.9}
+$$
+
+水平風 $(u, v)$ の陰的鉛直拡散では地表応力が風に逆らう場合（$\tau_{\mathrm{sfc}}\cdot u_0 < 0$）に最下層対角項へ陰的レイリー抗力 $r_{\mathrm{drag}}$ を組み込み、大時間刻みでの逆転振動を防ぐ。その後 $(\theta_l, q_n)$ を $K_H$ で陰的拡散して飽和調節を実行し $\theta_m$ を再構成する：
+
+$$
+r_{\mathrm{drag}} = \frac{|\tau_{\mathrm{sfc}}|}{\max(|u_0|,\ 0.10)} \tag{6.10}
+$$
+
+### 6.4 異方性 3D Smagorinsky–Lilly SGS クロージャ (`compute_smagorinsky_lilly_3d`)
+
+CRM の水平サブグリッド乱流混合には、扁平格子における等方長さと鉛直解像度の不整合を補正する Lilly (1962) および Scotti, Meneveau & Lilly (1993) のアスペクト比補正因子 $f(a)$（SCALE-RM Eqs. 8.25–8.40; $C_S = 0.18$, $\mathrm{Pr}_N = 0.70$, 臨界リチャードソン数 $\mathrm{Ri}_c = 0.25$, $g_c = (1 - \mathrm{Pr}_N)/\mathrm{Ri}_c = 1.2$）を適用する：
+
+$$
+\begin{aligned}
+a &= \max\!\left(\frac{\Delta_h}{\Delta z},\ \frac{\Delta z}{\Delta_h}\right), \qquad \lambda = f(a)(\Delta x\Delta y\Delta z)^{1/3}, \\
+\nu_{\mathrm{SGS}} &= \begin{cases} (C_S\lambda)^2 |S|\sqrt{1 - 16\,\mathrm{Ri}}, & \mathrm{Ri} < 0 \\ (C_S\lambda)^2 |S|(1 - \mathrm{Ri}/\mathrm{Ri}_c)^4, & 0 \le \mathrm{Ri} < \mathrm{Ri}_c \\ 0, & \mathrm{Ri} \ge \mathrm{Ri}_c \end{cases}, \\
+D_{\mathrm{SGS}} &= \begin{cases} \dfrac{(C_S\lambda)^2 |S|}{\mathrm{Pr}_N}\sqrt{1 - 40\,\mathrm{Ri}}, & \mathrm{Ri} < 0 \\ \dfrac{(C_S\lambda)^2 |S|}{\mathrm{Pr}_N}(1 - \mathrm{Ri}/\mathrm{Ri}_c)^4(1 - g_c\mathrm{Ri}), & 0 \le \mathrm{Ri} < \mathrm{Ri}_c \\ 0, & \mathrm{Ri} \ge \mathrm{Ri}_c \end{cases}
+\end{aligned} \tag{6.11}
 $$
 
 ---
 
-## 7. 陸面過程・MAML 水文・自律 EEO 生態系・陸域 C/N・山火事
+## 7. 陸面過程・自律 2 葉 $\mathrm{C}_3/\mathrm{C}_4$ EEO 生態系・土壌水文・陸域 C/N・山火事・河川流路
 
-### 7.1 陸面・生態系・水文結合の概要
+### 7.1 陸面・生態系・生物地球化学結合の全体像
 
-従来の ESM では「この格子は熱帯雨林」と静的な植生分類図 (PFT マップ) を張り付けるため、温暖化や氷期に植生帯が自律移動できない。AOBA は **生態進化最適性理論 (Eco-Evolutionary Optimality: EEO)**（Prentice et al., 2014; Wang et al., 2017; Smith et al., 2019; Cai et al., 2025）を採用する。自然選択のもとで植物は「光合成酵素 ($V_{c\max}, J_{\max}$) を維持するコスト」と「気孔を開いて水を失う蒸散コスト」の和を最小化しながら炭素同化を最大化する。これを各 CRM カラム直下の独立陸面パッチ（**MAML**）で解くことで、熱帯雨林・サバンナ・$\mathrm{C}_4$ 草原・砂漠・針葉樹林・ツンドラが日射・気温・$\mathrm{CO}_2$・降水から自律的に創発する。
+AOBA の陸面系は静的な植生機能型 (PFT) マップや土壌テクスチャマップを一切使用せず、各 CRM カラム直下の独立陸面タイル（MAML）において、2 葉群落放射伝達・自律 $\mathrm{C}_3/\mathrm{C}_4$ 生態進化最適性 (EEO) 光合成および呼吸順化・最適 LAI/常緑落葉比/根圏貯水容量/樹高予測・3 源エネルギー収支・積雪被覆ヒステリシスおよび SNICAR 暗化・5 層凍土 Richards 水文および熱伝導・サブグリッド地形微気候および動的湿地・Stocker–Prentice 陸域炭素窒素循環および 5 層永久凍土 C/N・MAML 離散パッチ SPITFIRE 山火事・Priority-Flood ボロノイ河川流路を結合して解く。
 
 ![図 7.1: MAML サブグリッド陸面・自律 EEO 生態系・土壌水文・陸域 C/N 循環](assets/fig_05_land_maml_eeo.svg)
 
-### 7.2 自律 Two-Leaf EEO 生態系 (`src/aoba/biosphere.py`)
+### 7.2 群落放射伝達・2 葉酵素最適配分・特異点フリー 2 ストリームアルベド (`src/aoba/biosphere.py`)
 
-最小コスト仮説により、葉内対大気 $\mathrm{CO}_2$ 濃度比 $\chi = c_i / c_a$ は空気の乾燥度（飽差 $D$）に応じて解析的に決まる：
-
-$$
-\chi = \frac{\Gamma^*}{c_a} + \left(1 - \frac{\Gamma^*}{c_a}\right)\frac{\xi}{\xi + \sqrt{D}}, \qquad \xi = \sqrt{\frac{\beta (K + \Gamma^*)}{1.6\,\eta^*}} \tag{7.1}
-$$
-
-光合成速度 $A$ は Rubisco 律速 ($A_c$) と電子伝達律速 ($A_j$) を曲率 $\theta = 0.85$ の非直角双曲線で滑らかに配位し、15 日間の正午 EMA で酵素容量 $(V_{c\max 25}, J_{\max 25})$ を順化する：
+McCree (1972) の光子換算係数（直達 $4.57$, 散乱 $4.24\ \mu\mathrm{mol\ J^{-1}}$）および de Pury & Farquhar (1997) に基づき、球面葉角分布下の露出葉面積指数 $L_c$ および葉面散乱係数（可視 $\sigma_{\mathrm{vis}} = 0.15$, 近赤外 $\sigma_{\mathrm{nir}} = 0.80$）に対する直達消散係数 $k_{db}$、散乱補正消散係数 $k'_b$、散乱光消散係数 $k'_d = 0.719$、直達・散乱群落頂面反射率 $(\rho_{cb}, \rho_{cd})$ を次式で定義する：
 
 $$
-\theta A^2 - (A_c + A_j) A + A_c A_j = 0, \qquad A = \frac{A_c + A_j - \sqrt{(A_c + A_j)^2 - 4\theta A_c A_j}}{2\theta} \tag{7.2}
+\begin{aligned}
+k_{db} &= \frac{0.5}{\max(\mu_0,\ 0.01)}, \qquad k'_b = k_{db}\sqrt{1 - \sigma_{\mathrm{vis}}}, \\
+\rho_h &= \frac{1 - \sqrt{1 - \sigma_{\mathrm{vis}}}}{1 + \sqrt{1 - \sigma_{\mathrm{vis}}}}, \qquad \rho_{cb} = \frac{2\rho_h k_{db}}{1 + k_{db}}, \qquad \rho_{cd} = 0.036
+\end{aligned} \tag{7.1}
 $$
 
-気孔コンダクタンス $g_{sw}$ は光合成と蒸散を直接結び付ける：
+これらを用いて群落全体・陽葉・陰葉の吸収光合成有効光量子束密度 $(I_c, I_{\mathrm{sun}}, I_{\mathrm{sh}})$ および陽葉・陰葉面積指数 $(L_{\mathrm{sun}}, L_{\mathrm{sh}})$ を解析計算する：
 
 $$
-g_{sw} = \frac{1.6\, A}{c_a (1 - \chi)} \tag{7.3}
-$$
-
-直射光の当たる**陽葉**と散乱光のみの**陰葉**の非線形応答を区別するため、Beer–Lambert 減衰係数 $k_b$ で葉面積指数 $L$ を解析的に 2 層分割する：
-
-$$
-L_{\mathrm{sun}} = \frac{1 - e^{-k_b L}}{k_b}, \qquad L_{\mathrm{shd}} = L - L_{\mathrm{sun}} \tag{7.4}
-$$
-
-平衡最適 **葉面積指数 ($L^*$)** は葉の建設コスト $z$ に対する純利益最大化の厳密解としてオーバーフローしない **Lambert-$W_0$ 関数** で閉形式表現され、根圏土壌水分ストレスで変調される：
-
-$$
-L^* = \frac{1}{k}\left[W_0\!\left(\frac{k\,A_0}{z}\right)\right] \cdot f_{\mathrm{water}}(\theta_{\mathrm{root}})^\sigma \tag{7.5}
-$$
-
-$\mathrm{C}_4$ 植物優占度 $F_4$ および常緑/落葉比率 $f_{\mathrm{evg}}$ も同様に、各戦略の年間純炭素利得の差から連続的に創発する：
-
-$$
-F_4 = \frac{1}{1 + \exp\!\big[-s_4 (P_{\mathrm{net,C4}} - P_{\mathrm{net,C3}})\big]}, \qquad f_{\mathrm{evg}} = \frac{1}{1 + \exp\!\big[-s_e (P_{\mathrm{net,evg}} - P_{\mathrm{net,dec}})\big]} \tag{7.6}
-$$
-
-### 7.3 3 源エネルギー収支・積雪 SNICAR・5 層凍土リチャーズ土壌 (`src/aoba/surface.py`)
-
-各 MAML パッチは陽葉・陰葉・地表面の **3 源連成エネルギー収支** を陰的反復（`land_eb_iterations = 3`）で解く：
-
-$$
-R_{n,\mathrm{can}} = H_{\mathrm{can}} + L_v E_{\mathrm{trans}} + L_v E_{\mathrm{int}}, \qquad R_{n,\mathrm{gnd}} = H_{\mathrm{gnd}} + L_v E_{\mathrm{soil}} + G_{\mathrm{soil}} \tag{7.7}
-$$
-
-積雪アルベドは時間経過とともに低下（エージング）し、`enable_snow_bc_darkening = true` 時は黒色炭素 (BC) やダスト沈着による **SNICAR 暗化効果**（Flanner et al., 2007）を反映する：
-
-$$
-\alpha_{\mathrm{snow,vis}} = \alpha_{\mathrm{old}} + (\alpha_{\mathrm{new}} - \alpha_{\mathrm{old}})e^{-t_{\mathrm{age}}/\tau_{\mathrm{age}}} - \Delta\alpha_{\mathrm{SNICAR}}(C_{\mathrm{BC}}, C_{\mathrm{dust}}) \tag{7.8}
-$$
-
-5 層土壌は氷の透水阻害（$10^{-\Omega f_{\mathrm{ice}}}$）を含む陰的三重対角 **Richards 水分輸送方程式** と、凍結・融解潜熱（*ゼロカーテン効果*）を含む **5 層熱伝導方程式** を解く：
-
-$$
-\frac{\partial \theta_\ell}{\partial t} = \frac{\partial}{\partial z}\left[K(\theta_\ell, f_{\mathrm{ice}})\left(\frac{\partial \psi(\theta_\ell)}{\partial z} + 1\right)\right] - S_{\mathrm{root}} \tag{7.9}
+\begin{aligned}
+I_c &= (1 - \rho_{cb}) I_{b0}\big(1 - e^{-k'_b L_c}\big) + (1 - \rho_{cd}) I_{d0}\big(1 - e^{-k'_d L_c}\big), \\
+L_{\mathrm{sun}} &= \frac{1 - e^{-k_{db} L_c}}{k_{db}}, \qquad L_{\mathrm{sh}} = L_c - L_{\mathrm{sun}}
+\end{aligned} \tag{7.2}
 $$
 
 $$
-\left(C_s + \rho_w L_{f0} \frac{\partial \theta_\ell}{\partial T}\right)\frac{\partial T_s}{\partial t} = \frac{\partial}{\partial z}\left(\kappa_s \frac{\partial T_s}{\partial z}\right) \tag{7.10}
+\begin{aligned}
+I_{\mathrm{sun}} &= I_{b0}(1 - \sigma_{\mathrm{vis}})\big(1 - e^{-k_{db} L_c}\big) + I_{b0}\!\left[\frac{(1-\rho_{cb})k'_b\big(1 - e^{-(k'_b+k_{db})L_c}\big)}{k'_b+k_{db}} - \frac{1-\sigma_{\mathrm{vis}}}{2}\big(1 - e^{-2k_{db} L_c}\big)\right] \\
+&\quad + I_{d0}\,\frac{(1-\rho_{cd})k'_d\big(1 - e^{-(k'_d+k_{db})L_c}\big)}{k'_d+k_{db}}, \\
+I_{\mathrm{sh}} &= \max(I_c - I_{\mathrm{sun}},\ 0)
+\end{aligned} \tag{7.3}
 $$
 
-### 7.4 MAML サブグリッド山岳微気候と動的湿地・湖沼 (`src/aoba/maml_land_subgrid.py`)
-
-200 km 四方の親セル内にも高山と谷、あるいは氾濫原の湿地が混在している。
-- **サブグリッド山岳微気候（`enable_maml_subgrid_topo`）**：`Earth2014` の地形標準偏差 $\sigma_{\mathrm{topo}}$ から各 MAML パッチ $m$ に親格子平均ゼロの標高差 $\Delta z_m$ と斜面方位を与え、湿潤気温減率 $\Gamma_m = 6.5\ \mathrm{K\ km^{-1}}$ で局所気温・雪線をダウンスケーリングする：
+群落全体の順化酵素容量 $X_{\mathrm{tot}}\in\{V_{c\max 25}, J_{\max 25}, V_{p\max 25}, R_{25}\}$ は、南中 EMA 平滑化入射放射 $(\tilde{I}_{b0}, \tilde{I}_{d0}, \tilde{k}'_b, \tilde{\rho}_{cb}, \tilde{I}_c)$ の鉛直吸収プロファイルに比例して最適配置されている（Field, 1983; Farquhar, 1989; de Pury & Farquhar, 1997）として、瞬間陽葉確率 $f_{\mathrm{sun}}(L) = e^{-k_{db} L}$ で積分した閉形式により陽葉・陰葉へ配分する：
 
 $$
-T_{\mathrm{air},m} = T_{\mathrm{air}} - \Gamma_m\,\Delta z_m, \qquad \sum_{m=1}^{N_{\mathrm{sub}}} \Delta z_m = 0 \tag{7.11}
+\begin{aligned}
+X_{\mathrm{sun}} &= \frac{X_{\mathrm{tot}}}{\tilde{I}_c}\left[\frac{(1-\tilde{\rho}_{cb})\tilde{k}'_b\tilde{I}_{b0}}{\tilde{k}'_b + k_{db}}\big(1 - e^{-(\tilde{k}'_b+k_{db})L_c}\big) + \frac{(1-\rho_{cd})k'_d\tilde{I}_{d0}}{k'_d + k_{db}}\big(1 - e^{-(k'_d+k_{db})L_c}\big)\right], \\
+X_{\mathrm{sh}} &= \max(X_{\mathrm{tot}} - X_{\mathrm{sun}},\ 10^{-6})
+\end{aligned} \tag{7.4}
 $$
 
-- **動的湿地・湖沼（`enable_maml_wetlands_lakes`）**：地形平坦度（TOPMODEL 指標）と土壌水分・河川流量から冠水率 $f_{\mathrm{wet}} \in [0, 0.85]$ を診断し、水面蒸発強化および自然湿地 $\mathrm{CH}_4$ 放出（第 10.5 節）へ結合する：
+地表面 VIS/NIR 直達・散乱群落アルベドおよび林床透過率は、球面葉角分布（$G(\mu) = 0.5, \bar{\mu} = 1.0$）に対する Sellers (1985) / Dai, Dickinson & Wang (2004, App. A) の 2 ストリーム解析解（特異点判別式 $\sigma_{\mathrm{sing}} = (\bar{\mu} k_{\mathrm{opt}})^2 - (b^2 - c^2) \to 0$ を微小正則化）で計算する。
+
+### 7.3 日次 EEO 光合成順化（$\mathrm{C}_3$ および $\mathrm{C}_4$ P-Model）と暗呼吸 (`src/aoba/biosphere.py`)
+
+南中時の入射可視放射・太陽天頂角・葉温 $T_g$・飽差 $D$ および夜間温度 $T_{\mathrm{night}}$ を 15 日時定数（$\alpha_{\mathrm{EMA}} = 0.067$; Mengoli et al., 2022）で指数移動平均し、さらに生育期（$T > 273.15\ \mathrm{K}$）の 3 年時定数順応温度 $T_{\mathrm{home}}$ を追跡する。水の相対粘性 $\eta^*(T)$（Vogel 式; Prentice et al., 2014）、光化学系 II 実効量子収率 $\phi_{\mathrm{PSII}}(T)$（Bernacchi et al., 2003; Smith et al., 2019）、および葉暗呼吸の MMRT 温度応答 $f_r(T)$（Heskel et al., 2016; Ren et al., 2024, 2025）は次式で与えられる（$T_C = T - 273.15$）：
 
 $$
-f_{\mathrm{wet}} = f_{\mathrm{flat}}(\sigma_{\mathrm{topo}})\cdot \operatorname{clamp}\!\left(\frac{\theta_{\mathrm{top}} - \theta_c}{\theta_{\mathrm{sat}} - \theta_c} + c_Q Q_{\mathrm{riv}},\ 0,\ 0.85\right) \tag{7.12}
+\begin{aligned}
+\eta^*(T) &= \frac{\exp\!\left(-3.719 + \dfrac{580}{T - 138}\right)}{\exp\!\left(-3.719 + \dfrac{580}{298.15 - 138}\right)}, \\
+\phi_{\mathrm{PSII}}(T) &= 0.257\,\frac{\max(0.352 + 0.022 T_C - 3.4\times 10^{-4} T_C^2,\ 0.02)}{0.656}, \\
+f_r(T) &= \exp\!\big(0.1012\,T_C - 0.0005\,T_C^2 - 2.2175\big)
+\end{aligned} \tag{7.5}
 $$
 
-### 7.5 陸域 6 プール C/N モデル・SPITFIRE 山火事・D8 河川流路 (`land_carbon.py`, `river_routing.py`)
-
-陸域炭素は 6 プール（葉・木部・根・リター・速/遅土壌炭素）を厳密指数更新で追跡し、無機窒素制限および生物的窒素固定 (BNF) と連成して純生態系生産量 $\mathrm{NBP}$ を大気 $\mathrm{CO}_2$ 収支へ渡す：
+酵素活性のピーク型 Arrhenius 温度応答（Kumarathunge et al., 2019; Schneider, Gessler & Stocker, 2025; 失活エネルギー $H_d = 200\ \mathrm{kJ\ mol^{-1}}$, 基準温度 $T_0 = 298.15\ \mathrm{K}$）は、生育温度 $T_g$ および多年生育環境温度 $T_{\mathrm{home}}$ に順応した活性化エネルギー $H_a$ とエントロピー因子 $\Delta S$ を用いて次式で表される：
 
 $$
-\mathrm{NBP} = \mathrm{GPP} - R_a - R_h(T_s, \theta) - F_{\mathrm{fire}} \tag{7.13}
+\begin{aligned}
+f_{\mathrm{enz}}(T; T_g, T_{\mathrm{home}}) &= \exp\!\left[\frac{H_a(T - T_0)}{R^* T_0 T}\right]\frac{1 + \exp\!\left(\dfrac{T_0\Delta S - H_d}{R^* T_0}\right)}{1 + \exp\!\left(\dfrac{T\Delta S - H_d}{R^* T}\right)}, \\
+H_{a,V}(T_g) &= 42600 + 1140\,T_{g,C}, \qquad \Delta S_V(T_g) = 645.13 - 0.38\,T_{g,C}, \\
+H_{a,J} &= 40710, \qquad \Delta S_J(T_g, T_{\mathrm{home}}) = 658.77 - 0.84\,T_{\mathrm{home},C} - 0.52(T_{g,C} - T_{\mathrm{home},C}), \\
+H_{a,P} &= 55000, \qquad \Delta S_P(T_g) = \Delta S_V(T_g)
+\end{aligned} \tag{7.6}
 $$
 
-山火事（`enable_fire_veg_feedback`; SPITFIRE）は CRM 発雷頻度（式 5.10）と乾燥度・燃料量から焼失面積を予報し、$\mathrm{CO}_2$・$\mathrm{CH}_4$・BC/OC 煙を放出する：
+**$\mathrm{C}_3$ P-Model（Smith et al., 2019, Eqs. 1–20）**：電子伝達速度 $J$ を非直角双曲線 $\theta J^2 - (\phi_{\mathrm{PSII}} I_{\mathrm{abs}} + J_{\max})J + \phi_{\mathrm{PSII}} I_{\mathrm{abs}} J_{\max} = 0$（曲率 $\theta = 0.85$、電子伝達限界コスト $c = 0.05336251$、水対カルボキシル化コスト比 $\beta_{\mathrm{C3}} = 146.0$）で表し、最小コスト仮説から気孔感度係数 $\xi_{\mathrm{C3}}$、最適葉内 $\mathrm{CO}_2$ 比 $\chi_{\mathrm{C3}}$、電子伝達因子 $m_{\mathrm{C3}}$ および閉形式最適係数 $(\omega, \omega^*)$ を算出する：
 
 $$
-\left(\frac{dA_{\mathrm{burn}}}{dt}\right) = P_{\mathrm{ign}}(F_{\mathrm{flash}})\cdot f_{\mathrm{dry}}(\mathrm{VPD}, \theta)\cdot R_{\mathrm{spread}}(U_{10}, C_{\mathrm{fuel}}) \tag{7.14}
+\begin{aligned}
+\xi_{\mathrm{C3}} &= \sqrt{\frac{\beta_{\mathrm{C3}}(K_{m,\mathrm{C3}} + \Gamma^*_{\mathrm{C3}})}{1.6\,\eta^*}}, \\
+\chi_{\mathrm{C3}} &= \operatorname{clamp}\!\left(\frac{\Gamma^*_{\mathrm{C3}}}{c_a} + \left(1 - \frac{\Gamma^*_{\mathrm{C3}}}{c_a}\right)\frac{\xi_{\mathrm{C3}}}{\xi_{\mathrm{C3}} + \sqrt{D}},\ 0.05,\ 0.95\right), \\
+m_{\mathrm{C3}} &= \frac{c_{i,\mathrm{C3}} - \Gamma^*_{\mathrm{C3}}}{c_{i,\mathrm{C3}} + 2\Gamma^*_{\mathrm{C3}}}, \qquad c_{i,\mathrm{C3}} = \chi_{\mathrm{C3}} c_a
+\end{aligned} \tag{7.7}
 $$
 
-陸域流出水は `Earth2014` 最急降下 D8 河川網（`enable_river_routing`）を Manning 流速 $v_{\mathrm{riv}}$ で流下し、沿岸海洋の塩分・栄養塩へ保存的に流入する：
+$$
+\begin{aligned}
+\omega &= -(1 - 2\theta) + \operatorname{sgn}\!\left(1 - 2\theta\frac{4c}{m}\right)\sqrt{(1 - \theta)\left[\frac{1}{\dfrac{4c}{m}\left(1 - \theta\dfrac{4c}{m}\right)} - 4\theta\right]}, \\
+\omega^* &= 1 + \omega - \sqrt{(1 + \omega)^2 - 4\theta\omega}
+\end{aligned} \tag{7.8}
+$$
+
+協調仮説（$A_c = A_j$）のもとで最適順化酵素容量 $(J_{\max,\mathrm{opt}}^{\mathrm{C3}}, V_{c\max,\mathrm{opt}}^{\mathrm{C3}})$ および $25^\circ\mathrm{C}$ 基準夜間呼吸容量 $R_{25}$（$b_{\mathrm{resp}} = 0.018$; Ren et al., 2025, Eq. 13）は次式で求まる（$m \le 4c$ ではゼロ）：
 
 $$
-\frac{dS_{\mathrm{riv},i}}{dt} = R_{\mathrm{runoff},i} + \sum_{j \in \mathrm{up}(i)} Q_{j\to i} - Q_{i\to\mathrm{dn}(i)}, \qquad Q_i = \frac{v_{\mathrm{riv},i}}{L_i} S_{\mathrm{riv},i} \tag{7.15}
+\begin{aligned}
+J_{\max,\mathrm{opt}}^{\mathrm{C3}} &= \phi_{\mathrm{PSII}} I_{\mathrm{abs}}\,\omega_{\mathrm{C3}}, \\
+A_{j,\mathrm{opt}}^{\mathrm{C3}} &= \frac{\phi_{\mathrm{PSII}} I_{\mathrm{abs}}\,m_{\mathrm{C3}}\,\omega^*_{\mathrm{C3}}}{8\theta}, \\
+V_{c\max,\mathrm{opt}}^{\mathrm{C3}} &= A_{j,\mathrm{opt}}^{\mathrm{C3}}\,\frac{c_{i,\mathrm{C3}} + K_{m,\mathrm{C3}}}{c_{i,\mathrm{C3}} - \Gamma^*_{\mathrm{C3}}}, \\
+R_{25} &= \frac{b_{\mathrm{resp}}\,V_{c\max,\mathrm{opt}}}{f_r(T_{\mathrm{night}})}
+\end{aligned} \tag{7.9}
+$$
+
+**$\mathrm{C}_4$ P-Model（Scott & Smith, 2022, JAMES, Eqs. 1–26; von Caemmerer, 2000）**：$\mathrm{C}_4$ 植物は葉肉細胞での PEPC 炭酸固定（ミカエリス定数 $K_{p25} = 60.5\ \mu\mathrm{mol\ mol^{-1}}$, $\Delta H_{a,K_p} = 27.2\ \mathrm{kJ\ mol^{-1}}$, $\beta_{\mathrm{C4}} = 166.0$）と維管束鞘細胞への $\mathrm{CO}_2$ 濃縮機構（漏出率 $\phi_L = 0.20$、維管束鞘コンダクタンス $g_{bs} = 0.003\ \mathrm{mol\ m^{-2}\ s^{-1}}$、$\Gamma^*_{25,\mathrm{C4}} = 2.60\ \mathrm{Pa}$, $K_{c25,\mathrm{C4}} = 121.0\ \mathrm{Pa}$, $K_{o25,\mathrm{C4}} = 29200\ \mathrm{Pa}$）を持つ。最適葉肉 $\mathrm{CO}_2$ 比 $\chi_{m,\mathrm{C4}}$ および葉肉分圧 $c_m = \chi_{m,\mathrm{C4}} c_a$ は次式で与えられる：
+
+$$
+\begin{aligned}
+\xi_{\mathrm{C4}} &= \sqrt{\frac{\beta_{\mathrm{C4}} K_p}{1.6\,\eta^*}}, \\
+\chi_{m,\mathrm{C4}} &= \operatorname{clamp}\!\left(\frac{\xi_{\mathrm{C4}}}{\xi_{\mathrm{C4}} + \sqrt{D}},\ 0.05,\ 0.92\right)
+\end{aligned} \tag{7.10}
+$$
+
+$\mathrm{C}_4$ の RuBP/PEP 再生に要する $5\ \mathrm{mol\ e^- / mol\ CO_2}$ 化学量論（比 $4/5 = 0.80$）、維管束鞘漏出 ATP 損失 $(1 - \phi_L)$（実効量子収率比 $0.64$）および低温感受性シグモイドゲート $g_{\mathrm{chill}}(T_g)$ を含め、2 回の不動点反復で維管束鞘 $\mathrm{CO}_2$ 分圧 $c_{bs}$ と光律速同化速度 $A_{l,\mathrm{opt}}^{\mathrm{C4}}$ を連立する：
+
+$$
+\begin{aligned}
+g_{\mathrm{chill}}(T_g) &= \frac{1}{1 + \exp\!\big(-0.35(T_{g,C} - 12.0)\big)}, \\
+m_{\mathrm{C4}} &= 0.80(1 - \phi_L)\,g_{\mathrm{chill}}(T_g)\,\frac{c_{bs} - \Gamma^*_{\mathrm{C4}}}{c_{bs} + 2\Gamma^*_{\mathrm{C4}}}, \\
+A_{l,\mathrm{opt}}^{\mathrm{C4}} &= \frac{\phi_{\mathrm{PSII}} I_{\mathrm{abs}}\,m_{\mathrm{C4}}\,\omega^*_{\mathrm{C4}}}{8\theta}
+\end{aligned} \tag{7.11}
+$$
+
+$$
+\begin{aligned}
+L_{\mathrm{leak}} &= \frac{\phi_L}{1 - \phi_L}\,A_{l,\mathrm{opt}}^{\mathrm{C4}}, \\
+c_{bs} &= c_m + \frac{L_{\mathrm{leak}}\times 10^{-6}}{g_{bs}\,\max(L_{\mathrm{exp}}, 0.1)}\,p_{\mathrm{sfc}}
+\end{aligned} \tag{7.12}
+$$
+
+収束後の 3 酵素配位（電子伝達・PEPC・Rubisco）の最適容量は次式で決まり、$\mathrm{C}_3$ と同じく 15 日 EMA で $25^\circ\mathrm{C}$ 基準プールへ順化される：
+
+$$
+\begin{aligned}
+J_{\max,\mathrm{opt}}^{\mathrm{C4}} &= \phi_{\mathrm{PSII}} I_{\mathrm{abs}}\,\omega_{\mathrm{C4}}, \\
+V_{p\max,\mathrm{opt}}^{\mathrm{C4}} &= \big(A_{l,\mathrm{opt}}^{\mathrm{C4}} + L_{\mathrm{leak}}\big)\frac{K_p + c_m}{c_m}, \\
+V_{c\max,\mathrm{opt}}^{\mathrm{C4}} &= A_{l,\mathrm{opt}}^{\mathrm{C4}}\,\frac{c_{bs} + K_{m,\mathrm{C4}}}{c_{bs} - \Gamma^*_{\mathrm{C4}}}
+\end{aligned} \tag{7.13}
+$$
+
+**自律 $\mathrm{C}_4$ 優占度 $F_4$（Scott & Smith, 2022, Eq. 26; Luo et al., 2024; Lavergne et al., 2026）**：南中純同化速度の相対優位度 $\Delta A_{\mathrm{rel}}$ に、閉鎖林冠下での $\mathrm{C}_4$ 草本被陰を表現する Beer–Lambert ギャップ透過率 $e^{-k L}$（$k = 0.50$）を乗じた目標値 $F_{4,\mathrm{tgt}}$ へ約 60 日時定数（$0.25\alpha_{\mathrm{EMA}}$）で緩和する：
+
+$$
+\begin{aligned}
+\Delta A_{\mathrm{rel}} &= \frac{A_{n,\mathrm{C4}}^{\mathrm{mid}} - A_{n,\mathrm{C3}}^{\mathrm{mid}}}{|A_{n,\mathrm{C3}}^{\mathrm{mid}}| + 1.0}, \\
+F_{4,\mathrm{tgt}} &= e^{-k L}\,\frac{1}{1 + \exp(-8\,\Delta A_{\mathrm{rel}})}
+\end{aligned} \tag{7.14}
+$$
+
+### 7.4 瞬間 2 葉ガス交換・$\mathrm{C}_3/\mathrm{C}_4$ リービッヒ共律速と重み付け混合・葉面境界層連成・土壌水分ストレス $\beta_{\mathrm{opt}}$
+
+日周ステップでは、順化気孔感度 $\xi(T_g)$ と量子収率 $\phi_{\mathrm{PSII}}(T_g)$ を日内一定に保持したまま（Schneider et al., 2025）、陽葉・陰葉（添字 $f\in\{\mathrm{sun}, \mathrm{sh}\}$）のそれぞれで土壌水分ストレス $\beta_{\mathrm{opt}}$ とピーク型 Arrhenius 応答により瞬時酵素活性 $(V_c, J_{\max}, V_p)$ を評価し、非直角双曲線（曲率 $\theta = 0.85$）で電子伝達速度 $(J_{\mathrm{C3}}, J_{\mathrm{C4}})$ を求める。
+
+AOBA は 2 葉（陽葉・陰葉）分割および MAML サブグリッド不均一性により群落スケールで自然な律速遷移を生じるため、単葉の双曲線平滑化に伴う協調点での系統的目減り（$\mathrm{C}_3$ で約 $-12\%$、$\mathrm{C}_4$ 二重平滑化で約 $-29\text{–}41\%$）を排し、各葉区分で厳密なリービッヒ最小値則（Farquhar et al., 1980; von Caemmerer, 2000）により $\mathrm{C}_3$ および $\mathrm{C}_4$ 総同化速度 $(A_{\mathrm{C3}}, A_{\mathrm{C4}})$ を算出する：
+
+$$
+\begin{aligned}
+A_{c,\mathrm{C3}} &= V_{c,\mathrm{C3}}\,\max\!\left(\frac{c_{i,\mathrm{C3}} - \Gamma^*_{\mathrm{C3}}}{c_{i,\mathrm{C3}} + K_{m,\mathrm{C3}}},\ 0\right), \qquad A_{j,\mathrm{C3}} = \frac{J_{\mathrm{C3}}}{4}\,\max\!\left(\frac{c_{i,\mathrm{C3}} - \Gamma^*_{\mathrm{C3}}}{c_{i,\mathrm{C3}} + 2\Gamma^*_{\mathrm{C3}}},\ 0\right), \\
+A_{\mathrm{C3}} &= \min\!\big(A_{c,\mathrm{C3}},\ A_{j,\mathrm{C3}}\big)
+\end{aligned} \tag{7.15}
+$$
+
+$$
+\begin{aligned}
+A_{c,\mathrm{C4}} &= V_{c,\mathrm{C4}}, \qquad A_{l,\mathrm{C4}} = 0.20(1 - \phi_L)\,J_{\mathrm{C4}}\,g_{\mathrm{chill}}(T_l), \\
+A_{p,\mathrm{C4}} &= (1 - \phi_L)\,V_{p,\mathrm{C4}}\,\frac{c_{m,\mathrm{C4}}}{\max(c_{m,\mathrm{C4}} + K_p,\ 0.5)}, \\
+A_{\mathrm{C4}} &= \min\!\big(A_{c,\mathrm{C4}},\ A_{l,\mathrm{C4}},\ A_{p,\mathrm{C4}}\big)
+\end{aligned} \tag{7.16}
+$$
+
+ここで $T_l$ は陽葉または陰葉の葉温である。式 (7.15)–(7.16) により、南中順化点における瞬時同化速度は式 (7.9) および式 (7.11) の協調順化速度へ厳密比 $1.000$ で一致する。各経路の気孔コンダクタンス（モル単位）および自律優占度 $F_4$ による $\mathrm{C}_3/\mathrm{C}_4$ 重み付け混合（総同化 $A_{\mathrm{mix}}$・葉呼吸 $R_{d,\mathrm{mix}}$・気孔コンダクタンス $g_{sw,\mathrm{mol}}$、残留クチクラ最小値 $g_0 = 0.002\,\beta_{\mathrm{opt}}\ \mathrm{mol\ m^{-2}\ s^{-1}}$）は次式で与えられる：
+
+$$
+\begin{aligned}
+g_{sw,3} &= \frac{1.6\,\max(A_{\mathrm{C3}} - R_{d,\mathrm{C3}},\ 0)\times 10^{-6}}{\max\!\big((c_s/p_{\mathrm{sfc}})(1 - \chi_{\mathrm{C3}}),\ 10^{-6}\big)}, \\
+g_{sw,4} &= \frac{1.6\,\max(A_{\mathrm{C4}} - R_{d,\mathrm{C4}},\ 0)\times 10^{-6}}{\max\!\big((c_s/p_{\mathrm{sfc}})(1 - \chi_{m,\mathrm{C4}}),\ 10^{-6}\big)}, \\
+A_{\mathrm{mix}} &= (1 - F_4) A_{\mathrm{C3}} + F_4 A_{\mathrm{C4}}, \\
+R_{d,\mathrm{mix}} &= (1 - F_4) R_{d,\mathrm{C3}} + F_4 R_{d,\mathrm{C4}}, \\
+g_{sw,\mathrm{mol}} &= (1 - F_4) g_{sw,3} + F_4 g_{sw,4} + g_0
+\end{aligned} \tag{7.17}
+$$
+
+さらに葉面境界層コンダクタンス $g_{bw}$ との直列連成を二重計上なく整合させるため、葉面 $\mathrm{CO}_2$ 分圧 $c_s$ および葉面飽差 $D_s$ について 2 回の不動点反復を実行する（$\mathrm{CO}_2$ 境界層コンダクタンス $g_{bc} = g_{bw}/1.37$; Dai et al., 2004, Eqs. 11, 45; Bonan et al., 2018）：
+
+$$
+\begin{aligned}
+c_s &= \operatorname{clamp}\!\left(c_a - \frac{\max(A_{\mathrm{mix}} - R_{d,\mathrm{mix}},\ 0)\times 10^{-6}}{g_{bc}}\,p_{\mathrm{sfc}},\ 0.35\,c_a,\ c_a\right), \\
+D_s &= \max\!\left(\frac{g_{bw}}{g_{bw} + g_{sw,\mathrm{mol}}}\,D_{\mathrm{af}},\ 20.0\right), \\
+g_{sw,\mathrm{ms}} &= g_{sw,\mathrm{mol}}\,\frac{R^* T_l}{p_{\mathrm{sfc}}}
+\end{aligned} \tag{7.18}
+$$
+
+気孔土壌水分ストレス係数 $\beta_{\mathrm{opt}}\in[0,1]$ は経験的閾値を用いず、Holtzman et al. (2024, Eqs. 2, 7) および Lu, Duursma & Medlyn (2016) の時間積分最適気孔理論により、気候学的生育期最長無降雨日数 $D_{\max}$ から決まる乾燥時定数 $\tau$、15 日平均潜在蒸発散量 $E_{\mathrm{pot}}$、根圏貯水容量 $S_R$ および根圏有効液相水分 $W_{\mathrm{avail}}$（下限 $w_c = 0.05 S_R$）から求める：
+
+$$
+\begin{aligned}
+\tau &= 0.85\,D_{\max} + 6.59\ [\mathrm{days}], \\
+\beta_{\mathrm{opt}} &= \operatorname{clamp}\!\left(\sqrt{\frac{\max(W_{\mathrm{avail}} - w_c,\ 0)}{\max(\tau E_{\mathrm{pot}},\ 0.10 S_R)}},\ 0,\ 1\right)
+\end{aligned} \tag{7.19}
+$$
+
+### 7.5 予報 EEO 葉面積指数（Lambert-$W_0$ 導出）・常緑/落葉比・根圏容量 $S_R$・樹高 $h_c$
+
+日次更新 `update_daily_lai_root_height` では、完全被覆（$\mathrm{fAPAR} = 1$）時の日次潜在総一次生産 $A_{0,\mathrm{day}}$（Körner, 2012 の $5^\circ\mathrm{C}$ 維管束成長ゲート付き）および土壌水分ゲート付き生産 $A_{0,\mathrm{fav}}$ を定義し、年次 EMA 積算値（$A_{0,\mathrm{yr}}, A_{0,\mathrm{fav,yr}}$, 年降水量 $P_{\mathrm{yr}}$, 年潜在蒸発散量 $\mathrm{PET}_{\mathrm{yr}}$, 生育期割合 $f_{\mathrm{gsl}}$）から群落構造を決定する：
+
+$$
+\begin{aligned}
+A_{0,\mathrm{day}} &= \mathrm{LUE}_{\mathrm{C3}}\,\mathrm{PPFD}_{\mathrm{day}}\,\frac{1}{1 + \exp\!\big(-0.5(T_C - 5.0)\big)}, \\
+A_{0,\mathrm{fav}} &= A_{0,\mathrm{day}}\,\beta_{\mathrm{opt}}
+\end{aligned} \tag{7.20}
+$$
+
+**1. 年間上限 $\mathrm{fAPAR}_{\max}$ と $L_{\max}$（Cai et al., 2025, Eqs. 1–2, 12; Zhou et al., 2025, Eq. 6）**：乾燥指数 $\mathrm{AI} = \mathrm{PET}_{\mathrm{yr}} / P_{\mathrm{yr}}$ に対する利用可能降水率 $f_0(\mathrm{AI})$ から水律速上限 $\mathrm{fAPAR}_w$ を、葉の年次実効建設コスト $z_{\mathrm{eff}}$ から光・エネルギー律速上限 $\mathrm{fAPAR}_c$（限界利益条件 $\partial[A_{0,\mathrm{yr}}(1 - e^{-k L}) - z_{\mathrm{eff}} L]/\partial L = 0$ の解）を算出し、対数和指数平滑最小（$K_{\mathrm{lse}} = 10$）で結合する：
+
+$$
+\begin{aligned}
+\mathrm{AI} &= \frac{\mathrm{PET}_{\mathrm{yr}}}{\max(P_{\mathrm{yr}},\ 1.0)}, \\
+f_0(\mathrm{AI}) &= 0.65\exp\!\left(-0.604169\left[\ln\frac{\max(\mathrm{AI},\ 1.9)}{1.9}\right]^2\right), \\
+\mathrm{fAPAR}_w &= \frac{f_0(\mathrm{AI})\,P_{\mathrm{mol,yr}}\,c_a(1 - \chi_{\mathrm{C3}})}{1.6\,D\,A_{0,\mathrm{yr}}}, \qquad \mathrm{fAPAR}_c = 1 - \frac{z_{\mathrm{eff}}}{k A_{0,\mathrm{yr}}}
+\end{aligned} \tag{7.21}
+$$
+
+$$
+\begin{aligned}
+\mathrm{fAPAR}_{\max} &= \operatorname{clamp}\!\Big(\operatorname{lsemin}_{K=10}(\mathrm{fAPAR}_w,\ \mathrm{fAPAR}_c),\ 0,\ 0.96\Big), \\
+L_{\max} &= -\frac{1}{k}\ln(1 - \mathrm{fAPAR}_{\max})
+\end{aligned} \tag{7.22}
+$$
+
+**2. 季節定常落葉葉面積指数 $L_s$ と Lambert-$W_0$ 厳密解の導出（Zhou et al., 2025, Eqs. 15–20）**：季節的な葉面積の炭素収支均衡は、1 日の光合成同化量 $A_{0,\mathrm{fav}}(1 - e^{-k L_s})$ に葉への炭素配分効率 $m_{\mathrm{alloc}}$（配分係数 $\sigma_{\mathrm{Zhou}} = 0.771$、生育期日数 $\mathrm{GSL}$）を乗じた葉生成量が現存葉面積 $L_s$ の代謝・落葉損失と釣り合う不動点方程式で与えられる：
+
+$$
+\begin{aligned}
+m_{\mathrm{alloc}} &= \frac{\sigma_{\mathrm{Zhou}}\,\mathrm{GSL}\,L_{\max}}{A_{0,\mathrm{fav,yr}}\,\mathrm{fAPAR}_{\max}}, \qquad \mu = m_{\mathrm{alloc}}\,A_{0,\mathrm{day}}\,\beta_{\mathrm{opt}}, \\
+L_s &= \mu\left(1 - e^{-k L_s}\right)
+\end{aligned} \tag{7.23}
+$$
+
+式 (7.23) を $k(L_s - \mu) = -k\mu e^{-k L_s} = -k\mu e^{-k\mu} e^{-k(L_s - \mu)}$ すなわち $[-k(L_s - \mu)]e^{-k(L_s - \mu)} = -k\mu e^{-k\mu}$ と変形すると、Lambert-$W$ 関数の主枝 $W_0$（$W_0(x)e^{W_0(x)} = x$, Halley 3 次反復 5 回で評価）により厳密閉形式解が得られる：
+
+$$
+L_s = \min\!\left(\mu + \frac{1}{k} W_0\!\left(-k\mu e^{-k\mu}\right),\ L_{\max}\right) \tag{7.24}
+$$
+
+ここで $u = k\mu \le 1$ のとき $W_0(-u e^{-u}) = -u$ となって $L_s \equiv 0$（群落が自己維持できない休眠・乾燥状態）、$u > 1$ のとき $W_0(-u e^{-u}) \in (-1, 0) > -u$ となって正の定常葉面積 $L_s > 0$ が滑らかに立ち上がる。
+
+**3. 自律常緑・落葉葉習性 $f_{\mathrm{evg}}$ と窒素・低温結合実効コスト $z_{\mathrm{eff}}$（Kikuzawa, 1991; Givnish, 2002; Sakai & Larcher, 1987; Wang et al., 2023）**：落葉コスト $c_{\mathrm{dec}} = 12.227\ \mathrm{mol\ C\ m^{-2}\ yr^{-1}}$ に対し、年最低気温 $T_{\min,\mathrm{yr}}$ における耐寒強化因子 $f_{\mathrm{cold}}$、常緑葉建設コスト $c_{\mathrm{evg}}$、針葉光合成効率 $\eta_{\mathrm{evg}}$ および $-40^\circ\mathrm{C}$ 以下の極寒凍害ペナルティ $\mathrm{frost}_{\mathrm{pen}}$ を次式で定める：
+
+$$
+\begin{aligned}
+f_{\mathrm{cold}} &= \sigma\!\left(\frac{273.15 - T_{\min,\mathrm{yr}}}{5.0}\right), \\
+c_{\mathrm{evg}} &= (1.35 + 0.55\,f_{\mathrm{cold}})\,c_{\mathrm{dec}}, \qquad \eta_{\mathrm{evg}} = 1 - 0.14\,f_{\mathrm{cold}}, \\
+\mathrm{frost}_{\mathrm{pen}} &= 18.0\,\sigma\!\left(\frac{233.15 - T_{\min,\mathrm{yr}}}{4.0}\right)
+\end{aligned} \tag{7.25}
+$$
+
+Kikuzawa (1991, Eq. 5) の最適常緑葉寿命 $\tau_{\mathrm{evg}}$（葉老化時定数 $b = 15\ \mathrm{yr}$）、非生育期維持呼吸 $f_{\mathrm{resp,off}}$（$Q_{10}\approx 2$）および落葉展葉遅延（25 日）を用いて常緑・落葉の年間純炭素利得 $(g_{\mathrm{evg}}, g_{\mathrm{dec}})$ と常緑優占度目標 $f_{\mathrm{evg,tgt}}$ を評価する：
+
+$$
+\begin{aligned}
+\tau_{\mathrm{evg}} &= \operatorname{clamp}\!\left(\sqrt{\frac{2 b\, c_{\mathrm{evg}}}{\eta_{\mathrm{evg}} a_{\mathrm{leaf}}}},\ 1,\ 7\right), \\
+g_{\mathrm{evg}} &= \eta_{\mathrm{evg}}\!\left(1 - \frac{\tau_{\mathrm{evg}}}{2b}\right)a_{\mathrm{leaf}} - \frac{c_{\mathrm{evg}}}{\tau_{\mathrm{evg}}} - 32\,f_{\mathrm{resp,off}}(1 - f_{\mathrm{gsl}}) - \mathrm{frost}_{\mathrm{pen}}, \\
+g_{\mathrm{dec}} &= \left(1 - \frac{25}{365.2425 f_{\mathrm{gsl}}}\right)\!\left(1 - \frac{f_{\mathrm{gsl}}}{2 b_{\mathrm{dec}}}\right)a_{\mathrm{leaf}} - c_{\mathrm{dec}}, \\
+f_{\mathrm{evg,tgt}} &= \sigma\!\left(\frac{4(g_{\mathrm{evg}} - g_{\mathrm{dec}})}{c_{\mathrm{dec}}}\right)
+\end{aligned} \tag{7.26}
+$$
+
+常緑葉の償却コスト・短生育期凍土ペナルティ・陸域 CN モデル（第 7.8 節）の窒素充足度 $\phi_N \in [0.25, 1.0]$（Stocker & Prentice, 2024）を統合して実効葉建設コスト $z_{\mathrm{eff}}$ を定め、常緑成分 $L_{\mathrm{evg}}$（時定数 $\tau_{\mathrm{evg}}$、$-40^\circ\mathrm{C}$ 急性凍死付き）と落葉成分 $L_{\mathrm{dec}}$（15 日 EMA）の 2 時間スケールで総葉面積 $L = L_{\mathrm{evg}} + L_{\mathrm{dec}}$ を予報する：
+
+$$
+z_{\mathrm{eff}} = \max\!\left((1 - f_{\mathrm{evg}})c_{\mathrm{dec}} + f_{\mathrm{evg}}\frac{c_{\mathrm{evg}}}{\tau_{\mathrm{evg}}},\ 0.55\,c_{\mathrm{dec}}\right)\Big[1 + 1.5\,\sigma\big(20(0.28 - f_{\mathrm{gsl}})\big)\Big]\Big[1 + 0.80(1 - \phi_N)\Big] \tag{7.27}
+$$
+
+**4. 最適耐乾根圏貯水容量 $S_R$（Gao et al., 2014; Davis et al., 2017）**：植物が乾季を乗り切るために発達させる最小限の根圏貯水容量を、日次の累積水不足量 $D_{\mathrm{cum}}$（蒸発散需要が降水量を上回る期間に積算され、湿潤期にゼロへ回復）から算出し、乾燥拡大時は 10 倍速い非対称ラチェット応答（$10\alpha_{\mathrm{yr}}$ 対 $\alpha_{\mathrm{yr}}$）で適応させる：
+
+$$
+\begin{aligned}
+D_{\mathrm{cum}}^{n+1} &= \operatorname{clamp}\!\big(D_{\mathrm{cum}}^n + \mathrm{fAPAR}_{\max}\mathrm{PET}_{\mathrm{day}} - P_{\mathrm{day}},\ 0,\ 800\big)\ [\mathrm{mm}], \\
+S_{R,\mathrm{tgt}} &= \operatorname{clamp}\!\big(50 + 1.35\,D_{\mathrm{cum}},\ 50,\ 650\big)\ [\mathrm{kg\ m^{-2}}]
+\end{aligned} \tag{7.28}
+$$
+
+**5. 利用可能水収支指数・生産指数および森林限界による潜在樹高 $h_c$（Kempes et al., 2011; Körner, 2012; Paulsen & Körner, 2014）**：樹木の最大到達樹高は、維管束水輸送の重力・摩擦損失を支える水収支余裕度（利用可能水収支指数 $\mathrm{MI}$：年降水量と年潜在蒸発散量の比で湿潤度を無次元化、$1.2$ で飽和）、幹・枝の木部建設を支える年間炭素供給量（群落生産指数 $\mathrm{PI}$：基準年生産 $180\ \mathrm{mol\ C\ m^{-2}\ yr^{-1}}$ に対する比）、および形成層木部細胞分裂の低温下限（日平均 $5^\circ\mathrm{C}$ 超の生育期間 $\ge 94$ 日すなわち $f_{\mathrm{gsl}} \approx 0.30$ での熱的森林限界ゲート）の積で決まり、1 年時定数 EMA で更新する：
+
+$$
+\begin{aligned}
+\mathrm{MI} &= \operatorname{clamp}\!\left(\frac{P_{\mathrm{yr}}}{\max(\mathrm{PET}_{\mathrm{yr}},\ 1.0)},\ 0,\ 1.2\right), \\
+\mathrm{PI} &= \operatorname{clamp}\!\left(\frac{\mathrm{fAPAR}_{\max}\,A_{0,\mathrm{yr}}}{180.0},\ 0,\ 2.0\right), \\
+h_{c,\mathrm{tgt}} &= \operatorname{clamp}\!\Big(34.0\,\mathrm{MI}^{0.85}\,\mathrm{PI}^{0.75}\,\sigma\big(30(f_{\mathrm{gsl}} - 0.30)\big),\ 0.05,\ 40.0\Big)\ [\mathrm{m}]
+\end{aligned} \tag{7.29}
+$$
+
+### 7.6 3 源エネルギー収支・積雪ヒステリシス/SNICAR・5 層凍土 Richards 土壌 (`src/aoba/surface.py`)
+
+**積雪被覆率・樹冠埋没・積雪/裸地アルベド・SNICAR 暗化**：Swenson & Lawrence (2012, Eqs. 4–6) に従い、季節最大積雪水量 $S_{n,\max}$ とサブグリッド地形粗度 $\sigma_{\mathrm{topo}}$ により決まる融雪形状指数 $N_{\mathrm{melt}}$ から積雪・融雪ヒステリシス付き被覆率 $A_{\mathrm{sn}}$ を診断し、MATSIRO6 (2021, Eqs. 2.1–2.3) により積雪深 $d_{\mathrm{sn}} = S_n/\rho_{\mathrm{sn}}$（$\rho_{\mathrm{sn}} = 250\ \mathrm{kg\ m^{-3}}$）による樹冠埋没後の露出樹高 $h_{\mathrm{exp}}$ および露出葉面積 $L_{\mathrm{exp}}$ を評価する：
+
+$$
+\begin{aligned}
+N_{\mathrm{melt}} &= \frac{200}{\operatorname{clamp}(\sigma_{\mathrm{topo}},\ 10,\ 1000)}, \\
+A_{\mathrm{sn}} &= \min\!\left(\tanh\frac{S_n}{25},\ 1 - \left[\frac{\arccos(2 S_n/S_{n,\max} - 1)}{\pi}\right]^{N_{\mathrm{melt}}}\right), \\
+h_{\mathrm{exp}} &= (1 - A_{\mathrm{sn}})h_c + A_{\mathrm{sn}}\max(h_c - d_{\mathrm{sn}},\ 0), \qquad L_{\mathrm{exp}} = L\frac{h_{\mathrm{exp}}}{\max(h_c,\ 0.05)}
+\end{aligned} \tag{7.30}
+$$
+
+積雪アルベドは Yang et al. (1997) / MATSIRO6 の無次元雪齢 $A_g$（時定数 $\tau_{\mathrm{age}} = 10^6\ \mathrm{s}$, 太陽天頂角補正 $0.4(1-\mu_0)^5$）で VIS ($0.90\to 0.65$)・NIR ($0.70\to 0.35$) を更新する。`enable_snow_bc_darkening = true` 時は表層 2 cm の黒色炭素・ダスト負荷 $(C_{\mathrm{BC}}, C_{\mathrm{dust}})$（新雪 $15\ \mathrm{kg\ m^{-2}}$ 埋没および 45 日流出で指数減衰）による SNICAR 可視暗化率 $d_{\mathrm{frac}}$（Flanner et al., 2007）を適用し、裸地アルベドは表層土壌飽和度 $s_0$ に応じた連続湿潤暗化（CLM4.5 Sec. 3.2）を用いる：
+
+$$
+\begin{aligned}
+d_{\mathrm{frac}} &= \operatorname{clamp}\!\big(180\sqrt{C_{\mathrm{BC}}} + 3.5\sqrt{C_{\mathrm{dust}}},\ 0,\ 0.45\big), \\
+\alpha_{\mathrm{soil,vis}} &= 0.14 + 0.14(1 - s_0)^{1.5}, \qquad \alpha_{\mathrm{soil,nir}} = 0.28 + 0.22(1 - s_0)^{1.5}
+\end{aligned} \tag{7.31}
+$$
+
+**CLM5 樹冠遮断・乾燥表層 (DSL) 土壌蒸発抵抗・3 源 $3\times 3$ Newton エネルギー収支**：液相樹冠遮断率 $f_{\mathrm{int}}$、最大貯水量 $W_{c,\max}$、湿潤葉面積割合 $f_{\mathrm{wet}}$（水収支制限付き $f_{\mathrm{wet,eff}}$; CLM5 Eqs. 7.4, 7.12, 7.23）、および裸地土壌蒸発における Kelvin 間隙相対湿度 $h_{\mathrm{soil}}$ と乾燥表層 (DSL) 土壌蒸発抵抗 $r_{\mathrm{soil}}$（Swenson & Lawrence, 2014; CLM5 Eqs. 5.72–5.81; 最大乾燥表層厚 $d_{\mathrm{sl}} \le 15\ \mathrm{mm}$、屈曲度 $\tau_{\mathrm{soil}}$、水蒸気拡散係数 $D_{\mathrm{vap}}(T)$）は次式で与えられる：
+
+$$
+\begin{aligned}
+f_{\mathrm{int}} &= \tanh(L_{\mathrm{exp}}), \qquad W_{c,\max} = 0.10\,L_{\mathrm{exp}}, \qquad f_{\mathrm{wet}} = \left(\frac{W_c}{W_{c,\max}}\right)^{2/3}, \\
+h_{\mathrm{soil}} &= \exp\!\left(\frac{\psi_0 g}{R_v T_{s,0}}\right), \qquad r_{\mathrm{soil}} = \frac{d_{\mathrm{sl}}}{D_{\mathrm{vap}}(T_{s,0})\,\tau_{\mathrm{soil}}}
+\end{aligned} \tag{7.32}
+$$
+
+林冠下空力抵抗 $r_{d,\mathrm{uc}}$ および陽葉・陰葉境界層コンダクタンス $(g_{b,\mathrm{sun}}, g_{b,\mathrm{sh}})$ のもとで、陽葉温度 $T_{\mathrm{sun}}$・陰葉温度 $T_{\mathrm{sh}}$・地表面温度 $T_{\mathrm{gnd}}$ の 3 源エネルギー収支および林冠空気 $(T_{\mathrm{af}}, q_{\mathrm{af}})$・気孔コンダクタンスを $3\times 3$ 余因子ヤコビアン Newton 法（`LAND_EB_ITERATIONS = 3`）で連成解法する：
+
+$$
+R_{n,i} - H_i(T_i, T_{\mathrm{af}}) - \lambda_i E_i(T_i, q_{\mathrm{af}}) - \delta_{i,2} G_0(T_{\mathrm{gnd}}, T_{s,0}) = 0, \qquad i \in \{\mathrm{sun}, \mathrm{sh}, \mathrm{gnd}\} \tag{7.33}
+$$
+
+積雪融解時は $T_{\mathrm{gnd}} \le 273.15\ \mathrm{K}$ にクランプして余剰熱を融雪潜熱へ振り分け、積雪水量が上限 $S_{\max} = 1000\ \mathrm{kg\ m^{-2}}$ を超えた分を氷河流出（calving）として分離するとともに気候的表面質量収支 $\mathrm{SMB}$ を記録する。
+
+**動的根系深さ・5 層陰的 Richards 土壌水文・エンタルピー保存凍土熱伝導**：鉛直 5 層（層厚 $0.05, 0.15, 0.40, 0.80, 1.60\ \mathrm{m}$, 総厚 $3.00\ \mathrm{m}$）の汎用ローム土壌（間隙率 $w_{\mathrm{sat}} = 0.43$, 飽和マトリックポテンシャル $\psi_s = -0.20\ \mathrm{m}$, Clapp–Hornberger 指数 $b = 5.39$, 飽和透水係数 $K_{\mathrm{sat}} = 7.0\times 10^{-6}\ \mathrm{m\ s^{-1}}$）において、最適根圏容量 $S_R$ から動的根系深さ $z_{\mathrm{root}}$、凍土透水阻害係数 $f_{\mathrm{ice}}$（Swenson et al., 2012; CLM5 Eq. 7.89）、および飽和/凍土不浸透地表流出率 $f_{\mathrm{sat}}$ を定める：
+
+$$
+\begin{aligned}
+z_{\mathrm{root}} &= \operatorname{clamp}\!\left(\frac{S_R}{\rho_w(\theta_{\mathrm{fc}} - \theta_{\mathrm{wp}})},\ 0.15,\ 3.0\right)\ [\mathrm{m}], \\
+f_{\mathrm{ice}} &= 10^{-6\,w_i/w_{\mathrm{sat}}}, \qquad f_{\mathrm{sat}} = (1 - f_{\mathrm{ice},0}) + f_{\mathrm{ice},0}\,s_0^4
+\end{aligned} \tag{7.34}
+$$
+
+下端自由重力排水 $q_{\mathrm{drain}} = K_{\mathrm{bot}}$ を含む線形化陰的三重対角 Richards 方程式を解く：
+
+$$
+\begin{aligned}
+\frac{\partial \theta_\ell}{\partial t} &= \frac{\partial}{\partial z}\left[f_{\mathrm{ice}} K_{\mathrm{sat}}\left(\frac{\theta_\ell}{w_{\mathrm{sat}}}\right)^{2b+3}\left(\frac{\partial \psi(\theta_\ell)}{\partial z} + 1\right)\right] - S_{\mathrm{root}}, \\
+\psi(\theta_\ell) &= \psi_s\left(\frac{\theta_\ell}{w_{\mathrm{sat}}}\right)^{-b}
+\end{aligned} \tag{7.35}
+$$
+
+土壌熱伝導では SCALE-RM Sec. 8.7.1 および MATSIRO6 Ch. 10 に従い、層体積熱容量 $C_{\mathrm{vol},k}$ および氷融解潜熱を含む層内部エネルギー $U_k$ を厳密保存する $0^\circ\mathrm{C}$ 相変化（ゼロカーテン効果）を適用したのち、水分・氷依存熱伝導率 $\kappa_s$ による陰的 Fourier 熱拡散を 5 層 Thomas ソルバで積分する：
+
+$$
+\begin{aligned}
+C_{\mathrm{vol},k} &= 1.26\times 10^6 + c_\ell\rho_w w_{\ell,k} + c_i\rho_i w_{i,k}, \\
+U_k &= C_{\mathrm{vol},k}(T_{s,k} - T_0) - L_{f0}\rho_i w_{i,k}, \\
+\kappa_{s,k} &= 0.30\left[1 + 5.5\tanh\!\left(\frac{w_{\ell,k} + w_{i,k}}{0.25}\right)\right] + 0.8\,w_{i,k}
+\end{aligned} \tag{7.36}
+$$
+
+### 7.7 MAML サブグリッド山岳微気候および動的湿地・湖沼 (`src/aoba/maml_land_subgrid.py`)
+
+`enable_maml_subgrid_topo = true` 時、`Earth2014` 標高標準偏差 $\sigma_{\mathrm{topo}}$ から各親セル内 $N_{\mathrm{sub}} = N_y N_x$ 個の MAML タイルへ親セル平均ゼロの対称標高分位点 $\Delta z_m \in [-1800, 1800]\ \mathrm{m}$ と交互斜面方位による日射変調因子 $s_{\mathrm{sw},m}$ を与え、気温減率 $\Gamma_m = 6.5\ \mathrm{K\ km^{-1}}$ および静水圧測高で微気候ダウンスケーリングする（Fiddes & Gruber, 2014）：
+
+$$
+\begin{aligned}
+T_{\mathrm{air},m} &= T_{\mathrm{air}} - \Gamma_m\Delta z_m, \qquad p_{\mathrm{sfc},m} = p_{\mathrm{sfc}}\exp\!\left(-\frac{g\Delta z_m}{R_d T_{\mathrm{air}}}\right), \\
+s_{\mathrm{sw},m} &= 1 \pm 0.12\min\!\left(\frac{\sigma_{\mathrm{topo}}}{400},\ 1\right), \qquad \sum_{m=1}^{N_{\mathrm{sub}}}\Delta z_m = 0
+\end{aligned} \tag{7.37}
+$$
+
+`enable_maml_wetlands_lakes = true` 時、TOPMODEL 原理（Beven & Kirkby, 1979）に基づく地形平坦度 $f_{\mathrm{flat}}$、表層土壌飽和超過項、谷底重み $w_{\mathrm{val}}$、融解因子 $f_{\mathrm{thaw}}$ および河川氾濫項 $f_{\mathrm{flood}}$ から目標冠水率 $f_{\mathrm{wet,tgt}}$ を算出し、時定数 $\tau_{\mathrm{wet}} = 10$ 日 の厳密指数緩和で動的湿地率 $f_{\mathrm{wet}} \in [0, 0.85]$ を更新する：
+
+$$
+\begin{aligned}
+f_{\mathrm{flat}} &= \left(1 + \frac{\sigma_{\mathrm{topo}}}{80}\right)^{-1}, \qquad f_{\mathrm{flood}} = 0.35\,\frac{Q_{\mathrm{riv}}}{Q_{\mathrm{riv}} + 4000}, \\
+f_{\mathrm{thaw}} &= \operatorname{clamp}\!\left(\frac{T_{s,0} - 270.15}{5.0},\ 0.15,\ 1.0\right), \\
+f_{\mathrm{wet,tgt}} &= \operatorname{clamp}\!\left(f_{\mathrm{flat}}\,w_{\mathrm{val}}\,f_{\mathrm{thaw}}\left(\left[\frac{\max(s_0 - 0.58,\ 0)}{0.42}\right]^{1.6} + f_{\mathrm{flood}}\right),\ 0,\ 0.85\right)
+\end{aligned} \tag{7.38}
+$$
+
+### 7.8 陸域炭素–窒素循環・5 層永久凍土 C/N・MAML SPITFIRE 山火事 (`src/aoba/land_carbon.py`)
+
+炭素 6 プール（葉 $C_l$・木部 $C_w$・細根 $C_r$・速分解リター $C_{lf}$・遅分解リター $C_{ls}$・5 層土壌有機炭素 $C_{s,0..4}$）および窒素 7 プール（各有機プール $N_l, N_w, N_r, N_{lf}, N_{ls}, N_{s,0..4}$ に加え土壌無機窒素 $N_{\min}$）を Neumaier/Kahan 補償加算で厳密保存積分する：
+
+$$
+\begin{aligned}
+\frac{dC_{\mathrm{tot}}}{dt} &= \mathrm{GPP} - R_{a,\mathrm{eff}} - R_h - F_{\mathrm{fire,C}} \equiv \mathrm{NBP}, \\
+\frac{dN_{\mathrm{tot}}}{dt} &= F_{\mathrm{dep}} + F_{\mathrm{BNF}} - F_{\mathrm{leach}} - F_{\mathrm{denit}} - F_{\mathrm{fire,N}}
+\end{aligned} \tag{7.39}
+$$
+
+1. **独立栄養呼吸および機能均衡動的炭素配分**：木部・細根維持呼吸（$Q_{10}=2.0$）と葉暗呼吸 $R_{\mathrm{leaf}}$ の和に対し正の余剰へ成長呼吸 $25\%$（Clark et al., 2011）を加える。新成長炭素の配分では樹高依存の基本木部配分 $f_{w0}$ に加え、窒素制限時（$\phi_N < 1$）に細根配分を自律増加させる機能均衡則（Stocker & Prentice, 2024）を適用する：
+
+$$
+\begin{aligned}
+f_{w0} &= 0.05 + 0.42\,\frac{h_c}{h_c + 4.0}, \\
+f_{\mathrm{root}} &= \operatorname{clamp}\!\big(0.45(1 - f_{w0}) + 0.35(1 - \phi_N),\ 0.15,\ 0.72\big)
+\end{aligned} \tag{7.40}
+$$
+
+2. **Stocker & Prentice (2024) 最適葉窒素需要・土壌溶質輸送窒素吸収・FUN/Houlton 生物的窒素固定 (BNF)**：Dong et al. (2022) に従い、順化 $V_{c\max 25}$ および創発葉面積重 $\mathrm{LMA}$ から最適葉窒素量 $N_{\mathrm{area,opt}}$ と最適葉 C:N 比 $\mathrm{CN}_{l,\mathrm{opt}} = \operatorname{clamp}(\mathrm{LMA}/N_{\mathrm{area,opt}}, 15, 65)$ を決定する（細根 $45$、木部 $250$、腐植土壌 $14$）。枯死回転時の内部再転流（葉 $50\%$・細根 $25\%$）を差し引いた正味窒素需要に対し、土壌無機窒素 $N_{\min}$ からの吸収を蒸散質量流 $u_{\mathrm{mass}}$ と細根拡散吸収 $u_{\mathrm{diff}}$ で評価する：
+
+$$
+\begin{aligned}
+\mathrm{LMA} &= 0.045 + 0.055\,f_{\mathrm{evg}} + 0.025\,f_{\mathrm{cold}}\ [\mathrm{kg\ C\ m^{-2}}], \\
+N_{\mathrm{area,opt}} &= 1.76\times 10^{-5}\,V_{c\max 25} + 0.016\,\mathrm{LMA}, \\
+u_{\mathrm{mass}} &= \Big[1 - \exp\!\left(-\frac{E_{\mathrm{tr}}\Delta t}{W_{\mathrm{root,col}}}\right)\Big]N_{\min}, \\
+k_{\mathrm{diff}} &= 8.0\,f_{\mathrm{moist}}\,f_{\mathrm{freeze}}\,\frac{C_r}{C_r + 0.25}, \qquad u_{\mathrm{diff}} = \big(1 - e^{-k_{\mathrm{diff}}\Delta t_{\mathrm{yr}}}\big)(N_{\min} - u_{\mathrm{mass}})
+\end{aligned} \tag{7.41}
+$$
+
+不足需要には Houlton et al. (2008) および Fisher et al. (2010, FUN Eq. 6) の土壌温度依存共生 BNF 炭素コスト $\mathrm{cost}_{\mathrm{BNF}}(T_{s,0})$（$25.15^\circ\mathrm{C}$ で最小 $\sim 6.3\ \mathrm{kg\ C / kg\ N}$、$0^\circ\mathrm{C}$ で $\sim 187\ \mathrm{kg\ C / kg\ N}$）で最大 NPP の $2.2\%$ を投資し（消費炭素は $R_{a,\mathrm{eff}}$ に加算して厳密保存）、瞬間窒素充足度 $\phi_N^{\mathrm{inst}}$ を算出する：
+
+$$
+\begin{aligned}
+\mathrm{cost}_{\mathrm{BNF}}(T_C) &= 5.0\,\exp\!\left(-\left[-3.62 + 0.27\,T_C\left(1 - \frac{T_C}{50.30}\right)\right]\right), \\
+\phi_N^{\mathrm{inst}} &= \operatorname{clamp}\!\left(\frac{N_{\mathrm{retrans}} + u_{\mathrm{soil}} + \mathrm{BNF}_{\mathrm{sym}}}{D_{N,\mathrm{gross}}},\ 0.15,\ 1.0\right)
+\end{aligned} \tag{7.42}
+$$
+
+15 日 EMA 平滑化した窒素充足度 $\phi_N$ は式 (7.40) の細根配分および式 (7.27) の葉建設コスト $z_{\mathrm{eff}}$ へ双方向結合する。非共生自由生活 BNF（最大 $2\times 10^{-4}\ \mathrm{kg\ N\ m^{-2}\ yr^{-1}}$）、雷 $\mathrm{LNO}_x$ 大気沈着、有機態窒素の無機化・不動化、湿潤溶脱（$0.60\ \mathrm{yr^{-1}}$）および嫌気脱窒（$0.80\ \mathrm{yr^{-1}}$）が $N_{\min}$ 収支を閉じる。
+
+3. **5 層永久凍土土壌 C/N 分解および凍土撹乱（Koven et al., 2013）**：土壌 5 層（$0.05\text{–}1.60\ \mathrm{m}$）の分解速度は深さ減衰因子 $\exp(-z_{\mathrm{mid},k}/0.50\ \mathrm{m})$、$Q_{10}=2.0$ 温度応答、水分正弦応答および完全凍結時 $0.05$ への永久凍土抑制を受け、厳密指数分解と鉛直保存凍土撹乱（拡散係数 $D_{\mathrm{cryo}} = 5.0\times 10^{-4}\ \mathrm{m^2\ yr^{-1}}$）で炭素・窒素を同時更新する。
+
+4. **プロセスベース MAML SPITFIRE 山火事（Thonicke et al., 2010; Rothermel, 1972; Byram, 1959; Van Wagner, 1973）**：Nesterov 乾燥指数 $\mathrm{DI}$ を日積算（日降水 $> 3\ \mathrm{mm}$ または $f_{\mathrm{snow}} > 0.20$ でリセット）して火災危険指数 $\mathrm{FDI}$ を算出する。Rothermel 枯死燃料水分減衰 $\eta_M(r)$ と樹冠減速風速 $u_{\mathrm{fwd}}$ から前進・後退延焼速度 $(R_f, R_b)$、風速楕円長短軸比 $L_B$、継続時間 $t_{\mathrm{fire}}$、焼失面積 $A_{\mathrm{fire}}$、Byram 火線強度 $I_B$（自己消火閾値 $50\ \mathrm{kW\ m^{-1}}$）、Van Wagner 焦げ高さ $\mathrm{SH}$ および樹高依存樹皮厚 $d_{\mathrm{bark}}$ を評価して樹冠・形成層枯死率 $p_{\mathrm{mort}}$ を求める：
+
+$$
+\begin{aligned}
+\mathrm{FDI} &= 1 - \exp(-3\times 10^{-4}\,\mathrm{DI}), \qquad A_{\mathrm{fire}} = \frac{\pi}{4 L_B}\big[(R_f + R_b)\,t_{\mathrm{fire}}\big]^2, \\
+I_B &= 18000\,F_c\,\frac{R_f}{60}\ [\mathrm{kW\ m^{-1}}], \\
+\mathrm{SH} &= 0.11\,I_B^{2/3}\ [\mathrm{m}], \qquad d_{\mathrm{bark}} = 0.8 + 1.8\left(\frac{h_c}{10}\right)^{0.6}\ [\mathrm{cm}]
+\end{aligned} \tag{7.43}
+$$
+
+CRM 対地落雷（親セル平均 50% ブレンドによる乾燥雷着火）から離散 MAML パッチ累積ハザードおよび 2D 隣接乾燥パッチ延焼を判定し、燃焼パッチの $\mathrm{LAI}$・$h_c$ を直接低下させて森林–サバンナ双安定モザイクを創発させるとともに、燃焼炭素・BC/OC 煙および燃焼窒素（$85\%$ 揮散、$15\%$ 灰分として $N_{\min}$ 還元）を厳密保存計算する。
+
+### 7.9 Priority-Flood SCVT ボロノイ河川流路網 (`src/aoba/river_routing.py`)
+
+外部河川方向マップを用いず、`Earth2014` 標高から Barnes, Lehman & Mulla (2014) の最小ヒープ Priority-Flood アルゴリズムにより全海洋セルから内陸へ無閉路・内陸盆地ゼロのボロノイ河川網を自動構築する。各セルの流路勾配 $S_i \in [10^{-4}, 10^{-1}]$ から運動学的流速 $v_{\mathrm{riv},i}$（Miller et al., 1994; Mizukami et al., 2016）を定め、厳密指数線形貯水池流出と Kahan 補償加算により陸域液体流出を沿岸海洋セルへ保存的に輸送する：
+
+$$
+\begin{aligned}
+v_{\mathrm{riv},i} &= \operatorname{clamp}\!\left(0.50\sqrt{\frac{S_i}{10^{-3}}},\ 0.15,\ 2.00\right)\ [\mathrm{m\ s^{-1}}], \\
+f_{\mathrm{out},i} &= -\operatorname{expm1}\!\left(-\frac{v_{\mathrm{riv},i}}{L_i}\Delta t\right), \qquad Q_{\mathrm{out},i} = f_{\mathrm{out},i}\,S_{\mathrm{riv},i}, \\
+\Delta S_{\mathrm{riv},i} &= R_{\mathrm{liq},i} A_i \Delta t + \sum_{j\in\mathrm{up}(i)} Q_{\mathrm{out},j} - Q_{\mathrm{out},i}
+\end{aligned} \tag{7.44}
 $$
 
 ---
 
-## 8. 全球非静力学 SCVT 力学・埋め込み CRM・重力波抵抗
+## 8. 全球非静力学 SCVT 力学・埋め込み CRM・重力波抵抗・SP 結合
 
-### 8.1 統一非静力学力学コアと時間分離法の概要
+### 8.1 統一圧縮性 Euler 方程式系・静水圧初期化・Held–Suarez 基準 (`src/aoba/scvt_dynamics.py`)
 
-従来の ESM は全球大気と対流で別個の近似式を用いるが、AOBA では全球 SCVT 親格子と埋め込み 4 km CRM の双方で**全く同一のフラックス形式圧縮性非静力学 Euler 方程式**を解く。音波は風速より桁違いに速いため（$\sim 340\ \mathrm{m\ s^{-1}}$）、特に薄い鉛直層での時間刻み制約を避けるために **RK3–HEVI**（3 段 Wicker–Skamarock Runge–Kutta ＋水平陽的・鉛直陰的音波三重対角解法）を採用する。さらにすべての水蒸気・オゾン・エアロゾル・$\mathrm{CO}_2$・水同位体トレーサは **Zalesak (1979) フラックス補正輸送法 (FCT)** により負値や振動を出さず厳密に質量保存移流される。
-
-### 8.2 統一圧縮性 Euler 方程式と RK3–HEVI (`src/aoba/scvt_dynamics.py`, `src/aoba/crm.py`)
-
-地形追従計量ヤコビアン $J$ を用いたフラックス形式支配方程式：
+全球 SCVT 親格子と埋め込み CRM の双方は、同一のフラックス形式圧縮性非静力学 Euler 方程式系（結合質量 $m = \rho_d\Delta z_c$, 結合湿潤仮温位 $\Theta_m = m\theta_m$, 水平風 $\mathbf{u}_h$, 鉛直速度 $w$）を解く：
 
 $$
-\frac{\partial (J\rho_d)}{\partial t} + \nabla_h \cdot (J\rho_d \mathbf{u}_h) + \frac{\partial (J\rho_d \dot{\zeta})}{\partial \zeta} = 0 \tag{8.1}
-$$
-
-$$
-\frac{\partial \mathbf{u}_h}{\partial t} + (\mathbf{u}\cdot\nabla)\mathbf{u}_h + f\hat{\mathbf{k}}\times\mathbf{u}_h = -\frac{1}{\rho_{\mathrm{tot}}}\nabla_h p + \mathbf{F}_{\mathrm{turb}} + \mathbf{F}_{\mathrm{GWD}} + \mathbf{F}_{\mathrm{sp}} \tag{8.2}
+\begin{aligned}
+\frac{\partial m}{\partial t} + \nabla_h\cdot(m\mathbf{u}_h) + \frac{\partial \Omega}{\partial \zeta} &= 0, \\
+\frac{\partial \Theta_m}{\partial t} + \nabla_h\cdot(m\mathbf{u}_h\theta_m) + \frac{\partial (\Omega\theta_m)}{\partial \zeta} &= m S_{\theta_m}
+\end{aligned} \tag{8.1}
 $$
 
 $$
-\frac{\partial w}{\partial t} + (\mathbf{u}\cdot\nabla)w = -\frac{1}{\rho_{\mathrm{tot}}}\frac{\partial p'}{\partial z} - g\frac{\rho_{\mathrm{tot}}'}{\rho_{\mathrm{tot}}} + F_{w,\mathrm{turb}} + F_{w,\mathrm{sp}} \tag{8.3}
+\frac{\partial \mathbf{u}_h}{\partial t} + (\zeta + f)\hat{\mathbf{k}}\times\mathbf{u}_h + \nabla_h K + \tilde{w}\frac{\partial \mathbf{u}_h}{\partial z} = -\frac{1}{\rho_{\mathrm{tot}}}\nabla_h p + \mathbf{F}_{\mathrm{turb}} + \mathbf{F}_{\mathrm{GWD}} + \mathbf{F}_{\mathrm{sp}} + \mathcal{D}_u \tag{8.2}
 $$
 
 $$
-\frac{\partial (J\rho_d \phi)}{\partial t} + \nabla_h\cdot(J\rho_d \mathbf{u}_h \phi) + \frac{\partial (J\rho_d \dot{\zeta}\phi)}{\partial \zeta} = J\rho_d S_\phi, \qquad \phi \in \{\theta_m, q_n, q_p, \chi_{\mathrm{O_3}}, \chi_{\mathrm{CO_2}}, q_{\mathrm{aero}}, q_{\mathrm{iso}}\} \tag{8.4}
+\frac{\partial w}{\partial t} + (\mathbf{u}\cdot\nabla)w = -\frac{1}{\rho_{\mathrm{tot}}}\frac{\partial p'}{\partial z} - g\frac{\rho_{\mathrm{tot}}'}{\rho_{\mathrm{tot}}} + F_{w,\mathrm{turb}} + F_{w,\mathrm{sp}} - \gamma_r w \tag{8.3}
 $$
 
-### 8.3 サブグリッド山岳ドラッグと地図不要の非地形性重力波抵抗 (`orography.py`, `gravity_wave.py`)
-
-親格子で解像できない山脈は Lott & Miller (1997) により、無次元山岳高度 $H_n = N\sigma_{\mathrm{topo}}/U > H_{nc}$ での**低層迂回ブロッキング抗力**と、上空へ伝播して砕波する**山岳重力波応力**を与える：
+ここで地形追従反変鉛直質量フラックス $\Omega$（剛体上下境界条件 $\Omega_0 = \Omega_{N_z} = 0$）およびセル中心運動エネルギー $K_i$ は次式で定義される：
 
 $$
-\boldsymbol{\tau}_{\mathrm{oro}} = \rho_0 G\, N\, \sigma_{\mathrm{topo}}\, \mathbf{U}_0 \cdot \mathcal{A}(\text{異方性, 勾配}) \tag{8.5}
+\Omega = \rho_{dw}\big(w - \mathbf{u}_h\cdot\nabla z_w\big), \qquad K_i = \frac{1}{2 A_i}\sum_{e\in E(i)} A_e u_e^2 \tag{8.4}
 $$
 
-また海洋上や中緯度傾圧帯では前線や深い積雲対流が内部重力波を発射する（`enable_nonoro_gwd`）。AOBA は緯度固定のチューニング表を使わず、**前線生成関数** $\mathcal{F}$ と **CRM 対流加熱率** $Q_{\mathrm{conv}}$ から重力波運動量フラックスを動的に診断し、Warner–McIntyre 多位相速度スペクトルが臨界層で砕波する高度に運動量を付与する：
+初期大気は `float64` 離散台形静水圧積分で構築され（赤道 $300\ \mathrm{K}$・極差 $35\ \mathrm{K}$ の地表温度、$6.5\ \mathrm{K\ km^{-1}}$ 対流圏減率、U.S. Standard Atmosphere 1976 成層圏逆転層、任意傾圧波摂動および指数減少相対湿度）、乾燥力学コア検証用の Held & Suarez (1994, Eqs. 1–4) 強制も内蔵する。
+
+### 8.2 SCVT 親格子 RK3–HEVI 音波分離解法とバッチ Zalesak FCT (`src/aoba/scvt_dynamics.py`)
+
+各力学ステップ $\Delta t_{\mathrm{dyn}}$（移流 CFL 制限 $\Delta t_{\mathrm{adv,host}} = \min(900, 0.40 d_{\min}/100)$ による自動サブステップ）では、格子スケール発散雑音と Hollingsworth 計算モードを抑制するスケール選択的水平発散減衰 $\nu_{\mathrm{div}}$ および 4 階超粘性 $\nu_4$ を評価する：
 
 $$
-\tau_{\mathrm{front}} = \tau_{0,f}\tanh\!\left(\frac{\mathcal{F}}{\mathcal{F}_{\mathrm{th}}}\right), \qquad \tau_{\mathrm{conv}} = \tau_{0,c}\tanh\!\left(\frac{\langle Q_{\mathrm{conv}}\rangle}{Q_{\mathrm{ref}}}\right) \tag{8.6}
+\begin{aligned}
+\nu_{\mathrm{div}} &= 0.02\,\frac{d_{\min}^2}{\Delta t_{\mathrm{dyn}}}, \qquad \nu_4 = 0.0002\,\frac{d_{\min}^4}{\Delta t_{\mathrm{dyn}}}, \\
+\mathcal{D}_u &= \nu_{\mathrm{div}}\nabla(\nabla\cdot\mathbf{u}) - \nu_4\nabla^4\mathbf{u}, \qquad \mathcal{D}_{\Theta_m} = -0.5\,\nu_4 m_0\nabla^4\theta_m
+\end{aligned} \tag{8.5}
+$$
+
+3 段 Wicker–Skamarock RK3（$\Delta\tau \in \{\Delta t_{\mathrm{dyn}}/3, \Delta t_{\mathrm{dyn}}/2, \Delta t_{\mathrm{dyn}}\}$）の各段で、非線形 TRiSK コリオリ・渦度項 $\sum_{e'} w_{e,e'}\frac{\eta_e+\eta_{e'}}{2}u_{e'}$、運動エネルギー勾配 $-\nabla K$、鉛直運動量移流および散逸項からなる低速傾向を凍結し、高速音波サブステップ（最大時間刻み $\Delta t_{\mathrm{ac,max}} = \min(\max(0.16 d_{\min}/350, 1), 300)\ \mathrm{s}$, 鉛直陰的重み $\beta_{\mathrm{HEVI}} = 0.60$）を積分する。山岳上の水平気圧傾度力には Klemp (2011) の静水圧指数係数 $(f_{z0}, f_{z1})$ を適用し、水平質量フラックスには前向きオフセンタリング $U_h^{(k)}$ を用いる。鉛直音波は線形化状態方程式を用いて反変鉛直フラックス増分 $\delta\Omega_k$ に関する $(N_z - 1)$ 層三重対角 Helmholtz 方程式へ帰着させ、厳密質量・温位保存更新を行う：
+
+$$
+\begin{aligned}
+f_{z0} &= \exp\!\left(-\frac{\rho_{\mathrm{tot},c_0} g}{2 p_{c_0}}\Delta z_{10}\right), \qquad f_{z1} = \exp\!\left(+\frac{\rho_{\mathrm{tot},c_1} g}{2 p_{c_1}}\Delta z_{10}\right), \\
+U_h^{(k)} &= \bar{m}_e\big(1.10\,u^{(k+1)} - 0.10\,u^{(k)}\big), \qquad p^{(k)} = p_s + \frac{\gamma_d p_s}{\Theta_{m,s}}\big(\Theta_m^{(k)} - \Theta_{m,s}\big)
+\end{aligned} \tag{8.6}
 $$
 
 $$
-\left(\frac{\partial \mathbf{u}}{\partial t}\right)_{\mathrm{GWD}} = -\frac{1}{\rho_d}\frac{\partial \boldsymbol{\tau}_{\mathrm{GW}}(z)}{\partial z} \tag{8.7}
+\begin{aligned}
+a_k\,\delta\Omega_{k-1} + b_k\,\delta\Omega_k + c_k\,\delta\Omega_{k+1} &= r_{\Omega,k}, \\
+m^{(k+1)} &= m^\dagger - \beta_{\mathrm{HEVI}}\Delta t_{\mathrm{ac}}\Delta\delta\Omega
+\end{aligned} \tag{8.7}
 $$
 
-### 8.4 超パラメタリゼーション (SP) と単独全球 CRM 結合 (`src/aoba/coupled_model.py`)
+第 3 段の時間平均質量フラックス $(\bar{U}_h, \bar{\Omega})$ を用い、全水分・エアロゾル・化学・$\mathrm{CO}_2$・水同位体トレーサを単一のバッチ Zalesak (1979) フラックス補正輸送 (`fct_advect_scvt_batch`: 1 次ドナーセル低次流束＋水平 2 次 / 鉛直 4 次高次流束＋局所極値リミタ $C_h, C_z \in [0, 1]$) で厳密非負・質量保存移流する。
 
-`enable_superparam = true` の場合、1 親ステップ $\Delta t_{\mathrm{host}}$ ごとに CRM を大気大規模傾向で強制しながら `n_crm_dyn_substeps` 回陽的時間積分し、領域平均の対流加熱・加湿・運動量輸送傾向を親格子へ還元する（Grabowski, 2001）：
+### 8.3 埋め込み CRM の RK3–HEVI コアと単独 RCE モード (`src/aoba/crm.py`)
+
+埋め込み CRM（二重周期 2D/3D Arakawa C-grid / Charney–Phillips、水平格子間隔 $\Delta x = \Delta y$ は `[grid] crm_dx` で任意設定・既定 $4\ \mathrm{km}$）は親格子と同一の RK3–HEVI 圧縮性 Euler 方程式を解く。水平運動量移流には 3 次 Wicker–Skamarock 上風バイアス流束差分法を、$\theta_m$ には 4 次中心＋$0.25$ 上風散逸を、全スカラー移流には 3D Zalesak FCT（水平・鉛直 4 次高次流束）を用いる。水平サブグリッド乱流には第 6.4 節の 3D Smagorinsky–Lilly SGS（背景数値粘性 $\nu_{\mathrm{bg}} = 0.004\,\Delta x\Delta y/10$ を含む）を、鉛直乱流には第 6.3 節の MYNN 2.5 を適用する。
+
+高速水平平均風による水平移流 CFL 制約を緩和するため、サブサイクル前に各親カラムで厳密なガリレイ並進速度 $U_{\mathrm{shift}} = \frac{1}{2}(\max u + \min u)$（3D 時は $V_{\mathrm{shift}}$ も）を差し引き、積分後に復元する。また次元整合コリオリ項（1D/2D では無効、3D のみ水平摂動風 $(u', v')$ に作用）および水平摂動のみに作用するレイリースポンジ層を備える。単独周期 3D CRM 放射対流平衡実験ドライバ `step_coupled_crm_rce`（Wing et al., 2018; 既定 $S_0 = 551.58\ \mathrm{W\ m^{-2}}, \mathrm{CO}_2 = 400\ \mathrm{ppmv}$）も同一コード内に実装されている。
+
+### 8.4 サブグリッド山岳ブロッキングおよび山岳重力波抵抗 (`src/aoba/orography.py`)
+
+`Earth2014` から算出したサブグリッド山岳テンソル $(\mu, \psi, \gamma, \sigma)$（式 2.7）に基づき、Lott & Miller (1997, Eqs. 7–22) の低層ブロッキング抗力と山岳内部重力波抵抗を計算する（臨界フルード数逆数 $H_{nc} = 0.50$, 抗力係数 $C_d = 1.00$, 発射係数 $G = 0.80$）。低層平均風 $(u_{\mathrm{low}}, v_{\mathrm{low}})$ と山岳主軸のなす角 $\phi$ から楕円方向因子 $D_{\mathrm{dir}}$ を求め、無次元山岳高度 $H_n > H_{nc}$ においてブロッキング深さ $Z_b$ 以下の層に陰的ウェイク抗力を作用させる：
 
 $$
-\left(\frac{\partial \bar{\phi}_{\mathrm{host}}}{\partial t}\right)_{\mathrm{SP}} = \frac{\langle \phi_{\mathrm{CRM}}^{n+1} \rangle_{x,y} - \bar{\phi}_{\mathrm{host}}^{*}}{\Delta t_{\mathrm{host}}} \tag{8.8}
+\begin{aligned}
+D_{\mathrm{dir}} &= \sqrt{(B\cos^2\phi + C\sin^2\phi)^2 + (B - C)^2\sin^2\phi\cos^2\phi}, \\
+H_n &= \frac{2\mu N_{\mathrm{low}}}{U_{\mathrm{low}}}, \qquad Z_b = 2\mu\,\max\!\left(1 - \frac{H_{nc}}{H_n},\ 0\right), \\
+r_{\mathrm{blk}} &= C_d\frac{\sigma}{2\mu}D_{\mathrm{dir}}\sqrt{\frac{Z_b - z_{\mathrm{rel}}}{z_{\mathrm{rel}} + \mu}}\,|\mathbf{u}|, \qquad \left(\frac{\partial\mathbf{u}}{\partial t}\right)_{\mathrm{blk}} = -\frac{r_{\mathrm{blk}}}{1 + \Delta t\,r_{\mathrm{blk}}}\,\mathbf{u}
+\end{aligned} \tag{8.8}
 $$
 
-`enable_superparam = false` とすれば埋め込み CRM をバイパスし、全球 SCVT 格子単独の雲解像シミュレーションへ切り替わる。
+残余の有効山岳高さ $h_{\mathrm{wave}} = \max(2\mu - Z_b, 0)$ から発射される山岳重力波運動量フラックス $\tau_{\mathrm{launch}}$ を上方へ伝播させ、Lindzen 飽和限界 $\tau_{\mathrm{sat},k}$ および上端条件 $\tau_{N_z} = 0$ により減速傾向を与える：
 
----
+$$
+\begin{aligned}
+k_{\mathrm{wave}} &= G\,\frac{\sigma}{4\mu}\,D_{\mathrm{dir}}, \qquad \tau_{\mathrm{launch}} = \rho_{\mathrm{low}}\,k_{\mathrm{wave}}\,N_{\mathrm{low}}\,U_{\mathrm{low}}\,h_{\mathrm{wave}}^2, \\
+\tau_{\mathrm{sat},k} &= \frac{\bar{\rho}_k\,k_{\mathrm{wave}}\,u_{\mathrm{proj}}^3}{N_k H_{nc}^2}, \qquad \left(\frac{\partial\mathbf{u}}{\partial t}\right)_{\mathrm{wave},k} = -\frac{\tau_k - \tau_{k+1}}{\rho_{d,k}\Delta z_k}\,\hat{\mathbf{u}}
+\end{aligned} \tag{8.9}
+$$
 
-## 9. 海洋循環 (`ocean_mode`)・独立高解像海洋・波浪・海氷・海洋 BGC
+### 8.5 地図不要の非地形性重力波抵抗 (`src/aoba/gravity_wave.py`)
 
-### 9.1 海洋循環の概要と選択制モード (`ocean_mode`)
+`enable_nonoro_gwd = true` 時、緯度依存テーブルを一切用いず 2 種の物理波源（Charron & Manzini, 2002; Beres et al., 2004, 2005; Richter et al., 2010）から $N_{\mathrm{bins}} = 17$ 位相速度ビン（$c_m \in [-80, +80]\ \mathrm{m\ s^{-1}}$、水平波長 $\lambda_h = 200\ \mathrm{km}$）の重力波スペクトルを発射する：
 
-海洋は地球の余剰熱の 90% 以上、大気の約 50 倍の炭素を蓄える地球システム最大の熱・炭素貯蔵庫である。風応力は表層の亜熱帯還流や赤道湧昇を駆動し、高緯度での冷却と海氷結氷時の塩分排出（ブライン排出）が重い深層水を沈み込ませて**大西洋子午面循環 (AMOC)** や**南極周極流 (ACC)** を維持する。
+1. **前線起源（$600\ \mathrm{hPa}$ 付近）**：Gauss–Green 勾配から 2D 前線生成関数 $F$（Hoskins, 1982）を評価し、閾値 $F_{\mathrm{th}} = 1.25\times 10^{-15}\ \mathrm{K^2\ m^{-2}\ s^{-1}}$ の半分を超える前線域で発射強度 $A_{\mathrm{fr}}$・ガウス幅 $c_w = 30\ \mathrm{m\ s^{-1}}$ のスペクトルを発射する：
 
-AOBA では **`[forcing] ocean_mode` により以下の 2 つの海洋力学コアから選択** でき、さらに `ocean_glevel > glevel` を指定すれば大気より高解像度な独立海洋格子を結合できる：
+$$
+\begin{aligned}
+F &= -\theta_x^2 u_x - \theta_y^2 v_y - \theta_x\theta_y(v_x + u_y), \\
+A_{\mathrm{fr}} &= \sigma\!\left(2.5\,\frac{F - F_{\mathrm{th}}}{F_{\mathrm{th}}}\right)
+\end{aligned} \tag{8.10}
+$$
 
-| `ocean_mode` | 鉛直構造 | 主な物理過程 | 主な適用対象 |
+2. **対流起源（CRM 対流加熱 $Q_{\mathrm{conv}}$）**：加熱層厚 $h_d \in [1, 16]\ \mathrm{km}$ および平均浮力振動数 $N_h$ から位相速度幅 $\sigma_c$ およびフラックス振幅 $\tau_{\mathrm{scale}}$ を定め、東西・南北両軸にレイリー型スペクトル $S_m$ を対流加熱層頂部 $k_{\mathrm{top}}$ から発射する：
+
+$$
+\begin{aligned}
+\sigma_c &= \operatorname{clamp}\!\left(\frac{N_h h_d}{\pi},\ 10,\ 60\right)\ [\mathrm{m\ s^{-1}}], \qquad \tau_{\mathrm{scale}} = \tau_{0,\mathrm{conv}}\,\min\!\left(\frac{Q_{\max}}{Q_{\mathrm{ref}}},\ 4\right)^2, \\
+x_m &= \frac{|c_m - u_{\mathrm{src}}|}{\sigma_c}, \qquad S_m = x_m\,\exp\!\left(-\frac{x_m^2}{2}\right)
+\end{aligned} \tag{8.11}
+$$
+
+各ビンは上方へ伝播し、臨界層（$(c_m - u_{w,k}) s_m \le 2\ \mathrm{m\ s^{-1}}$）で全吸収、または Lindzen (1981) 飽和限界 $\tau_{\mathrm{sat},k}(c_m)$ で砕波減衰し、開放上端放射境界条件（未砕波フラックスは上端通過）のもとで運動量を付与する：
+
+$$
+\begin{aligned}
+\tau_{\mathrm{sat},k}(c_m) &= \frac{1}{2}\,k_h\,\mathrm{eff}_{\mathrm{gw}}\,\frac{\rho_{w,k}}{N_{w,k}}|c_m - u_{w,k}|^3, \\
+\left(\frac{\partial u}{\partial t}\right)_{\mathrm{GWD},k} &= \sum_{m=1}^{17}\frac{s_m\max(\tau_{\mathrm{in},m} - \tau_{\mathrm{out},m},\ 0)}{\rho_{d,k}\Delta z_{c,k}}
+\end{aligned} \tag{8.12}
+$$
+
+### 8.6 超パラメタリゼーション結合と単独全球 CRM 切替 (`src/aoba/coupled_model.py`)
+
+`enable_superparam = true` 時、親格子力学傾向 $(\partial\theta_m/\partial t)_{\mathrm{LS}}, (\partial q_n/\partial t)_{\mathrm{LS}}$ で強制しながら CRM を `n_crm_dyn_substeps` 回（既定 $12\times 60\ \mathrm{s}$）積分し、熱力学ラチェット誤差を完全に防ぐ**厳密質量加重平均**で親格子へ同期する。同時に、CRM 領域平均風と親格子風の差を式 (2.6) でエッジ風速 $u_e$ へ射影し、次ステップの Beres 重力波駆動用に対流加熱率 $Q_{\mathrm{conv}}$ を診断する：
+
+$$
+\begin{aligned}
+\rho_{d,\mathrm{host}} &= \overline{\rho_{d,\mathrm{crm}}}, \qquad \phi_{\mathrm{host}} = \frac{\overline{\rho_{d,\mathrm{crm}}\phi_{\mathrm{crm}}}}{\max(\overline{\rho_{d,\mathrm{crm}}},\ 10^{-5})}, \qquad \phi \in \{\theta_m, q_n, q_p, q_v, q_c, q_i\}, \\
+Q_{\mathrm{conv}} &= \max\!\left(\frac{\theta_m^{\mathrm{post}} - \theta_m^{\mathrm{pre}}}{\Delta t}\,\Pi - \overline{Q_{\mathrm{rad}}},\ 0\right)
+\end{aligned} \tag{8.13}
+$$
+
+`enable_superparam = false` とすると埋め込み CRM をバイパスし、全球 SCVT 非静力学格子単独で雲解像シミュレーションを実行する。
+
+| 結合モード (`enable_superparam`) | 構造 | 利点 | 制約・留意点 |
 | :--- | :--- | :--- | :--- |
-| `"ekman_sw"` | 1.5 層（混合層＋還元重力躍層） | 風成エクマン輸送＋浅水ロスビー/ケルビン波（$Q$ フラックス不要） | 高速概念実験・水惑星・感度解析 |
-| `"ogcm_3d"` *(既定)* | 3 次元多層（`ocean_nz = 18`〜深海） | 実海底地形・FCT-$z^*$・GM90/Redi・KPP・サブメソ・潮汐混合・AMOC/ACC | 本格的気候・古気候・炭素循環・海洋 BGC 実験 |
+| `true` *(既定：超パラメタリゼーション SP)* | 粗い全球親格子（G3–G5）＋各セル内埋め込み CRM（任意 `crm_dx`、既定 $4\ \mathrm{km}$）＋MAML | 数十年〜数百年の多世紀気候積分を単一 GPU で実行しつつ、積雲パラメタリゼーションなしで深い対流・MJO・日周対流・サブグリッド陸面不均一性を陽的に表現できる。 | 2D カーテン（`crm_ny=1`）では CRM 内の 3 次元回転力学・メソ対流系回転が簡略化され、親セル間の直接的なサブグリッド水平伝播は親格子平均場を介する。 |
+| `false`（単独全球雲解像 GCRM） | 埋め込み CRM なし・全球 SCVT 格子単体 | 親–子スケール分離や周期境界仮定が一切存在せず、高解像度格子（G8–G10 相当）で全球の対流・前線・地形流を連続 3 次元解像できる。 | 対流を陽的に解像するには水平格子幅 $\le 4\text{–}10\ \mathrm{km}$ が必要となり、粗い格子（G3–G5）で単独実行すると格子スケール対流が過大または遅延する。 |
+
+---
+
+## 9. 海洋循環 (`ocean_mode`)・独立高解像海洋・波浪・EVP–ITD 海氷・FlexPFT 海洋 BGC
+
+### 9.1 選択制海洋モード (`ocean_mode`)
+
+`[forcing] ocean_mode` により 2 つの海洋力学コアから選択でき、さらに `ocean_glevel > glevel` により独立した高解像度海洋ボロノイ格子を結合できる。
+
+| `ocean_mode` | 鉛直構造 | 利点 | 制約・留意点 |
+| :--- | :--- | :--- | :--- |
+| `"ekman_sw"` | 1.5 層（混合層＋還元重力躍層） | 処方 $Q$ フラックスなしで赤道湧昇・ロスビー/ケルビン波・亜熱帯還流を極めて高速に再現でき、数年で平衡に達する。 | 塩分・深層水形成・熱塩循環 (AMOC)・深海熱吸収および 3D 海洋生物地球化学を表現できない。 |
+| `"ogcm_3d"` *(既定)* | 3 次元多層（既定 18 層 / $6000\ \mathrm{m}$） | 実海底地形上の水温・塩分・海面高度・AMOC/ACC・KPP/潮汐混合・GM90/サブメソ・海洋 BGC を一貫して再現でき、`ocean_glevel > glevel` で高解像化も可能。 | 深海熱塩平衡には数百年〜千年規模のスピンアップを要し、順圧サブサイクルおよび 3D 移流拡散に伴う計算負荷が大きい。 |
 
 ![図 9.1: 選択制海洋モデル・波浪・EVP-ITD 海氷・FlexPFT 海洋生物地球化学](assets/fig_06_ocean_ice_bgc.svg)
 
-### 9.2 選択肢 1：`ocean_mode = "ekman_sw"`（1.5 層エクマン＋浅水波海洋、`src/aoba/ocean_ekman.py`）
+### 9.2 海面アルベド・混合層熱収支・リード付き熱力学海氷 (`src/aoba/surface.py`)
 
-処方 $Q$ フラックスを一切用いず、線形摩擦付きエクマン流速と還元重力 $g'$ の 1.5 層浅水躍層変動 $\eta$ を解く：
-
-$$
-\mathbf{u}_{\mathrm{Ek}} = \frac{1}{\rho_{\mathrm{sw}} H_{\mathrm{ml}} (f^2 + r_{\mathrm{Ek}}^2)}\big(r_{\mathrm{Ek}}\boldsymbol{\tau}_s - f\hat{\mathbf{k}}\times\boldsymbol{\tau}_s\big) \tag{9.1}
-$$
+開水面直達アルベド $\alpha_{\mathrm{dir}}(\mu_0)$ は Briegleb et al. (1986, Eq. 11)（散乱アルベド $0.06$; MIROC6 Sec. 3.8.1.1）、海氷被覆率 $f_i$（SCALE-RM Eq. 8.342）、海氷上積雪被覆率 $f_{\mathrm{sn,ice}}$（VIS $0.72\to 0.90$・NIR $0.42\to 0.70$ を連続変調）および氷・雪直列複合熱伝導フラックス $G_{oi}$ は次式で与えられる：
 
 $$
-\frac{\partial \eta}{\partial t} + \nabla\cdot\big((H_{\mathrm{th}} + \eta)\mathbf{u}_g\big) = 0, \qquad \frac{\partial \mathbf{u}_g}{\partial t} + f\hat{\mathbf{k}}\times\mathbf{u}_g = -g'\nabla\eta - \frac{\mathbf{u}_g}{\tau_{\mathrm{sw}}} \tag{9.2}
+\begin{aligned}
+\alpha_{\mathrm{dir}}(\mu_0) &= \frac{0.026}{\mu_0^{1.7} + 0.065} + 0.15(\mu_0 - 0.1)(\mu_0 - 0.5)(\mu_0 - 1.0), \\
+f_i &= \operatorname{clamp}\!\left(\sqrt{\frac{m_{\mathrm{ice}}}{450}},\ 0,\ 1\right), \qquad f_{\mathrm{sn,ice}} = \tanh\!\left(\frac{\mathrm{SWE}_{\mathrm{ice}}}{15}\right), \\
+G_{oi} &= \left[\frac{h_i}{2 k_{\mathrm{ice}}} + \frac{h_{\mathrm{sn}}}{k_{\mathrm{snow}}}\right]^{-1}\big(T_{f,\mathrm{ocn}} - T_i\big)
+\end{aligned} \tag{9.1}
 $$
 
-### 9.3 選択肢 2：`ocean_mode = "ogcm_3d"`（標準 3D 多層 SCVT OGCM、`src/aoba/ocean_ogcm.py`）
+海面降雪は開水面で融解潜熱冷却 $-L_{f0} P_{\mathrm{snow}}$ を与え、海氷上では積雪として蓄積する。海氷表面温度 $T_i \le 273.15\ \mathrm{K}$ は陰的熱収支で解き、混合層水温 $T_{\mathrm{ml}}$ は Neumaier/Kahan 補償加算で更新しつつ $T_{\mathrm{ml}} < T_{f,\mathrm{ocn}}$ の過冷却エネルギーを厳密に海氷生成へ変換する。
 
-`Earth2014` 海底地形上で 3 次元静水圧 Boussinesq プリミティブ方程式を順圧・傾圧分離解法と $z^*$ 自由表面座標（$h_k = h_{k,0}(1+\eta/H)$）で積分し、**Neumaier/Kahan 補償加算**により float32 でも数十年間の熱・塩分ドリフトを極限まで抑える：
+### 9.3 選択肢 1：`ocean_mode = "ekman_sw"`（1.5 層エクマン＋浅水波海洋、`src/aoba/ocean_ekman.py`）
 
-$$
-\frac{\partial \mathbf{u}_o}{\partial t} + (\mathbf{u}_o\cdot\nabla)\mathbf{u}_o + f\hat{\mathbf{k}}\times\mathbf{u}_o = -g\nabla\eta - \frac{1}{\rho_0}\nabla p_{\mathrm{hyd}} + \frac{\partial}{\partial z}\left(\nu_v \frac{\partial \mathbf{u}_o}{\partial z}\right) + \mathbf{D}_h \tag{9.3}
-$$
+Codron (2012, Eqs. 1–10) に従い、沿岸フラックスゼロ条件のもとでエッジ上の正則化エクマン質量輸送（摩擦時定数 $\tau_{\mathrm{Ek}} = 2$ 日, $r_E = \tau_{\mathrm{Ek}}^{-1}$）、還元重力 $g' = 0.03\ \mathrm{m\ s^{-2}}$ の 1.5 層浅水躍層厚 $H_{\mathrm{sw}} \in [h_1+20, 800]\ \mathrm{m}$（WS-RK3 サブサイクル、スケール適応 Munk 粘性 $A_h$、緩和 $\tau_{\mathrm{sw}} = 180$ 日）、およびエクマン成分の二重計上を防ぐ地衡流速分離 $u_{g,e}$ を解く：
 
 $$
-\frac{\partial (h_k T)}{\partial t} + \nabla\cdot\big(h_k(\mathbf{u}_o + \mathbf{u}^*_{\mathrm{GM}})T\big) + \Delta_k(w T) = \nabla\cdot\big(h_k \mathbf{K}_{\mathrm{Redi}}\nabla T\big) + \frac{\partial}{\partial z}\left(\kappa_v \frac{\partial T}{\partial z}\right) + Q_{\mathrm{sw}}(z) \tag{9.4}
+\begin{aligned}
+\mathbf{M}_{\mathrm{Ek},e} &= \frac{r_E\boldsymbol{\tau}_e - f_e\hat{\mathbf{k}}\times\boldsymbol{\tau}_e}{f_e^2 + r_E^2}, \qquad \frac{\partial H_{\mathrm{sw}}}{\partial t} = -\nabla_{\mathrm{SCVT}}\cdot(H_{\mathrm{sw},\mathrm{up}} u_{\mathrm{sw}}), \\
+u_{g,e} &= u_{\mathrm{sw},e} - \frac{M_{n,\mathrm{Ek},e}}{\rho_w\bar{H}_{\mathrm{sw},e}}
+\end{aligned} \tag{9.2}
 $$
 
-ここで中規模渦の等密度面平坦化速度 $\mathbf{u}^*_{\mathrm{GM}}$ の拡散係数 $\kappa_{\mathrm{GM}}$ は、第一傾圧ロスビー変形半径 $L_d$ に応じて解像度適応的に自動減衰する（`enable_ogcm_scale_aware_gm`; Hallberg, 2013）：
+表層・躍層の 2 層エンタルピー輸送、鉛直湧昇 $W_E = \nabla\cdot\mathbf{M}_1$、等密度面横断熱交換（$\kappa_v = 2\times 10^{-5}\ \mathrm{m\ s^{-1}}$）、沿岸氷河流出融解冷却 $Q_{\mathrm{calve}}$ および保存的結氷を Kahan 補償加算で積分する。
+
+### 9.4 選択肢 2：`ocean_mode = "ogcm_3d"`（3D 多層 SCVT OGCM、`src/aoba/ocean_ogcm.py`）
+
+`Earth2014 BED2014` 上の部分ステップ鉛直 18 層（表層 $50\ \mathrm{m}$〜深海 $880\ \mathrm{m}$、総深 $6000\ \mathrm{m}$）で 3 次元静水圧 Boussinesq プリミティブ方程式を積分する。
+
+1. **非線形状態方程式（Roquet et al., 2015, Table 1）**：基準 $T_{\mathrm{ref}} = 283.15\ \mathrm{K}, S_{\mathrm{ref}} = 34.7\ \mathrm{psu}$ に対し、熱膨張・熱圧縮・塩分収縮を含む密度偏差 $\rho'(T, S, z)$ を算出する：
 
 $$
-\kappa_{\mathrm{GM,eff}} = \kappa_{\mathrm{GM}} \cdot \frac{1}{1 + (2 L_d / \Delta x)^2} \tag{9.5}
+\rho'(T, S, z) = \rho_w\Big[-\big(\alpha_0 + \alpha_T\Delta T + \alpha_z z + \alpha_S\Delta S\big)\Delta T + \beta_0\Delta S\Big] \tag{9.3}
 $$
 
-鉛直混合 $\kappa_v$ は KPP 境界層混合（Large et al., 1994）・内部シアー不安定・混合層サブメソスケール再成層（`enable_ogcm_submeso`; Fox-Kemper et al., 2008）・海底粗さ深海内部潮汐混合（`enable_ogcm_tidal_mixing`; St. Laurent et al., 2002）を統合する：
+2. **表層仮想塩分フラックスおよび Jerlov Type I 短波透過**：蒸発 $E$・降水 $P$・河川流出 $R$・海氷成長に伴うブライン排出（海氷塩分 $S_{\mathrm{ice}} = 4\ \mathrm{psu}$）による仮想塩分フラックス $\Delta S_0$、および Paulson & Simpson (1977) の 2 指数短波透過関数 $I(z)$（全柱熱量を厳密保存しつつ亜表層へ再配分）は次式で与えられる：
 
 $$
-\kappa_v(z) = \kappa_{v,\mathrm{bg}} + \kappa_{\mathrm{KPP}}(z) + \kappa_{\mathrm{shear}}(\mathrm{Ri}) + \frac{\Gamma_{\mathrm{mix}}\,\varepsilon_{\mathrm{tide}}(h_{\mathrm{rough}})}{N^2} \tag{9.6}
+\begin{aligned}
+\Delta S_0 &= \frac{S_{\mathrm{ref}}(E - P - R)\Delta t + (S_{\mathrm{ref}} - S_{\mathrm{ice}})\Delta m_{\mathrm{ice}}}{\rho_w h_0}, \\
+I(z) &= 0.58\,e^{-z/0.35} + 0.42\,e^{-z/23.0}
+\end{aligned} \tag{9.4}
 $$
 
-### 9.4 独立高解像度海洋グリッド結合 (`ocean_glevel > 0`) と海流相対風速
+静水圧傾度は Pacanowski & Gnanadesikan (1998) の名目層厚積分で評価し、部分ステップ上の静止成層での偽気圧傾度力を厳密ゼロにする。
 
-`ocean_glevel > 0`（`src/aoba/ocean_coupler.py`）を指定すると、細密海洋セル $j$ を包含する親大気セル $p(j) = \arg\max_i (\mathbf{x}_{\mathrm{ocn},j}\cdot\mathbf{x}_{\mathrm{atm},i})$ との間で淡水・河川流出を全球保存しつつ、高解像な SST や海氷を厳密な海面面積加重平均で大気へ返す：
-
-$$
-\bar{\psi}_{\mathrm{atm},i} = \frac{\sum_{j:\,p(j)=i} A_{\mathrm{ocn},j}\, w_{\mathrm{wet},j}\, \psi_{\mathrm{ocn},j}}{\sum_{j:\,p(j)=i} A_{\mathrm{ocn},j}\, w_{\mathrm{wet},j}} \tag{9.7}
-$$
-
-3D CRM（`crm_ny > 1, crm_nx > 1`）または単独全球 CRM（`enable_superparam = false`）かつ `enable_current_rel_wind = true` のとき、海面フラックスは**海流相対風速**（Renault et al., 2016）で計算され、中規模渦の風仕事減衰を再現する：
+3. **KPP 境界層・内部シアー・海底粗度内部潮汐混合・対流調節**：Large, McWilliams & Doney (1994) によりバルクリチャードソン数 $\mathrm{Ri}_{b,k} < 0.30$ から境界層深さ $h_{\mathrm{BL}}$、3 次形状関数 $G(\sigma)$、KPP 拡散係数 $K_{v,\mathrm{KPP}}$ および冷却時非局所フラックス $F_{\mathrm{NL}}$（$C_s = 6.33$）を求める。さらに内部シアー混合 $K_{v,\mathrm{shear}}$、Bryan–Lewis 背景拡散 $K_{v,\mathrm{bg}}$、および St. Laurent et al. (2002) / Simmons et al. (2004) の海底勾配 $|\nabla H|$・粗度 $\sigma_{\mathrm{topo}}$ 依存深海内部潮汐混合（減衰スケール $\zeta_{\mathrm{tide}} = 500\ \mathrm{m}$）を合算し、密度逆転時は $\kappa_{v,\mathrm{conv}} = 1.0\ \mathrm{m^2\ s^{-1}}$ へ引き上げる（波浪結合時は $z < h_{\mathrm{BL}}$ に Langmuir 係数 $E_L$ を乗じる）：
 
 $$
-\mathbf{U}_{\mathrm{rel}} = \mathbf{u}_a(z_1) - \mathbf{u}_o(z=0) \tag{9.8}
+\begin{aligned}
+G(\sigma) &= \sigma(1 - \sigma)^2, \qquad K_{v,\mathrm{KPP}} = h_{\mathrm{BL}} w_s G(\sigma), \qquad F_{\mathrm{NL}} = -C_s G(\sigma) w^{\mathrm{sfc}}, \\
+K_{v,\mathrm{shear}}(\mathrm{Ri}_g) &= \nu_0\left[1 - \min\!\left(\frac{\mathrm{Ri}_g}{0.70},\ 1\right)^2\right]^3, \\
+K_{v,\mathrm{tot}}(z) &= K_{v,\mathrm{bg}}(z) + \min\!\left(\frac{0.0667\,E_{\mathrm{tide}}\,F_{\mathrm{tide}}(z)}{\rho_w\max(N^2, 10^{-7})},\ 5\times 10^{-3}\right) + K_{v,\mathrm{KPP}}(z) + K_{v,\mathrm{shear}}(\mathrm{Ri}_g)
+\end{aligned} \tag{9.5}
 $$
 
-### 9.5 予報海洋波浪・Langmuir KPP 混合・海塩飛沫フラックス (`src/aoba/ocean_waves.py`)
-
-`enable_wave_coupling = true` 時、有義波高 $H_s$ とピーク周期 $T_p$ を Pierson–Moskowitz 平衡スペクトルへ向かう波浪エネルギー緩和方程式で予報し、表層 Stokes ドリフト $u_{\mathrm{St}}$ とラングミュア数 $La_t = \sqrt{u_{*w}/u_{\mathrm{St}}}$ から KPP 混合を強化する（McWilliams & Sullivan, 2000）：
+4. **3D 傾圧 WS-RK3 運動量＋順圧自由表面分離解法（Ringler et al., 2013; Shchepetkin & McWilliams, 2005）**：3D 傾圧運動量方程式を TRiSK 渦度コリオリ・スケール適応 Munk 粘性・半陰的レイリー＋海底二次摩擦（$C_{d,\mathrm{bot}} = 2.5\times 10^{-3}$）付き 3 段 WS-RK3 と陰的鉛直粘性 Thomas ソルバで進めたのち、鉛直平均傾向 $F_{\mathrm{baro}}$ で強制される 2D 順圧自由表面モード $(u_{\mathrm{bt}}, \eta)$ を最大 64 サブサイクル（融合 Metal/CUDA カーネル）で積分し、時間平均順圧流速 $\bar{u}_{\mathrm{bt}}$ で 3D 流速の順圧成分を置換する：
 
 $$
-\frac{dE_w}{dt} = \frac{E_{\mathrm{PM}}(U_{10}) - E_w}{\tau_{\mathrm{grow}}(U_{10})}, \qquad H_s = 4\sqrt{E_w}, \qquad u_{\mathrm{St}} \approx 0.016\, U_{10}\left(\frac{H_s}{H_{\mathrm{PM}}}\right)^{1/2} \tag{9.9}
+\frac{\partial \mathbf{u}_o}{\partial t} + (\mathbf{u}_o\cdot\nabla)\mathbf{u}_o + f\hat{\mathbf{k}}\times\mathbf{u}_o = -g\nabla\eta - \frac{1}{\rho_0}\nabla p_{\mathrm{hyd}} + \frac{\partial}{\partial z}\left(A_v\frac{\partial \mathbf{u}_o}{\partial z}\right) + A_h\nabla^2\mathbf{u}_o - r_{\mathrm{drag}}\mathbf{u}_o \tag{9.6}
+$$
+
+5. **解像度適応 GM90・Fox-Kemper サブメソ再成層・FCT-$z^*$ 移流・回転 Redi 拡散・増分陰的鉛直拡散**：中立面勾配 $S_x$（$|S_x| \le 10^{-2}$、境界層内線形テーパ）に対し、Hallberg (2013) のロスビー変形半径 $L_d$ 適応 GM90 流れ関数 $\Psi_{\mathrm{GM}}$（$\kappa_{\mathrm{GM}} = 800\ \mathrm{m^2\ s^{-1}}$）と Fox-Kemper et al. (2008, Eq. 5; 2011) の混合層サブメソ渦流れ関数 $\Psi_{\mathrm{MLE}}$ の和からボーラス速度 $u_{\mathrm{GM},k}$ を得る。トレーサ輸送は $z^*$ 座標（層厚 $h^*_k$・相対鉛直流 $w^*_{k+1/2}$; Adcroft & Campin, 2004; Danilov et al., 2017）上の偏差形式 Zalesak FCT 移流および完全回転 Redi 等密度面拡散（$\kappa_{\mathrm{Redi}} = 1000\ \mathrm{m^2\ s^{-1}}$、対角鉛直項 $K_{v,\mathrm{Redi}} \propto S_x^2$ は陰解法へ組込）で積分し、鉛直拡散は float32 桁落ちドリフトを完全排除する増分形式＋厳密テレスコーピングフラックス再構成＋Neumaier/Kahan 加算で解く：
+
+$$
+\begin{aligned}
+\Psi_{\mathrm{GM}} &= \kappa_{\mathrm{GM}}\left[1 + \left(\frac{L_d}{\Delta c_e}\right)^2\right]^{-1} S_x, \\
+\Psi_{\mathrm{MLE}} &= C_{\mathrm{FK}}\,h_{\mathrm{BL}}^2\,(\partial_x b_{\mathrm{ml}})\,(1 - \xi^2)\left(1 + \frac{5}{21}\xi^2\right), \\
+u_{\mathrm{GM},k} &= -\frac{\Psi_{k+1/2} - \Psi_{k-1/2}}{h_{e,k}}, \qquad h^*_k = h_{c,k}\left(1 + \frac{\eta}{H}\right), \qquad (I + L)\Delta q = -L q
+\end{aligned} \tag{9.7}
+$$
+
+EVP 無効時のフォールバックとして自由漂流＋塑性リジング海氷輸送（`step_seaice_drift_voronoi`）も備える。
+
+### 9.5 独立高解像度海洋グリッド結合 (`ocean_glevel > glevel`) と海流相対風速 (`src/aoba/ocean_coupler.py`)
+
+細密海洋セル $j$ を包含する親大気セル $p(j) = \arg\max_i(\mathbf{x}_{\mathrm{ocn},j}\cdot\mathbf{x}_{\mathrm{atm},i})$ に対し、海洋 $\to$ 大気は厳密湿潤面積加重平均、大気 $\to$ 海洋の示強量は直接参照、流出・河川などの示量フラックスは全球総量保存スケーリングでマッピングする。大気からの表層増分 $(\Delta T_{\mathrm{ml}}, \Delta m_{\mathrm{ice}}, \Delta\mathrm{SWE}_{\mathrm{ice}})$ は細密 SST 勾配を保ったまま増分結合される。また 3D CRM または単独全球 CRM かつ `enable_current_rel_wind = true` 時、海面フラックスは海流相対風速 $\mathbf{U}_{\mathrm{rel}}$（Renault et al., 2016）を用いる：
+
+$$
+\begin{aligned}
+\bar{\psi}_{\mathrm{atm},i} &= \frac{\sum_{j:\,p(j)=i} A_{\mathrm{ocn},j}\,w_{\mathrm{wet},j}\,\psi_{\mathrm{ocn},j}}{\sum_{j:\,p(j)=i} A_{\mathrm{ocn},j}\,w_{\mathrm{wet},j}}, \\
+\mathbf{U}_{\mathrm{rel}} &= \mathbf{u}_a(z_1) - \mathbf{u}_o(z=0)
+\end{aligned} \tag{9.8}
+$$
+
+### 9.6 予報表面波浪・Stokes/Langmuir 混合・波齢抗力・海塩飛沫 (`src/aoba/ocean_waves.py`)
+
+`enable_wave_coupling = true` 時、Pierson–Moskowitz 平衡有義波高 $H_{s,\mathrm{eq}}$ およびピーク周期 $T_{p,\mathrm{eq}}$ へ発達時定数 $\tau_{\mathrm{grow}} = 6\ \mathrm{h}$・減衰時定数 $\tau_{\mathrm{decay}} = 18\ \mathrm{h}$ の非対称厳密指数緩和で $(H_s, T_p)$ を予報する。深水表層 Stokes ドリフト $u_s$ と乱流ラングミュア数 $\mathrm{La}_t$ から KPP 混合強化係数 $E_L$（McWilliams & Sullivan, 2000; Takaya et al., 2010）および波齢依存海面抗力倍率 $\chi_{\mathrm{drag}}$（Janssen, 1991）を算出する：
+
+$$
+\begin{aligned}
+H_{s,\mathrm{eq}} &= 0.0246\,U_{10}^2, \qquad T_{p,\mathrm{eq}} = 0.81\,U_{10}, \\
+u_s &= \frac{\pi^3 H_s^2}{g T_p^3}, \qquad \mathrm{La}_t = \sqrt{\frac{u_{*w}}{u_s}}, \\
+E_L &= \operatorname{clamp}\!\left(\sqrt{1 + \frac{0.08}{\mathrm{La}_t^4} + \frac{0.04}{\mathrm{La}_t^2}},\ 1.0,\ 2.2\right), \qquad \chi_{\mathrm{drag}} = \operatorname{clamp}\!\left(\left(\frac{25.0}{c_p/u_{*a}}\right)^{0.25},\ 0.85,\ 1.35\right)
+\end{aligned} \tag{9.9}
+$$
+
+強風域（$U_{10} > 12\ \mathrm{m\ s^{-1}}$）では砕波海塩飛沫因子 $F_{\mathrm{spray}}$ による追加潜熱 $\Delta\mathrm{LH}_{\mathrm{spray}}$ および顕熱 $\Delta\mathrm{SH}_{\mathrm{spray}}$（Fairall et al., 2009; Andreas et al., 2015）を海面フラックスへ加算する：
+
+$$
+\begin{aligned}
+F_{\mathrm{spray}} &= \left(\frac{\max(U_{10} - 12,\ 0)}{20}\right)^{2.6} f_{\mathrm{open}}, \\
+\Delta\mathrm{LH}_{\mathrm{spray}} &= 120\,F_{\mathrm{spray}}\,\frac{\Delta q}{0.006}, \\
+\Delta\mathrm{SH}_{\mathrm{spray}} &= 25\,F_{\mathrm{spray}}\,\frac{\Delta T_{sa}}{2} - 0.25\,\Delta\mathrm{LH}_{\mathrm{spray}}
+\end{aligned} \tag{9.10}
+$$
+
+### 9.7 5 カテゴリ ITD・EVP 力学海氷 (`src/aoba/seaice_evp.py`)
+
+`enable_seaice_evp_itd = true` 時、海氷面積・体積 $(a_n, v_n)$ を 5 氷厚カテゴリ（境界 $0, 0.6, 1.4, 2.4, 3.6, \infty\ \mathrm{m}$）で予報する。熱力学質量変化の同期後にカテゴリ再配分（rebinning）および総被覆率 $A = \sum_n a_n > 1$ 時の機械的リジング（カテゴリ $n\to n+1$ へ厚さを 2 倍化して体積保存移動）を実行し、Hibler (1979) 圧縮強度 $P$（$P^* = 2.75\times 10^4\ \mathrm{N\ m^{-2}}$, $C^* = 20$, 楕円軸比 $e = 2$）のもとで $N_{\mathrm{EVP}} = 24$ サブサイクルの EVP 内部応力緩和（$T_{\mathrm{damp}} = 0.36\Delta t$, Hunke & Dukowicz, 1997, Eqs. 16–17）と 2 段半陰的中点法による海氷運動量方程式を融合 GPU カーネルで解く：
+
+$$
+\begin{aligned}
+P &= P^* V\,\exp\!\big(-C^*(1 - A)\big), \qquad \Delta = \sqrt{\dot{\varepsilon}_I^2 + e^{-2}\dot{\varepsilon}_{II}^2 + \Delta_{\min}^2}, \\
+\sigma_1^{\mathrm{new}} &= \frac{\sigma_1 + \alpha_e\zeta(\dot{\varepsilon}_I - \Delta)}{1 + \alpha_e}, \qquad \sigma_s^{\mathrm{new}} = \frac{\sigma_s + \alpha_e\eta\dot{\varepsilon}_{II}}{1 + \alpha_e}
+\end{aligned} \tag{9.11}
 $$
 
 $$
-\mathcal{E}_{\mathrm{Langmuir}} = \sqrt{1 + \left(0.08\,La_t^{-2}\right)^2} \tag{9.10}
+m_{\mathrm{ice}}\frac{\partial\mathbf{u}_{\mathrm{ice}}}{\partial t} = -m_{\mathrm{ice}} f\hat{\mathbf{k}}\times\mathbf{u}_{\mathrm{ice}} + A\boldsymbol{\tau}_a + A\rho_w C_w|\mathbf{u}_o - \mathbf{u}_{\mathrm{ice}}|(\mathbf{u}_o - \mathbf{u}_{\mathrm{ice}}) - m_{\mathrm{ice}} g\nabla\eta + \frac{1}{2}\nabla\sigma_1 \tag{9.12}
 $$
 
-台風級の強風（$U_{10} > 15\ \mathrm{m\ s^{-1}}$）では砕波による海塩飛沫が追加の顕熱・潜熱エンタルピーを供給する（Fairall et al., 1994; Andreas et al., 2015）：
+全 11 場（$a_{0..4}, v_{0..4}, \mathrm{SWE}_{\mathrm{ice}}$）を 2 段 SSP-RK2（Heun 法、水平拡散 $K_{\mathrm{ice}} = 250\ \mathrm{m^2\ s^{-1}}$）で保存移流し、移流後にリジング・再配分を施して $m_{\mathrm{ice}} = \rho_{\mathrm{ice}}\sum_n v_n$ を更新する。
+
+### 9.8 FlexPFT 海洋生物地球化学・OMIP/mocsy 2.0 炭酸系・$\mathrm{O}_2$ / OMZ 脱窒 (`src/aoba/ocean_bgc.py`)
+
+`enable_ocean_bgc = true` 時、7 種（$\mathrm{O}_2$ 有効時 8 種）の 3D トレーサ（$\mathrm{NO}_3, P, Z, D_N, D_C, \mathrm{DIC}, \mathrm{Alk}, \mathrm{O}_2$）を OGCM と同一のバッチ偏差形式移流・回転 Redi・増分陰的鉛直混合で輸送する。表層溶存鉄 $\mathrm{Fe}_{\mathrm{sfc}}\ [\mathrm{nM}]$ は大気ダスト沈着（鉄含有 $3.5\%$・可溶率 $2\%$）と時定数 90 日の除去の緩和で予報し、鉄制限因子 $\mathrm{Fe}_{\mathrm{sfc}}/(\mathrm{Fe}_{\mathrm{sfc}}+0.20)$ を水中 PAR へ結合する。
+
+1. **FlexPFT 最適光順化・可変 N:C クオータ（Pahlow et al., 2013; Smith et al., 2016; Sasai et al., 2022, Eqs. 2–7）**：クロロフィル自己遮蔽（消散係数 $k_d = 0.04 + 0.03\,\mathrm{Chl}$）下の層平均 PAR $I_k$ と Arrhenius 温度関数 $F(T)$（$E_a = 48\ \mathrm{kJ\ mol^{-1}}$）に対し、最適葉緑体 $\mathrm{Chl:C}$ 比 $\hat{\theta}$ をオーバーフロー回避型 Lambert-$W_0(e^y)$ で、潜在硝酸吸収 $\hat{V}^N$・最適細胞 N:C クオータ $Q$・最適配分比 $f_V$・比成長率 $\mu_{\mathrm{fl}}$ およびクロロフィル濃度 $\mathrm{Chl}$ を解析的に求める：
 
 $$
-H_{\mathrm{spray}} + L_v E_{\mathrm{spray}} \propto u_*^3 \cdot \max(0,\ U_{10} - 15)^{1.5} \tag{9.11}
+\begin{aligned}
+\hat{\theta} &= \frac{1}{\zeta^{\mathrm{Chl}}} + \frac{V_0}{\alpha_I I}\Big[1 - W_0(e^y)\Big], \\
+Q &= Q_s\left(1 + \sqrt{1 + \frac{1}{Q_s(V_L/\hat{V}^N + \zeta^N)}}\right), \\
+\mu_{\mathrm{fl}} &= \frac{f_V\hat{V}^N}{Q}, \qquad \mathrm{Chl} = P\frac{\hat{\theta}}{Q}
+\end{aligned} \tag{9.13}
 $$
 
-### 9.6 5 カテゴリ EVP–ITD 力学海氷 (`src/aoba/seaice_evp.py`)
+Holling Type III 動物プランクトン摂食、1 次・2 次枯死、$\mathrm{CaCO}_3$ レイン比 $r_{\mathrm{CaCO_3}} = 0.07$（アルカリ度 $-2\ \mathrm{eq/mol\ CaCO_3}$）、指数デトリタス再無機化、および無条件安定陰的沈降（$w_s = 15\ \mathrm{m\ d^{-1}}$、海底到達分は底層で即時再無機化して完全保存）を融合 GPU カーネルで積分する。
 
-`enable_seaice_evp_itd = true` 時、海氷を 5 つの氷厚カテゴリ＋リードに分割し、融合 GPU カーネル（60 サブサイクル）で**弾粘塑性 (EVP)** 内部応力レオロジー（Hunke & Dukowicz, 1997）を解く：
-
-$$
-m_{\mathrm{ice}}\frac{\partial \mathbf{u}_{\mathrm{ice}}}{\partial t} = -m_{\mathrm{ice}} f\hat{\mathbf{k}}\times\mathbf{u}_{\mathrm{ice}} + \boldsymbol{\tau}_a + \boldsymbol{\tau}_w - m_{\mathrm{ice}} g\nabla\eta + \nabla\cdot\boldsymbol{\sigma}_{\mathrm{EVP}} \tag{9.12}
-$$
-
-### 9.7 FlexPFT 海洋生物地球化学・溶存酸素 $\mathrm{O}_2$・貧酸素水塊 (OMZ) (`src/aoba/ocean_bgc.py`)
-
-`enable_ocean_bgc = true` 時、3D 海洋栄養塩・炭素プール（$\mathrm{NO}_3, \mathrm{PO}_4, \mathrm{dFe}, \mathrm{DIC}, \mathrm{Alk}, \mathrm{POC}$）と光・栄養塩・ダスト鉄に順化する **FlexPFT** 植物プランクトン最適成長モデル（Smith et al., 2016）を解く：
+2. **OMIP / mocsy 2.0 表層炭酸平衡と Wanninkhof (2014) 大気海洋 $\mathrm{CO}_2$ 交換（Orr & Epitalon, 2015; Orr et al., 2017）**：Lueker et al. (2000) の $K_1, K_2$、Dickson (1990) の $K_B$、Uppström (1974) の全ホウ素 $B_T$、Millero (1995) の $K_W$ を用い、float32 アンダーフローを回避するスケール変数 $x = [\mathrm{H}^+]\times 10^8$ の 7 回有界 Newton–Raphson 反復で $A_T(x) = A_{\mathrm{obs}}$ を解き、Weiss (1974) / Weiss & Price (1980) 溶解度と Wanninkhof (2014) ガス交換速度 $k_w$ から正味吸収フラックス $f_{g\mathrm{CO_2}}$ を算出する：
 
 $$
-\mu_{\mathrm{phyto}} = \mu_{\max}(T)\,\min\!\left(\frac{\mathrm{NO}_3}{K_N + \mathrm{NO}_3},\ \frac{\mathrm{PO}_4}{K_P + \mathrm{PO}_4},\ \frac{\mathrm{dFe}}{K_{\mathrm{Fe}} + \mathrm{dFe}}\right)\left(1 - e^{-\alpha_{\mathrm{Chl}}\,\theta_{\mathrm{Chl:C}}\,\mathrm{PAR}/\mu_{\max}}\right) \tag{9.13}
+\begin{aligned}
+A_T(x) &= C_T\frac{K_{1s} x + 2 K_{1s} K_{2s}}{x^2 + K_{1s} x + K_{1s} K_{2s}} + B_T\frac{K_{Bs}}{x + K_{Bs}} + \left(\frac{K_{Ws}}{x} - x\right)\times 10^{-8}, \qquad \mathrm{pH}_T = 8 - \log_{10} x, \\
+k_w &= (1 - f_{\mathrm{ice}})\cdot 6.97\times 10^{-7}\,U_{10}^2\sqrt{\frac{660}{\mathrm{Sc}_{\mathrm{CO_2}}}}, \qquad f_{g\mathrm{CO_2}} = k_w\big([\mathrm{CO}_2]_{\mathrm{sat}} - [\mathrm{CO}_2^*]\big)
+\end{aligned} \tag{9.14}
 $$
 
-大気海洋 $\mathrm{CO}_2$ 交換は炭酸平衡（$\mathrm{DIC}, \mathrm{Alk} \to [\mathrm{H}^+], p\mathrm{CO}_2^{\mathrm{ocn}}$）を倍精度（`float64`）で厳密に解き、Wanninkhof (2014) ガス交換速度 $k_w$ で計算する：
+3. **3D 溶存酸素 $\mathrm{O}_2$ と貧酸素水塊 (OMZ) 嫌気的脱窒**：`enable_ocean_o2_omz = true` 時、Garcia & Gordon (1992) の飽和酸素溶解度および Anderson & Sarmiento (1994) 化学量論比 $R_{\mathrm{O_2:C}} = 138/106$ で $\mathrm{O}_2$ を予報する。$\mathrm{O}_2 < 20\ \mathrm{mmol\ m^{-3}}$ の貧酸素水塊 (OMZ) では好気呼吸から硝酸還元の嫌気的脱窒（$R_{\mathrm{denit}} = 0.8\ \mathrm{mol\ N / mol\ O_2}$）へ滑らかに切り替わり（$K_{\mathrm{O_2}} = 5.0\ \mathrm{mmol\ m^{-3}}$）、海洋由来 $\mathrm{N}_2\mathrm{O}$ 放出（第 10.6 節）へ結合する：
 
 $$
-F_{\mathrm{CO_2}}^{\mathrm{ocn}} = k_w(U_{10}, \mathrm{Sc})\,(1 - f_{\mathrm{ice}})\,K_0(T, S)\,\big(p\mathrm{CO}_2^{\mathrm{atm}} - p\mathrm{CO}_2^{\mathrm{ocn}}\big) \tag{9.14}
-$$
-
-さらに `enable_ocean_o2_omz = true` 時、Garcia & Gordon (1992) の酸素溶解度と $R_{\mathrm{O_2:C}} = 138/106$ の光合成・有機物分解から 3D 溶存酸素 $\mathrm{O}_2$ を予報する：
-
-$$
-\frac{\partial \mathrm{O}_2}{\partial t} = \mathcal{T}_{\mathrm{adv/diff}}(\mathrm{O}_2) + R_{\mathrm{O_2:C}}\big(\mathrm{NPP} - R_{\mathrm{remin,aer}}\big) + \frac{k_w^{\mathrm{O_2}}(1-f_{\mathrm{ice}})}{h_0}\big(\mathrm{O}_{2,\mathrm{sat}}(T, S) - \mathrm{O}_2\big)\delta_{k,0} \tag{9.15}
-$$
-
-$\mathrm{O}_2 < 20\ \mathrm{mmol\ m^{-3}}$ の**貧酸素水塊 (OMZ)** では好気呼吸が**嫌気的脱窒**へ切り替わり、硝酸を消費して海洋 $\mathrm{N}_2\mathrm{O}$ を大気へ放出する：
-
-$$
-R_{\mathrm{denit}} = R_{\mathrm{remin}} \cdot \frac{1}{1 + (\mathrm{O}_2 / 5.0)^2}, \qquad F_{\mathrm{N_2O}}^{\mathrm{OMZ}} \propto \int_{\mathrm{col}} R_{\mathrm{denit}}\,dz \tag{9.16}
+\begin{aligned}
+\frac{\partial \mathrm{O}_2}{\partial t} &= \mathcal{T}(\mathrm{O}_2) + R_{\mathrm{O_2:C}}\big(\mathrm{NPP} - R_{\mathrm{remin,aer}}\big) + \frac{k_w^{\mathrm{O_2}}(1-f_{\mathrm{ice}})}{h_0}\big(\mathrm{O}_{2,\mathrm{sat}} - \mathrm{O}_2\big)\delta_{k,0}, \\
+f_{\mathrm{denit}} &= \frac{1}{1 + (\mathrm{O}_2/5.0)^2}
+\end{aligned} \tag{9.15}
 $$
 
 ---
 
-## 10. 大気化学 (`o3_mode`)・エアロゾル・炭素循環 (`co2_mode`)・水安定同位体
+## 10. 大気化学 (`o3_mode`)・自然/火山エアロゾル・炭素/微量気体循環 (`co2_mode`)・水安定同位体
 
-### 10.1 大気化学・エアロゾル・物質循環・水同位体の概要
+### 10.1 物質循環・微量気体・同位体結合の概要
 
-微量気体と微粒子（エアロゾル）は濃度はごくわずかでも気候を大きく左右する。成層圏オゾンは太陽紫外線を吸収して成層圏の逆転層を作り、大規模火山噴火は数年間地球を寒冷化させ、湿地と海洋 OMZ は $\mathrm{CH}_4$・$\mathrm{N}_2\mathrm{O}$ を制御する。また重い水分子（$\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$）は気温に応じた同位体分別を起こすため、南極・グリーンランドの氷床コア記録とモデルを直接比較する定量的古気候プロキシとして機能する。
+大気オゾン、自然・火山起源エアロゾル、閉ループ炭素・メタン・亜酸化窒素循環、および 3D 安定水同位体（$\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$）は、SCVT FCT 移流・放射伝達・雲微物理・陸域/海洋生物地球化学と双方向に結合される。
 
 ![図 10.1: 閉ループ物質循環・水安定同位体・動的氷床・汎用惑星プリセット](assets/fig_07_biogeochem_planetary.svg)
 
-### 10.2 大気オゾン — 選択制モード (`o3_mode`)
+### 10.2 大気オゾン：選択制モード (`o3_mode`) と 3D 光化学 (`src/aoba/ozone_forcing.py`, `src/aoba/ozone_chemistry.py`)
 
-**`[forcing] o3_mode` により以下の 4 モードから選択** できる：
+`[forcing] o3_mode` により 4 モードから選択できる。
 
-| `o3_mode` | 次元 | 物理内容・データ源 | 主な適用対象 |
+| `o3_mode` | 次元 | 物理内容・データ源 | 利点 | 制約・留意点 |
+| :--- | :--- | :--- | :--- | :--- |
+| `"rcemip"` | 1D ($p$) | Wing et al. (2018) ガンマ解析プロファイル | 計算負荷ゼロで RCE 相互比較基準と厳密整合する。 | 緯度勾配・季節変化・極渦オゾン変動を表現しない。 |
+| `"latitude_seasonal"` *(既定)* | 2D ($\phi, p, t$) | 地図不要の緯度×季節 Brewer–Dobson 解析オゾン | 外部ファイル不要・ほぼゼロ負荷で中高緯度の季節オゾン極大を再現し、古気候や理想化実験にも適用可能。 | 力学輸送・火山エアロゾル・PSC・$\mathrm{CH}_4/\mathrm{LNO}_x$ との双方向化学フィードバックを持たない。 |
+| `"climatology"` | 2D 帯状月平均 | 外部 CMIP6 / CMIP7 input4MIPs NetCDF | 歴史気候再現および CMIP 実験の標準強制と直接整合する。 | 外部データファイルが必要であり、現代以外の軌道・気候状態では固定分布となる。 |
+| `"prognostic"` | 3D ($\mathbf{x}, z, t$) | 3D FCT＋Chapman UV＋$\mathrm{NO}_x/\mathrm{HO}_x$＋PSC＋対流圏前駆体＋乾性沈着＋火山/太陽応答 | Brewer–Dobson 輸送・オゾンホール・火山/太陽応答・系外惑星大気化学を自己無撞着に予報できる。 | 3D トレーサ移流と光化学計算の追加コストを要し、成層圏温度バイアスが PSC 反応へ直接影響する。 |
+
+`o3_mode = "latitude_seasonal"` では、Brewer–Dobson 極向き輸送による高緯度下降と春季極大を表現する気圧ピーク高度 $g_3(\phi)$ および季節位相 $f_{\mathrm{seas}}(\phi, \mathrm{DOY})$ を解析オゾン分布へ乗じる：
+
+$$
+\begin{aligned}
+g_3(\phi) &= 9.5 + 6.5\sin^2\phi, \\
+f_{\mathrm{seas}}(\phi, \mathrm{DOY}) &= 1 + 0.16\sin\phi\cos\!\left(\frac{2\pi(\mathrm{DOY} - 85)}{365.2425}\right)
+\end{aligned} \tag{10.1}
+$$
+
+`o3_mode = "prognostic"`（融合 GPU カーネル `ozone_chem_col`）では、球殻空気質量因子 $\mathrm{AMF} = 35/\sqrt{1224\mu_0^2 + 1}$ 上の累積路程 $(S_{\mathrm{O_2}}, S_{\mathrm{O_3}})$ から Herzberg・Schumann–Runge・Hartley・Chappuis・UV-B の各光解離係数 $(J_{\mathrm{O_2}}, J_{\mathrm{O_3}}, J_{\mathrm{O(^1D)}})$ を算出し、JPL 評価 19（Burkholder et al., 2019）の Chapman 反応速度 $(k_2, k_3)$、成層圏 $\mathrm{NO}_x$（$\mathrm{N}_2\mathrm{O}$ 連動）・$\mathrm{HO}_x$（$q_v$ 連動）・極域成層圏雲 PSC（$T < 195\ \mathrm{K}$, $(\mathrm{eCl}/3.5)^2$ 依存）、対流圏 $\mathrm{CH}_4/\mathrm{LNO}_x/\text{山火事}$ 生成と $\mathrm{O}(^1D)+\mathrm{H}_2\mathrm{O}$ 消滅、および Wesely (1989) 乾性沈着（海面 $0.0005$・裸地 $0.0008$・クチクラ $0.0018$・気孔 $0.0042\,\mu_0\ \mathrm{m\ s^{-1}}$）を合わせた奇酸素 Riccati 方程式を、桁落ちのない正平衡根 $\chi_{\mathrm{eq}}$ と厳密指数緩和で積分する：
+
+$$
+\begin{aligned}
+\frac{d\chi_{\mathrm{O_3}}}{dt} &= P - L_1\chi_{\mathrm{O_3}} - L_2\chi_{\mathrm{O_3}}^2, \qquad \chi_{\mathrm{eq}} = \frac{2P}{L_1 + \sqrt{L_1^2 + 4 P L_2}}, \\
+\chi_{\mathrm{O_3}}^{n+1} &= \chi_{\mathrm{O_3}}^n + (\chi_{\mathrm{eq}} - \chi_{\mathrm{O_3}}^n)\Big[-\operatorname{expm1}\!\Big(-\big(L_1 + L_2(\chi_{\mathrm{O_3}}^n + \chi_{\mathrm{eq}})\big)\Delta t\Big)\Big]
+\end{aligned} \tag{10.2}
+$$
+
+その後、境界層最下 6 層の対保存陰的鉛直混合（$h_{\mathrm{PBL}} = 1500\ \mathrm{m}$）、および成層圏火山硫酸表面積密度 $\mathrm{SAD}$（Solomon et al., 1996）と 11 年太陽 UV 倍率 $s_{\mathrm{UV}}$ の指数摂動を適用する。
+
+### 10.3 地図不要の鉱物ダスト (`src/aoba/dust.py`)
+
+外部ダスト発生源マップを用いず（$S \equiv 1$）、DEAD / CLM5 Ch. 31（Zender et al., 2003; Lawrence et al., 2020）の物理放出過程を各 MAML 陸面タイル上で評価する。Iversen & White (1982) の乾燥閾値摩擦速度 $u_{*,t,\mathrm{dry}}$ に Fécan et al. (1999) の土壌水分阻害因子 $f_w$（閾値含水率 $w_t = 0.198$）を乗じて閾値摩擦速度 $u_{*,t}$ を得、Owen (1964) の跳躍強化摩擦速度 $u_{*,s}$ から White (1979) 水平跳躍フラックス $Q_s$、Marticorena & Bergametti (1995) サンドブラスト効率 $\alpha = 0.04786\ \mathrm{m^{-1}}$、3 対数正規モード輸送質量比 $\sum M_{i,j} = 0.8712$、裸地非積雪液相率 $f_m$ および全球係数 $T_{\mathrm{emis}}$（既定 `dust_emis_factor = 2.5e-6`）の積で鉛直放出フラックスを求める：
+
+$$
+\begin{aligned}
+u_{*,t,\mathrm{dry}} &= \frac{0.22655}{\sqrt{\rho}}, \qquad u_{*,t} = u_{*,t,\mathrm{dry}}\,f_w, \qquad u_{*,s} = u_* + 0.003\big(\max(u_{10} - u_{10,t},\ 0)\big)^2, \\
+Q_s &= 2.61\frac{\rho u_{*,s}^3}{g}\left(1 - \frac{u_{*,t}}{u_{*,s}}\right)\left(1 + \frac{u_{*,t}}{u_{*,s}}\right)^2, \\
+F_{\mathrm{dust}} &= T_{\mathrm{emis}}\,f_m\,\alpha\,Q_s\sum M_{i,j}
+\end{aligned} \tag{10.3}
+$$
+
+大気柱内では最下層注入・対保存陰的 PBL 混合（$h_{\mathrm{PBL}} = 1200\ \mathrm{m}$）・トップダウン陰的重力沈降および乾性沈着（$v_{\mathrm{settle}} = 4\times 10^{-3}, v_{\mathrm{dep}} = 6\times 10^{-3}\ \mathrm{m\ s^{-1}}$）・指数湿性洗浄 $\exp(-0.50 P\Delta t)$ を融合 GPU カーネルで積分する。
+
+### 10.4 自然起源 4 種エアロゾル（海塩・DMS 硫酸塩・山火事 BC/OC・BVOC SOA、`src/aoba/aerosols.py`）
+
+4 種の 3D トレーサ（$q_{\mathrm{ss}}, q_{\mathrm{so4}}, q_{\mathrm{bc}}, q_{\mathrm{oc}}$）を SCVT FCT 移流および 4 種融合 GPU カーネルで進める。海塩放出 $F_{\mathrm{ss}}$（Jaeglé et al., 2011; Gong, 2003）、海洋 DMS 由来の非海塩硫酸塩放出 $F_{\mathrm{SO_4}}$（Kloster et al., 2006; Wanninkhof, 2014; FlexPFT クロロフィルから $[\mathrm{DMS}]_w$ を診断し変換収率 $Y_{\mathrm{SO_4}} = 0.75$ を適用）、および森林 BVOC 由来の二次有機エアロゾル放出 $F_{\mathrm{SOA}}$（Guenther et al., 2012 MEGAN; OC プールへ合算）は次式で計算され、山火事 BC/OC は SPITFIRE から直接注入される：
+
+$$
+\begin{aligned}
+f_{\mathrm{SST}}(T_c) &= 0.3 + 0.1\,T_c - 0.0076\,T_c^2 + 0.00021\,T_c^3, \\
+F_{\mathrm{ss}} &= f_{\mathrm{open}}\cdot 2.5\times 10^{-13}\,f_{\mathrm{SST}}(T_c)\,u_{10}^{3.41}, \\
+F_{\mathrm{SOA}} &= \mathbb{I}_{\mathrm{land}}\cdot 3.2\times 10^{-11}\big(1 - e^{-0.5\mathrm{LAI}}\big)e^{0.09(T_c - 30)}\left(0.35 + 0.65\,\frac{\mathrm{PAR}}{\mathrm{PAR} + 120}\right)
+\end{aligned} \tag{10.4}
+$$
+
+| 種別 | $v_{\mathrm{settle}}\ [\mathrm{m\ s^{-1}}]$ | $v_{\mathrm{dry}}\ [\mathrm{m\ s^{-1}}]$ | $\alpha_{\mathrm{wet}}\ [\mathrm{m^2\ kg^{-1}}]$ | $\mathrm{MEE}_{550}\ [\mathrm{m^2\ kg^{-1}}]$ | $\omega_{\mathrm{SW}}$ | $g_{\mathrm{SW}}$ | $k_{\mathrm{abs,LW}}\ [\mathrm{m^2\ kg^{-1}}]$ |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 海塩 (SS) | $4\times 10^{-3}$ | $5\times 10^{-3}$ | $0.80$ | $2500$ | $0.99$ | $0.76$ | $80$ |
+| 硫酸塩 ($\mathrm{SO}_4$) | $4\times 10^{-4}$ | $1.5\times 10^{-3}$ | $0.60$ | $6000$ | $0.99$ | $0.70$ | $120$ |
+| 黒色炭素 (BC) | $2\times 10^{-4}$ | $1.0\times 10^{-3}$ | $0.30$ | $10000$ | $0.25$ | $0.35$ | $450$ |
+| 有機炭素 (OC/SOA) | $2\times 10^{-4}$ | $1.0\times 10^{-3}$ | $0.50$ | $4000$ | $0.92$ | $0.70$ | $180$ |
+
+最下層濃度から吸湿性 CCN 診断値 $N_{\mathrm{CCN}}$ を、柱質量収支から厳密保存 BC 沈着フラックス $D_{\mathrm{BC}}$（SNICAR 積雪暗化入力）を算出する。
+
+### 10.5 成層圏火山性エアロゾル・SAI・11 年太陽活動周期 (`src/aoba/volcanic_solar.py`)
+
+`enable_volcanic_aerosols = true` 時、離散噴火パルス（ガウス緯度分布）または連続 SAI 注入の成層圏 $\mathrm{SO}_2$（酸化時定数 $\tau_{\mathrm{ox}} = k_1^{-1} = 35$ 日）および硫酸エアロゾル $\mathrm{H}_2\mathrm{SO}_4$（沈降時定数 $\tau_{\mathrm{set}} = k_2^{-1} = 1.10$ 年, 分子量比 $\alpha_m = 98.08/64.066$）を厳密な 2 段 Bateman 解析解で積分し、Brewer–Dobson 水平拡散（$K_h \le 6\times 10^5\ \mathrm{m^2\ s^{-1}}$）と $40\ \mathrm{hPa}$ 中心対数気圧鉛直プルームへ展開して光学厚（$\mathrm{MEE}_{\mathrm{SW}} = 3400, \omega=0.998, g=0.72, k_{\mathrm{LW}} = 135$）および表面積密度 $\mathrm{SAD}$ を求める。また `enable_solar_cycle = true` 時は 11 年シュワーベ周期（Lean et al., 2005; 既定振幅 $A_{\mathrm{TSI}} = 1.0\ \mathrm{W\ m^{-2}}$）で太陽定数摂動 $\Delta\mathrm{TSI}$ および成層圏 UV 倍率 $s_{\mathrm{UV}}$ を変調する：
+
+$$
+\begin{aligned}
+S^{n+1} &= S^n e^{-k_1\Delta t}, \qquad A^{n+1} = A^n e^{-k_2\Delta t} + S^n\,\alpha_m\frac{k_1}{k_1 - k_2}\left(e^{-k_2\Delta t} - e^{-k_1\Delta t}\right), \\
+\Delta\mathrm{TSI} &= 0.5\,A_{\mathrm{TSI}}\sin\varphi, \qquad s_{\mathrm{UV}} = 1 + 0.015\,A_{\mathrm{TSI}}\sin\varphi
+\end{aligned} \tag{10.5}
+$$
+
+### 10.6 大気 $\mathrm{CO}_2$ (`co2_mode`)・予報 $\mathrm{CH}_4/\mathrm{N}_2\mathrm{O}$・ケイ酸塩風化 (`co2_forcing.py`, `prognostic_co2.py`, `trace_gas_cycle.py`, `planetary_geochem.py`)
+
+`[forcing] co2_mode` により以下の 4 モードから選択できる。
+
+| `co2_mode` | 動作仕様 | 利点 | 制約・留意点 |
 | :--- | :--- | :--- | :--- |
-| `"rcemip"` | 1D ($p$) | Wing et al. (2018) 解析プロファイル | 熱帯・放射対流平衡 (RCE) 基準実験 |
-| `"latitude_seasonal"` *(既定)* | 2D ($\phi, p, t$) | 地図不要の緯度×季節 Brewer–Dobson 解析オゾン | 高速な標準多十年気候実験 |
-| `"climatology"` | 2D 帯状月平均 | 外部 CMIP6/CMIP7 input4MIPs NetCDF | 歴史気候再現・CMIP 相互比較 |
-| `"prognostic"` | 3D ($\mathbf{x}, z, t$) | 3D FCT＋Chapman UV＋$\mathrm{NO}_x/\mathrm{HO}_x$＋PSC＋乾性沈着 | オゾンホール・火山/太陽応答・系外惑星大気化学 |
+| `"constant"` *(既定)* | 固定値 `co2_ppmv` | 放射強制力を厳密一定に保て、平衡気候感度・産業革命前スピンアップに適する。 | 炭素循環から大気 $\mathrm{CO}_2$ への双方向フィードバックは閉じない。 |
+| `"scenario"` | NOAA・CMIP5 RCP・CMIP6 SSP・80 万年南極氷床コアなど 25 種シナリオを `float64` 線形補間 | CMIP 濃度駆動実験・歴史再現・氷期サイクル強制を即座に実行できる。 | 濃度は外部処方であり、陸域・海洋炭素吸収の応答は大気濃度へ帰還しない。 |
+| `"csv"` | 外部指定 `(year, co2_ppmv)` CSV ファイルを補間 | 独自の古気候時系列やステップ/パルス濃度実験を柔軟に構築できる。 | ユーザが CSV ファイルを用意する必要がある。 |
+| `"prognostic"` | 排出駆動の閉ループ全球炭素収支（任意で 3D FCT 移流を結合） | 陸域 $\mathrm{NBP}$・海洋 $f_{g\mathrm{CO_2}}$・ケイ酸塩風化・火山/人為排出の完全な炭素–気候フィードバック（C4MIP）を再現できる。 | 陸域・海洋炭素プールが未平衡のまま開始すると初期ドリフトが大気 $\mathrm{CO}_2$ 濃度へ伝播するため事前スピンアップを要する。 |
 
-`o3_mode = "prognostic"`（`src/aoba/ozone_chemistry.py`、融合 GPU カーネル `ozone_chem_col`）では、奇酸素の Riccati 収支方程式を解く：
-
-$$
-\frac{d\chi_{\mathrm{O_3}}}{dt} = P - L_1 \chi_{\mathrm{O_3}} - L_2 \chi_{\mathrm{O_3}}^2 \tag{10.1}
-$$
-
-生成項 $P$ は球殻スランパス上の Chapman UV 光解離と対流圏前駆体（$\mathrm{CH}_4, \mathrm{LNO}_x, F_{\mathrm{fire}}$）を合わせ、$L_2$ は JPL 二次再結合、$L_1$ は $\mathrm{NO}_x/\mathrm{HO}_x$ 触媒破壊・極域成層圏雲 (PSC, $T < 195\ \mathrm{K}$, $(\mathrm{EESC}/3.5)^2$ および火山エアロゾル表面積密度 $\mathrm{SAD}$ 依存) の不均一破壊・EEO 植生への乾性沈着の和である。桁落ちのない正の平衡根 $\chi_+$ と厳密指数緩和により無条件安定・正値保存で時間積分する：
+`co2_mode = "prognostic"` では全球炭素収支（換算質量 $M_{\mathrm{ppmv}} = 2.124\ \mathrm{Pg\ C\ ppmv^{-1}}$）を `float64` で厳密保存積分し、任意 3D $\mathrm{CO}_2$ 移流場は地表フラックス注入・陰的 PBL 混合ののち全球質量ロック補正を行う：
 
 $$
-\chi_+ = \frac{2P}{L_1 + \sqrt{L_1^2 + 4 P L_2}} \tag{10.2}
+\frac{d[\mathrm{CO}_2]_{\mathrm{glob}}}{dt} = \frac{E_{\mathrm{anthro}} + E_{\mathrm{volc}} - \mathrm{NBP}_{\mathrm{land}} - F_{\mathrm{ocean}} - F_{\mathrm{weath}}}{2.124} \tag{10.6}
 $$
 
-$$
-\chi_{\mathrm{O_3}}^{n+1} = \chi_{\mathrm{O_3}}^n + (\chi_+ - \chi_{\mathrm{O_3}}^n)\Big[-\operatorname{expm1}\!\Big(-\big(L_1 + L_2(\chi_{\mathrm{O_3}}^n + \chi_+)\big)\Delta t\Big)\Big] \tag{10.3}
-$$
-
-### 10.3 自然起源 5 種エアロゾル (`src/aoba/dust.py`, `src/aoba/aerosols.py`)
-
-鉱物ダスト（`enable_dust`）・海塩・海洋 DMS 硫酸塩・山火事 BC/OC（`enable_natural_aerosols`）・森林 BVOC 由来 SOA（`enable_bvoc_soa`）はすべて物理量のみから発生し、3D SCVT FCT 移流および厳密指数型の湿性洗浄・乾性沈着で除去される：
+`enable_prognostic_ch4_n2o = true` 時、湿地嫌気メタン生成（$R_h$・土壌飽和超過・動的湿地率連動）・山火事・地質放出（$20\ \mathrm{Tg\ CH_4\ yr^{-1}}$）と温度・オゾン全量・自己フィードバック依存 OH 酸化＋土壌メタン酸化（$120\ \mathrm{yr}^{-1}$）の収支、および陸域脱窒/$R_h$・海洋沈降 POC/OMZ 脱窒からの $\mathrm{N}_2\mathrm{O}$ 放出とオゾン依存成層圏光解離（基準寿命 $116\ \mathrm{yr}$）の収支をそれぞれ厳密指数更新する（換算質量 $M_{\mathrm{CH_4}} = 2844\ \mathrm{Tg\ CH_4\ ppmv^{-1}}$, $M_{\mathrm{N_2O}} = 4966\ \mathrm{Tg\ N\ ppmv^{-1}}$）：
 
 $$
-E_{\mathrm{dust}} = C_{\mathrm{dust}}\, f_{\mathrm{bare}}\, u_*^2 \max(0,\ u_* - u_{*,t})\,(1 - f_{\mathrm{snow}}) \tag{10.4}
+\begin{aligned}
+k_{\mathrm{OH}} &= \frac{1}{9.5}\,e^{0.032(\bar{T}_s - 287)}\left(\frac{300}{\overline{\mathrm{TCO}}}\right)^{0.35}\left(\frac{[\mathrm{CH}_4]}{0.80825}\right)^{-0.32}, \\
+k_{\mathrm{N_2O}} &= \frac{1}{116.0}\left(\frac{300}{\overline{\mathrm{TCO}}}\right)^{0.25}
+\end{aligned} \tag{10.7}
 $$
 
-$$
-q_a^{n+1} = q_a^n \exp\!\left(-\Lambda_{\mathrm{wet}}(P)\,\Delta t - \frac{v_{d,a}}{\Delta z_0}\Delta t\,\delta_{k,0}\right) \tag{10.5}
-$$
-
-### 10.4 成層圏火山性エアロゾルと 11 年太陽活動周期 (`src/aoba/volcanic_solar.py`)
-
-`enable_volcanic_aerosols = true` 時、大規模噴火パルス（例：1991 年ピナツボ $17\ \mathrm{Tg\ SO_2}$）または連続 SAI 注入の $\mathrm{SO}_2$ が $\tau_{\mathrm{ox}} = 35\ \mathrm{日}$ で硫酸エアロゾル $\mathrm{H}_2\mathrm{SO}_4$ へ酸化され、$\tau_{\mathrm{set}} = 1.1\ \mathrm{年}$ で沈降する過程を厳密な **2 段 Bateman 解析解**（Forward Euler ゼロ）で解き、Brewer–Dobson 拡散・放射・オゾン不均一破壊へ結合する：
+`enable_silicate_weathering = true` 時、Walker et al. (1981) に基づき非積雪陸面の温度・流出量・$\mathrm{CO}_2$ 依存ケイ酸塩風化フラックス $F_{w,i}$ を計算し、火山脱ガス $V$ との差を陰的線形化指数法で時間加速積分するとともに、化学量論比 $2\ \mathrm{mol\ eq / mol\ C}$ の河川アルカリ度を海洋 BGC へ供給する：
 
 $$
-M_{\mathrm{SO_2}}(t+\Delta t) = M_{\mathrm{SO_2}}(t)e^{-k_1 \Delta t} \tag{10.6}
+F_{w,i} = \mathbb{I}_{\mathrm{land}}(1 - f_{\mathrm{snow}})\,K_{\mathrm{base}}\,\exp\!\left(\frac{T_s - 288.15}{13.7}\right)\left(\frac{q_{\mathrm{runoff}}}{10^{-5}}\right)^{0.65}\left(\frac{[\mathrm{CO}_2]}{284.3}\right)^{0.30} \tag{10.8}
+$$
+
+### 10.7 予報 3D 水安定同位体 ($\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$, `src/aoba/water_isotopes.py`)
+
+`enable_water_isotopes = true` 時、VSMOW 規格化 3D 重水蒸気 $(q_v^{18}, q_v^{\mathrm{D}})$ を SCVT FCT 移流し、千分率同位体比偏差 $\delta_x$ [‰] および重水素過剰 $d$ を診断する。液–気平衡分別は Majoube (1971)、氷–気平衡分別は Majoube (1971) / Merlivat & Nief (1967) に Jouzel & Merlivat (1984) の過飽和度 $S_i$ 依存動的分別係数（拡散比 $(D/D')_{18}=1.0285, (D/D')_{\mathrm{D}}=1.0251$）を組み合わせ、$253.15\text{–}273.15\ \mathrm{K}$ で線形混合する：
+
+$$
+\begin{aligned}
+\delta_x &= (R_x - 1)\times 1000, \qquad d = \delta\mathrm{D} - 8\,\delta^{18}\mathrm{O}, \\
+\ln\alpha_{\ell,18} &= \frac{1137.0}{T^2} - \frac{0.4156}{T} - 0.0020667, \qquad \ln\alpha_{\ell,\mathrm{D}} = \frac{24844.0}{T^2} - \frac{76.248}{T} + 0.052612
+\end{aligned} \tag{10.9}
 $$
 
 $$
-M_{\mathrm{H_2SO_4}}(t+\Delta t) = M_{\mathrm{H_2SO_4}}(t)e^{-k_2 \Delta t} + \frac{98}{64}\, M_{\mathrm{SO_2}}(t)\,\frac{k_1}{k_2 - k_1}\left(e^{-k_1 \Delta t} - e^{-k_2 \Delta t}\right) \tag{10.7}
+\begin{aligned}
+S_i &= 1 + 0.003\,\operatorname{clamp}(273.15 - T,\ 0,\ 60), \\
+\alpha_{i,x} &= \alpha_{i,x}^{\mathrm{eq}}\,\frac{S_i}{1 + \alpha_{i,x}^{\mathrm{eq}}(S_i - 1)(D/D')_x}, \\
+R_{\mathrm{evap,ocn},x} &= \frac{\alpha_{\ell,\mathrm{sfc},x}^{-1} - h R_{0,x}}{1 - h}(1 - k_x)
+\end{aligned} \tag{10.10}
 $$
 
-`enable_solar_cycle = true` 時は 11 年シュワーベ太陽活動周期（Lean et al., 2005）で全太陽放射照度 (TSI) と成層圏 UV 光解離を変調する：
+海面蒸発には Craig & Gordon (1965) / Merlivat & Jouzel (1979) 動的分別（$k_{18}=0.0060, k_{\mathrm{D}}=0.0053$）を、陸面蒸散には非分別（降水同位体比引継）を適用する。凝結除去による同位体枯渇は厳密 Rayleigh 蒸留解析解で更新し、降雪 $\delta^{18}\mathrm{O}_{\mathrm{snow}}, \delta\mathrm{D}_{\mathrm{snow}}$ を氷床コア比較用診断場へ質量加重積算する：
 
 $$
-S_0(t) = S_{0,\mathrm{base}} + \frac{\Delta S_{\mathrm{cyc}}}{2}\sin\!\left(\frac{2\pi (t_{\mathrm{yr}} - t_0)}{P_{\mathrm{cyc}}}\right), \qquad f_{\mathrm{UV}} = 1 + 0.035\sin\!\left(\frac{2\pi (t_{\mathrm{yr}} - t_0)}{P_{\mathrm{cyc}}}\right) \tag{10.8}
-$$
-
-### 10.5 大気 $\mathrm{CO}_2$ (`co2_mode`)・$\mathrm{CH}_4/\mathrm{N}_2\mathrm{O}$・ケイ酸塩風化
-
-**`[forcing] co2_mode` により以下の 4 モードから選択** できる：
-
-| `co2_mode` | 動作仕様 | 主な適用対象 |
-| :--- | :--- | :--- |
-| `"constant"` *(既定)* | 固定値 `co2_ppmv`（例: 284.3 piControl, 185 LGM, 1137 $4\times\mathrm{CO}_2$） | 平衡気候感度・産業革命前基準実験 |
-| `"scenario"` | 同梱 NOAA / CMIP5 RCP / CMIP6 SSP / 80 万年氷床コア表を線形補間 | 濃度駆動の歴史再現・将来予測 (SSP) |
-| `"csv"` | ユーザ任意の `(year, co2_ppmv)` CSV ファイル (`co2_csv_path`) | 独自古気候・パルス実験 |
-| `"prognostic"` | 排出駆動・完全双方向の大気炭素収支（＋任意 3D FCT 移流） | 炭素–気候フィードバック完全結合 ESM (C4MIP) |
-
-`co2_mode = "prognostic"`（`src/aoba/prognostic_co2.py`）では、全フラックス収支を倍精度（換算係数 $2.124\ \mathrm{PgC\ ppmv^{-1}}$）で厳密保存積分する：
-
-$$
-\frac{d C_{\mathrm{CO_2}}}{dt} = \frac{E_{\mathrm{anthro}} + E_{\mathrm{volc}} - \mathrm{NBP}_{\mathrm{land}} - F_{\mathrm{CO_2}}^{\mathrm{ocn}} - F_{\mathrm{weath}}}{2.124} \tag{10.9}
-$$
-
-`enable_prognostic_ch4_n2o = true`（`src/aoba/trace_gas_cycle.py`）では湿地・山火事・土壌・海洋 OMZ 放出と OH / 成層圏 UV 消滅を厳密指数法で解く：
-
-$$
-\frac{dC_{\mathrm{CH_4}}}{dt} = \frac{E_{\mathrm{wet}} + E_{\mathrm{fire}}}{2.75} - \frac{C_{\mathrm{CH_4}}}{\tau_{\mathrm{OH}}(C_{\mathrm{CH_4}}, T)}, \qquad \frac{dC_{\mathrm{N_2O}}}{dt} = \frac{E_{\mathrm{soil}} + E_{\mathrm{OMZ}}}{4.79} - \frac{C_{\mathrm{N_2O}}}{\tau_{\mathrm{UV}}} \tag{10.10}
-$$
-
-地質学的長期実験（`enable_silicate_weathering`; Walker et al., 1981）では、温暖湿潤になるほど進むケイ酸塩風化が $\mathrm{CO}_2$ を吸収し惑星の負のフィードバック安定化装置として働く：
-
-$$
-F_{\mathrm{weath}} = F_{w0} \left(\frac{R_{\mathrm{runoff}}}{R_0}\right)^{0.65} \exp\!\left(\frac{T_s - T_0}{13.7\ \mathrm{K}}\right)\left(\frac{C_{\mathrm{CO_2}}}{284.3}\right)^{0.3} \tag{10.11}
-$$
-
-### 10.6 予報 3D 水安定同位体 ($\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$, `src/aoba/water_isotopes.py`)
-
-重い水分子（$\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$）は通常の水 ($\mathrm{H}_2^{16}\mathrm{O}$) より飽和蒸気圧がわずかに低いため、降水時に優先的に液滴・氷晶へ取り込まれる。結果として極域や高山へ運ばれる空気塊ほど重い同位体が枯渇し、南極・グリーンランドの氷床コアに刻まれる緯度・高度・気温に応じた空間勾配が形成される。
-
-`enable_water_isotopes = true` 時、VSMOW 規格化 3D 重水蒸気 $(q_v^{18}, q_v^{\mathrm{D}})$ を SCVT FCT 移流し、$\delta$ 値（$\text{‰}$）と重水素過剰 $d_{\mathrm{excess}}$ を診断する：
-
-$$
-R_i = \frac{q_v^{(i)}}{q_v}, \qquad \delta_i\ [\text{‰}] = (R_i - 1)\times 1000, \qquad d_{\mathrm{excess}} = \delta\mathrm{D} - 8\,\delta^{18}\mathrm{O} \tag{10.12}
-$$
-
-液–気平衡分別は Majoube (1971)、氷晶昇華分別は Merlivat & Nief (1967) および Jouzel & Merlivat (1984) の過飽和動的分別 $S_i(T)$ を用いる：
-
-$$
-\ln\alpha_\ell^{18}(T) = \frac{1137}{T^2} - \frac{0.4156}{T} - 0.0020667, \qquad \ln\alpha_\ell^{\mathrm{D}}(T) = \frac{24844}{T^2} - \frac{76.248}{T} + 0.052612 \tag{10.13}
-$$
-
-$$
-\alpha_{i,\mathrm{kin}} = \alpha_{i,\mathrm{eq}} \frac{S_i}{1 + \alpha_{i,\mathrm{eq}}(S_i - 1)(D_{\mathrm{light}}/D_{\mathrm{heavy}})} \tag{10.14}
-$$
-
-海面蒸発分別には Craig & Gordon (1965) / Merlivat & Jouzel (1979) モデルを適用する（海水 $R_{\mathrm{ocn}} = 1.0$、相対湿度 $h$）：
-
-$$
-R_{\mathrm{evap}}^{\mathrm{ocn}} = \frac{\alpha_\ell^{-1} - h\,R_v}{1 - h}(1 - k_{\mathrm{kin}}) \tag{10.15}
-$$
-
-凝結降水による残存水蒸気の枯渇は**厳密な Rayleigh 蒸留解析解**で更新し、降雪 $\delta^{18}\mathrm{O}_{\mathrm{snow}}$ を氷床コア比較用アーカイブへ質量加重積算する：
-
-$$
-R_v^{n+1} = R_v^n \, f_{\mathrm{rem}}^{\alpha_{\mathrm{eff}} - 1}, \qquad f_{\mathrm{rem}} = \exp\!\left(-\frac{P\,\Delta t}{\mathrm{CWV}}\right) \tag{10.16}
+\begin{aligned}
+f_{\mathrm{rem}} &= \exp\!\left(-\frac{(P_{\mathrm{rain}} + P_{\mathrm{snow}})\Delta t}{\mathrm{CWV}}\right), \\
+R_{k,x}^{n+1} &= R_{k,x}^n\,f_{\mathrm{rem}}^{\alpha_{\mathrm{eff},k,x} - 1}
+\end{aligned} \tag{10.11}
 $$
 
 ---
 
-## 11. 動的氷床モデル・ミランコビッチ古気候・汎用惑星プリセット
+## 11. 動的氷床モデル・ミランコビッチ軌道進化・汎用惑星プリセット
 
-### 11.1 氷床力学・軌道強制・汎用惑星構成の概要
+### 11.1 Glen ($n=3$) SIA 氷床・アイソスタシー・静水圧鉛直再補間 (`src/aoba/icesheet.py`)
 
-数千年の時間スケールでは、夏の融解を上回って積もった雪が巨大な大陸氷床となり、自重でゆっくりと流動しながら下の地殻をマントルへ沈み込ませる。同時に惑星間重力による**ミランコビッチ軌道変化**が北半球夏の日射量を変動させて氷期・間氷期を引き起こす。AOBA は現代地図を一切持たないため、同じ方程式系のまま全球凍結（スノーボールアース）や赤色矮星を公転する潮汐固定系外惑星（TRAPPIST-1e）も自然にシミュレートできる。
-
-### 11.2 Glen ($n=3$) SIA 氷床・アイソスタシー・鉛直格子再構築 (`src/aoba/icesheet.py`)
-
-`enable_dynamic_icesheet = true` 時、年次表面質量収支 (SMB) を `icesheet_ema_years` で平滑化し、SCVT 格子上の Glen ($n=3$) **浅氷近似 (SIA)** 方程式を任意の加速倍率 $\alpha_{\mathrm{acc}}$ で解く：
+`enable_dynamic_icesheet = true` 時、年次表面質量収支 $\mathrm{SMB}$ を指数移動平均（既定 $\tau_{\mathrm{EMA}} = 5\ \mathrm{yr}$）し、加速時間刻み $\Delta t_{\mathrm{ice}} = \alpha_{\mathrm{acc}}\Delta t_{\mathrm{clim}}$（既定 $\alpha_{\mathrm{acc}} = 100$）上で Glen 流動則（$n=3$, 流動係数 $A_{\mathrm{Glen}} = 10^{-16}\ \mathrm{Pa^{-3}\ yr^{-1}}$）の浅氷近似 (SIA) 上流型有限体積拡散方程式を最大 256 サブサイクルで解く（Mahaffy, 1976; Bueler et al., 2005）。海洋セルへ流出した氷は即時カービング除去される：
 
 $$
-\frac{\partial H}{\partial t_{\mathrm{ice}}} = \nabla\cdot\big(D_{\mathrm{ice}}\nabla s\big) + \overline{\mathrm{SMB}}_{\mathrm{EMA}}, \qquad s = b + H \tag{11.1}
+\begin{aligned}
+\Gamma_{\mathrm{SIA}} &= \frac{2}{5}\,A_{\mathrm{Glen}}(\rho_i g)^3, \qquad D_e = \min\!\left(\Gamma_{\mathrm{SIA}} H_{\mathrm{up},e}^5 \left(\frac{s_{c_1}-s_{c_0}}{d_{c,e}}\right)^2,\ D_{\mathrm{cap}}\right), \\
+H^{m+1} &= \operatorname{clamp}\!\Big(H^m + \Delta t_{\mathrm{sub}}\big(\nabla_{\mathrm{SCVT}}\cdot(D_e\nabla s) + b_{\mathrm{ice}}\big),\ 0,\ 6000\Big)
+\end{aligned} \tag{11.1}
 $$
 
-$$
-D_{\mathrm{ice}} = \frac{2 A_{\mathrm{Glen}}}{n + 2}(\rho_{\mathrm{ice}} g)^n H^{n+2} |\nabla s|^{n-1}, \qquad n = 3 \tag{11.2}
-$$
-
-氷床下の岩盤高度 $b$ はマントル（$\rho_m = 3300\ \mathrm{kg\ m^{-3}}$）とのアイソスタシー平衡へ向かって時定数 $\tau_{\mathrm{iso}} = 1000\ \mathrm{年}$ で指数緩和する：
+基盤岩高度 $b$ はマントル（$\rho_m = 3300\ \mathrm{kg\ m^{-3}}$）とのアイソスタシー平衡 $b_{\mathrm{eq}}$ へ緩和時定数 $\tau_{\mathrm{iso}} = 1000\ \mathrm{yr}$ で指数緩和する（Pollard & DeConto, 2012）：
 
 $$
-b_{\mathrm{eq}} = b_0 - \frac{\rho_{\mathrm{ice}}}{\rho_m} H, \qquad b^{n+1} = b^n + \left(1 - e^{-\Delta t_{\mathrm{ice}}/\tau_{\mathrm{iso}}}\right)(b_{\mathrm{eq}} - b^n) \tag{11.3}
+\begin{aligned}
+b_{\mathrm{eq}} &= b_0 - \frac{\rho_i}{\rho_m}\,H, \\
+b^{n+1} &= b^n + \left(1 - e^{-\Delta t_{\mathrm{ice,yr}}/\tau_{\mathrm{iso}}}\right)(b_{\mathrm{eq}} - b^n)
+\end{aligned} \tag{11.2}
 $$
 
-氷厚が $H_{\mathrm{crit}} = 5.0\ \mathrm{m}$ を横切ると `SURF_LAND` $\leftrightarrow$ `SURF_ICESHEET` が自動遷移し、地形変化が $0.05\ \mathrm{m}$ を超えると静水圧測高外挿による保存的鉛直格子再補間（`remap_atmosphere_and_crm_vertical`）を実行する：
+氷厚が $H_{\mathrm{thr}} = 5.0\ \mathrm{m}$ を横断すると `SURF_LAND` $\leftrightarrow$ `SURF_ICESHEET` が自動遷移する。2 回平滑化後の地形変化が $0.05\ \mathrm{m}$ 以上の場合、`remap_atmosphere_and_crm_vertical` が新 STF 鉛直座標を再構築し、$\ln p, \theta_m, q$・風速を区分線形補間するとともに、脱氷河により露出した下方領域には静水圧等エントロピー外挿を適用する：
 
 $$
-p(z_c^{\mathrm{new}}) = p_0^{\mathrm{old}} \left[1 - \frac{g(z_c^{\mathrm{new}} - z_{c,0}^{\mathrm{old}})}{c_{pd}\theta_{m,0}^{\mathrm{old}}\Pi_0^{\mathrm{old}}}\right]^{c_{pd}/R_d} \tag{11.4}
+\begin{aligned}
+p_{\mathrm{extrap}} &= p_0\left[1 - \frac{g(z_{\mathrm{new}} - z_{\mathrm{old},0})}{c_{pd}\theta_{m,0}\Pi_0}\right]^{1/\kappa_d}, \\
+\rho_d &= \frac{p_{\mathrm{new}}}{R_d\theta_{m,\mathrm{new}}\Pi_{\mathrm{new}}}
+\end{aligned} \tag{11.3}
 $$
 
-### 11.3 解析的ミランコビッチ軌道進化 (`src/aoba/planetary_geochem.py`)
+### 11.2 解析的ミランコビッチ軌道進化 (`src/aoba/planetary_geochem.py`)
 
-`enable_milankovitch_orbit = true` 時、Berger (1978) / Laskar (2004) の三角級数により離心率 $e(t)$・傾斜角 $\varepsilon(t)$・気候歳差 $e\sin\varpi(t)$ を連続更新する（開始時期 `milankovitch_start_kyr`、例：LGM なら `-21.0` kyr）：
+`enable_milankovitch_orbit = true` 時、J2000 基準経過時間 $t\ [\mathrm{kyr}]$（開始時期 `milankovitch_start_kyr`, 例 LGM `-21.0`）に対し Berger (1978) / Laskar et al. (2004) の 5 項三角級数により離心率 $e(t)$（周期 $405.0, 94.9, 123.8, 98.9, 131.2\ \mathrm{kyr}$）、黄道傾斜角 $\varepsilon(t)$（周期 $41.00, 39.73, 53.62, 40.52, 28.91\ \mathrm{kyr}$）および近日点黄経 $\varpi(t)$（周期 $21.74\ \mathrm{kyr}$）を連続更新する：
 
 $$
-\varepsilon(t) = \varepsilon_0 + \sum_j A_j \cos(\omega_j t + \phi_j), \qquad e(t)\sin\varpi(t) = \sum_k P_k \sin(\nu_k t + \psi_k) \tag{11.5}
+\begin{aligned}
+e(t) &= 0.0278 + \sum_{j=1}^5 A_{e,j}\cos\!\left(\frac{2\pi t}{P_{e,j}} + \phi_{e,j}\right), \\
+\varepsilon(t) &= 23.320^\circ + \sum_{j=1}^5 A_{\varepsilon,j}\cos\!\left(\frac{2\pi t}{P_{\varepsilon,j}} + \phi_{\varepsilon,j}\right), \\
+\varpi(t) &= \left(283.0^\circ + 360^\circ\frac{t}{21.74}\right)\bmod 360^\circ
+\end{aligned} \tag{11.4}
 $$
 
-### 11.4 汎用惑星・系外惑星プリセット (`planet_preset`, `src/aoba/planetary_presets.py`)
+### 11.3 汎用惑星・系外惑星プリセット (`planet_preset`, `src/aoba/planetary_presets.py`)
 
-**`[forcing] planet_preset` により以下の 6 つの惑星設定から選択** できる：
+`[forcing] planet_preset` により以下の 6 構成から選択できる。
 
-| `planet_preset` | 地表面・地形 | 太陽定数・自転 | 特徴的物理 |
+| `planet_preset` | 主なパラメータ上書き | 地表面初期条件 | 基準文献 |
 | :--- | :--- | :--- | :--- |
-| `"earth"` *(既定)* | `Earth2014` 実大陸・海底・氷床 | $S_0 = 1361\ \mathrm{W\ m^{-2}}$, 24 時間 | 現代・歴史・古気候の地球 |
-| `"aquaplanet"` | 100% 全球海・地形ゼロ | $S_0 = 1361$, $\varepsilon = 0^\circ$ | Neale–Hoskins ITCZ / MJO / SP 標準ベンチマーク |
-| `"snowball_earth"` | 全球凍結（海氷 3 m＋積雪） | 微弱な若い太陽 $S_0 = 1280$, $200\ \mathrm{ppmv}$ | ケイ酸塩風化＋SNICAR 融解サーモスタット |
-| `"tidally_locked"` | 100% 海洋・太陽直下点固定 | 自転周期 10 日、`enable_tidal_lock = true` | 眼球型気候と太陽直下点厚雲シールド |
-| `"trappist1e"` | 100% 海洋・THAI 系外惑星基準 | $S_0 = 900$, $P_{\mathrm{rot}} = 6.101\ \mathrm{d}$, $1000\ \mathrm{ppmv}$ | ハビタブルゾーン赤色矮星惑星 (Fauchez et al., 2020) |
-| `"mars_like"` | 100% 寒冷乾燥裸地 | $S_0 = 589$, $\varepsilon = 25.19^\circ$, $4\%\ \mathrm{CO}_2$ | 乾燥岩石惑星の大気循環 |
+| `"earth"` *(既定)* | なし | `Earth2014` 実大陸・海底・氷床 | — |
+| `"aquaplanet"` | `use_earth2014=false`, $\varepsilon=0^\circ, e=0$, 河川/陸域 C/ダスト無効 | 100% 海洋・平坦、$T_{\mathrm{ml}}=288\ \mathrm{K}$、海氷 0 | Neale & Hoskins (2000) |
+| `"snowball_earth"` | $S_0=1280$, $\mathrm{CO}_2=200\ \mathrm{ppmv}$, 風化・SNICAR 有効 | 海洋 $m_{\mathrm{ice}}=2750\ \mathrm{kg\ m^{-2}}$ ($\sim 3\ \mathrm{m}$), $T_{\mathrm{ice}}=245\ \mathrm{K}$; 陸 $\mathrm{SWE}=120$ | Pierrehumbert et al. (2011) |
+| `"tidally_locked"` | `enable_tidal_lock=true`, $P_{\mathrm{rot}}=10\ \mathrm{d}$, $\varepsilon=e=0$, 日周無効 | 100% 海洋・平坦 | Yang et al. (2013) |
+| `"trappist1e"` | `enable_tidal_lock=true`, $S_0=900$, $P_{\mathrm{rot}}=6.101\ \mathrm{d}$, $\mathrm{CO}_2=1000\ \mathrm{ppmv}$ | 100% 海洋・平坦 | Turbet et al. (2018); Fauchez et al. (2020) |
+| `"mars_like"` | $S_0=589$, $\Omega=7.0882\times 10^{-5}$, $\varepsilon=25.19^\circ$, $e=0.0934$, $\mathrm{CO}_2=4\%$ | 100% 乾燥裸地 ($\sigma_{\mathrm{topo}}=150\ \mathrm{m}, T=218\ \mathrm{K}, w_\ell=0.005, \mathrm{LAI}=0$) | — |
 
-`enable_tidal_lock = true` 時、太陽天頂角は固定された太陽直下経度 $\lambda_{\mathrm{sub}}$（`substellar_lon_deg`）に対して定常となる：
+`enable_tidal_lock = true` 時、太陽天頂角余弦は太陽直下経度 $\lambda_{\mathrm{sub}}$（`substellar_lon_deg`）に対し定常分布となる：
 
 $$
-\mu_0(\phi, \lambda) = \max\!\big(0,\ \cos\phi\cos(\lambda - \lambda_{\mathrm{sub}})\big) \tag{11.6}
+\mu_0(\phi, \lambda) = \max\!\big(0,\ \cos\phi\cos(\lambda - \lambda_{\mathrm{sub}})\big), \qquad S_{\mathrm{TOA}} = S_0 \tag{11.5}
 $$
 
 ---
 
-## 12. 一元 307 パラメータ TOML レジストリ・Zarr v3 出力・AOBA Studio
+## 12. 一元 307 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio
 
-### 12.1 単一 TOML 設定管理とネイティブ Zarr v3 出力
+### 12.1 単一 TOML 設定管理・融合 GPU カーネル・ネイティブ Zarr v3 出力
 
-全 **14 セクション・307 パラメータ** が [`config/aoba_default.toml`](../config/aoba_default.toml)（`src/aoba/params.py`）に集約され、全 306 ユニークキーの日英物理説明が [`src/aoba/param_docs.py`](../src/aoba/param_docs.py) で 100% 管理されている。モデルコアの出力はすべて **CF-1.11 / UGRID-1.0 準拠 Zarr v3**（`mesh.zarr`, `monthly.zarr`, `snapshots.zarr`, オプション `cmip7_monthly.zarr`）および `daily_global.csv`・原子的チェックポイント `restart.pt` / `restart_mid.pt` を用いる。
+全 14 セクション・307 パラメータが [`config/aoba_default.toml`](../config/aoba_default.toml)（`src/aoba/params.py`）に集約され、全 306 ユニークキーの日英物理解説が [`src/aoba/param_docs.py`](../src/aoba/param_docs.py) で管理されている。ハードウェア可搬 `float32` 実行（`src/aoba/runtime.py` による `cuda` $\to$ `mps` $\to$ `cpu` 自動切替）では、単一ソース融合 Metal カーネル（`kernels.py`, `kernels_physics.py`, `kernels_extra.py`, `kernels_esm.py`）を `kernels_cuda.py` でネイティブ CUDA へ自動変換し、鉛直三重対角解法・沈降・放射・微物理・CRM サブサイクル・EVP 海氷・順圧海洋サブサイクルをステップ途中 CPU–GPU 同期ゼロで実行する。モデルコアの全履歴出力（`src/aoba/io_zarr.py`）は CF-1.11 / UGRID-1.0 準拠の Zarr v3（`mesh.zarr`, `monthly.zarr`, `snapshots.zarr`, 選択時 `cmip7_monthly.zarr` / `cmip7_fx.zarr`）、日別全球診断 `daily_global.csv` および原子的チェックポイント `restart.pt` / `restart_mid.pt`（異鉛直解像度間の自動静水圧再補間対応）を使用する。
 
-| TOML セクション | 項目数 | 主な役割 |
+| TOML セクション | 項目数 | 管轄領域 |
 | :--- | ---: | :--- |
-| `[grid]` | 16 | SCVT `glevel`、鉛直層 `nz`/`z_top`、CRM `(nx, ny, dx)`、時間刻み、メモリチャンク |
-| `[forcing]` | 83 | 全選択制スキーム（`rad_scheme`, `microphysics_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`）、軌道・暦法、全 ESM スイッチ |
-| `[icesheet]` | 5 | 動的 SIA 氷床有効化、EMA 時定数、時間加速倍率、アイソスタシー時定数 |
-| `[output]` | 23 | Zarr v3 出力間隔・分割方式、CSV、月末リスタート、CMIP7 Data Request 出力 |
+| `[grid]` | 16 | SCVT `glevel`、鉛直層 `nz`/`z_top`、CRM `(nx, ny, dx)`、時間刻み、チャンク設定 |
+| `[forcing]` | 83 | 全選択制スキーム（`rad_scheme`, `microphysics_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`）、軌道・暦法、ESM スイッチ |
+| `[icesheet]` | 5 | 動的 SIA 氷床有効化、EMA 時定数、加速倍率、アイソスタシー時定数 |
+| `[output]` | 23 | Zarr v3 出力間隔・分割方式、CSV、月末リスタート、CMIP7 出力 |
 | `[constants]` | 26 | 惑星半径・重力・気体定数・潜熱・海水/海氷基礎定数 |
-| `[radiation]` | 7 | バンド分割比・PAR 換算・解析的オゾン鉛直係数 |
+| `[radiation]` | 7 | バンド分割比・PAR 換算・解析オゾン係数 |
 | `[microphysics]` | 32 | 雨/雪/霰密度・粒径分布切片・落下速度則・CCN/INP スケール |
 | `[turbulence]` | 13 | MYNN 2.5 クロージャ定数・De Ridder RSL 係数・空気動粘性係数 |
 | `[surface]` | 24 | 土壌熱/水文定数・樹冠遮断・積雪/海氷アルベド・射出率 |
 | `[biosphere]` | 41 | $\mathrm{C}_3/\mathrm{C}_4$ EEO 光合成・酵素活性化エネルギー・LAI コスト・フェノロジー |
 | `[ocean_ekman]` | 18 | 1.5 層海洋定数および 3D OGCM GM90/Redi/KPP/潮汐/短波透過定数 |
 | `[orography]` | 3 | Lott–Miller ブロッキング臨界高度・抗力係数・山岳波振幅係数 |
-| `[gravity_wave]` | 11 | 前線・対流起源の非地形性重力波スペクトル定数 |
+| `[gravity_wave]` | 11 | 前線・対流起源非地形性重力波スペクトル定数 |
 | `[icesheet_physics]` | 5 | 氷・マントル密度、Glen 係数 $A$、マスク切替閾値、氷厚上限 |
 
-### 12.2 AOBA Studio 統合ワークベンチ (`scripts/aoba_config_gui.py`)
+### 12.2 30 区分 Köppen–Geiger 気候分類と CMIP7 ESM-BCV 診断 (`src/aoba/koppen.py`, `src/aoba/cmip7_diag.py`)
 
-外部依存ゼロのローカル Web アプリ（`python scripts/aoba_config_gui.py --port 8765`）により、設定・実行・監視・学習を一気通貫で行える：
-- **全 307 パラメータ完全日英解説 & ドロップダウン**：`src/aoba/param_docs.py` を直結し、すべての設定項目に単位と物理的意味を表示。`Full-ESM + RRTMGP`・`Aquaplanet`・`Snowball Earth`・`TRAPPIST-1e` 等のワンクリックプリセットを搭載。
-- **ライブ 3 地球儀モニター & 現代地球観測ベンチマーク**：`T₂`・`Precip` に加え、第 3 地球儀で **10 種の Full-ESM 2D 場**（`LAI`, `全オゾン O₃`, `発雷頻度`, `火山 AOD`, `湿地率`, `降水 δ¹⁸O`, `地表 CO₂`, `海洋 Chl`, `海洋 O₂`, `波高 H_s`）を切替描画し、ERA5 / CERES / GPCP / MODIS / NSIDC の観測範囲とリアルタイム比較できる。
-- **内蔵ドキュメントビューア**：再帰下降 LaTeX 数式レンダラ（右揃え式番号対応）および SVG 図のオフライン表示に対応する。
+- **30 区分 Köppen–Geiger 気候分類（`classify_koppen_geiger`; Beck et al., 2018, 2023, Table 1）**：月平均地表気温 $T_m\ [^\circ\mathrm{C}]$ と月降水合計 $P_m\ [\mathrm{mm}]$（半球別夏半年 4–9 月 / 10–3 月判定）から、厳密優先順序 `E`（寒帯：$T_{\mathrm{hot}} < 10^\circ\mathrm{C}$）$\to$ `B`（乾燥帯：$P_{\mathrm{ann}} < 10 P_{\mathrm{th}}$）$\to$ `A`（熱帯）$\to$ `C`（温帯）$\to$ `D`（冷帯）で 30 区分コード（`1=Af` .. `30=EF`）および 5 大区分を自律診断する。
+- **CMIP7 Data Request v1.2 ESM-BCV 出力（`cmip7_output_enabled = true`）**：大気 2D/TOA、標準 19 気圧面 `plev19`（$1000\text{–}1\ \mathrm{hPa}$）対数気圧補間 3D 場（`ta, ua, va, wap, zg, hus, hur, cl`）、海洋 2D/3D（`tos, sos, zos, mlotst, hfds, thetao, so, uo, vo, wo`）、海氷、陸面・雪氷、および AOBA 自律 EEO 生態系特性（`hcanopy, sroot, fc4, fevg, vcmax25, jmax25, vpmax25_c4` 等）を CF-1.11 符号規約準拠の Zarr v3 で出力する。
+
+### 12.3 AOBA Studio ワークベンチ (`scripts/aoba_config_gui.py`)
+
+ローカル Web アプリケーション（`python scripts/aoba_config_gui.py --port 8765`）により、全 307 パラメータの日英解説・列挙型ドロップダウン編集・実験プリセット適用、同期回転 3 地球儀（`T₂`, `Precip`, 10 種 ESM 診断場）と観測基準範囲（ERA5, CERES EBAF, GPCP, MODIS, NSIDC）対比、および KaTeX 数式組版（オフライン時は内蔵再帰下降レンダラへ自動フォールバック）＋SVG 概念図付き内蔵ドキュメントビューアを提供する。

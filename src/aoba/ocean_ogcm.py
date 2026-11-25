@@ -47,7 +47,7 @@ Physics & Numerics (Zero Q-Flux, Strictly Conservative):
    resistance above critical thickness `h_ridge`, conservatively advecting `m_seaice`
    and `swe_seaice` across wet ocean Voronoi edges.
 
-AOBA Formulation Reference: Sec. 9.3, Eqs. (9.3)-(9.6) (3D Multi-Layer SCVT OGCM, FCT-z*, GM90/Redi, KPP & Tidal Mixing).
+AOBA Formulation Reference: Sec. 9.4, Eqs. (9.3)-(9.7) (3D Multi-Layer SCVT OGCM, FCT-z*, GM90/Redi, KPP & Tidal Mixing).
 """
 
 from __future__ import annotations

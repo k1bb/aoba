@@ -19,7 +19,7 @@ References
 - Pollard & DeConto (2012, Geosci. Model Dev., 5) & Le Meur & Huybrechts (1996): Relaxed
   lithospheric isostasy (`rho_ice / rho_mantle ~ 0.278`) and asynchronous climate acceleration.
 
-AOBA Formulation Reference: Sec. 11.2, Eqs. (11.1)-(11.4) (Glen n=3 SIA Ice Sheet, Isostasy & Barometric Remap).
+AOBA Formulation Reference: Sec. 11.1, Eqs. (11.1)-(11.3) (Glen n=3 SIA Ice Sheet, Isostasy & Hydrostatic Remap).
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ def smooth_scvt_terrain_torch(mesh: SCVTMesh, z_topo: torch.Tensor, n_pass: int 
     return z_s
 
 
-# AOBA Formulation Eqs. (11.1)-(11.3)
+# AOBA Formulation Eqs. (11.1)-(11.2)
 def step_sia_icesheet_scvt(
     ice: IceSheetState,
     mesh: SCVTMesh,
@@ -265,7 +265,7 @@ def _remap_thermo_state(
     return rho_new, thm_new, qn_new, qp_new, qv_new, qc_new, qi_new
 
 
-# AOBA Formulation Eq. (11.4)
+# AOBA Formulation Eq. (11.3)
 def remap_atmosphere_and_crm_vertical(
     atmos: GlobalAtmosState,
     crm,

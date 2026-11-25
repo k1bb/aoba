@@ -13,7 +13,7 @@ exponential-reservoir time integration (Mizukami et al., 2016, *Geosci. Model De
 plumes (Amazon, Congo, Yangtze, Siberian Arctic rivers) to coastal ocean Voronoi cells
 with exact float32 + Kahan mass conservation.
 
-AOBA Formulation Reference: Sec. 7.5, Eq. (7.15) (D8 Priority-Flood Global River Routing).
+AOBA Formulation Reference: Sec. 7.9, Eq. (7.44) (Priority-Flood SCVT Voronoi River Routing).
 """
 
 from __future__ import annotations

@@ -9,6 +9,8 @@ References
 - Beck, Zimmermann, McVicar, Vergopolan, Berg, & Wood (2018, Scientific Data, 5, 180214, Table 1).
 - Beck, McVicar, Vergopolan, Berg, Luthi, Dufour, Zeng, Jiang, van Dijk, & Miralles
   (2023, Scientific Data, 10, 724).
+
+AOBA Formulation Reference: Sec. 12.2 (30-Class Köppen-Geiger Climate Classification).
 """
 
 from __future__ import annotations
