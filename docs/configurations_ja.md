@@ -10,12 +10,12 @@ AOBA は単一のコードベースと統一パラメータレジストリ（`co
 
 | 構成名 | プリセット TOML (`config/presets/`) | 大気格子 (`glevel` / `nz` / CRM) | 海洋格子 (`ocean_glevel` / `ocean_nz`) | 放射 / オゾン | 物質循環・追加物理 | 推奨環境（1 GPU） | 実行速度の目安 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **1. Mac お試し構成** | `mac_g5_quickstart.toml` | `5` (110 km) / `32` / `4×1` | `ekman_sw`（または `ogcm_3d` 18層） | `ckd` or `four_band` / `latitude_seasonal` | 生物物理オン、BGC 類オフ | Apple Silicon Mac (MPS, 16–32 GB) | 数分〜十数分/月 |
-| **2. 大循環創発（アクアプラネット）** | `aquaplanet_jet_emergence.toml` | `5–6` (110–55 km) / `44` / `8×1` | `ekman_sw` (`h_ml=30 m`)、陸地なし | `ckd` or `rrtmgp` / `prognostic` or `rcemip` | すべてオフ（純粋力学＋対流＋放射） | A100 / 4090 / M3–M4 Max | ~1.5–8 時間/年 |
-| **3. 大循環創発（現実地球・高解像度物理コア）** | `earth_g6g7_rrtmgp_o3.toml` | `6` (55 km) / `44` / `8×1` | `7` (28 km, 渦許容) / `36` (表層 15 m) | `rrtmgp` (240 g-pt) / `prognostic` | 生物物理フルオン、雷・他 BGC オフ | NVIDIA A100 (40/80 GB) / H100 | ~13–19 時間/年 *(海洋 G6 なら ~9–11 時間/年)* |
-| **4. 長期結合バランス構成（Phase-1 PI-Control）** | `earth_g5_phase1_picontrol.toml` | `5` (110 km) / `44` / `8×1` | `0` (同 110 km) / `18` | `ckd` (50 g-pt) / `latitude_seasonal` | 生物物理＋ダスト＋自然エアロゾル＋EVP 海氷 | NVIDIA A100 (40 GB) | **~2.2 時間/年**（実測 `21.8 秒/日`） |
-| **5. フル ESM 構成** | `earth_full_esm.toml` | `5–6` / `44` / `8×1` | `6–7` / `32–36` | `rrtmgp` or `ckd_hd` / `prognostic` | 全 BGC・動的湖・MAML・波浪・同位体・氷床オン | NVIDIA A100/H100 (40–80 GB) | ~5–25 時間/年 |
-| **6. 古気候（6 ka 緑のサハラ）・系外惑星** | `paleo_green_sahara_6ka.toml` | `4–5` / `44` / `8×1` | `0` (`ogcm_3d` 18層 or `ekman_sw`) | `ckd` or `rrtmgp` / `prognostic` | 軌道進化＋動的湖沼（`init_fill=0`）、または `planet_preset` | Mac MPS / A100 | ~1–4 時間/年 |
+| **1. Mac お試し構成** | `mac_g5_quickstart.toml` | `5` (110 km) / `32` (42 km) / `4×1` | 1.5 層 Ekman–浅水 (`ekman_sw`、または `ogcm_3d` 18層) | `ckd` or `four_band` / `latitude_seasonal` | 生物物理オン、BGC 類オフ | Apple Silicon Mac (MPS, 16–32 GB) | **~3.8 時間/年**（MPS 実測 `37.7 秒/日`, 初期化 `4.5 秒`） |
+| **2. 大循環創発（アクアプラネット）** | `aquaplanet_jet_emergence.toml` | `6` (55 km) / `56` (65 km) / `8×1` | 1.5 層 Ekman–浅水 (`h_ml=30 m`)、陸地なし | `ckd` or `rrtmgp` / `prognostic` or `rcemip` | すべてオフ（純粋力学＋対流＋放射） | A100 / 4090 / M3–M4 Max | ~2–7 時間/年 |
+| **3. 大循環創発（現実地球・高解像度物理コア）** | `earth_g6g7_rrtmgp_o3.toml` | `6` (55 km) / `56` (65 km) / `8×1` | `7` (28 km, 渦許容) / `36` (表層 15 m) | `rrtmgp` (240 g-pt) / `prognostic` | 生物物理フルオン、雷・他 BGC オフ | NVIDIA A100 (40/80 GB) / H100 | **~10.1 時間/年**（A100 実測 `99.9 秒/日`, `14.1 GB VRAM`; `nz=44` 時は **`8.1 時間/年`**, `80.1 秒/日`） |
+| **4. 長期結合バランス構成（Phase-1 PI-Control）** | `earth_g5_phase1_picontrol.toml` | `5` (110 km) / `44` (48 km) / `8×1` | `0` (同 110 km) / `18` | `ckd` (50 g-pt) / `latitude_seasonal` | 生物物理＋ダスト＋自然エアロゾル＋EVP 海氷 | NVIDIA A100 (40 GB) | **~2.2 時間/年**（A100 実測 `21.8 秒/日`） |
+| **5. フル ESM 構成** | `earth_full_esm.toml` | `5–6` / `56` (65 km) / `8×1` | `6–7` / `32–36` | `rrtmgp` or `ckd_hd` / `prognostic` | 全 BGC・動的湖・MAML・波浪・同位体・氷床オン | NVIDIA A100/H100 (40–80 GB) | ~6–28 時間/年 |
+| **6. 古気候（6 ka 緑のサハラ）・系外惑星** | `paleo_green_sahara_6ka.toml` | `4–5` / `44` (48 km) / `8×1` | `0` (`ogcm_3d` 18層 or `ekman_sw`) | `ckd` or `rrtmgp` / `prognostic` | 軌道進化＋動的湖沼（`init_fill=0`）、または `planet_preset` | Mac MPS / A100 | ~1–4 時間/年 |
 
 > **生物物理（Biogeophysics）の常時稼働について**：2 葉 $\mathrm{C}_3/\mathrm{C}_4$ P-Model 光合成・熱順化 $T_{\mathrm{home}}$・Lambert-$W_0$ 予報 LAI・常緑/落葉葉習性 $f_{\mathrm{evg}}$・樹高 $h_c$・根圏容量 $S_R$・離散樹冠クランピング $\Omega(\mu_0, L)$・非反復最適葉傾角 $\chi_L$ は陸面コア（`surface.py` + `biosphere.py`）に統合されているため、陸域炭素・窒素・海洋 BGC・エアロゾル・ダスト・雷をすべてオフにしても陸面の植生・アルベド・蒸散・粗度フィードバックは完全に動作する。
 
@@ -39,7 +39,7 @@ dt_host = 720.0
 n_host_dyn_substeps = 1
 n_crm_dyn_substeps = 10
 rad_stride = 5
-crm_col_chunk = 8192
+crm_col_chunk = 12288
 rad_col_chunk = 16384
 
 [forcing]
@@ -131,16 +131,17 @@ snapshots_include_subgrid_2d = false
 ```toml
 [grid]
 glevel = 6
-nz = 44
-z_top = 48000.0
+nz = 56
+z_top = 65000.0
+z_sponge_base = 52000.0
 crm_nx = 8
 crm_ny = 1
 crm_dx = 4000.0
 dt_host = 600.0
 n_host_dyn_substeps = 2
-n_crm_dyn_substeps = 12
+n_crm_dyn_substeps = 10
 rad_stride = 6
-crm_col_chunk = 16384
+crm_col_chunk = 49152
 rad_col_chunk = 32768
 
 [forcing]
@@ -281,5 +282,6 @@ icesheet_accel_spinup_years = 20.0
 ## 8. GPU 資源運用とメモリ調整の指針
 
 1. **1 実行 ＝ 1 GPU 設計**：AOBA は単一 GPU 上でメモリ帯域を飽和させる融合カーネル設計であるため、1 本のジョブに 2 GPU 以上を割り当てても計算は高速化しない。複数 GPU を活用する場合は、異なる設定・アンサンブル・感度実験（例：$1\times\mathrm{CO}_2$ と $4\times\mathrm{CO}_2$、あるいは `G5` 長期ランと `G6+G7` 高解像度ラン）を**独立した 1 GPU ジョブとして同時並列投入**するのが最も高効率である。
-2. **VRAM 容量に応じたチャンク調整**：高解像度（`glevel = 6` 以上）で VRAM を抑える場合は `[grid]` の `crm_col_chunk`（既定 `16384`）および `rad_col_chunk`（既定 `32768`）を半分（例：`8192` / `16384`）に下げると、精度を一切変えずにピーク VRAM を大幅に削減できる。
-3. **出力容量の最適化**：高解像度実験で Zarr 出力を抑えたい場合は `monthly_mean_include_subgrid_2d = false`, `snapshots_include_subgrid_2d = false` とし、日次診断・月次 2D/3D 平均・月次リスタート（`restart_monthly = true`）を有効にして 1 年単位で安全にリレー実行する。
+2. **VRAM 容量に応じたチャンク調整**：高解像度（`glevel = 6` 以上）で VRAM に余裕がある GPU（A100 40/80 GB）では `crm_col_chunk = 49152` として非分割一括処理すると最速になる。メモリ容量が小さい GPU では `crm_col_chunk = 8192` / `rad_col_chunk = 16384` に下げると、精度を一切変えずにピーク VRAM を大幅に削減できる。
+3. **Zarr v3 メッシュキャッシュとユニバーサル異格子リスタート**：`build_scvt_mesh` は `glevel >= 4` の SCVT 格子と Earth2014 境界データを `~/aoba_outputs/_mesh_cache/`（`AOBA_OUTPUT_DIR/_mesh_cache/`）に CF/UGRID 準拠の Zarr v3 ストアとして自動キャッシュするため、2 回目以降の G6+G7 起動は **1 秒台** で完了する。また `scripts/run_g5_30yr.py` のリスタート読込は `(glevel, nz, z_top, crm_nx/ny, ocean_glevel, ocean_nz)` の任意変更に対応しており、海陸・湿潤セル対応の球面 `cKDTree` 補間と静水圧成層圏延長（例：`z_top = 48 km / 44 層` から `65 km / 56 層` への継続や、G5 スピンアップから G6/G7 への引き継ぎ）を自動で実行する。
+4. **出力容量の最適化**：高解像度実験で Zarr 出力を抑えたい場合は `monthly_mean_include_subgrid_2d = false`, `snapshots_include_subgrid_2d = false` とし、日次診断・月次 2D/3D 平均・月次リスタート（`restart_monthly = true`）を有効にして 1 年単位で安全にリレー実行する。

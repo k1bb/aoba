@@ -6,10 +6,10 @@
 # --- Horizontal, Vertical & Subgrid CRM Mesh Settings ---
 [grid]
 glevel = 6
-nz = 44
-z_top = 48000.0
+nz = 56
+z_top = 65000.0
 dz_min = 60.0
-z_sponge_base = 36000.0
+z_sponge_base = 52000.0
 tau_sponge_min = 300.0
 terrain_scale_exp = 1.5
 crm_nx = 8
@@ -17,9 +17,9 @@ crm_ny = 1
 crm_dx = 4000.0
 dt_host = 600.0
 n_host_dyn_substeps = 2
-n_crm_dyn_substeps = 12
+n_crm_dyn_substeps = 10
 rad_stride = 6
-crm_col_chunk = 16384
+crm_col_chunk = 49152
 rad_col_chunk = 32768
 
 # --- Planetary Boundary, Orbital & Atmospheric Forcing ---

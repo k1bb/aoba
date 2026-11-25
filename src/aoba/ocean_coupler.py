@@ -65,16 +65,20 @@ def _nearest_spherical_indices(
     dst_xyz: torch.Tensor,
     chunk_size: int = 4096,
 ) -> torch.Tensor:
-    """Return index in `dst_xyz` minimizing great-circle distance for every point in `src_xyz`."""
-    src_cpu = src_xyz.detach().cpu().to(torch.float32)
-    dst_t = dst_xyz.detach().cpu().to(torch.float32).T.contiguous()  # [3, N_dst]
-    n_src = src_cpu.shape[0]
-    out = torch.empty(n_src, dtype=torch.long)
-    for start in range(0, n_src, chunk_size):
-        end = min(start + chunk_size, n_src)
-        dots = src_cpu[start:end] @ dst_t
-        out[start:end] = dots.argmax(dim=1)
-    return out
+    """Return index in `dst_xyz` minimizing great-circle distance for every point in `src_xyz`.
+
+    On the unit sphere, minimizing 3D Euclidean distance `||x - y||^2 = 2 - 2 (x . y)` is
+    mathematically identical to maximizing `x . y`, so a `scipy.spatial.cKDTree` query runs
+    in `O((N_src + N_dst) log N_dst)` instead of `O(N_src * N_dst)`.
+    """
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    src_np = src_xyz.detach().cpu().numpy().astype(np.float64, copy=False)
+    dst_np = dst_xyz.detach().cpu().numpy().astype(np.float64, copy=False)
+    tree = cKDTree(dst_np)
+    _, idx = tree.query(src_np, k=1)
+    return torch.from_numpy(np.asarray(idx, dtype=np.int64))
 
 
 def build_ocean_atmos_coupler(

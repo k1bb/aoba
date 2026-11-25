@@ -662,6 +662,105 @@ def _aggregate_earth2014_to_scvt(
     }
 
 
+_SCVT_CACHE_SCHEMA_VERSION = 2
+
+_SCVT_TOPO_KEYS: tuple[str, ...] = (
+    "lat_cell", "lon_cell", "xyz_cell", "area_cell",
+    "lat_edge", "lon_edge", "dc_edge", "dv_edge", "area_edge",
+    "cells_on_edge", "verts_on_edge", "east_normal_edge", "north_normal_edge",
+    "edges_on_cell", "edge_sign_on_cell", "n_edges_on_cell",
+    "lat_vert", "area_vert", "edges_on_vert", "edge_sign_on_vert",
+    "trisk_edges", "trisk_weights",
+)
+
+_SCVT_BNDRY_KEYS: tuple[str, ...] = (
+    "surf_type", "ocean_frac", "icesheet_frac",
+    "z_topo", "z_topo_smooth", "sigma_topo", "slope_topo", "aniso_topo", "angle_topo",
+    "coastal_ocean_idx", "z_bed", "h_ice_init", "z_min_land",
+    "lake_basin_frac_bed", "lake_basin_vol_bed",
+)
+
+
+def _scvt_mesh_cache_path(
+    glevel: int,
+    n_lloyd_iter: int,
+    radius: float,
+    has_earth2014: bool,
+    stride: int,
+) -> Path:
+    """Return deterministic CF/UGRID Zarr v3 cache path under `aoba.get_output_dir()/_mesh_cache`."""
+    import aoba
+
+    cache_dir = aoba.get_output_dir() / "_mesh_cache"
+    e14_tag = f"e14s{max(int(stride), 1)}" if has_earth2014 else "aqua"
+    name = f"scvt_g{int(glevel)}_l{int(n_lloyd_iter)}_r{int(round(radius))}_{e14_tag}_v{_SCVT_CACHE_SCHEMA_VERSION}.zarr"
+    return cache_dir / name
+
+
+def _load_scvt_mesh_cache_zarr(cache_path: Path) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]] | None:
+    """Load cached SCVT topology & boundary arrays from a CF/UGRID Zarr v3 store, or return None."""
+    if not cache_path.is_dir():
+        return None
+    try:
+        import zarr
+
+        grp = zarr.open_group(str(cache_path), mode="r")
+        if int(grp.attrs.get("schema_version", -1)) != _SCVT_CACHE_SCHEMA_VERSION:
+            return None
+        topo = {k: np.asarray(grp[k][:]) for k in _SCVT_TOPO_KEYS}
+        bndry = {k: np.asarray(grp[k][:]) for k in _SCVT_BNDRY_KEYS}
+        return topo, bndry
+    except Exception:
+        return None
+
+
+def _save_scvt_mesh_cache_zarr(
+    cache_path: Path,
+    glevel: int,
+    radius: float,
+    topo: dict[str, np.ndarray],
+    bndry: dict[str, np.ndarray],
+) -> None:
+    """Atomically write SCVT topology & boundary arrays to a CF/UGRID Zarr v3 store."""
+    import os
+    import shutil
+    import zarr
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.parent / f".{cache_path.name}.tmp_{os.getpid()}"
+    try:
+        if tmp_path.exists():
+            shutil.rmtree(tmp_path, ignore_errors=True)
+        grp = zarr.open_group(str(tmp_path), mode="w", zarr_format=3)
+        grp.attrs.update({
+            "cf_role": "mesh_topology",
+            "topology_dimension": 2,
+            "glevel": int(glevel),
+            "n_cells": int(topo["lat_cell"].shape[0]),
+            "n_edges": int(topo["dc_edge"].shape[0]),
+            "n_verts": int(topo["area_vert"].shape[0]),
+            "radius_m": float(radius),
+            "schema_version": _SCVT_CACHE_SCHEMA_VERSION,
+        })
+        for k in _SCVT_TOPO_KEYS:
+            arr = topo[k]
+            arr_store = arr.astype(np.float32) if np.issubdtype(arr.dtype, np.floating) else arr.astype(np.int64)
+            grp.create_array(k, data=arr_store)
+        for k in _SCVT_BNDRY_KEYS:
+            arr = bndry[k]
+            arr_store = arr.astype(np.float32) if np.issubdtype(arr.dtype, np.floating) else arr.astype(np.int64)
+            grp.create_array(k, data=arr_store)
+        if not cache_path.exists():
+            try:
+                os.replace(tmp_path, cache_path)
+            except OSError:
+                shutil.rmtree(tmp_path, ignore_errors=True)
+        else:
+            shutil.rmtree(tmp_path, ignore_errors=True)
+    except Exception:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def build_scvt_mesh(
     glevel: int = 3,
     n_lloyd_iter: int = 12,
@@ -672,15 +771,10 @@ def build_scvt_mesh(
     radius: float = C.EARTH_RADIUS,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
+    use_cache: bool | None = None,
 ) -> SCVTMesh:
-    """Build complete SCVT Voronoi C-grid mesh (`glevel = 0..5`) on `device`."""
-    pts0 = _icosahedron_generators(glevel)
-    xyz_cell = _lloyd_relax_scvt(pts0, n_iter=n_lloyd_iter) if n_lloyd_iter > 0 else pts0
-    topo = _build_voronoi_cgrid_topology(xyz_cell, radius=radius)
-
-    n_cells = xyz_cell.shape[0]
-    n_edges = topo["dc_edge"].shape[0]
-    n_verts = topo["area_vert"].shape[0]
+    """Build complete SCVT Voronoi C-grid mesh (`glevel = 0..8`) on `device` with Zarr v3 disk cache."""
+    import os
 
     if use_earth2014:
         try:
@@ -690,35 +784,62 @@ def build_scvt_mesh(
             e_dir = Path(earth2014_dir)
     else:
         e_dir = Path(earth2014_dir)
+    has_e14 = bool(use_earth2014 and (e_dir / "Earth2014.SUR2014.5min.geod.bin").exists())
 
-    if use_earth2014 and (e_dir / "Earth2014.SUR2014.5min.geod.bin").exists():
-        bndry = _aggregate_earth2014_to_scvt(
-            xyz_cell,
-            topo["edges_on_cell"],
-            topo["n_edges_on_cell"],
-            topo["cells_on_edge"],
-            e_dir,
-            stride=max(earth2014_stride, 1),
-        )
+    enable_cache = (glevel >= 4) if use_cache is None else bool(use_cache)
+    if os.environ.get("AOBA_DISABLE_MESH_CACHE", "0") == "1":
+        enable_cache = False
+
+    cache_path = (
+        _scvt_mesh_cache_path(glevel, n_lloyd_iter, radius, has_e14, earth2014_stride)
+        if enable_cache
+        else None
+    )
+    cached = _load_scvt_mesh_cache_zarr(cache_path) if cache_path is not None else None
+    if cached is not None:
+        topo, bndry = cached
+        n_cells = int(topo["lat_cell"].shape[0])
+        n_edges = int(topo["dc_edge"].shape[0])
+        n_verts = int(topo["area_vert"].shape[0])
     else:
-        # Idealized aquaplanet / Held-Suarez flat boundary fallback
-        bndry = {
-            "surf_type": np.zeros(n_cells, dtype=np.int64),
-            "ocean_frac": np.ones(n_cells, dtype=np.float64),
-            "icesheet_frac": np.zeros(n_cells, dtype=np.float64),
-            "z_topo": np.zeros(n_cells, dtype=np.float64),
-            "z_topo_smooth": np.zeros(n_cells, dtype=np.float64),
-            "sigma_topo": np.zeros(n_cells, dtype=np.float64),
-            "slope_topo": np.zeros(n_cells, dtype=np.float64),
-            "aniso_topo": np.ones(n_cells, dtype=np.float64),
-            "angle_topo": np.zeros(n_cells, dtype=np.float64),
-            "coastal_ocean_idx": np.arange(n_cells, dtype=np.int64),
-            "z_bed": np.full(n_cells, -4000.0, dtype=np.float64),
-            "h_ice_init": np.zeros(n_cells, dtype=np.float64),
-            "z_min_land": np.zeros(n_cells, dtype=np.float64),
-            "lake_basin_frac_bed": np.zeros(n_cells, dtype=np.float64),
-            "lake_basin_vol_bed": np.zeros(n_cells, dtype=np.float64),
-        }
+        pts0 = _icosahedron_generators(glevel)
+        xyz_cell = _lloyd_relax_scvt(pts0, n_iter=n_lloyd_iter) if n_lloyd_iter > 0 else pts0
+        topo = _build_voronoi_cgrid_topology(xyz_cell, radius=radius)
+
+        n_cells = xyz_cell.shape[0]
+        n_edges = topo["dc_edge"].shape[0]
+        n_verts = topo["area_vert"].shape[0]
+
+        if has_e14:
+            bndry = _aggregate_earth2014_to_scvt(
+                xyz_cell,
+                topo["edges_on_cell"],
+                topo["n_edges_on_cell"],
+                topo["cells_on_edge"],
+                e_dir,
+                stride=max(earth2014_stride, 1),
+            )
+        else:
+            # Idealized aquaplanet / Held-Suarez flat boundary fallback
+            bndry = {
+                "surf_type": np.zeros(n_cells, dtype=np.int64),
+                "ocean_frac": np.ones(n_cells, dtype=np.float64),
+                "icesheet_frac": np.zeros(n_cells, dtype=np.float64),
+                "z_topo": np.zeros(n_cells, dtype=np.float64),
+                "z_topo_smooth": np.zeros(n_cells, dtype=np.float64),
+                "sigma_topo": np.zeros(n_cells, dtype=np.float64),
+                "slope_topo": np.zeros(n_cells, dtype=np.float64),
+                "aniso_topo": np.ones(n_cells, dtype=np.float64),
+                "angle_topo": np.zeros(n_cells, dtype=np.float64),
+                "coastal_ocean_idx": np.arange(n_cells, dtype=np.int64),
+                "z_bed": np.full(n_cells, -4000.0, dtype=np.float64),
+                "h_ice_init": np.zeros(n_cells, dtype=np.float64),
+                "z_min_land": np.zeros(n_cells, dtype=np.float64),
+                "lake_basin_frac_bed": np.zeros(n_cells, dtype=np.float64),
+                "lake_basin_vol_bed": np.zeros(n_cells, dtype=np.float64),
+            }
+        if cache_path is not None:
+            _save_scvt_mesh_cache_zarr(cache_path, glevel, radius, topo, bndry)
 
     dev = torch.device(device)
     def _tf(arr: np.ndarray) -> torch.Tensor:

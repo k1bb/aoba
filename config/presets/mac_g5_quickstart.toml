@@ -19,7 +19,7 @@ dt_host = 720.0
 n_host_dyn_substeps = 1
 n_crm_dyn_substeps = 10
 rad_stride = 5
-crm_col_chunk = 8192
+crm_col_chunk = 12288
 rad_col_chunk = 16384
 
 # --- Planetary Boundary, Orbital & Atmospheric Forcing ---

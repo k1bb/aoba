@@ -43,6 +43,7 @@ from aoba.kernels import (
     can_use_crm_metal,
     dispatch_crm_fct_advect_metal,
     dispatch_crm_fct_pair_metal,
+    dispatch_crm_fct_quad_metal,
     dispatch_crm_sgs_metal,
     run_crm_rk3_hevi_metal,
     solve_tridiagonal_batched,
@@ -998,7 +999,7 @@ def step_crm_physics_and_dynamics(
         thm_box: list[torch.Tensor] = []
         sgs_cached: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         s_idx = 0
-        simd_pingpong = (use_metal_crm and ny == 1 and 1 < nx <= 32 and nz <= 48 and (32 % nx == 0))
+        simd_pingpong = (use_metal_crm and ny == 1 and 1 < nx <= 32 and nz <= 64 and (32 % nx == 0))
         while s_idx < n_sub:
             k_cnt = min(adv_group, n_sub - s_idx)
             rho_start = crm.rho_d if (k_cnt == 1 and simd_pingpong) else crm.rho_d.clone()
@@ -1052,7 +1053,18 @@ def step_crm_physics_and_dynamics(
                 else:
                     fy_mean = fx_mean
             dt_adv = dt_sub * float(k_cnt)
-            if use_metal_crm:
+            if use_2m_mp and crm.n_c is not None and crm.n_i is not None:
+                if use_metal_crm:
+                    crm.q_n, crm.q_p, crm.n_c, crm.n_i = dispatch_crm_fct_quad_metal(
+                        crm.q_n, crm.q_p, crm.n_c, crm.n_i, rho_start, crm.rho_d,
+                        fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv,
+                    )
+                else:
+                    crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+                    crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+                    crm.n_c = fct_advect_3d(crm.n_c, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+                    crm.n_i = fct_advect_3d(crm.n_i, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+            elif use_metal_crm:
                 crm.q_n, crm.q_p = dispatch_crm_fct_pair_metal(
                     crm.q_n, crm.q_p, rho_start, crm.rho_d,
                     fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv,
@@ -1060,15 +1072,6 @@ def step_crm_physics_and_dynamics(
             else:
                 crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
                 crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
-            if use_2m_mp and crm.n_c is not None and crm.n_i is not None:
-                if use_metal_crm:
-                    crm.n_c, crm.n_i = dispatch_crm_fct_pair_metal(
-                        crm.n_c, crm.n_i, rho_start, crm.rho_d,
-                        fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv,
-                    )
-                else:
-                    crm.n_c = fct_advect_3d(crm.n_c, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
-                    crm.n_i = fct_advect_3d(crm.n_i, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
             s_idx += k_cnt
         if u_gal_shift is not None:
             crm.u = crm.u + u_gal_shift

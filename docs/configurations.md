@@ -10,12 +10,12 @@ This guide summarizes six reference configurations, including their physical des
 
 | Configuration | Preset TOML (`config/presets/`) | Atmosphere (`glevel` / `nz` / CRM) | Ocean (`ocean_glevel` / `ocean_nz`) | Radiation / Ozone | BGC & Additional Physics | Target Hardware (1 GPU) | Typical Speed |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **1. Mac Exploratory Preset** | `mac_g5_quickstart.toml` | `5` (110 km) / `32` / `4×1` | `ekman_sw` (or `ogcm_3d` 18-lvl) | `ckd` or `four_band` / `latitude_seasonal` | Biogeophysics ON, BGC OFF | Apple Silicon Mac (MPS, 16–32 GB) | ~minutes–15 min/mo |
-| **2. Circulation Emergence (Aquaplanet)** | `aquaplanet_jet_emergence.toml` | `5–6` (110–55 km) / `44` / `8×1` | `ekman_sw` (`h_ml=30 m`), no land | `ckd` or `rrtmgp` / `prognostic` or `rcemip` | All OFF (pure dynamics + convection + rad) | A100 / 4090 / M3–M4 Max | ~1.5–8 h/yr |
-| **3. Circulation Emergence (High-Res Earth Physics Core)** | `earth_g6g7_rrtmgp_o3.toml` | `6` (55 km) / `44` / `8×1` | `7` (28 km, eddy-permitting) / `36` (15 m top) | `rrtmgp` (240 g-pt) / `prognostic` | Biogeophysics ON, lightning & other BGC OFF | NVIDIA A100 (40/80 GB) / H100 | ~13–19 h/yr *(~9–11 h/yr with G6 ocean)* |
-| **4. Balanced Multi-Decadal Spinup (Phase-1 PI-Control)** | `earth_g5_phase1_picontrol.toml` | `5` (110 km) / `44` / `8×1` | `0` (same 110 km) / `18` | `ckd` (50 g-pt) / `latitude_seasonal` | Biogeophysics + dust + nat. aerosols + EVP ice | NVIDIA A100 (40 GB) | **~2.2 h/yr** (measured `21.8 s/day`) |
-| **5. Full ESM** | `earth_full_esm.toml` | `5–6` / `44` / `8×1` | `6–7` / `32–36` | `rrtmgp` or `ckd_hd` / `prognostic` | All BGC, dynamic lakes, MAML, waves, isotopes, ice sheet ON | NVIDIA A100/H100 (40–80 GB) | ~5–25 h/yr |
-| **6. Paleoclimate (6 ka Green Sahara) & Exoplanet** | `paleo_green_sahara_6ka.toml` | `4–5` / `44` / `8×1` | `0` (`ogcm_3d` 18-lvl or `ekman_sw`) | `ckd` or `rrtmgp` / `prognostic` | Orbital forcing + dynamic lakes (`init_fill=0`), or `planet_preset` | Mac MPS / A100 | ~1–4 h/yr |
+| **1. Mac Exploratory Preset** | `mac_g5_quickstart.toml` | `5` (110 km) / `32` (42 km) / `4×1` | 1.5-layer Ekman–SW (`ekman_sw`, or `ogcm_3d` 18-lvl) | `ckd` or `four_band` / `latitude_seasonal` | Biogeophysics ON, BGC OFF | Apple Silicon Mac (MPS, 16–32 GB) | **~3.8 h/yr** (MPS measured `37.7 s/day`, `4.5 s` init) |
+| **2. Circulation Emergence (Aquaplanet)** | `aquaplanet_jet_emergence.toml` | `6` (55 km) / `56` (65 km) / `8×1` | 1.5-layer Ekman–SW (`h_ml=30 m`), no land | `ckd` or `rrtmgp` / `prognostic` or `rcemip` | All OFF (pure dynamics + convection + rad) | A100 / 4090 / M3–M4 Max | ~2–7 h/yr |
+| **3. Circulation Emergence (High-Res Earth Physics Core)** | `earth_g6g7_rrtmgp_o3.toml` | `6` (55 km) / `56` (65 km) / `8×1` | `7` (28 km, eddy-permitting) / `36` (15 m top) | `rrtmgp` (240 g-pt) / `prognostic` | Biogeophysics ON, lightning & other BGC OFF | NVIDIA A100 (40/80 GB) / H100 | **~10.1 h/yr** (A100 measured `99.9 s/day`, `14.1 GB VRAM`; at `nz=44`: **`8.1 h/yr`**, `80.1 s/day`) |
+| **4. Balanced Multi-Decadal Spinup (Phase-1 PI-Control)** | `earth_g5_phase1_picontrol.toml` | `5` (110 km) / `44` (48 km) / `8×1` | `0` (same 110 km) / `18` | `ckd` (50 g-pt) / `latitude_seasonal` | Biogeophysics + dust + nat. aerosols + EVP ice | NVIDIA A100 (40 GB) | **~2.2 h/yr** (A100 measured `21.8 s/day`) |
+| **5. Full ESM** | `earth_full_esm.toml` | `5–6` / `56` (65 km) / `8×1` | `6–7` / `32–36` | `rrtmgp` or `ckd_hd` / `prognostic` | All BGC, dynamic lakes, MAML, waves, isotopes, ice sheet ON | NVIDIA A100/H100 (40–80 GB) | ~6–28 h/yr |
+| **6. Paleoclimate (6 ka Green Sahara) & Exoplanet** | `paleo_green_sahara_6ka.toml` | `4–5` / `44` (48 km) / `8×1` | `0` (`ogcm_3d` 18-lvl or `ekman_sw`) | `ckd` or `rrtmgp` / `prognostic` | Orbital forcing + dynamic lakes (`init_fill=0`), or `planet_preset` | Mac MPS / A100 | ~1–4 h/yr |
 
 > **Always-On Biogeophysics**: Two-leaf $\mathrm{C}_3/\mathrm{C}_4$ P-Model photosynthesis, thermal acclimation $T_{\mathrm{home}}$, Lambert-$W_0$ prognostic LAI, evergreen/deciduous habit $f_{\mathrm{evg}}$, canopy height $h_c$, root capacity $S_R$, discrete-crown clumping $\Omega(\mu_0, L)$, and non-iterative optimal leaf orientation $\chi_L$ reside directly in the land-surface physics core (`surface.py` + `biosphere.py`). Turning off terrestrial carbon/nitrogen, marine BGC, aerosols, dust, and lightning leaves all vegetation–albedo–transpiration–roughness feedbacks fully active.
 
@@ -39,7 +39,7 @@ dt_host = 720.0
 n_host_dyn_substeps = 1
 n_crm_dyn_substeps = 10
 rad_stride = 5
-crm_col_chunk = 8192
+crm_col_chunk = 12288
 rad_col_chunk = 16384
 
 [forcing]
@@ -131,16 +131,17 @@ HighResMIP-class realistic-Earth physical configuration coupling a 55 km superpa
 ```toml
 [grid]
 glevel = 6
-nz = 44
-z_top = 48000.0
+nz = 56
+z_top = 65000.0
+z_sponge_base = 52000.0
 crm_nx = 8
 crm_ny = 1
 crm_dx = 4000.0
 dt_host = 600.0
 n_host_dyn_substeps = 2
-n_crm_dyn_substeps = 12
+n_crm_dyn_substeps = 10
 rad_stride = 6
-crm_col_chunk = 16384
+crm_col_chunk = 49152
 rad_col_chunk = 32768
 
 [forcing]
@@ -281,5 +282,6 @@ icesheet_accel_spinup_years = 20.0
 ## 8. GPU Resource & Memory Guidelines
 
 1. **One Simulation = One GPU**: AOBA saturates single-GPU memory bandwidth via fused Metal/CUDA kernels without multi-GPU domain decomposition. Allocating 2+ GPUs to a single job yields no speedup; instead, run independent ensemble members or sensitivity cases (e.g., $1\times\mathrm{CO}_2$ vs. $4\times\mathrm{CO}_2$, or `G5` multi-decadal alongside `G6+G7` high-res) concurrently as separate 1-GPU jobs.
-2. **VRAM Chunking**: At `glevel >= 6`, lowering `crm_col_chunk` (default `16384`) and `rad_col_chunk` (default `32768`) by half cuts peak VRAM with zero change in numerical results.
-3. **Output Volume Control**: For high-resolution experiments, set `monthly_mean_include_subgrid_2d = false` and `snapshots_include_subgrid_2d = false` while keeping `restart_monthly = true` to relay 1-year jobs cleanly.
+2. **VRAM Chunking**: On 40–80 GB GPUs (A100/H100), setting `crm_col_chunk = 49152` runs G6 unchunked for peak throughput. On memory-constrained GPUs, lowering `crm_col_chunk` to `8192` and `rad_col_chunk` to `16384` reduces peak VRAM with zero numerical change.
+3. **Zarr v3 Mesh Cache & Universal Cross-Grid Restart Remapping**: `build_scvt_mesh` automatically caches `glevel >= 4` SCVT grids and Earth2014 boundary fields as CF/UGRID-compliant Zarr v3 stores under `~/aoba_outputs/_mesh_cache/` (`AOBA_OUTPUT_DIR/_mesh_cache/`), cutting repeat G6+G7 initialization from ~5 minutes to **~1 second**. Moreover, `scripts/run_g5_30yr.py` supports universal cross-grid restarts across any change in `(glevel, nz, z_top, crm_nx/ny, ocean_glevel, ocean_nz)` using surface-class-aware / wet-ocean spherical `cKDTree` remapping and hydrostatic stratospheric extension (e.g., extending a `48 km / 44-layer` Year-1 checkpoint to `65 km / 56 layers` or up-scaling a G5 spinup to G6/G7).
+4. **Output Volume Control**: For high-resolution experiments, set `monthly_mean_include_subgrid_2d = false` and `snapshots_include_subgrid_2d = false` while keeping `restart_monthly = true` to relay 1-year jobs cleanly.

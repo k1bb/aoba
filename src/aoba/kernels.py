@@ -28,6 +28,7 @@ from aoba.kernels_extra import (
     _get_scvt_mesh_cache,
     run_crm_fct_advect_metal,
     run_crm_fct_pair_metal,
+    run_crm_fct_quad_metal,
     run_crm_microphysics_2m_metal,
     run_crm_microphysics_metal,
     run_crm_mynn_metal,
@@ -942,6 +943,26 @@ def dispatch_crm_fct_pair_metal(
     return run_crm_fct_pair_metal(lib, q0, q1, rho_old, rho_new, fx, fy, fz, dx, dy, dz_c, dt)
 
 
+def dispatch_crm_fct_quad_metal(
+    q0: torch.Tensor,
+    q1: torch.Tensor,
+    q2: torch.Tensor,
+    q3: torch.Tensor,
+    rho_old: torch.Tensor,
+    rho_new: torch.Tensor,
+    fx: torch.Tensor,
+    fy: torch.Tensor,
+    fz: torch.Tensor,
+    dx: float,
+    dy: float,
+    dz_c: torch.Tensor,
+    dt: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(q0.device)
+    assert lib is not None
+    return run_crm_fct_quad_metal(lib, q0, q1, q2, q3, rho_old, rho_new, fx, fy, fz, dx, dy, dz_c, dt)
+
+
 def dispatch_crm_sgs_metal(
     rho_d: torch.Tensor,
     u: torch.Tensor,
@@ -1278,17 +1299,11 @@ def run_crm_rk3_hevi_metal(
     fx_acc, fy_acc, fz_acc = ws["fx_acc"], ws["fy_acc"], ws["fz_acc"]
     dummy = ws["dummy"]
 
-    use_simd_2d = (ny == 1 and 1 < nx <= 32 and nz <= 48 and (32 % nx == 0) and (f_cor is None))
+    use_simd_2d = (ny == 1 and 1 < nx <= 32 and nz <= 64 and (32 % nx == 0) and (f_cor is None))
     if use_simd_2d:
-        if "stage_c0" not in ws:
-            ws["stage_c0"] = torch.empty((nz, M, 4), device=dev, dtype=torch.float32)
-            ws["stage_c1"] = torch.empty((nz, M, 4), device=dev, dtype=torch.float32)
-            ws["stage_w0"] = torch.empty((nz - 1, M, 4), device=dev, dtype=torch.float32)
-            ws["stage_w1"] = torch.empty((nz - 1, M, 4), device=dev, dtype=torch.float32)
-            ws["fy_zero"] = torch.zeros_like(rho0_c)
-        stage_c0, stage_c1, stage_w0, stage_w1 = (
-            ws["stage_c0"], ws["stage_c1"], ws["stage_w0"], ws["stage_w1"]
-        )
+        c_tg = 64 // nx
+        n_tg = (n_col + c_tg - 1) // c_tg
+        grid_64 = (n_tg * 64,)
         # Ping-pong output buffer so rho0_c..w0_c never alias rho_out..w_out across substeps
         if rho0_c.data_ptr() == rho_a.data_ptr():
             rho_out, Thm_out, u_out, v_out, w_out = rho_b, Thm_b, u_b, v_b, w_b
@@ -1296,17 +1311,50 @@ def run_crm_rk3_hevi_metal(
             rho_out, Thm_out, u_out, v_out, w_out = rho_a, Thm_a, u_a, v_a, w_a
 
         qn_c = q_n.contiguous() if q_n is not None else (q_load - 1.0).contiguous()
-        qp_c = q_p.contiguous() if q_p is not None else ws["fy_zero"]
-
-        c_tg = 64 // nx
-        n_tg = (n_col + c_tg - 1) // c_tg
-        grid_64 = (n_tg * 64,)
-        u_prep = [nz, n_col, nx, dz_cols]
+        qp_c = q_p.contiguous() if q_p is not None else ws.setdefault("fy_zero", torch.zeros_like(rho0_c))
+        if "fy_zero" not in ws:
+            ws["fy_zero"] = torch.zeros_like(rho0_c)
         f_prep0 = [float(p_ref), float(r_d), float(gamma_d), float(dx)]
 
-        rho_s, Thm_s, u_s, v_s, w_s = rho0_c, Thm0_c, u0_c, v0_c, w0_c
         import math as _math
         rk_taus = (dt_dyn / 3.0, 0.5 * dt_dyn, dt_dyn)
+
+        if dev.type == "mps":
+            # Apple Silicon unified L1/SLC favors single-launch fused stage_prep + fast_hevi
+            # with block-contiguous L2-hot stage slab (`1.28x` faster on MPS).
+            if "stage_buf_bc" not in ws:
+                ws["stage_buf_bc"] = torch.empty((n_tg, nz, 4, 64, 4), device=dev, dtype=torch.float32)
+            stage_buf = ws["stage_buf_bc"]
+            for stage_idx, dtau in enumerate(rk_taus):
+                n_ac = max(1, int(_math.ceil(dtau / max(dt_ac_max, 0.1))))
+                dt_ac = dtau / float(n_ac)
+                first_i = 1 if stage_idx == 0 else 0
+                accum_i = 1 if stage_idx == 2 else 0
+                u_fused = [nz, n_col, nx, (int(dz_cols) << 16) | (int(n_ac) << 2) | (first_i << 1) | accum_i]
+                f_fused1 = [float(dt_ac), float(beta_hevi), float(gravity), 0.0]
+                lib.crm_2d_rk3_stage_fused_simd(
+                    rho0_c, Thm0_c, u0_c, v0_c, w0_c,
+                    rho_out, Thm_out, u_out, v_out, w_out,
+                    qn_c, qp_c, du_s_c, dv_s_c, dw_s_c, tTh_c,
+                    dzc_c, dzw_c, spc_c, spw_c,
+                    stage_buf, fx_acc, fz_acc,
+                    u_fused, f_prep0, f_fused1,
+                    threads=grid_64, group_size=(64,),
+                )
+            return rho_out, Thm_out, u_out, v_out, w_out, fx_acc, ws["fy_zero"], fz_acc
+
+        # NVIDIA CUDA (A100/H100) achieves higher SM occupancy with the low-register 2-kernel
+        # split (`d_star[64]` only, avoiding per-thread local-memory spill of 6x[64] arrays).
+        if "stage_c0" not in ws:
+            ws["stage_c0"] = torch.empty((nz, M, 4), device=dev, dtype=torch.float32)
+            ws["stage_c1"] = torch.empty((nz, M, 4), device=dev, dtype=torch.float32)
+            ws["stage_w0"] = torch.empty((nz - 1, M, 4), device=dev, dtype=torch.float32)
+            ws["stage_w1"] = torch.empty((nz - 1, M, 4), device=dev, dtype=torch.float32)
+        stage_c0, stage_c1, stage_w0, stage_w1 = (
+            ws["stage_c0"], ws["stage_c1"], ws["stage_w0"], ws["stage_w1"]
+        )
+        u_prep = [nz, n_col, nx, dz_cols]
+        rho_s, Thm_s, u_s, v_s, w_s = rho0_c, Thm0_c, u0_c, v0_c, w0_c
         for stage_idx, dtau in enumerate(rk_taus):
             n_ac = max(1, int(_math.ceil(dtau / max(dt_ac_max, 0.1))))
             dt_ac = dtau / float(n_ac)

@@ -84,14 +84,67 @@ def _serialize_surface(sfc_obj) -> dict:
     }
 
 
-def _restore_surface(sfc_target, payload: dict, device: torch.device) -> None:
-    """Restore serialized `SurfaceState` tensors onto `device`."""
+_STATIC_SFC_KEYS: frozenset[str] = frozenset({
+    "surf_type", "z_topo", "sigma_topo", "slope_topo", "aniso_topo", "angle_topo",
+})
+
+
+def _remap_horizontal_tensor(
+    t: torch.Tensor,
+    h_idx: torch.Tensor | None,
+    n_old: int,
+    n_sub_old: int = 1,
+    n_sub_new: int = 1,
+) -> torch.Tensor:
+    """Remap a 1D/2D tensor whose last axis is `n_old` or `n_old * n_sub_old` onto `h_idx` (`[n_new]`)."""
+    if h_idx is None and n_sub_old == n_sub_new:
+        return t
+    last = int(t.shape[-1])
+    if n_sub_old == 1 and n_sub_new == 1:
+        if last == n_old and h_idx is not None:
+            return t.index_select(-1, h_idx)
+        return t
+    if last == n_old * n_sub_old:
+        prefix = t.shape[:-1]
+        t_rs = t.reshape(*prefix, n_old, n_sub_old)
+        if h_idx is not None:
+            t_rs = t_rs.index_select(-2, h_idx)
+        if n_sub_new != n_sub_old:
+            s_idx = torch.arange(n_sub_new, dtype=torch.long) % max(n_sub_old, 1)
+            t_rs = t_rs.index_select(-1, s_idx)
+        n_c = int(h_idx.numel()) if h_idx is not None else n_old
+        return t_rs.reshape(*prefix, n_c * n_sub_new)
+    return t
+
+
+def _restore_surface(
+    sfc_target,
+    payload: dict,
+    device: torch.device,
+    *,
+    h_idx: torch.Tensor | None = None,
+    n_old: int = 0,
+    n_sub_old: int = 1,
+    n_sub_new: int = 1,
+) -> None:
+    """Restore serialized `SurfaceState` tensors onto `device` (with optional horizontal/subgrid remap)."""
+    do_remap = (h_idx is not None) or (n_sub_old != n_sub_new)
     for k, v in payload.items():
         if k == "bio":
             for bk, bv in v.items():
-                setattr(sfc_target.bio, bk, bv.to(device=device) if isinstance(bv, torch.Tensor) else bv)
+                if isinstance(bv, torch.Tensor):
+                    bv_use = _remap_horizontal_tensor(bv.cpu(), h_idx, n_old, n_sub_old, n_sub_new) if do_remap else bv
+                    setattr(sfc_target.bio, bk, bv_use.to(device=device))
+                else:
+                    setattr(sfc_target.bio, bk, bv)
+        elif do_remap and k in _STATIC_SFC_KEYS:
+            # Keep active target mesh's static topography and surface-type masks intact
+            continue
+        elif isinstance(v, torch.Tensor):
+            v_use = _remap_horizontal_tensor(v.cpu(), h_idx, n_old, n_sub_old, n_sub_new) if do_remap else v
+            setattr(sfc_target, k, v_use.to(device=device))
         else:
-            setattr(sfc_target, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+            setattr(sfc_target, k, v)
     # Backward-compatible warm-start when resuming from pre-3-source restart checkpoints
     if "t_leaf_sun" not in payload or sfc_target.t_leaf_sun is None:
         sfc_target.t_leaf_sun = sfc_target.t_canopy.clone()
@@ -104,7 +157,7 @@ def _restore_surface(sfc_target, payload: dict, device: torch.device) -> None:
 
     w_ice_cap = torch.clamp(SOIL_POROSITY - sfc_target.w_liq_soil, min=0.0)
     sfc_target.w_ice_soil = torch.clamp(sfc_target.w_ice_soil, min=0.0).minimum(w_ice_cap)
-    # Backward-compatible warm-start for evergreen/deciduous leaf-habit fields
+    # Backward-compatible warm-start for evergreen/deciduous leaf-habit & leaf-angle fields
     bio_payload = payload.get("bio", {}) or {}
     if "f_evg" not in bio_payload or sfc_target.bio.f_evg is None:
         from aoba.surface import SURF_LAND
@@ -126,6 +179,8 @@ def _restore_surface(sfc_target, payload: dict, device: torch.device) -> None:
         sfc_target.bio.ema_temp_home = sfc_target.bio.ema_temp_mid.clone()
     if "n_avail_fac" not in bio_payload or sfc_target.bio.n_avail_fac is None:
         sfc_target.bio.n_avail_fac = torch.ones_like(sfc_target.bio.lai)
+    if "chi_leaf" not in bio_payload or sfc_target.bio.chi_leaf is None:
+        sfc_target.bio.chi_leaf = torch.zeros_like(sfc_target.bio.lai)
 
 
 def _inspect_nonfinite_state(model: AOBAState) -> list[str]:
@@ -285,6 +340,11 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
             if model.river is not None
             else None
         ),
+        "lakes": (
+            {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.lakes.__dict__.items()}
+            if getattr(model, "lakes", None) is not None
+            else None
+        ),
         "land_carbon": (
             {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.land_carbon.__dict__.items()}
             if model.land_carbon is not None
@@ -326,6 +386,17 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
             "z_topo_smooth": model.mesh.z_topo_smooth.detach().cpu(),
             "surf_type": model.mesh.surf_type.detach().cpu(),
         },
+        "mesh_coords": (
+            lambda u_c_s, v_c_s: {
+                "atm_xyz": model.mesh.xyz_cell.detach().cpu(),
+                "atm_st": model.mesh.surf_type.detach().cpu(),
+                "atm_u_cell": u_c_s.detach().cpu(),
+                "atm_v_cell": v_c_s.detach().cpu(),
+                "ocn_xyz": (model.ocn_mesh if model.ocn_mesh is not None else model.mesh).xyz_cell.detach().cpu(),
+                "ocn_z_c": model.ogcm.z_c.detach().cpu() if model.ogcm is not None else None,
+                "ocn_wet0": model.ogcm.wet_c[0].detach().cpu() if model.ogcm is not None else None,
+            }
+        )(*__import__("aoba.scvt_mesh", fromlist=["reconstruct_cell_winds"]).reconstruct_cell_winds(model.mesh, model.atmos.u_edge)),
         "rad_cache": {k: v.detach().cpu() for k, v in model.rad_cache.items()},
     }
     if extra:
@@ -437,21 +508,154 @@ def _remap_thermo_columns(
     )
 
 
+def _infer_glevel_from_ncells(n_cells: int) -> int:
+    """Recover icosahedral grid level `g` from `n_cells = 10 * 4^g + 2`."""
+    ratio = max((int(n_cells) - 2) / 10.0, 1.0)
+    return max(int(round(math.log(ratio) / math.log(4.0))), 0)
+
+
+def _build_surface_aware_remap_idx(
+    xyz_old: torch.Tensor,
+    st_old: torch.Tensor | None,
+    xyz_new: torch.Tensor,
+    st_new: torch.Tensor | None,
+) -> torch.Tensor:
+    """Nearest-neighbor spherical remap index matching surface class (ocean/land/ice) when available."""
+    from scipy.spatial import cKDTree
+
+    xo = xyz_old.detach().cpu().numpy().astype(np.float64)
+    xn = xyz_new.detach().cpu().numpy().astype(np.float64)
+    tree_all = cKDTree(xo)
+    _, idx_all = tree_all.query(xn, k=1)
+    idx_out = np.asarray(idx_all, dtype=np.int64)
+
+    if st_old is None or st_new is None:
+        return torch.from_numpy(idx_out)
+
+    sto = st_old.detach().cpu().numpy().astype(np.int64)
+    stn = st_new.detach().cpu().numpy().astype(np.int64)
+    for cls in (0, 1, 2):
+        tgt_mask = stn == cls
+        if not np.any(tgt_mask):
+            continue
+        src_ids = np.nonzero(sto == cls)[0]
+        if src_ids.size == 0 and cls == 2:
+            # Fallback: ice-sheet cells inherit from land cells if old grid had no ice sheets
+            src_ids = np.nonzero(sto == 1)[0]
+        if src_ids.size == 0:
+            continue
+        sub_tree = cKDTree(xo[src_ids])
+        _, local_nn = sub_tree.query(xn[tgt_mask], k=1)
+        idx_out[tgt_mask] = src_ids[local_nn]
+    return torch.from_numpy(idx_out)
+
+
+def _build_wet_ocean_remap_idx(
+    xyz_old: torch.Tensor,
+    wet0_old: torch.Tensor | None,
+    xyz_new: torch.Tensor,
+) -> torch.Tensor:
+    """Nearest wet-ocean-column spherical remap index `[n_cells_new]`."""
+    from scipy.spatial import cKDTree
+
+    xo = xyz_old.detach().cpu().numpy().astype(np.float64)
+    xn = xyz_new.detach().cpu().numpy().astype(np.float64)
+    if wet0_old is not None:
+        wet_ids = np.nonzero(wet0_old.detach().cpu().numpy() > 0.5)[0]
+        if wet_ids.size > 0:
+            tree_w = cKDTree(xo[wet_ids])
+            _, local_nn = tree_w.query(xn, k=1)
+            return torch.from_numpy(wet_ids[local_nn].astype(np.int64))
+    tree_all = cKDTree(xo)
+    _, idx_all = tree_all.query(xn, k=1)
+    return torch.from_numpy(np.asarray(idx_all, dtype=np.int64))
+
+
+def _forward_fill_wet_downward(val: torch.Tensor, wet: torch.Tensor) -> torch.Tensor:
+    """Propagate deepest wet-layer ocean values downward into dry bathymetry cells `[nz, N]`."""
+    out = val.clone()
+    nz = int(out.shape[0])
+    for k in range(1, nz):
+        dry = wet[k] <= 0.5
+        out[k] = torch.where(dry, out[k - 1], out[k])
+    return out
+
+
+def _remap_ocean_3d_field(
+    val_old: torch.Tensor,
+    wet_old: torch.Tensor,
+    z_old: torch.Tensor,
+    z_new: torch.Tensor,
+    og_h_idx: torch.Tensor | None,
+    wet_new: torch.Tensor,
+    *,
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> torch.Tensor:
+    """Horizontally + vertically remap a 3D OGCM tracer `[nz_old, nc_old] -> [nz_new, nc_new]`."""
+    v = val_old.cpu()
+    w = wet_old.cpu()
+    if og_h_idx is not None:
+        v = v.index_select(1, og_h_idx)
+        w = w.index_select(1, og_h_idx)
+    v_fill = _forward_fill_wet_downward(v, w)
+    nc_new = int(v_fill.shape[1])
+    zo_2d = z_old.cpu().unsqueeze(1).expand(-1, nc_new).contiguous()
+    zn_2d = z_new.cpu().unsqueeze(1).expand(-1, nc_new).contiguous()
+    v_new = _interp_vertical_batch(zo_2d, v_fill, zn_2d)
+    if vmin is not None or vmax is not None:
+        v_new = torch.clamp(v_new, min=vmin, max=vmax)
+    return v_new * (wet_new.cpu() > 0.5).to(v_new.dtype)
+
+
 def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device) -> dict[str, Any]:
-    """Restore prognostic tensors (including vertical remap when `nz` / `z_top` changes) from `restart.pt`."""
+    """Restore prognostic tensors with universal cross-grid remapping across `(glevel, nz, z_top, crm_nx/ny, ocean_glevel, ocean_nz)`."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.sim_time_sec = float(ckpt["sim_time_sec"])
     model.step_count = int(ckpt["step_count"])
 
     ck_atmos = ckpt["atmos"]
     ck_crm = ckpt["crm"]
+    mesh_coords = ckpt.get("mesh_coords") or {}
+
     nz_old = int(ck_atmos.rho_d.shape[0])
     nz_new = int(model.atmos.rho_d.shape[0])
+    nc_old = int(ck_atmos.rho_d.shape[1])
+    nc_new = int(model.atmos.rho_d.shape[1])
+    _, _, ny_old, nx_old = ck_crm.rho_d.shape
+    _, _, ny_new, nx_new = model.crm.rho_d.shape
+    n_sub_old = int(ny_old * nx_old)
+    n_sub_new = int(ny_new * nx_new)
+
     z_top_old_val = float(ck_atmos.z_w[-1].mean().item())
     z_top_new_val = float(model.atmos.z_w[-1].mean().item())
+    needs_hremap = nc_old != nc_new
+    needs_subremap = (ny_old != ny_new) or (nx_old != nx_new)
     needs_vremap = (nz_old != nz_new) or (abs(z_top_old_val - z_top_new_val) > 50.0)
+    needs_atm_remap = needs_hremap or needs_vremap or needs_subremap
 
-    if not needs_vremap:
+    # Build spherical surface-type-aware remap index for atmosphere if horizontal mesh changed
+    atm_h_idx: torch.Tensor | None = None
+    old_atm_xyz: torch.Tensor | None = mesh_coords.get("atm_xyz")
+    old_atm_st: torch.Tensor | None = mesh_coords.get("atm_st")
+    if old_atm_st is None and isinstance(ckpt.get("sfc"), dict):
+        old_atm_st = ckpt["sfc"].get("surf_type")
+    if old_atm_st is None and isinstance(ckpt.get("mesh_dynamic"), dict):
+        old_atm_st = ckpt["mesh_dynamic"].get("surf_type")
+
+    old_atm_mesh_rebuilt = None
+    if needs_hremap:
+        if old_atm_xyz is None:
+            from aoba.scvt_mesh import build_scvt_mesh
+
+            g_old = _infer_glevel_from_ncells(nc_old)
+            old_atm_mesh_rebuilt = build_scvt_mesh(g_old, use_earth2014=False, device=torch.device("cpu"))
+            old_atm_xyz = old_atm_mesh_rebuilt.xyz_cell.cpu()
+        atm_h_idx = _build_surface_aware_remap_idx(
+            old_atm_xyz, old_atm_st, model.mesh.xyz_cell.cpu(), model.mesh.surf_type.cpu()
+        )
+
+    if not needs_atm_remap:
         for k, v in ck_atmos.__dict__.items():
             setattr(model.atmos, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
         for k, v in ck_crm.__dict__.items():
@@ -459,8 +663,9 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         model.rad_cache = {k: v.to(device=device) for k, v in ckpt["rad_cache"].items()}
     else:
         print(
-            f"  [Vertical Remap] Seamlessly connecting restart ({nz_old} layers, top={z_top_old_val/1000:.1f} km) "
-            f"-> active grid ({nz_new} layers, top={z_top_new_val/1000:.1f} km)...",
+            f"  [Universal Grid Remap] Seamlessly connecting restart "
+            f"(nc={nc_old}, nz={nz_old}, top={z_top_old_val/1000:.1f} km, crm={ny_old}x{nx_old}) "
+            f"-> active grid (nc={nc_new}, nz={nz_new}, top={z_top_new_val/1000:.1f} km, crm={ny_new}x{nx_new})...",
             flush=True,
         )
         z_old_c = ck_atmos.z_c.cpu()
@@ -468,9 +673,23 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         z_old_w = ck_atmos.z_w.cpu()
         z_new_w = model.atmos.z_w.cpu()
 
-        # 1. Host thermodynamics (hydrostatic stratospheric extension above z_old_top)
+        def _h_atm(t: torch.Tensor) -> torch.Tensor:
+            t_cpu = t.cpu()
+            return t_cpu.index_select(1, atm_h_idx) if atm_h_idx is not None else t_cpu
+
+        z_old_c_h = _h_atm(z_old_c)
+        z_old_w_h = _h_atm(z_old_w)
+
+        # 1. Host thermodynamics (hydrostatic remap + stratospheric extension above z_old_top)
         rho_n, thm_n, qn_n, qp_n, qv_n, qc_n, qi_n = _remap_thermo_columns(
-            z_old_c, ck_atmos.rho_d, ck_atmos.theta_m, ck_atmos.q_v, ck_atmos.q_c, ck_atmos.q_i, ck_atmos.q_p, z_new_c
+            z_old_c_h,
+            _h_atm(ck_atmos.rho_d),
+            _h_atm(ck_atmos.theta_m),
+            _h_atm(ck_atmos.q_v),
+            _h_atm(ck_atmos.q_c),
+            _h_atm(ck_atmos.q_i),
+            _h_atm(ck_atmos.q_p),
+            z_new_c,
         )
         model.atmos.rho_d = rho_n.to(device=device)
         model.atmos.theta_m = thm_n.to(device=device)
@@ -480,49 +699,78 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         model.atmos.q_c = qc_n.to(device=device)
         model.atmos.q_i = qi_n.to(device=device)
 
-        # Host edge winds: interpolate below z_old_top, smooth exponential taper aloft
-        c0 = model.mesh.cells_on_edge[:, 0].cpu()
-        c1 = model.mesh.cells_on_edge[:, 1].cpu()
-        ze_old = 0.5 * (z_old_c[:, c0] + z_old_c[:, c1])
-        ze_new = 0.5 * (z_new_c[:, c0] + z_new_c[:, c1])
-        ue_interp = _interp_vertical_batch(ze_old, ck_atmos.u_edge, ze_new)
-        taper_e = torch.exp(-torch.clamp(ze_new - ze_old[-1:], min=0.0) / 12000.0)
-        model.atmos.u_edge = (ue_interp * taper_e).to(device=device)
+        # Host edge winds: either direct edge vertical remap or cell-vector remap -> edge projection
+        if not needs_hremap:
+            if needs_vremap:
+                c0 = model.mesh.cells_on_edge[:, 0].cpu()
+                c1 = model.mesh.cells_on_edge[:, 1].cpu()
+                ze_old = 0.5 * (z_old_c[:, c0] + z_old_c[:, c1])
+                ze_new = 0.5 * (z_new_c[:, c0] + z_new_c[:, c1])
+                ue_interp = _interp_vertical_batch(ze_old, ck_atmos.u_edge.cpu(), ze_new)
+                taper_e = torch.exp(-torch.clamp(ze_new - ze_old[-1:], min=0.0) / 12000.0)
+                model.atmos.u_edge = (ue_interp * taper_e).to(device=device)
+            else:
+                model.atmos.u_edge = ck_atmos.u_edge.to(device=device)
+        else:
+            from aoba.scvt_mesh import build_scvt_mesh, project_cell_vectors_to_edges, reconstruct_cell_winds
 
-        w_interp = _interp_vertical_batch(z_old_w, ck_atmos.w, z_new_w)
-        model.atmos.w = torch.where(z_new_w > z_old_w[-1:], torch.zeros_like(w_interp), w_interp).to(device=device)
+            u_c_old = mesh_coords.get("atm_u_cell")
+            v_c_old = mesh_coords.get("atm_v_cell")
+            if u_c_old is None or v_c_old is None:
+                if old_atm_mesh_rebuilt is None:
+                    g_old = _infer_glevel_from_ncells(nc_old)
+                    old_atm_mesh_rebuilt = build_scvt_mesh(g_old, use_earth2014=False, device=torch.device("cpu"))
+                u_c_old, v_c_old = reconstruct_cell_winds(old_atm_mesh_rebuilt, ck_atmos.u_edge.cpu())
+            u_c_h = u_c_old.cpu().index_select(1, atm_h_idx)
+            v_c_h = v_c_old.cpu().index_select(1, atm_h_idx)
+            taper_c = torch.exp(-torch.clamp(z_new_c - z_old_c_h[-1:], min=0.0) / 12000.0)
+            u_c_new = (_interp_vertical_batch(z_old_c_h, u_c_h, z_new_c) * taper_c).to(device=device)
+            v_c_new = (_interp_vertical_batch(z_old_c_h, v_c_h, z_new_c) * taper_c).to(device=device)
+            model.atmos.u_edge = project_cell_vectors_to_edges(model.mesh, u_c_new, v_c_new)
+
+        w_interp = _interp_vertical_batch(z_old_w_h, _h_atm(ck_atmos.w), z_new_w)
+        model.atmos.w = torch.where(z_new_w > z_old_w_h[-1:], torch.zeros_like(w_interp), w_interp).to(device=device)
         if getattr(ck_atmos, "q_dust", None) is not None and model.atmos.q_dust is not None:
-            qd_i = torch.clamp(_interp_vertical_batch(z_old_c, ck_atmos.q_dust, z_new_c), min=0.0)
-            model.atmos.q_dust = torch.where(z_new_c > z_old_c[-1:], torch.zeros_like(qd_i), qd_i).to(device=device)
+            qd_i = torch.clamp(_interp_vertical_batch(z_old_c_h, _h_atm(ck_atmos.q_dust), z_new_c), min=0.0)
+            model.atmos.q_dust = torch.where(z_new_c > z_old_c_h[-1:], torch.zeros_like(qd_i), qd_i).to(device=device)
 
-        # 2. Embedded 1:1 CRM columns [nz, nc, ny, nx] -> flatten to [nz, nc*ny*nx]
-        _, nc, ny, nx = ck_crm.rho_d.shape
-        n_sub = ny * nx
-        m_sub = nc * n_sub
-        zo_sub = z_old_c.unsqueeze(-1).expand(nz_old, nc, n_sub).reshape(nz_old, m_sub)
-        zn_sub = z_new_c.unsqueeze(-1).expand(nz_new, nc, n_sub).reshape(nz_new, m_sub)
-        zow_sub = z_old_w.unsqueeze(-1).expand(nz_old + 1, nc, n_sub).reshape(nz_old + 1, m_sub)
-        znw_sub = z_new_w.unsqueeze(-1).expand(nz_new + 1, nc, n_sub).reshape(nz_new + 1, m_sub)
+        # 2. Embedded CRM columns [nz_old, nc_old, ny_old, nx_old] -> [nz_new, nc_new, ny_new, nx_new]
+        m_sub_new = nc_new * n_sub_new
+        s_idx = torch.arange(n_sub_new, dtype=torch.long) % max(n_sub_old, 1)
+
+        def _hs_crm(t: torch.Tensor) -> torch.Tensor:
+            # t: [nz_in, nc_old, ny_old, nx_old] -> [nz_in, nc_new * n_sub_new]
+            t_flat = t.cpu().reshape(t.shape[0], nc_old, n_sub_old)
+            if atm_h_idx is not None:
+                t_flat = t_flat.index_select(1, atm_h_idx)
+            if n_sub_new != n_sub_old:
+                t_flat = t_flat.index_select(2, s_idx)
+            return t_flat.reshape(t.shape[0], m_sub_new).contiguous()
+
+        zo_sub = z_old_c_h.unsqueeze(-1).expand(nz_old, nc_new, n_sub_new).reshape(nz_old, m_sub_new)
+        zn_sub = z_new_c.unsqueeze(-1).expand(nz_new, nc_new, n_sub_new).reshape(nz_new, m_sub_new)
+        zow_sub = z_old_w_h.unsqueeze(-1).expand(nz_old + 1, nc_new, n_sub_new).reshape(nz_old + 1, m_sub_new)
+        znw_sub = z_new_w.unsqueeze(-1).expand(nz_new + 1, nc_new, n_sub_new).reshape(nz_new + 1, m_sub_new)
 
         c_rho, c_thm, c_qn, c_qp, c_qv, c_qc, c_qi = _remap_thermo_columns(
             zo_sub,
-            ck_crm.rho_d.reshape(nz_old, m_sub),
-            ck_crm.theta_m.reshape(nz_old, m_sub),
-            ck_crm.q_v.reshape(nz_old, m_sub),
-            ck_crm.q_c.reshape(nz_old, m_sub),
-            ck_crm.q_i.reshape(nz_old, m_sub),
-            ck_crm.q_p.reshape(nz_old, m_sub),
+            _hs_crm(ck_crm.rho_d),
+            _hs_crm(ck_crm.theta_m),
+            _hs_crm(ck_crm.q_v),
+            _hs_crm(ck_crm.q_c),
+            _hs_crm(ck_crm.q_i),
+            _hs_crm(ck_crm.q_p),
             zn_sub,
         )
         taper_sub = torch.exp(-torch.clamp(zn_sub - zo_sub[-1:], min=0.0) / 12000.0)
-        c_u = _interp_vertical_batch(zo_sub, ck_crm.u.reshape(nz_old, m_sub), zn_sub) * taper_sub
-        c_v = _interp_vertical_batch(zo_sub, ck_crm.v.reshape(nz_old, m_sub), zn_sub) * taper_sub
-        c_w_i = _interp_vertical_batch(zow_sub, ck_crm.w.reshape(nz_old + 1, m_sub), znw_sub)
+        c_u = _interp_vertical_batch(zo_sub, _hs_crm(ck_crm.u), zn_sub) * taper_sub
+        c_v = _interp_vertical_batch(zo_sub, _hs_crm(ck_crm.v), zn_sub) * taper_sub
+        c_w_i = _interp_vertical_batch(zow_sub, _hs_crm(ck_crm.w), znw_sub)
         c_w = torch.where(znw_sub > zow_sub[-1:], torch.zeros_like(c_w_i), c_w_i)
-        c_qke_i = _interp_vertical_batch(zo_sub, ck_crm.qke.reshape(nz_old, m_sub), zn_sub)
+        c_qke_i = _interp_vertical_batch(zo_sub, _hs_crm(ck_crm.qke), zn_sub)
         c_qke = torch.where(zn_sub > zo_sub[-1:], torch.full_like(c_qke_i, 2.0e-4), torch.clamp(c_qke_i, min=2.0e-4))
 
-        sh4 = (nz_new, nc, ny, nx)
+        sh4 = (nz_new, nc_new, ny_new, nx_new)
         model.crm.rho_d = c_rho.reshape(sh4).to(device=device)
         model.crm.theta_m = c_thm.reshape(sh4).to(device=device)
         model.crm.q_n = c_qn.reshape(sh4).to(device=device)
@@ -532,33 +780,101 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         model.crm.q_i = c_qi.reshape(sh4).to(device=device)
         model.crm.u = c_u.reshape(sh4).to(device=device)
         model.crm.v = c_v.reshape(sh4).to(device=device)
-        model.crm.w = c_w.reshape(nz_new + 1, nc, ny, nx).to(device=device)
+        model.crm.w = c_w.reshape(nz_new + 1, nc_new, ny_new, nx_new).to(device=device)
         model.crm.qke = c_qke.reshape(sh4).to(device=device)
-        model.crm.n_c = None
-        model.crm.n_i = None
+        _mp_scheme = str(model.cfg.microphysics_scheme)
+        _keep_opt = (
+            {"n_c", "n_i"} if _mp_scheme == "two_moment"
+            else ({"n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"} if _mp_scheme == "six_class_2m" else set())
+        )
+        for opt_field in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
+            old_val = getattr(ck_crm, opt_field, None)
+            if isinstance(old_val, torch.Tensor) and (opt_field in _keep_opt or getattr(model.crm, opt_field, None) is not None):
+                rm = torch.clamp(_interp_vertical_batch(zo_sub, _hs_crm(old_val), zn_sub), min=0.0)
+                rm = torch.where(zn_sub > zo_sub[-1:], torch.zeros_like(rm), rm)
+                setattr(model.crm, opt_field, rm.reshape(sh4).to(device=device))
+            elif getattr(model.crm, opt_field, None) is not None:
+                setattr(model.crm, opt_field, torch.zeros(sh4, device=device, dtype=model.crm.rho_d.dtype))
+            else:
+                setattr(model.crm, opt_field, None)
 
-        # Force fresh radiation evaluation on the first step with the new vertical grid
+        # Force fresh radiation evaluation on the first step with the remapped grid
         model.rad_cache = {}
         stride = max(int(model.cfg.rad_stride), 1)
         model.step_count = (model.step_count // stride) * stride
-        ckpt["_vertical_remapped"] = True
+        if needs_vremap:
+            ckpt["_vertical_remapped"] = True
+        if needs_hremap:
+            ckpt["_horizontal_remapped"] = True
 
     # Honor active run_config grid spacing (`crm_dx`) when switching spacing on resume
     model.crm.dx = float(model.cfg.crm_dx)
     model.crm.dy = float(model.cfg.crm_dx)
-    _restore_surface(model.sfc, ckpt["sfc"], device)
-    if ckpt.get("sfc_sub") is not None and model.sfc_sub is not None:
-        _restore_surface(model.sfc_sub, ckpt["sfc_sub"], device)
-    if ckpt.get("ocn_sfc") is not None and model.ocn_sfc is not None:
-        _restore_surface(model.ocn_sfc, ckpt["ocn_sfc"], device)
-    for k, v in ckpt["ocn"].items():
-        setattr(model.ocn, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+
+    # 3. Surface states (`sfc`, `sfc_sub`, `ocn_sfc`)
+    _restore_surface(model.sfc, ckpt["sfc"], device, h_idx=atm_h_idx, n_old=nc_old)
+    if model.sfc_sub is not None:
+        if ckpt.get("sfc_sub") is not None:
+            _restore_surface(
+                model.sfc_sub,
+                ckpt["sfc_sub"],
+                device,
+                h_idx=atm_h_idx,
+                n_old=nc_old,
+                n_sub_old=n_sub_old,
+                n_sub_new=n_sub_new,
+            )
+        else:
+            _restore_surface(
+                model.sfc_sub,
+                ckpt["sfc"],
+                device,
+                h_idx=atm_h_idx,
+                n_old=nc_old,
+                n_sub_old=1,
+                n_sub_new=n_sub_new,
+            )
+
+    # Build ocean horizontal remap index when ocean mesh changed (or transitioning from unified -> high-res ocean)
+    ocn_mesh_act = model.ocn_mesh if model.ocn_mesh is not None else model.mesh
+    ocn_sfc_act = model.ocn_sfc if model.ocn_sfc is not None else model.sfc
+    ocn_nc_new = int(ocn_mesh_act.n_cells)
+    ck_ocn_sfc = ckpt.get("ocn_sfc")
+    if model.ocn_sfc is not None:
+        src_sfc = ck_ocn_sfc if ck_ocn_sfc is not None else ckpt["sfc"]
+        src_n_ocn = int(src_sfc["t_ocean_ml"].shape[-1])
+        if src_n_ocn == ocn_nc_new:
+            _restore_surface(model.ocn_sfc, src_sfc, device)
+        else:
+            src_xyz = mesh_coords.get("ocn_xyz") if ck_ocn_sfc is not None else old_atm_xyz
+            if src_xyz is None or int(src_xyz.shape[0]) != src_n_ocn:
+                from aoba.scvt_mesh import build_scvt_mesh
+
+                src_xyz = build_scvt_mesh(_infer_glevel_from_ncells(src_n_ocn), use_earth2014=False, device=torch.device("cpu")).xyz_cell.cpu()
+            ocn_sfc_h_idx = _build_surface_aware_remap_idx(
+                src_xyz, src_sfc.get("surf_type"), ocn_mesh_act.xyz_cell.cpu(), ocn_mesh_act.surf_type.cpu()
+            )
+            _restore_surface(model.ocn_sfc, src_sfc, device, h_idx=ocn_sfc_h_idx, n_old=src_n_ocn)
+
+    # 4. 1.5-layer Ekman-SW ocean state (`model.ocn`)
+    if not needs_hremap:
+        for k, v in ckpt["ocn"].items():
+            setattr(model.ocn, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+    else:
+        for k, v in ckpt["ocn"].items():
+            if not isinstance(v, torch.Tensor):
+                setattr(model.ocn, k, v)
+            elif v.ndim >= 1 and int(v.shape[-1]) == nc_old:
+                setattr(model.ocn, k, _remap_horizontal_tensor(v.cpu(), atm_h_idx, nc_old).to(device=device))
+            elif k == "u_sw_edge" and hasattr(model.ocn, k) and isinstance(getattr(model.ocn, k), torch.Tensor):
+                setattr(model.ocn, k, torch.zeros_like(getattr(model.ocn, k)))
+
+    # 5. 3D OGCM (+ BGC + EVP-ITD sea ice) with universal (ocean_glevel, ocean_nz) remapping
     if model.ogcm is not None:
-        ocn_mesh_act = model.ocn_mesh if model.ocn_mesh is not None else model.mesh
-        ocn_sfc_act = model.ocn_sfc if model.ocn_sfc is not None else model.sfc
         ck_og = ckpt.get("ogcm")
         ck_og_nc = int(ck_og["eta"].shape[0]) if (ck_og is not None and "eta" in ck_og and isinstance(ck_og["eta"], torch.Tensor)) else -1
-        if ck_og is not None and int(ck_og.get("nz_ocn", -1)) == model.ogcm.nz_ocn and ck_og_nc == ocn_mesh_act.n_cells:
+        ck_og_nz = int(ck_og.get("nz_ocn", -1)) if ck_og is not None else -1
+        if ck_og is not None and ck_og_nz == model.ogcm.nz_ocn and ck_og_nc == ocn_nc_new:
             for k, v in ck_og.items():
                 if k == "_static_cache":
                     continue
@@ -570,6 +886,78 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
                             setattr(sub_target, bk, bv.to(device=device) if isinstance(bv, torch.Tensor) else bv)
                     continue
                 setattr(model.ogcm, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+        elif ck_og is not None and "temp" in ck_og and "sal" in ck_og and ck_og_nc > 0 and ck_og_nz > 0:
+            print(
+                f"  [Ocean OGCM Remap] Remapping 3D OGCM (nc={ck_og_nc}, nz={ck_og_nz}) "
+                f"-> active grid (nc={ocn_nc_new}, nz={model.ogcm.nz_ocn})...",
+                flush=True,
+            )
+            ocn_xyz_old = mesh_coords.get("ocn_xyz")
+            if ocn_xyz_old is None or int(ocn_xyz_old.shape[0]) != ck_og_nc:
+                from aoba.scvt_mesh import build_scvt_mesh
+
+                ocn_xyz_old = build_scvt_mesh(_infer_glevel_from_ncells(ck_og_nc), use_earth2014=False, device=torch.device("cpu")).xyz_cell.cpu()
+            wet_old = ck_og.get("wet_c")
+            if wet_old is None:
+                wet_old = torch.ones_like(ck_og["temp"])
+            wet0_old = mesh_coords.get("ocn_wet0")
+            if wet0_old is None:
+                wet0_old = wet_old[0]
+            og_h_idx = (
+                _build_wet_ocean_remap_idx(ocn_xyz_old, wet0_old, ocn_mesh_act.xyz_cell.cpu())
+                if ck_og_nc != ocn_nc_new
+                else None
+            )
+            z_old_ocn = ck_og.get("z_c")
+            if z_old_ocn is None:
+                z_old_ocn = mesh_coords.get("ocn_z_c")
+            if z_old_ocn is None:
+                z_old_ocn = torch.linspace(10.0, 4500.0, ck_og_nz)
+            z_new_ocn = model.ogcm.z_c.cpu()
+
+            model.ogcm.temp = _remap_ocean_3d_field(
+                ck_og["temp"], wet_old, z_old_ocn, z_new_ocn, og_h_idx, model.ogcm.wet_c, vmin=271.15, vmax=315.0
+            ).to(device=device)
+            model.ogcm.sal = _remap_ocean_3d_field(
+                ck_og["sal"], wet_old, z_old_ocn, z_new_ocn, og_h_idx, model.ogcm.wet_c, vmin=5.0, vmax=45.0
+            ).to(device=device)
+            # Zero currents, SSH, and Kahan residuals for clean geostrophic spinup on the new bathymetry
+            model.ogcm.u_edge.zero_()
+            model.ogcm.u_baro.zero_()
+            model.ogcm.eta.zero_()
+            model.ogcm.w_vel.zero_()
+            model.ogcm.t_comp.zero_()
+            model.ogcm.s_comp.zero_()
+            if isinstance(model.ogcm.m_seaice_prev, torch.Tensor):
+                model.ogcm.m_seaice_prev = ocn_sfc_act.m_seaice.clone()
+            # Keep surface ocean mixed-layer temperature synchronized with remapped top OGCM layer
+            wet0_mask = model.ogcm.wet_c[0] > 0.5
+            ocn_sfc_act.t_ocean_ml = torch.where(wet0_mask, model.ogcm.temp[0], ocn_sfc_act.t_ocean_ml)
+
+            # Remap 3D Ocean BGC tracers when present in both checkpoint and active model
+            ck_bgc = ck_og.get("bgc")
+            if ck_bgc is not None and model.ogcm.bgc is not None:
+                bgc_items = ck_bgc.items() if isinstance(ck_bgc, dict) else ck_bgc.__dict__.items()
+                for bk, bv in bgc_items:
+                    if not isinstance(bv, torch.Tensor) or not hasattr(model.ogcm.bgc, bk):
+                        continue
+                    tgt = getattr(model.ogcm.bgc, bk)
+                    if bk.endswith("_comp") and isinstance(tgt, torch.Tensor):
+                        tgt.zero_()
+                    elif bv.ndim == 2 and int(bv.shape[0]) == ck_og_nz and int(bv.shape[1]) == ck_og_nc:
+                        rm_bgc = _remap_ocean_3d_field(
+                            bv, wet_old, z_old_ocn, z_new_ocn, og_h_idx, model.ogcm.wet_c, vmin=0.0
+                        )
+                        setattr(model.ogcm.bgc, bk, rm_bgc.to(device=device))
+                    elif bv.ndim == 1 and int(bv.shape[0]) == ck_og_nc:
+                        rm_1d = bv.cpu().index_select(0, og_h_idx) if og_h_idx is not None else bv.cpu()
+                        setattr(model.ogcm.bgc, bk, (rm_1d * wet0_mask.cpu().to(rm_1d.dtype)).to(device=device))
+
+            # Re-sync EVP-ITD sea-ice categories cleanly from the already-remapped `ocn_sfc_act.m_seaice`
+            if bool(model.cfg.enable_seaice_evp_itd):
+                from aoba.seaice_evp import init_seaice_evp_state
+
+                model.ogcm.seaice_evp = init_seaice_evp_state(ocn_sfc_act, ocn_mesh_act)
         else:
             from aoba.ocean_ogcm import init_ogcm_state
 
@@ -582,31 +970,114 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
                 from aoba.seaice_evp import init_seaice_evp_state
 
                 model.ogcm.seaice_evp = init_seaice_evp_state(ocn_sfc_act, ocn_mesh_act)
+
+    # 6. River routing state (keep new mesh static drainage network if horizontal grid changed)
+    _STATIC_RIVER_KEYS = {"downstream_idx", "reach_len_m", "channel_slope", "flow_vel_ms", "drain_area_m2", "is_land_river"}
     if ckpt.get("river") is not None and model.river is not None:
-        for k, v in ckpt["river"].items():
-            setattr(model.river, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+        ck_riv = ckpt["river"]
+        if not needs_hremap:
+            for k, v in ck_riv.items():
+                if hasattr(model.river, k):
+                    setattr(model.river, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+        else:
+            if isinstance(ck_riv.get("storage_kg"), torch.Tensor) and int(ck_riv["storage_kg"].shape[0]) == nc_old:
+                st_new = _remap_horizontal_tensor(ck_riv["storage_kg"].cpu(), atm_h_idx, nc_old).to(device=device)
+                model.river.storage_kg = st_new * model.river.is_land_river.to(st_new.dtype)
+                model.river.storage_comp.zero_()
+
+    # 7. Dynamic lakes state (exact copy on same grid; fill-fraction-conserving remap on grid change)
+    _STATIC_LAKE_KEYS = {"f_cap", "h_cap", "v_cap_m3", "d_pf_m", "is_basin"}
+    if ckpt.get("lakes") is not None and getattr(model, "lakes", None) is not None:
+        from aoba.lakes import update_lake_hypsometry
+
+        ck_lk = ckpt["lakes"]
+        if not needs_hremap:
+            for k, v in ck_lk.items():
+                if hasattr(model.lakes, k):
+                    setattr(model.lakes, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+        else:
+            v_old = ck_lk.get("v_lake_m3")
+            vcap_old = ck_lk.get("v_cap_m3")
+            if isinstance(v_old, torch.Tensor) and isinstance(vcap_old, torch.Tensor) and int(v_old.shape[0]) == nc_old:
+                phi_old = torch.where(vcap_old > 1.0, (v_old / torch.clamp(vcap_old, min=1.0)).clamp(0.0, 1.0), torch.zeros_like(v_old))
+                phi_new = _remap_horizontal_tensor(phi_old.cpu(), atm_h_idx, nc_old).to(device=device)
+                model.lakes.v_lake_m3 = phi_new * model.lakes.v_cap_m3
+                model.lakes.v_lake_comp.zero_()
+            for k in ("t_ml", "t_bot", "h_ml", "h_ice", "swe_ice", "t_ice"):
+                v = ck_lk.get(k)
+                if isinstance(v, torch.Tensor) and int(v.shape[0]) == nc_old and hasattr(model.lakes, k):
+                    setattr(model.lakes, k, _remap_horizontal_tensor(v.cpu(), atm_h_idx, nc_old).to(device=device))
+            model.lakes.h_ml = torch.minimum(model.lakes.h_ml, torch.clamp(model.lakes.h_cap, min=1.0))
+        model.lakes.v_lake_m3 = torch.minimum(torch.clamp(model.lakes.v_lake_m3, min=0.0), model.lakes.v_cap_m3)
+        update_lake_hypsometry(model.lakes, model.mesh.area_cell)
+
+    # 8. Land carbon & nitrogen pools (supports both cell-level and subgrid pools)
     if ckpt.get("land_carbon") is not None and model.land_carbon is not None:
         ck_lc = ckpt["land_carbon"]
         ck_c_leaf = ck_lc.get("c_leaf")
-        if isinstance(ck_c_leaf, torch.Tensor) and ck_c_leaf.shape == model.land_carbon.c_leaf.shape:
-            for k, v in ck_lc.items():
-                if hasattr(model.land_carbon, k):
-                    setattr(model.land_carbon, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
-    if ckpt.get("aerosols") is not None and model.aerosols is not None:
-        for k, v in ckpt["aerosols"].items():
-            if isinstance(v, torch.Tensor) and needs_vremap and v.ndim == 2 and v.shape[0] == nz_old:
-                remapped = torch.clamp(_interp_vertical_batch(z_old_c, v.cpu(), z_new_c), min=0.0)
-                remapped = torch.where(z_new_c > z_old_c[-1:], torch.zeros_like(remapped), remapped)
-                setattr(model.aerosols, k, remapped.to(device=device))
+        if isinstance(ck_c_leaf, torch.Tensor):
+            lc_old_n = int(ck_c_leaf.shape[-1])
+            lc_new_n = int(model.land_carbon.c_leaf.shape[-1])
+            if lc_old_n == lc_new_n and not needs_hremap and not needs_subremap:
+                for k, v in ck_lc.items():
+                    if hasattr(model.land_carbon, k):
+                        setattr(model.land_carbon, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
             else:
-                setattr(model.aerosols, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+                lc_sub_old = n_sub_old if lc_old_n == nc_old * n_sub_old else 1
+                lc_sub_new = n_sub_new if lc_new_n == nc_new * n_sub_new else 1
+                for k, v in ck_lc.items():
+                    if not hasattr(model.land_carbon, k):
+                        continue
+                    if not isinstance(v, torch.Tensor):
+                        setattr(model.land_carbon, k, v)
+                    elif k.endswith("_comp"):
+                        tgt = getattr(model.land_carbon, k)
+                        if isinstance(tgt, torch.Tensor):
+                            tgt.zero_()
+                    elif v.ndim >= 1 and int(v.shape[-1]) == lc_old_n:
+                        rm = _remap_horizontal_tensor(v.cpu(), atm_h_idx, nc_old, lc_sub_old, lc_sub_new)
+                        setattr(model.land_carbon, k, rm.to(device=device))
+
+    # 9. Natural aerosols & prognostic ozone (horizontal + vertical remap)
+    if ckpt.get("aerosols") is not None and model.aerosols is not None:
+        z_oc_a = z_old_c_h if needs_atm_remap else ck_atmos.z_c.cpu()
+        z_nc_a = model.atmos.z_c.cpu()
+        for k, v in ckpt["aerosols"].items():
+            if not hasattr(model.aerosols, k):
+                continue
+            if not isinstance(v, torch.Tensor):
+                setattr(model.aerosols, k, v)
+            elif v.ndim == 2 and int(v.shape[0]) == nz_old and int(v.shape[1]) == nc_old:
+                vh = v.cpu().index_select(1, atm_h_idx) if atm_h_idx is not None else v.cpu()
+                if needs_hremap or needs_vremap:
+                    remapped = torch.clamp(_interp_vertical_batch(z_oc_a, vh, z_nc_a), min=0.0)
+                    remapped = torch.where(z_nc_a > z_oc_a[-1:], torch.zeros_like(remapped), remapped)
+                    setattr(model.aerosols, k, remapped.to(device=device))
+                else:
+                    setattr(model.aerosols, k, vh.to(device=device))
+            elif v.ndim == 1 and int(v.shape[0]) == nc_old:
+                vh = v.cpu().index_select(0, atm_h_idx) if atm_h_idx is not None else v.cpu()
+                setattr(model.aerosols, k, vh.to(device=device))
+
     if ckpt.get("ozone") is not None and model.ozone is not None:
+        z_oc_o = z_old_c_h if needs_atm_remap else ck_atmos.z_c.cpu()
+        z_nc_o = model.atmos.z_c.cpu()
         for k, v in ckpt["ozone"].items():
-            if isinstance(v, torch.Tensor) and needs_vremap and v.ndim == 2 and v.shape[0] == nz_old:
-                remapped = torch.clamp(_interp_vertical_batch(z_old_c, v.cpu(), z_new_c), min=1.0e-10)
-                setattr(model.ozone, k, remapped.to(device=device))
-            elif hasattr(model.ozone, k):
-                setattr(model.ozone, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+            if not hasattr(model.ozone, k):
+                continue
+            if not isinstance(v, torch.Tensor):
+                setattr(model.ozone, k, v)
+            elif v.ndim == 2 and int(v.shape[0]) == nz_old and int(v.shape[1]) == nc_old:
+                vh = v.cpu().index_select(1, atm_h_idx) if atm_h_idx is not None else v.cpu()
+                if needs_hremap or needs_vremap:
+                    remapped = torch.clamp(_interp_vertical_batch(z_oc_o, vh, z_nc_o), min=1.0e-10)
+                    setattr(model.ozone, k, remapped.to(device=device))
+                else:
+                    setattr(model.ozone, k, vh.to(device=device))
+            elif v.ndim == 1 and int(v.shape[0]) == nc_old:
+                vh = v.cpu().index_select(0, atm_h_idx) if atm_h_idx is not None else v.cpu()
+                setattr(model.ozone, k, vh.to(device=device))
+
     if ckpt.get("trace_gas") is not None and bool(model.cfg.enable_prognostic_ch4_n2o):
         from aoba.trace_gas_cycle import init_trace_gas_cycle_state
 
@@ -623,15 +1094,41 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         for k, v in ckpt["weathering"].items():
             if hasattr(model.weathering, k):
                 setattr(model.weathering, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+
+    # 10. Climate accumulators (`clim`, `clim_sub`)
     for k, v in ckpt["clim"].items():
-        setattr(model.clim, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
-    if ckpt.get("clim_sub") is not None and model.clim_sub is not None:
-        for k, v in ckpt["clim_sub"].items():
-            setattr(model.clim_sub, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+        if not isinstance(v, torch.Tensor):
+            setattr(model.clim, k, v)
+        elif needs_hremap and v.ndim >= 1 and int(v.shape[-1]) == nc_old:
+            setattr(model.clim, k, _remap_horizontal_tensor(v.cpu(), atm_h_idx, nc_old).to(device=device))
+        else:
+            setattr(model.clim, k, v.to(device=device))
+    if model.clim_sub is not None:
+        ck_cs = ckpt.get("clim_sub")
+        if ck_cs is not None:
+            for k, v in ck_cs.items():
+                if not isinstance(v, torch.Tensor):
+                    setattr(model.clim_sub, k, v)
+                elif (needs_hremap or needs_subremap) and v.ndim >= 1 and int(v.shape[-1]) == nc_old * n_sub_old:
+                    setattr(model.clim_sub, k, _remap_horizontal_tensor(v.cpu(), atm_h_idx, nc_old, n_sub_old, n_sub_new).to(device=device))
+                else:
+                    setattr(model.clim_sub, k, v.to(device=device))
+
+    # 11. Dynamic ice sheet (`icesheet`) & dynamic mesh fields
+    _STATIC_ICE_KEYS = {"z_bed", "z_bed_unloaded"}
     if ckpt.get("icesheet") is not None and model.icesheet is not None:
         for k, v in ckpt["icesheet"].items():
-            setattr(model.icesheet, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
-    if ckpt.get("mesh_dynamic") is not None:
+            if not hasattr(model.icesheet, k):
+                continue
+            if needs_hremap and k in _STATIC_ICE_KEYS:
+                continue
+            if not isinstance(v, torch.Tensor):
+                setattr(model.icesheet, k, v)
+            elif needs_hremap and v.ndim >= 1 and int(v.shape[-1]) == nc_old:
+                setattr(model.icesheet, k, _remap_horizontal_tensor(v.cpu(), atm_h_idx, nc_old).to(device=device))
+            else:
+                setattr(model.icesheet, k, v.to(device=device))
+    if ckpt.get("mesh_dynamic") is not None and not needs_hremap:
         for k, v in ckpt["mesh_dynamic"].items():
             setattr(model.mesh, k, v.to(device=device))
     return ckpt
@@ -1019,7 +1516,9 @@ def main() -> None:
                     f"{m0.get('acc_drake_sv', float('nan')):.2f}",
                 ])
     elif prev_ohc_j is None and model.ogcm is not None:
-        m_res = diagnose_ocean_spinup_metrics(model.ogcm, model.sfc, model.mesh)
+        ocn_mesh_r = model.ocn_mesh if model.ocn_mesh is not None else model.mesh
+        ocn_sfc_r = model.ocn_sfc if model.ocn_sfc is not None else model.sfc
+        m_res = diagnose_ocean_spinup_metrics(model.ogcm, ocn_sfc_r, ocn_mesh_r)
         prev_ohc_j = m_res.get("ohc_j", None)
         prev_ohc_time_sec = model.sim_time_sec
 
