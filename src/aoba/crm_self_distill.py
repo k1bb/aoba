@@ -337,7 +337,7 @@ def apply_exact_conservation_closure(
     d_temp_raw = torch.tanh(rp[0] * 0.2) * 5.0
     d_thm_raw = d_temp_raw / torch.clamp(exner, min=0.05)
     d_qn_raw = torch.tanh(rp[1] * 0.2) * 5.0e-3      # bounded [kg kg^-1] per step
-    d_qp_raw = torch.tanh(rp[2] * 0.2) * 2.0e-3
+    f_qp_logit = rp[2]
     f_cond_logit = rp[3]
     f_ice_logit = rp[4]
     d_u_raw = torch.tanh(rp[5] * 0.2) * 8.0          # bounded [m s^-1] per step
@@ -362,7 +362,10 @@ def apply_exact_conservation_closure(
     qn_base = torch.clamp(qn_post_ls, min=0.0).clone()
     qn_base[0] = torch.clamp(qn_base[0] + (evap * dt) / torch.clamp(dm[0], min=1.0e-4), min=0.0)
     qn_prov = torch.clamp(qn_base + d_qn_raw, min=0.0)
-    qp_prov = torch.clamp(qp_pre + d_qp_raw, min=0.0)
+    # Parameterize short-lived falling hydrometeors q_p directly (contractive, <= 3 g/kg ceiling,
+    # zero dry-stratosphere bias, zero additive random-walk accumulation).
+    fp_sig = torch.sigmoid(f_qp_logit - 2.5)
+    qp_prov = torch.clamp(qn_base + torch.clamp(qp_pre, min=0.0), max=6.0e-3) * (0.5 * (fp_sig * fp_sig))
 
     w_prov = (dm * (qn_prov + qp_prov)).sum(dim=0)
     w_target = torch.clamp(w_avail - p_tot_mass, min=0.0)

@@ -5532,9 +5532,9 @@ kernel void crm_distill_closure_col(
 
         float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
         float dqn_r = tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * 5.0e-3f;
-        float dqp_r = tanh(raw_prof[rp_base + 2u * nz + k] * 0.2f) * 2.0e-3f;
+        float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.5f);
         float qn_p = max(qnb + dqn_r, 0.0f);
-        float qp_p = max(qp_pre[idx] + dqp_r, 0.0f);
+        float qp_p = min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig));
         w_prov += dm * (qn_p + qp_p);
 
         float d_thm_r = (tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 5.0f) / max(ex, 0.05f);
@@ -5564,11 +5564,12 @@ kernel void crm_distill_closure_col(
         uint idx = k * N + c;
         float dm = max(rho_d[idx] * dz_c[idx], 1.0e-6f);
         float qn0 = max(qn_post_ls[idx], 0.0f);
+        float qp0 = max(qp_pre[idx], 0.0f);
         float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
         float dqn_r = tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * 5.0e-3f;
-        float dqp_r = tanh(raw_prof[rp_base + 2u * nz + k] * 0.2f) * 2.0e-3f;
+        float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.5f);
         float qn_n = zero_prov ? qnb : (max(qnb + dqn_r, 0.0f) * scale_w);
-        float qp_n = zero_prov ? qp_pre[idx] : (max(qp_pre[idx] + dqp_r, 0.0f) * scale_w);
+        float qp_n = zero_prov ? qp0 : (min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig)) * scale_w);
         w_post_check += dm * (qn_n + qp_n);
 
         float fc_sig = aoba_sigmoid(raw_prof[rp_base + 3u * nz + k] - 2.5f);

@@ -1144,10 +1144,10 @@ def _step_crm_physics_and_dynamics_impl(
     dt_sub = dt_crm / float(max(n_sub, 1))
     dz_fct = dz_c_col if dz_c_col is not None else vgrid.dzeta_c
 
-    # Group acoustic substeps into advective super-steps (<= 60 s in both 2D and 3D now that
-    # `crm_fct_flux_td` uses unconditionally stable implicit-vertical M-matrix Thomas FCT).
-    adv_group = max(1, min(n_sub, int(math.floor(60.0 / max(dt_sub, 1.0e-3)))))
-    sgs_stride = max(1, int(math.floor((120.0 if is_2d_crm else 60.0) / max(dt_sub, 1.0e-3))))
+    # Group acoustic substeps into advective super-steps (<= 60 s in 2D; 1 substep = 30 s in 3D
+    # so explicit horizontal 2D donor-cell FCT obeys C_x + C_y <= 1 even in >65 m/s polar-night jets).
+    adv_group = max(1, min(n_sub, int(math.floor(60.0 / max(dt_sub, 1.0e-3))))) if is_2d_crm else 1
+    sgs_stride = max(1, int(math.floor(120.0 / max(dt_sub, 1.0e-3)))) if is_2d_crm else 1
     use_metal_crm = can_use_crm_metal(crm.rho_d)
     if n_sub > 0:
         # Exact Galilean co-moving frame shift per column (Grabowski, 2001; Khairoutdinov et al., 2005):
