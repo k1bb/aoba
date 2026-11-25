@@ -313,7 +313,7 @@ def can_use_cuda_graph(device: torch.device | str | None) -> bool:
     if device is None:
         return False
     dev_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
-    return dev_type == "cuda" and torch.cuda.is_available() and not torch.is_grad_enabled()
+    return dev_type == "cuda" and torch.cuda.is_available()
 
 
 def run_cuda_graph_cached(
@@ -331,6 +331,8 @@ def run_cuda_graph_cached(
     Falls back transparently to eager execution if capture is unsupported for the inputs.
     """
     global _CUDA_GRAPH_POOL
+    if any(t.requires_grad for t in live_inputs):
+        return body_fn(live_inputs)
     slot = _CUDA_GRAPH_CACHE.get(key)
     if slot is not None and slot.get("failed", False):
         return body_fn(live_inputs)
@@ -348,35 +350,38 @@ def run_cuda_graph_cached(
         try:
             if _CUDA_GRAPH_POOL is None:
                 _CUDA_GRAPH_POOL = torch.cuda.graphs.graph_pool_handle()
-            static_in = [t.detach().clone() for t in live_inputs]
-            torch.cuda.synchronize()
-            cap_stream = torch.cuda.Stream()
-            cap_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(cap_stream):
-                # One stream-local warmup on cloned tensors so static_in stays pristine
-                _tmp_in = [t.clone() for t in static_in]
-                _ = body_fn(_tmp_in)
-                del _tmp_in
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g, pool=_CUDA_GRAPH_POOL):
-                    static_out = body_fn(static_in)
-            torch.cuda.current_stream().wait_stream(cap_stream)
-            slot["graph"] = g
-            slot["static_in"] = static_in
-            slot["static_out"] = static_out
-            # Capture only records the graph; replay once to produce call outputs for live_inputs
-            g.replay()
-            return [t.clone() for t in static_out] if clone_outputs else list(static_out)
-        except Exception:
+            with torch.no_grad():
+                static_in = [t.detach().clone() for t in live_inputs]
+                torch.cuda.synchronize()
+                cap_stream = torch.cuda.Stream()
+                cap_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(cap_stream):
+                    # One stream-local warmup on cloned tensors so static_in stays pristine
+                    _tmp_in = [t.clone() for t in static_in]
+                    _ = body_fn(_tmp_in)
+                    del _tmp_in
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool=_CUDA_GRAPH_POOL):
+                        static_out = body_fn(static_in)
+                torch.cuda.current_stream().wait_stream(cap_stream)
+                slot["graph"] = g
+                slot["static_in"] = static_in
+                slot["static_out"] = static_out
+                # Capture only records the graph; replay once to produce call outputs for live_inputs
+                g.replay()
+                return [t.clone() for t in static_out] if clone_outputs else list(static_out)
+        except Exception as exc:
+            print(f"[AOBA CUDA Graph] Capture fallback for {key[0]}: {type(exc).__name__}: {exc}", flush=True)
             slot["failed"] = True
             return body_fn(live_inputs)
 
     static_in = slot["static_in"]
     static_out = slot["static_out"]
-    for dst, src in zip(static_in, live_inputs):
-        dst.copy_(src)
-    slot["graph"].replay()
-    return [t.clone() for t in static_out] if clone_outputs else list(static_out)
+    with torch.no_grad():
+        for dst, src in zip(static_in, live_inputs):
+            dst.copy_(src)
+        slot["graph"].replay()
+        return [t.clone() for t in static_out] if clone_outputs else list(static_out)
 
 
 def maybe_cuda_compile(fn, *, device: torch.device | str | None = None):
