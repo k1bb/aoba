@@ -3010,7 +3010,7 @@ def step_aoba_model(
                         score_prec=stu_out.get("score_prec"),
                         rho_pre_0=rho_pre_sd[0],
                         dz_0=atmos.dz_c[0],
-                        exner_0=exner_all_sd[0],
+                        exner_0=exner_mynn_sd[0],
                         shf_tile=sfc_diag_tile["shf"],
                         evap_tile=sfc_diag_tile["evap"],
                         dthm_cp=stu_out.get("dthm_cp"),

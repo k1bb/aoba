@@ -495,10 +495,14 @@ def step_mynn_level25(
         torch.where(zeta_int < 1.0, ls_weak, ls_strong),
     )
 
-    # Boundary-layer integral scale L_T = 0.23 * int(q * z dz) / int(q dz) (Eq. 8.145)
+    # Boundary-layer integral scale L_T = 0.23 * int(q_exc * z dz) / int(q_exc dz) (Eq. 8.145)
+    # Subtract background floor q_min and restrict to the PBL envelope (z <= 4 km) so high-top
+    # stratospheric layers (z up to 65 km) do not bias L_T to its upper clamp.
     z_rel_c = z_c - z_w[0:1]
-    l_t_col = 0.23 * (q_vel * z_rel_c * dz_c).sum(dim=0) / torch.clamp((q_vel * dz_c).sum(dim=0), min=1.0e-4)
-    l_t_col = torch.clamp(l_t_col, min=20.0, max=2500.0)
+    q_min_vel = math.sqrt(2.0 * TKE_MIN)
+    q_exc = torch.clamp(q_vel - q_min_vel, min=0.0) * (z_rel_c <= 4000.0).to(q_vel.dtype)
+    l_t_col = 0.23 * (q_exc * z_rel_c * dz_c).sum(dim=0) / torch.clamp((q_exc * dz_c).sum(dim=0), min=1.0e-4)
+    l_t_col = torch.clamp(l_t_col, min=20.0, max=500.0)
     l_t = l_t_col.unsqueeze(0).expand_as(q_int)
 
     # Convective velocity scale q_c = (B_sfc^+ * L_T)^(1/3) and buoyancy scale L_B (Eqs. 8.146, 8.149)
@@ -513,7 +517,7 @@ def step_mynn_level25(
     )
 
     l_master = 1.0 / (1.0 / torch.clamp(l_surf, min=0.5) + 1.0 / l_t + inv_lb)
-    l_master = torch.clamp(l_master, min=0.5, max=1500.0)
+    l_master = torch.clamp(l_master, min=0.5, max=500.0)
 
     # Subgrid Gaussian condensation variance sigma_s & cloud fraction R (SCALE-RM Eqs. 8.122-8.126)
     dq_li = dqn_dz - b_cond * dthl_dz
@@ -564,8 +568,8 @@ def step_mynn_level25(
     s_m = torch.clamp(alpha_c * MYNN_A1 * (phi3 - 3.0 * MYNN_C1 * phi4) / denom_25, 0.0, 2.5)
     s_h = torch.clamp(alpha_c * MYNN_A2 * (phi2 + 3.0 * MYNN_C1 * phi5) / denom_25, 0.0, 3.0)
 
-    k_m_int = l_master * q_int * s_m  # Eddy viscosity at k+1/2 [m^2 s^-1]
-    k_h_int = l_master * q_int * s_h  # Eddy diffusivity at k+1/2 [m^2 s^-1]
+    k_m_int = torch.clamp(l_master * q_int * s_m, 0.0, 500.0)  # Eddy viscosity at k+1/2 [m^2 s^-1]
+    k_h_int = torch.clamp(l_master * q_int * s_h, 0.0, 500.0)  # Eddy diffusivity at k+1/2 [m^2 s^-1]
     rho_int = 0.5 * (rho_d[1:] + rho_d[:-1])
 
     # Interpolate shear production, buoyancy production, and L to full levels for q^2 update (Eq. 8.163)
@@ -583,9 +587,13 @@ def step_mynn_level25(
     l_c[1:-1] = 0.5 * (l_master[1:] + l_master[:-1])
     l_c[-1] = l_master[-1]
 
-    # Separate positive production (explicit RHS) from negative buoyancy destruction (implicit diagonal)
+    # Separate positive production (explicit RHS) from negative buoyancy destruction (implicit diagonal).
+    # Use equilibrium-consistent dissipation velocity q_diss = max(q_vel, (0.5 * B1 * L * P_+)^(1/3))
+    # so large-dt implicit updates converge monotonically to the cubic steady state (0.5*B1*L*P_+)^(2/3).
     prod_pos = torch.clamp(prod_c, min=0.0)
     buoy_sink_rate = torch.clamp(-prod_c, min=0.0) / q2
+    q_eq = torch.pow(torch.clamp(0.5 * MYNN_B1 * l_c * prod_pos, min=0.0), 1.0 / 3.0)
+    q_diss = torch.maximum(q_vel, q_eq)
 
     # Implicit batched Thomas solve for q^2 (SCALE-RM Eqs. 8.163-8.168)
     mass_c = rho_d * dz_c
@@ -595,9 +603,9 @@ def step_mynn_level25(
     du_tke = torch.zeros_like(q2)
     dl_tke[1:] = -flux_coeff_tke / mass_c[1:]
     du_tke[:-1] = -flux_coeff_tke / mass_c[:-1]
-    d_tke = 1.0 - dl_tke - du_tke + dt * (2.0 * q_vel / (MYNN_B1 * l_c) + buoy_sink_rate)
+    d_tke = 1.0 - dl_tke - du_tke + dt * (2.0 * q_diss / (MYNN_B1 * l_c) + buoy_sink_rate)
     rhs_tke = q2 + dt * prod_pos
-    qke_new = torch.clamp(solve_tridiagonal_batched(dl_tke, d_tke, du_tke, rhs_tke), min=2.0 * TKE_MIN)
+    qke_new = torch.clamp(solve_tridiagonal_batched(dl_tke, d_tke, du_tke, rhs_tke), min=2.0 * TKE_MIN, max=100.0)
 
     # Implicit batched Thomas solve for u, v, theta_l, q_n (SCALE-RM Eqs. 8.172-8.176)
     def _diffuse_implicit(field: torch.Tensor, k_diff: torch.Tensor, sfc_flux: torch.Tensor) -> torch.Tensor:

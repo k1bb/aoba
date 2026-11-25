@@ -1710,6 +1710,7 @@ kernel void crm_mynn_col(
     float pres_a[64], exn_a[64], temp_a[64], th_a[64], thl_a[64], zc_a[64], dzc_a[64], qvel_a[64];
 
     float zw0 = z_w[col_dz];
+    float q_min_vel = sqrt(2.0f * tke_min);
     float num_lt = 0.0f;
     float den_lt = 0.0f;
     for (uint k = 0u; k < nz; ++k) {
@@ -1733,8 +1734,12 @@ kernel void crm_mynn_col(
 
         float zc = z_c[dz_idx];
         float dzc = dz_c[dz_idx];
-        num_lt += qvel * (zc - zw0) * dzc;
-        den_lt += qvel * dzc;
+        float zrel = zc - zw0;
+        if (zrel <= 4000.0f) {
+            float q_exc = max(qvel - q_min_vel, 0.0f);
+            num_lt += q_exc * zrel * dzc;
+            den_lt += q_exc * dzc;
+        }
 
         rd_a[k] = rd;
         u_a[k] = u_in[idx];
@@ -1754,7 +1759,7 @@ kernel void crm_mynn_col(
         qvel_a[k] = qvel;
     }
 
-    float l_t_col = clamp(0.23f * num_lt / max(den_lt, 1.0e-4f), 20.0f, 2500.0f);
+    float l_t_col = clamp(0.23f * num_lt / max(den_lt, 1.0e-4f), 20.0f, 500.0f);
     float us_safe = max(u_star, 0.02f);
     float b_sfc_nz = (fabs(sfc_buoy) < 1.0e-9f) ? 1.0e-9f : sfc_buoy;
     float l_mo = -(us_safe * us_safe * us_safe) / (kappa_vk * b_sfc_nz);
@@ -1817,7 +1822,7 @@ kernel void crm_mynn_col(
             inv_lb = 1.0f / max(lb, 1.0f);
         }
 
-        float l_master = clamp(1.0f / (1.0f / max(l_surf, 0.5f) + 1.0f / l_t_col + inv_lb), 0.5f, 1500.0f);
+        float l_master = clamp(1.0f / (1.0f / max(l_surf, 0.5f) + 1.0f / l_t_col + inv_lb), 0.5f, 500.0f);
         if (k == 0u) l_c[0] = l_master;
         if (k > 0u)  l_c[k] = 0.5f * (l_c[k] + l_master);
         if (k + 1u < n_int) l_c[k + 1u] = l_master;
@@ -1857,8 +1862,8 @@ kernel void crm_mynn_col(
         float s_m = clamp(alpha_c * A1 * (phi3 - 3.0f * C1 * phi4) / denom25, 0.0f, 2.5f);
         float s_h = clamp(alpha_c * A2 * (phi2 + 3.0f * C1 * phi5) / denom25, 0.0f, 3.0f);
 
-        float km = l_master * q_int * s_m;
-        float kh = l_master * q_int * s_h;
+        float km = clamp(l_master * q_int * s_m, 0.0f, 500.0f);
+        float kh = clamp(l_master * q_int * s_h, 0.0f, 500.0f);
         km_a[k] = km;
         kh_a[k] = kh;
         km_out[k * M + m] = km;
@@ -1888,11 +1893,13 @@ kernel void crm_mynn_col(
     for (uint k = 0u; k < nz; ++k) {
         float prod_pos = max(prod_c[k], 0.0f);
         float buoy_sink = max(-prod_c[k], 0.0f) / q2_a[k];
-        diag_t[k] = 1.0f - dl_t[k] - du_t[k] + dt * (2.0f * qvel_a[k] / (B1 * l_c[k]) + buoy_sink);
+        float q_eq = pow(max(0.5f * B1 * l_c[k] * prod_pos, 0.0f), 1.0f / 3.0f);
+        float q_diss = max(qvel_a[k], q_eq);
+        diag_t[k] = 1.0f - dl_t[k] - du_t[k] + dt * (2.0f * q_diss / (B1 * l_c[k]) + buoy_sink);
         rhs_t[k] = q2_a[k] + dt * prod_pos;
     }
     mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, sol_a);
-    for (uint k = 0u; k < nz; ++k) qke_out[k * M + m] = max(sol_a[k], 2.0f * tke_min);
+    for (uint k = 0u; k < nz; ++k) qke_out[k * M + m] = clamp(sol_a[k], 2.0f * tke_min, 100.0f);
 
     for (uint k = 0u; k < n_int; ++k) {
         float fcm = dt * rho_int_a[k] * km_a[k] / dzint_a[k];

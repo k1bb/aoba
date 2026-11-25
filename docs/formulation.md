@@ -752,27 +752,28 @@ $$
 
 ### 6.3 Implicit MYNN Level 2.5 PBL Closure (`step_mynn_level25`)
 
-Implements Nakanishi & Niino (2009) and SCALE-RM v5.5.5 (Sec. 8.2.1, Eqs. 8.96–8.176) with closure constants $B_1 = 24.0, B_2 = 15.0, C_2 = 0.75, C_3 = 0.352, C_5 = 0.20, \gamma_1 = 0.235, \mathrm{Pr}_N = 0.74$ (derived $A_1 = 1.180, A_2 = 0.6645, C_1 = 0.1371, \gamma_2 = 0.5525, R_{f1} = 0.3737, R_{f2} = 0.3131, R_{fc} = 0.2984$). Liquid–ice potential temperature $\theta_l$ serves as the conserved thermodynamic variable, and the master mixing length $L$ harmonically combines surface-layer ($L_S$), turbulent integral ($L_T$), and buoyancy ($L_B$) length scales:
+Implements Nakanishi & Niino (2009) and SCALE-RM v5.5.5 (Sec. 8.2.1, Eqs. 8.96–8.176) with closure constants $B_1 = 24.0, B_2 = 15.0, C_2 = 0.75, C_3 = 0.352, C_5 = 0.20, \gamma_1 = 0.235, \mathrm{Pr}_N = 0.74$ (derived $A_1 = 1.180, A_2 = 0.6645, C_1 = 0.1371, \gamma_2 = 0.5525, R_{f1} = 0.3737, R_{f2} = 0.3131, R_{fc} = 0.2984$). Liquid–ice potential temperature $\theta_l$ serves as the conserved thermodynamic variable. The turbulent integral scale $L_T$ weights excess turbulent velocity $q_{\mathrm{exc}} = \max(q - \sqrt{2\,\mathrm{TKE}_{\min}}, 0)$ over the boundary-layer depth envelope ($z_{\mathrm{rel}} \le 4\ \mathrm{km}$, bounded to $[20, 500]\ \mathrm{m}$), and the master mixing length $L$ (bounded to $[0.5, 500]\ \mathrm{m}$) harmonically combines surface-layer ($L_S$), integral ($L_T$), and buoyancy ($L_B$) length scales:
 
 $$
 \begin{aligned}
 \theta_l &= \theta - \frac{L_{v0} q_c + L_{s0} q_i}{c_{pd}\Pi}, \\
+L_T &= 0.23\,\frac{\int_{0}^{4\ \mathrm{km}} q_{\mathrm{exc}}\,z_{\mathrm{rel}}\,dz}{\int_{0}^{4\ \mathrm{km}} q_{\mathrm{exc}}\,dz}, \\
 L &= \big(L_S^{-1} + L_T^{-1} + L_B^{-1}\big)^{-1}
 \end{aligned} \tag{6.7}
 $$
 
-A Gaussian subgrid partial-condensation closure ($\sigma_s$, normalized supersaturation $Q_1$, cloud fraction $R$, effective cloud fraction $\tilde{R}$) evaluates moist buoyancy frequency $N^2$, while Level-2 equilibrium $q_2^2$ and ratio $\alpha_c$ determine Level-2.5 stability functions $(S_M, S_H)$ and eddy diffusivities $(K_M, K_H)$:
+A Gaussian subgrid partial-condensation closure ($\sigma_s$, normalized supersaturation $Q_1$, cloud fraction $R$, effective cloud fraction $\tilde{R}$) evaluates moist buoyancy frequency $N^2$, while Level-2 equilibrium $q_2^2$ and ratio $\alpha_c$ determine Level-2.5 stability functions $(S_M, S_H)$ and eddy diffusivities $(K_M, K_H)$ (realizability-bounded to $[0, 500]\ \mathrm{m^2\ s^{-1}}$):
 
 $$
 \begin{aligned}
 \sigma_s &= \frac{1}{2}\,a L\sqrt{\frac{B_2}{2}}\left|\frac{\partial q_n}{\partial z} - b\frac{\partial \theta_l}{\partial z}\right|, \qquad Q_1 = \frac{a(q_n - q_{sl})}{2\sigma_s}, \\
 N^2 &= \frac{g}{\theta}\left(\beta_\theta\frac{\partial \theta_l}{\partial z} + \beta_q\frac{\partial q_n}{\partial z}\right), \\
 q_2^2 &= B_1 L^2 S_{M2}(1 - R_f) S^2, \qquad \alpha_c = \min\!\left(\frac{q}{q_2},\ 1\right), \\
-K_M &= L q S_M, \qquad K_H = L q S_H
+K_M &= \min(L q S_M,\ 500), \qquad K_H = \min(L q S_H,\ 500)
 \end{aligned} \tag{6.8}
 $$
 
-Twice turbulent kinetic energy ($q^2 = 2e$) advances with explicit positive production and implicit tridiagonal Thomas diffusion ($3 K_M$), negative buoyancy sink, and viscous dissipation $2q/(B_1 L)$:
+Twice turbulent kinetic energy ($q^2 = 2e$, bounded to $[2\,\mathrm{TKE}_{\min}, 100]\ \mathrm{m^2\ s^{-2}}$) advances with explicit positive production $P_+ = \max(P, 0)$ and implicit tridiagonal Thomas diffusion ($3 K_M$), negative buoyancy sink, and equilibrium-consistent viscous dissipation $2 q_{\mathrm{diss}}/(B_1 L)$ where $q_{\mathrm{diss}} = \max\!\big(q,\ (B_1 L P_+ / 2)^{1/3}\big)$ guarantees monotonic convergence to the local cubic balance at large host time steps:
 
 $$
 \frac{\partial q^2}{\partial t} = 2\left(K_M S^2 - K_H N^2\right) + \frac{1}{\rho_d}\frac{\partial}{\partial z}\left(3\rho_d K_M \frac{\partial q^2}{\partial z}\right) - \frac{2 q^3}{B_1 L} \tag{6.9}

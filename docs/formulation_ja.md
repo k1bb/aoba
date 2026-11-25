@@ -752,27 +752,28 @@ $$
 
 ### 6.3 陰的 MYNN Level 2.5 PBL クロージャ (`step_mynn_level25`)
 
-Nakanishi & Niino (2009) および SCALE-RM v5.5.5（Sec. 8.2.1, Eqs. 8.96–8.176）に準拠し、基礎定数 $B_1 = 24.0, B_2 = 15.0, C_2 = 0.75, C_3 = 0.352, C_5 = 0.20, \gamma_1 = 0.235, \mathrm{Pr}_N = 0.74$（導出定数 $A_1 = 1.180, A_2 = 0.6645, C_1 = 0.1371, \gamma_2 = 0.5525, R_{f1} = 0.3737, R_{f2} = 0.3131, R_{fc} = 0.2984$）を用いる。保存変数として液氷温位 $\theta_l$ をとり、接地層スケール $L_S$・乱流積分長 $L_T$・浮力長 $L_B$ の調和平均からマスター混合距離 $L$ を決定する：
+Nakanishi & Niino (2009) および SCALE-RM v5.5.5（Sec. 8.2.1, Eqs. 8.96–8.176）に準拠し、基礎定数 $B_1 = 24.0, B_2 = 15.0, C_2 = 0.75, C_3 = 0.352, C_5 = 0.20, \gamma_1 = 0.235, \mathrm{Pr}_N = 0.74$（導出定数 $A_1 = 1.180, A_2 = 0.6645, C_1 = 0.1371, \gamma_2 = 0.5525, R_{f1} = 0.3737, R_{f2} = 0.3131, R_{fc} = 0.2984$）を用いる。保存変数として液氷温位 $\theta_l$ をとり、乱流積分長 $L_T$ は境界層高度包絡内（$z_{\mathrm{rel}} \le 4\ \mathrm{km}$）の超過乱流速度 $q_{\mathrm{exc}} = \max(q - \sqrt{2\,\mathrm{TKE}_{\min}}, 0)$ で重み付けして $[20, 500]\ \mathrm{m}$ に有界化する。接地層スケール $L_S$・乱流積分長 $L_T$・浮力長 $L_B$ の調和平均からマスター混合距離 $L$（$[0.5, 500]\ \mathrm{m}$）を決定する：
 
 $$
 \begin{aligned}
 \theta_l &= \theta - \frac{L_{v0} q_c + L_{s0} q_i}{c_{pd}\Pi}, \\
+L_T &= 0.23\,\frac{\int_{0}^{4\ \mathrm{km}} q_{\mathrm{exc}}\,z_{\mathrm{rel}}\,dz}{\int_{0}^{4\ \mathrm{km}} q_{\mathrm{exc}}\,dz}, \\
 L &= \big(L_S^{-1} + L_T^{-1} + L_B^{-1}\big)^{-1}
 \end{aligned} \tag{6.7}
 $$
 
-さらにサブグリッドガウス部分凝結スキーム（標準偏差 $\sigma_s$、規格化過飽和度 $Q_1$、部分雲量 $R$、有効雲量 $\tilde{R}$）により湿潤浮力振動数 $N^2$ を評価し、Level-2 平衡強度 $q_2^2$ との比 $\alpha_c$ から Level-2.5 安定度関数 $(S_M, S_H)$ および渦拡散係数 $(K_M, K_H)$ を求める：
+さらにサブグリッドガウス部分凝結スキーム（標準偏差 $\sigma_s$、規格化過飽和度 $Q_1$、部分雲量 $R$、有効雲量 $\tilde{R}$）により湿潤浮力振動数 $N^2$ を評価し、Level-2 平衡強度 $q_2^2$ との比 $\alpha_c$ から Level-2.5 安定度関数 $(S_M, S_H)$ および渦拡散係数 $(K_M, K_H)$（$[0, 500]\ \mathrm{m^2\ s^{-1}}$ に有界化）を求める：
 
 $$
 \begin{aligned}
 \sigma_s &= \frac{1}{2}\,a L\sqrt{\frac{B_2}{2}}\left|\frac{\partial q_n}{\partial z} - b\frac{\partial \theta_l}{\partial z}\right|, \qquad Q_1 = \frac{a(q_n - q_{sl})}{2\sigma_s}, \\
 N^2 &= \frac{g}{\theta}\left(\beta_\theta\frac{\partial \theta_l}{\partial z} + \beta_q\frac{\partial q_n}{\partial z}\right), \\
 q_2^2 &= B_1 L^2 S_{M2}(1 - R_f) S^2, \qquad \alpha_c = \min\!\left(\frac{q}{q_2},\ 1\right), \\
-K_M &= L q S_M, \qquad K_H = L q S_H
+K_M &= \min(L q S_M,\ 500), \qquad K_H = \min(L q S_H,\ 500)
 \end{aligned} \tag{6.8}
 $$
 
-乱流運動エネルギーの 2 倍量 $q^2 = 2e$ の時間発展は、正の生成項を陽的に、負の浮力減衰および粘性散逸 $2q/(B_1 L)$ と鉛直拡散（拡散係数 $3 K_M$）を陰的三重対角 Thomas ソルバで積分する：
+乱流運動エネルギーの 2 倍量 $q^2 = 2e$（$[2\,\mathrm{TKE}_{\min}, 100]\ \mathrm{m^2\ s^{-2}}$）の時間発展は、正の生成項 $P_+ = \max(P, 0)$ を陽的に、負の浮力減衰・鉛直拡散（拡散係数 $3 K_M$）・平衡整合型粘性散逸 $2 q_{\mathrm{diss}}/(B_1 L)$（$q_{\mathrm{diss}} = \max\!\big(q,\ (B_1 L P_+ / 2)^{1/3}\big)$）を陰的三重対角 Thomas ソルバで積分し、親格子時間刻みでも局所 3 次平衡へ単調収束させる：
 
 $$
 \frac{\partial q^2}{\partial t} = 2\left(K_M S^2 - K_H N^2\right) + \frac{1}{\rho_d}\frac{\partial}{\partial z}\left(3\rho_d K_M \frac{\partial q^2}{\partial z}\right) - \frac{2 q^3}{B_1 L} \tag{6.9}
