@@ -2739,13 +2739,13 @@ kernel void ogcm_bt_vel_edge(
     device float* u_out             [[buffer(8)]],  // [ne]
     device float* flux_out          [[buffer(9)]],  // [ne]
     constant ulong& ne_u            [[buffer(10)]],
-    constant float& rk_dt           [[buffer(11)]],
+    constant float4& f_dt           [[buffer(11)]],  // [rk_dt, 1 / (1 + rk_dt * r_bt_pert), 0, 0]
     uint e                          [[thread_position_in_grid]])
 {
     if (e >= uint(ne_u)) return;
     float m = ocn_e0f[e];
     float pgf = g_inv_dc[e] * (eta_bt[uint(c1[e])] - eta_bt[uint(c0[e])]);
-    float u_st = clamp((u0_bt[e] + rk_dt * (pgf + f_baro[e])) * m, -2.5f, 2.5f);
+    float u_st = clamp(((u0_bt[e] + f_dt.x * (pgf + f_baro[e])) * f_dt.y) * m, -2.5f, 2.5f);
     u_out[e] = u_st;
     flux_out[e] = h_col_e[e] * u_st;
 }
@@ -6749,19 +6749,24 @@ def run_ogcm_barotropic_rk3_metal(
     dw = div_w.contiguous()
     u_cell_dim = [nc, max_eoc, 0, 0]
 
+    dt_total = max(float(n_bt) * float(dt_bt), 1.0)
+    r_bt_pert = 1.0 / dt_total
     dt1 = float(dt_bt) / 3.0
     dt2 = 0.5 * float(dt_bt)
     dt3 = float(dt_bt)
+    p_dt1 = [dt1, 1.0 / (1.0 + dt1 * r_bt_pert), 0.0, 0.0]
+    p_dt2 = [dt2, 1.0 / (1.0 + dt2 * r_bt_pert), 0.0, 0.0]
+    p_dt3 = [dt3, 1.0 / (1.0 + dt3 * r_bt_pert), 0.0, 0.0]
 
     for _ in range(n_bt):
         # Stage 1: (u_bt, eta_bt) -> (u_st, eta_st)
-        lib.ogcm_bt_vel_edge(u_bt, eta_bt, f_b, g_i, hc_e, oe, c0_i32, c1_i32, u_st, flux_bt, ne, dt1, threads=ne)
+        lib.ogcm_bt_vel_edge(u_bt, eta_bt, f_b, g_i, hc_e, oe, c0_i32, c1_i32, u_st, flux_bt, ne, p_dt1, threads=ne)
         lib.ogcm_bt_eta_cell(eta_bt, flux_bt, io, eoc_i32, dw, eta_st, u_cell_dim, dt1, threads=nc)
         # Stage 2: (u_bt, eta_st) -> (u_st, eta_st)
-        lib.ogcm_bt_vel_edge(u_bt, eta_st, f_b, g_i, hc_e, oe, c0_i32, c1_i32, u_st, flux_bt, ne, dt2, threads=ne)
+        lib.ogcm_bt_vel_edge(u_bt, eta_st, f_b, g_i, hc_e, oe, c0_i32, c1_i32, u_st, flux_bt, ne, p_dt2, threads=ne)
         lib.ogcm_bt_eta_cell(eta_bt, flux_bt, io, eoc_i32, dw, eta_st, u_cell_dim, dt2, threads=nc)
         # Stage 3: (u_bt, eta_st) -> (u_st, eta_st), then commit to (u_bt, eta_bt)
-        lib.ogcm_bt_vel_edge(u_bt, eta_st, f_b, g_i, hc_e, oe, c0_i32, c1_i32, u_st, flux_bt, ne, dt3, threads=ne)
+        lib.ogcm_bt_vel_edge(u_bt, eta_st, f_b, g_i, hc_e, oe, c0_i32, c1_i32, u_st, flux_bt, ne, p_dt3, threads=ne)
         lib.ogcm_bt_eta_cell(eta_bt, flux_bt, io, eoc_i32, dw, eta_st, u_cell_dim, dt3, threads=nc)
         u_bt.copy_(u_st)
         eta_bt.copy_(eta_st)

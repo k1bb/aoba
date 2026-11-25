@@ -830,8 +830,11 @@ def _ogcm_barotropic_rk3_core(
     """Pure-tensor barotropic mode projection + 2D Wicker-Skamarock RK3 loop (CUDA-compilable)."""
     u_star = u_star_raw * wet_ef
     u_star_baro = (u_star * h_e).sum(dim=0) / h_col_e_safe * ocn_e0f
-    # Exact depth-averaged slow tendency from u_prev -> u_star (Ringler et al., 2013, Ocean Modelling, 69)
-    f_baro = (u_star_baro - u_prev_baro) / max(dt, 1.0)
+    # Depth-averaged slow tendency plus implicit fast-fluctuation damping `-r_pert*(u_stage - u_prev_baro)`
+    # with `r_pert = 1/dt` (eliminates split-explicit boxcar-averaging resonance at w*dt ~ 3.5 while
+    # introducing identically zero drag on steady geostrophic currents; Shchepetkin & McWilliams, 2005).
+    r_bt_pert = 1.0 / max(dt, 1.0)
+    f_baro = (u_star_baro - u_prev_baro) / max(dt, 1.0) + r_bt_pert * u_prev_baro
     u_bt = u_baro_prev * ocn_e0f
     eta_bt = eta_old
     u_bt_acc = torch.zeros_like(u_bt)
@@ -842,8 +845,9 @@ def _ogcm_barotropic_rk3_core(
         u0_bt = u_bt
         eta0_bt = eta_bt
         for rk_dt in (dt1, dt2, dt3):
+            inv_damp = 1.0 / (1.0 + rk_dt * r_bt_pert)
             pgf_bt = g_inv_dc * (eta_bt[c1] - eta_bt[c0])
-            u_stage = torch.clamp((u0_bt + rk_dt * (pgf_bt + f_baro)) * ocn_e0f, -2.5, 2.5)
+            u_stage = torch.clamp(((u0_bt + rk_dt * (pgf_bt + f_baro)) * inv_damp) * ocn_e0f, -2.5, 2.5)
             flux_bt = h_col_e * u_stage
             deta = -(flux_bt[eoc] * div_w).sum(dim=-1) * is_ocn_f
             eta_bt = torch.clamp((eta0_bt + rk_dt * deta) * is_ocn_f, -5.0, 5.0)
@@ -1917,7 +1921,8 @@ def _step_ogcm_voronoi_impl(
             eoc_i32 = cache["eoc_i32"]
         u_star = u_star_raw * wet_ef
         u_star_baro = (u_star * h_e).sum(dim=0) / h_col_e_safe * ocn_e0f
-        f_baro = (u_star_baro - u_prev_baro) / max(dt, 1.0)
+        r_bt_pert = 1.0 / max(dt, 1.0)
+        f_baro = (u_star_baro - u_prev_baro) / max(dt, 1.0) + r_bt_pert * u_prev_baro
         u_bt, u_bt_mean = dispatch_ogcm_barotropic_rk3_metal(
             u_bt_init=ogcm.u_baro * ocn_e0f,
             eta_init=eta_old,
