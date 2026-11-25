@@ -5510,7 +5510,7 @@ kernel void crm_distill_closure_col(
     uint plane = nz * N;
 
     // Pass 1: column integrals for water, enthalpy, momentum
-    float dm_sum = 0.0f;
+    float dm_sum_m = 0.0f;
     float w_pre = 0.0f;
     float w_prov = 0.0f;
     float dh_raw = 0.0f;
@@ -5525,35 +5525,37 @@ kernel void crm_distill_closure_col(
         uint idx = k * N + c;
         float dm = max(rho_d[idx] * dz_c[idx], 1.0e-6f);
         float ex = exner[idx];
+        float s_lin = clamp((ex - 0.42f) / 0.15f, 0.0f, 1.0f);
+        float s_conv = s_lin * s_lin;
         float qn0 = max(qn_post_ls[idx], 0.0f);
         float qp0 = max(qp_pre[idx], 0.0f);
-        dm_sum += dm;
+        dm_sum_m += dm * s_conv;
         w_pre += dm * (qn0 + qp0);
 
         float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
-        float dqn_r = tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * 5.0e-3f;
+        float dqn_r = s_conv * tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * 5.0e-3f;
         float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.5f);
         float qn_p = max(qnb + dqn_r, 0.0f);
-        float qp_p = min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig));
+        float qp_p = s_conv * min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig));
         w_prov += dm * (qn_p + qp_p);
 
-        float d_thm_r = (tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 5.0f) / max(ex, 0.05f);
+        float d_thm_r = (s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 5.0f) / max(ex, 0.05f);
         dh_raw += cp_d * dm * ex * d_thm_r;
-        denom_h += cp_d * dm * ex * ex;
+        denom_h += cp_d * dm * ex * ex * s_conv;
 
-        float du_r = tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 8.0f;
-        float dv_r = tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 8.0f;
+        float du_r = s_conv * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 8.0f;
+        float dv_r = s_conv * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 8.0f;
         du_imp += dm * du_r;
         dv_imp += dm * dv_r;
     }
 
-    float dm_sum_safe = max(dm_sum, 1.0e-3f);
+    float dm_sum_safe = max(dm_sum_m, 1.0e-3f);
     float w_avail = max(w_pre + evap * dt, 1.0e-8f);
     float p_frac = 0.35f * aoba_sigmoid(raw_scal[rs_base + 0u] - 4.0f);
     float p_tot_mass = (w_avail > 0.05f) ? max(p_frac * w_avail, 0.0f) : 0.0f;
     float w_target = max(w_avail - p_tot_mass, 0.0f);
-    bool zero_prov = (w_prov <= 1.0e-10f);
-    float scale_w = w_target / max(w_prov, 1.0e-10f);
+    bool zero_prov = (w_prov <= 1.0e-5f);
+    float scale_w = clamp(w_target / max(w_prov, 1.0e-5f), 0.0f, 50.0f);
 
     // Pass 2: compute exact rescaled water, condensate partition, and latent-heat integrals
     float w_post_check = 0.0f;
@@ -5563,17 +5565,20 @@ kernel void crm_distill_closure_col(
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * N + c;
         float dm = max(rho_d[idx] * dz_c[idx], 1.0e-6f);
+        float ex = exner[idx];
+        float s_lin = clamp((ex - 0.42f) / 0.15f, 0.0f, 1.0f);
+        float s_conv = s_lin * s_lin;
         float qn0 = max(qn_post_ls[idx], 0.0f);
         float qp0 = max(qp_pre[idx], 0.0f);
         float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
-        float dqn_r = tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * 5.0e-3f;
+        float dqn_r = s_conv * tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * 5.0e-3f;
         float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.5f);
         float qn_n = zero_prov ? qnb : (max(qnb + dqn_r, 0.0f) * scale_w);
-        float qp_n = zero_prov ? qp0 : (min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig)) * scale_w);
+        float qp_n = zero_prov ? qp0 : (s_conv * min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig)) * scale_w);
         w_post_check += dm * (qn_n + qp_n);
 
         float fc_sig = aoba_sigmoid(raw_prof[rp_base + 3u * nz + k] - 2.5f);
-        float f_cond = 0.95f * (fc_sig * fc_sig);
+        float f_cond = s_conv * 0.95f * (fc_sig * fc_sig);
         float f_ice = aoba_sigmoid(raw_prof[rp_base + 4u * nz + k]);
         float q_cond = qn_n * f_cond;
         float qc_n = q_cond * (1.0f - f_ice);
@@ -5588,7 +5593,7 @@ kernel void crm_distill_closure_col(
         out_prof[3u * plane + idx] = qv_n;
         out_prof[4u * plane + idx] = qc_n;
         out_prof[5u * plane + idx] = qi_n;
-        out_prof[8u * plane + idx] = aoba_sigmoid(raw_prof[rp_base + 7u * nz + k] - 1.0f);
+        out_prof[8u * plane + idx] = s_conv * aoba_sigmoid(raw_prof[rp_base + 7u * nz + k] - 1.0f);
     }
 
     float p_tot_fin = max(w_avail - w_post_check, 0.0f);
@@ -5606,12 +5611,14 @@ kernel void crm_distill_closure_col(
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * N + c;
         float ex = exner[idx];
-        float d_thm_r = (tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 5.0f) / max(ex, 0.05f);
-        float du_r = tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 8.0f;
-        float dv_r = tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 8.0f;
-        out_prof[idx]              = clamp(thm_post_ls[idx] + d_thm_r + h_corr * ex, 150.0f, 10000.0f);
-        out_prof[6u * plane + idx] = u_pre[idx] + du_r + u_corr;
-        out_prof[7u * plane + idx] = v_pre[idx] + dv_r + v_corr;
+        float s_lin = clamp((ex - 0.42f) / 0.15f, 0.0f, 1.0f);
+        float s_conv = s_lin * s_lin;
+        float d_thm_r = (s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 5.0f) / max(ex, 0.05f);
+        float du_r = s_conv * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 8.0f;
+        float dv_r = s_conv * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 8.0f;
+        out_prof[idx]              = clamp(thm_post_ls[idx] + d_thm_r + h_corr * ex * s_conv, 150.0f, 10000.0f);
+        out_prof[6u * plane + idx] = u_pre[idx] + du_r + u_corr * s_conv;
+        out_prof[7u * plane + idx] = v_pre[idx] + dv_r + v_corr * s_conv;
     }
 }
 

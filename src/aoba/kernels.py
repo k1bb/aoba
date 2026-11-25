@@ -317,7 +317,8 @@ kernel void crm_fast_hevi_col(
             float thm_kp = Thm_cur[idx_p] / max(rho_cur[idx_p], 1.0e-5f);
             float sgn_up = (w_up > 0.0f) ? 1.0f : ((w_up < 0.0f) ? -1.0f : 0.0f);
             float dz_wu = dz_w_int[k * dz_cols + col_dz];
-            float beta_up = min(1.0f, 0.25f + 1.5f * fabs(w_up) * (dt_ac / max(dz_wu, 1.0f)));
+            float cfl_up = fabs(w_up) * (dt_ac / max(dz_wu, 1.0f));
+            float beta_up = min(1.0f, max(0.0f, (cfl_up - 0.25f) * 4.0f));
             thm_w_above = 0.5f * (thm_k + thm_kp) - 0.5f * beta_up * sgn_up * (thm_kp - thm_k);
         }
 

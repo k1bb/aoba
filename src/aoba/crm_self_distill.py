@@ -333,20 +333,26 @@ def apply_exact_conservation_closure(
 
     # Convert [N, 8, nz] -> [nz, N] per field (contiguous for MPS backward kernels)
     rp = raw_prof.permute(1, 2, 0).contiguous()  # [8, nz, N]
+    # Universal thermodynamic convective envelope s_conv(exner) in [0, 1]:
+    # 1.0 throughout the troposphere (p >= 140 hPa, exner >= 0.57), tapering smoothly via C^1 quadratic
+    # ramp to 0.0 above 50 hPa (exner <= 0.42) so the stratospheric/mesospheric column obeys pure host
+    # dynamics + radiation + O3 + GWD with zero neural-network temperature, moisture, or wind drift.
+    s_lin = torch.clamp((exner - 0.42) / 0.15, min=0.0, max=1.0)
+    s_conv = s_lin * s_lin
     # Predict bounded temperature residual dT [K] -> d_theta_m = dT / exner so troposphere & stratosphere share O(1 K) scale
-    d_temp_raw = torch.tanh(rp[0] * 0.2) * 5.0
+    d_temp_raw = s_conv * torch.tanh(rp[0] * 0.2) * 5.0
     d_thm_raw = d_temp_raw / torch.clamp(exner, min=0.05)
-    d_qn_raw = torch.tanh(rp[1] * 0.2) * 5.0e-3      # bounded [kg kg^-1] per step
+    d_qn_raw = s_conv * torch.tanh(rp[1] * 0.2) * 5.0e-3      # bounded [kg kg^-1] per step
     f_qp_logit = rp[2]
     f_cond_logit = rp[3]
     f_ice_logit = rp[4]
-    d_u_raw = torch.tanh(rp[5] * 0.2) * 8.0          # bounded [m s^-1] per step
-    d_v_raw = torch.tanh(rp[6] * 0.2) * 8.0
-    f_cld_pred = torch.sigmoid(rp[7] - 1.0)          # subgrid cloud area fraction in (0, 1)
+    d_u_raw = s_conv * torch.tanh(rp[5] * 0.2) * 8.0          # bounded [m s^-1] per step
+    d_v_raw = s_conv * torch.tanh(rp[6] * 0.2) * 8.0
+    f_cld_pred = s_conv * torch.sigmoid(rp[7] - 1.0)          # subgrid cloud area fraction in (0, 1)
     f_prec_pred = torch.sigmoid(raw_scal[:, 2] - 1.0)  # subgrid precipitating area fraction in (0, 1)
 
     dm = torch.clamp(rho_d * dz_c, min=1.0e-6)       # [nz, N] kg m^-2
-    dm_sum = torch.clamp(dm.sum(dim=0), min=1.0e-3)  # [N]
+    dm_sum_m = torch.clamp((dm * s_conv).sum(dim=0), min=1.0e-3)  # [N]
 
     # --- 1. Exact Total Column Water Mass Conservation ---
     w_pre = (dm * (torch.clamp(qn_post_ls, min=0.0) + torch.clamp(qp_pre, min=0.0))).sum(dim=0)
@@ -365,7 +371,7 @@ def apply_exact_conservation_closure(
     # Parameterize short-lived falling hydrometeors q_p directly (contractive, <= 3 g/kg ceiling,
     # zero dry-stratosphere bias, zero additive random-walk accumulation).
     fp_sig = torch.sigmoid(f_qp_logit - 2.5)
-    qp_prov = torch.clamp(qn_base + torch.clamp(qp_pre, min=0.0), max=6.0e-3) * (0.5 * (fp_sig * fp_sig))
+    qp_prov = s_conv * torch.clamp(qn_base + torch.clamp(qp_pre, min=0.0), max=6.0e-3) * (0.5 * (fp_sig * fp_sig))
 
     w_prov = (dm * (qn_prov + qp_prov)).sum(dim=0)
     w_target = torch.clamp(w_avail - p_tot_mass, min=0.0)
@@ -392,7 +398,7 @@ def apply_exact_conservation_closure(
     # Smooth squared-sigmoid activation eliminates clear-sky thin-cloud bias (~2e-6 for logit < -4)
     # while preserving strictly non-zero gradients everywhere (avoiding dead-ReLU collapse during clear spinup).
     fc_sig = torch.sigmoid(f_cond_logit - 2.5)
-    f_cond = 0.95 * (fc_sig * fc_sig)
+    f_cond = s_conv * 0.95 * (fc_sig * fc_sig)
     f_ice = torch.sigmoid(f_ice_logit)
     q_cond = qn_new * f_cond
     qc_new = q_cond * (1.0 - f_ice)
@@ -409,15 +415,15 @@ def apply_exact_conservation_closure(
         + C.L_F0 * (p_tot_mass * f_snow + d_m_ice)
     )
     dh_raw = C.CP_D * (dm * exner * d_thm_raw).sum(dim=0)
-    denom_h = torch.clamp(C.CP_D * (dm * exner * exner).sum(dim=0), min=1.0)
-    d_thm_cons = d_thm_raw + ((dh_exact - dh_raw) / denom_h).unsqueeze(0) * exner
+    denom_h = torch.clamp(C.CP_D * (dm * exner * exner * s_conv).sum(dim=0), min=1.0)
+    d_thm_cons = d_thm_raw + ((dh_exact - dh_raw) / denom_h).unsqueeze(0) * (exner * s_conv)
     thm_new = torch.clamp(thm_post_ls + d_thm_cons, min=150.0, max=10000.0)
 
     # --- 3. Exact Column Horizontal Momentum Conservation ---
     du_imp_raw = (dm * d_u_raw).sum(dim=0)
     dv_imp_raw = (dm * d_v_raw).sum(dim=0)
-    du_cons = d_u_raw + ((tau_x * dt - du_imp_raw) / dm_sum).unsqueeze(0)
-    dv_cons = d_v_raw + ((tau_y * dt - dv_imp_raw) / dm_sum).unsqueeze(0)
+    du_cons = d_u_raw + ((tau_x * dt - du_imp_raw) / dm_sum_m).unsqueeze(0) * s_conv
+    dv_cons = d_v_raw + ((tau_y * dt - dv_imp_raw) / dm_sum_m).unsqueeze(0) * s_conv
     u_new = u_pre + du_cons
     v_new = v_pre + dv_cons
 
@@ -1273,7 +1279,7 @@ def _compute_distill_loss(
     w_prof = _cached_loss_weights(
         "crm_prof", (2.0, 2.5, 0.8, 1.5, 1.5, 0.5, 0.5, 1.8), (8, 1, 1), tp.device, tp.dtype
     )
-    l_prof = (F.smooth_l1_loss(prof_p2, prof_t2, reduction="none") * w_prof).mean(dim=(1, 2)).sum()
+    l_prof = (F.smooth_l1_loss(prof_p2, prof_t2, beta=0.15, reduction="none") * w_prof).mean(dim=(1, 2)).sum()
 
     scal_t = torch.stack(
         [

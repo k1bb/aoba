@@ -601,7 +601,11 @@ def _crm_fast_acoustic_hevi_torch(
         fz_old[1:-1] = rho_dw * w_k[1:-1]
         thm_live = Thm_k / torch.clamp(rho_k, min=1.0e-5)
         w_int_live = w_k[1:-1]
-        beta_th = torch.clamp(0.25 + 1.5 * torch.abs(w_int_live) * (dt_ac / torch.clamp(dz_w_int, min=1.0)), max=1.0)
+        # Centered live vertical theta_m transport for all acoustic/gravity waves (CFL <= 0.25)
+        # to eliminate spurious downward thermal diffusion across the sharp stratospheric d(theta)/dz,
+        # ramping smoothly to upwind only inside extreme convective cores approaching vertical CFL.
+        cfl_th = torch.abs(w_int_live) * (dt_ac / torch.clamp(dz_w_int, min=1.0))
+        beta_th = torch.clamp((cfl_th - 0.25) * 4.0, min=0.0, max=1.0)
         thm_w_live = (
             0.5 * (thm_live[:-1] + thm_live[1:])
             - 0.5 * beta_th * torch.sign(w_int_live) * (thm_live[1:] - thm_live[:-1])

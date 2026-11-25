@@ -733,15 +733,20 @@ def init_aoba_model(
     sfc = init_surface_state(
         mesh.surf_type, z_topo=mesh.z_topo, t_init=293.15, sigma_topo=mesh.sigma_topo, h_ml_ocean=cfg.h_ml_ocean,
     )
+    t_ocn_raw_h = 301.0 - 34.0 * (torch.sin(mesh.lat_cell) ** 2)
     sfc.t_ocean_ml = torch.where(
         mesh.surf_type == SURF_OCEAN,
-        torch.clamp(301.0 - 34.0 * (torch.sin(mesh.lat_cell) ** 2), min=C.T_FREEZE_OCEAN + 0.2),
+        torch.clamp(t_ocn_raw_h, min=C.T_FREEZE_OCEAN + 0.2),
         sfc.t_ocean_ml,
     )
     sfc.t_canopy = t_sfc_lat.clone()
     sfc.t_soil = t_sfc_lat.unsqueeze(0).expand_as(sfc.t_soil).clone()
-    polar_cold = (mesh.surf_type == SURF_OCEAN) & (t_sfc_lat < C.T_FREEZE_OCEAN)
-    sfc.m_seaice = torch.where(polar_cold, torch.full_like(t_sfc_lat, 1400.0), torch.zeros_like(t_sfc_lat))
+    polar_cold = (mesh.surf_type == SURF_OCEAN) & (t_ocn_raw_h < C.T_FREEZE_OCEAN)
+    sfc.m_seaice = torch.where(
+        polar_cold,
+        torch.clamp((C.T_FREEZE_OCEAN - t_ocn_raw_h) * 450.0, min=200.0, max=1400.0),
+        torch.zeros_like(t_ocn_raw_h),
+    )
     if str(cfg.planet_preset).strip().lower() != "earth":
         from aoba.planetary_presets import apply_planet_initial_surface
 
@@ -779,13 +784,18 @@ def init_aoba_model(
             ocn_mesh.surf_type, z_topo=ocn_mesh.z_topo, t_init=293.15,
             sigma_topo=ocn_mesh.sigma_topo, h_ml_ocean=cfg.h_ml_ocean,
         )
+        t_ocn_raw_f = 301.0 - 34.0 * (torch.sin(ocn_mesh.lat_cell) ** 2)
         ocn_sfc.t_ocean_ml = torch.where(
             ocn_mesh.surf_type == SURF_OCEAN,
-            torch.clamp(301.0 - 34.0 * (torch.sin(ocn_mesh.lat_cell) ** 2), min=C.T_FREEZE_OCEAN + 0.2),
+            torch.clamp(t_ocn_raw_f, min=C.T_FREEZE_OCEAN + 0.2),
             ocn_sfc.t_ocean_ml,
         )
-        polar_ocn = (ocn_mesh.surf_type == SURF_OCEAN) & (t_ocn_lat < C.T_FREEZE_OCEAN)
-        ocn_sfc.m_seaice = torch.where(polar_ocn, torch.full_like(t_ocn_lat, 1400.0), torch.zeros_like(t_ocn_lat))
+        polar_ocn = (ocn_mesh.surf_type == SURF_OCEAN) & (t_ocn_raw_f < C.T_FREEZE_OCEAN)
+        ocn_sfc.m_seaice = torch.where(
+            polar_ocn,
+            torch.clamp((C.T_FREEZE_OCEAN - t_ocn_raw_f) * 450.0, min=200.0, max=1400.0),
+            torch.zeros_like(t_ocn_raw_f),
+        )
         ogcm = init_ogcm_state(ocn_sfc, ocn_mesh, nz_ocn=cfg.ocean_nz)
         if bool(cfg.enable_ocean_bgc):
             from aoba.ocean_bgc import init_ocean_bgc_state
@@ -3104,8 +3114,10 @@ def step_aoba_model(
                 model.crm_distill.last_uncertainty.zero_()
                 model.crm_distill.last_uncertainty[s_idx] = stu_unc
 
-            # Commit exact genuine teacher state onto the tiny `t_idx` columns
-            atmos.rho_d[:, t_idx] = rho_t_mean
+            # Commit exact genuine teacher state onto the tiny `t_idx` columns.
+            # Keep global host `atmos.rho_d` governed uniformly by `step_scvt_rk3_hevi` across
+            # teacher & student cells so sparse teacher columns do not create isolated hydrostatic
+            # density dipoles against surrounding student cells.
             atmos.theta_m[:, t_idx] = thm_t_post
             atmos.q_n[:, t_idx] = qn_t_post
             atmos.q_p[:, t_idx] = qp_t_post

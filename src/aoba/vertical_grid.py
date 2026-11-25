@@ -125,10 +125,13 @@ def build_vertical_grid(
     dzeta_w64[1:-1] = zeta_c64[1:] - zeta_c64[:-1]
     dzeta_w64[-1] = zeta_w64[-1] - zeta_c64[-1]
 
-    # Klemp (2011, Eq. 2 & Eq. 4) hybrid attenuation A(zeta) = cos^2(pi/2 * zeta / z_top)^p
-    # satisfies A(0) = 1, A(z_top) = 0, dA/dzeta(z_top) = 0 smoothly.
-    atten_w64 = torch.cos(0.5 * math.pi * (zeta_w64 / z_top)) ** (2.0 * terrain_scale_exp)
-    atten_w64[-1] = 0.0
+    # Klemp (2011, Eq. 2 & Eq. 4) hybrid attenuation A(zeta) = cos^2(pi/2 * zeta / z_atten_top)^p
+    # satisfies A(0) = 1, A(z >= z_atten_top) = 0, dA/dzeta = 0 smoothly. Cap z_atten_top at 24 km
+    # so high-top stratospheric/mesospheric coordinate surfaces (z >= 24 km) remain strictly horizontal.
+    z_atten_top = min(float(z_top), 24000.0)
+    xi_atten = torch.clamp(zeta_w64 / max(z_atten_top, 1.0), 0.0, 1.0)
+    atten_w64 = torch.cos(0.5 * math.pi * xi_atten) ** (2.0 * terrain_scale_exp)
+    atten_w64[zeta_w64 >= z_atten_top] = 0.0
 
     # Rayleigh wave-absorbing sponge (Klemp et al., 2008; Skamarock et al., 2012):
     # gamma_r(zeta) = (1 / tau_min) * sin^2(0.5 * pi * (zeta - z_s) / (z_top - z_s)) for zeta > z_s
