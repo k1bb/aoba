@@ -11,7 +11,7 @@ glevel = 5
 nz = 56
 z_top = 65000.0
 dz_min = 60.0
-z_sponge_base = 52000.0
+z_sponge_base = 45000.0
 tau_sponge_min = 300.0
 terrain_scale_exp = 1.5
 crm_nx = 8
@@ -120,8 +120,8 @@ enable_milankovitch_orbit = false
 milankovitch_start_kyr = 0.0
 milankovitch_accel_factor = 1.0
 re_liq_um = 10.0
-re_ice_um = 35.0
-cloud_sw_inhomog = 0.88
+re_ice_um = 38.0
+cloud_sw_inhomog = 0.82
 microphysics_scheme = "six_class_2m"
 
 # --- Dynamic Equilibrium / Accelerated SIA Ice-Sheet Options ---

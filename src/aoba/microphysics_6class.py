@@ -206,10 +206,10 @@ def step_microphysics_six_class_2m(
     nr_cur = nr_cur + dq_c2r / 2.5e-7  # Mean new raindrop mass ~2.5e-7 kg (r ~ 400 um)
 
     # 3. Cold-cloud pathways:
-    # (a) Ice crystal aggregation (q_i -> q_s): excess above qi_thresh = 8e-5 kg/kg
+    # (a) Ice crystal aggregation (q_i -> q_s): excess above qi_thresh = 6e-5 kg/kg
     #     preserves upper-tropospheric cirrus/anvil decks while converting dense cores to snow (Morrison et al., 2005).
     k_agg = 1.5e-3 * torch.exp(torch.clamp(0.025 * (temp - C.T_FREEZE), min=-3.0, max=0.0))
-    qi_exc = torch.clamp(qi - 8.0e-5, min=0.0)
+    qi_exc = torch.clamp(qi - 6.0e-5, min=0.0)
     dq_i2s = (-torch.expm1(-torch.clamp(k_agg * dt, max=5.0))) * qi_exc
     qi = qi - dq_i2s
     qs = qs + dq_i2s
@@ -295,7 +295,7 @@ def step_microphysics_six_class_2m(
 
     # 4. Class-specific terminal velocities [m s^-1] (air-density corrected sqrt(rho_0/rho))
     rho_fac = torch.sqrt(torch.clamp(1.2 / torch.clamp(rho_d, min=0.05), min=0.5, max=6.0))
-    v_ice = torch.clamp(0.15 + 0.35 * torch.pow(torch.clamp(qi / 1.0e-4, min=0.0), 0.25), min=0.12, max=0.65)
+    v_ice = torch.clamp(0.22 + 0.45 * torch.pow(torch.clamp(qi / 1.0e-4, min=0.0), 0.25), min=0.18, max=0.80)
     v_rain = torch.clamp(6.5 * torch.pow(torch.clamp(rho_d * qr * 1.0e3, min=1.0e-6), 0.14) * rho_fac, min=1.0, max=9.5)
     v_snow = torch.clamp(1.1 * torch.pow(torch.clamp(rho_d * qs * 1.0e3, min=1.0e-6), 0.10) * rho_fac, min=0.3, max=2.2)
     v_graup = torch.clamp(4.2 * torch.pow(torch.clamp(rho_d * qg * 1.0e3, min=1.0e-6), 0.18) * rho_fac, min=0.8, max=8.5)

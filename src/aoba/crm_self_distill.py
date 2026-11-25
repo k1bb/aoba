@@ -1460,6 +1460,9 @@ def train_student_online(
 
         state.optimizer.zero_grad(set_to_none=False)
         loss_i.backward()
+        for p_g in state.net.parameters():
+            if p_g.grad is not None:
+                torch.nan_to_num_(p_g.grad, nan=0.0, posinf=0.0, neginf=0.0)
         torch.nn.utils.clip_grad_norm_(
             state.net.parameters(), max_norm=2.0, foreach=(x_fresh.device.type == "cuda"),
         )
@@ -2237,6 +2240,9 @@ def train_rad_student_online(
 
         state.optimizer.zero_grad(set_to_none=False)
         loss_i.backward()
+        for p_g in state.net.parameters():
+            if p_g.grad is not None:
+                torch.nan_to_num_(p_g.grad, nan=0.0, posinf=0.0, neginf=0.0)
         torch.nn.utils.clip_grad_norm_(
             state.net.parameters(), max_norm=2.0, foreach=(x_fresh.device.type == "cuda"),
         )
