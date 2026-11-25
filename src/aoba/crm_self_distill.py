@@ -417,12 +417,18 @@ def apply_exact_conservation_closure(
     p_snow_rate = (p_tot_mass * f_snow) / dt
     p_rain_rate = (p_tot_mass * (1.0 - f_snow)) / dt
 
-    # Partition convective q_n into (q_v, q_c, q_i) strictly preserving q_v + q_c + q_i == q_n,
-    # while preserving exact stratospheric/mesospheric (q_v, q_c, q_i) where s_conv == 0.
+    # Partition convective q_n into (q_v, q_c, q_i) strictly preserving q_v + q_c + q_i == q_n
+    # and thermodynamic saturation consistency (q_v <= qsat_env, homogeneous freezing T <= 253.15 K,
+    # liquid-only T >= 273.15 K), while keeping stratospheric/mesospheric layers (s_conv == 0) invariant.
     fc_sig = torch.sigmoid(f_cond_logit - 2.5)
     f_cond = s_conv * 0.95 * (fc_sig * fc_sig)
-    f_ice = torch.sigmoid(f_ice_logit)
-    q_cond = qn_new * f_cond
+    f_ice_nn = torch.sigmoid(f_ice_logit)
+    f_ice = torch.where(
+        t_env <= 253.15,
+        torch.ones_like(f_ice_nn),
+        torch.where(t_env >= C.T_FREEZE, torch.zeros_like(f_ice_nn), f_ice_nn),
+    )
+    q_cond = torch.maximum(qn_new * f_cond, torch.clamp(qn_new - qsat_env, min=0.0))
     qc_new = torch.where(in_conv, q_cond * (1.0 - f_ice), qc0)
     qi_new = torch.where(in_conv, q_cond * f_ice, qi0)
     qv_new = torch.where(in_conv, torch.clamp(qn_new - qc_new - qi_new, min=0.0), qv0)

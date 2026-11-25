@@ -5641,8 +5641,9 @@ kernel void crm_distill_closure_col(
 
             float fc_sig = aoba_sigmoid(raw_prof[rp_base + 3u * nz + k] - 2.5f);
             float f_cond = s_conv * 0.95f * (fc_sig * fc_sig);
-            float f_ice = aoba_sigmoid(raw_prof[rp_base + 4u * nz + k]);
-            float q_cond = qn_n * f_cond;
+            float f_ice_nn = aoba_sigmoid(raw_prof[rp_base + 4u * nz + k]);
+            float f_ice = (t_env <= 253.15f) ? 1.0f : ((t_env >= t_frz) ? 0.0f : f_ice_nn);
+            float q_cond = max(qn_n * f_cond, max(qn_n - qsat_env, 0.0f));
             qc_n = q_cond * (1.0f - f_ice);
             qi_n = q_cond * f_ice;
             qv_n = max(qn_n - qc_n - qi_n, 0.0f);

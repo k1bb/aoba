@@ -517,7 +517,10 @@ def step_mynn_level25(
     )
 
     l_master = 1.0 / (1.0 / torch.clamp(l_surf, min=0.5) + 1.0 / l_t + inv_lb)
-    l_master = torch.clamp(l_master, min=0.5, max=500.0)
+    # Taper maximum mixing length from 300 m inside the PBL (z <= 3 km) to 30 m in the free
+    # troposphere aloft so MYNN does not act as a 1D deep-convection diffuser above the PBL.
+    l_cap = 30.0 + 270.0 * torch.exp(-torch.clamp((z_int - 3000.0) / 1500.0, min=0.0))
+    l_master = torch.minimum(torch.clamp(l_master, min=0.5), l_cap)
 
     # Subgrid Gaussian condensation variance sigma_s & cloud fraction R (SCALE-RM Eqs. 8.122-8.126)
     dq_li = dqn_dz - b_cond * dthl_dz

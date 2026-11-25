@@ -1822,7 +1822,8 @@ kernel void crm_mynn_col(
             inv_lb = 1.0f / max(lb, 1.0f);
         }
 
-        float l_master = clamp(1.0f / (1.0f / max(l_surf, 0.5f) + 1.0f / l_t_col + inv_lb), 0.5f, 500.0f);
+        float l_cap = 30.0f + 270.0f * exp(-max((z_int - 3000.0f) / 1500.0f, 0.0f));
+        float l_master = clamp(1.0f / (1.0f / max(l_surf, 0.5f) + 1.0f / l_t_col + inv_lb), 0.5f, l_cap);
         if (k == 0u) l_c[0] = l_master;
         if (k > 0u)  l_c[k] = 0.5f * (l_c[k] + l_master);
         if (k + 1u < n_int) l_c[k + 1u] = l_master;
