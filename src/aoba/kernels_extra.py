@@ -685,16 +685,19 @@ inline void mp_sat_adj(
         return;
     }
     float T = t_li;
-    for (int it = 0; it < 4; ++it) {
+    float t_hi = t_li + (ls0 / cpd) * qn;
+    for (int it = 0; it < 6; ++it) {
         float qsat, dqsat;
         mp_qsat_mix(T, pres, e_tr, t_frz, t_ice, t_liq, eps_w, qsat, dqsat);
-        float qc_tmp = max(qn - qsat, 0.0f);
+        bool sat_it = qn > qsat;
+        float qc_tmp = sat_it ? (qn - qsat) : 0.0f;
         float om = clamp((T - t_ice) / (t_liq - t_ice), 0.0f, 1.0f);
         float leff = om * lv0 + (1.0f - om) * ls0;
         float res = T - t_li - (leff / cpd) * qc_tmp;
         float dl = (T > t_ice && T < t_liq) ? ((lv0 - ls0) / (t_liq - t_ice)) : 0.0f;
-        float df = 1.0f + (leff / cpd) * dqsat - (dl / cpd) * qc_tmp;
-        T = T - res / max(df, 1.0f);
+        float df = sat_it ? max(1.0f + (leff / cpd) * dqsat - (dl / cpd) * qc_tmp, 1.0f) : 1.0f;
+        float step_t = clamp(res / df, -40.0f, 40.0f);
+        T = clamp(T - step_t, t_li, t_hi);
     }
     float qsat_f, dq_f;
     mp_qsat_mix(T, pres, e_tr, t_frz, t_ice, t_liq, eps_w, qsat_f, dq_f);
@@ -2598,6 +2601,7 @@ kernel void crm_2d_stage_prep_simd(
     float dt_ac   = f_p1.x;
     float beta    = f_p1.y;
     float gravity = f_p1.z;
+    float dtau_2d = f_p1.w;
     float bdt2    = (beta * dt_ac) * (beta * dt_ac);
     float inv_nx  = 1.0f / float(nx);
 
@@ -2684,13 +2688,25 @@ kernel void crm_2d_stage_prep_simd(
             float dzw_up = dz_w_int[k * dz_cols + col_dz];
             float w_cur_xp1 = simd_shuffle(w_cur, l_xp1);
             w_ux_up = 0.5f * (w_cur + w_cur_xp1);
-            if (w_ux_up < 0.0f) vadv_u += -w_ux_up * (u_next - u_cur) / dzw_up;
-            if (w_cur   < 0.0f) vadv_v += -w_cur   * (v_next - v_cur) / dzw_up;
+            if (w_ux_up < 0.0f) {
+                float lim = (dtau_2d > 0.0f) ? max(1.0f, (-w_ux_up) * (dtau_2d / 0.45f) / dzw_up) : 1.0f;
+                vadv_u += (-w_ux_up / lim) * (u_next - u_cur) / dzw_up;
+            }
+            if (w_cur < 0.0f) {
+                float lim = (dtau_2d > 0.0f) ? max(1.0f, (-w_cur) * (dtau_2d / 0.45f) / dzw_up) : 1.0f;
+                vadv_v += (-w_cur / lim) * (v_next - v_cur) / dzw_up;
+            }
         }
         if (k > 0u) {
             float dzw_dn = dz_w_int[(k - 1u) * dz_cols + col_dz];
-            if (w_ux_dn > 0.0f) vadv_u += -w_ux_dn * (u_cur - u_prev) / dzw_dn;
-            if (w_below > 0.0f) vadv_v += -w_below * (v_cur - v_prev) / dzw_dn;
+            if (w_ux_dn > 0.0f) {
+                float lim = (dtau_2d > 0.0f) ? max(1.0f, w_ux_dn * (dtau_2d / 0.45f) / dzw_dn) : 1.0f;
+                vadv_u += (-w_ux_dn / lim) * (u_cur - u_prev) / dzw_dn;
+            }
+            if (w_below > 0.0f) {
+                float lim = (dtau_2d > 0.0f) ? max(1.0f, w_below * (dtau_2d / 0.45f) / dzw_dn) : 1.0f;
+                vadv_v += (-w_below / lim) * (v_cur - v_prev) / dzw_dn;
+            }
         }
 
         float sp = sponge_c[k];
@@ -2733,7 +2749,11 @@ kernel void crm_2d_stage_prep_simd(
 
             float dw_dz_dn = (w_int - w_prev2) / dz_prev;
             float dw_dz_up = (w_cur - w_int) / dz_cur;
-            float adv_w_v = -(max(w_int, 0.0f) * dw_dz_dn + min(w_int, 0.0f) * dw_dz_up);
+            float w_pos_2d = max(w_int, 0.0f);
+            float w_neg_2d = min(w_int, 0.0f);
+            float lim_p2d = (dtau_2d > 0.0f) ? max(1.0f, w_pos_2d * (dtau_2d / 0.50f) / dz_prev) : 1.0f;
+            float lim_n2d = (dtau_2d > 0.0f) ? max(1.0f, (-w_neg_2d) * (dtau_2d / 0.50f) / dz_cur) : 1.0f;
+            float adv_w_v = -((w_pos_2d / lim_p2d) * dw_dz_dn + (w_neg_2d / lim_n2d) * dw_dz_up);
             float tw_sl = adv_w_h + adv_w_v + dw_sgs[idx];
 
             float rdw = 0.5f * (r_prev + r_cur);
@@ -3042,6 +3062,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
     float dt_ac   = f_p1.x;
     float beta    = f_p1.y;
     float gravity = f_p1.z;
+    float dtau_2d = f_p1.w;
     float bdt2    = (beta * dt_ac) * (beta * dt_ac);
     float inv_nx  = 1.0f / float(nx);
     float n_ac_f  = float(n_ac);
@@ -3142,13 +3163,25 @@ kernel void crm_2d_rk3_stage_fused_simd(
             float dzw_up = dz_w_int[k * dz_cols + col_dz];
             float w_cur_xp1 = simd_shuffle(w_cur, l_xp1);
             w_ux_up = 0.5f * (w_cur + w_cur_xp1);
-            if (w_ux_up < 0.0f) vadv_u += -w_ux_up * (u_next - u_cur) / dzw_up;
-            if (w_cur   < 0.0f) vadv_v += -w_cur   * (v_next - v_cur) / dzw_up;
+            if (w_ux_up < 0.0f) {
+                float lim = (dtau_2d > 0.0f) ? max(1.0f, (-w_ux_up) * (dtau_2d / 0.45f) / dzw_up) : 1.0f;
+                vadv_u += (-w_ux_up / lim) * (u_next - u_cur) / dzw_up;
+            }
+            if (w_cur < 0.0f) {
+                float lim = (dtau_2d > 0.0f) ? max(1.0f, (-w_cur) * (dtau_2d / 0.45f) / dzw_up) : 1.0f;
+                vadv_v += (-w_cur / lim) * (v_next - v_cur) / dzw_up;
+            }
         }
         if (k > 0u) {
             float dzw_dn = dz_w_int[(k - 1u) * dz_cols + col_dz];
-            if (w_ux_dn > 0.0f) vadv_u += -w_ux_dn * (u_cur - u_prev) / dzw_dn;
-            if (w_below > 0.0f) vadv_v += -w_below * (v_cur - v_prev) / dzw_dn;
+            if (w_ux_dn > 0.0f) {
+                float lim = (dtau_2d > 0.0f) ? max(1.0f, w_ux_dn * (dtau_2d / 0.45f) / dzw_dn) : 1.0f;
+                vadv_u += (-w_ux_dn / lim) * (u_cur - u_prev) / dzw_dn;
+            }
+            if (w_below > 0.0f) {
+                float lim = (dtau_2d > 0.0f) ? max(1.0f, w_below * (dtau_2d / 0.45f) / dzw_dn) : 1.0f;
+                vadv_v += (-w_below / lim) * (v_cur - v_prev) / dzw_dn;
+            }
         }
 
         float sp = sponge_c[k];
@@ -3189,7 +3222,12 @@ kernel void crm_2d_rk3_stage_fused_simd(
 
             float dw_dz_dn = (w_int - w_prev2) * inv_dz_prev;
             float dw_dz_up = (w_cur - w_int) * inv_dz_cur;
-            float adv_w_v = -(max(w_int, 0.0f) * dw_dz_dn + min(w_int, 0.0f) * dw_dz_up);
+            float dtau_f = n_ac_f * dt_ac;
+            float w_pos_f = max(w_int, 0.0f);
+            float w_neg_f = min(w_int, 0.0f);
+            float lim_pf = max(1.0f, w_pos_f * (dtau_f / 0.50f) * inv_dz_prev);
+            float lim_nf = max(1.0f, (-w_neg_f) * (dtau_f / 0.50f) * inv_dz_cur);
+            float adv_w_v = -((w_pos_f / lim_pf) * dw_dz_dn + (w_neg_f / lim_nf) * dw_dz_up);
             float tw_sl = adv_w_h + adv_w_v + dw_sgs[idx];
 
             float rdw = 0.5f * (r_prev + r_cur);

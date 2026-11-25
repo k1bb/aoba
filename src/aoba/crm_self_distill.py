@@ -552,8 +552,10 @@ def reconstruct_subgrid_heterogeneity(
         rank_prec = rank_cld
 
     # Cloud subcolumn multipliers m_cld [nz, N_s, n_sub] with exact mean == 1.0
+    # Enforce physical in-cloud condensate ceiling (<= 6 g/kg) while preserving exact column mean.
     f_min = 1.0 / float(n_sub)
-    f_c_eff = torch.clamp(f_cld, min=f_min, max=1.0)                           # [nz, N_s]
+    f_c_phys = torch.maximum(f_cld, (q_c_col + q_i_col) / 0.006)
+    f_c_eff = torch.clamp(f_c_phys, min=f_min, max=1.0)                        # [nz, N_s]
     w_cld = torch.clamp(f_c_eff.unsqueeze(-1) * float(n_sub) - rank_cld.unsqueeze(0), min=0.0, max=1.0)
     m_cld = w_cld / torch.clamp(w_cld.mean(dim=-1, keepdim=True), min=1.0e-6)  # exact mean == 1.0
 

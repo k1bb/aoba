@@ -1663,7 +1663,7 @@ kernel void microphysics_6class_col(
         ns_new = (qs_new > 1.0e-10f) ? clamp(ns_new, 1.0f, 1.0e6f) : 0.0f;
         ng_new = (qg_new > 1.0e-10f) ? clamp(ng_new, 1.0f, 1.0e5f) : 0.0f;
 
-        theta_m[idx] = clamp(thm + dtheta_lat, 150.0f, 2500.0f);
+        theta_m[idx] = clamp(thm + dtheta_lat, 150.0f, 15000.0f);
         q_v[idx] = qv;
         q_c[idx] = qc;
         q_i[idx] = qi;

@@ -607,8 +607,8 @@ def _scvt_rk3_stage_prep_core(
     thm_e = 0.5 * (thm_s[:, c0] + thm_s[:, c1]) - 0.15 * torch.sign(u_s) * (thm_s[:, c1] - thm_s[:, c0])
     rtot_e = torch.clamp(0.5 * (rtot_s[:, c0] + rtot_s[:, c1]), min=1.0e-5)
     dz_10 = z_c[:, c1] - z_c[:, c0]
-    fac_z0 = torch.exp(-0.5 * (rtot_s[:, c0] * C.GRAVITY / torch.clamp(pres_s[:, c0], min=10.0)) * dz_10)
-    fac_z1 = torch.exp(+0.5 * (rtot_s[:, c1] * C.GRAVITY / torch.clamp(pres_s[:, c1], min=10.0)) * dz_10)
+    fac_z0 = torch.exp(-0.5 * (rtot_s[:, c0] * C.GRAVITY / torch.clamp(pres_s[:, c0], min=0.1)) * dz_10)
+    fac_z1 = torch.exp(+0.5 * (rtot_s[:, c1] * C.GRAVITY / torch.clamp(pres_s[:, c1], min=0.1)) * dz_10)
 
     ke_edge = area_e * (u_s * u_s)
     ke_cell = 0.5 * (ke_edge[:, edges_on_cell] * valid_ce).sum(dim=-1) / area_c

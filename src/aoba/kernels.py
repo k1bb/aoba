@@ -864,21 +864,34 @@ kernel void crm_stage_uv_flux(
 
     float vadv_u = 0.0f;
     float vadv_v = 0.0f;
+    float dtau_v = f_p.z;
     if (k < nz - 1u) {
         float dzw = dz_w_int[k * dz_cols + col_dz];
         uint kp1 = (k + 1u) * M;
         float w_ux = 0.5f * (w_s[kp1 + tid] + w_s[kp1 + col * stride_c + iy * nx + ix_p1]);
         float w_vy = 0.5f * (w_s[kp1 + tid] + w_s[kp1 + col * stride_c + iy_p1 * nx + ix]);
-        if (w_ux < 0.0f) vadv_u += -w_ux * (u_s[kp1 + tid] - u0) / dzw;
-        if (w_vy < 0.0f) vadv_v += -w_vy * (v_s[kp1 + tid] - v0) / dzw;
+        if (w_ux < 0.0f) {
+            float lim = (dtau_v > 0.0f) ? max(1.0f, (-w_ux) * (dtau_v / 0.45f) / dzw) : 1.0f;
+            vadv_u += (-w_ux / lim) * (u_s[kp1 + tid] - u0) / dzw;
+        }
+        if (w_vy < 0.0f) {
+            float lim = (dtau_v > 0.0f) ? max(1.0f, (-w_vy) * (dtau_v / 0.45f) / dzw) : 1.0f;
+            vadv_v += (-w_vy / lim) * (v_s[kp1 + tid] - v0) / dzw;
+        }
     }
     if (k > 0u) {
         float dzw = dz_w_int[(k - 1u) * dz_cols + col_dz];
         uint km1 = (k - 1u) * M;
         float w_ux = 0.5f * (w_s[k * M + tid] + w_s[k * M + col * stride_c + iy * nx + ix_p1]);
         float w_vy = 0.5f * (w_s[k * M + tid] + w_s[k * M + col * stride_c + iy_p1 * nx + ix]);
-        if (w_ux > 0.0f) vadv_u += -w_ux * (u0 - u_s[km1 + tid]) / dzw;
-        if (w_vy > 0.0f) vadv_v += -w_vy * (v0 - v_s[km1 + tid]) / dzw;
+        if (w_ux > 0.0f) {
+            float lim = (dtau_v > 0.0f) ? max(1.0f, w_ux * (dtau_v / 0.45f) / dzw) : 1.0f;
+            vadv_u += (-w_ux / lim) * (u0 - u_s[km1 + tid]) / dzw;
+        }
+        if (w_vy > 0.0f) {
+            float lim = (dtau_v > 0.0f) ? max(1.0f, w_vy * (dtau_v / 0.45f) / dzw) : 1.0f;
+            vadv_v += (-w_vy / lim) * (v0 - v_s[km1 + tid]) / dzw;
+        }
     }
 
     float fc = (has_cor != 0u) ? f_cor[col] : 0.0f;
@@ -922,7 +935,7 @@ kernel void crm_stage_w_hevi(
     constant ulong4& u_dim         [[buffer(19)]],  // [nz, n_col, ny, nx]
     constant uint& dz_cols         [[buffer(20)]],
     constant float4& f_p0          [[buffer(21)]],  // [dt_ac, beta_hevi, gravity, dx]
-    constant float& dy_p           [[buffer(22)]],
+    constant float4& f_p1          [[buffer(22)]],  // [dy, dtau, 0, 0]
     uint gid [[thread_position_in_grid]])
 {
     uint nz = uint(u_dim.x);
@@ -965,7 +978,8 @@ kernel void crm_stage_w_hevi(
     uint idx_mp2 = (m + 2u) * M + tid;
 
     float inv_dx = 1.0f / f_p0.w;
-    float inv_dy = 1.0f / dy_p;
+    float inv_dy = 1.0f / f_p1.x;
+    float dtau_w = f_p1.y;
 
     float u_w_left  = 0.5f * (u_s[m * M + tid_xm1] + u_s[(m + 1u) * M + tid_xm1]);
     float u_w_right = 0.5f * (u_s[idx_m]           + u_s[idx_mp1]);
@@ -995,7 +1009,11 @@ kernel void crm_stage_w_hevi(
 
     float dw_dz_dn = (w_int - w_s[idx_m]) / dz_m;
     float dw_dz_up = (w_s[idx_mp2] - w_int) / dz_mp1;
-    float adv_w_v = -(max(w_int, 0.0f) * dw_dz_dn + min(w_int, 0.0f) * dw_dz_up);
+    float w_pos = max(w_int, 0.0f);
+    float w_neg = min(w_int, 0.0f);
+    float lim_pos = (dtau_w > 0.0f) ? max(1.0f, w_pos * (dtau_w / 0.50f) / dz_m) : 1.0f;
+    float lim_neg = (dtau_w > 0.0f) ? max(1.0f, (-w_neg) * (dtau_w / 0.50f) / dz_mp1) : 1.0f;
+    float adv_w_v = -((w_pos / lim_pos) * dw_dz_dn + (w_neg / lim_neg) * dw_dz_up);
     tend_w_slow[gid] = adv_w_h + adv_w_v + dw_sgs[idx_mp1];
 
     float rdw = 0.5f * (rho_s[idx_m] + rho_s[idx_mp1]);
@@ -1775,7 +1793,7 @@ def run_crm_rk3_hevi_metal(
                 first_i = 1 if stage_idx == 0 else 0
                 accum_i = 1 if stage_idx == 2 else 0
                 u_fused = [nz, n_col, nx, (int(dz_cols) << 16) | (int(n_ac) << 2) | (first_i << 1) | accum_i]
-                f_fused1 = [float(dt_ac), float(beta_hevi), float(gravity), 0.0]
+                f_fused1 = [float(dt_ac), float(beta_hevi), float(gravity), float(dtau)]
                 lib.crm_2d_rk3_stage_fused_simd(
                     rho0_c, Thm0_c, u0_c, v0_c, w0_c,
                     rho_out, Thm_out, u_out, v_out, w_out,
@@ -1802,7 +1820,7 @@ def run_crm_rk3_hevi_metal(
         for stage_idx, dtau in enumerate(rk_taus):
             n_ac = max(1, int(_math.ceil(dtau / max(dt_ac_max, 0.1))))
             dt_ac = dtau / float(n_ac)
-            f_prep1 = [float(dt_ac), float(beta_hevi), float(gravity), 0.0]
+            f_prep1 = [float(dt_ac), float(beta_hevi), float(gravity), float(dtau)]
             lib.crm_2d_stage_prep_simd(
                 rho_s, Thm_s, u_s, v_s, w_s,
                 qn_c, qp_c, du_s_c, dv_s_c, dw_s_c, dzc_c, dzw_c, spc_c, spw_c,
@@ -1886,18 +1904,20 @@ def run_crm_rk3_hevi_metal(
         else:
             u_mean = dummy
             v_mean = dummy
+        f_suv4_s = [float(dx), float(dy), float(dtau), 0.0]
         lib.crm_stage_uv_flux(
             rho_s, rho_tot_s, thm_s, u_s, v_s, w_s, du_s_c, dv_s_c, u_mean, v_mean,
             dzw_c, spc_c, fcor_c,
             rho_x, rho_y, rtot_x_inv, rtot_y_inv, thm_x_eff, thm_y_eff, tend_u_slow, tend_v_slow,
-            u_dim4, u_suv_flg, f_suv4, threads=total_pts,
+            u_dim4, u_suv_flg, f_suv4_s, threads=total_pts,
         )
         f_hevi4 = [float(dt_ac), float(beta_hevi), float(gravity), float(dx)]
+        f_w_p1 = [float(dy), float(dtau), 0.0, 0.0]
         lib.crm_stage_w_hevi(
             rho_s, rho_tot_s, thm_s, dp_dThm_s, ql_c, u_s, v_s, w_s, dw_s_c,
             dzc_c, dzw_c, spw_c,
             tend_w_slow, rho_dw, rho_tot_w, thm_w, dl, diag, du,
-            u_dim4, int(dz_cols), f_hevi4, float(dy), threads=n_int_pts,
+            u_dim4, int(dz_cols), f_hevi4, f_w_p1, threads=n_int_pts,
         )
 
         accum = stage_idx == 2

@@ -266,7 +266,7 @@ def step_microphysics_six_class_2m(
     qv = qv + dq_evap
     dtheta_lat = dtheta_lat - (C.L_V0 / (C.CP_D * torch.clamp(pi_ex, min=0.1))) * dq_evap
 
-    theta_new = torch.clamp(theta_m + dtheta_lat, min=150.0, max=2500.0)
+    theta_new = torch.clamp(theta_m + dtheta_lat, min=150.0, max=15000.0)
 
     # 4. Class-specific terminal velocities [m s^-1] (air-density corrected sqrt(rho_0/rho))
     rho_fac = torch.sqrt(torch.clamp(1.2 / torch.clamp(rho_d, min=0.05), min=0.5, max=6.0))

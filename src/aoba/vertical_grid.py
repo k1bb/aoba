@@ -57,6 +57,8 @@ class VerticalGrid:
     terrain_atten_w: torch.Tensor
     sponge_w: torch.Tensor
     sponge_c: torch.Tensor
+    crm_sponge_w: torch.Tensor
+    crm_sponge_c: torch.Tensor
 
     def to(self, device: torch.device) -> "VerticalGrid":
         """Move grid tensors to the target compute device."""
@@ -70,6 +72,8 @@ class VerticalGrid:
             terrain_atten_w=self.terrain_atten_w.to(device),
             sponge_w=self.sponge_w.to(device),
             sponge_c=self.sponge_c.to(device),
+            crm_sponge_w=self.crm_sponge_w.to(device),
+            crm_sponge_c=self.crm_sponge_c.to(device),
         )
 
 
@@ -135,6 +139,19 @@ def build_vertical_grid(
     sponge_w64 = _sponge(zeta_w64)
     sponge_c64 = _sponge(zeta_c64)
 
+    # Perturbation-only upper wave-absorbing layer for embedded periodic CRMs in high-top
+    # configurations (z_top > 32 km; Klemp et al., 2008): absorbs trapped convective gravity waves
+    # above 26 km before 1/sqrt(rho) mesospheric amplification while preserving host-mean fields.
+    if z_top > 32000.0:
+        z_crm_sp = min(z_sponge_base, 26000.0)
+        xi_cw = torch.clamp((zeta_w64 - z_crm_sp) / max(z_top - z_crm_sp, 1.0), 0.0, 1.0)
+        xi_cc = torch.clamp((zeta_c64 - z_crm_sp) / max(z_top - z_crm_sp, 1.0), 0.0, 1.0)
+        crm_sponge_w64 = torch.maximum(sponge_w64, (1.0 / 20.0) * torch.sin(0.5 * math.pi * xi_cw) ** 2)
+        crm_sponge_c64 = torch.maximum(sponge_c64, (1.0 / 90.0) * torch.sin(0.5 * math.pi * xi_cc) ** 2)
+    else:
+        crm_sponge_w64 = sponge_w64
+        crm_sponge_c64 = sponge_c64
+
     return VerticalGrid(
         nz=nz,
         z_top=z_top,
@@ -145,6 +162,8 @@ def build_vertical_grid(
         terrain_atten_w=atten_w64.to(device=dev, dtype=dtype),
         sponge_w=sponge_w64.to(device=dev, dtype=dtype),
         sponge_c=sponge_c64.to(device=dev, dtype=dtype),
+        crm_sponge_w=crm_sponge_w64.to(device=dev, dtype=dtype),
+        crm_sponge_c=crm_sponge_c64.to(device=dev, dtype=dtype),
     )
 
 

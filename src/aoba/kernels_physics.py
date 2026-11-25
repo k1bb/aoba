@@ -3682,8 +3682,8 @@ kernel void scvt_rk3_prep_edge(
     float th1 = thm_s[i1];
     float rt0 = rtot_s[i0];
     float rt1 = rtot_s[i1];
-    float p0 = max(pres_s[i0], 10.0f);
-    float p1 = max(pres_s[i1], 10.0f);
+    float p0 = max(pres_s[i0], 0.1f);
+    float p1 = max(pres_s[i1], 0.1f);
     float dz10 = z_c[i1] - z_c[i0];
 
     m_edge[gid] = 0.5f * (m_s[i0] + m_s[i1]);
@@ -4750,7 +4750,8 @@ kernel void crm_student_tile_update_col(
         float qp_c  = stu_qp[kc];
         float u_c   = stu_u[kc];
         float v_c   = stu_v[kc];
-        float fc_n  = clamp(stu_fcld[kc], inv_nsub, 1.0f) * fn_sub;
+        float fc_phys = max(stu_fcld[kc], (qc_c + qi_c) / 0.006f);
+        float fc_n  = clamp(fc_phys, inv_nsub, 1.0f) * fn_sub;
 
         float thm_old = crm_thm[idx];
         float u_old   = crm_u[idx];

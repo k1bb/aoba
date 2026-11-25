@@ -171,8 +171,10 @@ def saturation_adjustment(
     is_sat = qn_pos > qsat0
 
     temp = t_li.clone()
-    for _ in range(n_iter):
+    t_hi = t_li + (C.L_S0 / C.CP_D) * qn_pos
+    for _ in range(max(n_iter, 6)):
         qsat, dqsat_dT = qsat_mixed(temp, pres)
+        sat_it = qn_pos > qsat
         q_cond = torch.clamp(qn_pos - qsat, min=0.0)
         omega = liquid_fraction_condensate(temp)
         l_eff = omega * C.L_V0 + (1.0 - omega) * C.L_S0
@@ -181,9 +183,10 @@ def saturation_adjustment(
         res = temp - t_li - (l_eff / C.CP_D) * q_cond
         in_ramp = ((temp > C.T_ICE_ALL) & (temp < C.T_LIQ_ALL)).to(temp.dtype)
         dl_dT = in_ramp * (C.L_V0 - C.L_S0) / (C.T_LIQ_ALL - C.T_ICE_ALL)
-        df_dT = 1.0 + (l_eff / C.CP_D) * dqsat_dT - (dl_dT / C.CP_D) * q_cond
-        step = res / torch.clamp(df_dT, min=1.0)
-        temp = torch.where(is_sat, temp - step, t_li)
+        df_sat = torch.clamp(1.0 + (l_eff / C.CP_D) * dqsat_dT - (dl_dT / C.CP_D) * q_cond, min=1.0)
+        df_dT = torch.where(sat_it, df_sat, torch.ones_like(df_sat))
+        step = torch.clamp(res / df_dT, min=-40.0, max=40.0)
+        temp = torch.where(is_sat, torch.clamp(temp - step, min=t_li, max=t_hi), t_li)
 
     qsat_final = qsat_mixed_val(temp, pres)
     q_cond_final = torch.where(is_sat, torch.clamp(qn_pos - qsat_final, min=0.0), torch.zeros_like(qn_pos))

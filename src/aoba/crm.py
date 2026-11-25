@@ -508,12 +508,17 @@ def _upwind_vertical_advect(
     q: torch.Tensor,
     w_int: torch.Tensor,
     dz_w_int: torch.Tensor,
+    dtau: float = 0.0,
 ) -> torch.Tensor:
-    """First-order upwind vertical advection tendency `-w * dq/dz` on stretched interfaces."""
+    """First-order upwind vertical advection tendency `-w * dq/dz` with semi-implicit CFL bound."""
     dq_dz_int = (q[1:] - q[:-1]) / dz_w_int
+    if dtau > 0.0:
+        w_eff = w_int / torch.clamp(torch.abs(w_int) * (dtau / 0.45) / dz_w_int, min=1.0)
+    else:
+        w_eff = w_int
     out = torch.zeros_like(q)
-    out[1:] += -torch.clamp(w_int, min=0.0) * dq_dz_int
-    out[:-1] += -torch.clamp(w_int, max=0.0) * dq_dz_int
+    out[1:] += -torch.clamp(w_eff, min=0.0) * dq_dz_int
+    out[:-1] += -torch.clamp(w_eff, max=0.0) * dq_dz_int
     return out
 
 
@@ -693,8 +698,8 @@ def step_crm_rk3_hevi(
         if z_c_col is not None
         else (vgrid.zeta_c[1:] - vgrid.zeta_c[:-1]).view(nz - 1, 1, 1, 1)
     )
-    sponge_w = vgrid.sponge_w[1:-1].view(nz - 1, 1, 1, 1)
-    sponge_c = vgrid.sponge_c.view(nz, 1, 1, 1)
+    sponge_w = vgrid.crm_sponge_w[1:-1].view(nz - 1, 1, 1, 1)
+    sponge_c = vgrid.crm_sponge_c.view(nz, 1, 1, 1)
 
     rho0 = crm.rho_d
     u0 = crm.u
@@ -808,8 +813,8 @@ def step_crm_rk3_hevi(
 
         w_ux = 0.5 * (w_s[1:-1] + torch.roll(w_s[1:-1], -1, -1))
         w_vy = 0.5 * (w_s[1:-1] + torch.roll(w_s[1:-1], -1, -2))
-        vadv_u = _upwind_vertical_advect(u_s, w_ux, dz_w_int)
-        vadv_v = _upwind_vertical_advect(v_s, w_vy, dz_w_int)
+        vadv_u = _upwind_vertical_advect(u_s, w_ux, dz_w_int, dtau=dtau)
+        vadv_v = _upwind_vertical_advect(v_s, w_vy, dz_w_int, dtau=dtau)
 
         if use_3d_pert_cor and f_col_3d is not None:
             v_c_pert = v_c - mean_2d(v_c, keepdim=True)
@@ -832,7 +837,11 @@ def step_crm_rk3_hevi(
         adv_w_h = _ws3_horizontal_advect(w_int, u_w_left, v_w_bot, dx, dy)
         dw_dz_dn = (w_int - w_s[:-2]) / dz_c[:-1]
         dw_dz_up = (w_s[2:] - w_int) / dz_c[1:]
-        adv_w_v = -(torch.clamp(w_int, min=0.0) * dw_dz_dn + torch.clamp(w_int, max=0.0) * dw_dz_up)
+        w_pos = torch.clamp(w_int, min=0.0)
+        w_neg = torch.clamp(w_int, max=0.0)
+        w_pos_eff = w_pos / torch.clamp(w_pos * (dtau / 0.50) / dz_c[:-1], min=1.0)
+        w_neg_eff = w_neg / torch.clamp((-w_neg) * (dtau / 0.50) / dz_c[1:], min=1.0)
+        adv_w_v = -(w_pos_eff * dw_dz_dn + w_neg_eff * dw_dz_up)
         tend_w_slow = adv_w_h + adv_w_v + dw_sgs[1:-1]
         tend_Thm_slow = dThm_sgs
 
@@ -1227,6 +1236,17 @@ def _step_crm_physics_and_dynamics_impl(
                     crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
                     crm.n_c = fct_advect_3d(crm.n_c, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
                     crm.n_i = fct_advect_3d(crm.n_i, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+            elif use_6c_mp:
+                if use_metal_crm:
+                    crm.q_n, crm.q_p, crm.q_c, crm.q_i = dispatch_crm_fct_quad_metal(
+                        crm.q_n, crm.q_p, crm.q_c, crm.q_i, rho_start, crm.rho_d,
+                        fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv,
+                    )
+                else:
+                    crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+                    crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+                    crm.q_c = fct_advect_3d(crm.q_c, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
+                    crm.q_i = fct_advect_3d(crm.q_i, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
             elif use_metal_crm:
                 crm.q_n, crm.q_p = dispatch_crm_fct_pair_metal(
                     crm.q_n, crm.q_p, rho_start, crm.rho_d,
@@ -1249,8 +1269,11 @@ def _step_crm_physics_and_dynamics_impl(
         if v_gal_shift is not None:
             crm.v = crm.v + v_gal_shift
         crm.theta_m = Thm_cur / crm.rho_d
-        q_cond_adv = torch.minimum(crm.q_c + crm.q_i, crm.q_n)
-        crm.q_v = torch.clamp(crm.q_n - q_cond_adv, min=0.0)
+        q_ci_sum = crm.q_c + crm.q_i
+        scale_ci = torch.where(q_ci_sum > crm.q_n, crm.q_n / torch.clamp(q_ci_sum, min=1.0e-12), torch.ones_like(q_ci_sum))
+        crm.q_c = crm.q_c * scale_ci
+        crm.q_i = crm.q_i * scale_ci
+        crm.q_v = torch.clamp(crm.q_n - crm.q_c - crm.q_i, min=0.0)
 
     # Expand column vertical metrics across `[Nz, m_sub]` if terrain-following
     zc_flat = (
@@ -1491,7 +1514,7 @@ def step_coupled_crm_rce(
         pres_w = torch.empty((nz + 1, m_sub), device=rho_sub.device, dtype=rho_sub.dtype)
         pres_w[0] = pres_sfc_sub
         pres_w[1:-1] = torch.sqrt(torch.clamp(pres_sub[:-1] * pres_sub[1:], min=1.0))
-        pres_w[-1] = torch.clamp(0.5 * pres_sub[-1], min=10.0)
+        pres_w[-1] = torch.clamp(0.5 * pres_sub[-1], min=0.1)
 
         temp_w = torch.empty((nz + 1, m_sub), device=rho_sub.device, dtype=rho_sub.dtype)
         temp_w[0] = temp_sub[0]
