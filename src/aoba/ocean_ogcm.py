@@ -72,7 +72,7 @@ from aoba.kernels import (
     get_active_gpu_backend,
     solve_tridiagonal_batched,
 )
-from aoba.runtime import maybe_cuda_compile
+from aoba.runtime import can_use_cuda_graph, maybe_cuda_compile, run_cuda_graph_cached
 from aoba.scvt_dynamics import (
     compute_scvt_divergence,
     compute_scvt_vorticity,
@@ -1544,6 +1544,187 @@ def step_ogcm_voronoi(
 
     is_ocean = sfc.surf_type == SURF_OCEAN
     cache = _get_ogcm_static_cache(ogcm, mesh, is_ocean)
+
+    if can_use_cuda_graph(dev) and ogcm.bgc is None:
+        has_evp = ogcm.seaice_evp is not None
+        has_sw = sw_net_ocn is not None
+        has_riv = river_mouth_flux is not None
+        has_lang = langmuir_fac is not None
+
+        live_in: list[torch.Tensor] = [
+            ogcm.temp, ogcm.sal, ogcm.t_comp, ogcm.s_comp,
+            ogcm.u_edge, ogcm.u_baro, ogcm.eta, ogcm.m_seaice_prev,
+            sfc.t_ocean_ml, sfc.m_seaice, sfc.swe_seaice,
+            tau_x_sfc, tau_y_sfc, f_seaice, evap_cell, precip_cell,
+            runoff_total, runoff_glacier,
+        ]
+        if has_sw:
+            assert sw_net_ocn is not None
+            live_in.append(sw_net_ocn)
+        if has_riv:
+            assert river_mouth_flux is not None
+            live_in.append(river_mouth_flux)
+        if has_lang:
+            assert langmuir_fac is not None
+            live_in.append(langmuir_fac)
+        if has_evp:
+            evp0 = ogcm.seaice_evp
+            live_in.extend([
+                evp0.a_cat, evp0.v_cat, evp0.u_ice_e,
+                evp0.sigma_1, evp0.sigma_s, evp0.m_seaice_sync,
+            ])
+
+        g_key = (
+            "ogcm_voronoi",
+            nzo, nc, ne,
+            int(mesh.cells_on_edge.data_ptr()),
+            str(dev), str(dtype),
+            bool(enable_seaice_drift), bool(has_evp),
+            bool(has_sw), bool(has_riv), bool(has_lang),
+            bool(enable_fct_zstar), bool(enable_scale_aware_gm),
+            bool(enable_submeso), bool(enable_tidal_mixing),
+            round(float(dt), 6),
+        )
+
+        def _cg_body(inp: list[torch.Tensor]) -> list[torch.Tensor]:
+            idx = 18
+            sw_i = inp[idx] if has_sw else None
+            idx += int(has_sw)
+            riv_i = inp[idx] if has_riv else None
+            idx += int(has_riv)
+            lang_i = inp[idx] if has_lang else None
+            idx += int(has_lang)
+
+            evp_v = None
+            if has_evp:
+                from aoba.seaice_evp import SeaIceEVPState
+
+                evp_v = SeaIceEVPState(
+                    a_cat=inp[idx],
+                    v_cat=inp[idx + 1],
+                    u_ice_e=inp[idx + 2],
+                    sigma_1=inp[idx + 3],
+                    sigma_s=inp[idx + 4],
+                    m_seaice_sync=inp[idx + 5],
+                )
+            ogcm_d = dict(ogcm.__dict__)
+            ogcm_d["temp"] = inp[0]
+            ogcm_d["sal"] = inp[1]
+            ogcm_d["t_comp"] = inp[2]
+            ogcm_d["s_comp"] = inp[3]
+            ogcm_d["u_edge"] = inp[4]
+            ogcm_d["u_baro"] = inp[5]
+            ogcm_d["eta"] = inp[6]
+            ogcm_d["m_seaice_prev"] = inp[7]
+            ogcm_d["seaice_evp"] = evp_v
+            ogcm_v = OceanOGCMState(**{k: v for k, v in ogcm_d.items() if k in OceanOGCMState.__dataclass_fields__})
+            ogcm_v._static_cache = getattr(ogcm, "_static_cache", None)  # type: ignore[attr-defined]
+
+            sfc_d = dict(sfc.__dict__)
+            sfc_d["t_ocean_ml"] = inp[8]
+            sfc_d["m_seaice"] = inp[9]
+            sfc_d["swe_seaice"] = inp[10]
+            sfc_v = SurfaceState(**{k: v for k, v in sfc_d.items() if k in SurfaceState.__dataclass_fields__})
+
+            _step_ogcm_voronoi_impl(
+                ogcm_v, sfc_v, mesh, cache, is_ocean,
+                inp[11], inp[12], inp[13], inp[14], inp[15], inp[16], inp[17], dt,
+                enable_seaice_drift=enable_seaice_drift,
+                sw_net_ocn=sw_i, sw_par_ocn=None, u10_ocn=None, co2_ppmv=co2_ppmv,
+                river_mouth_flux=riv_i,
+                enable_fct_zstar=enable_fct_zstar,
+                enable_scale_aware_gm=enable_scale_aware_gm,
+                enable_submeso=enable_submeso,
+                enable_tidal_mixing=enable_tidal_mixing,
+                enable_o2_omz=enable_o2_omz,
+                langmuir_fac=lang_i,
+            )
+            res = [
+                ogcm_v.temp, ogcm_v.sal, ogcm_v.t_comp, ogcm_v.s_comp,
+                ogcm_v.u_edge, ogcm_v.u_baro, ogcm_v.eta, ogcm_v.m_seaice_prev,
+                ogcm_v.h_bl, ogcm_v.w_vel, ogcm_v.kv_last,
+                sfc_v.t_ocean_ml, sfc_v.m_seaice, sfc_v.swe_seaice,
+            ]
+            if has_evp and evp_v is not None:
+                res.extend([
+                    evp_v.a_cat, evp_v.v_cat, evp_v.u_ice_e,
+                    evp_v.sigma_1, evp_v.sigma_s, evp_v.m_seaice_sync,
+                ])
+            return res
+
+        out = run_cuda_graph_cached(g_key, live_in, _cg_body, warmup_calls=2, clone_outputs=False)
+        ogcm.temp.copy_(out[0])
+        ogcm.sal.copy_(out[1])
+        ogcm.t_comp.copy_(out[2])
+        ogcm.s_comp.copy_(out[3])
+        ogcm.u_edge.copy_(out[4])
+        ogcm.u_baro.copy_(out[5])
+        ogcm.eta.copy_(out[6])
+        ogcm.m_seaice_prev.copy_(out[7])
+        ogcm.h_bl = out[8].clone()
+        ogcm.w_vel = out[9].clone()
+        ogcm.kv_last = out[10].clone()
+        sfc.t_ocean_ml.copy_(out[11])
+        sfc.m_seaice.copy_(out[12])
+        sfc.swe_seaice.copy_(out[13])
+        if has_evp and ogcm.seaice_evp is not None:
+            ogcm.seaice_evp.a_cat.copy_(out[14])
+            ogcm.seaice_evp.v_cat.copy_(out[15])
+            ogcm.seaice_evp.u_ice_e.copy_(out[16])
+            ogcm.seaice_evp.sigma_1.copy_(out[17])
+            ogcm.seaice_evp.sigma_s.copy_(out[18])
+            ogcm.seaice_evp.m_seaice_sync.copy_(out[19])
+        return
+
+    _step_ogcm_voronoi_impl(
+        ogcm, sfc, mesh, cache, is_ocean,
+        tau_x_sfc, tau_y_sfc, f_seaice, evap_cell, precip_cell,
+        runoff_total, runoff_glacier, dt,
+        enable_seaice_drift=enable_seaice_drift,
+        sw_net_ocn=sw_net_ocn, sw_par_ocn=sw_par_ocn, u10_ocn=u10_ocn, co2_ppmv=co2_ppmv,
+        river_mouth_flux=river_mouth_flux,
+        enable_fct_zstar=enable_fct_zstar,
+        enable_scale_aware_gm=enable_scale_aware_gm,
+        enable_submeso=enable_submeso,
+        enable_tidal_mixing=enable_tidal_mixing,
+        enable_o2_omz=enable_o2_omz,
+        langmuir_fac=langmuir_fac,
+    )
+
+
+def _step_ogcm_voronoi_impl(
+    ogcm: OceanOGCMState,
+    sfc: SurfaceState,
+    mesh: SCVTMesh,
+    cache: dict,
+    is_ocean: torch.Tensor,
+    tau_x_sfc: torch.Tensor,
+    tau_y_sfc: torch.Tensor,
+    f_seaice: torch.Tensor,
+    evap_cell: torch.Tensor,
+    precip_cell: torch.Tensor,
+    runoff_total: torch.Tensor,
+    runoff_glacier: torch.Tensor,
+    dt: float,
+    enable_seaice_drift: bool = True,
+    sw_net_ocn: torch.Tensor | None = None,
+    sw_par_ocn: torch.Tensor | None = None,
+    u10_ocn: torch.Tensor | None = None,
+    co2_ppmv: float = 284.3,
+    river_mouth_flux: torch.Tensor | None = None,
+    enable_fct_zstar: bool = False,
+    enable_scale_aware_gm: bool = True,
+    enable_submeso: bool = True,
+    enable_tidal_mixing: bool = True,
+    enable_o2_omz: bool = False,
+    langmuir_fac: torch.Tensor | None = None,
+) -> None:
+    """Core 3D Voronoi OGCM + sea-ice advancement body (shared across CUDA Graph & MPS/CPU)."""
+    dev = ogcm.temp.device
+    dtype = ogcm.temp.dtype
+    nzo = ogcm.nz_ocn
+    nc = mesh.n_cells
+    ne = mesh.n_edges
     is_ocn_f = cache["is_ocn_f"]
     c0 = mesh.cells_on_edge[:, 0]
     c1 = mesh.cells_on_edge[:, 1]

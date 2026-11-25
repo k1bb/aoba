@@ -62,6 +62,11 @@ from aoba.kernels import (
     mean_2d,
     sum_2d,
 )
+from aoba.runtime import (
+    can_use_cuda_graph,
+    run_cuda_graph_cached,
+    run_cuda_graph_train_step,
+)
 from aoba.thermodynamics import diagnose_pressure_temperature, qsat_mixed_val
 
 
@@ -1070,7 +1075,13 @@ def init_crm_self_distill_state(
     """Initialize online self-distilling 2D/3D CRM student network, optimizer, and GPU replay buffer."""
     st = max(int(stride), 2)
     net = CRMSelfDistillNet(nz=nz, hidden_dim=hidden_dim).to(device=device, dtype=torch.float32)
-    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1.0e-4, fused=(device.type == "cuda"))
+    opt = torch.optim.AdamW(
+        net.parameters(),
+        lr=lr,
+        weight_decay=1.0e-4,
+        fused=(device.type == "cuda"),
+        capturable=(device.type == "cuda"),
+    )
     replay = GPUReplayBuffer(capacity=replay_size, nz=nz, device=device, ny=ny, nx=nx)
     # Quasi-uniform spatial cohort hash across all latitudes/longitudes (coprime Knuth multiplier)
     cell_ids = torch.arange(n_cells, device=device, dtype=torch.int64)
@@ -1345,6 +1356,49 @@ def train_student_online(
         sm_fresh_b = None
         tm_fresh_b = None
 
+    def _one_grad_step(inp: list[torch.Tensor]) -> list[torch.Tensor]:
+        xb_i, cpb_i, csb_i, tpb_i, tsb_i = inp[0], inp[1], inp[2], inp[3], inp[4]
+        pa_raw, sa_raw, pb_raw, sb_raw, h_lat = state.net.forward_with_latent(xb_i)
+        # Unpack physics context [B, 10, nz] -> [nz, B]
+        cp_t = cpb_i.permute(1, 2, 0).contiguous()
+        rho_b, dz_b, ex_b = cp_t[0], cp_t[1], cp_t[2]
+        thm_ls_b, qn_ls_b = cp_t[3], cp_t[4]
+        qp_b, qc_b, qi_b, u_b, v_b = cp_t[5], cp_t[6], cp_t[7], cp_t[8], cp_t[9]
+        tsfc_b, shf_b, evap_b, tx_b, ty_b = csb_i[:, 0], csb_i[:, 1], csb_i[:, 2], csb_i[:, 3], csb_i[:, 4]
+
+        # Single batched exact conservation closure for both ensemble heads [2*B]
+        p_both = torch.cat([pa_raw, pb_raw], dim=0)
+        s_both = torch.cat([sa_raw, sb_raw], dim=0)
+        pred_both = apply_exact_conservation_closure(
+            p_both, s_both,
+            rho_b.repeat(1, 2), dz_b.repeat(1, 2), ex_b.repeat(1, 2), tsfc_b.repeat(2),
+            thm_ls_b.repeat(1, 2), qn_ls_b.repeat(1, 2),
+            qp_b.repeat(1, 2), qc_b.repeat(1, 2), qi_b.repeat(1, 2),
+            u_b.repeat(1, 2), v_b.repeat(1, 2),
+            shf_b.repeat(2), evap_b.repeat(2), tx_b.repeat(2), ty_b.repeat(2), dt,
+        )
+        b_cur = int(xb_i.shape[0])
+        pred_a = {k: (v[:, :b_cur].contiguous() if v.ndim == 2 else v[:b_cur]) for k, v in pred_both.items()}
+        pred_b = {k: (v[:, b_cur:].contiguous() if v.ndim == 2 else v[b_cur:]) for k, v in pred_both.items()}
+        loss_i, r_thm_i, r_qn_i = _compute_distill_loss(pred_a, pred_b, tpb_i, tsb_i, ex_b, dt)
+
+        if len(inp) == 8:
+            sc_pred, sp_pred, dt_cp_pred, dq_cp_pred, ug_pred = state.net.spatial_head(h_lat, inp[5])
+            loss_sp = _compute_spatial_placement_loss(
+                sc_pred, sp_pred, inp[6], inp[7],
+                dthm_cp=dt_cp_pred, dqv_cp=dq_cp_pred, u_gust=ug_pred,
+            )
+            loss_i = loss_i + 0.6 * loss_sp
+
+        state.optimizer.zero_grad(set_to_none=False)
+        loss_i.backward()
+        torch.nn.utils.clip_grad_norm_(
+            state.net.parameters(), max_norm=2.0, foreach=(x_fresh.device.type == "cuda"),
+        )
+        state.optimizer.step()
+        return [loss_i.detach(), r_thm_i.detach(), r_qn_i.detach()]
+
+    use_cg_train = can_use_cuda_graph(x_fresh.device)
     last_loss = None
     last_rthm = None
     last_rqn = None
@@ -1358,47 +1412,37 @@ def train_student_online(
         tpb = torch.cat([tgt_p_fresh[f_idx], tpr], dim=0)
         tsb = torch.cat([tgt_s_fresh[f_idx], tsr], dim=0)
 
-        pa_raw, sa_raw, pb_raw, sb_raw, h_lat = state.net.forward_with_latent(xb)
-        # Unpack physics context [B, 10, nz] -> [nz, B]
-        cp_t = cpb.permute(1, 2, 0).contiguous()
-        rho_b, dz_b, ex_b = cp_t[0], cp_t[1], cp_t[2]
-        thm_ls_b, qn_ls_b = cp_t[3], cp_t[4]
-        qp_b, qc_b, qi_b, u_b, v_b = cp_t[5], cp_t[6], cp_t[7], cp_t[8], cp_t[9]
-        tsfc_b, shf_b, evap_b, tx_b, ty_b = csb[:, 0], csb[:, 1], csb[:, 2], csb[:, 3], csb[:, 4]
-
-        # Single batched exact conservation closure for both ensemble heads [2*B]
-        p_both = torch.cat([pa_raw, pb_raw], dim=0)
-        s_both = torch.cat([sa_raw, sb_raw], dim=0)
-        pred_both = apply_exact_conservation_closure(
-            p_both, s_both,
-            rho_b.repeat(1, 2), dz_b.repeat(1, 2), ex_b.repeat(1, 2), tsfc_b.repeat(2),
-            thm_ls_b.repeat(1, 2), qn_ls_b.repeat(1, 2),
-            qp_b.repeat(1, 2), qc_b.repeat(1, 2), qi_b.repeat(1, 2),
-            u_b.repeat(1, 2), v_b.repeat(1, 2),
-            shf_b.repeat(2), evap_b.repeat(2), tx_b.repeat(2), ty_b.repeat(2), dt,
+        has_sp_batch = (
+            use_sp
+            and sm_fresh_b is not None
+            and tm_fresh_b is not None
+            and smr is not None
+            and tmr is not None
+            and hmr is not None
         )
-        b_cur = int(xb.shape[0])
-        pred_a = {k: (v[:, :b_cur].contiguous() if v.ndim == 2 else v[:b_cur]) for k, v in pred_both.items()}
-        pred_b = {k: (v[:, b_cur:].contiguous() if v.ndim == 2 else v[b_cur:]) for k, v in pred_both.items()}
-        loss, r_thm, r_qn = _compute_distill_loss(pred_a, pred_b, tpb, tsb, ex_b, dt)
-
-        if use_sp and sm_fresh_b is not None and tm_fresh_b is not None and smr is not None and tmr is not None and hmr is not None:
+        if has_sp_batch:
+            assert sm_fresh_b is not None and tm_fresh_b is not None and tgt_has_map_fresh is not None
+            assert smr is not None and tmr is not None and hmr is not None
             smb = torch.cat([sm_fresh_b[f_idx], smr], dim=0)
             tmb = torch.cat([tm_fresh_b[f_idx], tmr], dim=0)
             hmb = torch.cat([tgt_has_map_fresh[f_idx], hmr], dim=0)
-            sc_pred, sp_pred, dt_cp_pred, dq_cp_pred, ug_pred = state.net.spatial_head(h_lat, smb)
-            loss_sp = _compute_spatial_placement_loss(
-                sc_pred, sp_pred, tmb, hmb,
-                dthm_cp=dt_cp_pred, dqv_cp=dq_cp_pred, u_gust=ug_pred,
-            )
-            loss = loss + 0.6 * loss_sp
+            step_in = [xb, cpb, csb, tpb, tsb, smb, tmb, hmb]
+        else:
+            step_in = [xb, cpb, csb, tpb, tsb]
 
-        state.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            state.net.parameters(), max_norm=2.0, foreach=(x_fresh.device.type == "cuda"),
-        )
-        state.optimizer.step()
+        if use_cg_train:
+            g_key = (
+                "crm_ml_train",
+                id(state.net),
+                int(xb.shape[0]),
+                int(xb.shape[1]),
+                bool(has_sp_batch),
+                tuple(step_in[5].shape) if has_sp_batch else (),
+                round(float(dt), 6),
+            )
+            loss, r_thm, r_qn = run_cuda_graph_train_step(g_key, step_in, _one_grad_step, warmup_calls=3)
+        else:
+            loss, r_thm, r_qn = _one_grad_step(step_in)
         state.grad_updates += 1
         last_loss, last_rthm, last_rqn = loss, r_thm, r_qn
 
@@ -1442,73 +1486,117 @@ def predict_student_columns(
     n_s = int(x_stu.shape[0])
     nz = int(rho_d.shape[0])
     dev = x_stu.device
-
-    pa_all = torch.empty((n_s, _N_PROF_OUT, nz), device=dev, dtype=torch.float32)
-    sa_all = torch.empty((n_s, _N_SCAL_OUT), device=dev, dtype=torch.float32)
-    pb_all = torch.empty((n_s, _N_PROF_OUT, nz), device=dev, dtype=torch.float32)
-    sb_all = torch.empty((n_s, _N_SCAL_OUT), device=dev, dtype=torch.float32)
     want_sp = sub_maps_stu is not None and int(sub_maps_stu.shape[-2] * sub_maps_stu.shape[-1]) > 1
-    if want_sp:
-        ny_s, nx_s = int(sub_maps_stu.shape[-2]), int(sub_maps_stu.shape[-1])
-        sc_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
-        sp_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
-        dt_cp_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
-        dq_cp_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
-        ug_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
-    else:
-        sc_all = None
-        sp_all = None
-        dt_cp_all = None
-        dq_cp_all = None
-        ug_all = None
 
-    # Use FP16 autocast on MPS and BF16 on CUDA for peak Matrix/Tensor Core throughput!
-    use_cuda_amp = (dev.type == "cuda")
-    use_mps_amp = (dev.type == "mps")
-    for i0 in range(0, n_s, chunk_size):
-        i1 = min(i0 + chunk_size, n_s)
-        if use_cuda_amp:
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                pa, sa, pb, sb, h_lat = state.net.forward_with_latent(x_stu[i0:i1])
-                if want_sp and sub_maps_stu is not None:
-                    sc_c, sp_c, dtc_c, dqc_c, ugc_c = state.net.spatial_head(h_lat, sub_maps_stu[i0:i1])
-        elif use_mps_amp:
-            with torch.amp.autocast("mps", dtype=torch.float16):
-                pa, sa, pb, sb, h_lat = state.net.forward_with_latent(x_stu[i0:i1])
-                if want_sp and sub_maps_stu is not None:
-                    sc_c, sp_c, dtc_c, dqc_c, ugc_c = state.net.spatial_head(h_lat, sub_maps_stu[i0:i1])
+    def _pred_core(inp: list[torch.Tensor]) -> list[torch.Tensor]:
+        (
+            x_i, rho_i, dz_i, ex_i, ts_i, thm_i, qn_i, qp_i, qc_i, qi_i,
+            u_i, v_i, shf_i, evap_i, tx_i, ty_i,
+        ) = inp[0:16]
+        sm_i = inp[16] if len(inp) > 16 else None
+        pa_all = torch.empty((n_s, _N_PROF_OUT, nz), device=dev, dtype=torch.float32)
+        sa_all = torch.empty((n_s, _N_SCAL_OUT), device=dev, dtype=torch.float32)
+        pb_all = torch.empty((n_s, _N_PROF_OUT, nz), device=dev, dtype=torch.float32)
+        sb_all = torch.empty((n_s, _N_SCAL_OUT), device=dev, dtype=torch.float32)
+        if want_sp and sm_i is not None:
+            ny_s, nx_s = int(sm_i.shape[-2]), int(sm_i.shape[-1])
+            sc_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
+            sp_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
+            dt_cp_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
+            dq_cp_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
+            ug_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
         else:
-            pa, sa, pb, sb, h_lat = state.net.forward_with_latent(x_stu[i0:i1])
-            if want_sp and sub_maps_stu is not None:
-                sc_c, sp_c, dtc_c, dqc_c, ugc_c = state.net.spatial_head(h_lat, sub_maps_stu[i0:i1])
-        pa_all[i0:i1] = pa.float()
-        sa_all[i0:i1] = sa.float()
-        pb_all[i0:i1] = pb.float()
-        sb_all[i0:i1] = sb.float()
-        if want_sp and sc_all is not None and sp_all is not None and dt_cp_all is not None and dq_cp_all is not None and ug_all is not None:
-            sc_all[i0:i1] = sc_c.float()
-            sp_all[i0:i1] = sp_c.float()
-            dt_cp_all[i0:i1] = dtc_c.float()
-            dq_cp_all[i0:i1] = dqc_c.float()
-            ug_all[i0:i1] = ugc_c.float()
+            sc_all = sp_all = dt_cp_all = dq_cp_all = ug_all = None
 
-    # Ensemble-mean raw prediction -> single exact conservation projection
-    p_mean = 0.5 * (pa_all + pb_all)
-    s_mean = 0.5 * (sa_all + sb_all)
-    out = apply_exact_conservation_closure(
-        p_mean, s_mean, rho_d, dz_c, exner, temp_sfc, thm_post_ls, qn_post_ls,
-        qp_pre, qc_pre, qi_pre, u_pre, v_pre, shf, evap, tau_x, tau_y, dt,
-    )
-    if sc_all is not None and sp_all is not None:
-        out["score_cld"] = sc_all
-        out["score_prec"] = sp_all
-        if dt_cp_all is not None and dq_cp_all is not None and ug_all is not None:
-            out["dthm_cp"] = dt_cp_all
-            out["dqv_cp"] = dq_cp_all
-            out["u_gust"] = ug_all
-    # Epistemic disagreement score per column [N_s] for active OOD teacher routing
-    unc = (pa_all - pb_all).abs().reshape(n_s, -1).mean(dim=-1) + (sa_all - sb_all).abs().mean(dim=1)
-    return out, unc
+        use_cuda_amp = (dev.type == "cuda")
+        use_mps_amp = (dev.type == "mps")
+        for i0 in range(0, n_s, chunk_size):
+            i1 = min(i0 + chunk_size, n_s)
+            if use_cuda_amp:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pa, sa, pb, sb, h_lat = state.net.forward_with_latent(x_i[i0:i1])
+                    if want_sp and sm_i is not None:
+                        sc_c, sp_c, dtc_c, dqc_c, ugc_c = state.net.spatial_head(h_lat, sm_i[i0:i1])
+            elif use_mps_amp:
+                with torch.amp.autocast("mps", dtype=torch.float16):
+                    pa, sa, pb, sb, h_lat = state.net.forward_with_latent(x_i[i0:i1])
+                    if want_sp and sm_i is not None:
+                        sc_c, sp_c, dtc_c, dqc_c, ugc_c = state.net.spatial_head(h_lat, sm_i[i0:i1])
+            else:
+                pa, sa, pb, sb, h_lat = state.net.forward_with_latent(x_i[i0:i1])
+                if want_sp and sm_i is not None:
+                    sc_c, sp_c, dtc_c, dqc_c, ugc_c = state.net.spatial_head(h_lat, sm_i[i0:i1])
+            pa_all[i0:i1] = pa.float()
+            sa_all[i0:i1] = sa.float()
+            pb_all[i0:i1] = pb.float()
+            sb_all[i0:i1] = sb.float()
+            if want_sp and sc_all is not None and sp_all is not None and dt_cp_all is not None and dq_cp_all is not None and ug_all is not None:
+                sc_all[i0:i1] = sc_c.float()
+                sp_all[i0:i1] = sp_c.float()
+                dt_cp_all[i0:i1] = dtc_c.float()
+                dq_cp_all[i0:i1] = dqc_c.float()
+                ug_all[i0:i1] = ugc_c.float()
+
+        p_mean = 0.5 * (pa_all + pb_all)
+        s_mean = 0.5 * (sa_all + sb_all)
+        out_d = apply_exact_conservation_closure(
+            p_mean, s_mean, rho_i, dz_i, ex_i, ts_i, thm_i, qn_i,
+            qp_i, qc_i, qi_i, u_i, v_i, shf_i, evap_i, tx_i, ty_i, dt,
+        )
+        unc_v = (pa_all - pb_all).abs().reshape(n_s, -1).mean(dim=-1) + (sa_all - sb_all).abs().mean(dim=1)
+        res = [
+            out_d["theta_m"], out_d["q_n"], out_d["q_p"], out_d["q_v"], out_d["q_c"], out_d["q_i"],
+            out_d["u"], out_d["v"], out_d["f_cld"],
+            out_d["precip_rain"], out_d["precip_snow"], out_d["f_prec"],
+            unc_v,
+        ]
+        if sc_all is not None and sp_all is not None and dt_cp_all is not None and dq_cp_all is not None and ug_all is not None:
+            res.extend([sc_all, sp_all, dt_cp_all, dq_cp_all, ug_all])
+        return res
+
+    live_in = [
+        x_stu, rho_d, dz_c, exner, temp_sfc, thm_post_ls, qn_post_ls,
+        qp_pre, qc_pre, qi_pre, u_pre, v_pre, shf, evap, tau_x, tau_y,
+    ]
+    if want_sp and sub_maps_stu is not None:
+        live_in.append(sub_maps_stu)
+
+    if can_use_cuda_graph(dev):
+        g_key = (
+            "crm_ml_predict",
+            id(state.net),
+            n_s,
+            nz,
+            int(x_stu.shape[1]),
+            bool(want_sp),
+            tuple(sub_maps_stu.shape) if (want_sp and sub_maps_stu is not None) else (),
+            round(float(dt), 6),
+        )
+        res_t = run_cuda_graph_cached(g_key, live_in, _pred_core, warmup_calls=2, clone_outputs=True)
+    else:
+        res_t = _pred_core(live_in)
+
+    out = {
+        "theta_m": res_t[0],
+        "q_n": res_t[1],
+        "q_p": res_t[2],
+        "q_v": res_t[3],
+        "q_c": res_t[4],
+        "q_i": res_t[5],
+        "u": res_t[6],
+        "v": res_t[7],
+        "f_cld": res_t[8],
+        "precip_rain": res_t[9],
+        "precip_snow": res_t[10],
+        "f_prec": res_t[11],
+    }
+    if len(res_t) > 13:
+        out["score_cld"] = res_t[13]
+        out["score_prec"] = res_t[14]
+        out["dthm_cp"] = res_t[15]
+        out["dqv_cp"] = res_t[16]
+        out["u_gust"] = res_t[17]
+    return out, res_t[12]
 
 
 def pack_teacher_context_and_targets(
@@ -1893,7 +1981,13 @@ def init_rad_self_distill_state(
     """Initialize online ICA radiation student network, optimizer, and GPU replay buffer."""
     st = max(int(stride), 2)
     net = RadSelfDistillNet(nz=nz, hidden_dim=hidden_dim).to(device=device, dtype=torch.float32)
-    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1.0e-4, fused=(device.type == "cuda"))
+    opt = torch.optim.AdamW(
+        net.parameters(),
+        lr=lr,
+        weight_decay=1.0e-4,
+        fused=(device.type == "cuda"),
+        capturable=(device.type == "cuda"),
+    )
     replay = GPURadReplayBuffer(capacity=replay_size, nz=nz, device=device)
     cell_ids = torch.arange(n_cells, device=device, dtype=torch.int64)
     cohort_id = ((cell_ids * 2654435761) % st).to(torch.int64)
@@ -1974,29 +2068,31 @@ def _compute_rad_distill_loss(
     tgt_s: torch.Tensor,      # [B, 7] [W m^-2]
     cp_layer: torch.Tensor,   # [nz, B]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Multi-scale heating-rate + TOA/surface flux loss across both epistemic heads."""
+    """Multi-scale heating-rate + TOA/surface flux loss across both epistemic heads (batched)."""
     qr_t_kd = tgt_qrad * C.SECONDS_PER_DAY
     cp_w = cp_layer / torch.clamp(cp_layer.sum(dim=0, keepdim=True), min=1.0)
     s_scale = 0.01  # 100 W m^-2 -> 1.0
 
-    def _head_loss(pr: dict[str, torch.Tensor]) -> torch.Tensor:
-        qr_p_kd = pr["q_rad"] * C.SECONDS_PER_DAY
-        l_qr_unif = F.smooth_l1_loss(qr_p_kd, qr_t_kd, beta=0.5)
-        l_qr_mass = (cp_w * F.smooth_l1_loss(qr_p_kd, qr_t_kd, beta=0.25, reduction="none")).sum(dim=0).mean()
-        l_s1d = F.smooth_l1_loss(pr["sw1_dir"] * s_scale, tgt_s[:, 0] * s_scale, beta=0.05)
-        l_s1f = F.smooth_l1_loss(pr["sw1_dif"] * s_scale, tgt_s[:, 1] * s_scale, beta=0.05)
-        l_s2d = F.smooth_l1_loss(pr["sw2_dir"] * s_scale, tgt_s[:, 2] * s_scale, beta=0.05)
-        l_s2f = F.smooth_l1_loss(pr["sw2_dif"] * s_scale, tgt_s[:, 3] * s_scale, beta=0.05)
-        l_lwd = F.smooth_l1_loss(pr["lw_dn"] * s_scale, tgt_s[:, 4] * s_scale, beta=0.05)
-        l_olr = F.smooth_l1_loss(pr["olr"] * s_scale, tgt_s[:, 5] * s_scale, beta=0.05)
-        l_asr = F.smooth_l1_loss(pr["asr"] * s_scale, tgt_s[:, 6] * s_scale, beta=0.05)
-        return (
-            1.5 * l_qr_unif + 2.5 * l_qr_mass
-            + 2.0 * (l_s1d + l_s1f + l_s2d + l_s2f)
-            + 3.0 * (l_lwd + l_olr + l_asr)
-        )
+    qr_p2 = torch.cat([pred_a["q_rad"], pred_b["q_rad"]], dim=1) * C.SECONDS_PER_DAY
+    qr_t2 = torch.cat([qr_t_kd, qr_t_kd], dim=1)
+    cp_w2 = torch.cat([cp_w, cp_w], dim=1)
+    l_qr_unif = F.smooth_l1_loss(qr_p2, qr_t2, beta=0.5)
+    l_qr_mass = (cp_w2 * F.smooth_l1_loss(qr_p2, qr_t2, beta=0.25, reduction="none")).sum(dim=0).mean()
 
-    loss = 0.5 * (_head_loss(pred_a) + _head_loss(pred_b))
+    sp_a = torch.stack(
+        [pred_a["sw1_dir"], pred_a["sw1_dif"], pred_a["sw2_dir"], pred_a["sw2_dif"], pred_a["lw_dn"], pred_a["olr"], pred_a["asr"]],
+        dim=1,
+    )
+    sp_b = torch.stack(
+        [pred_b["sw1_dir"], pred_b["sw1_dif"], pred_b["sw2_dir"], pred_b["sw2_dif"], pred_b["lw_dn"], pred_b["olr"], pred_b["asr"]],
+        dim=1,
+    )
+    sp2 = torch.cat([sp_a, sp_b], dim=0) * s_scale
+    st2 = torch.cat([tgt_s, tgt_s], dim=0) * s_scale
+    w_s = torch.tensor([2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0], device=tgt_s.device, dtype=tgt_s.dtype).unsqueeze(0)
+    l_scal = (F.smooth_l1_loss(sp2, st2, beta=0.05, reduction="none") * w_s).mean(dim=0).sum()
+
+    loss = 1.5 * l_qr_unif + 2.5 * l_qr_mass + l_scal
     with torch.no_grad():
         olr_m = 0.5 * (pred_a["olr"] + pred_b["olr"])
         asr_m = 0.5 * (pred_a["asr"] + pred_b["asr"])
@@ -2055,6 +2151,30 @@ def train_rad_student_online(
     b_fresh = int(x_fresh.shape[0])
     half_b = min(batch_size // 2, b_fresh)
 
+    def _one_rad_grad_step(inp: list[torch.Tensor]) -> list[torch.Tensor]:
+        xb_i, cpb_i, csb_i, tqb_i, tsb_i = inp[0], inp[1], inp[2], inp[3], inp[4]
+        qa_raw, sa_raw, qb_raw, sb_raw = state.net(xb_i)
+        pred_both = apply_exact_rad_conservation_closure(
+            torch.cat([qa_raw, qb_raw], dim=0),
+            torch.cat([sa_raw, sb_raw], dim=0),
+            cpb_i.repeat(1, 2),
+            csb_i[:, 0].repeat(2), csb_i[:, 1].repeat(2), csb_i[:, 2].repeat(2),
+            csb_i[:, 3].repeat(2), csb_i[:, 4].repeat(2), csb_i[:, 5].repeat(2), csb_i[:, 6].repeat(2),
+        )
+        b_cur = int(xb_i.shape[0])
+        pred_a = {k: (v[:, :b_cur].contiguous() if v.ndim == 2 else v[:b_cur]) for k, v in pred_both.items()}
+        pred_b = {k: (v[:, b_cur:].contiguous() if v.ndim == 2 else v[b_cur:]) for k, v in pred_both.items()}
+        loss_i, r_olr_i, r_asr_i = _compute_rad_distill_loss(pred_a, pred_b, tqb_i, tsb_i, cpb_i)
+
+        state.optimizer.zero_grad(set_to_none=False)
+        loss_i.backward()
+        torch.nn.utils.clip_grad_norm_(
+            state.net.parameters(), max_norm=2.0, foreach=(x_fresh.device.type == "cuda"),
+        )
+        state.optimizer.step()
+        return [loss_i.detach(), r_olr_i.detach(), r_asr_i.detach()]
+
+    use_cg_rad = can_use_cuda_graph(x_fresh.device)
     last_loss = None
     last_olr = None
     last_asr = None
@@ -2067,25 +2187,12 @@ def train_rad_student_online(
         tqb = torch.cat([tgt_qr_fresh[f_idx], tqr], dim=0).transpose(0, 1).contiguous()  # [nz, B]
         tsb = torch.cat([tgt_s_fresh[f_idx], tsr], dim=0)
 
-        qa_raw, sa_raw, qb_raw, sb_raw = state.net(xb)
-        pred_both = apply_exact_rad_conservation_closure(
-            torch.cat([qa_raw, qb_raw], dim=0),
-            torch.cat([sa_raw, sb_raw], dim=0),
-            cpb.repeat(1, 2),
-            csb[:, 0].repeat(2), csb[:, 1].repeat(2), csb[:, 2].repeat(2),
-            csb[:, 3].repeat(2), csb[:, 4].repeat(2), csb[:, 5].repeat(2), csb[:, 6].repeat(2),
-        )
-        b_cur = int(xb.shape[0])
-        pred_a = {k: (v[:, :b_cur].contiguous() if v.ndim == 2 else v[:b_cur]) for k, v in pred_both.items()}
-        pred_b = {k: (v[:, b_cur:].contiguous() if v.ndim == 2 else v[b_cur:]) for k, v in pred_both.items()}
-        loss, r_olr, r_asr = _compute_rad_distill_loss(pred_a, pred_b, tqb, tsb, cpb)
-
-        state.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            state.net.parameters(), max_norm=2.0, foreach=(x_fresh.device.type == "cuda"),
-        )
-        state.optimizer.step()
+        step_in = [xb, cpb, csb, tqb, tsb]
+        if use_cg_rad:
+            g_key = ("rad_ml_train", id(state.net), int(xb.shape[0]), int(xb.shape[1]), int(cpb.shape[0]))
+            loss, r_olr, r_asr = run_cuda_graph_train_step(g_key, step_in, _one_rad_grad_step, warmup_calls=3)
+        else:
+            loss, r_olr, r_asr = _one_rad_grad_step(step_in)
         state.grad_updates += 1
         last_loss, last_olr, last_asr = loss, r_olr, r_asr
 
@@ -2119,35 +2226,59 @@ def predict_rad_student_columns(
     nz = int(cp_layer.shape[0])
     dev = x_stu.device
 
-    qa_all = torch.empty((m_s, nz), device=dev, dtype=torch.float32)
-    sa_all = torch.empty((m_s, _N_RAD_SCAL_OUT), device=dev, dtype=torch.float32)
-    qb_all = torch.empty((m_s, nz), device=dev, dtype=torch.float32)
-    sb_all = torch.empty((m_s, _N_RAD_SCAL_OUT), device=dev, dtype=torch.float32)
+    def _rad_pred_core(inp: list[torch.Tensor]) -> list[torch.Tensor]:
+        x_i, cp_i, si_i, avd_i, avf_i, and_i, anf_i, em_i, ts_i = inp
+        qa_all = torch.empty((m_s, nz), device=dev, dtype=torch.float32)
+        sa_all = torch.empty((m_s, _N_RAD_SCAL_OUT), device=dev, dtype=torch.float32)
+        qb_all = torch.empty((m_s, nz), device=dev, dtype=torch.float32)
+        sb_all = torch.empty((m_s, _N_RAD_SCAL_OUT), device=dev, dtype=torch.float32)
 
-    use_cuda_amp = (dev.type == "cuda")
-    use_mps_amp = (dev.type == "mps")
-    for i0 in range(0, m_s, chunk_size):
-        i1 = min(i0 + chunk_size, m_s)
-        if use_cuda_amp:
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                qa, sa, qb, sb = state.net(x_stu[i0:i1])
-        elif use_mps_amp:
-            with torch.amp.autocast("mps", dtype=torch.float16):
-                qa, sa, qb, sb = state.net(x_stu[i0:i1])
-        else:
-            qa, sa, qb, sb = state.net(x_stu[i0:i1])
-        qa_all[i0:i1] = qa.float()
-        sa_all[i0:i1] = sa.float()
-        qb_all[i0:i1] = qb.float()
-        sb_all[i0:i1] = sb.float()
+        use_cuda_amp = (dev.type == "cuda")
+        use_mps_amp = (dev.type == "mps")
+        for i0 in range(0, m_s, chunk_size):
+            i1 = min(i0 + chunk_size, m_s)
+            if use_cuda_amp:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    qa, sa, qb, sb = state.net(x_i[i0:i1])
+            elif use_mps_amp:
+                with torch.amp.autocast("mps", dtype=torch.float16):
+                    qa, sa, qb, sb = state.net(x_i[i0:i1])
+            else:
+                qa, sa, qb, sb = state.net(x_i[i0:i1])
+            qa_all[i0:i1] = qa.float()
+            sa_all[i0:i1] = sa.float()
+            qb_all[i0:i1] = qb.float()
+            sb_all[i0:i1] = sb.float()
 
-    q_mean = 0.5 * (qa_all + qb_all)
-    s_mean = 0.5 * (sa_all + sb_all)
-    out = apply_exact_rad_conservation_closure(
-        q_mean, s_mean, cp_layer, s_inc, alb_vd, alb_vf, alb_nd, alb_nf, emiss_sfc, t_sfc
-    )
-    unc = (qa_all - qb_all).abs().mean(dim=1) + (sa_all - sb_all).abs().mean(dim=1)
-    return out, unc
+        q_mean = 0.5 * (qa_all + qb_all)
+        s_mean = 0.5 * (sa_all + sb_all)
+        out_d = apply_exact_rad_conservation_closure(
+            q_mean, s_mean, cp_i, si_i, avd_i, avf_i, and_i, anf_i, em_i, ts_i
+        )
+        unc_v = (qa_all - qb_all).abs().mean(dim=1) + (sa_all - sb_all).abs().mean(dim=1)
+        return [
+            out_d["q_rad"], out_d["sw1_dir"], out_d["sw1_dif"], out_d["sw2_dir"],
+            out_d["sw2_dif"], out_d["lw_dn"], out_d["olr"], out_d["asr"], unc_v,
+        ]
+
+    live_in = [x_stu, cp_layer, s_inc, alb_vd, alb_vf, alb_nd, alb_nf, emiss_sfc, t_sfc]
+    if can_use_cuda_graph(dev):
+        g_key = ("rad_ml_predict", id(state.net), m_s, nz, int(x_stu.shape[1]))
+        res_t = run_cuda_graph_cached(g_key, live_in, _rad_pred_core, warmup_calls=2, clone_outputs=True)
+    else:
+        res_t = _rad_pred_core(live_in)
+
+    out = {
+        "q_rad": res_t[0],
+        "sw1_dir": res_t[1],
+        "sw1_dif": res_t[2],
+        "sw2_dir": res_t[3],
+        "sw2_dif": res_t[4],
+        "lw_dn": res_t[5],
+        "olr": res_t[6],
+        "asr": res_t[7],
+    }
+    return out, res_t[8]
 
 
 # ---------------------------------------------------------------------------

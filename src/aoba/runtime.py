@@ -384,6 +384,66 @@ def run_cuda_graph_cached(
         return [t.clone() for t in static_out] if clone_outputs else list(static_out)
 
 
+def run_cuda_graph_train_step(
+    key: tuple,
+    live_inputs: list[torch.Tensor],
+    train_body_fn,
+    *,
+    warmup_calls: int = 3,
+) -> list[torch.Tensor]:
+    """Execute one autograd + optimizer training step via a lazily captured static CUDA Graph.
+
+    Runs `warmup_calls` real eager training steps first so fused AdamW state buffers and cuDNN
+    convolution heuristics are fully initialized on GPU before stream capture. Because CUDA Graph
+    capture only records kernels without executing them, calling `g.replay()` immediately after
+    capture applies the exact single gradient update for the capture step with zero extra steps.
+    """
+    global _CUDA_GRAPH_POOL
+    slot = _CUDA_GRAPH_CACHE.get(key)
+    if slot is not None and slot.get("failed", False):
+        return train_body_fn(live_inputs)
+
+    if slot is None:
+        slot = {"seen": 0, "graph": None, "failed": False}
+        _CUDA_GRAPH_CACHE[key] = slot
+
+    if slot["graph"] is None:
+        seen = int(slot["seen"])
+        if seen < warmup_calls:
+            if seen == 0:
+                torch.backends.cudnn.benchmark = True
+            slot["seen"] = seen + 1
+            return train_body_fn(live_inputs)
+        try:
+            if _CUDA_GRAPH_POOL is None:
+                _CUDA_GRAPH_POOL = torch.cuda.graphs.graph_pool_handle()
+            static_in = [t.detach().clone() for t in live_inputs]
+            torch.cuda.synchronize()
+            cap_stream = torch.cuda.Stream()
+            cap_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(cap_stream):
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=_CUDA_GRAPH_POOL):
+                    static_out = train_body_fn(static_in)
+            torch.cuda.current_stream().wait_stream(cap_stream)
+            slot["graph"] = g
+            slot["static_in"] = static_in
+            slot["static_out"] = static_out
+            g.replay()
+            return list(static_out)
+        except Exception as exc:
+            print(f"[AOBA CUDA Graph] Train capture fallback for {key[0]}: {type(exc).__name__}: {exc}", flush=True)
+            slot["failed"] = True
+            return train_body_fn(live_inputs)
+
+    static_in = slot["static_in"]
+    static_out = slot["static_out"]
+    for dst, src in zip(static_in, live_inputs):
+        dst.copy_(src)
+    slot["graph"].replay()
+    return list(static_out)
+
+
 def maybe_cuda_compile(fn, *, device: torch.device | str | None = None):
     """Return a lazily `torch.compile`-fused version of pure-tensor `fn` on CUDA (no-op on CPU/MPS).
 

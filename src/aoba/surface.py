@@ -68,7 +68,7 @@ from aoba.kernels import (
     dispatch_surface_ocean_seaice_post_metal,
     solve_tridiagonal_batched,
 )
-from aoba.runtime import maybe_cuda_compile
+from aoba.runtime import can_use_cuda_graph, maybe_cuda_compile, run_cuda_graph_cached
 from aoba.thermodynamics import esat_ice, esat_liquid, qsat_mixed
 from aoba.turbulence import (
     canopy_roughness_raupach,
@@ -1831,6 +1831,183 @@ def _step_surface_compacted(
         sfc.t_gnd_skin = sfc.t_soil[0].clone()
     if sfc.t_ocean_ml_comp is None:
         sfc.t_ocean_ml_comp = torch.zeros_like(sfc.t_ocean_ml)
+
+    if can_use_cuda_graph(dev):
+        bio_dict0 = sfc.bio.__dict__
+        bio_keys: list[str] = []
+        bio_tensors: list[torch.Tensor] = []
+        for attr in _BIO_SURFACE_READ_ATTRS:
+            val = bio_dict0.get(attr)
+            if isinstance(val, torch.Tensor):
+                bio_keys.append(attr)
+                bio_tensors.append(val)
+        n_bio = len(bio_keys)
+
+        sfc_state_in = [
+            sfc.t_soil, sfc.w_liq_soil, sfc.w_ice_soil, sfc.w_root, sfc.w_canopy,
+            sfc.t_canopy, sfc.t_leaf_sun, sfc.t_leaf_sh, sfc.t_gnd_skin,
+            sfc.swe_land, sfc.swe_max_season, sfc.snow_age,
+            sfc.t_ocean_ml, sfc.t_ocean_ml_comp, sfc.h_ocean_ml, sfc.u_star_ocean,
+            sfc.m_seaice, sfc.t_seaice, sfc.swe_seaice,
+        ]
+        forcing_in = [
+            u_1, v_1, temp_1, qv_1, pres_1, pres_sfc, z_ref_rel,
+            sw1_dir_down, sw1_dif_down, sw2_dir_down, sw2_dif_down, lw_down,
+            precip_rain, precip_snow, mu0,
+            alb_vis_dir, alb_vis_dif, alb_nir_dir, alb_nir_dif,
+            h_exp, lai_exp, a_sn, f_ice,
+        ]
+        live_in = sfc_state_in + forcing_in + bio_tensors
+        g_key = (
+            "surface_compacted",
+            n_tot,
+            int(terr_idx.data_ptr()),
+            int(ocn_idx.data_ptr()),
+            str(dev),
+            str(dtype),
+            tuple(bio_keys),
+            round(float(co2_ppmv), 4),
+            round(float(dt), 6),
+        )
+
+        def _cg_body(inp: list[torch.Tensor]) -> list[torch.Tensor]:
+            # Build shallow view states pointing to graph static buffers (never mutates outer `sfc`)
+            s_d = dict(sfc.__dict__)
+            (
+                s_d["t_soil"], s_d["w_liq_soil"], s_d["w_ice_soil"], s_d["w_root"], s_d["w_canopy"],
+                s_d["t_canopy"], s_d["t_leaf_sun"], s_d["t_leaf_sh"], s_d["t_gnd_skin"],
+                s_d["swe_land"], s_d["swe_max_season"], s_d["snow_age"],
+                s_d["t_ocean_ml"], s_d["t_ocean_ml_comp"], s_d["h_ocean_ml"], s_d["u_star_ocean"],
+                s_d["m_seaice"], s_d["t_seaice"], s_d["swe_seaice"],
+            ) = inp[0:19]
+            b_d = dict(bio_dict0)
+            for bi, bk in enumerate(bio_keys):
+                b_d[bk] = inp[42 + bi]
+            s_d["bio"] = BiosphereState(**b_d)
+            # Shallow clone mutable state tensors so graph replay starts cleanly from `inp`
+            for mk in (
+                "t_soil", "w_liq_soil", "w_ice_soil", "w_root", "w_canopy",
+                "t_canopy", "t_leaf_sun", "t_leaf_sh", "t_gnd_skin",
+                "swe_land", "swe_max_season", "snow_age",
+                "t_ocean_ml", "t_ocean_ml_comp", "u_star_ocean",
+                "m_seaice", "t_seaice", "swe_seaice",
+            ):
+                s_d[mk] = s_d[mk].clone()
+            sfc_v = SurfaceState(**{k: v for k, v in s_d.items() if k in SurfaceState.__dataclass_fields__})
+            diag_v = _step_surface_compacted_impl(
+                sfc_v, terr_idx, ocn_idx, is_land_t, is_ice_t, is_terr_t,
+                inp[19], inp[20], inp[21], inp[22], inp[23], inp[24], inp[25],
+                inp[26], inp[27], inp[28], inp[29], inp[30],
+                inp[31], inp[32], inp[33], co2_ppmv, dt,
+                inp[34], inp[35], inp[36], inp[37],
+                inp[38], inp[39], inp[40], inp[41],
+            )
+            return [
+                sfc_v.t_soil, sfc_v.w_liq_soil, sfc_v.w_ice_soil, sfc_v.w_root, sfc_v.w_canopy,
+                sfc_v.t_canopy, sfc_v.t_leaf_sun, sfc_v.t_leaf_sh, sfc_v.t_gnd_skin,
+                sfc_v.swe_land, sfc_v.swe_max_season, sfc_v.snow_age,
+                sfc_v.t_ocean_ml, sfc_v.t_ocean_ml_comp, sfc_v.u_star_ocean,
+                sfc_v.m_seaice, sfc_v.t_seaice, sfc_v.swe_seaice,
+                diag_v.shf, diag_v.lhf, diag_v.evap, diag_v.tau_x, diag_v.tau_y,
+                diag_v.u_star, diag_v.buoy_flux, diag_v.t_rad_sfc, diag_v.emiss_sfc,
+                diag_v.d_disp, diag_v.z0m, diag_v.runoff_total, diag_v.runoff_ice,
+                diag_v.gpp, diag_v.f_snow_land, diag_v.smb_ice_flux,
+                diag_v.resp_leaf, diag_v.an_net, diag_v.transp,
+            ]
+
+        out = run_cuda_graph_cached(g_key, live_in, _cg_body, warmup_calls=2, clone_outputs=False)
+        sfc.t_soil.copy_(out[0])
+        sfc.w_liq_soil.copy_(out[1])
+        sfc.w_ice_soil.copy_(out[2])
+        sfc.w_root.copy_(out[3])
+        sfc.w_canopy.copy_(out[4])
+        sfc.t_canopy.copy_(out[5])
+        sfc.t_leaf_sun.copy_(out[6])
+        sfc.t_leaf_sh.copy_(out[7])
+        sfc.t_gnd_skin.copy_(out[8])
+        sfc.swe_land.copy_(out[9])
+        sfc.swe_max_season.copy_(out[10])
+        sfc.snow_age.copy_(out[11])
+        sfc.t_ocean_ml.copy_(out[12])
+        sfc.t_ocean_ml_comp.copy_(out[13])
+        sfc.u_star_ocean.copy_(out[14])
+        sfc.m_seaice.copy_(out[15])
+        sfc.t_seaice.copy_(out[16])
+        sfc.swe_seaice.copy_(out[17])
+        return SurfaceFluxDiagnostics(
+            shf=out[18].clone(),
+            lhf=out[19].clone(),
+            evap=out[20].clone(),
+            tau_x=out[21].clone(),
+            tau_y=out[22].clone(),
+            u_star=out[23].clone(),
+            buoy_flux=out[24].clone(),
+            alb_vis_dir=alb_vis_dir,
+            alb_vis_dif=alb_vis_dif,
+            alb_nir_dir=alb_nir_dir,
+            alb_nir_dif=alb_nir_dif,
+            t_rad_sfc=out[25].clone(),
+            emiss_sfc=out[26].clone(),
+            d_disp=out[27].clone(),
+            z0m=out[28].clone(),
+            runoff_total=out[29].clone(),
+            runoff_ice=out[30].clone(),
+            gpp=out[31].clone(),
+            f_seaice=f_ice,
+            f_snow_land=out[32].clone(),
+            smb_ice_flux=out[33].clone(),
+            resp_leaf=out[34].clone(),
+            an_net=out[35].clone(),
+            transp=out[36].clone(),
+        )
+
+    return _step_surface_compacted_impl(
+        sfc, terr_idx, ocn_idx, is_land_t, is_ice_t, is_terr_t,
+        u_1, v_1, temp_1, qv_1, pres_1, pres_sfc, z_ref_rel,
+        sw1_dir_down, sw1_dif_down, sw2_dir_down, sw2_dif_down, lw_down,
+        precip_rain, precip_snow, mu0, co2_ppmv, dt,
+        alb_vis_dir, alb_vis_dif, alb_nir_dir, alb_nir_dif,
+        h_exp, lai_exp, a_sn, f_ice,
+    )
+
+
+def _step_surface_compacted_impl(
+    sfc: SurfaceState,
+    terr_idx: torch.Tensor,
+    ocn_idx: torch.Tensor,
+    is_land_t: torch.Tensor,
+    is_ice_t: torch.Tensor,
+    is_terr_t: torch.Tensor,
+    u_1: torch.Tensor,
+    v_1: torch.Tensor,
+    temp_1: torch.Tensor,
+    qv_1: torch.Tensor,
+    pres_1: torch.Tensor,
+    pres_sfc: torch.Tensor,
+    z_ref_rel: torch.Tensor,
+    sw1_dir_down: torch.Tensor,
+    sw1_dif_down: torch.Tensor,
+    sw2_dir_down: torch.Tensor,
+    sw2_dif_down: torch.Tensor,
+    lw_down: torch.Tensor,
+    precip_rain: torch.Tensor,
+    precip_snow: torch.Tensor,
+    mu0: torch.Tensor,
+    co2_ppmv: float,
+    dt: float,
+    alb_vis_dir: torch.Tensor,
+    alb_vis_dif: torch.Tensor,
+    alb_nir_dir: torch.Tensor,
+    alb_nir_dif: torch.Tensor,
+    h_exp: torch.Tensor,
+    lai_exp: torch.Tensor,
+    a_sn: torch.Tensor,
+    f_ice: torch.Tensor,
+) -> SurfaceFluxDiagnostics:
+    """Core compacted terrestrial+ocean surface integration body (shared across CUDA Graph & MPS/CPU)."""
+    dev = u_1.device
+    dtype = u_1.dtype
+    n_tot = int(u_1.numel())
 
     # =========================================================================
     # PART A: TERRESTRIAL TILES ONLY (`terr_idx`, ~29% of Earth tiles -> 3.4x speedup)
