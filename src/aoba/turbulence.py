@@ -407,6 +407,7 @@ def step_mynn_level25(
     evap_sfc: torch.Tensor,
     dt: float,
     return_hydrometeors: bool = False,
+    do_sat_adj: bool = True,
 ):
     """Advance vertical PBL mixing and prognostic doubled TKE `qke = q^2 = 2e` via MYNN Level 2.5.
 
@@ -414,6 +415,8 @@ def step_mynn_level25(
     except `z_w` which has `[nz + 1, ...]`. Surface fluxes (`tau_x_sfc`, `tau_y_sfc`, `shf_sfc` [W m^-2],
     `evap_sfc` [kg m^-2 s^-1], `sfc_buoy_flux` `= (g/theta_0) * <w'theta_v'>_sfc` [m^2 s^-3])
     are defined positive upward from the surface into layer `k = 0`.
+    Setting `do_sat_adj = False` performs pure conservative turbulent mixing of `(theta, q_v, q_c, q_i)`
+    without grid-mean phase conversion (appropriate for 250 km host columns where clouds are subgrid).
 
     Returns `(u_new, v_new, theta_m_c_new, q_n_new, qke_new, k_m_int, k_h_int)`.
 
@@ -432,6 +435,7 @@ def step_mynn_level25(
             tau_x_sfc=tau_x_sfc, tau_y_sfc=tau_y_sfc,
             shf_sfc=shf_sfc, evap_sfc=evap_sfc,
             dt=dt, mynn_consts=_MYNN_METAL_CONSTS,
+            do_sat_adj=do_sat_adj,
         )
         return res if return_hydrometeors else res[:7]
     q2 = torch.clamp(qke, min=2.0 * TKE_MIN)
@@ -648,16 +652,25 @@ def step_mynn_level25(
     u_new = _diffuse_momentum_implicit(u, k_m_int, tau_x_sfc)
     v_new = _diffuse_momentum_implicit(v, k_m_int, tau_y_sfc)
 
-    # Convert upward sensible heat flux [W m^-2] to kinematic rho_d * w'theta_l' flux [kg m^-2 K s^-1]
+    # Convert upward sensible heat flux [W m^-2] to kinematic rho_d * w'theta' flux [kg m^-2 K s^-1]
     cp_eff_0 = C.CP_D + C.CP_V * q_v[0]
     thl_flux_sfc = shf_sfc / (cp_eff_0 * exner[0])
-    theta_l_new = _diffuse_implicit(theta_l, k_h_int, thl_flux_sfc)
-    q_n_new = torch.clamp(_diffuse_implicit(q_n, k_h_int, evap_sfc), min=0.0)
-
-    # Reconstruct updated moist potential temperature theta_m_c from diffused (theta_l_new, q_n_new)
-    t_li_new = theta_l_new * exner
-    temp_new, qv_new, qc_new, qi_new = saturation_adjustment(t_li_new, pres, q_n_new)
-    theta_m_new = (temp_new / exner) * (1.0 + C.RV_OVER_RD * qv_new)
+    if do_sat_adj:
+        theta_l_new = _diffuse_implicit(theta_l, k_h_int, thl_flux_sfc)
+        q_n_new = torch.clamp(_diffuse_implicit(q_n, k_h_int, evap_sfc), min=0.0)
+        # Reconstruct updated moist potential temperature theta_m_c from diffused (theta_l_new, q_n_new)
+        t_li_new = theta_l_new * exner
+        temp_new, qv_new, qc_new, qi_new = saturation_adjustment(t_li_new, pres, q_n_new)
+        theta_m_new = (temp_new / exner) * (1.0 + C.RV_OVER_RD * qv_new)
+    else:
+        # Pure conservative turbulent mixing without grid-mean phase conversion (preserves subgrid clouds)
+        zero_sfc = torch.zeros_like(evap_sfc)
+        theta_new = _diffuse_implicit(theta, k_h_int, thl_flux_sfc)
+        qv_new = torch.clamp(_diffuse_implicit(q_v, k_h_int, evap_sfc), min=0.0)
+        qc_new = torch.clamp(_diffuse_implicit(q_c, k_h_int, zero_sfc), min=0.0)
+        qi_new = torch.clamp(_diffuse_implicit(q_i, k_h_int, zero_sfc), min=0.0)
+        q_n_new = qv_new + qc_new + qi_new
+        theta_m_new = theta_new * (1.0 + C.RV_OVER_RD * qv_new)
 
     if return_hydrometeors:
         return u_new, v_new, theta_m_new, q_n_new, qke_new, k_m_int, k_h_int, qv_new, qc_new, qi_new

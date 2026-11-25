@@ -211,9 +211,12 @@ def test_gui_server_endpoints() -> None:
                 ).read().decode("utf-8")
             )
             assert mon["ok"] and mon["raster"] is not None
-            assert mon["raster"]["width"] == 360 and mon["raster"]["height"] == 180
+            assert mon["raster"]["width"] == 720 and mon["raster"]["height"] == 360
             assert len(mon["raster"]["t2_b64"]) > 1000
+            assert len(mon["raster"]["ir_b64"]) > 1000
             assert len(mon["raster"]["precip_b64"]) > 1000
+            assert len(mon["raster"]["sst_b64"]) > 1000
+            assert len(mon["raster"]["ocn_spd_b64"]) > 1000
             assert len(mon["raster"]["lai_b64"]) > 1000
             assert mon["meta"]["source"] == "live_preview.npz"
             assert "Completed Year 0001" in mon["log_tail"]

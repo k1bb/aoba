@@ -107,15 +107,17 @@ def count_modified_keys(cfg: dict[str, dict[str, Any]]) -> int:
 class CPUGlobePreviewEngine:
     """Runs strictly on CPU (`numpy`/`scipy`) to convert SCVT simulation outputs into live raster maps."""
 
-    GRID_H = 180
-    GRID_W = 360
+    GRID_H = 360
+    GRID_W = 720
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._mesh_cache: dict[tuple[int, float, float], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         self._frame_cache: dict[tuple[str, str, int, float], dict[str, Any]] = {}
-        lat_centers = np.linspace(89.5, -89.5, self.GRID_H, dtype=np.float64)
-        lon_centers = np.linspace(-179.5, 179.5, self.GRID_W, dtype=np.float64)
+        d_lat = 180.0 / self.GRID_H
+        d_lon = 360.0 / self.GRID_W
+        lat_centers = np.linspace(90.0 - 0.5 * d_lat, -90.0 + 0.5 * d_lat, self.GRID_H, dtype=np.float64)
+        lon_centers = np.linspace(-180.0 + 0.5 * d_lon, 180.0 - 0.5 * d_lon, self.GRID_W, dtype=np.float64)
         lon2d, lat2d = np.meshgrid(lon_centers, lat_centers)
         lat_r = np.deg2rad(lat2d.ravel())
         lon_r = np.deg2rad(lon2d.ravel())
@@ -2630,7 +2632,7 @@ function buildOrthographicCache(lat0Deg) {
       const sinLat = Math.max(-1, Math.min(1, Z*sinL0 + Y*cosL0));
       const lat = Math.asin(sinLat) * (180 / Math.PI);
       const dlon = Math.atan2(X, Z*cosL0 - Y*sinL0) * (180 / Math.PI);
-      const j = Math.max(0, Math.min(179, Math.floor(89.5 - lat + 0.5)));
+      const j = Math.max(0, Math.min(359, Math.floor((90.0 - lat) * 2.0)));
       const li = 0.58 + 0.42 * Math.max(0, 0.78*Z - 0.32*X + 0.38*Y); // subtle 3D sphere shading
       pixIdx.push((py*size + px) * 4);
       latRow.push(j);
@@ -2639,7 +2641,7 @@ function buildOrthographicCache(lat0Deg) {
       latVal.push(lat);
     }
   }
-  return { size, R, cx, cy, count: pixIdx.length, pixIdx: new Int32Array(pixIdx), latRow: new Uint8Array(latRow), dlonDeg: new Float32Array(dlonDeg), shade: new Float32Array(shade), latVal: new Float32Array(latVal) };
+  return { size, R, cx, cy, count: pixIdx.length, pixIdx: new Int32Array(pixIdx), latRow: new Uint16Array(latRow), dlonDeg: new Float32Array(dlonDeg), shade: new Float32Array(shade), latVal: new Float32Array(latVal) };
 }
 
 function getOrthoGeo() {
@@ -2738,11 +2740,16 @@ function renderOneGlobe(canvasId, kind, geo) {
   const seaIce = MON.rawSeaIce;
   const coast = (isOcnGlobe && MON.rawOcnCoast) ? MON.rawOcnCoast : MON.rawCoast;
 
+  const rH = (MON.raster && MON.raster.height) || 360;
+  const rW = (MON.raster && MON.raster.width) || 720;
+  const rowScale = rH / 360.0;
+  const lonScale = rW / 360.0;
+
   for (let p = 0; p < geo.count; p++) {
-    const row = geo.latRow[p];
+    const row = Math.max(0, Math.min(rH - 1, Math.floor(geo.latRow[p] * rowScale)));
     const lon = wrapLonDeg(lon0 + geo.dlonDeg[p]);
-    const col = Math.max(0, Math.min(359, Math.floor(lon + 180)));
-    const gIdx = row * 360 + col;
+    const col = Math.max(0, Math.min(rW - 1, Math.floor((lon + 180) * lonScale)));
+    const gIdx = row * rW + col;
     const sh = geo.shade[p];
 
     let r, g, b;
@@ -2850,9 +2857,11 @@ function bindGlobeInteractions() {
       const lat = Math.asin(Math.max(-1, Math.min(1, Z*Math.sin(lat0) + Y*Math.cos(lat0)))) * 180 / Math.PI;
       let lon = GLOBE_VIEW.lon0 + Math.atan2(X, Z*Math.cos(lat0) - Y*Math.sin(lat0)) * 180 / Math.PI;
       lon = ((lon + 180) % 360 + 360) % 360 - 180;
-      const row = Math.max(0, Math.min(179, Math.floor(89.5 - lat + 0.5)));
-      const col = Math.max(0, Math.min(359, Math.floor(lon + 180)));
-      const idx = row * 360 + col;
+      const rH = MON.raster.height || 360;
+      const rW = MON.raster.width || 720;
+      const row = Math.max(0, Math.min(rH - 1, Math.floor((90.0 - lat) * (rH / 180.0))));
+      const col = Math.max(0, Math.min(rW - 1, Math.floor((lon + 180.0) * (rW / 360.0))));
+      const idx = row * rW + col;
       const t2v = -45 + (MON.rawT2[idx]/255) * 85;
       const irv = MON.rawIR ? (110 + (MON.rawIR[idx]/255) * 210) : 240;
       const precipv = (MON.rawOLR[idx]/255) * 25.0;
@@ -3899,6 +3908,9 @@ def create_gui_server(
     server.current_config = cfg  # type: ignore[attr-defined]
     server.preview_engine = CPUGlobePreviewEngine()  # type: ignore[attr-defined]
     server.run_manager = RunManager(server.preview_engine)  # type: ignore[attr-defined]
+    init_out_dir = str((cfg.get("output") or {}).get("out_dir", "")).strip()
+    if init_out_dir:
+        server.run_manager.last_watch_dir = str(Path(init_out_dir).expanduser())  # type: ignore[attr-defined]
     return server
 
 

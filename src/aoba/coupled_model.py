@@ -2738,6 +2738,7 @@ def step_aoba_model(
                 evap_sfc=evap_cell_pre,
                 dt=dt,
                 return_hydrometeors=True,
+                do_sat_adj=False,
             )
             _, exner_mynn_sd, temp_mynn_sd = diagnose_pressure_temperature(rho_pre_sd, thm_mynn_sd, qv_mynn_sd)
             zero_sfc_sd = torch.zeros_like(shf_cell_pre)

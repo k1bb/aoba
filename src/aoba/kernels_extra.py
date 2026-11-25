@@ -1932,33 +1932,66 @@ kernel void crm_mynn_col(
         dl_t[k + 1u] = -fch / mass_c[k + 1u];
         du_t[k]      = -fch / mass_c[k];
     }
-    for (uint k = 0u; k < nz; ++k) {
-        diag_t[k] = 1.0f - dl_t[k] - du_t[k];
-        rhs_t[k] = thl_a[k];
-    }
+    bool no_sat_adj = (u_dim.w != 0u);
     float cp_eff0 = cp_d + cp_v * qv_a[0];
-    rhs_t[0] += dt * (shf_sfc / (cp_eff0 * exn_a[0])) / mass_c[0];
-    mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, sol_a);
+    if (!no_sat_adj) {
+        for (uint k = 0u; k < nz; ++k) {
+            diag_t[k] = 1.0f - dl_t[k] - du_t[k];
+            rhs_t[k] = thl_a[k];
+        }
+        rhs_t[0] += dt * (shf_sfc / (cp_eff0 * exn_a[0])) / mass_c[0];
+        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, sol_a);
 
-    float thl_new_a[64];
-    for (uint k = 0u; k < nz; ++k) {
-        thl_new_a[k] = sol_a[k];
-        rhs_t[k] = qn_a[k];
-    }
-    rhs_t[0] += dt * evap_sfc / mass_c[0];
-    mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, sol_a);
+        float thl_new_a[64];
+        for (uint k = 0u; k < nz; ++k) {
+            thl_new_a[k] = sol_a[k];
+            rhs_t[k] = qn_a[k];
+        }
+        rhs_t[0] += dt * evap_sfc / mass_c[0];
+        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, sol_a);
 
-    for (uint k = 0u; k < nz; ++k) {
-        uint idx = k * M + m;
-        float qn_new = max(sol_a[k], 0.0f);
-        float t_li_new = thl_new_a[k] * exn_a[k];
-        float t_new, qv_new, qc_new, qi_new, qsat_u;
-        mp_sat_adj(t_li_new, pres_a[k], qn_new, e_tr, t_frz, t_ice, t_liq, eps_w, lv0, ls0, cp_d, t_new, qv_new, qc_new, qi_new, qsat_u);
-        qn_out[idx]  = qn_new;
-        qv_out[idx]  = qv_new;
-        qc_out[idx]  = qc_new;
-        qi_out[idx]  = qi_new;
-        thm_out[idx] = (t_new / exn_a[k]) * (1.0f + rv_ov_rd * qv_new);
+        for (uint k = 0u; k < nz; ++k) {
+            uint idx = k * M + m;
+            float qn_new = max(sol_a[k], 0.0f);
+            float t_li_new = thl_new_a[k] * exn_a[k];
+            float t_new, qv_new, qc_new, qi_new, qsat_u;
+            mp_sat_adj(t_li_new, pres_a[k], qn_new, e_tr, t_frz, t_ice, t_liq, eps_w, lv0, ls0, cp_d, t_new, qv_new, qc_new, qi_new, qsat_u);
+            qn_out[idx]  = qn_new;
+            qv_out[idx]  = qv_new;
+            qc_out[idx]  = qc_new;
+            qi_out[idx]  = qi_new;
+            thm_out[idx] = (t_new / exn_a[k]) * (1.0f + rv_ov_rd * qv_new);
+        }
+    } else {
+        float th_new_a[64], qv_new_a[64], qc_new_a[64];
+        for (uint k = 0u; k < nz; ++k) {
+            diag_t[k] = 1.0f - dl_t[k] - du_t[k];
+            rhs_t[k] = th_a[k];
+        }
+        rhs_t[0] += dt * (shf_sfc / (cp_eff0 * exn_a[0])) / mass_c[0];
+        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, th_new_a);
+
+        for (uint k = 0u; k < nz; ++k) rhs_t[k] = qv_a[k];
+        rhs_t[0] += dt * evap_sfc / mass_c[0];
+        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, qv_new_a);
+
+        for (uint k = 0u; k < nz; ++k) rhs_t[k] = qc_a[k];
+        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, qc_new_a);
+
+        for (uint k = 0u; k < nz; ++k) rhs_t[k] = qi_a[k];
+        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, sol_a);
+
+        for (uint k = 0u; k < nz; ++k) {
+            uint idx = k * M + m;
+            float qv_new = max(qv_new_a[k], 0.0f);
+            float qc_new = max(qc_new_a[k], 0.0f);
+            float qi_new = max(sol_a[k], 0.0f);
+            qv_out[idx]  = qv_new;
+            qc_out[idx]  = qc_new;
+            qi_out[idx]  = qi_new;
+            qn_out[idx]  = qv_new + qc_new + qi_new;
+            thm_out[idx] = th_new_a[k] * (1.0f + rv_ov_rd * qv_new);
+        }
     }
 }
 
@@ -4683,6 +4716,7 @@ def run_crm_mynn_metal(
     evap_sfc: torch.Tensor,
     dt: float,
     mynn_consts: list[float],
+    do_sat_adj: bool = True,
 ) -> tuple[torch.Tensor, ...]:
     """Execute column-local MYNN 2.5 PBL turbulence in 1 fused Metal kernel."""
     orig_shape = rho_d.shape
@@ -4731,7 +4765,7 @@ def run_crm_mynn_metal(
         r_c, u_c, v_c, th_c, qn_c, qv_c, qc_c, qi_c, qke_c,
         zc_2d, zw_2d, dz_2d, sfc6,
         u_out, v_out, thm_out, qn_out, qke_out, km_out, kh_out, qv_out, qc_out, qi_out,
-        [nz, M, dz_cols, 0], float(dt), mp_buf, threads=M,
+        [nz, M, dz_cols, 0 if do_sat_adj else 1], float(dt), mp_buf, threads=M,
     )
     return u_out, v_out, thm_out, qn_out, qke_out, km_out, kh_out, qv_out, qc_out, qi_out
 
