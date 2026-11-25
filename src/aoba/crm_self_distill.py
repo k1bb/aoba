@@ -61,8 +61,8 @@ from aoba.thermodynamics import diagnose_pressure_temperature, qsat_mixed_val
 # ---------------------------------------------------------------------------
 _N_PROF_IN = 14      # 14 vertical profile channels per level
 _N_SCAL_IN = 9       # 7 boundary forcings + 2 subgrid organization/memory scalars (sigma_qn, w_rms)
-_N_PROF_OUT = 7      # (d_thm_raw, d_qn_raw, d_qp_raw, logit_fc, logit_fi, d_u_raw, d_v_raw)
-_N_SCAL_OUT = 2      # (raw_ptot_frac, logit_fsnow)
+_N_PROF_OUT = 8      # (d_temp_raw, d_qn_raw, d_qp_raw, logit_fc, logit_fi, d_u_raw, d_v_raw, logit_fcld)
+_N_SCAL_OUT = 3      # (raw_ptot_frac, logit_fsnow, logit_fprec)
 
 
 def extract_crm_distill_features(
@@ -170,8 +170,8 @@ def apply_exact_conservation_closure(
       3. `sum_k dm_k * (u_new - u_pre) == tau_x * dt`, `sum_k dm_k * (v_new - v_pre) == tau_y * dt`
       4. `q_v >= 0, q_c >= 0, q_i >= 0, q_p >= 0, P_rain >= 0, P_snow >= 0`
     """
-    # Convert [N, 7, nz] -> [nz, N] per field (contiguous for MPS backward kernels)
-    rp = raw_prof.permute(1, 2, 0).contiguous()  # [7, nz, N]
+    # Convert [N, 8, nz] -> [nz, N] per field (contiguous for MPS backward kernels)
+    rp = raw_prof.permute(1, 2, 0).contiguous()  # [8, nz, N]
     # Predict bounded temperature residual dT [K] -> d_theta_m = dT / exner so troposphere & stratosphere share O(1 K) scale
     d_temp_raw = torch.tanh(rp[0] * 0.2) * 5.0
     d_thm_raw = d_temp_raw / torch.clamp(exner, min=0.05)
@@ -181,6 +181,8 @@ def apply_exact_conservation_closure(
     f_ice_logit = rp[4]
     d_u_raw = torch.tanh(rp[5] * 0.2) * 8.0          # bounded [m s^-1] per step
     d_v_raw = torch.tanh(rp[6] * 0.2) * 8.0
+    f_cld_pred = torch.sigmoid(rp[7] - 1.0)          # subgrid cloud area fraction in (0, 1)
+    f_prec_pred = torch.sigmoid(raw_scal[:, 2] - 1.0)  # subgrid precipitating area fraction in (0, 1)
 
     dm = torch.clamp(rho_d * dz_c, min=1.0e-6)       # [nz, N] kg m^-2
     dm_sum = torch.clamp(dm.sum(dim=0), min=1.0e-3)  # [N]
@@ -217,9 +219,9 @@ def apply_exact_conservation_closure(
     p_snow_rate = (p_tot_mass * f_snow) / dt
     p_rain_rate = (p_tot_mass * (1.0 - f_snow)) / dt
 
-    # Partition q_n into (q_v, q_c, q_i) strictly preserving q_v + q_c + q_i == q_n
-    # Bias condensate logit so clear-sky default stays near zero
-    f_cond = torch.sigmoid(f_cond_logit - 3.5) * 0.95
+    # Partition q_n into (q_v, q_c, q_i) strictly preserving q_v + q_c + q_i == q_n.
+    # Dead-zone threshold guarantees exact zero condensate in clear sky (eliminating spurious thin-cloud ASR bias).
+    f_cond = torch.clamp(F.relu(torch.sigmoid(f_cond_logit - 1.5) - 0.18) * 1.16, 0.0, 0.95)
     f_ice = torch.sigmoid(f_ice_logit)
     q_cond = qn_new * f_cond
     qc_new = q_cond * (1.0 - f_ice)
@@ -259,7 +261,71 @@ def apply_exact_conservation_closure(
         "v": v_new,
         "precip_rain": p_rain_rate,
         "precip_snow": p_snow_rate,
+        "f_cld": f_cld_pred,
+        "f_prec": f_prec_pred,
     }
+
+
+def reconstruct_subgrid_heterogeneity(
+    q_v_col: torch.Tensor,       # [nz, N_s]
+    q_c_col: torch.Tensor,       # [nz, N_s]
+    q_i_col: torch.Tensor,       # [nz, N_s]
+    q_p_col: torch.Tensor,       # [nz, N_s]
+    f_cld: torch.Tensor,         # [nz, N_s] predicted subgrid cloud fraction in [0, 1]
+    rain_col: torch.Tensor,      # [N_s]
+    snow_col: torch.Tensor,      # [N_s]
+    f_prec: torch.Tensor,        # [N_s] predicted subgrid precipitating area fraction in [0, 1]
+    cell_ids: torch.Tensor,      # [N_s] int64 cell indices for deterministic storm-core rotation
+    ny: int,
+    nx: int,
+    step_count: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reconstruct exact mass-conserving clear/cloudy & dry/rainy subcolumns `[nz, N_s, ny, nx]`.
+
+    Eliminates plane-parallel albedo bias (Jensen's inequality) by concentrating cloud condensate
+    (`q_c / f_cld`, `q_i / f_cld`) onto `f_cld * n_sub` coherent convective-core subcolumns while
+    leaving the remaining `(1 - f_cld) * n_sub` subcolumns genuinely cloud-free (`0.0`). Surface
+    precipitation is concentrated directly beneath the cloudy core using `f_prec`, and the core
+    position rotates slowly across subcolumns (`step_count // 12`) so land tiles receive realistic
+    intermittent sunlit/shaded and dry/wet forcing without permanent tile bias.
+    """
+    n_sub = max(int(ny * nx), 1)
+    nz, n_s = q_c_col.shape
+    dev = q_c_col.device
+    dtype = q_c_col.dtype
+
+    if n_sub == 1:
+        q_v_4 = q_v_col.view(nz, n_s, 1, 1)
+        q_c_4 = q_c_col.view(nz, n_s, 1, 1)
+        q_i_4 = q_i_col.view(nz, n_s, 1, 1)
+        q_p_4 = q_p_col.view(nz, n_s, 1, 1)
+        q_n_4 = q_v_4 + q_c_4 + q_i_4
+        return q_n_4, q_p_4, q_v_4, q_c_4, q_i_4, rain_col.view(n_s, 1, 1), snow_col.view(n_s, 1, 1)
+
+    # Deterministic slowly-drifting subcolumn rank r in 0..n_sub-1 per cell [N_s, n_sub]
+    sub_idx = torch.arange(n_sub, device=dev, dtype=torch.int64).unsqueeze(0)  # [1, n_sub]
+    shift = ((cell_ids + (int(step_count) // 12)) % n_sub).unsqueeze(1)        # [N_s, 1]
+    rank = ((sub_idx + shift) % n_sub).to(dtype)                               # [N_s, n_sub]
+
+    # Cloud subcolumn multipliers m_cld [nz, N_s, n_sub] with exact mean == 1.0
+    f_min = 1.0 / float(n_sub)
+    f_c_eff = torch.clamp(f_cld, min=f_min, max=1.0)                           # [nz, N_s]
+    w_cld = torch.clamp(f_c_eff.unsqueeze(-1) * float(n_sub) - rank.unsqueeze(0), min=0.0, max=1.0)
+    m_cld = w_cld / torch.clamp(w_cld.mean(dim=-1, keepdim=True), min=1.0e-6)  # exact mean == 1.0
+
+    q_c_4 = (q_c_col.unsqueeze(-1) * m_cld).view(nz, n_s, ny, nx)
+    q_i_4 = (q_i_col.unsqueeze(-1) * m_cld).view(nz, n_s, ny, nx)
+    q_p_4 = (q_p_col.unsqueeze(-1) * m_cld).view(nz, n_s, ny, nx)
+    q_v_4 = q_v_col.unsqueeze(-1).expand(nz, n_s, n_sub).reshape(nz, n_s, ny, nx)
+    q_n_4 = q_v_4 + q_c_4 + q_i_4
+
+    # Precipitation subcolumn multipliers aligned with the same convective core [N_s, n_sub]
+    f_p_eff = torch.clamp(f_prec, min=f_min, max=1.0)                          # [N_s]
+    w_pr = torch.clamp(f_p_eff.unsqueeze(-1) * float(n_sub) - rank, min=0.0, max=1.0)
+    m_pr = w_pr / torch.clamp(w_pr.mean(dim=-1, keepdim=True), min=1.0e-6)     # exact mean == 1.0
+    rain_3 = (rain_col.unsqueeze(-1) * m_pr).view(n_s, ny, nx)
+    snow_3 = (snow_col.unsqueeze(-1) * m_pr).view(n_s, ny, nx)
+    return q_n_4, q_p_4, q_v_4, q_c_4, q_i_4, rain_3, snow_3
 
 
 # ---------------------------------------------------------------------------
@@ -340,10 +406,10 @@ class GPUReplayBuffer:
         self.ctx_p = torch.zeros((self.capacity, 10, self.nz), device=device, dtype=torch.float32)
         # Scalar context: [temp_sfc, shf, evap, tau_x, tau_y] -> 5 scalars
         self.ctx_s = torch.zeros((self.capacity, 5), device=device, dtype=torch.float32)
-        # Teacher targets: [thm_tgt, qn_tgt, qp_tgt, qc_tgt, qi_tgt, u_tgt, v_tgt] -> 7 profiles
-        self.tgt_p = torch.zeros((self.capacity, 7, self.nz), device=device, dtype=torch.float32)
-        # Teacher scalar targets: [precip_rain, precip_snow] -> 2 scalars
-        self.tgt_s = torch.zeros((self.capacity, 2), device=device, dtype=torch.float32)
+        # Teacher targets: [thm_tgt, qn_tgt, qp_tgt, qc_tgt, qi_tgt, u_tgt, v_tgt, f_cld_tgt] -> 8 profiles
+        self.tgt_p = torch.zeros((self.capacity, 8, self.nz), device=device, dtype=torch.float32)
+        # Teacher scalar targets: [precip_rain, precip_snow, f_prec_tgt] -> 3 scalars
+        self.tgt_s = torch.zeros((self.capacity, 3), device=device, dtype=torch.float32)
 
     @property
     def size(self) -> int:
@@ -522,17 +588,18 @@ def select_teacher_indices(state: CRMSelfDistillState) -> tuple[torch.Tensor, to
 def _compute_distill_loss(
     pred_a: dict[str, torch.Tensor],
     pred_b: dict[str, torch.Tensor],
-    tgt_p: torch.Tensor,   # [B, 7, nz]
-    tgt_s: torch.Tensor,   # [B, 2]
+    tgt_p: torch.Tensor,   # [B, 8, nz]
+    tgt_s: torch.Tensor,   # [B, 3]
     exner: torch.Tensor,   # [nz, B]
     dt: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Mass-and-temperature-scaled multi-variable loss across both epistemic heads."""
-    tp = tgt_p.permute(1, 2, 0).contiguous()  # [7, nz, B]
-    thm_t, qn_t, qp_t, qc_t, qi_t, u_t, v_t = tp[0], tp[1], tp[2], tp[3], tp[4], tp[5], tp[6]
+    tp = tgt_p.permute(1, 2, 0).contiguous()  # [8, nz, B]
+    thm_t, qn_t, qp_t, qc_t, qi_t, u_t, v_t, fcld_t = tp[0], tp[1], tp[2], tp[3], tp[4], tp[5], tp[6], tp[7]
     t_tgt = thm_t * exner  # Temperature space [K] ensures uniform troposphere/stratosphere weighting
     pr_t = tgt_s[:, 0]
     ps_t = tgt_s[:, 1]
+    fprec_t = tgt_s[:, 2]
 
     def _head_loss(pr: dict[str, torch.Tensor]) -> torch.Tensor:
         l_temp = F.smooth_l1_loss(pr["theta_m"] * exner, t_tgt)
@@ -542,6 +609,8 @@ def _compute_distill_loss(
         l_qi = F.smooth_l1_loss(pr["q_i"] * 5.0e3, qi_t * 5.0e3)
         l_u = F.smooth_l1_loss(pr["u"] * 0.2, u_t * 0.2)
         l_v = F.smooth_l1_loss(pr["v"] * 0.2, v_t * 0.2)
+        l_fcld = F.smooth_l1_loss(pr["f_cld"], fcld_t)
+        l_fprec = F.smooth_l1_loss(pr["f_prec"], fprec_t)
         l_pr = F.smooth_l1_loss(
             torch.log1p(torch.clamp(pr["precip_rain"] * 86400.0, min=0.0)),
             torch.log1p(torch.clamp(pr_t * 86400.0, min=0.0)),
@@ -550,7 +619,10 @@ def _compute_distill_loss(
             torch.log1p(torch.clamp(pr["precip_snow"] * 86400.0, min=0.0)),
             torch.log1p(torch.clamp(ps_t * 86400.0, min=0.0)),
         )
-        return 2.0 * l_temp + 2.5 * l_qn + 0.8 * l_qp + 1.5 * (l_qc + l_qi) + 0.5 * (l_u + l_v) + 1.2 * (l_pr + l_ps)
+        return (
+            2.0 * l_temp + 2.5 * l_qn + 0.8 * l_qp + 1.5 * (l_qc + l_qi)
+            + 0.5 * (l_u + l_v) + 1.2 * (l_pr + l_ps) + 1.8 * l_fcld + 0.8 * l_fprec
+        )
 
     loss = 0.5 * (_head_loss(pred_a) + _head_loss(pred_b))
     with torch.no_grad():
@@ -722,14 +794,16 @@ def pack_teacher_context_and_targets(
     v_post: torch.Tensor,
     precip_rain: torch.Tensor,
     precip_snow: torch.Tensor,
+    f_cld_tgt: torch.Tensor,
+    f_prec_tgt: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack teacher CRM physics context and post-CRM targets into `[B, C, nz]` / `[B, C]`."""
+    """Pack teacher CRM physics context and post-CRM targets (including subgrid `f_cld`, `f_prec`)."""
     ctx_p = torch.stack([
         rho_d, dz_c, exner, thm_post_ls, qn_post_ls, qp_pre, qc_pre, qi_pre, u_pre, v_pre,
     ], dim=0).permute(2, 0, 1).contiguous()
     ctx_s = torch.stack([temp_sfc, shf, evap, tau_x, tau_y], dim=1).contiguous()
     tgt_p = torch.stack([
-        thm_post, qn_post, qp_post, qc_post, qi_post, u_post, v_post,
+        thm_post, qn_post, qp_post, qc_post, qi_post, u_post, v_post, f_cld_tgt,
     ], dim=0).permute(2, 0, 1).contiguous()
-    tgt_s = torch.stack([precip_rain, precip_snow], dim=1).contiguous()
+    tgt_s = torch.stack([precip_rain, precip_snow, f_prec_tgt], dim=1).contiguous()
     return ctx_p, ctx_s, tgt_p, tgt_s

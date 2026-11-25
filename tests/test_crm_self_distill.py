@@ -5,7 +5,7 @@ import torch
 
 from aoba import constants as C
 from aoba.coupled_model import AOBAConfig, init_aoba_model, step_aoba_model
-from aoba.crm_self_distill import apply_exact_conservation_closure
+from aoba.crm_self_distill import apply_exact_conservation_closure, reconstruct_subgrid_heterogeneity
 
 
 def test_exact_column_conservation_closure() -> None:
@@ -14,8 +14,8 @@ def test_exact_column_conservation_closure() -> None:
     nz, n_col = 32, 64
     dt = 600.0
 
-    raw_prof = torch.randn(n_col, 7, nz) * 2.0
-    raw_scal = torch.randn(n_col, 2) * 2.0
+    raw_prof = torch.randn(n_col, 8, nz) * 2.0
+    raw_scal = torch.randn(n_col, 3) * 2.0
 
     rho_d = torch.linspace(1.2, 0.05, nz).unsqueeze(1).expand(nz, n_col).clone()
     dz_c = torch.linspace(120.0, 2000.0, nz).unsqueeze(1).expand(nz, n_col).clone()
@@ -67,6 +67,22 @@ def test_exact_column_conservation_closure() -> None:
     for k in ("q_n", "q_p", "q_v", "q_c", "q_i", "precip_rain", "precip_snow"):
         assert bool((out[k] >= 0.0).all()), f"Negative value in {k}"
     assert float((out["q_v"] + out["q_c"] + out["q_i"] - out["q_n"]).abs().max()) < 1.0e-6
+
+    # 5. Exact mass-conserving subcolumn heterogeneity reconstruction (clear vs cloudy & dry vs rainy)
+    f_cld_t = torch.full((nz, n_col), 0.25)
+    f_prec_t = torch.full((n_col,), 0.25)
+    cids = torch.arange(n_col, dtype=torch.int64)
+    qn4, qp4, qv4, qc4, qi4, rain3, snow3 = reconstruct_subgrid_heterogeneity(
+        out["q_v"], out["q_c"], out["q_i"], out["q_p"], f_cld_t,
+        out["precip_rain"], out["precip_snow"], f_prec_t, cids, ny=1, nx=8, step_count=5,
+    )
+    assert float((qc4.mean(dim=(-2, -1)) - out["q_c"]).abs().max()) < 1.0e-6
+    assert float((qi4.mean(dim=(-2, -1)) - out["q_i"]).abs().max()) < 1.0e-6
+    assert float((qn4.mean(dim=(-2, -1)) - out["q_n"]).abs().max()) < 1.0e-6
+    assert float((rain3.mean(dim=(-2, -1)) - out["precip_rain"]).abs().max()) < 1.0e-6
+    # Verify 6 of 8 subcolumns are genuinely cloud-free when f_cld == 0.25
+    clear_frac = float((qc4 == 0.0).to(torch.float32).mean())
+    assert clear_frac >= 0.74, f"Expected >=75% clear-sky subcolumns at f_cld=0.25, got {clear_frac:.3f}"
 
 
 def test_coupled_self_distill_vs_full_crm() -> None:

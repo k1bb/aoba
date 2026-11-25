@@ -1813,6 +1813,7 @@ def step_aoba_model(
                 extract_crm_distill_features,
                 pack_teacher_context_and_targets,
                 predict_student_columns,
+                reconstruct_subgrid_heterogeneity,
                 select_teacher_indices,
                 train_student_online,
             )
@@ -1940,13 +1941,19 @@ def step_aoba_model(
                 snow_3d[t_idx] = sp_t.precip_snow.unsqueeze(-1).unsqueeze(-1)
 
             # 7a-ii. Online self-distillation update from fresh teacher CRM + GPU replay buffer
+            # Extract exact subgrid cloud area fraction f_cld [nz, N_t] and precipitation fraction f_prec [N_t]
+            f_cld_t = ((sub_crm_t.q_c + sub_crm_t.q_i) > 1.0e-6).to(atmos.q_n.dtype).mean(dim=(-2, -1))
+            if sp_t.precip_rain_sub is not None and sp_t.precip_snow_sub is not None:
+                f_prec_t = ((sp_t.precip_rain_sub + sp_t.precip_snow_sub) > 1.0e-7).to(atmos.q_n.dtype).mean(dim=(-2, -1))
+            else:
+                f_prec_t = ((sp_t.precip_rain + sp_t.precip_snow) > 1.0e-7).to(atmos.q_n.dtype)
             ctx_p_t, ctx_s_t, tgt_p_t, tgt_s_t = pack_teacher_context_and_targets(
                 rho_pre_sd[:, t_idx], atmos.dz_c[:, t_idx], exner_all_sd[:, t_idx], temp_all_sd[0, t_idx],
                 thm_post_ls_sd[:, t_idx], qn_pre_sd[:, t_idx], qp_pre_sd[:, t_idx],
                 qc_pre_sd[:, t_idx], qi_pre_sd[:, t_idx], u_host_new[:, t_idx], v_host_new[:, t_idx],
                 shf_cell_pre[t_idx], evap_cell_pre[t_idx], tx_cell_pre[t_idx], ty_cell_pre[t_idx],
                 thm_t_post, qn_t_post, qp_t_post, qc_t_post, qi_t_post, u_t_post, v_t_post,
-                sp_t.precip_rain, sp_t.precip_snow,
+                sp_t.precip_rain, sp_t.precip_snow, f_cld_t, f_prec_t,
             )
             train_student_online(model.crm_distill, x_all_sd[t_idx], ctx_p_t, ctx_s_t, tgt_p_t, tgt_s_t, dt)
 
@@ -1968,20 +1975,26 @@ def step_aoba_model(
             atmos.q_i[:, s_idx] = stu_out["q_i"]
             du_crm_c[:, s_idx] = (stu_out["u"] - u_host_new[:, s_idx]) / dt
             dv_crm_c[:, s_idx] = (stu_out["v"] - v_host_new[:, s_idx]) / dt
-            rain_3d[s_idx] = stu_out["precip_rain"].unsqueeze(-1).unsqueeze(-1)
-            snow_3d[s_idx] = stu_out["precip_snow"].unsqueeze(-1).unsqueeze(-1)
 
-            # Synchronize student column means smoothly onto embedded CRM subcolumns (zero ratchet)
+            # Reconstruct exact mass-conserving clear/cloudy & dry/rainy subcolumn heterogeneity
+            # so ICA radiation and subgrid land surface feel authentic cloud & precipitation patchiness
+            qn_4s, qp_4s, qv_4s, qc_4s, qi_4s, rain_3s, snow_3s = reconstruct_subgrid_heterogeneity(
+                stu_out["q_v"], stu_out["q_c"], stu_out["q_i"], stu_out["q_p"], stu_out["f_cld"],
+                stu_out["precip_rain"], stu_out["precip_snow"], stu_out["f_prec"],
+                s_idx, ny, nx, step_count=model.step_count,
+            )
+            rain_3d[s_idx] = rain_3s
+            snow_3d[s_idx] = snow_3s
             crm.rho_d[:, s_idx] = atmos.rho_d[:, s_idx].unsqueeze(-1).unsqueeze(-1)
             crm_thm_s = crm.theta_m[:, s_idx]
             crm.theta_m[:, s_idx] = stu_out["theta_m"].unsqueeze(-1).unsqueeze(-1) + 0.85 * (
                 crm_thm_s - crm_thm_s.mean(dim=(-2, -1), keepdim=True)
             )
-            crm.q_n[:, s_idx] = stu_out["q_n"].unsqueeze(-1).unsqueeze(-1).expand(-1, -1, ny, nx)
-            crm.q_p[:, s_idx] = stu_out["q_p"].unsqueeze(-1).unsqueeze(-1).expand(-1, -1, ny, nx)
-            crm.q_v[:, s_idx] = stu_out["q_v"].unsqueeze(-1).unsqueeze(-1).expand(-1, -1, ny, nx)
-            crm.q_c[:, s_idx] = stu_out["q_c"].unsqueeze(-1).unsqueeze(-1).expand(-1, -1, ny, nx)
-            crm.q_i[:, s_idx] = stu_out["q_i"].unsqueeze(-1).unsqueeze(-1).expand(-1, -1, ny, nx)
+            crm.q_n[:, s_idx] = qn_4s
+            crm.q_p[:, s_idx] = qp_4s
+            crm.q_v[:, s_idx] = qv_4s
+            crm.q_c[:, s_idx] = qc_4s
+            crm.q_i[:, s_idx] = qi_4s
             crm_u_s = crm.u[:, s_idx]
             crm_v_s = crm.v[:, s_idx]
             crm.u[:, s_idx] = stu_out["u"].unsqueeze(-1).unsqueeze(-1) + 0.85 * (crm_u_s - crm_u_s.mean(dim=(-2, -1), keepdim=True))
@@ -2133,6 +2146,10 @@ def step_aoba_model(
                 w_idx = torch.arange(nc, device=atmos.rho_d.device)
             u_post_w = u_host_new[:, w_idx] + dt * du_crm_c[:, w_idx]
             v_post_w = v_host_new[:, w_idx] + dt * dv_crm_c[:, w_idx]
+            f_cld_w = ((crm.q_c[:, w_idx] + crm.q_i[:, w_idx]) > 1.0e-6).to(atmos.q_n.dtype).mean(dim=(-2, -1))
+            f_prec_w = (
+                (rain_new_sub.reshape(nc, ny, nx)[w_idx] + snow_new_sub.reshape(nc, ny, nx)[w_idx]) > 1.0e-7
+            ).to(atmos.q_n.dtype).mean(dim=(-2, -1))
             ctx_p_w, ctx_s_w, tgt_p_w, tgt_s_w = pack_teacher_context_and_targets(
                 rho_pre_sd[:, w_idx], atmos.dz_c[:, w_idx], exner_all_sd[:, w_idx], temp_all_sd[0, w_idx],
                 thm_post_ls_sd[:, w_idx], qn_pre_sd[:, w_idx], qp_pre_sd[:, w_idx],
@@ -2140,7 +2157,7 @@ def step_aoba_model(
                 shf_cell_pre[w_idx], evap_cell_pre[w_idx], tx_cell_pre[w_idx], ty_cell_pre[w_idx],
                 atmos.theta_m[:, w_idx], atmos.q_n[:, w_idx], atmos.q_p[:, w_idx],
                 atmos.q_c[:, w_idx], atmos.q_i[:, w_idx], u_post_w, v_post_w,
-                rain_cell_w[w_idx], snow_cell_w[w_idx],
+                rain_cell_w[w_idx], snow_cell_w[w_idx], f_cld_w, f_prec_w,
             )
             train_student_online(model.crm_distill, x_all_sd[w_idx], ctx_p_w, ctx_s_w, tgt_p_w, tgt_s_w, dt)
             model.crm_distill.teacher_frac_last = 1.0
