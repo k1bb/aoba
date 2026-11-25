@@ -401,7 +401,7 @@ kernel void crm_3d_fast_hevi_loop(
     device float* st4_a               [[buffer(0)]],   // [4, nz, M]: rho, Thm, u, v (in/out)
     device float* w_a                 [[buffer(1)]],   // [nz+1, M] (in/out)
     device float* fxy_buf             [[buffer(2)]],   // [2, nz, M]: fx, fy scratch
-    device const float* prep_c0       [[buffer(3)]],   // [4, nz, M]
+    device float* prep_c0             [[buffer(3)]],   // [4, nz, M]: [p_blend_scratch, a_p_s, dp_dThm_s, rtot_blend_scratch]
     device const float* prep_c1       [[buffer(4)]],   // [8, nz, M]
     device const float* prep_w        [[buffer(5)]],   // [7, nz-1, M]
     device const float* q_load        [[buffer(6)]],
@@ -430,7 +430,7 @@ kernel void crm_3d_fast_hevi_loop(
 
     uint kz = ltid / stride_c;
     uint rem = ltid - kz * stride_c;
-    if (kz >= 8u) return;
+    if (kz >= 4u) return;
     uint tid = col * stride_c + rem;
     uint iy = rem / nx;
     uint ix = rem - iy * nx;
@@ -457,8 +457,10 @@ kernel void crm_3d_fast_hevi_loop(
     device float* fx_acc = fxy_acc;
     device float* fy_acc = fxy_acc + total;
 
+    device float* p_blend_buf       = prep_c0;
     device const float* a_p_s       = prep_c0 + total;
     device const float* dp_dThm_s   = prep_c0 + 2u * total;
+    device float* rtot_blend_buf    = prep_c0 + 3u * total;
     device const float* rho_x       = prep_c1;
     device const float* rho_y       = prep_c1 + total;
     device const float* rtot_x_inv  = prep_c1 + 2u * total;
@@ -484,12 +486,10 @@ kernel void crm_3d_fast_hevi_loop(
     float inv_nac = f_p1.y;
 
     threadgroup float sm_dstar[64u * 64u];
-    float p_reg[8];
-    float rt_reg[8];
 
     for (uint ac = 0u; ac < n_ac; ++ac) {
-        // Step A (8x k-parallel): Horizontal acoustic PGF + u/v update + forward-backward mass flux
-        for (uint k = kz; k < K; k += 8u) {
+        // Step A (4x k-parallel, 256 threads/block): Horizontal acoustic PGF + u/v + mass flux
+        for (uint k = kz; k < K; k += 4u) {
             uint kM = k * M;
             uint idx = kM + tid;
             uint idx_xp = kM + tid_xp;
@@ -526,66 +526,54 @@ kernel void crm_3d_fast_hevi_loop(
         }
         threadgroup_barrier(mem_flags::mem_device);
 
-        // Step B-1 (8x k-parallel): Explicit horizontal + vertical-old divergence -> r_dag, T_dag, p_blend, rtot_blend
-        for (uint it = 0u; it < 8u; ++it) {
-            uint k = kz + it * 8u;
-            if (k < K) {
-                uint kM = k * M;
-                uint idx = kM + tid;
-                uint idx_xm = kM + tid_xm;
-                uint idx_ym = kM + tid_ym;
+        // Step B-1 (4x k-parallel): Explicit horizontal + vertical-old divergence -> r_dag, T_dag, p_blend, rtot_blend
+        for (uint k = kz; k < K; k += 4u) {
+            uint kM = k * M;
+            uint idx = kM + tid;
+            uint idx_xm = kM + tid_xm;
+            uint idx_ym = kM + tid_ym;
 
-                float fx_0 = fx_buf[idx];
-                float fx_m = fx_buf[idx_xm];
-                float fy_0 = fy_buf[idx];
-                float fy_m = fy_buf[idx_ym];
+            float fx_0 = fx_buf[idx];
+            float fx_m = fx_buf[idx_xm];
+            float fy_0 = fy_buf[idx];
+            float fy_m = fy_buf[idx_ym];
 
-                float div_h_rho = (fx_0 - fx_m) * inv_dx + (fy_0 - fy_m) * inv_dy;
-                float div_h_Thm =
-                    (fx_0 * thm_x_eff[idx] - fx_m * thm_x_eff[idx_xm]) * inv_dx
-                    + (fy_0 * thm_y_eff[idx] - fy_m * thm_y_eff[idx_ym]) * inv_dy;
+            float div_h_rho = (fx_0 - fx_m) * inv_dx + (fy_0 - fy_m) * inv_dy;
+            float div_h_Thm =
+                (fx_0 * thm_x_eff[idx] - fx_m * thm_x_eff[idx_xm]) * inv_dx
+                + (fy_0 * thm_y_eff[idx] - fy_m * thm_y_eff[idx_ym]) * inv_dy;
 
-                float fz_old_below = (k > 0u) ? (rho_dw[(k - 1u) * M + tid] * w_a[idx]) : 0.0f;
-                float thm_w_below  = (k > 0u) ? thm_w[(k - 1u) * M + tid] : 0.0f;
-                float fz_old_above = (k < K - 1u) ? (rho_dw[idx] * w_a[(k + 1u) * M + tid]) : 0.0f;
-                float thm_w_above  = (k < K - 1u) ? thm_w[idx] : 0.0f;
+            float fz_old_below = (k > 0u) ? (rho_dw[(k - 1u) * M + tid] * w_a[idx]) : 0.0f;
+            float thm_w_below  = (k > 0u) ? thm_w[(k - 1u) * M + tid] : 0.0f;
+            float fz_old_above = (k < K - 1u) ? (rho_dw[idx] * w_a[(k + 1u) * M + tid]) : 0.0f;
+            float thm_w_above  = (k < K - 1u) ? thm_w[idx] : 0.0f;
 
-                float dz_val = dz_c[k * dz_cols + col_dz];
-                float r_cur = rho_a[idx];
-                float T_cur = Thm_a[idx];
-                float r_dag = r_cur - dt_ac * (div_h_rho + (fz_old_above - fz_old_below) / dz_val);
-                float T_dag = T_cur + dt_ac * (
-                    -div_h_Thm
-                    - (thm_w_above * fz_old_above - thm_w_below * fz_old_below) / dz_val
-                    + tend_Thm_slow[idx]
-                );
-                rho_a[idx] = r_dag;
-                Thm_a[idx] = T_dag;
+            float dz_val = dz_c[k * dz_cols + col_dz];
+            float r_cur = rho_a[idx];
+            float T_cur = Thm_a[idx];
+            float r_dag = r_cur - dt_ac * (div_h_rho + (fz_old_above - fz_old_below) / dz_val);
+            float T_dag = T_cur + dt_ac * (
+                -div_h_Thm
+                - (thm_w_above * fz_old_above - thm_w_below * fz_old_below) / dz_val
+                + tend_Thm_slow[idx]
+            );
+            rho_a[idx] = r_dag;
+            Thm_a[idx] = T_dag;
 
-                float T_blend = (1.0f - beta) * T_cur + beta * T_dag;
-                p_reg[it]  = fma(dp_dThm_s[idx], T_blend, a_p_s[idx]);
-                rt_reg[it] = ((1.0f - beta) * r_cur + beta * r_dag) * q_load[idx];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-        for (uint it = 0u; it < 8u; ++it) {
-            uint k = kz + it * 8u;
-            if (k < K) {
-                uint idx = k * M + tid;
-                fx_buf[idx] = p_reg[it];
-                fy_buf[idx] = rt_reg[it];
-            }
+            float T_blend = (1.0f - beta) * T_cur + beta * T_dag;
+            p_blend_buf[idx]    = fma(dp_dThm_s[idx], T_blend, a_p_s[idx]);
+            rtot_blend_buf[idx] = ((1.0f - beta) * r_cur + beta * r_dag) * q_load[idx];
         }
         threadgroup_barrier(mem_flags::mem_device);
 
-        // Step B-2 (8x k-parallel): Assemble vertical HEVI Helmholtz RHS directly into shared memory
-        for (uint um = kz; um < K - 1u; um += 8u) {
+        // Step B-2 (4x k-parallel): Assemble vertical HEVI Helmholtz RHS directly into shared memory
+        for (uint um = kz; um < K - 1u; um += 4u) {
             uint idx_m = um * M + tid;
             uint idx_p = (um + 1u) * M + tid;
-            float p_prev  = fx_buf[idx_m];
-            float p_cur   = fx_buf[idx_p];
-            float rt_prev = fy_buf[idx_m];
-            float rt_cur  = fy_buf[idx_p];
+            float p_prev  = p_blend_buf[idx_m];
+            float p_cur   = p_blend_buf[idx_p];
+            float rt_prev = rtot_blend_buf[idx_m];
+            float rt_cur  = rtot_blend_buf[idx_p];
             float dz_w_val = dz_w_int[um * dz_cols + col_dz];
             float nh_imb = (p_cur - p_prev) / dz_w_val + 0.5f * (rt_cur + rt_prev) * gravity;
             float rdw_m = rho_dw[idx_m];
@@ -627,8 +615,8 @@ kernel void crm_3d_fast_hevi_loop(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Step B-4 (8x k-parallel): Apply implicit vertical flux increments to (rho, Thm, w, fz_acc)
-        for (uint k = kz; k < K; k += 8u) {
+        // Step B-4 (4x k-parallel): Apply implicit vertical flux increments to (rho, Thm, w, fz_acc)
+        for (uint k = kz; k < K; k += 4u) {
             uint idx = k * M + tid;
             float dfz_below = (k > 0u) ? sm_dstar[(k - 1u) * stride_c + rem] : 0.0f;
             float dfz_above = (k < K - 1u) ? sm_dstar[k * stride_c + rem] : 0.0f;
@@ -1921,7 +1909,7 @@ def run_crm_rk3_hevi_metal(
                 ws["prep_c0"], ws["prep_c1"], ws["prep_w"],
                 ql_c, tTh_c, dzc_c, dzw_c, spw_c,
                 ws["fxy_acc"], fz_acc, u_pack, f_hevi4, f_p1,
-                threads=(n_col * grp * 8,), group_size=(grp * 8,),
+                threads=(n_col * grp * 4,), group_size=(grp * 4,),
             )
             rho_s, Thm_s, u_s, v_s, w_s = pp0
             if accum:
