@@ -307,14 +307,21 @@ kernel void crm_fast_hevi_col(
 
         float fz_old_above = 0.0f;
         float thm_w_above = 0.0f;
+        float r_cur = rho_cur[idx];
+        float T_cur = Thm_cur[idx];
+        float thm_k = T_cur / max(r_cur, 1.0e-5f);
         if (k < K - 1u) {
-            fz_old_above = rho_dw[idx] * w_cur[(k + 1u) * M + tid];
-            thm_w_above = thm_w[idx];
+            float w_up = w_cur[(k + 1u) * M + tid];
+            fz_old_above = rho_dw[idx] * w_up;
+            uint idx_p = (k + 1u) * M + tid;
+            float thm_kp = Thm_cur[idx_p] / max(rho_cur[idx_p], 1.0e-5f);
+            float sgn_up = (w_up > 0.0f) ? 1.0f : ((w_up < 0.0f) ? -1.0f : 0.0f);
+            float dz_wu = dz_w_int[k * dz_cols + col_dz];
+            float beta_up = min(1.0f, 0.25f + 1.5f * fabs(w_up) * (dt_ac / max(dz_wu, 1.0f)));
+            thm_w_above = 0.5f * (thm_k + thm_kp) - 0.5f * beta_up * sgn_up * (thm_kp - thm_k);
         }
 
         float dz_val = dz_c[k * dz_cols + col_dz];
-        float r_cur = rho_cur[idx];
-        float T_cur = Thm_cur[idx];
         float r_dag = r_cur - dt_ac * (div_h_rho + (fz_old_above - fz_old_below) / dz_val);
         float T_dag = T_cur + dt_ac * (
             -div_h_Thm
@@ -523,10 +530,12 @@ kernel void crm_3d_fast_hevi_loop(
                     fy_acc[idx] += fy_v * inv_nac;
                 }
             }
+            // Cache live theta_m in idle sm_dstar for race-free conservative upwind vertical Thm flux in Step B-1
+            sm_dstar[k * stride_c + rem] = Thm_a[idx] / max(rho_a[idx], 1.0e-5f);
         }
-        threadgroup_barrier(mem_flags::mem_device);
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
-        // Step B-1 (4x k-parallel): Explicit horizontal + vertical-old divergence -> r_dag, T_dag, p_blend, rtot_blend
+        // Step B-1 (4x k-parallel): Explicit horizontal + live upwind vertical-old divergence -> r_dag, T_dag
         for (uint k = kz; k < K; k += 4u) {
             uint kM = k * M;
             uint idx = kM + tid;
@@ -543,10 +552,29 @@ kernel void crm_3d_fast_hevi_loop(
                 (fx_0 * thm_x_eff[idx] - fx_m * thm_x_eff[idx_xm]) * inv_dx
                 + (fy_0 * thm_y_eff[idx] - fy_m * thm_y_eff[idx_ym]) * inv_dy;
 
-            float fz_old_below = (k > 0u) ? (rho_dw[(k - 1u) * M + tid] * w_a[idx]) : 0.0f;
-            float thm_w_below  = (k > 0u) ? thm_w[(k - 1u) * M + tid] : 0.0f;
-            float fz_old_above = (k < K - 1u) ? (rho_dw[idx] * w_a[(k + 1u) * M + tid]) : 0.0f;
-            float thm_w_above  = (k < K - 1u) ? thm_w[idx] : 0.0f;
+            float thm_k = sm_dstar[k * stride_c + rem];
+            float fz_old_below = 0.0f;
+            float thm_w_below = 0.0f;
+            if (k > 0u) {
+                float w_dn = w_a[idx];
+                fz_old_below = rho_dw[(k - 1u) * M + tid] * w_dn;
+                float thm_km = sm_dstar[(k - 1u) * stride_c + rem];
+                float sgn_dn = (w_dn > 0.0f) ? 1.0f : ((w_dn < 0.0f) ? -1.0f : 0.0f);
+                float dz_wd = dz_w_int[(k - 1u) * dz_cols + col_dz];
+                float beta_dn = min(1.0f, 0.25f + 1.5f * fabs(w_dn) * (dt_ac / max(dz_wd, 1.0f)));
+                thm_w_below = 0.5f * (thm_km + thm_k) - 0.5f * beta_dn * sgn_dn * (thm_k - thm_km);
+            }
+            float fz_old_above = 0.0f;
+            float thm_w_above = 0.0f;
+            if (k < K - 1u) {
+                float w_up = w_a[(k + 1u) * M + tid];
+                fz_old_above = rho_dw[idx] * w_up;
+                float thm_kp = sm_dstar[(k + 1u) * stride_c + rem];
+                float sgn_up = (w_up > 0.0f) ? 1.0f : ((w_up < 0.0f) ? -1.0f : 0.0f);
+                float dz_wu = dz_w_int[k * dz_cols + col_dz];
+                float beta_up = min(1.0f, 0.25f + 1.5f * fabs(w_up) * (dt_ac / max(dz_wu, 1.0f)));
+                thm_w_above = 0.5f * (thm_k + thm_kp) - 0.5f * beta_up * sgn_up * (thm_kp - thm_k);
+            }
 
             float dz_val = dz_c[k * dz_cols + col_dz];
             float r_cur = rho_a[idx];
@@ -564,7 +592,7 @@ kernel void crm_3d_fast_hevi_loop(
             p_blend_buf[idx]    = fma(dp_dThm_s[idx], T_blend, a_p_s[idx]);
             rtot_blend_buf[idx] = ((1.0f - beta) * r_cur + beta * r_dag) * q_load[idx];
         }
-        threadgroup_barrier(mem_flags::mem_device);
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
         // Step B-2 (4x k-parallel): Assemble vertical HEVI Helmholtz RHS directly into shared memory
         for (uint um = kz; um < K - 1u; um += 4u) {

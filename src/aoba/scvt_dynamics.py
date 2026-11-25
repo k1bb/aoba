@@ -345,15 +345,22 @@ def fct_advect_scvt(
     q_c0 = q[:, c0]
     q_c1 = q[:, c1]
 
-    # 1. Low-order 1st-order donor-cell upwind fluxes
+    # 1. Implicit-vertical, explicit-horizontal 1st-order donor-cell predictor (monotone for any C_z)
     fl_h = torch.clamp(uh_edge, min=0.0) * q_c0 + torch.clamp(uh_edge, max=0.0) * q_c1
-    fl_z = torch.zeros_like(omega_z)
-    om_int = omega_z[1:-1]
-    fl_z[1:-1] = torch.clamp(om_int, min=0.0) * q[:-1] + torch.clamp(om_int, max=0.0) * q[1:]
-
-    div_fl = compute_scvt_divergence(mesh, fl_h) + (fl_z[1:] - fl_z[:-1])
+    div_fl_h = compute_scvt_divergence(mesh, fl_h)
+    rhs_m = torch.clamp(mass_old * q - dt * div_fl_h, min=0.0)
     m_safe = torch.clamp(mass_new, min=1.0e-4)
-    q_td = torch.clamp((mass_old * q - dt * div_fl) / m_safe, min=0.0)
+    om_int = omega_z[1:-1]
+    om_pos = torch.clamp(om_int, min=0.0)
+    om_neg = torch.clamp(om_int, max=0.0)
+    z0 = torch.zeros_like(q[0:1])
+    dl_v = torch.cat([z0, -dt * om_pos], dim=0)
+    du_v = torch.cat([dt * om_neg, z0], dim=0)
+    diag_v = m_safe + torch.cat([dt * om_pos, z0], dim=0) - torch.cat([z0, dt * om_neg], dim=0)
+    q_td = torch.clamp(solve_tridiagonal_batched(dl_v, diag_v, du_v, rhs_m), min=0.0)
+
+    fl_z = torch.zeros_like(omega_z)
+    fl_z[1:-1] = om_pos * q_td[:-1] + om_neg * q_td[1:]
 
     # 2. Centered high-order fluxes & anti-diffusive fluxes A = F^H - F^L
     fh_h = uh_edge * (0.5 * (q_c0 + q_c1))
@@ -593,6 +600,7 @@ def _scvt_rk3_stage_prep_core(
     sponge_w: torch.Tensor,
     dt_ac: float,
     beta_hevi: float,
+    dtau_stage: float = 0.0,
 ):
     """Pure-tensor SCVT RK3 stage preparation (EOS, PGF factors, KE, vertical adv, HEVI tridiag)."""
     gamma = C.GAMMA_D
@@ -618,12 +626,20 @@ def _scvt_rk3_stage_prep_core(
     uz_edge = area_e * u_int_e * zw_slope_e
     u_dot_gradz_s = (uz_edge[:, edges_on_cell] * valid_ce).sum(dim=-1) / area_c
 
+    # Upwind-biased, CFL-bounded vertical momentum advection (Skamarock et al., 2012, Sec. 3b).
+    # Pure centered differencing has positive 2*dz growth (+dw/dz) in deep convective updrafts
+    # and violates the RK3 vertical CFL on stretched high-top grids when |w_tilde|*dtau/dz > 0.5.
     w_tilde_s = w_s[1:-1] - u_dot_gradz_s
     wt_e = 0.5 * (w_tilde_s[:, c0] + w_tilde_s[:, c1])
+    dtau_v = dtau_stage if dtau_stage > 0.0 else dt_ac
+    cfl_z = torch.abs(wt_e) * (dtau_v / torch.clamp(dz_w_e, min=1.0))
+    wt_eff = wt_e / torch.clamp(cfl_z / 0.40, min=1.0)
+    beta_upw = torch.clamp(0.35 + 1.5 * cfl_z, max=1.0)
     du_dz_int = (u_s[1:] - u_s[:-1]) / dz_w_e
-    vadv_half = -0.5 * wt_e * du_dz_int
+    vadv_up = -0.5 * (wt_eff - beta_upw * torch.abs(wt_eff)) * du_dz_int
+    vadv_dn = -0.5 * (wt_eff + beta_upw * torch.abs(wt_eff)) * du_dz_int
     z_row_u = torch.zeros_like(u_s[0:1])
-    vadv_u = torch.cat([vadv_half, z_row_u], dim=0) + torch.cat([z_row_u, vadv_half], dim=0)
+    vadv_u = torch.cat([vadv_up, z_row_u], dim=0) + torch.cat([z_row_u, vadv_dn], dim=0)
 
     tend_u_slow = rot_acc - grad_ke + vadv_u + visc_u + du_ext
 
@@ -806,6 +822,7 @@ def _step_scvt_rk3_hevi_impl(
                 q_load=q_load, area_e=area_e, zw_slope_e=zw_slope_e,
                 rot_acc=rot_acc, visc_u=visc_u, du_ext=du_ext,
                 sponge_w=sponge_w, dt_ac=dt_ac, beta_hevi=beta_hevi,
+                dtau_stage=dtau,
             )
         else:
             (
@@ -815,7 +832,7 @@ def _step_scvt_rk3_hevi_impl(
                 m_s, Thm_s, u_s, w_s, dz_c, dz_w_int, dz_w_e, state.z_c,
                 q_load, dc_e, area_e, area_c, zw_slope_e, valid_ce,
                 mesh.edges_on_cell, c0, c1, rot_acc, visc_u, du_ext,
-                sponge_w, dt_ac, beta_hevi,
+                sponge_w, dt_ac, beta_hevi, dtau,
             )
 
         # --- Fast Horizontal Acoustic + Vertical Implicit HEVI Loop from U^0 over n_ac steps of dt_ac ---

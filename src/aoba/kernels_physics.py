@@ -69,59 +69,86 @@ kernel void scvt_fct_cell_td(
     constant float& dt          [[buffer(10)]],
     uint gid [[thread_position_in_grid]])
 {
+    // Column-wise implicit-vertical donor-cell predictor + anti-diffusive fluxes:
+    // Strictly conservative, constant-preserving, and unconditionally monotone for any |omega_z|*dt/m.
     uint B = uint(u_dim.x);
     uint nz = uint(u_dim.y);
     uint nc = uint(u_dim.z);
     uint ne = uint(u_dim.w);
-    uint vol = nz * nc;
-    if (gid >= B * vol) return;
+    if (gid >= B * nc || nz < 1u || nz > 128u) return;
 
-    uint b = gid / vol;
-    uint loc = gid - b * vol;
-    uint k = loc / nc;
-    uint c = loc - k * nc;
+    uint b = gid / nc;
+    uint c = gid - b * nc;
     uint c6 = c * 6u;
-    uint ebase = b * (nz * ne) + k * ne;
-
-    float div_fl_h = 0.0f;
-    for (uint d = 0u; d < 6u; ++d) {
-        div_fl_h += div_w[c6 + d] * fl_h[ebase + uint(eoc[c6 + d])];
-    }
-
+    uint vol = nz * nc;
+    uint q_b_base = b * vol;
+    uint e_b_base = b * (nz * ne);
     uint az_base = b * (nz + 1u) * nc;
-    if (k == 0u) {
-        az_out[az_base + c] = 0.0f;
-    }
-    if (k + 1u == nz) {
-        az_out[az_base + nz * nc + c] = 0.0f;
+
+    int e_idx[6];
+    float dw[6];
+    for (uint d = 0u; d < 6u; ++d) {
+        e_idx[d] = eoc[c6 + d];
+        dw[d] = div_w[c6 + d];
     }
 
-    float q0 = q[gid];
-    float fl_dn = 0.0f;
-    float fl_up = 0.0f;
-    if (k > 0u) {
-        float w_dn = om_z[k * nc + c];
-        float q_km1 = q[gid - nc];
-        fl_dn = max(w_dn, 0.0f) * q_km1 + min(w_dn, 0.0f) * q0;
+    float q_loc[128];
+    float qt_loc[128];
+    float c_star[128];
+    float d_star[128];
+
+    float c_prev = 0.0f;
+    float d_prev = 0.0f;
+    for (uint k = 0u; k < nz; ++k) {
+        uint loc = k * nc + c;
+        uint qidx = q_b_base + loc;
+        uint ebase = e_b_base + k * ne;
+
+        float div_fl_h = 0.0f;
+        for (uint d = 0u; d < 6u; ++d) {
+            div_fl_h += dw[d] * fl_h[ebase + uint(e_idx[d])];
+        }
+
+        float q0 = q[qidx];
+        q_loc[k] = q0;
+        float rhs_k = max(m_old[loc] * q0 - dt * div_fl_h, 0.0f);
+
+        float w_dn = (k > 0u) ? om_z[k * nc + c] : 0.0f;
+        float w_up = (k + 1u < nz) ? om_z[(k + 1u) * nc + c] : 0.0f;
+        float a_k = (k > 0u) ? (-dt * max(w_dn, 0.0f)) : 0.0f;
+        float c_k = (k + 1u < nz) ? (dt * min(w_up, 0.0f)) : 0.0f;
+        float b_k = max(m_new[loc], 1.0e-4f) + dt * (max(w_up, 0.0f) - min(w_dn, 0.0f));
+
+        float den = (k == 0u) ? b_k : (b_k - a_k * c_prev);
+        float inv_den = 1.0f / max(den, 1.0e-20f);
+        c_prev = (k + 1u < nz) ? (c_k * inv_den) : 0.0f;
+        d_prev = (k == 0u) ? (rhs_k * inv_den) : ((rhs_k - a_k * d_prev) * inv_den);
+        c_star[k] = c_prev;
+        d_star[k] = d_prev;
     }
-    if (k + 1u < nz) {
-        uint m = k + 1u;
-        float w_up = om_z[m * nc + c];
-        float q_kp1 = q[gid + nc];
-        fl_up = max(w_up, 0.0f) * q0 + min(w_up, 0.0f) * q_kp1;
+
+    float q_next = 0.0f;
+    for (int ki = int(nz) - 1; ki >= 0; --ki) {
+        uint k = uint(ki);
+        float sol = (ki == int(nz) - 1) ? d_star[k] : (d_star[k] - c_star[k] * q_next);
+        q_next = max(sol, 0.0f);
+        qt_loc[k] = q_next;
+        q_td[q_b_base + k * nc + c] = q_next;
+    }
+
+    az_out[az_base + c] = 0.0f;
+    az_out[az_base + nz * nc + c] = 0.0f;
+    for (uint m = 1u; m < nz; ++m) {
+        float w_m = om_z[m * nc + c];
+        float fl_impl = max(w_m, 0.0f) * qt_loc[m - 1u] + min(w_m, 0.0f) * qt_loc[m];
         float fh_up;
         if (nz >= 4u && m >= 2u && m <= nz - 2u) {
-            float q_km1 = q[gid - nc];
-            float q_kp2 = q[gid + 2u * nc];
-            fh_up = w_up * ((-q_km1 + 7.0f * q0 + 7.0f * q_kp1 - q_kp2) * (1.0f / 12.0f));
+            fh_up = w_m * ((-q_loc[m - 2u] + 7.0f * q_loc[m - 1u] + 7.0f * q_loc[m] - q_loc[m + 1u]) * (1.0f / 12.0f));
         } else {
-            fh_up = w_up * (0.5f * (q0 + q_kp1));
+            fh_up = w_m * (0.5f * (q_loc[m - 1u] + q_loc[m]));
         }
-        az_out[az_base + m * nc + c] = fh_up - fl_up;
+        az_out[az_base + m * nc + c] = fh_up - fl_impl;
     }
-
-    float m_safe = max(m_new[loc], 1.0e-4f);
-    q_td[gid] = max((m_old[loc] * q0 - dt * (div_fl_h + fl_up - fl_dn)) / m_safe, 0.0f);
 }
 
 kernel void scvt_fct_bounds_ratios(
@@ -2759,7 +2786,7 @@ kernel void ogcm_fct_edge(
     device const int* c1_arr        [[buffer(1)]],   // [ne]
     device const float* inv_dc      [[buffer(2)]],   // [ne]
     device const float* w_vor_edge  [[buffer(3)]],   // [ne]
-    device const float* dz_c_int    [[buffer(4)]],   // [nzo-1]
+    device const float* dz_c_int    [[buffer(4)]],   // [nzo-1, nc]
     device const float* qp          [[buffer(5)]],   // [B, nzo, nc]
     device const float* h_u_edge    [[buffer(6)]],   // [nzo, ne]
     device const float* h_e         [[buffer(7)]],   // [nzo, ne]
@@ -2812,11 +2839,10 @@ kernel void ogcm_fct_edge(
         if (k + 1u < nzo) {
             uint k_int = k * ne + e;
             float wie = wet_int_ef[k_int];
-            float inv_dz = 1.0f / dz_c_int[k];
             uint q_kp1 = q_b + (k + 1u) * nc;
             uint wc_int = k * nc;
-            float dqdz0 = ((qp[q_kp1 + c0] - q0) * inv_dz) * wet_int_cf[wc_int + c0];
-            float dqdz1 = ((qp[q_kp1 + c1] - q1) * inv_dz) * wet_int_cf[wc_int + c1];
+            float dqdz0 = ((qp[q_kp1 + c0] - q0) / dz_c_int[wc_int + c0]) * wet_int_cf[wc_int + c0];
+            float dqdz1 = ((qp[q_kp1 + c1] - q1) / dz_c_int[wc_int + c1]) * wet_int_cf[wc_int + c1];
             float dqdz_e = 0.5f * (dqdz0 + dqdz1) * wie;
             float sx_k = sx_int[k_int];
             sx_dqdz_hi = sx_k * dqdz_e;
@@ -2831,11 +2857,10 @@ kernel void ogcm_fct_edge(
             uint km1 = k - 1u;
             uint km1_int = km1 * ne + e;
             float wie = wet_int_ef[km1_int];
-            float inv_dz = 1.0f / dz_c_int[km1];
             uint q_km1 = q_b + km1 * nc;
             uint wc_int = km1 * nc;
-            float dqdz0 = ((q0 - qp[q_km1 + c0]) * inv_dz) * wet_int_cf[wc_int + c0];
-            float dqdz1 = ((q1 - qp[q_km1 + c1]) * inv_dz) * wet_int_cf[wc_int + c1];
+            float dqdz0 = ((q0 - qp[q_km1 + c0]) / dz_c_int[wc_int + c0]) * wet_int_cf[wc_int + c0];
+            float dqdz1 = ((q1 - qp[q_km1 + c1]) / dz_c_int[wc_int + c1]) * wet_int_cf[wc_int + c1];
             float dqdz_e = 0.5f * (dqdz0 + dqdz1) * wie;
             sx_dqdz_lo = sx_int[km1_int] * dqdz_e;
         }
@@ -3662,13 +3687,16 @@ kernel void scvt_rk3_prep_edge(
     device float* fac_z1            [[buffer(20)]],  // [nz, ne]
     device float* tend_u_slow       [[buffer(21)]],  // [nz, ne]
     constant ulong4& u_dim          [[buffer(22)]],  // [nz, nc, ne, 0]
-    constant float& gravity         [[buffer(23)]],
+    constant float4& f_par          [[buffer(23)]],  // [gravity, dtau_stage, 0, 0]
     uint gid                        [[thread_position_in_grid]]
 ) {
     uint nz = uint(u_dim.x);
     uint nc = uint(u_dim.y);
     uint ne = uint(u_dim.z);
     if (gid >= nz * ne) return;
+
+    float gravity = f_par.x;
+    float dtau_v = f_par.y;
 
     uint k = gid / ne;
     uint e = gid - k * ne;
@@ -3705,8 +3733,12 @@ kernel void scvt_rk3_prep_edge(
         float wt0 = w_s[widx0] - u_dot_gradz[midx0];
         float wt1 = w_s[widx1] - u_dot_gradz[midx1];
         float wt_e = 0.5f * (wt0 + wt1);
-        float du_dz = (u_s[(k + 1u) * ne + e] - u_v) / dz_w_e[k * ne + e];
-        vadv += -0.5f * wt_e * du_dz;
+        float dz_up = dz_w_e[k * ne + e];
+        float cfl_z = fabs(wt_e) * (dtau_v / max(dz_up, 1.0f));
+        float wt_eff = wt_e / max(1.0f, cfl_z / 0.40f);
+        float beta_upw = min(1.0f, 0.35f + 1.5f * cfl_z);
+        float du_dz = (u_s[(k + 1u) * ne + e] - u_v) / dz_up;
+        vadv += -0.5f * (wt_eff - beta_upw * fabs(wt_eff)) * du_dz;
     }
     if (k > 0u) {
         uint m = k - 1u;
@@ -3717,8 +3749,12 @@ kernel void scvt_rk3_prep_edge(
         float wt0 = w_s[widx0] - u_dot_gradz[midx0];
         float wt1 = w_s[widx1] - u_dot_gradz[midx1];
         float wt_e = 0.5f * (wt0 + wt1);
-        float du_dz = (u_v - u_s[(k - 1u) * ne + e]) / dz_w_e[m * ne + e];
-        vadv += -0.5f * wt_e * du_dz;
+        float dz_dn = dz_w_e[m * ne + e];
+        float cfl_z = fabs(wt_e) * (dtau_v / max(dz_dn, 1.0f));
+        float wt_eff = wt_e / max(1.0f, cfl_z / 0.40f);
+        float beta_upw = min(1.0f, 0.35f + 1.5f * cfl_z);
+        float du_dz = (u_v - u_s[(k - 1u) * ne + e]) / dz_dn;
+        vadv += -0.5f * (wt_eff + beta_upw * fabs(wt_eff)) * du_dz;
     }
 
     tend_u_slow[gid] = rot_acc[gid] - grad_ke + vadv + visc_u[gid] + du_ext[gid];
@@ -5533,8 +5569,8 @@ kernel void crm_distill_closure_col(
         float qp_n = zero_prov ? qp_pre[idx] : (max(qp_pre[idx] + dqp_r, 0.0f) * scale_w);
         w_post_check += dm * (qn_n + qp_n);
 
-        float fc_sig = aoba_sigmoid(raw_prof[rp_base + 3u * nz + k] - 1.5f);
-        float f_cond = clamp(max(fc_sig - 0.18f, 0.0f) * 1.16f, 0.0f, 0.95f);
+        float fc_sig = aoba_sigmoid(raw_prof[rp_base + 3u * nz + k] - 2.5f);
+        float f_cond = 0.95f * (fc_sig * fc_sig);
         float f_ice = aoba_sigmoid(raw_prof[rp_base + 4u * nz + k]);
         float q_cond = qn_n * f_cond;
         float qc_n = q_cond * (1.0f - f_ice);
@@ -6402,7 +6438,7 @@ def run_scvt_fct_advect_metal(
     lib.scvt_fct_cell_td(
         mc["eoc"], mc["div_w"], q_c, mo_c, mn_c, ws["fl_h"], om_c,
         ws["q_td"], ws["az"], u_dim, dt_f,
-        threads=B * nz * nc,
+        threads=B * nc,
     )
     lib.scvt_fct_bounds_ratios(
         mc["eoc"], nb_idx, mc["div_w"], q_c, ws["q_td"], mn_c, ws["ah"], ws["az"],
@@ -6801,7 +6837,7 @@ def run_ogcm_fct_zstar_metal(
     wic_c = wet_int_cf.contiguous()
     wie_c = wet_int_ef.contiguous()
     sx_c = sx_int.contiguous()
-    dz_c = dz_c_int.reshape(-1).contiguous()
+    dz_c = dz_c_int.contiguous()
     idc_c = inv_dc_edge.contiguous()
     wve_c = w_vor_edge.contiguous()
     dw_c = div_w.contiguous()
@@ -6929,6 +6965,7 @@ def run_scvt_rk3_prep_metal(
     sponge_w: torch.Tensor,
     dt_ac: float,
     beta_hevi: float,
+    dtau_stage: float = 0.0,
 ) -> tuple[torch.Tensor, ...]:
     """Fused GPU SCVT RK3 stage prep (`scvt_rk3_prep_cell` + `scvt_rk3_prep_edge`)."""
     nz, nc = m_s.shape
@@ -6970,13 +7007,14 @@ def run_scvt_rk3_prep_metal(
     fac_z1 = torch.empty((nz, ne), device=dev, dtype=dtype)
     tend_u_slow = torch.empty((nz, ne), device=dev, dtype=dtype)
 
+    dtau_v = float(dtau_stage) if float(dtau_stage) > 0.0 else float(dt_ac)
     lib.scvt_rk3_prep_edge(
         mc["c0"], mc["c1"], mc["inv_dc"],
         m_s.contiguous(), thm_s, rtot_s, pres_s, z_c.contiguous(), ke_cell,
         u_s.contiguous(), w_s.contiguous(), u_dot_gradz_s, dz_w_e.contiguous(),
         rot_acc.contiguous(), visc_u.contiguous(), du_ext.contiguous(),
         m_edge, thm_e, rtot_e, fac_z0, fac_z1, tend_u_slow,
-        u_dim, float(C.GRAVITY),
+        u_dim, [float(C.GRAVITY), dtau_v, 0.0, 0.0],
         threads=nz * ne,
     )
     return (

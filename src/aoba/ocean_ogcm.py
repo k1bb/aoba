@@ -268,10 +268,17 @@ def init_ogcm_state(
         if k == 0:
             hk = torch.where(is_ocean, torch.full_like(h_target, float(dz_k.item())), torch.zeros_like(h_target))
         else:
-            rem = torch.clamp(h_target - top_k, min=0.0, max=float(dz_k.item()))
-            # Enforce minimum partial step 20 m to avoid tiny-volume CFL issues
-            hk = torch.where(rem >= 20.0, rem, torch.zeros_like(rem))
+            dz_f = float(dz_k.item())
+            rem = torch.clamp(h_target - top_k, min=0.0, max=dz_f)
+            # Enforce minimum partial step (35% of nominal dz, capped at 20 m) to prevent
+            # vanishing bottom slivers while keeping thin upper-ocean levels (< 20 m) wet.
+            min_partial = min(20.0, 0.35 * dz_f)
+            hk = torch.where(rem >= min_partial, rem, torch.zeros_like(rem))
         h_c[k] = hk
+
+    # Enforce strict monotonic vertical wetting (a wet layer can never sit beneath a dry layer)
+    for k in range(1, nzo):
+        h_c[k] = torch.where(h_c[k - 1] > 0.0, h_c[k], torch.zeros_like(h_c[k]))
 
     wet_c = h_c > 0.0
     c0 = mesh.cells_on_edge[:, 0]

@@ -2327,7 +2327,7 @@ def step_aoba_model(
                 tau_y_ocn = atm_to_ocn_intensive(coupler, tau_y_ocn)
                 f_ice_ocn = atm_to_ocn_intensive(coupler, f_ice_ocn)
                 evap_ocn = atm_to_ocn_intensive(coupler, evap_ocn)
-                precip_ocn = atm_to_ocn_intensive(coupler, precip_ocn)
+                precip_ocn = atm_to_ocn_intensive(coupler, precip_ocn, ocean_only_source=False)
                 sw_net_ocn = atm_to_ocn_intensive(coupler, sw_net_ocn)
                 if sw_par_ocn is not None:
                     sw_par_ocn = atm_to_ocn_intensive(coupler, sw_par_ocn)

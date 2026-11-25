@@ -49,6 +49,7 @@ class OceanAtmosCoupler:
     atm_glevel: int
     ocn_glevel: int
     ocn_to_atm_idx: torch.Tensor         # [N_ocn] int64 parent host atmosphere cell index
+    ocn_to_atm_ocn_idx: torch.Tensor     # [N_ocn] int64 nearest coarse OCEAN host cell (avoids land-drag leakage)
     atm_to_ocn_nearest_wet: torch.Tensor # [N_atm] int64 nearest wet fine ocean cell (coastal fallback)
     ocn_wet_mask: torch.Tensor           # [N_ocn] bool (fine ocean cell is wet SURF_OCEAN)
     atm_ocn_mask: torch.Tensor           # [N_atm] bool (coarse host cell is SURF_OCEAN)
@@ -113,12 +114,29 @@ def build_ocean_atmos_coupler(
     else:
         atm_to_ocn_nearest_wet = torch.zeros(n_atm, device=dev, dtype=torch.long)
 
+    # Nearest coarse OCEAN cell for every fine cell: coastal wet fine ocean cells that fall
+    # inside a coarse land cell inherit marine forcing (stress, evap, SW, heat increment) from
+    # the nearest coarse ocean cell rather than from high-roughness forested land!
+    atm_ocn_indices = torch.nonzero(atm_ocn, as_tuple=False).squeeze(-1)
+    if atm_ocn_indices.numel() > 0:
+        parent_is_ocn = atm_ocn[ocn_to_atm]
+        if bool((ocn_wet & (~parent_is_ocn)).any()):
+            atm_ocn_xyz = atm_mesh.xyz_cell.to(dev)[atm_ocn_indices]
+            nearest_atm_ocn_pos = _nearest_spherical_indices(ocn_mesh.xyz_cell, atm_ocn_xyz).to(dev)
+            nearest_atm_ocn = atm_ocn_indices[nearest_atm_ocn_pos]
+            ocn_to_atm_ocn = torch.where(parent_is_ocn, ocn_to_atm, nearest_atm_ocn)
+        else:
+            ocn_to_atm_ocn = ocn_to_atm
+    else:
+        ocn_to_atm_ocn = ocn_to_atm
+
     return OceanAtmosCoupler(
         n_atm=n_atm,
         n_ocn=n_ocn,
         atm_glevel=int(atm_mesh.glevel),
         ocn_glevel=int(ocn_mesh.glevel),
         ocn_to_atm_idx=ocn_to_atm,
+        ocn_to_atm_ocn_idx=ocn_to_atm_ocn,
         atm_to_ocn_nearest_wet=atm_to_ocn_nearest_wet,
         ocn_wet_mask=ocn_wet,
         atm_ocn_mask=atm_ocn,
@@ -134,9 +152,17 @@ def build_ocean_atmos_coupler(
 def atm_to_ocn_intensive(
     coupler: OceanAtmosCoupler,
     field_atm: torch.Tensor,
+    *,
+    ocean_only_source: bool = True,
 ) -> torch.Tensor:
-    """Gather an intensive atmospheric surface field `[N_atm]` onto the fine ocean mesh `[N_ocn]`."""
-    return field_atm[coupler.ocn_to_atm_idx]
+    """Gather an intensive atmospheric surface field `[N_atm]` onto the fine ocean mesh `[N_ocn]`.
+
+    When `ocean_only_source=True` (default), fine wet coastal ocean cells whose Voronoi parent
+    coarse cell is land sample the nearest coarse ocean cell instead, preventing high-roughness
+    land wind stress or dry-soil increments from contaminating coastal marine cells.
+    """
+    idx = coupler.ocn_to_atm_ocn_idx if ocean_only_source else coupler.ocn_to_atm_idx
+    return field_atm[idx]
 
 
 def atm_to_ocn_conservative_flux(

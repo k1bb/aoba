@@ -386,8 +386,10 @@ def apply_exact_conservation_closure(
     p_rain_rate = (p_tot_mass * (1.0 - f_snow)) / dt
 
     # Partition q_n into (q_v, q_c, q_i) strictly preserving q_v + q_c + q_i == q_n.
-    # Dead-zone threshold guarantees exact zero condensate in clear sky (eliminating spurious thin-cloud ASR bias).
-    f_cond = torch.clamp(F.relu(torch.sigmoid(f_cond_logit - 1.5) - 0.18) * 1.16, 0.0, 0.95)
+    # Smooth squared-sigmoid activation eliminates clear-sky thin-cloud bias (~2e-6 for logit < -4)
+    # while preserving strictly non-zero gradients everywhere (avoiding dead-ReLU collapse during clear spinup).
+    fc_sig = torch.sigmoid(f_cond_logit - 2.5)
+    f_cond = 0.95 * (fc_sig * fc_sig)
     f_ice = torch.sigmoid(f_ice_logit)
     q_cond = qn_new * f_cond
     qc_new = q_cond * (1.0 - f_ice)
@@ -1241,6 +1243,7 @@ def _compute_distill_loss(
     tgt_s: torch.Tensor,   # [B, 3]
     exner: torch.Tensor,   # [nz, B]
     dt: float,
+    dm: torch.Tensor | None = None,  # [nz, B] layer air mass [kg m^-2] for LWP/IWP path loss
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Mass-and-temperature-scaled multi-variable loss across both epistemic heads (batched)."""
     tp = tgt_p.permute(1, 2, 0).contiguous()  # [8, nz, B]
@@ -1289,6 +1292,18 @@ def _compute_distill_loss(
     w_scal = _cached_loss_weights("crm_scal", (1.2, 1.2, 0.8), (3, 1), tp.device, tp.dtype)
     l_scal = (F.smooth_l1_loss(scal_p2, scal_t2, reduction="none") * w_scal).mean(dim=1).sum()
     loss = l_prof + l_scal
+
+    # Column-integrated LWP & IWP [g m^-2] loss prevents clear-sky stratospheric levels from diluting cloud paths
+    if dm is not None:
+        dm2 = torch.cat([dm, dm], dim=1)  # [nz, 2*B]
+        lwp_t = torch.log1p(torch.clamp((dm * tp[3]).sum(dim=0) * 1.0e3, min=0.0))
+        iwp_t = torch.log1p(torch.clamp((dm * tp[4]).sum(dim=0) * 1.0e3, min=0.0))
+        lwp_p2 = torch.log1p(torch.clamp((dm2 * torch.cat([pred_a["q_c"], pred_b["q_c"]], dim=1)).sum(dim=0) * 1.0e3, min=0.0))
+        iwp_p2 = torch.log1p(torch.clamp((dm2 * torch.cat([pred_a["q_i"], pred_b["q_i"]], dim=1)).sum(dim=0) * 1.0e3, min=0.0))
+        loss = loss + 0.8 * (
+            F.smooth_l1_loss(lwp_p2, torch.cat([lwp_t, lwp_t], dim=0))
+            + F.smooth_l1_loss(iwp_p2, torch.cat([iwp_t, iwp_t], dim=0))
+        )
 
     with torch.no_grad():
         rmse_t = torch.sqrt(F.mse_loss(0.5 * (pred_a["theta_m"] + pred_b["theta_m"]) * exner, t_tgt))
@@ -1405,7 +1420,8 @@ def train_student_online(
         b_cur = int(xb_i.shape[0])
         pred_a = {k: (v[:, :b_cur].contiguous() if v.ndim == 2 else v[:b_cur]) for k, v in pred_both.items()}
         pred_b = {k: (v[:, b_cur:].contiguous() if v.ndim == 2 else v[b_cur:]) for k, v in pred_both.items()}
-        loss_i, r_thm_i, r_qn_i = _compute_distill_loss(pred_a, pred_b, tpb_i, tsb_i, ex_b, dt)
+        dm_b = torch.clamp(rho_b * dz_b, min=1.0e-6)
+        loss_i, r_thm_i, r_qn_i = _compute_distill_loss(pred_a, pred_b, tpb_i, tsb_i, ex_b, dt, dm=dm_b)
 
         if len(inp) == 8:
             sc_pred, sp_pred, dt_cp_pred, dq_cp_pred, ug_pred = state.net.spatial_head(h_lat, inp[5])

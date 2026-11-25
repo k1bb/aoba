@@ -261,19 +261,25 @@ def fct_advect_3d(
     q_yp2 = torch.roll(q, shifts=-2, dims=-2)
     fl_y = torch.clamp(fy, min=0.0) * q + torch.clamp(fy, max=0.0) * q_yp1
 
-    # fz[m] (m = 1..Nz-1) sits between cell m-1 (below) and cell m (above)
-    fl_z = torch.zeros_like(fz)
-    fz_int = fz[1:-1]
-    fl_z[1:-1] = torch.clamp(fz_int, min=0.0) * q[:-1] + torch.clamp(fz_int, max=0.0) * q[1:]
-
-    # Transported & diffused (monotone low-order) update
-    div_fl = (
+    # Implicit-vertical, explicit-horizontal low-order donor-cell predictor:
+    # Strictly mass-conserving, constant-preserving, and unconditionally monotone for any |w|*dt/dz.
+    div_fl_h = (
         (fl_x - torch.roll(fl_x, shifts=1, dims=-1)) / dx
         + (fl_y - torch.roll(fl_y, shifts=1, dims=-2)) / dy
-        + (fl_z[1:] - fl_z[:-1]) / dz
     )
+    rhs_m = torch.clamp(rho_old * dz * q - dt * dz * div_fl_h, min=0.0)
     rho_safe = torch.clamp(rho_new, min=1.0e-5)
-    q_td = torch.clamp((rho_old * q - dt * div_fl) / rho_safe, min=0.0)
+    fz_int = fz[1:-1]
+    fz_pos = torch.clamp(fz_int, min=0.0)
+    fz_neg = torch.clamp(fz_int, max=0.0)
+    z0 = torch.zeros_like(q[0:1])
+    dl_v = torch.cat([z0, -dt * fz_pos], dim=0)
+    du_v = torch.cat([dt * fz_neg, z0], dim=0)
+    diag_v = rho_safe * dz + torch.cat([dt * fz_pos, z0], dim=0) - torch.cat([z0, dt * fz_neg], dim=0)
+    q_td = torch.clamp(solve_tridiagonal_batched(dl_v, diag_v, du_v, rhs_m), min=0.0)
+
+    fl_z = torch.zeros_like(fz)
+    fl_z[1:-1] = fz_pos * q_td[:-1] + fz_neg * q_td[1:]
 
     # --- 2. High-order 4th-order centered horizontal & 2nd/4th-order vertical fluxes ---
     fh_x = fx * ((-q_xm1 + 7.0 * q + 7.0 * q_xp1 - q_xp2) / 12.0)
@@ -593,8 +599,15 @@ def _crm_fast_acoustic_hevi_torch(
 
         fz_old = torch.zeros_like(w_k)
         fz_old[1:-1] = rho_dw * w_k[1:-1]
+        thm_live = Thm_k / torch.clamp(rho_k, min=1.0e-5)
+        w_int_live = w_k[1:-1]
+        beta_th = torch.clamp(0.25 + 1.5 * torch.abs(w_int_live) * (dt_ac / torch.clamp(dz_w_int, min=1.0)), max=1.0)
+        thm_w_live = (
+            0.5 * (thm_live[:-1] + thm_live[1:])
+            - 0.5 * beta_th * torch.sign(w_int_live) * (thm_live[1:] - thm_live[:-1])
+        )
         fTh_z_old = torch.zeros_like(w_k)
-        fTh_z_old[1:-1] = thm_w * fz_old[1:-1]
+        fTh_z_old[1:-1] = thm_w_live * fz_old[1:-1]
 
         rho_dag = rho_k - dt_ac * (div_h_rho + (fz_old[1:] - fz_old[:-1]) / dz_c)
         Thm_dag = Thm_k + dt_ac * (-div_h_Thm - (fTh_z_old[1:] - fTh_z_old[:-1]) / dz_c + tend_Thm_slow)
@@ -1131,9 +1144,9 @@ def _step_crm_physics_and_dynamics_impl(
     dt_sub = dt_crm / float(max(n_sub, 1))
     dz_fct = dz_c_col if dz_c_col is not None else vgrid.dzeta_c
 
-    # Group acoustic substeps into advective super-steps (<= 60 s) via exact time-averaged mass fluxes,
-    # and refresh slow 3D Smagorinsky-Lilly eddy viscosity every ~120 s (every 2 substeps at dt_sub = 60 s).
-    adv_group = max(1, min(n_sub, int(math.floor(60.0 / max(dt_sub, 1.0e-3)))))
+    # Group acoustic substeps into advective super-steps (<= 60 s in 2D, 1 substep = 30 s in 3D
+    # to keep horizontal donor-cell FCT Courant number < 0.50 during strong gust-front outflows).
+    adv_group = max(1, min(n_sub, int(math.floor(60.0 / max(dt_sub, 1.0e-3))))) if is_2d_crm else 1
     sgs_stride = max(1, int(math.floor(120.0 / max(dt_sub, 1.0e-3)))) if is_2d_crm else 1
     use_metal_crm = can_use_crm_metal(crm.rho_d)
     if n_sub > 0:

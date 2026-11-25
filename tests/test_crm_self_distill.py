@@ -89,8 +89,10 @@ def test_exact_column_conservation_closure() -> None:
     assert float((qi4.mean(dim=(-2, -1)) - out["q_i"]).abs().max()) < 1.0e-6
     assert float((qn4.mean(dim=(-2, -1)) - out["q_n"]).abs().max()) < 1.0e-6
     assert float((rain3.mean(dim=(-2, -1)) - out["precip_rain"]).abs().max()) < 1.0e-6
-    # Verify 6 of 8 subcolumns are genuinely cloud-free when f_cld == 0.25
-    clear_frac = float((qc4 == 0.0).to(torch.float32).mean())
+    # Verify 6 of 8 subcolumns are genuinely cloud-free whenever f_cld == 0.25 and below the 6 g/kg ceiling
+    unclamped = (out["q_c"] + out["q_i"]) <= 0.25 * 0.006
+    assert bool(unclamped.any())
+    clear_frac = float((qc4 == 0.0).to(torch.float32)[unclamped].mean())
     assert clear_frac >= 0.74, f"Expected >=75% clear-sky subcolumns at f_cld=0.25, got {clear_frac:.3f}"
 
 

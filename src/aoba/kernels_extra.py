@@ -44,6 +44,9 @@ kernel void crm_fct_flux_td(
     constant float4& f_p           [[buffer(13)]],  // [dt, dx, dy, 0]
     uint gid [[thread_position_in_grid]])
 {
+    // Column-wise implicit-vertical donor-cell predictor + anti-diffusive fluxes:
+    // Strictly conservative, constant-preserving, and unconditionally monotone for any
+    // vertical Courant number |w|*dt/dz (including strong convective downdrafts on stretched grids).
     uint B = uint(u_p0.x);
     uint nz = uint(u_p0.y);
     uint n_col = uint(u_p0.z);
@@ -53,13 +56,10 @@ kernel void crm_fct_flux_td(
 
     uint stride_c = ny * nx;
     uint M = n_col * stride_c;
-    uint vol_pts = nz * M;
-    if (gid >= B * vol_pts) return;
+    if (gid >= B * M || nz < 1u || nz > 128u) return;
 
-    uint b = gid / vol_pts;
-    uint loc = gid - b * vol_pts;
-    uint k = loc / M;
-    uint tid = loc - k * M;
+    uint b = gid / M;
+    uint tid = gid - b * M;
     uint col = tid / stride_c;
     uint rem = tid - col * stride_c;
     uint iy = rem / nx;
@@ -69,78 +69,97 @@ kernel void crm_fct_flux_td(
     uint ix_m1 = (ix > 0u) ? (ix - 1u) : (nx - 1u);
     uint ix_p1 = (ix + 1u < nx) ? (ix + 1u) : 0u;
     uint ix_p2 = (ix + 2u < nx) ? (ix + 2u) : ((nx == 1u) ? 0u : (ix + 2u - nx));
+    uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
+    uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
+    uint iy_p2 = (iy + 2u < ny) ? (iy + 2u) : ((ny == 1u) ? 0u : (iy + 2u - ny));
 
-    uint q_k_base = b * vol_pts + k * M + col * stride_c;
-    uint f_k_base = k * M + col * stride_c;
-
-    float q0 = q[gid];
-    float q_xm1 = q[q_k_base + iy * nx + ix_m1];
-    float q_xp1 = q[q_k_base + iy * nx + ix_p1];
-    float q_xp2 = q[q_k_base + iy * nx + ix_p2];
-
-    float fx_self = fx[loc];
-    float fx_xm1  = fx[f_k_base + iy * nx + ix_m1];
-    float fl_x_self = max(fx_self, 0.0f) * q0    + min(fx_self, 0.0f) * q_xp1;
-    float fl_x_xm1  = max(fx_xm1,  0.0f) * q_xm1 + min(fx_xm1,  0.0f) * q0;
-    float fh_x_self = fx_self * ((-q_xm1 + 7.0f * q0 + 7.0f * q_xp1 - q_xp2) * (1.0f / 12.0f));
-    ax_out[gid] = fh_x_self - fl_x_self;
-
+    uint vol_pts = nz * M;
+    uint q_b_base = b * vol_pts;
+    uint az_base = b * (nz + 1u) * M;
     float dt = f_p.x;
     float inv_dx = 1.0f / f_p.y;
     float inv_dy = 1.0f / f_p.z;
-    float div_fl_y = 0.0f;
-    if (ny > 1u) {
-        uint iy_m1 = (iy > 0u) ? (iy - 1u) : (ny - 1u);
-        uint iy_p1 = (iy + 1u < ny) ? (iy + 1u) : 0u;
-        uint iy_p2 = (iy + 2u < ny) ? (iy + 2u) : (iy + 2u - ny);
-        float q_ym1 = q[q_k_base + iy_m1 * nx + ix];
-        float q_yp1 = q[q_k_base + iy_p1 * nx + ix];
-        float q_yp2 = q[q_k_base + iy_p2 * nx + ix];
-        float fy_self = fy[loc];
-        float fy_ym1  = fy[f_k_base + iy_m1 * nx + ix];
-        float fl_y_self = max(fy_self, 0.0f) * q0    + min(fy_self, 0.0f) * q_yp1;
-        float fl_y_ym1  = max(fy_ym1,  0.0f) * q_ym1 + min(fy_ym1,  0.0f) * q0;
-        float fh_y_self = fy_self * ((-q_ym1 + 7.0f * q0 + 7.0f * q_yp1 - q_yp2) * (1.0f / 12.0f));
-        ay_out[gid] = fh_y_self - fl_y_self;
-        div_fl_y = (fl_y_self - fl_y_ym1) * inv_dy;
-    }
 
-    uint az_base = b * (nz + 1u) * M;
-    if (k == 0u) {
-        az_out[az_base + tid] = 0.0f;
-    }
-    if (k == nz - 1u) {
-        az_out[az_base + nz * M + tid] = 0.0f;
-    }
+    float q_loc[128];
+    float qt_loc[128];
+    float c_star[128];
+    float d_star[128];
 
-    float fl_z_dn = 0.0f;
-    float fl_z_up = 0.0f;
-    if (k > 0u) {
-        float fz_dn = fz[k * M + tid];
-        float q_km1 = q[gid - M];
-        fl_z_dn = max(fz_dn, 0.0f) * q_km1 + min(fz_dn, 0.0f) * q0;
-    }
-    if (k + 1u < nz) {
-        uint m = k + 1u;
-        float fz_up = fz[m * M + tid];
-        float q_kp1 = q[gid + M];
-        fl_z_up = max(fz_up, 0.0f) * q0 + min(fz_up, 0.0f) * q_kp1;
+    float c_prev = 0.0f;
+    float d_prev = 0.0f;
+    for (uint k = 0u; k < nz; ++k) {
+        uint loc = k * M + tid;
+        uint qidx = q_b_base + loc;
+        uint q_k_base = q_b_base + k * M + col * stride_c;
+        uint f_k_base = k * M + col * stride_c;
 
-        float fh_z_up;
-        if (nz >= 4u && m >= 2u && m <= nz - 2u) {
-            float q_km1 = q[gid - M];
-            float q_kp2 = q[gid + 2u * M];
-            fh_z_up = fz_up * ((-q_km1 + 7.0f * q0 + 7.0f * q_kp1 - q_kp2) * (1.0f / 12.0f));
-        } else {
-            fh_z_up = fz_up * (0.5f * (q0 + q_kp1));
+        float q0 = q[qidx];
+        q_loc[k] = q0;
+        float q_xm1 = q[q_k_base + iy * nx + ix_m1];
+        float q_xp1 = q[q_k_base + iy * nx + ix_p1];
+        float q_xp2 = q[q_k_base + iy * nx + ix_p2];
+
+        float fx_self = fx[loc];
+        float fx_xm1  = fx[f_k_base + iy * nx + ix_m1];
+        float fl_x_self = max(fx_self, 0.0f) * q0    + min(fx_self, 0.0f) * q_xp1;
+        float fl_x_xm1  = max(fx_xm1,  0.0f) * q_xm1 + min(fx_xm1,  0.0f) * q0;
+        float fh_x_self = fx_self * ((-q_xm1 + 7.0f * q0 + 7.0f * q_xp1 - q_xp2) * (1.0f / 12.0f));
+        ax_out[qidx] = fh_x_self - fl_x_self;
+
+        float div_fl_y = 0.0f;
+        if (ny > 1u) {
+            float q_ym1 = q[q_k_base + iy_m1 * nx + ix];
+            float q_yp1 = q[q_k_base + iy_p1 * nx + ix];
+            float q_yp2 = q[q_k_base + iy_p2 * nx + ix];
+            float fy_self = fy[loc];
+            float fy_ym1  = fy[f_k_base + iy_m1 * nx + ix];
+            float fl_y_self = max(fy_self, 0.0f) * q0    + min(fy_self, 0.0f) * q_yp1;
+            float fl_y_ym1  = max(fy_ym1,  0.0f) * q_ym1 + min(fy_ym1,  0.0f) * q0;
+            float fh_y_self = fy_self * ((-q_ym1 + 7.0f * q0 + 7.0f * q_yp1 - q_yp2) * (1.0f / 12.0f));
+            ay_out[qidx] = fh_y_self - fl_y_self;
+            div_fl_y = (fl_y_self - fl_y_ym1) * inv_dy;
         }
-        az_out[az_base + m * M + tid] = fh_z_up - fl_z_up;
+
+        float dz_k = dz_c[k * dz_cols + col_dz];
+        float div_fl_h = (fl_x_self - fl_x_xm1) * inv_dx + div_fl_y;
+        float rhs_k = max(rho_old[loc] * dz_k * q0 - dt * dz_k * div_fl_h, 0.0f);
+
+        float fz_dn = (k > 0u) ? fz[k * M + tid] : 0.0f;
+        float fz_up = (k + 1u < nz) ? fz[(k + 1u) * M + tid] : 0.0f;
+        float a_k = (k > 0u) ? (-dt * max(fz_dn, 0.0f)) : 0.0f;
+        float c_k = (k + 1u < nz) ? (dt * min(fz_up, 0.0f)) : 0.0f;
+        float b_k = max(rho_new[loc], 1.0e-5f) * dz_k + dt * (max(fz_up, 0.0f) - min(fz_dn, 0.0f));
+
+        float den = (k == 0u) ? b_k : (b_k - a_k * c_prev);
+        float inv_den = 1.0f / max(den, 1.0e-20f);
+        c_prev = (k + 1u < nz) ? (c_k * inv_den) : 0.0f;
+        d_prev = (k == 0u) ? (rhs_k * inv_den) : ((rhs_k - a_k * d_prev) * inv_den);
+        c_star[k] = c_prev;
+        d_star[k] = d_prev;
     }
 
-    float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
-    float div_fl = (fl_x_self - fl_x_xm1) * inv_dx + div_fl_y + (fl_z_up - fl_z_dn) * inv_dz;
-    float rho_safe = max(rho_new[loc], 1.0e-5f);
-    q_td[gid] = max((rho_old[loc] * q0 - dt * div_fl) / rho_safe, 0.0f);
+    float q_next = 0.0f;
+    for (int ki = int(nz) - 1; ki >= 0; --ki) {
+        uint k = uint(ki);
+        float sol = (ki == int(nz) - 1) ? d_star[k] : (d_star[k] - c_star[k] * q_next);
+        q_next = max(sol, 0.0f);
+        qt_loc[k] = q_next;
+        q_td[q_b_base + k * M + tid] = q_next;
+    }
+
+    az_out[az_base + tid] = 0.0f;
+    az_out[az_base + nz * M + tid] = 0.0f;
+    for (uint m = 1u; m < nz; ++m) {
+        float fz_m = fz[m * M + tid];
+        float fl_z_impl = max(fz_m, 0.0f) * qt_loc[m - 1u] + min(fz_m, 0.0f) * qt_loc[m];
+        float fh_z;
+        if (nz >= 4u && m >= 2u && m <= nz - 2u) {
+            fh_z = fz_m * ((-q_loc[m - 2u] + 7.0f * q_loc[m - 1u] + 7.0f * q_loc[m] - q_loc[m + 1u]) * (1.0f / 12.0f));
+        } else {
+            fh_z = fz_m * (0.5f * (q_loc[m - 1u] + q_loc[m]));
+        }
+        az_out[az_base + m * M + tid] = fh_z - fl_z_impl;
+    }
 }
 
 kernel void crm_fct_bounds_ratios(
@@ -4176,7 +4195,7 @@ def run_crm_fct_advect_metal(
     lib.crm_fct_flux_td(
         q_c, ro_c, rn_c, fx_c, fy_c, fz_c, dz_2d,
         ws["ax"], ws["ay"], ws["az"], ws["q_td"],
-        u_p0, u_p1, f_p, threads=total_q,
+        u_p0, u_p1, f_p, threads=B * M,
     )
     lib.crm_fct_bounds_ratios(
         q_c, ws["q_td"], rn_c, ws["ax"], ws["ay"], ws["az"], dz_2d,
