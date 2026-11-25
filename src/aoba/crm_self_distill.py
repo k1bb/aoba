@@ -361,7 +361,8 @@ def apply_exact_conservation_closure(
     p_env = C.P_REF * torch.pow(ex_safe, 3.5)
     es_w = 611.2 * torch.exp(torch.clamp(17.67 * (t_env - C.T_FREEZE) / torch.clamp(t_env - 29.65, min=20.0), -25.0, 12.0))
     es_i = 611.2 * torch.exp(torch.clamp(21.875 * (t_env - C.T_FREEZE) / torch.clamp(t_env - 7.66, min=20.0), -25.0, 12.0))
-    es_env = torch.where(t_env >= C.T_FREEZE, es_w, es_i)
+    om_liq = torch.clamp((t_env - 253.15) / 20.0, min=0.0, max=1.0)
+    es_env = om_liq * es_w + (1.0 - om_liq) * es_i
     qsat_env = torch.clamp(C.EPS_WATER * es_env / torch.clamp(p_env - es_env, min=100.0), min=1.0e-7, max=0.10)
 
     # Predict bounded sensible-temperature residual dT_raw [K] (<= 1.5 K per host step)
@@ -441,17 +442,23 @@ def apply_exact_conservation_closure(
     dm_pbl_sum = torch.clamp((dm * pbl_shape).sum(dim=0), min=1.0e-3)
     d_temp_shf = ((shf * dt) / (C.CP_D * dm_pbl_sum)).unsqueeze(0) * pbl_shape
 
-    # Remaining column enthalpy budget is purely net condensation/freezing latent heating [J m^-2]
-    d_m_cond = (dm * conv_f * ((qc_new + qi_new + qp_new) - (qc0 + qi0 + qp0))).sum(dim=0)
-    d_m_ice = (dm * conv_f * (qi_new - qi0)).sum(dim=0)
-    dh_lat = (
-        C.L_V0 * (p_tot_mass + d_m_cond)
-        + C.L_F0 * (p_tot_mass * f_snow + d_m_ice)
+    # Local in-situ phase-change latent heating for suspended cloud condensate (q_c, q_i)
+    # preserves liquid-ice potential temperature theta_l layer-by-layer and prevents
+    # spurious theta_l inversions between host MYNN saturation adjustment and OSSP closure.
+    d_temp_lat = conv_f * (
+        C.L_V0 * ((qc_new + qi_new) - (qc0 + qi0))
+        + C.L_F0 * (qi_new - qi0)
+    ) / C.CP_D
+    # Remaining column enthalpy budget is purely precipitation formation & fallout [J m^-2]
+    d_m_qp = (dm * conv_f * (qp_new - qp0)).sum(dim=0)
+    dh_precip = (
+        C.L_V0 * (p_tot_mass + d_m_qp)
+        + C.L_F0 * (p_tot_mass * f_snow)
     )
     dh_raw = C.CP_D * (dm * d_temp_raw).sum(dim=0)
     denom_h = torch.clamp(C.CP_D * (dm * s_conv).sum(dim=0), min=1.0)
-    h_corr = (dh_lat - dh_raw) / denom_h
-    d_temp_cons = d_temp_shf + d_temp_raw + h_corr.unsqueeze(0) * s_conv
+    h_corr = (dh_precip - dh_raw) / denom_h
+    d_temp_cons = d_temp_shf + d_temp_lat + d_temp_raw + h_corr.unsqueeze(0) * s_conv
 
     # Exact enthalpy-conserving 2-pass red-black dry-convective adjustment within s_conv > 0:
     # removes statically unstable super-adiabatic 2dz sawtooth pairs (theta_k > theta_{k+1})

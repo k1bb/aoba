@@ -5556,10 +5556,10 @@ kernel void crm_distill_closure_col(
             float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
             float t_env = clamp(t_post_ls, 180.0f, 340.0f);
             float p_env = p_ref * pow(ex_safe, 3.5f);
-            float es_arg = (t_env >= t_frz)
-                ? clamp(17.67f * (t_env - t_frz) / max(t_env - 29.65f, 20.0f), -25.0f, 12.0f)
-                : clamp(21.875f * (t_env - t_frz) / max(t_env - 7.66f, 20.0f), -25.0f, 12.0f);
-            float es_env = 611.2f * exp(es_arg);
+            float es_w = 611.2f * exp(clamp(17.67f * (t_env - t_frz) / max(t_env - 29.65f, 20.0f), -25.0f, 12.0f));
+            float es_i = 611.2f * exp(clamp(21.875f * (t_env - t_frz) / max(t_env - 7.66f, 20.0f), -25.0f, 12.0f));
+            float om_liq = clamp((t_env - 253.15f) / 20.0f, 0.0f, 1.0f);
+            float es_env = om_liq * es_w + (1.0f - om_liq) * es_i;
             float qsat_env = clamp(eps_w * es_env / max(p_env - es_env, 100.0f), 1.0e-7f, 0.10f);
 
             w_pre_conv += dm * (qn0 + qp0);
@@ -5590,10 +5590,9 @@ kernel void crm_distill_closure_col(
     bool zero_prov = (w_prov_conv <= 1.0e-5f);
     float scale_w = clamp(w_target_conv / max(w_prov_conv, 1.0e-5f), 0.0f, 50.0f);
 
-    // Pass 2: convective rescaled water, condensate partition, and latent-heat integrals
+    // Pass 2: convective rescaled water, condensate partition, and precipitation latent-heat integral
     float w_post_conv = 0.0f;
-    float d_m_cond = 0.0f;
-    float d_m_ice = 0.0f;
+    float d_m_qp = 0.0f;
 
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * N + c;
@@ -5625,10 +5624,10 @@ kernel void crm_distill_closure_col(
             float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
             float t_env = clamp(t_post_ls, 180.0f, 340.0f);
             float p_env = p_ref * pow(ex_safe, 3.5f);
-            float es_arg = (t_env >= t_frz)
-                ? clamp(17.67f * (t_env - t_frz) / max(t_env - 29.65f, 20.0f), -25.0f, 12.0f)
-                : clamp(21.875f * (t_env - t_frz) / max(t_env - 7.66f, 20.0f), -25.0f, 12.0f);
-            float es_env = 611.2f * exp(es_arg);
+            float es_w = 611.2f * exp(clamp(17.67f * (t_env - t_frz) / max(t_env - 29.65f, 20.0f), -25.0f, 12.0f));
+            float es_i = 611.2f * exp(clamp(21.875f * (t_env - t_frz) / max(t_env - 7.66f, 20.0f), -25.0f, 12.0f));
+            float om_liq = clamp((t_env - 253.15f) / 20.0f, 0.0f, 1.0f);
+            float es_env = om_liq * es_w + (1.0f - om_liq) * es_i;
             float qsat_env = clamp(eps_w * es_env / max(p_env - es_env, 100.0f), 1.0e-7f, 0.10f);
 
             float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
@@ -5648,8 +5647,7 @@ kernel void crm_distill_closure_col(
             qi_n = q_cond * f_ice;
             qv_n = max(qn_n - qc_n - qi_n, 0.0f);
 
-            d_m_cond += dm * ((qc_n + qi_n + qp_n) - (qc0 + qi0 + qp0));
-            d_m_ice  += dm * (qi_n - qi0);
+            d_m_qp += dm * (qp_n - qp0);
         }
 
         out_prof[1u * plane + idx] = qn_n;
@@ -5666,8 +5664,8 @@ kernel void crm_distill_closure_col(
     out_scal[N + c]      = (p_tot_fin * f_snow) / dt;
     out_scal[2u * N + c] = aoba_sigmoid(raw_scal[rs_base + 2u] - 1.0f);
 
-    float dh_lat = l_v0 * (p_tot_fin + d_m_cond) + l_f0 * (p_tot_fin * f_snow + d_m_ice);
-    float h_corr = (dh_lat - dh_raw) / max(denom_h, 1.0f);
+    float dh_precip = l_v0 * (p_tot_fin + d_m_qp) + l_f0 * (p_tot_fin * f_snow);
+    float h_corr = (dh_precip - dh_raw) / max(denom_h, 1.0f);
     float dT_shf_scale = (shf * dt) / (cp_d * max(dm_pbl_sum, 1.0e-3f));
     float u_corr = (tau_x * dt - du_imp) / dm_sum_safe;
     float v_corr = (tau_y * dt - dv_imp) / dm_sum_safe;
@@ -5701,8 +5699,11 @@ kernel void crm_distill_closure_col(
         float d_temp_cons = 0.0f;
         if (s_conv > 0.0f) {
             float pbl_sh = clamp(1.0f - (ex0 - ex) * inv_pbl_ex, 0.0f, 1.0f) * s_conv;
+            float qc_n = out_prof[4u * plane + idx];
+            float qi_n = out_prof[5u * plane + idx];
+            float d_temp_lat = (l_v0 * ((qc_n + qi_n) - (qc0 + qi0)) + l_f0 * (qi_n - qi0)) / cp_d;
             float d_temp_r = s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 1.5f;
-            d_temp_cons = dT_shf_scale * pbl_sh + d_temp_r + h_corr * s_conv;
+            d_temp_cons = dT_shf_scale * pbl_sh + d_temp_lat + d_temp_r + h_corr * s_conv;
         }
         if (use_adj) {
             t_pls[k] = t_post_ls;

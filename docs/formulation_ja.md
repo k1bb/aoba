@@ -1472,8 +1472,9 @@ $$
 
 $$
 \begin{aligned}
-\Delta H_{\mathrm{lat}} &= L_{v0}\big(P_{\mathrm{tot}}\Delta t + \Delta M_{\mathrm{cond}}\big) + L_{f0}\big(P_{\mathrm{snow}}\Delta t + \Delta M_{\mathrm{ice}}\big), \\
-h_{\mathrm{corr}} &= \frac{\Delta H_{\mathrm{lat}} - c_{pd}\sum_k \Delta m_k \Delta T_{\mathrm{raw},k}}{c_{pd}\sum_k \Delta m_k s_{\mathrm{conv},k}}, \qquad \Delta T_{\mathrm{cons},k} = \Delta T_{\mathrm{shf},k} + \Delta T_{\mathrm{raw},k} + h_{\mathrm{corr}}\,s_{\mathrm{conv},k}, \\
+\Delta T_{\mathrm{lat},k} &= \frac{L_{v0}\big[(q_{c,k}^{n+1} + q_{i,k}^{n+1}) - (q_{c,k}^0 + q_{i,k}^0)\big] + L_{f0}\big(q_{i,k}^{n+1} - q_{i,k}^0\big)}{c_{pd}}, \\
+\Delta H_{\mathrm{precip}} &= L_{v0}\big(P_{\mathrm{tot}}\Delta t + \Delta M_p\big) + L_{f0} P_{\mathrm{snow}}\Delta t, \\
+h_{\mathrm{corr}} &= \frac{\Delta H_{\mathrm{precip}} - c_{pd}\sum_k \Delta m_k \Delta T_{\mathrm{raw},k}}{c_{pd}\sum_k \Delta m_k s_{\mathrm{conv},k}}, \qquad \Delta T_{\mathrm{cons},k} = \Delta T_{\mathrm{shf},k} + \Delta T_{\mathrm{lat},k} + \Delta T_{\mathrm{raw},k} + h_{\mathrm{corr}}\,s_{\mathrm{conv},k}, \\
 \theta_{m,k}^{n+1} &= \theta_{m,k}^{\mathrm{post,ls}} + \frac{\Delta T_{\mathrm{cons},k}\!\left(1 + \frac{R_v}{R_d} q_{v,k}^{n+1}\right) + T_k^{\mathrm{post,ls}}\frac{R_v}{R_d}\!\left(q_{v,k}^{n+1} - q_{v,k}^0\right)}{\max(\Pi_k,\ 0.05)}
 \end{aligned} \tag{8.15}
 $$
