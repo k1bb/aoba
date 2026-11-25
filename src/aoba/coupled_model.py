@@ -1457,7 +1457,10 @@ def step_aoba_model(
                 train_rad_student_online,
             )
 
-            rad_sel = select_rad_teacher_indices(model.rad_distill, crm_state=model.crm_distill)
+            sparse_warmup_3d = (ny > 1 and nx > 1 and m_crm > 100_000)
+            rad_sel = select_rad_teacher_indices(
+                model.rad_distill, crm_state=model.crm_distill, allow_sparse_warmup=sparse_warmup_3d,
+            )
 
         use_2m_re = (
             str(cfg.microphysics_scheme).strip().lower() in ("two_moment", "six_class_2m")
@@ -1772,69 +1775,122 @@ def step_aoba_model(
                 q_rad_t[:, tr_s], sw1d_t[tr_s], sw1f_t[tr_s], sw2d_t[tr_s], sw2f_t[tr_s],
                 lwd_t[tr_s], olr_t[tr_s], asr_t[tr_s],
             )
-            train_rad_student_online(model.rad_distill, x_rt, cp_rt, cs_rt, tqr_rt, ts_rt)
+            n_rgrad_d = 4 if model.rad_distill.steps_seen < model.rad_distill.warmup_steps else 2
+            train_rad_student_online(
+                model.rad_distill, x_rt, cp_rt, cs_rt, tqr_rt, ts_rt, n_grad_steps=n_rgrad_d
+            )
 
             # 3b. Student cells: fast per-surface-tile (`n_sub`) RadSelfDistillNet inference
-            rho_s = _c2s(rho_crm_flat[:, s_crm], n_sr)
-            thm_s = _c2s(thm_crm_flat[:, s_crm], n_sr)
-            qv_s = _c2s(qv_crm_flat[:, s_crm], n_sr)
-            qc_s = _c2s(qc_crm_flat[:, s_crm], n_sr)
-            qi_s = _c2s(qi_crm_flat[:, s_crm], n_sr)
-            pres_s, _, temp_s = diagnose_pressure_temperature(rho_s, thm_s, qv_s)
-            dz_s = _cell_to_sub(atmos.dz_c[:, s_ridx], n_sr, n_sub)
-            qd_s = _cell_to_sub(q_dust_cell[:, s_ridx], n_sr, n_sub) if q_dust_cell is not None else None
-            tau_aero_s = _cell_to_sub(aero_opt_cell[0][:, s_ridx], n_sr, n_sub) if aero_opt_cell is not None else None
-            if o3_prog_cell is not None:
-                o3_s = _cell_to_sub(o3_prog_cell[:, s_ridx], n_sr, n_sub)
-            elif o3_use_provider:
-                o3_s = model.o3_provider.compute_vmr(
-                    pres_s, lat_rad=_cell_to_sub(mesh.lat_cell[s_ridx], n_sr, n_sub), doy=doy_now_rad
+            if n_sub == n_crm:
+                # Zero-gather/zero-scatter contiguous path for 1:1 MAML+ICA grids
+                pres_all, _, temp_all = diagnose_pressure_temperature(
+                    rho_crm_flat, thm_crm_flat, qv_crm_flat
                 )
+                dz_all = _cell_to_sub(atmos.dz_c, nc, n_crm)
+                qd_all = _cell_to_sub(q_dust_cell, nc, n_crm) if q_dust_cell is not None else None
+                tau_aero_all = _cell_to_sub(aero_opt_cell[0], nc, n_crm) if aero_opt_cell is not None else None
+                if o3_prog_cell is not None:
+                    o3_all = _cell_to_sub(o3_prog_cell, nc, n_crm)
+                elif o3_use_provider:
+                    o3_all = model.o3_provider.compute_vmr(
+                        pres_all, lat_rad=_cell_to_sub(mesh.lat_cell, nc, n_crm), doy=doy_now_rad
+                    )
+                else:
+                    o3_all = None
+                x_ra, cp_ra, s_inc_ra = extract_rad_distill_features(
+                    pres_all, temp_all, dz_all, rho_crm_flat, qv_crm_flat, qc_crm_flat, qi_crm_flat,
+                    t_rad_in, alb_vd, alb_vf, alb_nd, alb_nf,
+                    emiss_in, mu0_sub, s_toa_sub,
+                    co2_ppmv=co2_rad_now, ch4_ppmv=ch4_rad_now, n2o_ppmv=n2o_rad_now,
+                    o3_vmr_c=o3_all, q_dust_c=qd_all, tau_aero_sw_c=tau_aero_all,
+                )
+                rad_stu_out, rad_stu_unc = predict_rad_student_columns(
+                    model.rad_distill, x_ra, cp_ra, s_inc_ra,
+                    alb_vd, alb_vf, alb_nd, alb_nf, emiss_in, t_rad_in,
+                )
+                q_rad_sub = rad_stu_out["q_rad"]
+                sw1_dir_sub = rad_stu_out["sw1_dir"]
+                sw1_dif_sub = rad_stu_out["sw1_dif"]
+                sw2_dir_sub = rad_stu_out["sw2_dir"]
+                sw2_dif_sub = rad_stu_out["sw2_dif"]
+                lw_dn_sub = rad_stu_out["lw_dn"]
+                olr_sub = rad_stu_out["olr"]
+                asr_sub = rad_stu_out["asr"]
+
+                q_rad_sub.index_copy_(1, t_crm, q_rad_t)
+                sw1_dir_sub.index_copy_(0, t_crm, sw1d_t)
+                sw1_dif_sub.index_copy_(0, t_crm, sw1f_t)
+                sw2_dir_sub.index_copy_(0, t_crm, sw2d_t)
+                sw2_dif_sub.index_copy_(0, t_crm, sw2f_t)
+                lw_dn_sub.index_copy_(0, t_crm, lwd_t)
+                olr_sub.index_copy_(0, t_crm, olr_t)
+                asr_sub.index_copy_(0, t_crm, asr_t)
+
+                model.rad_distill.last_uncertainty = rad_stu_unc.reshape(nc, n_sub).mean(dim=-1)
+                model.rad_distill.last_uncertainty[t_ridx] = 0.0
+                model.rad_distill.teacher_frac_last = float(n_tr) / float(max(nc, 1))
+                model.rad_distill.steps_seen += 1
             else:
-                o3_s = None
-            x_rs, cp_rs, s_inc_rs = extract_rad_distill_features(
-                pres_s, temp_s, dz_s, rho_s, qv_s, qc_s, qi_s,
-                t_rad_in[s_sfc], alb_vd[s_sfc], alb_vf[s_sfc], alb_nd[s_sfc], alb_nf[s_sfc],
-                emiss_in[s_sfc], mu0_sub[s_sfc], s_toa_sub[s_sfc],
-                co2_ppmv=co2_rad_now, ch4_ppmv=ch4_rad_now, n2o_ppmv=n2o_rad_now,
-                o3_vmr_c=o3_s, q_dust_c=qd_s, tau_aero_sw_c=tau_aero_s,
-            )
-            rad_stu_out, rad_stu_unc = predict_rad_student_columns(
-                model.rad_distill, x_rs, cp_rs, s_inc_rs,
-                alb_vd[s_sfc], alb_vf[s_sfc], alb_nd[s_sfc], alb_nf[s_sfc], emiss_in[s_sfc], t_rad_in[s_sfc],
-            )
+                rho_s = _c2s(rho_crm_flat[:, s_crm], n_sr)
+                thm_s = _c2s(thm_crm_flat[:, s_crm], n_sr)
+                qv_s = _c2s(qv_crm_flat[:, s_crm], n_sr)
+                qc_s = _c2s(qc_crm_flat[:, s_crm], n_sr)
+                qi_s = _c2s(qi_crm_flat[:, s_crm], n_sr)
+                pres_s, _, temp_s = diagnose_pressure_temperature(rho_s, thm_s, qv_s)
+                dz_s = _cell_to_sub(atmos.dz_c[:, s_ridx], n_sr, n_sub)
+                qd_s = _cell_to_sub(q_dust_cell[:, s_ridx], n_sr, n_sub) if q_dust_cell is not None else None
+                tau_aero_s = _cell_to_sub(aero_opt_cell[0][:, s_ridx], n_sr, n_sub) if aero_opt_cell is not None else None
+                if o3_prog_cell is not None:
+                    o3_s = _cell_to_sub(o3_prog_cell[:, s_ridx], n_sr, n_sub)
+                elif o3_use_provider:
+                    o3_s = model.o3_provider.compute_vmr(
+                        pres_s, lat_rad=_cell_to_sub(mesh.lat_cell[s_ridx], n_sr, n_sub), doy=doy_now_rad
+                    )
+                else:
+                    o3_s = None
+                x_rs, cp_rs, s_inc_rs = extract_rad_distill_features(
+                    pres_s, temp_s, dz_s, rho_s, qv_s, qc_s, qi_s,
+                    t_rad_in[s_sfc], alb_vd[s_sfc], alb_vf[s_sfc], alb_nd[s_sfc], alb_nf[s_sfc],
+                    emiss_in[s_sfc], mu0_sub[s_sfc], s_toa_sub[s_sfc],
+                    co2_ppmv=co2_rad_now, ch4_ppmv=ch4_rad_now, n2o_ppmv=n2o_rad_now,
+                    o3_vmr_c=o3_s, q_dust_c=qd_s, tau_aero_sw_c=tau_aero_s,
+                )
+                rad_stu_out, rad_stu_unc = predict_rad_student_columns(
+                    model.rad_distill, x_rs, cp_rs, s_inc_rs,
+                    alb_vd[s_sfc], alb_vf[s_sfc], alb_nd[s_sfc], alb_nf[s_sfc], emiss_in[s_sfc], t_rad_in[s_sfc],
+                )
 
-            q_rad_sub = torch.empty((nz, m_crm), device=dev_r, dtype=rho_crm_flat.dtype)
-            sw1_dir_sub = torch.empty_like(t_rad_in)
-            sw1_dif_sub = torch.empty_like(t_rad_in)
-            sw2_dir_sub = torch.empty_like(t_rad_in)
-            sw2_dif_sub = torch.empty_like(t_rad_in)
-            lw_dn_sub = torch.empty_like(t_rad_in)
-            olr_sub = torch.empty_like(t_rad_in)
-            asr_sub = torch.empty_like(t_rad_in)
+                q_rad_sub = torch.empty((nz, m_crm), device=dev_r, dtype=rho_crm_flat.dtype)
+                sw1_dir_sub = torch.empty_like(t_rad_in)
+                sw1_dif_sub = torch.empty_like(t_rad_in)
+                sw2_dir_sub = torch.empty_like(t_rad_in)
+                sw2_dif_sub = torch.empty_like(t_rad_in)
+                lw_dn_sub = torch.empty_like(t_rad_in)
+                olr_sub = torch.empty_like(t_rad_in)
+                asr_sub = torch.empty_like(t_rad_in)
 
-            q_rad_sub[:, t_crm] = q_rad_t
-            sw1_dir_sub[t_sfc] = _c2s(sw1d_t, n_tr)
-            sw1_dif_sub[t_sfc] = _c2s(sw1f_t, n_tr)
-            sw2_dir_sub[t_sfc] = _c2s(sw2d_t, n_tr)
-            sw2_dif_sub[t_sfc] = _c2s(sw2f_t, n_tr)
-            lw_dn_sub[t_sfc] = _c2s(lwd_t, n_tr)
-            olr_sub[t_sfc] = _c2s(olr_t, n_tr)
-            asr_sub[t_sfc] = _c2s(asr_t, n_tr)
+                q_rad_sub[:, t_crm] = q_rad_t
+                sw1_dir_sub[t_sfc] = _c2s(sw1d_t, n_tr)
+                sw1_dif_sub[t_sfc] = _c2s(sw1f_t, n_tr)
+                sw2_dir_sub[t_sfc] = _c2s(sw2d_t, n_tr)
+                sw2_dif_sub[t_sfc] = _c2s(sw2f_t, n_tr)
+                lw_dn_sub[t_sfc] = _c2s(lwd_t, n_tr)
+                olr_sub[t_sfc] = _c2s(olr_t, n_tr)
+                asr_sub[t_sfc] = _c2s(asr_t, n_tr)
 
-            q_rad_sub[:, s_crm] = _s2c(rad_stu_out["q_rad"], n_sr)
-            sw1_dir_sub[s_sfc] = rad_stu_out["sw1_dir"]
-            sw1_dif_sub[s_sfc] = rad_stu_out["sw1_dif"]
-            sw2_dir_sub[s_sfc] = rad_stu_out["sw2_dir"]
-            sw2_dif_sub[s_sfc] = rad_stu_out["sw2_dif"]
-            lw_dn_sub[s_sfc] = rad_stu_out["lw_dn"]
-            olr_sub[s_sfc] = rad_stu_out["olr"]
-            asr_sub[s_sfc] = rad_stu_out["asr"]
+                q_rad_sub[:, s_crm] = _s2c(rad_stu_out["q_rad"], n_sr)
+                sw1_dir_sub[s_sfc] = rad_stu_out["sw1_dir"]
+                sw1_dif_sub[s_sfc] = rad_stu_out["sw1_dif"]
+                sw2_dir_sub[s_sfc] = rad_stu_out["sw2_dir"]
+                sw2_dif_sub[s_sfc] = rad_stu_out["sw2_dif"]
+                lw_dn_sub[s_sfc] = rad_stu_out["lw_dn"]
+                olr_sub[s_sfc] = rad_stu_out["olr"]
+                asr_sub[s_sfc] = rad_stu_out["asr"]
 
-            model.rad_distill.last_uncertainty.zero_()
-            model.rad_distill.last_uncertainty[s_ridx] = rad_stu_unc.reshape(n_sr, n_sub).mean(dim=-1)
-            model.rad_distill.teacher_frac_last = float(n_tr) / float(max(nc, 1))
-            model.rad_distill.steps_seen += 1
+                model.rad_distill.last_uncertainty.zero_()
+                model.rad_distill.last_uncertainty[s_ridx] = rad_stu_unc.reshape(n_sr, n_sub).mean(dim=-1)
+                model.rad_distill.teacher_frac_last = float(n_tr) / float(max(nc, 1))
+                model.rad_distill.steps_seen += 1
         else:
             # Full-physics / warmup ICA radiation across `[nz, m_crm]`
             pres_crm, _, temp_crm = diagnose_pressure_temperature(rho_crm_flat, thm_crm_flat, qv_crm_flat)
@@ -2631,10 +2687,11 @@ def step_aoba_model(
                 subgrid_struct=subgrid_struct_sd,
             )
             thm_post_ls_sd = thm_pre_sd + dt * q_rad_cell_pre * (1.0 + C.RV_OVER_RD * qv_pre_sd) / torch.clamp(exner_all_sd, min=1.0e-3)
+            sparse_warmup_crm = (ny > 1 and nx > 1 and m_crm > 100_000)
             if has_pool and t_pool_idx is not None and s_pool_idx is not None:
                 distill_sel = (t_pool_idx, s_pool_idx)
             else:
-                distill_sel = select_teacher_indices(model.crm_distill)
+                distill_sel = select_teacher_indices(model.crm_distill, allow_sparse_warmup=sparse_warmup_crm)
 
         if distill_sel is not None and model.crm_distill is not None:
             t_idx, s_idx = distill_sel
@@ -2752,6 +2809,12 @@ def step_aoba_model(
                     f_coriolis=mesh.f_cell[t_idx],
                     n_c=crm.n_c[:, t_idx] if crm.n_c is not None else None,
                     n_i=crm.n_i[:, t_idx] if crm.n_i is not None else None,
+                    q_r=crm.q_r[:, t_idx] if getattr(crm, "q_r", None) is not None else None,
+                    q_s=crm.q_s[:, t_idx] if getattr(crm, "q_s", None) is not None else None,
+                    q_g=crm.q_g[:, t_idx] if getattr(crm, "q_g", None) is not None else None,
+                    n_r=crm.n_r[:, t_idx] if getattr(crm, "n_r", None) is not None else None,
+                    n_s=crm.n_s[:, t_idx] if getattr(crm, "n_s", None) is not None else None,
+                    n_g=crm.n_g[:, t_idx] if getattr(crm, "n_g", None) is not None else None,
                 )
                 sub_sfc_t = SurfaceFluxDiagnostics(**{k: _tile3d_to_crm3d(v[t_idx]) for k, v in sfc_diag_tile.items()})
                 sp_t = step_crm_physics_and_dynamics(
@@ -2774,14 +2837,14 @@ def step_aoba_model(
                     u_sfc_sub=_tile3d_to_crm3d(u_sfc_tile[t_idx]),
                     q_dust_sub=q_dust_4d[:, t_idx] if q_dust_4d is not None else None,
                 )
-                if sub_crm_t.n_c is not None:
-                    if crm.n_c is None:
-                        crm.n_c = torch.zeros_like(crm.q_c)
-                    crm.n_c[:, t_idx] = sub_crm_t.n_c
-                if sub_crm_t.n_i is not None:
-                    if crm.n_i is None:
-                        crm.n_i = torch.zeros_like(crm.q_i)
-                    crm.n_i[:, t_idx] = sub_crm_t.n_i
+                for opt_attr in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
+                    src_f = getattr(sub_crm_t, opt_attr, None)
+                    if src_f is not None:
+                        dst_f = getattr(crm, opt_attr, None)
+                        if dst_f is None:
+                            dst_f = torch.zeros_like(crm.q_c)
+                            setattr(crm, opt_attr, dst_f)
+                        dst_f.index_copy_(1, t_idx, src_f)
 
             rho_t_mean = mean_2d(sub_crm_t.rho_d)
             inv_rho_t = 1.0 / torch.clamp(rho_t_mean, min=1.0e-5)
@@ -2829,7 +2892,7 @@ def step_aoba_model(
                 if sub_maps_all_sd is not None
                 else (None, None)
             )
-            n_cgrad = 4 if (has_pool and model.crm_distill.steps_seen < model.crm_distill.warmup_steps) else 1
+            n_cgrad = 4 if ((has_pool or sparse_warmup_crm) and model.crm_distill.steps_seen < model.crm_distill.warmup_steps) else 1
             train_student_online(
                 model.crm_distill, x_all_sd[t_idx], ctx_p_t, ctx_s_t, tgt_p_t, tgt_s_t, dt,
                 n_grad_steps=n_cgrad,
