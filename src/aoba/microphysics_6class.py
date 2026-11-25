@@ -206,9 +206,11 @@ def step_microphysics_six_class_2m(
     nr_cur = nr_cur + dq_c2r / 2.5e-7  # Mean new raindrop mass ~2.5e-7 kg (r ~ 400 um)
 
     # 3. Cold-cloud pathways:
-    # (a) Ice crystal aggregation (q_i -> q_s)
-    k_agg = 1.5e-3 * torch.exp(torch.clamp(0.025 * (temp - C.T_FREEZE), min=-3.0, max=0.0)) * torch.clamp(qi / 1.0e-4, 0.0, 5.0)
-    dq_i2s = torch.where(qi > 2.0e-5, (-torch.expm1(-torch.clamp(k_agg * dt, max=5.0))) * qi, torch.zeros_like(qi))
+    # (a) Ice crystal aggregation (q_i -> q_s): excess above qi_thresh = 1e-4 kg/kg
+    #     preserves upper-tropospheric cirrus/anvil decks while converting dense cores to snow (Morrison et al., 2005).
+    k_agg = 1.0e-3 * torch.exp(torch.clamp(0.025 * (temp - C.T_FREEZE), min=-3.0, max=0.0))
+    qi_exc = torch.clamp(qi - 1.0e-4, min=0.0)
+    dq_i2s = (-torch.expm1(-torch.clamp(k_agg * dt, max=5.0))) * qi_exc
     qi = qi - dq_i2s
     qs = qs + dq_i2s
     ns_cur = ns_cur + dq_i2s / 4.0e-8
@@ -253,33 +255,56 @@ def step_microphysics_six_class_2m(
     nr_cur = nr_cur + (dq_s2r + dq_g2r) / 3.0e-7
     dtheta_lat = dtheta_lat - (C.L_F0 / (C.CP_D * torch.clamp(pi_ex, min=0.1))) * (dq_s2r + dq_g2r)
 
-    # (e) Sub-cloud rain evaporation in subsaturated air (cold pool generation!)
+    # (e) Sub-cloud rain evaporation & snow/graupel sublimation in subsaturated air (cold pool generation!)
     e_sat = 611.2 * torch.exp(torch.clamp(17.67 * (temp - C.T_FREEZE) / torch.clamp(temp - 29.65, min=20.0), min=-30.0, max=15.0))
     q_sat = torch.clamp(C.EPS_WATER * e_sat / torch.clamp(pres - e_sat, min=100.0), min=1.0e-6, max=0.15)
     subsat = torch.clamp(q_sat - qv, min=0.0)
+    sub_rem = 0.5 * subsat
     k_evap = 0.004 * torch.pow(torch.clamp(qr * rho_d, min=0.0), 0.55)
     dq_evap = torch.minimum(
         (-torch.expm1(-torch.clamp(k_evap * dt, max=5.0))) * qr,
-        0.5 * subsat,
+        sub_rem,
     )
     qr = qr - dq_evap
     qv = qv + dq_evap
+    sub_rem = torch.clamp(sub_rem - dq_evap, min=0.0)
     dtheta_lat = dtheta_lat - (C.L_V0 / (C.CP_D * torch.clamp(pi_ex, min=0.1))) * dq_evap
+
+    k_sub_s = 0.003 * torch.pow(torch.clamp(qs * rho_d, min=0.0), 0.55)
+    dq_sub_s = torch.minimum(
+        (-torch.expm1(-torch.clamp(k_sub_s * dt, max=5.0))) * qs,
+        sub_rem,
+    )
+    qs = qs - dq_sub_s
+    qv = qv + dq_sub_s
+    sub_rem = torch.clamp(sub_rem - dq_sub_s, min=0.0)
+
+    k_sub_g = 0.002 * torch.pow(torch.clamp(qg * rho_d, min=0.0), 0.55)
+    dq_sub_g = torch.minimum(
+        (-torch.expm1(-torch.clamp(k_sub_g * dt, max=5.0))) * qg,
+        sub_rem,
+    )
+    qg = qg - dq_sub_g
+    qv = qv + dq_sub_g
+    dtheta_lat = dtheta_lat - ((C.L_V0 + C.L_F0) / (C.CP_D * torch.clamp(pi_ex, min=0.1))) * (dq_sub_s + dq_sub_g)
 
     theta_new = torch.clamp(theta_m + dtheta_lat, min=150.0, max=15000.0)
 
     # 4. Class-specific terminal velocities [m s^-1] (air-density corrected sqrt(rho_0/rho))
     rho_fac = torch.sqrt(torch.clamp(1.2 / torch.clamp(rho_d, min=0.05), min=0.5, max=6.0))
+    v_ice = torch.clamp(0.15 + 0.35 * torch.pow(torch.clamp(qi / 1.0e-4, min=0.0), 0.25), min=0.10, max=0.55)
     v_rain = torch.clamp(6.5 * torch.pow(torch.clamp(rho_d * qr * 1.0e3, min=1.0e-6), 0.14) * rho_fac, min=1.0, max=9.5)
     v_snow = torch.clamp(1.1 * torch.pow(torch.clamp(rho_d * qs * 1.0e3, min=1.0e-6), 0.10) * rho_fac, min=0.3, max=2.2)
     v_graup = torch.clamp(4.2 * torch.pow(torch.clamp(rho_d * qg * 1.0e3, min=1.0e-6), 0.18) * rho_fac, min=0.8, max=8.5)
 
-    # 5. Unconditionally stable implicit sedimentation for Rain, Snow, & Graupel
+    # 5. Unconditionally stable implicit sedimentation for Cloud Ice, Rain, Snow, & Graupel
+    qi, ni_cur, pr_ice = _implicit_sediment_column(qi, ni_cur, rho_d, dz_4d, v_ice, dt)
     qr, nr_cur, pr_rain = _implicit_sediment_column(qr, nr_cur, rho_d, dz_4d, v_rain, dt)
     qs, ns_cur, pr_snow_only = _implicit_sediment_column(qs, ns_cur, rho_d, dz_4d, v_snow, dt)
     qg, ng_cur, pr_graup = _implicit_sediment_column(qg, ng_cur, rho_d, dz_4d, v_graup, dt)
 
     # Enforce consistent physical bounds on number concentrations
+    ni_cur = torch.where(qi > 1.0e-10, torch.clamp(ni_cur, min=1.0e2, max=5.0e6), torch.zeros_like(ni_cur))
     nr_cur = torch.where(qr > 1.0e-10, torch.clamp(nr_cur, min=1.0, max=1.0e6), torch.zeros_like(nr_cur))
     ns_cur = torch.where(qs > 1.0e-10, torch.clamp(ns_cur, min=1.0, max=1.0e6), torch.zeros_like(ns_cur))
     ng_cur = torch.where(qg > 1.0e-10, torch.clamp(ng_cur, min=1.0, max=1.0e5), torch.zeros_like(ng_cur))
@@ -287,5 +312,5 @@ def step_microphysics_six_class_2m(
     return (
         theta_new, qv, qc, qi, qr, qs, qg,
         nc_cur, ni_cur, nr_cur, ns_cur, ng_cur,
-        pr_rain, pr_snow_only + pr_graup,
+        pr_rain, pr_snow_only + pr_graup + pr_ice,
     )

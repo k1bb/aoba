@@ -4492,7 +4492,7 @@ kernel void ogcm_gm_bolus_edge_col(
     for (uint k = 0u; k < nzo; ++k) {
         uint idx = k * ne + e;
         float wef = wet_ef[idx];
-        float u_n = clamp((u_star[idx] + du_bt) * wef, -3.0f, 3.0f);
+        float u_n = clamp((u_star[idx] + du_bt) * wef, -4.0f, 4.0f);
         u_new_out[idx] = u_n;
 
         float psi_k = 0.0f;
@@ -4523,6 +4523,8 @@ kernel void ogcm_gm_bolus_edge_col(
                         psi_k += clamp(fk_c * db_dx_ml * mu_fk, -2.5f, 2.5f) * wie;
                     }
                 }
+                float psi_cap = 0.15f * min(h_e_safe[idx], h_e_safe[nidx]);
+                psi_k = clamp(psi_k, -psi_cap, psi_cap) * wie;
             }
             sx_int_out[idx] = sx;
             if (use_redi) s2_edge_w_out[idx] = (sx * sx) * wvor;
@@ -4533,7 +4535,7 @@ kernel void ogcm_gm_bolus_edge_col(
         }
 
         float dpsi = psi_k - psi_prev;
-        float u_gm = clamp((-dpsi / h_e_safe[idx]) * wef, -0.3f, 0.3f);
+        float u_gm = (-dpsi / h_e_safe[idx]) * wef;
         h_u_edge_out[idx] = h_e[idx] * ((u_n + u_gm) * wef);
         psi_prev = psi_k;
     }

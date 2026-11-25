@@ -1293,17 +1293,19 @@ def _compute_distill_loss(
     l_scal = (F.smooth_l1_loss(scal_p2, scal_t2, reduction="none") * w_scal).mean(dim=1).sum()
     loss = l_prof + l_scal
 
-    # Column-integrated LWP & IWP [g m^-2] loss prevents clear-sky stratospheric levels from diluting cloud paths
+    # Column-integrated LWP, IWP, & RWP [g m^-2] loss prevents clear-sky stratospheric levels from diluting cloud/precip paths
     if dm is not None:
         dm2 = torch.cat([dm, dm], dim=1)  # [nz, 2*B]
         lwp_t = torch.log1p(torch.clamp((dm * tp[3]).sum(dim=0) * 1.0e3, min=0.0))
         iwp_t = torch.log1p(torch.clamp((dm * tp[4]).sum(dim=0) * 1.0e3, min=0.0))
+        rwp_t = torch.log1p(torch.clamp((dm * tp[2]).sum(dim=0) * 1.0e3, min=0.0))
         lwp_p2 = torch.log1p(torch.clamp((dm2 * torch.cat([pred_a["q_c"], pred_b["q_c"]], dim=1)).sum(dim=0) * 1.0e3, min=0.0))
         iwp_p2 = torch.log1p(torch.clamp((dm2 * torch.cat([pred_a["q_i"], pred_b["q_i"]], dim=1)).sum(dim=0) * 1.0e3, min=0.0))
+        rwp_p2 = torch.log1p(torch.clamp((dm2 * torch.cat([pred_a["q_p"], pred_b["q_p"]], dim=1)).sum(dim=0) * 1.0e3, min=0.0))
         loss = loss + 0.8 * (
             F.smooth_l1_loss(lwp_p2, torch.cat([lwp_t, lwp_t], dim=0))
             + F.smooth_l1_loss(iwp_p2, torch.cat([iwp_t, iwp_t], dim=0))
-        )
+        ) + 0.5 * F.smooth_l1_loss(rwp_p2, torch.cat([rwp_t, rwp_t], dim=0))
 
     with torch.no_grad():
         rmse_t = torch.sqrt(F.mse_loss(0.5 * (pred_a["theta_m"] + pred_b["theta_m"]) * exner, t_tgt))

@@ -1144,10 +1144,10 @@ def _step_crm_physics_and_dynamics_impl(
     dt_sub = dt_crm / float(max(n_sub, 1))
     dz_fct = dz_c_col if dz_c_col is not None else vgrid.dzeta_c
 
-    # Group acoustic substeps into advective super-steps (<= 60 s in 2D, 1 substep = 30 s in 3D
-    # to keep horizontal donor-cell FCT Courant number < 0.50 during strong gust-front outflows).
-    adv_group = max(1, min(n_sub, int(math.floor(60.0 / max(dt_sub, 1.0e-3))))) if is_2d_crm else 1
-    sgs_stride = max(1, int(math.floor(120.0 / max(dt_sub, 1.0e-3)))) if is_2d_crm else 1
+    # Group acoustic substeps into advective super-steps (<= 60 s in both 2D and 3D now that
+    # `crm_fct_flux_td` uses unconditionally stable implicit-vertical M-matrix Thomas FCT).
+    adv_group = max(1, min(n_sub, int(math.floor(60.0 / max(dt_sub, 1.0e-3)))))
+    sgs_stride = max(1, int(math.floor((120.0 if is_2d_crm else 60.0) / max(dt_sub, 1.0e-3))))
     use_metal_crm = can_use_crm_metal(crm.rho_d)
     if n_sub > 0:
         # Exact Galilean co-moving frame shift per column (Grabowski, 2001; Khairoutdinov et al., 2005):
@@ -1347,6 +1347,18 @@ def _step_crm_physics_and_dynamics_impl(
     # 4. Mixed-phase microphysics (6-class 2M Morrison, 2-moment KK00, or 1-moment SAM KR03) & sedimentation
     if use_6c_mp and crm.q_r is not None and crm.q_s is not None and crm.q_g is not None:
         from aoba.microphysics_6class import step_microphysics_six_class_2m
+
+        # Conservatively synchronize (q_r, q_s, q_g) to advected & host-coupled q_p before
+        # 6-class microphysics so FCT transport and student->teacher handoffs conserve total water exactly.
+        qp_tgt = torch.clamp(crm.q_p, min=0.0)
+        qp_sum = torch.clamp(crm.q_r, min=0.0) + torch.clamp(crm.q_s, min=0.0) + torch.clamp(crm.q_g, min=0.0)
+        has_part = qp_sum > 1.0e-10
+        scale_p = torch.where(has_part, qp_tgt / torch.clamp(qp_sum, min=1.0e-10), torch.zeros_like(qp_tgt))
+        _, _, temp_sync = diagnose_pressure_temperature(crm.rho_d, crm.theta_m, crm.q_v)
+        is_warm_p = (temp_sync > C.T_FREEZE).to(qp_tgt.dtype)
+        crm.q_r = torch.where(has_part, torch.clamp(crm.q_r, min=0.0) * scale_p, qp_tgt * is_warm_p)
+        crm.q_s = torch.where(has_part, torch.clamp(crm.q_s, min=0.0) * scale_p, qp_tgt * (1.0 - is_warm_p))
+        crm.q_g = torch.where(has_part, torch.clamp(crm.q_g, min=0.0) * scale_p, torch.zeros_like(qp_tgt))
 
         (
             crm.theta_m, crm.q_v, crm.q_c, crm.q_i,

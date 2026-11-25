@@ -887,7 +887,7 @@ def _ogcm_gm_and_w_core(
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
 ]:
     """Pure-tensor GM90 + Hallberg scale-aware + Fox-Kemper submeso bolus + continuity w + eta."""
-    u_new = torch.clamp((u_star + (u_bt_mean - u_star_baro).unsqueeze(0)) * wet_ef, -3.0, 3.0)
+    u_new = torch.clamp((u_star + (u_bt_mean - u_star_baro).unsqueeze(0)) * wet_ef, -4.0, 4.0)
 
     drho_dx = ((rho_anom[:, c1] - rho_anom[:, c0]) * inv_dc_edge.unsqueeze(0)) * wet_ef
     drho_dz_c = ((rho_anom[1:] - rho_anom[:-1]) / dz_c_int) * wet_int_cf
@@ -913,9 +913,13 @@ def _ogcm_gm_and_w_core(
             max=2.5,
         ) * wet_int_ef
         psi_int = psi_int + psi_mle
+    # Bound bolus streamfunction before vertical differencing so |u_gm| <= 0.30 m s^-1 AND
+    # depth-integrated bolus transport sum_k(h_e * u_gm) == 0 identically (zero spurious eta pumping).
+    psi_cap = 0.15 * torch.minimum(h_e_safe[:-1], h_e_safe[1:])
+    psi_int = torch.clamp(psi_int, min=-psi_cap, max=psi_cap) * wet_int_ef
     z_e = torch.zeros_like(u_new[0:1])
     dpsi = torch.cat([psi_int, z_e], dim=0) - torch.cat([z_e, psi_int], dim=0)
-    u_gm = torch.clamp((-dpsi / h_e_safe) * wet_ef, -0.3, 0.3)
+    u_gm = (-dpsi / h_e_safe) * wet_ef
 
     h_u_edge = h_e * ((u_new + u_gm) * wet_ef)
     div_hu = (h_u_edge[:, eoc] * div_w.unsqueeze(0)).sum(dim=-1) * wet_cf
