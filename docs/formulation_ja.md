@@ -246,11 +246,11 @@ s_k &= \frac{k}{\max(N_z - 1, 1)}, \qquad S_k = 0.38\,s_k^{1.35} + 0.62\,s_k^{4.
 \end{aligned} \tag{2.9}
 $$
 
-山岳上の水平気圧傾度力誤差を抑えるため、Klemp (2011, Eqs. 4 & 7) の余弦べき乗減衰関数 $A(\zeta_w)$（高度とともに地形起伏を速やかに平坦化）と最小層厚圧縮保護（$\gamma_{\min} = 0.20$）を組み合わせた平滑化地形追従座標 (STF) を構成する（既定指数 $p =$ `terrain_scale_exp` $= 1.5$）：
+山岳上の水平気圧傾度力誤差を抑えつつ高度 $24\ \mathrm{km}$ 以高の成層圏・中間圏座標面を完全に平坦に保つため、減衰上限高度 $z_{\mathrm{atten}} = \min(z_{\mathrm{top}}, 24\ \mathrm{km})$ に対して Klemp (2011, Eqs. 4 & 7) の余弦べき乗減衰関数 $A(\zeta_w)$ と最小層厚圧縮保護（$\gamma_{\min} = 0.20$）を組み合わせた平滑化地形追従座標 (STF) を構成する（既定指数 $p =$ `terrain_scale_exp` $= 1.5$）：
 
 $$
 \begin{aligned}
-A(\zeta_w) &= \left[\cos\!\left(\frac{\pi}{2}\frac{\zeta_w}{z_{\mathrm{top}}}\right)\right]^{2p}, \\
+z_{\mathrm{atten}} &= \min(z_{\mathrm{top}},\ 24000\ \mathrm{m}), \qquad A(\zeta_w) = \left[\cos\!\left(\frac{\pi}{2}\,\min\!\left(\frac{\zeta_w}{z_{\mathrm{atten}}},\ 1\right)\right)\right]^{2p}, \\
 z_{w,k} &= \max\!\Big(\zeta_{w,k} + A(\zeta_{w,k})h_s,\ z_{w,k-1} + \gamma_{\min}\Delta\zeta_{c,k-1}\Big)
 \end{aligned} \tag{2.10}
 $$
@@ -665,11 +665,11 @@ k_{\mathrm{frz}} &= 0.015\,\exp\!\big(0.25(268.15 - T)\big)
 \end{aligned} \tag{5.13}
 $$
 
-さらに雲氷凝集（$q_i\to q_s$）、$T > 273.15\ \mathrm{K}$ での雪・霰融解および雲底下雨滴蒸発を処理したのち、空気密度補正 $f_\rho$ 付きの種別終端落下速度 $(v_r, v_s, v_g)$ によりトップダウン陰的上風沈降を実行する：
+さらに雲氷凝集（閾値 $q_{i,\mathrm{th}} = 6\times 10^{-5}\ \mathrm{kg\ kg^{-1}}$ 超過時の $q_i\to q_s$）、$T > 273.15\ \mathrm{K}$ での雪・霰融解、液水飽和 $q_{\mathrm{sat,w}}$ 基準の雲底下雨滴蒸発、および氷飽和 $q_{\mathrm{sat,i}}$ 基準の雪・霰昇華を処理し、潜熱変化に伴う湿潤仮温位を $\theta_m^{n+1} = (T^{n+1}/\Pi)(1 + (R_v/R_d) q_v^{n+1})$ により厳密再構成する。その後、空気密度補正 $f_\rho$ 付きの種別終端落下速度 $(v_i, v_r, v_s, v_g)$ によりトップダウン陰的上風沈降を実行する：
 
 $$
 \begin{aligned}
-f_\rho &= \sqrt{\operatorname{clamp}\!\left(\frac{1.2}{\rho_d},\ 0.5,\ 6.0\right)}, \\
+f_\rho &= \sqrt{\operatorname{clamp}\!\left(\frac{1.2}{\rho_d},\ 0.5,\ 6.0\right)}, \qquad v_i = \operatorname{clamp}\!\left(0.22 + 0.45\left(\frac{q_i}{10^{-4}}\right)^{0.25},\ 0.18,\ 0.80\right), \\
 v_r &= 6.5\,(10^3\rho_d q_r)^{0.14} f_\rho, \qquad v_s = 1.1\,(10^3\rho_d q_s)^{0.10} f_\rho, \qquad v_g = 4.2\,(10^3\rho_d q_g)^{0.18} f_\rho
 \end{aligned} \tag{5.14}
 $$
@@ -1456,6 +1456,33 @@ $$
 | `true` *(既定：超パラメタリゼーション SP)* | 粗い全球親格子（G3–G5）＋各セル内埋め込み CRM（任意 `crm_dx`、既定 $4\ \mathrm{km}$）＋MAML | 数十年〜数百年の多世紀気候積分を単一 GPU で実行しつつ、積雲パラメタリゼーションなしで深い対流・MJO・日周対流・サブグリッド陸面不均一性を陽的に表現できる。 | 2D カーテン（`crm_ny=1`）では CRM 内の 3 次元回転力学・メソ対流系回転が簡略化され、親セル間の直接的なサブグリッド水平伝播は親格子平均場を介する。 |
 | `false`（単独全球雲解像 GCRM） | 埋め込み CRM なし・全球 SCVT 格子単体 | 親–子スケール分離や周期境界仮定が一切存在せず、高解像度格子（G8–G10 相当）で全球の対流・前線・地形流を連続 3 次元解像できる。 | 対流を陽的に解像するには水平格子幅 $\le 4\text{–}10\ \mathrm{km}$ が必要となり、粗い格子（G3–G5）で単独実行すると格子スケール対流が過大または遅延する。 |
 
+### 8.7 ペア型オンライン能動学習 CRM・ICA 放射代理モデル (`src/aoba/crm_self_distill.py`)
+
+`enable_crm_self_distill = true` および `enable_rad_self_distill = true` のとき、空間層化ローテーションと高エピステミック不確実性（OOD）選択によって抽出した教師親セル（`1 / crm_distill_stride`）のみで本物の 2D/3D CRM と厳密 ICA / 3D-TICA 放射伝達を実行し、残りのセルを GPU リング・リザーバ再生バッファ付き 2 ヘッド残差 MLP（`CRMSelfDistillNet` と `RadSelfDistillNet`）でオンライン推論する。事前学習済み重みを持たないため、惑星気候・古気候・急激な放射強制変化にも実行中に自律適応する。
+
+すべての代理推論カラムは融合 GPU カーネル（`crm_distill_closure_col`, `rad_distill_closure_col`）内で厳密な物理保存クロージャを通過する。気圧テーパ付き対流包絡関数 $s_{\mathrm{conv}}(\Pi)$ は対流圏全域（$p \ge 210\ \mathrm{hPa}$）で $1$ をとり、$90\ \mathrm{hPa}$ 圏界面コールドポイント（$\Pi \le 0.50$）以高で滑らかに $0$ へ減衰し、成層圏・中間圏の気温・水蒸気・運動量を完全に不変に保つ。対流領域（$s_{\mathrm{conv}} > 0$）では、水物質増分を局所 Clausius–Clapeyron 飽和混合比 $q_{\mathrm{sat}}(T_{\mathrm{env}}, p_{\mathrm{env}})$ で有界化して列総水量を機械精度で保存し、地表面顕熱フラックス $\mathrm{SHF}\,\Delta t$ を最下層境界層（$p \gtrsim 0.95\,p_s$）へ事前注入した上で、真気温空間 $T = \Pi\theta_m / (1 + (R_v/R_d) q_v)$ にて厳密顕熱エンタルピー保存クロージャを課す：
+
+$$
+\begin{aligned}
+s_{\mathrm{conv}}(\Pi) &= \left[\operatorname{clamp}\!\left(\frac{\Pi - 0.50}{0.14},\ 0,\ 1\right)\right]^2, \qquad |\Delta q_{n,\mathrm{raw}}| \le s_{\mathrm{conv}}\min\!\big(1.5\,q_{\mathrm{sat}} + 0.5\,q_{n,\mathrm{base}},\ 5\times 10^{-3}\big), \\
+\phi_{\mathrm{pbl}}(\Pi) &= \operatorname{clamp}\!\left(1 - \frac{\Pi_0 - \Pi}{0.015\,\Pi_0},\ 0,\ 1\right) s_{\mathrm{conv}}, \qquad \Delta T_{\mathrm{shf},k} = \frac{\mathrm{SHF}\,\Delta t}{c_{pd}\sum_j \Delta m_j\,\phi_{\mathrm{pbl},j}}\,\phi_{\mathrm{pbl},k}
+\end{aligned} \tag{8.14}
+$$
+
+$$
+\begin{aligned}
+\Delta H_{\mathrm{lat}} &= L_{v0}\big(P_{\mathrm{tot}}\Delta t + \Delta M_{\mathrm{cond}}\big) + L_{f0}\big(P_{\mathrm{snow}}\Delta t + \Delta M_{\mathrm{ice}}\big), \\
+h_{\mathrm{corr}} &= \frac{\Delta H_{\mathrm{lat}} - c_{pd}\sum_k \Delta m_k \Delta T_{\mathrm{raw},k}}{c_{pd}\sum_k \Delta m_k s_{\mathrm{conv},k}}, \qquad \Delta T_{\mathrm{cons},k} = \Delta T_{\mathrm{shf},k} + \Delta T_{\mathrm{raw},k} + h_{\mathrm{corr}}\,s_{\mathrm{conv},k}, \\
+\theta_{m,k}^{n+1} &= \theta_{m,k}^{\mathrm{post,ls}} + \frac{\Delta T_{\mathrm{cons},k}\!\left(1 + \frac{R_v}{R_d} q_{v,k}^{n+1}\right) + T_k^{\mathrm{post,ls}}\frac{R_v}{R_d}\!\left(q_{v,k}^{n+1} - q_{v,k}^0\right)}{\max(\Pi_k,\ 0.05)}
+\end{aligned} \tag{8.15}
+$$
+
+放射代理モデルの各サブカラムは、夜側（$\mu_0 \le 0$）で短波フラックスが厳密に零となり、長波フラックスは地表 Planck 放射 $\sigma T_{\mathrm{sfc}}^4$ に解析的にスケールし、放射加熱率鉛直プロファイルは列フラックス発散保存則を厳密に満たす。オンライン学習では、境界層重視の真気温および鉛直気温減率 Smooth-$L_1$ 損失に、射影零空間沿いの飽和ドリフトを完全に抑止する列平均ロジットのゲージ固定正則化を組み合わせる：
+
+$$
+\sum_{k=0}^{N_z-1} c_{p,\mathrm{moist},k}\,\Delta m_k\,Q_{\mathrm{rad},k} = (\mathrm{ASR} - \mathrm{OLR}) - (F_{\mathrm{SW,sfc}}^{\mathrm{net}} + F_{\mathrm{LW,sfc}}^{\mathrm{net}}) \tag{8.16}
+$$
+
 ---
 
 ## 9. 海洋循環 (`ocean_mode`)・独立高解像海洋・波浪・EVP–ITD 海氷・FlexPFT 海洋 BGC
@@ -1529,7 +1556,7 @@ K_{v,\mathrm{tot}}(z) &= K_{v,\mathrm{bg}}(z) + \min\!\left(\frac{0.0667\,E_{\ma
 \end{aligned} \tag{9.5}
 $$
 
-4. **3D 傾圧 WS-RK3 運動量＋順圧自由表面分離解法（Ringler et al., 2013; Shchepetkin & McWilliams, 2005）**：3D 傾圧運動量方程式を TRiSK 渦度コリオリ・スケール適応 Munk 粘性・半陰的レイリー＋海底二次摩擦（$C_{d,\mathrm{bot}} = 2.5\times 10^{-3}$）付き 3 段 WS-RK3 と陰的鉛直粘性 Thomas ソルバで進めたのち、鉛直平均傾向 $F_{\mathrm{baro}}$ で強制される 2D 順圧自由表面モード $(u_{\mathrm{bt}}, \eta)$ を最大 64 サブサイクル（融合 Metal/CUDA カーネル）で積分し、時間平均順圧流速 $\bar{u}_{\mathrm{bt}}$ で 3D 流速の順圧成分を置換する：
+4. **3D 傾圧 WS-RK3 運動量＋順圧自由表面分離解法（Ringler et al., 2013; Shchepetkin & McWilliams, 2005）**：3D 傾圧運動量方程式を TRiSK 渦度コリオリ・スケール適応 Munk 粘性・半陰的レイリー＋海底二次摩擦（$C_{d,\mathrm{bot}} = 2.5\times 10^{-3}$）付き 3 段 WS-RK3 と陰的鉛直粘性 Thomas ソルバで進めたのち、鉛直平均傾向 $F_{\mathrm{baro}}$ で強制される 2D 順圧自由表面モード $(u_{\mathrm{bt}}, \eta)$ を最大 64 サブサイクル（融合 Metal/CUDA カーネル）で積分する。サブサイクル内では定常地衡流を一切減衰させずにボックスカー共鳴のみを除去する高速変動減衰（アンカー流速偏差 $u_{\mathrm{bt}} - u_{\mathrm{bt}}^{\mathrm{bar}}$ にのみ作用）を適用し、時間平均順圧流速 $\bar{u}_{\mathrm{bt}}$ で 3D 流速の順圧成分を置換する：
 
 $$
 \frac{\partial \mathbf{u}_o}{\partial t} + (\mathbf{u}_o\cdot\nabla)\mathbf{u}_o + f\hat{\mathbf{k}}\times\mathbf{u}_o = -g\nabla\eta - \frac{1}{\rho_0}\nabla p_{\mathrm{hyd}} + \frac{\partial}{\partial z}\left(A_v\frac{\partial \mathbf{u}_o}{\partial z}\right) + A_h\nabla^2\mathbf{u}_o - r_{\mathrm{drag}}\mathbf{u}_o \tag{9.6}

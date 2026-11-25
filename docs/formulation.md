@@ -246,11 +246,11 @@ s_k &= \frac{k}{\max(N_z - 1, 1)}, \qquad S_k = 0.38\,s_k^{1.35} + 0.62\,s_k^{4.
 \end{aligned} \tag{2.9}
 $$
 
-To minimize horizontal pressure-gradient errors over steep orography, the Smoothed Terrain-Following (STF) coordinate applies the Klemp (2011, Eqs. 4 & 7) cosine-power decay $A(\zeta_w)$ (default $p =$ `terrain_scale_exp` $= 1.5$) with minimum-thickness compression protection ($\gamma_{\min} = 0.20$):
+To minimize horizontal pressure-gradient errors over steep orography while keeping high-top stratospheric coordinate surfaces above $24\ \mathrm{km}$ flat, the Smoothed Terrain-Following (STF) coordinate applies the Klemp (2011, Eqs. 4 & 7) cosine-power decay $A(\zeta_w)$ over $z_{\mathrm{atten}} = \min(z_{\mathrm{top}}, 24\ \mathrm{km})$ (default $p =$ `terrain_scale_exp` $= 1.5$) with minimum-thickness compression protection ($\gamma_{\min} = 0.20$):
 
 $$
 \begin{aligned}
-A(\zeta_w) &= \left[\cos\!\left(\frac{\pi}{2}\frac{\zeta_w}{z_{\mathrm{top}}}\right)\right]^{2p}, \\
+z_{\mathrm{atten}} &= \min(z_{\mathrm{top}},\ 24000\ \mathrm{m}), \qquad A(\zeta_w) = \left[\cos\!\left(\frac{\pi}{2}\,\min\!\left(\frac{\zeta_w}{z_{\mathrm{atten}}},\ 1\right)\right)\right]^{2p}, \\
 z_{w,k} &= \max\!\Big(\zeta_{w,k} + A(\zeta_{w,k})h_s,\ z_{w,k-1} + \gamma_{\min}\Delta\zeta_{c,k-1}\Big)
 \end{aligned} \tag{2.10}
 $$
@@ -665,11 +665,11 @@ k_{\mathrm{frz}} &= 0.015\,\exp\!\big(0.25(268.15 - T)\big)
 \end{aligned} \tag{5.13}
 $$
 
-Following ice aggregation ($q_i\to q_s$), snow/graupel melting above $273.15\ \mathrm{K}$, and sub-cloud rain evaporation, species-specific terminal fall speeds $(v_r, v_s, v_g)$ with air-density scaling $f_\rho$ drive top-down implicit upwind sedimentation:
+Following ice aggregation ($q_i\to q_s$ above threshold $q_{i,\mathrm{th}} = 6\times 10^{-5}\ \mathrm{kg\ kg^{-1}}$), snow/graupel melting above $273.15\ \mathrm{K}$, sub-cloud rain evaporation (relative to liquid saturation $q_{\mathrm{sat,w}}$), and snow/graupel sublimation (relative to ice saturation $q_{\mathrm{sat,i}}$), latent-heating updates reconstruct exact moist potential temperature $\theta_m^{n+1} = (T^{n+1}/\Pi)(1 + (R_v/R_d) q_v^{n+1})$. Species-specific terminal fall speeds $(v_i, v_r, v_s, v_g)$ with air-density scaling $f_\rho$ drive top-down implicit upwind sedimentation:
 
 $$
 \begin{aligned}
-f_\rho &= \sqrt{\operatorname{clamp}\!\left(\frac{1.2}{\rho_d},\ 0.5,\ 6.0\right)}, \\
+f_\rho &= \sqrt{\operatorname{clamp}\!\left(\frac{1.2}{\rho_d},\ 0.5,\ 6.0\right)}, \qquad v_i = \operatorname{clamp}\!\left(0.22 + 0.45\left(\frac{q_i}{10^{-4}}\right)^{0.25},\ 0.18,\ 0.80\right), \\
 v_r &= 6.5\,(10^3\rho_d q_r)^{0.14} f_\rho, \qquad v_s = 1.1\,(10^3\rho_d q_s)^{0.10} f_\rho, \qquad v_g = 4.2\,(10^3\rho_d q_g)^{0.18} f_\rho
 \end{aligned} \tag{5.14}
 $$
@@ -1456,6 +1456,33 @@ Setting `enable_superparam = false` bypasses the embedded CRM and executes a uni
 | `true` *(default: Superparameterization SP)* | Coarse global SCVT host (G3–G5) + embedded CRM (configurable `crm_dx`, default $4\ \mathrm{km}$) + MAML per cell | Enables multi-decadal to multi-century climate integrations on a single GPU while explicitly representing deep convection, MJO, diurnal convection, and subgrid land heterogeneity without cumulus parameterization. | A 2D curtain (`crm_ny=1`) simplifies 3D rotational mesoscale dynamics inside the CRM, and direct subgrid propagation between neighboring host columns occurs only through host-mean fields. |
 | `false` (Standalone Global CRM / GCRM) | No embedded CRM; single global SCVT nonhydrostatic mesh | Eliminates scale separation and periodic CRM boundary assumptions entirely; resolves continuous 3D global convection, fronts, and orographic flows at high grid levels (G8–G10). | Explicit convection requires horizontal grid spacing $\le 4\text{–}10\ \mathrm{km}$; running standalone on coarse meshes (G3–G5) yields excessive or delayed grid-scale convection. |
 
+### 8.7 Paired Online Active-Learning CRM & ICA Radiation Surrogates (`src/aoba/crm_self_distill.py`)
+
+When `enable_crm_self_distill = true` and `enable_rad_self_distill = true`, AOBA executes the genuine 2D/3D CRM and full ICA / 3D-TICA radiation solver on a rotating, spatially stratified subset of teacher host columns (`1 / crm_distill_stride`, augmented by high-epistemic-uncertainty out-of-distribution columns) while evaluating the remaining columns via two online-trained two-head epistemic residual MLPs (`CRMSelfDistillNet` and `RadSelfDistillNet`) backed by GPU ring-and-reservoir replay buffers. No pre-trained climate weights are prescribed, so planetary, paleoclimate, and radiative regime shifts are tracked on the fly.
+
+Every surrogate column passes through exact physical conservation closures inside fused GPU kernels (`crm_distill_closure_col`, `rad_distill_closure_col`). A pressure-tapered convective envelope $s_{\mathrm{conv}}(\Pi)$ equals unity throughout the troposphere ($p \ge 210\ \mathrm{hPa}$) and vanishes smoothly at and above the $90\ \mathrm{hPa}$ tropopause cold point ($\Pi \le 0.50$), keeping stratospheric and mesospheric temperature, moisture, and momentum invariant under surrogate inference. In the convective domain ($s_{\mathrm{conv}} > 0$), moisture increments are bounded by the local Clausius–Clapeyron saturation mixing ratio $q_{\mathrm{sat}}(T_{\mathrm{env}}, p_{\mathrm{env}})$, total convective-column water is conserved to machine precision, and surface sensible heat flux $\mathrm{SHF}\,\Delta t$ is pre-injected over the lowest boundary layer ($p \gtrsim 0.95\,p_s$) prior to exact sensible-enthalpy closure in true temperature space $T = \Pi\theta_m / (1 + (R_v/R_d) q_v)$:
+
+$$
+\begin{aligned}
+s_{\mathrm{conv}}(\Pi) &= \left[\operatorname{clamp}\!\left(\frac{\Pi - 0.50}{0.14},\ 0,\ 1\right)\right]^2, \qquad |\Delta q_{n,\mathrm{raw}}| \le s_{\mathrm{conv}}\min\!\big(1.5\,q_{\mathrm{sat}} + 0.5\,q_{n,\mathrm{base}},\ 5\times 10^{-3}\big), \\
+\phi_{\mathrm{pbl}}(\Pi) &= \operatorname{clamp}\!\left(1 - \frac{\Pi_0 - \Pi}{0.015\,\Pi_0},\ 0,\ 1\right) s_{\mathrm{conv}}, \qquad \Delta T_{\mathrm{shf},k} = \frac{\mathrm{SHF}\,\Delta t}{c_{pd}\sum_j \Delta m_j\,\phi_{\mathrm{pbl},j}}\,\phi_{\mathrm{pbl},k}
+\end{aligned} \tag{8.14}
+$$
+
+$$
+\begin{aligned}
+\Delta H_{\mathrm{lat}} &= L_{v0}\big(P_{\mathrm{tot}}\Delta t + \Delta M_{\mathrm{cond}}\big) + L_{f0}\big(P_{\mathrm{snow}}\Delta t + \Delta M_{\mathrm{ice}}\big), \\
+h_{\mathrm{corr}} &= \frac{\Delta H_{\mathrm{lat}} - c_{pd}\sum_k \Delta m_k \Delta T_{\mathrm{raw},k}}{c_{pd}\sum_k \Delta m_k s_{\mathrm{conv},k}}, \qquad \Delta T_{\mathrm{cons},k} = \Delta T_{\mathrm{shf},k} + \Delta T_{\mathrm{raw},k} + h_{\mathrm{corr}}\,s_{\mathrm{conv},k}, \\
+\theta_{m,k}^{n+1} &= \theta_{m,k}^{\mathrm{post,ls}} + \frac{\Delta T_{\mathrm{cons},k}\!\left(1 + \frac{R_v}{R_d} q_{v,k}^{n+1}\right) + T_k^{\mathrm{post,ls}}\frac{R_v}{R_d}\!\left(q_{v,k}^{n+1} - q_{v,k}^0\right)}{\max(\Pi_k,\ 0.05)}
+\end{aligned} \tag{8.15}
+$$
+
+For each radiation surrogate subcolumn, shortwave fluxes vanish identically on the night side ($\mu_0 \le 0$), longwave fluxes scale analytically with surface Planck emission $\sigma T_{\mathrm{sfc}}^4$, and the radiative heating profile satisfies exact column flux-divergence closure. Online optimization combines boundary-layer-emphasized true-temperature and vertical lapse-rate Smooth-$L_1$ losses with a nullspace gauge-fixing penalty on column-mean raw temperature, momentum, and heating-rate logits to prevent saturation drift along projection nullspaces:
+
+$$
+\sum_{k=0}^{N_z-1} c_{p,\mathrm{moist},k}\,\Delta m_k\,Q_{\mathrm{rad},k} = (\mathrm{ASR} - \mathrm{OLR}) - (F_{\mathrm{SW,sfc}}^{\mathrm{net}} + F_{\mathrm{LW,sfc}}^{\mathrm{net}}) \tag{8.16}
+$$
+
 ---
 
 ## 9. Ocean Circulation (`ocean_mode`), Independent Fine Ocean, Surface Waves, EVP–ITD Sea Ice & FlexPFT Marine BGC
@@ -1529,7 +1556,7 @@ K_{v,\mathrm{tot}}(z) &= K_{v,\mathrm{bg}}(z) + \min\!\left(\frac{0.0667\,E_{\ma
 \end{aligned} \tag{9.5}
 $$
 
-4. **3D Baroclinic WS-RK3 Momentum + Split-Explicit Barotropic Free Surface (Ringler et al., 2013; Shchepetkin & McWilliams, 2005)**: 3D baroclinic momentum advances via 3-stage WS-RK3 with TRiSK vorticity Coriolis, scale-adaptive Munk viscosity, semi-implicit Rayleigh and quadratic bottom drag ($C_{d,\mathrm{bot}} = 2.5\times 10^{-3}$), and implicit vertical viscosity (Thomas tridiagonal). The 2D barotropic free-surface mode $(u_{\mathrm{bt}}, \eta)$ forced by depth-averaged tendency $F_{\mathrm{baro}}$ is integrated over up to 64 sub-cycles (fused Metal/CUDA kernel), after which time-averaged $\bar{u}_{\mathrm{bt}}$ replaces the depth-mean component of the 3D velocity:
+4. **3D Baroclinic WS-RK3 Momentum + Split-Explicit Barotropic Free Surface (Ringler et al., 2013; Shchepetkin & McWilliams, 2005)**: 3D baroclinic momentum advances via 3-stage WS-RK3 with TRiSK vorticity Coriolis, scale-adaptive Munk viscosity, semi-implicit Rayleigh and quadratic bottom drag ($C_{d,\mathrm{bot}} = 2.5\times 10^{-3}$), and implicit vertical viscosity (Thomas tridiagonal). The 2D barotropic free-surface mode $(u_{\mathrm{bt}}, \eta)$ forced by depth-averaged tendency $F_{\mathrm{baro}}$ is integrated over up to 64 sub-cycles (fused Metal/CUDA kernel) with zero-steady-drag fast-fluctuation damping acting exclusively on departures from the sub-cycle anchor velocity $(u_{\mathrm{bt}} - u_{\mathrm{bt}}^{\mathrm{bar}})$ to eliminate boxcar resonance without damping geostrophic currents, after which time-averaged $\bar{u}_{\mathrm{bt}}$ replaces the depth-mean component of the 3D velocity:
 
 $$
 \frac{\partial \mathbf{u}_o}{\partial t} + (\mathbf{u}_o\cdot\nabla)\mathbf{u}_o + f\hat{\mathbf{k}}\times\mathbf{u}_o = -g\nabla\eta - \frac{1}{\rho_0}\nabla p_{\mathrm{hyd}} + \frac{\partial}{\partial z}\left(A_v\frac{\partial \mathbf{u}_o}{\partial z}\right) + A_h\nabla^2\mathbf{u}_o - r_{\mathrm{drag}}\mathbf{u}_o \tag{9.6}
