@@ -372,7 +372,6 @@ def apply_exact_conservation_closure(
     f_ice_logit = rp[4]
     d_u_raw = s_conv * torch.tanh(rp[5] * 0.2) * 8.0          # bounded [m s^-1] per step
     d_v_raw = s_conv * torch.tanh(rp[6] * 0.2) * 8.0
-    f_cld_pred = s_conv * torch.sigmoid(rp[7] - 1.0)          # subgrid cloud area fraction in (0, 1)
     f_prec_pred = torch.sigmoid(raw_scal[:, 2] - 1.0)         # subgrid precipitating area fraction in (0, 1)
 
     dm = torch.clamp(rho_d * dz_c, min=1.0e-6)                # [nz, N] kg m^-2
@@ -383,8 +382,10 @@ def apply_exact_conservation_closure(
     w_pre_conv = (dm * conv_f * (qn0 + qp0)).sum(dim=0)
     w_avail_conv = torch.clamp(w_pre_conv + evap * dt, min=1.0e-8)
 
-    # Predicted total precipitation mass [kg m^-2] bounded to physical column fraction <= 0.35
-    p_frac = 0.35 * torch.sigmoid(raw_scal[:, 0] - 4.0)
+    # Predicted total precipitation mass [kg m^-2] bounded to physical column fraction <= 0.35;
+    # cubic sigmoid eliminates clear-sky drizzle floor (~0.04 mm/day at zero logit) while preserving full gradients.
+    pf_sig = torch.sigmoid(raw_scal[:, 0] - 3.5)
+    p_frac = 0.35 * (pf_sig * pf_sig * pf_sig)
     p_tot_mass = torch.clamp(p_frac * w_avail_conv, min=0.0)
     p_tot_mass = torch.where(w_avail_conv > 0.05, p_tot_mass, torch.zeros_like(p_tot_mass))
 
@@ -394,8 +395,8 @@ def apply_exact_conservation_closure(
     dq_lim = torch.clamp(1.5 * qsat_env + 0.5 * qn_base, max=5.0e-3)
     d_qn_raw = s_conv * torch.tanh(rp[1] * 0.2) * dq_lim
     qn_prov = torch.clamp(qn_base + d_qn_raw, min=0.0)
-    fp_sig = torch.sigmoid(f_qp_logit - 2.5)
-    qp_prov = s_conv * torch.clamp(qn_base + qp0, max=6.0e-3) * (0.5 * (fp_sig * fp_sig))
+    fp_sig = torch.sigmoid(f_qp_logit - 3.5)
+    qp_prov = s_conv * torch.clamp(qn_base + qp0, max=6.0e-3) * (0.5 * (fp_sig * fp_sig * fp_sig))
 
     w_prov_conv = (dm * conv_f * (qn_prov + qp_prov)).sum(dim=0)
     w_target_conv = torch.clamp(w_avail_conv - p_tot_mass, min=0.0)
@@ -420,9 +421,12 @@ def apply_exact_conservation_closure(
 
     # Partition convective q_n into (q_v, q_c, q_i) strictly preserving q_v + q_c + q_i == q_n
     # and thermodynamic saturation consistency (q_v <= qsat_env, homogeneous freezing T <= 253.15 K,
-    # liquid-only T >= 273.15 K), while keeping stratospheric/mesospheric layers (s_conv == 0) invariant.
-    fc_sig = torch.sigmoid(f_cond_logit - 2.5)
-    f_cond = s_conv * 0.95 * (fc_sig * fc_sig)
+    # liquid-only T >= 273.15 K), while gating subgrid condensate by local RH and cubic sigmoid so
+    # dry/clear student columns never leak spurious background cloud decks.
+    rh_gate = torch.clamp((qn_new / torch.clamp(qsat_env, min=1.0e-7) - 0.35) / 0.45, min=0.0, max=1.0)
+    fc_sig = torch.sigmoid(f_cond_logit - 3.5)
+    f_cond = s_conv * rh_gate * 0.95 * (fc_sig * fc_sig * fc_sig)
+    f_cld_pred = s_conv * rh_gate * torch.sigmoid(rp[7] - 2.0)
     f_ice_nn = torch.sigmoid(f_ice_logit)
     f_ice = torch.where(
         t_env <= 253.15,

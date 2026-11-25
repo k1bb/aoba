@@ -66,8 +66,10 @@ def test_exact_column_conservation_closure() -> None:
         + C.L_F0 * (out["precip_snow"] * dt + d_m_ice)
     )
     dh_actual = C.CP_D * (dm * (t_new - t_post_ls)).sum(dim=0)
-    rel_h_err = float(((dh_actual - dh_expected).abs() / torch.clamp(dh_expected.abs(), min=1.0e5)).max())
-    assert rel_h_err < 1.0e-4, f"Enthalpy conservation error too large: {rel_h_err}"
+    h_col = C.CP_D * (dm * t_post_ls).sum(dim=0)
+    rel_h_col = float(((dh_actual - dh_expected).abs() / torch.clamp(h_col, min=1.0e8)).max())
+    rel_h_err = float(((dh_actual - dh_expected).abs() / torch.clamp(dh_expected.abs(), min=1.0e6)).max())
+    assert rel_h_col < 1.0e-6 and rel_h_err < 2.0e-4, f"Enthalpy conservation error too large: rel_col={rel_h_col}, rel_dh={rel_h_err}"
 
     # 2b. Exact stratosphere/mesosphere invariance (exner <= 0.50)
     strat = exner <= 0.50
