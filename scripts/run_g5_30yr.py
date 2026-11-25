@@ -357,6 +357,18 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
             if getattr(model, "crm_distill", None) is not None
             else None
         ),
+        "rad_distill": (
+            {
+                "net_state": {k: v.detach().cpu() for k, v in model.rad_distill.net.state_dict().items()},
+                "steps_seen": int(model.rad_distill.steps_seen),
+                "grad_updates": int(model.rad_distill.grad_updates),
+                "ema_loss": float(model.rad_distill.ema_loss),
+                "ema_val_rmse_olr": float(model.rad_distill.ema_val_rmse_olr),
+                "ema_val_rmse_asr": float(model.rad_distill.ema_val_rmse_asr),
+            }
+            if getattr(model, "rad_distill", None) is not None
+            else None
+        ),
         "land_carbon": (
             {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.land_carbon.__dict__.items()}
             if model.land_carbon is not None
@@ -1156,6 +1168,19 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             model.crm_distill.ema_val_rmse_qn = float(ck_cd.get("ema_val_rmse_qn", 1.0e-3))
         except Exception:
             # Architecture width changed: start student fresh with warmup automatically
+            pass
+    if ckpt.get("rad_distill") is not None and getattr(model, "rad_distill", None) is not None:
+        ck_rd = ckpt["rad_distill"]
+        try:
+            model.rad_distill.net.load_state_dict(
+                {k: v.to(device=device) for k, v in ck_rd["net_state"].items()}, strict=True
+            )
+            model.rad_distill.steps_seen = int(ck_rd.get("steps_seen", model.rad_distill.warmup_steps))
+            model.rad_distill.grad_updates = int(ck_rd.get("grad_updates", 0))
+            model.rad_distill.ema_loss = float(ck_rd.get("ema_loss", 1.0))
+            model.rad_distill.ema_val_rmse_olr = float(ck_rd.get("ema_val_rmse_olr", 5.0))
+            model.rad_distill.ema_val_rmse_asr = float(ck_rd.get("ema_val_rmse_asr", 5.0))
+        except Exception:
             pass
     return ckpt
 

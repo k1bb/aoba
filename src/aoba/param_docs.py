@@ -183,8 +183,12 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "en": "Enable embedded-CRM superparameterization (SP). False switches AOBA into standalone global CRM mode.",
     },
     "enable_crm_self_distill": {
-        "ja": "オンライン自己蒸留・Active-Learning 2D CRM 加速の有効化（既定 false）。一部の列のみ本物 2D CRM を連続実行し、残りを保存則制約付き軽量 1D-ResNet で推論しながら同時学習する。",
-        "en": "Enable online self-distilling / active-learning 2D CRM acceleration (default false). Runs the genuine 2D CRM on a rotating + high-uncertainty subset of columns while a conservation-constrained 1D-ResNet emulates the rest and learns online.",
+        "ja": "オンライン自己蒸留・Active-Learning 2D/3D CRM 加速の有効化（既定 false）。一部の列のみ本物 CRM を連続実行し、残りを保存則制約付き密行列積 MLP＋周期 2D 空間ヘッド（地表面不均一性の空間配置・植生風・森林ロック対応）で推論しながら同時学習する。",
+        "en": "Enable online self-distilling / active-learning 2D/3D CRM acceleration (default false). Runs the genuine CRM on a rotating + high-uncertainty teacher subset while a conservation-constrained dense-GEMM MLP and periodic 2D spatial head (resolving surface patch clustering, vegetation breezes, and forest-locking) emulate the rest and learn online.",
+    },
+    "enable_rad_self_distill": {
+        "ja": "オンライン自己蒸留サブカラム ICA 放射伝達加速の有効化（既定 false）。教師列（CRM 自己蒸留と同期）のみ本物 CKD/RRTMGP 放射を解き、残りのサブカラムを厳密エネルギー保存制約付き学生 MLP で推論しつつ同時学習する（陸面各タイルのアルベド・射出率はそのまま保持）。",
+        "en": "Enable online self-distilling per-subcolumn ICA radiative transfer acceleration (default false). Runs genuine CKD/RRTMGP radiation on teacher columns (synced with CRM distillation) while a column-energy-conserving student MLP emulates the remaining subcolumns online while preserving exact per-tile surface albedo and emissivity.",
     },
     "crm_distill_stride": {
         "ja": "自己蒸留 CRM の教師列ストライド [-]。毎ステップ全球の 1/stride の列（既定 13 ≒ 7.7%）のみ本物 2D CRM を実行する。大きいほど高速。",

@@ -5,7 +5,15 @@ import torch
 
 from aoba import constants as C
 from aoba.coupled_model import AOBAConfig, init_aoba_model, step_aoba_model
-from aoba.crm_self_distill import apply_exact_conservation_closure, reconstruct_subgrid_heterogeneity
+from aoba.crm_self_distill import (
+    SubgridSpatialHead,
+    apply_exact_conservation_closure,
+    apply_exact_rad_conservation_closure,
+    apply_subgrid_surface_microclimate,
+    compute_periodic_spatial_stats,
+    compute_subgrid_structure_features,
+    reconstruct_subgrid_heterogeneity,
+)
 
 
 def test_exact_column_conservation_closure() -> None:
@@ -85,8 +93,161 @@ def test_exact_column_conservation_closure() -> None:
     assert clear_frac >= 0.74, f"Expected >=75% clear-sky subcolumns at f_cld=0.25, got {clear_frac:.3f}"
 
 
+def test_2d_and_3d_spatial_clustering_descriptors() -> None:
+    """Verify Moran's I, L_patch, and rho(SHF, LHF) distinguish clustered vs scattered 2D & 3D patches."""
+    # 1. 2D (1 x 8) wildfire patch: 2 burned tiles out of 8, identical mean & std
+    f_clump_2d = torch.tensor([[[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]])
+    f_scatt_2d = torch.tensor([[[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]])
+    f_unif_2d = torch.ones((1, 1, 8)) * 0.25
+    fields_2d = torch.cat([f_clump_2d, f_scatt_2d, f_unif_2d], dim=0)
+    std2, mi2, lp2 = compute_periodic_spatial_stats(fields_2d, dx=4000.0)
+    assert abs(float(std2[0] - std2[1])) < 1.0e-6, "Mean/std should match between clumped & scattered"
+    assert float(mi2[0]) > 0.25, f"Expected positive Moran's I for clumped 2D patch, got {float(mi2[0])}"
+    assert float(mi2[1]) < -0.25, f"Expected negative Moran's I for scattered 2D patch, got {float(mi2[1])}"
+    assert float(mi2[2]) == 0.0 and float(lp2[2]) == 0.0
+    assert float(lp2[0]) > float(lp2[1]) * 1.3, f"Expected larger L_patch for clumped 2D ({float(lp2[0]):.2f} vs {float(lp2[1]):.2f})"
+
+    # 2. 3D (4 x 4) CRM domain: 2x2 contiguous forest block vs 4x4 checkerboard
+    f_clump_3d = torch.zeros((1, 4, 4))
+    f_clump_3d[0, :2, :2] = 1.0
+    f_scatt_3d = torch.tensor([[[((r + c) % 2) for c in range(4)] for r in range(4)]], dtype=torch.float32)
+    fields_3d = torch.cat([f_clump_3d, f_scatt_3d], dim=0)
+    _, mi3, lp3 = compute_periodic_spatial_stats(fields_3d, dx=2000.0, dy=2000.0)
+    assert float(mi3[0]) > 0.25, f"Expected positive Moran's I for 3D block, got {float(mi3[0])}"
+    assert float(mi3[1]) < -0.95, f"Expected Moran's I ~ -1 for 3D checkerboard, got {float(mi3[1])}"
+    assert float(lp3[0]) > float(lp3[1]) * 1.5
+
+    # 3. Bowen-ratio (wildfire vs forest: rho=-1) vs cloud-shadowing (rho=+1)
+    shf_bowen = torch.tensor([[[200.0, 200.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0]]])
+    lhf_bowen = torch.tensor([[[10.0, 10.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0]]])
+    shf_shad = torch.tensor([[[120.0, 120.0, 120.0, 120.0, 30.0, 30.0, 30.0, 30.0]]])
+    lhf_shad = torch.tensor([[[160.0, 160.0, 160.0, 160.0, 40.0, 40.0, 40.0, 40.0]]])
+    shf_both = torch.cat([shf_bowen, shf_shad], dim=0)
+    lhf_both = torch.cat([lhf_bowen, lhf_shad], dim=0)
+    trad_both = torch.full_like(shf_both, 295.0)
+    alb_both = torch.full_like(shf_both, 0.15)
+    qn_both = torch.full((4, 2, 1, 8), 0.01)
+    w_both = torch.zeros((5, 2, 1, 8))
+    struct = compute_subgrid_structure_features(shf_both, lhf_both, trad_both, alb_both, qn_both, w_both, dx=4000.0)
+    assert struct.shape == (2, 16)
+    assert float(struct[0, 6]) < -0.99, f"Expected rho(SHF,LHF) ~ -1 for wildfire/forest, got {float(struct[0, 6])}"
+    assert float(struct[1, 6]) > 0.99, f"Expected rho(SHF,LHF) ~ +1 for cloud shadow, got {float(struct[1, 6])}"
+
+
+def test_learned_spatial_placement_forest_locking_and_microclimate() -> None:
+    """Verify SubgridSpatialHead learns forest-locking rain placement & microclimate preserves conservation."""
+    torch.manual_seed(42)
+    head = SubgridSpatialHead(col_hidden_dim=32, c_hid=16)
+    opt = torch.optim.Adam(head.parameters(), lr=1.0e-2)
+
+    # Synthetic forest-locking dataset: 4x4 3D CRM with random moist-forest patches (+LHF', -SHF')
+    # Teacher places rain strictly on the forest patch
+    b = 32
+    h_col = torch.zeros((b, 32))
+    forest = (torch.rand((b, 4, 4)) > 0.65).float()
+    # Ensure at least 1 forest pixel per sample
+    forest[:, 0, 0] = 1.0
+    shf_a = -(forest - forest.mean(dim=(-2, -1), keepdim=True)) * 1.5
+    lhf_a = (forest - forest.mean(dim=(-2, -1), keepdim=True)) * 1.5
+    z_a = torch.zeros_like(shf_a)
+    sub_maps = torch.stack([shf_a, lhf_a, z_a, z_a, z_a, z_a], dim=1)  # [B, 6, 4, 4]
+    p_tgt = forest / forest.sum(dim=(-2, -1), keepdim=True)
+
+    for _ in range(80):
+        sc, sp = head(h_col, sub_maps)
+        loss = -(p_tgt.reshape(b, -1) * torch.log_softmax(sp.reshape(b, -1), dim=-1)).sum(dim=-1).mean()
+        loss = loss - (p_tgt.reshape(b, -1) * torch.log_softmax(sc.reshape(b, -1), dim=-1)).sum(dim=-1).mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+    with torch.no_grad():
+        sc_eval, sp_eval = head(h_col, sub_maps)
+        nz = 4
+        qv = torch.full((nz, b), 0.01)
+        qc = torch.full((nz, b), 2.0e-4)
+        qi = torch.zeros((nz, b))
+        qp = torch.zeros((nz, b))
+        f_cld = forest.mean(dim=(-2, -1)).unsqueeze(0).expand(nz, b)
+        f_prec = forest.mean(dim=(-2, -1))
+        rain_col = torch.full((b,), 1.0e-4)
+        snow_col = torch.zeros((b,))
+        cids = torch.arange(b, dtype=torch.int64)
+        _, _, _, qc4, _, rain3, _ = reconstruct_subgrid_heterogeneity(
+            qv, qc, qi, qp, f_cld, rain_col, snow_col, f_prec, cids, ny=4, nx=4,
+            score_cld=sc_eval, score_prec=sp_eval,
+        )
+        # Exact mass conservation AND >95% of rain lands directly on the moist forest tiles!
+        assert float((rain3.mean(dim=(-2, -1)) - rain_col).abs().max()) < 1.0e-8
+        assert float((qc4.mean(dim=(-2, -1)) - qc).abs().max()) < 1.0e-7
+        rain_on_forest_frac = float((rain3 * forest).sum() / rain3.sum())
+        assert rain_on_forest_frac > 0.95, f"Expected >95% rain locked onto forest, got {rain_on_forest_frac:.3f}"
+
+    # Verify zero-mean surface microclimate warms burned tiles and moistens forest tiles
+    thm0 = torch.full((2, 1, 8), 300.0)
+    qv0 = torch.full((2, 1, 8), 0.012)
+    rho0 = torch.full((2,), 1.18)
+    dz0 = torch.full((2,), 120.0)
+    ex0 = torch.full((2,), 1.0)
+    shf3 = torch.tensor([[[250.0, 250.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0]]] * 2)
+    evap3 = torch.tensor([[[5.0e-6, 5.0e-6, 1.0e-4, 1.0e-4, 1.0e-4, 1.0e-4, 1.0e-4, 1.0e-4]]] * 2)
+    thm0_new, qv0_new = apply_subgrid_surface_microclimate(thm0, qv0, rho0, dz0, ex0, shf3, evap3, dt=1800.0)
+    assert float((thm0_new.mean(dim=(-2, -1)) - 300.0).abs().max()) < 1.0e-5
+    assert float((qv0_new.mean(dim=(-2, -1)) - 0.012).abs().max()) < 1.0e-7
+    assert float(thm0_new[0, 0, 0] - thm0_new[0, 0, 4]) > 0.5, "Burned tile air must be warmer than forest tile air"
+    assert float(qv0_new[0, 0, 4] - qv0_new[0, 0, 0]) > 1.0e-4, "Forest tile air must be moister than burned tile air"
+
+
+def test_exact_radiation_conservation_closure() -> None:
+    """Verify exact TOA-atmosphere-surface radiative energy closure, zero night SW, and wildfire albedo sensitivity."""
+    torch.manual_seed(3)
+    nz, m_col = 28, 64
+    raw_qrad = torch.randn(m_col, nz) * 3.0
+    raw_scal = torch.randn(m_col, 7) * 1.5
+    cp_layer = torch.linspace(1.5e5, 8.0e3, nz).unsqueeze(1).expand(nz, m_col).clone()
+    mu0 = torch.cat([torch.zeros(32), torch.linspace(0.05, 1.0, 32)])
+    s_inc = mu0 * 1361.0
+    alb_vd = torch.full((m_col,), 0.18)
+    alb_vf = torch.full((m_col,), 0.18)
+    alb_nd = torch.full((m_col,), 0.28)
+    alb_nf = torch.full((m_col,), 0.28)
+    emiss = torch.full((m_col,), 0.97)
+    t_sfc = torch.linspace(240.0, 310.0, m_col)
+
+    out = apply_exact_rad_conservation_closure(
+        raw_qrad, raw_scal, cp_layer, s_inc, alb_vd, alb_vf, alb_nd, alb_nf, emiss, t_sfc
+    )
+    # 1. Exact zero night-side SW
+    for k in ("sw1_dir", "sw1_dif", "sw2_dir", "sw2_dif", "asr"):
+        assert float(out[k][:32].abs().max()) == 0.0, f"Night-side {k} must be identically 0.0"
+
+    # 2. Physical SW bounds on day side
+    sw_dn_tot = out["sw1_dir"] + out["sw1_dif"] + out["sw2_dir"] + out["sw2_dif"]
+    assert bool((sw_dn_tot <= s_inc + 1.0e-4).all())
+    assert bool((out["asr"] <= s_inc + 1.0e-4).all())
+
+    # 3. Exact TOA - sfc == column atmospheric radiative heating integral
+    f_sw_sfc = (
+        (1.0 - alb_vd) * out["sw1_dir"] + (1.0 - alb_vf) * out["sw1_dif"]
+        + (1.0 - alb_nd) * out["sw2_dir"] + (1.0 - alb_nf) * out["sw2_dif"]
+    )
+    f_lw_sfc = emiss * (out["lw_dn"] - C.STEFAN_BOLTZMANN * (t_sfc ** 4))
+    f_atm_expected = (out["asr"] - out["olr"]) - (f_sw_sfc + f_lw_sfc)
+    f_atm_actual = (cp_layer * out["q_rad"]).sum(dim=0)
+    rel_err = float(((f_atm_actual - f_atm_expected).abs() / torch.clamp(f_atm_expected.abs(), min=50.0)).max())
+    assert rel_err < 1.0e-5, f"Radiative column energy conservation error: {rel_err}"
+
+    # 4. Immediate wildfire albedo darkening sensitivity on day-side tile
+    alb_vd_dark = alb_vd.clone()
+    alb_vd_dark[48] = 0.05  # charred black soil
+    out_dark = apply_exact_rad_conservation_closure(
+        raw_qrad, raw_scal, cp_layer, s_inc, alb_vd_dark, alb_vf, alb_nd, alb_nf, emiss, t_sfc
+    )
+    assert float(out_dark["asr"][48] - out["asr"][48]) > 1.0, "Darkening surface albedo must immediately raise ASR"
+
+
 def test_coupled_self_distill_vs_full_crm() -> None:
-    """Compare coupled AOBA with 1/13 self-distilling CRM against 100% genuine 2D CRM."""
+    """Compare coupled AOBA with paired 1/13 CRM + ICA-Radiation self-distillation against 100% genuine physics."""
     dev = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     base_kw = dict(
         glevel=2,
@@ -110,43 +271,57 @@ def test_coupled_self_distill_vs_full_crm() -> None:
         enable_river_routing=False,
     )
     torch.manual_seed(7)
-    m_ctrl = init_aoba_model(AOBAConfig(**base_kw, enable_crm_self_distill=False), device=dev)
+    m_ctrl = init_aoba_model(
+        AOBAConfig(**base_kw, enable_crm_self_distill=False, enable_rad_self_distill=False), device=dev
+    )
     torch.manual_seed(7)
     m_dist = init_aoba_model(
         AOBAConfig(
             **base_kw,
             enable_crm_self_distill=True,
+            enable_rad_self_distill=True,
             crm_distill_stride=13,
-            crm_distill_warmup_steps=6,
-            crm_distill_hidden_dim=48,
+            crm_distill_warmup_steps=12,
+            crm_distill_hidden_dim=64,
             crm_distill_replay_size=4096,
         ),
         device=dev,
     )
 
-    # Run 6 warmup steps + 12 active self-distillation steps
-    for _ in range(18):
+    # Run 12 warmup steps (6 rad steps) + 12 active paired CRM+Rad self-distillation steps
+    for _ in range(24):
         d_ctrl = step_aoba_model(m_ctrl)
         d_dist = step_aoba_model(m_dist)
 
     assert m_dist.crm_distill is not None
-    assert m_dist.crm_distill.steps_seen == 18
+    assert m_dist.rad_distill is not None
+    assert m_dist.crm_distill.steps_seen == 24
+    assert m_dist.rad_distill.steps_seen == 12
     assert m_dist.crm_distill.grad_updates > 0
+    assert m_dist.rad_distill.grad_updates > 0
     assert m_dist.crm_distill.teacher_frac_last < 0.15
+    assert m_dist.rad_distill.teacher_frac_last < 0.15
     assert torch.isfinite(m_dist.atmos.theta_m).all()
     assert torch.isfinite(m_dist.atmos.q_n).all()
     assert abs(d_ctrl.global_mean_t_sfc_k - d_dist.global_mean_t_sfc_k) < 1.5
     assert abs(d_ctrl.global_mean_olr_wm2 - d_dist.global_mean_olr_wm2) < 15.0
+    assert abs(d_ctrl.global_mean_asr_wm2 - d_dist.global_mean_asr_wm2) < 20.0
     print(
-        f"  [PASS] Coupled G2 18-step parity ({dev}): "
-        f"Ctrl Ts={d_ctrl.global_mean_t_sfc_k:.2f}K OLR={d_ctrl.global_mean_olr_wm2:.1f} | "
-        f"Distill Ts={d_dist.global_mean_t_sfc_k:.2f}K OLR={d_dist.global_mean_olr_wm2:.1f} | "
-        f"teacher_frac={m_dist.crm_distill.teacher_frac_last:.3f} grad_updates={m_dist.crm_distill.grad_updates}"
+        f"  [PASS] Coupled G2 24-step paired CRM+Rad parity ({dev}): "
+        f"Ctrl Ts={d_ctrl.global_mean_t_sfc_k:.2f}K OLR={d_ctrl.global_mean_olr_wm2:.1f} ASR={d_ctrl.global_mean_asr_wm2:.1f} | "
+        f"Distill Ts={d_dist.global_mean_t_sfc_k:.2f}K OLR={d_dist.global_mean_olr_wm2:.1f} ASR={d_dist.global_mean_asr_wm2:.1f} | "
+        f"crm_tf={m_dist.crm_distill.teacher_frac_last:.3f} rad_tf={m_dist.rad_distill.teacher_frac_last:.3f}"
     )
 
 
 if __name__ == "__main__":
     test_exact_column_conservation_closure()
     print("  [PASS] Exact column conservation closure (water, enthalpy, momentum, non-negativity)")
+    test_2d_and_3d_spatial_clustering_descriptors()
+    print("  [PASS] 2D & 3D periodic spatial clustering descriptors (Moran's I, L_patch, rho(SHF, LHF))")
+    test_learned_spatial_placement_forest_locking_and_microclimate()
+    print("  [PASS] Learned SubgridSpatialHead forest-locking placement & zero-mean microclimate")
+    test_exact_radiation_conservation_closure()
+    print("  [PASS] Exact per-subcolumn radiative energy closure, zero night SW, wildfire albedo response")
     test_coupled_self_distill_vs_full_crm()
-    print("ALL CRM SELF-DISTILLATION TESTS PASSED!")
+    print("ALL CRM + RADIATION SELF-DISTILLATION TESTS PASSED!")

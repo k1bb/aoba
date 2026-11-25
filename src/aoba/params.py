@@ -277,7 +277,7 @@ _FORCING_KEYS: tuple[str, ...] = (
     "solar_constant", "omega", "obliquity_deg", "eccentricity", "perihelion_deg",
     "start_date", "calendar_type", "insolation_mode", "fixed_insolation_date", "diurnal_cycle",
     "use_earth2014", "earth2014_dir", "earth2014_stride", "enable_superparam",
-    "enable_crm_self_distill", "crm_distill_stride", "crm_distill_warmup_steps",
+    "enable_crm_self_distill", "enable_rad_self_distill", "crm_distill_stride", "crm_distill_warmup_steps",
     "crm_distill_hidden_dim", "crm_distill_replay_size",
     "enable_dust", "dust_emis_factor",
     "h_ml_ocean", "ocean_mode", "ocean_glevel", "ocean_nz", "enable_seaice_drift", "enable_ocean_bgc",
