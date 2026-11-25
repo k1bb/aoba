@@ -375,6 +375,114 @@ def test_rcelarge_decoupled_surface_tiles_and_persistent_anchor() -> None:
     )
 
 
+def test_2d_isotropic_surface_tile_grid_and_kronecker_ops() -> None:
+    """Verify general 2D isotropic tile factorization and exact 2D Kronecker block avg/expand."""
+    from aoba.coupled_model import resolve_crm_sfc_tile_grid
+    from aoba.crm_self_distill import block_avg_2d, block_expand_2d
+
+    cases = [
+        (16, 64, 16, (2, 8)),
+        (16, 16, 16, (4, 4)),
+        (64, 64, 16, (4, 4)),
+        (12, 36, 12, (2, 6)),
+        (15, 45, 15, (3, 5)),
+        (1, 64, 8, (1, 8)),
+        (16, 64, 0, (16, 64)),
+    ]
+    for ny, nx, req, exp in cases:
+        got = resolve_crm_sfc_tile_grid(ny, nx, req)
+        assert got == exp, f"tile_grid({ny}, {nx}, {req}) -> {got}, expected {exp}"
+        ny_t, nx_t = got
+        x_tile = torch.randn(4, 3, ny_t, nx_t)
+        x_full = block_expand_2d(x_tile, ny_t, nx_t, ny, nx)
+        assert x_full.shape == (4, 3, ny, nx)
+        x_back = block_avg_2d(x_full, ny, nx, ny_t, nx_t)
+        assert torch.allclose(x_back, x_tile, atol=1.0e-6)
+        # Verify exact cell-mean preservation on arbitrary 2D field
+        f_full = torch.randn(4, 3, ny, nx)
+        f_tile = block_avg_2d(f_full, ny, nx, ny_t, nx_t)
+        assert torch.allclose(f_tile.mean(dim=(-2, -1)), f_full.mean(dim=(-2, -1)), atol=1.0e-6)
+
+
+def test_sparse_3d_crm_pool_slot_preservation_and_coupled_tica() -> None:
+    """Verify teacher-only SparseCRMPool across arbitrary 3D shapes, slot preservation, 3D TICA & O3."""
+    from aoba.coupled_model import resolve_crm_sfc_tile_grid
+    from aoba.crm_self_distill import sync_sparse_crm_pool
+
+    dev = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    torch.manual_seed(19)
+    for (ny, nx, dx, tiles, rad_sd) in [
+        (16, 64, 4000.0, 16, True),
+        (12, 36, 3000.0, 12, False),
+    ]:
+        cfg = AOBAConfig(
+            glevel=1,
+            nz=16,
+            z_top=30000.0,
+            z_sponge_base=24000.0,
+            crm_ny=ny,
+            crm_nx=nx,
+            crm_dx=dx,
+            crm_sfc_tiles=tiles,
+            dt_host=360.0,
+            n_host_dyn_substeps=1,
+            n_crm_dyn_substeps=4,
+            rad_stride=2,
+            rad_scheme="four_band",
+            enable_rad_3d_tica=True,
+            o3_mode="prognostic",
+            microphysics_scheme="two_moment",
+            ocean_mode="ekman_sw",
+            use_earth2014=False,
+            enable_dust=False,
+            enable_natural_aerosols=False,
+            enable_land_carbon=False,
+            enable_ocean_bgc=False,
+            enable_river_routing=False,
+            enable_crm_self_distill=True,
+            enable_rad_self_distill=rad_sd,
+            crm_distill_stride=8,
+            crm_distill_warmup_steps=4,
+            crm_distill_dwell_steps=48,
+            crm_distill_hidden_dim=48,
+            crm_distill_replay_size=2048,
+        )
+        m = init_aoba_model(cfg, device=dev)
+        ny_t, nx_t = resolve_crm_sfc_tile_grid(ny, nx, tiles)
+        assert m.sparse_crm_pool is not None
+        assert m.crm.rho_d.shape == (16, m.mesh.n_cells, ny_t, nx_t)
+        assert m.sparse_crm_pool.crm.rho_d.shape == (16, m.sparse_crm_pool.n_pool, ny, nx)
+
+        for _ in range(6):
+            d = step_aoba_model(m)
+
+        assert torch.isfinite(m.atmos.theta_m).all()
+        assert torch.isfinite(m.sparse_crm_pool.crm.theta_m).all()
+        assert m.sparse_crm_pool.q_rad_valid
+
+        # Verify slot preservation: cell staying in t_idx retains its exact slot & untouched 3D state
+        pool = m.sparse_crm_pool
+        cur_ids = pool.slot_cell_ids.clone()
+        keep_cell = int(cur_ids[0].item())
+        sentinel = pool.crm.theta_m[:, 0].clone()
+        # Rotate only the last slot to a different host cell
+        new_ids = cur_ids.clone()
+        used = set(cur_ids.tolist())
+        replacement = next(c for c in range(m.mesh.n_cells) if c not in used)
+        new_ids[-1] = replacement
+        ordered, n_act = sync_sparse_crm_pool(
+            pool, new_ids, m.crm, m.atmos.rho_d, m.mesh.f_cell, step_seed=99
+        )
+        assert n_act == pool.n_pool
+        assert int(ordered[0].item()) == keep_cell
+        assert torch.equal(pool.crm.theta_m[:, 0], sentinel)
+        assert int(ordered[-1].item()) == replacement
+        print(
+            f"  [PASS] SparseCRMPool 3D {ny}x{nx}@{dx:.0f}m (tiles={ny_t}x{nx_t}, rad_sd={rad_sd}, 3D-TICA+O3) ({dev}): "
+            f"Ts={d.global_mean_t_sfc_k:.2f}K OLR={d.global_mean_olr_wm2:.1f}"
+        )
+
+
 if __name__ == "__main__":
     test_exact_column_conservation_closure()
     print("  [PASS] Exact column conservation closure (water, enthalpy, momentum, non-negativity)")
@@ -386,4 +494,7 @@ if __name__ == "__main__":
     print("  [PASS] Exact per-subcolumn radiative energy closure, zero night SW, wildfire albedo response")
     test_coupled_self_distill_vs_full_crm()
     test_rcelarge_decoupled_surface_tiles_and_persistent_anchor()
+    test_2d_isotropic_surface_tile_grid_and_kronecker_ops()
+    print("  [PASS] General 2D isotropic surface-tile grid & exact Kronecker block avg/expand")
+    test_sparse_3d_crm_pool_slot_preservation_and_coupled_tica()
     print("ALL CRM + RADIATION SELF-DISTILLATION TESTS PASSED!")

@@ -180,9 +180,14 @@ kernel void crm_fast_uv_flux(
     v_nxt[gid] = v1_v;
     fx_buf[gid] = fx_v;
     fy_buf[gid] = fy_v;
-    if (accum != 0u) {
-        fx_acc[gid] += fx_v;
-        fy_acc[gid] += fy_v;
+    if (accum == 1u) {
+        float w_acc = f_p.w;
+        fx_acc[gid] = fx_v * w_acc;
+        fy_acc[gid] = fy_v * w_acc;
+    } else if (accum == 2u) {
+        float w_acc = f_p.w;
+        fx_acc[gid] += fx_v * w_acc;
+        fy_acc[gid] += fy_v * w_acc;
     }
 }
 
@@ -213,9 +218,9 @@ kernel void crm_fast_hevi_col(
     device float* w_nxt               [[buffer(23)]],
     device float* fz_acc              [[buffer(24)]],
     constant ulong4& u_dim            [[buffer(25)]],  // [nz, n_col, ny, nx]
-    constant ulong4& u_flg            [[buffer(26)]],  // [dz_cols, accum, 0, 0]
+    constant ulong4& u_flg            [[buffer(26)]],  // [dz_cols, accum (0=off,1=init,2=add), 0, 0]
     constant float4& f_p0             [[buffer(27)]],  // [dt_ac, beta, gravity, dx]
-    constant float& dy_p              [[buffer(28)]],
+    constant float4& f_p1             [[buffer(28)]],  // [dy, inv_nac, 0, 0]
     uint tid [[thread_position_in_grid]])
 {
     uint K = uint(u_dim.x);
@@ -243,7 +248,8 @@ kernel void crm_fast_hevi_col(
     float beta = f_p0.y;
     float gravity = f_p0.z;
     float inv_dx = 1.0f / f_p0.w;
-    float inv_dy = 1.0f / dy_p;
+    float inv_dy = 1.0f / f_p1.x;
+    float inv_nac = f_p1.y;
 
     float d_star[128];
 
@@ -319,6 +325,10 @@ kernel void crm_fast_hevi_col(
 
     w_nxt[tid] = 0.0f;
     w_nxt[K * M + tid] = 0.0f;
+    if (accum == 1u) {
+        fz_acc[tid] = 0.0f;
+        fz_acc[K * M + tid] = 0.0f;
+    }
 
     float dfz_above = 0.0f;
     float thm_w_above = 0.0f;
@@ -330,8 +340,10 @@ kernel void crm_fast_hevi_col(
         float fz_old_m = rdw_m * w_cur[(um + 1u) * M + tid];
         float fz_new_m = fz_old_m + dfz_cur;
         w_nxt[(um + 1u) * M + tid] = fz_new_m / max(rdw_m, 1.0e-5f);
-        if (accum != 0u) {
-            fz_acc[(um + 1u) * M + tid] += (fz_old_m + beta * dfz_cur);
+        if (accum == 1u) {
+            fz_acc[(um + 1u) * M + tid] = (fz_old_m + beta * dfz_cur) * inv_nac;
+        } else if (accum == 2u) {
+            fz_acc[(um + 1u) * M + tid] += (fz_old_m + beta * dfz_cur) * inv_nac;
         }
 
         uint k_layer = um + 1u;
@@ -1216,6 +1228,7 @@ def run_crm_rk3_hevi_metal(
     f_cor: torch.Tensor | None,
     q_n: torch.Tensor | None = None,
     q_p: torch.Tensor | None = None,
+    clone_out: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Execute the full 3-stage Split-Explicit Wicker-Skamarock RK3-HEVI step on GPU (Metal or CUDA)."""
     lib = _get_gpu_lib(rho0.device)
@@ -1264,6 +1277,11 @@ def run_crm_rk3_hevi_metal(
             "u_b": torch.empty_like(u0_c),
             "v_b": torch.empty_like(v0_c),
             "w_b": torch.empty_like(w0_c),
+            "rho_c": torch.empty_like(rho0_c),
+            "Thm_c": torch.empty_like(Thm0_c),
+            "u_c": torch.empty_like(u0_c),
+            "v_c": torch.empty_like(v0_c),
+            "w_c": torch.empty_like(w0_c),
             "fx_buf": torch.empty_like(rho0_c),
             "fy_buf": torch.empty_like(rho0_c),
             "fx_acc": torch.empty_like(rho0_c),
@@ -1295,6 +1313,7 @@ def run_crm_rk3_hevi_metal(
 
     rho_a, Thm_a, u_a, v_a, w_a = ws["rho_a"], ws["Thm_a"], ws["u_a"], ws["v_a"], ws["w_a"]
     rho_b, Thm_b, u_b, v_b, w_b = ws["rho_b"], ws["Thm_b"], ws["u_b"], ws["v_b"], ws["w_b"]
+    rho_c_ws, Thm_c_ws, u_c_ws, v_c_ws, w_c_ws = ws["rho_c"], ws["Thm_c"], ws["u_c"], ws["v_c"], ws["w_c"]
     fx_buf, fy_buf = ws["fx_buf"], ws["fy_buf"]
     fx_acc, fy_acc, fz_acc = ws["fx_acc"], ws["fy_acc"], ws["fz_acc"]
     dummy = ws["dummy"]
@@ -1381,9 +1400,19 @@ def run_crm_rk3_hevi_metal(
         return rho_s, Thm_s, u_s, v_s, w_s, fx_acc, ws["fy_zero"], fz_acc
 
     ql_c = q_load.contiguous() if q_load is not None else (1.0 + q_n + q_p).contiguous()
-    fx_acc.zero_()
-    fy_acc.zero_()
-    fz_acc.zero_()
+
+    # Select two scratch state banks disjoint from rho0_c (so ac==0 reads rho0_c directly with zero copy
+    # and the final output is also disjoint from rho0_c, enabling clone_out=False across RK3 substeps).
+    ptr0 = rho0_c.data_ptr()
+    bank_a = (rho_a, Thm_a, u_a, v_a, w_a)
+    bank_b = (rho_b, Thm_b, u_b, v_b, w_b)
+    bank_c = (rho_c_ws, Thm_c_ws, u_c_ws, v_c_ws, w_c_ws)
+    if ptr0 == rho_a.data_ptr():
+        pp0, pp1 = bank_b, bank_c
+    elif ptr0 == rho_b.data_ptr():
+        pp0, pp1 = bank_a, bank_c
+    else:
+        pp0, pp1 = bank_a, bank_b
 
     thm_s, a_p_s, dp_dThm_s, rho_tot_s = (
         ws["thm_s"], ws["a_p_s"], ws["dp_dThm_s"], ws["rho_tot_s"]
@@ -1403,6 +1432,12 @@ def run_crm_rk3_hevi_metal(
     n_w_pts = (nz + 1) * M
     n_int = nz - 1
 
+    use_2d_tg_loop = (ny == 1 and 1 < nx <= 128 and nz <= 64 and (128 % nx == 0))
+    if use_2d_tg_loop:
+        fx_acc.zero_()
+        fy_acc.zero_()
+        fz_acc.zero_()
+
     rho_s, Thm_s, u_s, v_s, w_s = rho0_c, Thm0_c, u0_c, v0_c, w0_c
     fx_final = dummy
     fy_final = dummy
@@ -1413,6 +1448,7 @@ def run_crm_rk3_hevi_metal(
     for stage_idx, dtau in enumerate(rk_taus):
         n_ac = max(1, int(_math.ceil(dtau / max(dt_ac_max, 0.1))))
         dt_ac = dtau / float(n_ac)
+        inv_nac = 1.0 / float(n_ac)
 
         lib.crm_stage_thermo(rho_s, Thm_s, ql_c, thm_s, a_p_s, dp_dThm_s, rho_tot_s, total_pts, f_th4, threads=total_pts)
         if k_sp0 < nz:
@@ -1435,11 +1471,15 @@ def run_crm_rk3_hevi_metal(
             u_dim4, int(dz_cols), f_hevi4, float(dy), threads=n_int_pts,
         )
         lib.crm_stage_hevi_factor(dl, diag, du, int(n_int), int(M), threads=M)
-        lib.crm_copy_state5(rho0_c, Thm0_c, u0_c, v0_c, w0_c, rho_a, Thm_a, u_a, v_a, w_a, total_pts, n_w_pts, threads=n_w_pts)
 
         accum = stage_idx == 2
-        accum_i = 1 if accum else 0
-        if ny == 1 and 1 < nx <= 128 and nz <= 64 and (128 % nx == 0):
+        if use_2d_tg_loop:
+            accum_i = 1 if accum else 0
+            lib.crm_copy_state5(
+                rho0_c, Thm0_c, u0_c, v0_c, w0_c,
+                pp0[0], pp0[1], pp0[2], pp0[3], pp0[4],
+                total_pts, n_w_pts, threads=n_w_pts,
+            )
             u_2d4 = [nz, n_col, nx, (int(dz_cols) << 16) | (int(n_ac) << 1) | accum_i]
             f_2d4 = [float(dt_ac), float(beta_hevi), float(gravity), float(dx)]
             if nx <= 64 and nz <= 48 and (64 % nx == 0):
@@ -1453,48 +1493,60 @@ def run_crm_rk3_hevi_metal(
                 kern_2d = lib.crm_2d_fast_hevi_loop_tg128
                 grp = 128
             kern_2d(
-                rho_a, Thm_a, u_a, v_a, w_a,
+                pp0[0], pp0[1], pp0[2], pp0[3], pp0[4],
                 rho_x, rtot_x_inv, thm_x_eff, a_p_s, dp_dThm_s, ql_c,
                 tend_u_slow, tend_v_slow, tend_w_slow, tTh_c,
                 rho_dw, rho_tot_w, thm_w, dl, diag, du, dzc_c, dzw_c, spw_c,
                 fx_acc, fy_acc, fz_acc, u_2d4, f_2d4,
                 threads=(n_tg * grp,), group_size=(grp,),
             )
-            rho_s, Thm_s, u_s, v_s, w_s = rho_a, Thm_a, u_a, v_a, w_a
+            rho_s, Thm_s, u_s, v_s, w_s = pp0
+            if accum:
+                fx_final = fx_acc * inv_nac
+                fy_final = fy_acc * inv_nac
+                fz_final = fz_acc * inv_nac
         else:
             fx_out = fx_acc if accum else dummy
             fy_out = fy_acc if accum else dummy
             fz_out = fz_acc if accum else dummy
 
-            f_uv4 = [float(dt_ac), float(dx), float(dy), 0.0]
-            u_flg4 = [int(dz_cols), accum_i, 0, 0]
+            f_uv4 = [float(dt_ac), float(dx), float(dy), float(inv_nac)]
+            f_hevi_p1 = [float(dy), float(inv_nac), 0.0, 0.0]
 
-            cur = (rho_a, Thm_a, u_a, v_a, w_a)
-            nxt = (rho_b, Thm_b, u_b, v_b, w_b)
+            # Substep 0 reads (rho0_c..w0_c) directly -> pp0, avoiding crm_copy_state5 altogether!
+            cur = (rho0_c, Thm0_c, u0_c, v0_c, w0_c)
+            nxt = pp0
+            alt = pp1
 
-            for _ in range(n_ac):
+            for ac_i in range(n_ac):
+                acc_mode = 0 if not accum else (1 if ac_i == 0 else 2)
+                u_flg4 = [int(dz_cols), acc_mode, 0, 0]
                 rho_c, Thm_c, u_c, v_c, w_c = cur
                 rho_n, Thm_n, u_n, v_n, w_n = nxt
                 lib.crm_fast_uv_flux(
                     rho_x, rho_y, rtot_x_inv, rtot_y_inv, a_p_s, dp_dThm_s,
                     tend_u_slow, tend_v_slow, Thm_c, u_c, v_c,
                     u_n, v_n, fx_buf, fy_buf, fx_out, fy_out,
-                    u_dim4, accum_i, f_uv4, threads=total_pts,
+                    u_dim4, acc_mode, f_uv4, threads=total_pts,
                 )
                 lib.crm_fast_hevi_col(
                     rho_c, Thm_c, w_c, fx_buf, fy_buf, thm_x_eff, thm_y_eff,
                     a_p_s, dp_dThm_s, ql_c, tend_w_slow, tTh_c,
                     rho_dw, rho_tot_w, thm_w, dl, diag, du, dzc_c, dzw_c, spw_c,
                     rho_n, Thm_n, w_n, fz_out,
-                    u_dim4, u_flg4, f_hevi4, float(dy), threads=M,
+                    u_dim4, u_flg4, f_hevi4, f_hevi_p1, threads=M,
                 )
-                cur, nxt = nxt, cur
+                if ac_i == 0:
+                    cur, nxt = pp0, pp1
+                else:
+                    cur, nxt = nxt, cur
 
             rho_s, Thm_s, u_s, v_s, w_s = cur
-        if accum:
-            inv_nac = 1.0 / float(n_ac)
-            fx_final = fx_acc * inv_nac
-            fy_final = fy_acc * inv_nac
-            fz_final = fz_acc * inv_nac
+            if accum:
+                fx_final = fx_acc
+                fy_final = fy_acc
+                fz_final = fz_acc
 
-    return rho_s.clone(), Thm_s.clone(), u_s.clone(), v_s.clone(), w_s.clone(), fx_final, fy_final, fz_final
+    if clone_out:
+        return rho_s.clone(), Thm_s.clone(), u_s.clone(), v_s.clone(), w_s.clone(), fx_final, fy_final, fz_final
+    return rho_s, Thm_s, u_s, v_s, w_s, fx_final, fy_final, fz_final

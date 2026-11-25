@@ -369,6 +369,22 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
             if getattr(model, "rad_distill", None) is not None
             else None
         ),
+        "sparse_crm_pool": (
+            {
+                "crm": {
+                    k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+                    for k, v in model.sparse_crm_pool.crm.__dict__.items()
+                },
+                "q_rad": model.sparse_crm_pool.q_rad.detach().cpu(),
+                "slot_cell_ids": model.sparse_crm_pool.slot_cell_ids.detach().cpu(),
+                "ny_full": int(model.sparse_crm_pool.ny_full),
+                "nx_full": int(model.sparse_crm_pool.nx_full),
+                "n_pool": int(model.sparse_crm_pool.n_pool),
+                "q_rad_valid": bool(model.sparse_crm_pool.q_rad_valid),
+            }
+            if getattr(model, "sparse_crm_pool", None) is not None
+            else None
+        ),
         "land_carbon": (
             {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.land_carbon.__dict__.items()}
             if model.land_carbon is not None
@@ -1187,6 +1203,34 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             model.rad_distill.ema_val_rmse_asr = float(ck_rd.get("ema_val_rmse_asr", 5.0))
         except Exception:
             pass
+    if getattr(model, "sparse_crm_pool", None) is not None:
+        pool_dst = model.sparse_crm_pool
+        ck_sp = ckpt.get("sparse_crm_pool")
+        restored_pool = False
+        if (
+            ck_sp is not None
+            and not needs_hremap
+            and not needs_vremap
+            and int(ck_sp.get("ny_full", -1)) == int(pool_dst.ny_full)
+            and int(ck_sp.get("nx_full", -1)) == int(pool_dst.nx_full)
+            and int(ck_sp.get("n_pool", -1)) == int(pool_dst.n_pool)
+        ):
+            try:
+                for k, v in ck_sp["crm"].items():
+                    if isinstance(v, torch.Tensor):
+                        setattr(pool_dst.crm, k, v.to(device=device))
+                    else:
+                        setattr(pool_dst.crm, k, v)
+                pool_dst.q_rad = ck_sp["q_rad"].to(device=device)
+                pool_dst.slot_cell_ids = ck_sp["slot_cell_ids"].to(device=device, dtype=torch.int64)
+                pool_dst.q_rad_valid = bool(ck_sp.get("q_rad_valid", False))
+                restored_pool = True
+            except Exception:
+                restored_pool = False
+        if not restored_pool:
+            # Cross-grid / resolution remap or legacy checkpoint: repopulate slots cleanly from remapped tile CRM
+            pool_dst.slot_cell_ids.fill_(-1)
+            pool_dst.q_rad_valid = False
     return ckpt
 
 

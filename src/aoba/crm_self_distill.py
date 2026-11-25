@@ -957,6 +957,8 @@ def _select_hybrid_teacher_indices(
     steps_seen: int,
     warmup_steps: int,
     dwell_steps: int,
+    *,
+    allow_sparse_warmup: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Select `(teacher_idx, student_idx)` with optional persistent RCEMIP self-aggregation anchor.
 
@@ -965,15 +967,35 @@ def _select_hybrid_teacher_indices(
       globally stratified anchor backbone (`cohort_id == 0`, uninterrupted multi-week/seasonal
       convective self-aggregation memory) + 35% multi-day rotating cohort (`1..stride-1`) + 15%
       top-OOD active fallback.
+    - Sparse warmup (`allow_sparse_warmup=True`): during `steps_seen < warmup_steps`, keeps
+      teacher count strictly bounded to `n_teach = ceil(n_cells / stride)` while rotating
+      faster (`dwell_w = max(warmup_steps // 4, 1)`) so the student sees diverse global regimes
+      rapidly without ever allocating dense full-3D state across all `n_cells`.
     """
-    if steps_seen < warmup_steps:
+    in_warmup = steps_seen < warmup_steps
+    if in_warmup and not allow_sparse_warmup:
         return None
     n_teach = max(1, (n_cells + stride - 1) // stride)
     if n_teach >= n_cells:
         return None
 
-    n_ood = max(1, n_teach // 6) if n_teach >= 12 else 0
-    if dwell_steps >= 48 and stride >= 3 and n_teach >= 8:
+    n_ood = max(1, n_teach // 6) if (n_teach >= 12 and not in_warmup) else 0
+    if in_warmup:
+        # Fast stratified global sweep during sparse warmup while preserving persistent anchor slots
+        dwell_w = max(warmup_steps // 4, 1)
+        if dwell_steps >= 48 and stride >= 3 and n_teach >= 8:
+            anchor_all = torch.nonzero(cohort_id == 0, as_tuple=False).squeeze(-1)
+            n_anchor = min(int(anchor_all.numel()), max(n_teach // 2, 1))
+            anchor_sel = anchor_all[:n_anchor]
+            rot_cohort = 1 + ((steps_seen // dwell_w) % (stride - 1))
+            rot_all = torch.nonzero(cohort_id == rot_cohort, as_tuple=False).squeeze(-1)
+            n_rot_keep = min(int(rot_all.numel()), max(n_teach - n_anchor, 0))
+            base_sel = torch.cat([anchor_sel, rot_all[:n_rot_keep]], dim=0) if n_rot_keep > 0 else anchor_sel
+        else:
+            active_cohort = (steps_seen // dwell_w) % stride
+            rot_idx = torch.nonzero(cohort_id == active_cohort, as_tuple=False).squeeze(-1)
+            base_sel = rot_idx[:min(int(rot_idx.numel()), n_teach)]
+    elif dwell_steps >= 48 and stride >= 3 and n_teach >= 8:
         anchor_all = torch.nonzero(cohort_id == 0, as_tuple=False).squeeze(-1)
         n_anchor = min(int(anchor_all.numel()), max(n_teach // 2, 1))
         anchor_sel = anchor_all[:n_anchor]
@@ -1003,11 +1025,16 @@ def _select_hybrid_teacher_indices(
     return teacher_idx, student_idx
 
 
-def select_teacher_indices(state: CRMSelfDistillState) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return `(teacher_idx, student_idx)` or `None` during warmup (100% genuine 2D/3D CRM)."""
+def select_teacher_indices(
+    state: CRMSelfDistillState,
+    *,
+    allow_sparse_warmup: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return `(teacher_idx, student_idx)` or `None` during dense warmup (100% genuine 2D/3D CRM)."""
     return _select_hybrid_teacher_indices(
         state.cohort_id, state.last_uncertainty,
         state.n_cells, state.stride, state.steps_seen, state.warmup_steps, state.dwell_steps,
+        allow_sparse_warmup=allow_sparse_warmup,
     )
 
 
@@ -1650,19 +1677,24 @@ def select_rad_teacher_indices(
     state: RadSelfDistillState,
     *,
     crm_state: CRMSelfDistillState | None = None,
+    allow_sparse_warmup: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Select host-cell `(teacher_idx, student_idx)` for ICA radiation, synced with CRM when active."""
-    if state.steps_seen < state.warmup_steps:
+    if state.steps_seen < state.warmup_steps and not allow_sparse_warmup:
         return None
-    if crm_state is not None and crm_state.stride == state.stride and crm_state.steps_seen >= crm_state.warmup_steps:
+    if crm_state is not None and crm_state.stride == state.stride and (
+        allow_sparse_warmup or crm_state.steps_seen >= crm_state.warmup_steps
+    ):
         return _select_hybrid_teacher_indices(
             crm_state.cohort_id,
             state.last_uncertainty + 0.5 * crm_state.last_uncertainty,
             state.n_cells, crm_state.stride, crm_state.steps_seen, crm_state.warmup_steps, crm_state.dwell_steps,
+            allow_sparse_warmup=allow_sparse_warmup,
         )
     return _select_hybrid_teacher_indices(
         state.cohort_id, state.last_uncertainty,
         state.n_cells, state.stride, state.steps_seen, state.warmup_steps, state.dwell_steps,
+        allow_sparse_warmup=allow_sparse_warmup,
     )
 
 
@@ -1841,3 +1873,226 @@ def predict_rad_student_columns(
     )
     unc = (qa_all - qb_all).abs().mean(dim=1) + (sa_all - sb_all).abs().mean(dim=1)
     return out, unc
+
+
+# ---------------------------------------------------------------------------
+# 6. General 2D Kronecker Block Helpers & Teacher-Only Sparse 3D CRM Pool
+# ---------------------------------------------------------------------------
+def block_avg_2d(
+    x: torch.Tensor,
+    ny: int,
+    nx: int,
+    ny_t: int,
+    nx_t: int,
+) -> torch.Tensor:
+    """2D Kronecker block average `[..., ny, nx] -> [..., ny_t, nx_t]` for exact divisors."""
+    if ny == ny_t and nx == nx_t:
+        return x
+    by = ny // ny_t
+    bx = nx // nx_t
+    lead = x.shape[:-2]
+    return x.reshape(*lead, ny_t, by, nx_t, bx).mean(dim=(-3, -1))
+
+
+def block_expand_2d(
+    x: torch.Tensor,
+    ny_t: int,
+    nx_t: int,
+    ny: int,
+    nx: int,
+) -> torch.Tensor:
+    """2D Kronecker block expansion `[..., ny_t, nx_t] -> [..., ny, nx]` for exact divisors."""
+    if ny == ny_t and nx == nx_t:
+        return x
+    by = ny // ny_t
+    bx = nx // nx_t
+    lead = x.shape[:-2]
+    return (
+        x.reshape(*lead, ny_t, 1, nx_t, 1)
+        .expand(*lead, ny_t, by, nx_t, bx)
+        .reshape(*lead, ny, nx)
+    )
+
+
+@dataclass
+class SparseCRMPool:
+    """Teacher-only full-resolution 3D CRM pool with slot-preserving multi-day memory.
+
+    Allocates full `(ny_full, nx_full)` 3D CRM dynamics & ICA/TICA radiation state strictly for
+    the `n_pool = ceil(n_cells / stride)` active teachers while all `n_cells` host columns store
+    lightweight tile-resolution `(ny_tile, nx_tile)` state in `model.crm`. Works identically for
+    arbitrary `(ny_full, nx_full)` and arbitrary `crm_dx`.
+    """
+
+    crm: object                      # CRMState on `[nz, n_pool, ny_full, nx_full]`
+    q_rad: torch.Tensor              # `[nz, n_pool, ny_full, nx_full]` full-3D radiative heating [K s^-1]
+    slot_cell_ids: torch.Tensor      # `[n_pool]` int64 host cell ID per pool slot (`-1` = empty)
+    ny_full: int
+    nx_full: int
+    ny_tile: int
+    nx_tile: int
+    n_pool: int
+    q_rad_valid: bool = False
+
+
+def init_sparse_crm_pool(
+    n_pool: int,
+    nz: int,
+    ny_full: int,
+    nx_full: int,
+    ny_tile: int,
+    nx_tile: int,
+    dx: float,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> SparseCRMPool:
+    """Allocate an empty teacher-only full-3D CRM pool (`~0.15 GB` for 65 x 16x64 @ nz=44)."""
+    from aoba.crm import CRMState
+    from aoba.turbulence import TKE_MIN
+
+    np_eff = max(int(n_pool), 1)
+    sh4 = (int(nz), np_eff, int(ny_full), int(nx_full))
+    shw = (int(nz) + 1, np_eff, int(ny_full), int(nx_full))
+    crm_p = CRMState(
+        rho_d=torch.ones(sh4, device=device, dtype=dtype),
+        u=torch.zeros(sh4, device=device, dtype=dtype),
+        v=torch.zeros(sh4, device=device, dtype=dtype),
+        w=torch.zeros(shw, device=device, dtype=dtype),
+        theta_m=torch.full(sh4, 300.0, device=device, dtype=dtype),
+        q_n=torch.zeros(sh4, device=device, dtype=dtype),
+        q_p=torch.zeros(sh4, device=device, dtype=dtype),
+        q_v=torch.zeros(sh4, device=device, dtype=dtype),
+        q_c=torch.zeros(sh4, device=device, dtype=dtype),
+        q_i=torch.zeros(sh4, device=device, dtype=dtype),
+        qke=torch.full(sh4, 2.0 * TKE_MIN, device=device, dtype=dtype),
+        dx=float(dx),
+        dy=float(dx),
+        f_coriolis=torch.zeros(np_eff, device=device, dtype=dtype),
+    )
+    return SparseCRMPool(
+        crm=crm_p,
+        q_rad=torch.zeros(sh4, device=device, dtype=dtype),
+        slot_cell_ids=torch.full((np_eff,), -1, device=device, dtype=torch.int64),
+        ny_full=int(ny_full),
+        nx_full=int(nx_full),
+        ny_tile=int(ny_tile),
+        nx_tile=int(nx_tile),
+        n_pool=np_eff,
+        q_rad_valid=False,
+    )
+
+
+@torch.no_grad()
+def sync_sparse_crm_pool(
+    pool: SparseCRMPool,
+    t_idx: torch.Tensor,            # `[n_t]` int64 desired teacher host cell IDs (`n_t <= pool.n_pool`)
+    tile_crm: object,               # `model.crm` at tile resolution `[nz, nc, ny_tile, nx_tile]`
+    atmos_rho: torch.Tensor,        # `[nz, nc]` current host dry density
+    f_cell: torch.Tensor,           # `[nc]` Coriolis parameter
+    *,
+    tile_q_rad_4d: torch.Tensor | None = None,  # optional `[nz, nc, ny_tile, nx_tile]` cached rad heating
+    step_seed: int = 0,
+) -> tuple[torch.Tensor, int]:
+    """Synchronize teacher slots in-place without disturbing staying cells' 3D convective memory.
+
+    Returns `(t_idx_ordered, n_active)` where `t_idx_ordered = pool.slot_cell_ids[:n_active]`
+    gives the host cell ID corresponding to each contiguous pool slot `0..n_active-1`. Cells
+    remaining in `t_idx` (persistent RCEMIP anchors and active multi-day cohorts) keep their
+    exact slot and unbroken full-3D state with zero tensor copies. Newly entering cells claim
+    vacated slots initialized in one vectorized GPU batch from 2D-expanded tile state plus a
+    tiny zero-mean `+-0.10 K` lowest-2 km thermal perturbation to break block symmetry.
+    """
+    dev = pool.slot_cell_ids.device
+    req_list = [int(c) for c in t_idx.detach().cpu().tolist()]
+    n_t = min(len(req_list), pool.n_pool)
+    req_list = req_list[:n_t]
+    req_set = set(req_list)
+
+    cur_list = [int(c) for c in pool.slot_cell_ids.detach().cpu().tolist()]
+    kept_set: set[int] = set()
+    vacated_slots: list[int] = []
+    for s in range(n_t):
+        cid = cur_list[s]
+        if cid >= 0 and cid in req_set and cid not in kept_set:
+            kept_set.add(cid)
+        else:
+            vacated_slots.append(s)
+
+    entering_cells = [c for c in req_list if c not in kept_set]
+    assert len(entering_cells) == len(vacated_slots), (
+        f"SparseCRMPool slot mismatch: {len(entering_cells)} entering vs {len(vacated_slots)} vacated"
+    )
+
+    if entering_cells:
+        new_slots = torch.tensor(vacated_slots, device=dev, dtype=torch.int64)
+        new_cells = torch.tensor(entering_cells, device=dev, dtype=torch.int64)
+        ny_f, nx_f = pool.ny_full, pool.nx_full
+        ny_t, nx_t = pool.ny_tile, pool.nx_tile
+        nz = int(tile_crm.rho_d.shape[0])
+
+        def _exp4(field: torch.Tensor) -> torch.Tensor:
+            return block_expand_2d(field[:, new_cells], ny_t, nx_t, ny_f, nx_f)
+
+        rho_exp = _exp4(tile_crm.rho_d)
+        drho = (atmos_rho[:, new_cells] - rho_exp.mean(dim=(-2, -1))).unsqueeze(-1).unsqueeze(-1)
+        pool.crm.rho_d[:, new_slots] = torch.clamp(rho_exp + drho, min=1.0e-5)
+        pool.crm.u[:, new_slots] = _exp4(tile_crm.u)
+        pool.crm.v[:, new_slots] = _exp4(tile_crm.v)
+        pool.crm.w[:, new_slots] = 0.0
+
+        thm_exp = _exp4(tile_crm.theta_m).contiguous()
+        k_pbl = min(nz, max(nz // 5, 4))
+        gen = torch.Generator(device="cpu").manual_seed(104729 + int(step_seed) * 97 + len(entering_cells))
+        noise = (torch.rand((k_pbl, len(entering_cells), ny_f, nx_f), generator=gen, dtype=torch.float32) * 2.0 - 1.0) * 0.10
+        noise = (noise - noise.mean(dim=(-2, -1), keepdim=True)).to(device=dev, dtype=thm_exp.dtype)
+        thm_exp[:k_pbl] = thm_exp[:k_pbl] + noise
+        pool.crm.theta_m[:, new_slots] = thm_exp
+
+        pool.crm.q_n[:, new_slots] = _exp4(tile_crm.q_n)
+        pool.crm.q_p[:, new_slots] = _exp4(tile_crm.q_p)
+        pool.crm.q_v[:, new_slots] = _exp4(tile_crm.q_v)
+        pool.crm.q_c[:, new_slots] = _exp4(tile_crm.q_c)
+        pool.crm.q_i[:, new_slots] = _exp4(tile_crm.q_i)
+        pool.crm.qke[:, new_slots] = _exp4(tile_crm.qke)
+
+        # Optional 2-moment / 6-class 2-moment hydrometeor fields
+        for opt_attr in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
+            src_f = getattr(tile_crm, opt_attr, None)
+            if src_f is not None:
+                dst_f = getattr(pool.crm, opt_attr, None)
+                if dst_f is None:
+                    dst_f = torch.zeros_like(pool.crm.q_c)
+                    setattr(pool.crm, opt_attr, dst_f)
+                dst_f[:, new_slots] = _exp4(src_f)
+
+        if tile_q_rad_4d is not None:
+            pool.q_rad[:, new_slots] = _exp4(tile_q_rad_4d)
+
+        for s, cid in zip(vacated_slots, entering_cells):
+            cur_list[s] = cid
+        if n_t < pool.n_pool:
+            for s in range(n_t, pool.n_pool):
+                cur_list[s] = -1
+        pool.slot_cell_ids = torch.tensor(cur_list, device=dev, dtype=torch.int64)
+        pool.crm.f_coriolis = f_cell[torch.clamp(pool.slot_cell_ids, min=0)]
+
+    return pool.slot_cell_ids[:n_t], n_t
+
+
+@torch.no_grad()
+def compute_pool_org_invariants(
+    qn_4d: torch.Tensor,    # `[nz, n_t, ny_full, nx_full]`
+    w_4d: torch.Tensor,     # `[nz+1, n_t, ny_full, nx_full]`
+    dx: float,
+    dy: float,
+) -> torch.Tensor:
+    """Compute the 4 full-3D atmospheric organization invariants `[n_t, 4]` for `subgrid_struct[:, 12:16]`."""
+    qn_col_3d = qn_4d.mean(dim=0)
+    qn_std, qn_mi, qn_lp = compute_periodic_spatial_stats(qn_col_3d, dx, dy)
+    w_rms = torch.sqrt(torch.clamp((w_4d * w_4d).mean(dim=(0, 2, 3)), min=0.0))
+    return torch.stack([
+        torch.log1p(torch.clamp(qn_std, min=0.0) * 1.0e3),
+        qn_mi,
+        torch.log1p(torch.clamp(qn_lp, 0.0, 200.0)),
+        torch.clamp(w_rms, 0.0, 10.0),
+    ], dim=1).contiguous()

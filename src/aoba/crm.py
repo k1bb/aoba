@@ -660,6 +660,7 @@ def step_crm_rk3_hevi(
     sgs_in: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     update_theta_m: bool = True,
     thm_out: list[torch.Tensor] | None = None,
+    clone_out: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Advance `(rho_d, u, v, w, theta_m)` over one Split-Explicit RK3-HEVI step `dt_dyn` [s].
 
@@ -723,6 +724,7 @@ def step_crm_rk3_hevi(
             du_sgs, dv_sgs, dw_sgs, dThm_sgs,
             dz_c, dz_w_int, sponge_c, sponge_w, None,
             q_n=crm.q_n, q_p=crm.q_p,
+            clone_out=clone_out,
         )
         crm.rho_d = rho_s
         crm.u = u_s
@@ -999,10 +1001,10 @@ def step_crm_physics_and_dynamics(
         thm_box: list[torch.Tensor] = []
         sgs_cached: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         s_idx = 0
-        simd_pingpong = (use_metal_crm and ny == 1 and 1 < nx <= 32 and nz <= 64 and (32 % nx == 0))
+        no_clone_pp = use_metal_crm
         while s_idx < n_sub:
             k_cnt = min(adv_group, n_sub - s_idx)
-            rho_start = crm.rho_d if (k_cnt == 1 and simd_pingpong) else crm.rho_d.clone()
+            rho_start = crm.rho_d if (k_cnt == 1 and no_clone_pp) else crm.rho_d.clone()
             if k_cnt == 1:
                 if sgs_cached is None or (s_idx % sgs_stride == 0):
                     thm_sgs = crm.theta_m if s_idx == 0 else (Thm_cur / torch.clamp(crm.rho_d, min=1.0e-5))
@@ -1012,6 +1014,7 @@ def step_crm_physics_and_dynamics(
                 fx_mean, fy_mean, fz_mean = step_crm_rk3_hevi(
                     crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col,
                     Thm_in=Thm_cur, sgs_in=sgs_cached, update_theta_m=False, thm_out=thm_box,
+                    clone_out=not no_clone_pp,
                 )
                 Thm_cur = thm_box[0]
             else:
@@ -1028,6 +1031,7 @@ def step_crm_physics_and_dynamics(
                     fx, fy, fz = step_crm_rk3_hevi(
                         crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col,
                         Thm_in=Thm_cur, sgs_in=sgs_cached, update_theta_m=False, thm_out=thm_box,
+                        clone_out=not no_clone_pp,
                     )
                     Thm_cur = thm_box[0]
                     if sub_i == 0:
@@ -1073,6 +1077,14 @@ def step_crm_physics_and_dynamics(
                 crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
                 crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
             s_idx += k_cnt
+        if no_clone_pp:
+            # Detach CRM tensors from shared RK3-HEVI workspace buffers once after all substeps finish
+            crm.rho_d = crm.rho_d.clone()
+            crm.w = crm.w.clone()
+            if u_gal_shift is None:
+                crm.u = crm.u.clone()
+            if v_gal_shift is None:
+                crm.v = crm.v.clone()
         if u_gal_shift is not None:
             crm.u = crm.u + u_gal_shift
         if v_gal_shift is not None:
@@ -1102,7 +1114,7 @@ def step_crm_physics_and_dynamics(
     if sfc_fluxes is not None:
         # Broadcast host/column surface fluxes `[N_col]` or `[N_col, Ny, Nx]` across `[N_col * Ny * Nx]`
         def _bcast_sfc(arr: torch.Tensor) -> torch.Tensor:
-            if arr.ndim == 1:
+            if arr.ndim == 1 and int(arr.numel()) == n_col and m_sub != n_col:
                 return arr.view(n_col, 1, 1).expand(n_col, ny, nx).reshape(m_sub)
             return arr.reshape(m_sub)
 
