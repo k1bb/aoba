@@ -244,7 +244,9 @@ def _inspect_nonfinite_state(model: AOBAState) -> list[str]:
     if model.ozone is not None:
         checks.append(("ozone.o3_vmr", model.ozone.o3_vmr))
 
-    n_sub = max(int(model.cfg.crm_ny * model.cfg.crm_nx), 1)
+    from aoba.coupled_model import resolve_crm_sfc_tiles
+
+    n_sub = resolve_crm_sfc_tiles(model.cfg)
     bad_lines: list[str] = []
     for name, ten in checks:
         if ten is None or not isinstance(ten, torch.Tensor) or not ten.is_floating_point():
@@ -848,13 +850,18 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             ckpt["_horizontal_remapped"] = True
 
     # Honor active run_config grid spacing (`crm_dx`) when switching spacing on resume
-    model.crm.dx = float(model.cfg.crm_dx)
-    model.crm.dy = float(model.cfg.crm_dx)
+    if getattr(model, "sparse_crm_pool", None) is None:
+        model.crm.dx = float(model.cfg.crm_dx)
+        model.crm.dy = float(model.cfg.crm_dx)
+    else:
+        model.sparse_crm_pool.crm.dx = float(model.cfg.crm_dx)
+        model.sparse_crm_pool.crm.dy = float(model.cfg.crm_dx)
 
     # 3. Surface states (`sfc`, `sfc_sub`, `ocn_sfc`)
     from aoba.coupled_model import resolve_crm_sfc_tiles
 
     n_sfc_new = resolve_crm_sfc_tiles(model.cfg)
+    n_sfc_old = n_sub_old
     _restore_surface(model.sfc, ckpt["sfc"], device, h_idx=atm_h_idx, n_old=nc_old)
     if model.sfc_sub is not None:
         if ckpt.get("sfc_sub") is not None:
@@ -879,6 +886,7 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
                 n_sub_old=1,
                 n_sub_new=n_sfc_new,
             )
+    needs_sfc_remap = (n_sfc_old != n_sfc_new)
 
     # Build ocean horizontal remap index when ocean mesh changed (or transitioning from unified -> high-res ocean)
     ocn_mesh_act = model.ocn_mesh if model.ocn_mesh is not None else model.mesh
@@ -1068,8 +1076,8 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
                     if hasattr(model.land_carbon, k):
                         setattr(model.land_carbon, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
             else:
-                lc_sub_old = n_sub_old if lc_old_n == nc_old * n_sub_old else 1
-                lc_sub_new = n_sub_new if lc_new_n == nc_new * n_sub_new else 1
+                lc_sub_old = n_sfc_old if lc_old_n == nc_old * n_sfc_old else 1
+                lc_sub_new = n_sfc_new if lc_new_n == nc_new * n_sfc_new else 1
                 for k, v in ck_lc.items():
                     if not hasattr(model.land_carbon, k):
                         continue
@@ -1154,8 +1162,8 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             for k, v in ck_cs.items():
                 if not isinstance(v, torch.Tensor):
                     setattr(model.clim_sub, k, v)
-                elif (needs_hremap or needs_subremap) and v.ndim >= 1 and int(v.shape[-1]) == nc_old * n_sub_old:
-                    setattr(model.clim_sub, k, _remap_horizontal_tensor(v.cpu(), atm_h_idx, nc_old, n_sub_old, n_sub_new).to(device=device))
+                elif (needs_hremap or needs_sfc_remap) and v.ndim >= 1 and int(v.shape[-1]) == nc_old * n_sfc_old:
+                    setattr(model.clim_sub, k, _remap_horizontal_tensor(v.cpu(), atm_h_idx, nc_old, n_sfc_old, n_sfc_new).to(device=device))
                 else:
                     setattr(model.clim_sub, k, v.to(device=device))
 
@@ -1827,8 +1835,10 @@ def main() -> None:
             if is_sync_step or model.sfc_sub is None:
                 t_sfc_p = torch.where(model.mesh.surf_type == SURF_OCEAN, model.sfc.t_ocean_ml, model.sfc.t_canopy)
             else:
+                from aoba.coupled_model import resolve_crm_sfc_tiles
+
                 ss = model.sfc_sub
-                n_sub = model.cfg.crm_ny * model.cfg.crm_nx
+                n_sub = resolve_crm_sfc_tiles(model.cfg)
                 t_sfc_p = torch.where(ss.surf_type == SURF_OCEAN, ss.t_ocean_ml, ss.t_canopy).reshape(model.mesh.n_cells, n_sub).mean(dim=-1)
             t2_inst = 0.35 * t_sfc_p + 0.65 * temp0_p[0]
             rain_p = model.rad_cache.get("rain", torch.zeros_like(t2_inst))
@@ -1903,7 +1913,9 @@ def main() -> None:
                         sample["lw_dn_sfc"] = model.rad_cache.get("lw_dn", torch.zeros_like(model.sfc.t_ocean_ml))
                         sd_sub = model.last_sfc_diag_sub
                         if sd_sub is not None:
-                            n_sub_c = model.cfg.crm_ny * model.cfg.crm_nx
+                            from aoba.coupled_model import resolve_crm_sfc_tiles
+
+                            n_sub_c = resolve_crm_sfc_tiles(model.cfg)
                             nc_c = model.mesh.n_cells
                             sample["tau_x_sfc"] = sd_sub.tau_x.reshape(nc_c, n_sub_c).mean(dim=-1)
                             sample["tau_y_sfc"] = sd_sub.tau_y.reshape(nc_c, n_sub_c).mean(dim=-1)
