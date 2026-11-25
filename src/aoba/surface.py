@@ -39,7 +39,7 @@ with zero external PFT, soil-texture, or albedo lookup maps:
      & SCALE-RM (2025, Sec. 8.6 Eqs. 8.328-8.358):
      Slab ocean mixed layer with snowfall fusion cooling and fractional-lead sea ice `f_i`.
 
-AOBA Formulation Reference: Sec. 7.6 Eqs. (7.30)-(7.36) & Sec. 9.2 Eq. (9.1) (3-Source Energy Balance, Snow/SNICAR, 5-Layer Soil & Sea Ice).
+AOBA Formulation Reference: Sec. 7.6 Eqs. (7.32)-(7.38) & Sec. 9.2 Eq. (9.1) (3-Source Energy Balance, Snow/SNICAR, 5-Layer Soil & Sea Ice).
 """
 
 from __future__ import annotations
@@ -491,8 +491,9 @@ def compute_surface_albedos(
     gnd_nir_dir = (1.0 - a_sn) * soil_nir + a_sn * sn_nir_dir
     gnd_nir_dif = (1.0 - a_sn) * soil_nir + a_sn * sn_nir_dif
 
-    l_vis_dir, _, l_nir_dir, _, _, _ = canopy_two_stream_albedo_dai(lai_exp, mu0, gnd_vis_dir, gnd_nir_dir)
-    _, l_vis_dif, _, l_nir_dif, _, _ = canopy_two_stream_albedo_dai(lai_exp, mu0, gnd_vis_dif, gnd_nir_dif)
+    chi_leaf = sfc.bio.chi_leaf
+    l_vis_dir, _, l_nir_dir, _, _, _ = canopy_two_stream_albedo_dai(lai_exp, mu0, gnd_vis_dir, gnd_nir_dir, chi_leaf=chi_leaf)
+    _, l_vis_dif, _, l_nir_dif, _, _ = canopy_two_stream_albedo_dai(lai_exp, mu0, gnd_vis_dif, gnd_nir_dif, chi_leaf=chi_leaf)
 
     # 2. Ocean + fractional-lead sea ice (SCALE-RM Eq. 8.342; Briegleb et al., 1986)
     f_ice = torch.where(
@@ -888,6 +889,8 @@ def _surface_land_pre_newton_core(
     l_sun: torch.Tensor,
     l_sh: torch.Tensor,
     k_db_inst: torch.Tensor,
+    kd_par_inst: torch.Tensor,
+    chi_leaf: torch.Tensor,
     snow_age: torch.Tensor,
     w_liq_soil0: torch.Tensor,
     w_ice_soil0: torch.Tensor,
@@ -935,9 +938,9 @@ def _surface_land_pre_newton_core(
     ag_nir_f = (1.0 - a_sn) * soil_n + a_sn * sn_nir_f
 
     kb_vis_p = k_db_inst * math.sqrt(1.0 - LEAF_SCAT_VIS)
-    kd_vis_p = 0.78 * math.sqrt(1.0 - LEAF_SCAT_VIS)
+    kd_vis_p = kd_par_inst
     kb_nir_p = k_db_inst * math.sqrt(1.0 - LEAF_SCAT_NIR)
-    kd_nir_p = 0.78 * math.sqrt(1.0 - LEAF_SCAT_NIR)
+    kd_nir_p = (kd_par_inst / math.sqrt(1.0 - LEAF_SCAT_VIS)) * math.sqrt(1.0 - LEAF_SCAT_NIR)
     tr_vis_d = torch.exp(-torch.clamp(kb_vis_p * lai_exp, max=40.0))
     tr_vis_f = torch.exp(-torch.clamp(kd_vis_p * lai_exp, max=40.0))
     tr_nir_d = torch.exp(-torch.clamp(kb_nir_p * lai_exp, max=40.0))
@@ -953,8 +956,8 @@ def _surface_land_pre_newton_core(
     )
     sw_can_vis = torch.where(has_veg, torch.clamp(sw_tot_vis - sw_gnd_vis, min=0.0), torch.zeros_like(sw_tot_vis))
     sw_can_nir = torch.where(has_veg, torch.clamp(sw_tot_nir - sw_gnd_nir, min=0.0), torch.zeros_like(sw_tot_nir))
-    f_sun_vis = canopy_sunlit_sw_fraction(sw1_dir_down, sw1_dif_down, mu0, lai_exp, LEAF_SCAT_VIS)
-    f_sun_nir = canopy_sunlit_sw_fraction(sw2_dir_down, sw2_dif_down, mu0, lai_exp, LEAF_SCAT_NIR)
+    f_sun_vis = canopy_sunlit_sw_fraction(sw1_dir_down, sw1_dif_down, mu0, lai_exp, LEAF_SCAT_VIS, chi_leaf=chi_leaf)
+    f_sun_nir = canopy_sunlit_sw_fraction(sw2_dir_down, sw2_dif_down, mu0, lai_exp, LEAF_SCAT_NIR, chi_leaf=chi_leaf)
     sw_abs_sun = torch.where(has_sun, f_sun_vis * sw_can_vis + f_sun_nir * sw_can_nir, torch.zeros_like(sw_abs))
     sw_abs_sh = torch.where(has_sh, (sw_can_vis + sw_can_nir) - sw_abs_sun, torch.zeros_like(sw_abs))
     sw_abs_gnd = sw_abs - sw_abs_sun - sw_abs_sh
@@ -1757,6 +1760,8 @@ def step_surface(
     l_sun = alloc_2l.inst_rad.l_sun
     l_sh = alloc_2l.inst_rad.l_sh
     k_db_inst = alloc_2l.inst_rad.k_db
+    kd_par_inst = alloc_2l.inst_rad.kd_prime if alloc_2l.inst_rad.kd_prime is not None else torch.full_like(k_db_inst, 0.78 * math.sqrt(1.0 - LEAF_SCAT_VIS))
+    chi_leaf_in = sfc.bio.chi_leaf if sfc.bio.chi_leaf is not None else torch.zeros_like(lai_exp)
 
     # =========================================================================
     # PART A: TERRESTRIAL TILES (3-Source Sunlit/Shaded/Ground + RSL + P-Model)
@@ -1774,7 +1779,7 @@ def step_surface(
         sw1_dir_down, sw1_dif_down, sw2_dir_down, sw2_dif_down,
         alb_vis_dir, alb_vis_dif, alb_nir_dir, alb_nir_dif,
         h_exp, lai_exp, a_sn, temp_1, qv_1, pres_1, pres_sfc, mu0,
-        l_sun, l_sh, k_db_inst, sfc.snow_age, sfc.w_liq_soil[0],
+        l_sun, l_sh, k_db_inst, kd_par_inst, chi_leaf_in, sfc.snow_age, sfc.w_liq_soil[0],
         sfc.w_ice_soil[0], t_soil0, sfc.w_canopy, sfc.swe_land,
     )
 

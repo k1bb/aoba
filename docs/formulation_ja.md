@@ -806,15 +806,37 @@ AOBA の陸面系は静的な植生機能型 (PFT) マップや土壌テクス�
 
 ![図 7.1: MAML サブグリッド陸面・自律 EEO 生態系・土壌水文・陸域 C/N 循環](assets/fig_05_land_maml_eeo.svg)
 
-### 7.2 群落放射伝達・2 葉酵素最適配分・特異点フリー 2 ストリームアルベド (`src/aoba/biosphere.py`)
+### 7.2 群落放射伝達・離散樹冠クランピング・最適葉傾角・2 葉酵素配分 (`src/aoba/biosphere.py`)
 
-McCree (1972) の光子換算係数（直達 $4.57$, 散乱 $4.24\ \mu\mathrm{mol\ J^{-1}}$）および de Pury & Farquhar (1997) に基づき、球面葉角分布下の露出葉面積指数 $L_c$ および葉面散乱係数（可視 $\sigma_{\mathrm{vis}} = 0.15$, 近赤外 $\sigma_{\mathrm{nir}} = 0.80$）に対する直達消散係数 $k_{db}$、散乱補正消散係数 $k'_b$、散乱光消散係数 $k'_d = 0.719$、直達・散乱群落頂面反射率 $(\rho_{cb}, \rho_{cd})$ を次式で定義する：
+葉角分布は球面仮定に固定せず、Ross (1975) および Goudriaan (1977) の葉傾角指数 $\chi_L \in [-0.40, +0.50]$（$\chi_L = 0$: 球面分布、$\chi_L < 0$: 直立葉、$\chi_L > 0$: 水平葉）により投影関数 $G(\mu_0; \chi_L)$ と散乱光平均逆光学厚さ $\bar{\mu}(\chi_L)$（Dai et al., 2004, Eq. A4c; $\phi_2\to 0$ で 3 項 Taylor 展開により $\bar{\mu}\to (2\phi_1)^{-1}=1$ へ滑らかに接続）を定める。さらに反復不要の閉形式最適則により、高 LAI における群落深部への光配分（直立葉化; Monsi & Saeki, 1953; Hikosaka & Hirose, 1997）と乾燥・高 VPD・強日射環境での過昇温・蒸散コスト回避（直立葉化; Ehleringer & Werk, 1986; Falster & Westoby, 2003; Pisek et al., 2013）の均衡点 $\chi_L^*$ へ約 30 日時定数で日次順化する：
 
 $$
 \begin{aligned}
-k_{db} &= \frac{0.5}{\max(\mu_0,\ 0.01)}, \qquad k'_b = k_{db}\sqrt{1 - \sigma_{\mathrm{vis}}}, \\
-\rho_h &= \frac{1 - \sqrt{1 - \sigma_{\mathrm{vis}}}}{1 + \sqrt{1 - \sigma_{\mathrm{vis}}}}, \qquad \rho_{cb} = \frac{2\rho_h k_{db}}{1 + k_{db}}, \qquad \rho_{cd} = 0.036
+\phi_1 &= 0.5 - 0.633\,\chi_L - 0.330\,\chi_L^2, \qquad \phi_2 = 0.877(1 - 2\phi_1), \qquad G(\mu_0;\chi_L) = \phi_1 + \phi_2\,\mu_0, \\
+\bar{\mu}(\chi_L) &= \frac{1}{\phi_2}\left[1 - \frac{\phi_1}{\phi_2}\ln\!\left(1 + \frac{\phi_2}{\phi_1}\right)\right], \\
+\chi_{\mathrm{light}} &= 0.25\tanh\!\left(\frac{2.5 - L}{2.0}\right), \qquad S_{\mathrm{dry}} = \operatorname{clamp}\!\left(\frac{1.2 - \mathrm{MI}}{1.2},\ 0,\ 1\right), \\
+S_{\mathrm{vpd}} &= \frac{D_{\mathrm{mid}}}{D_{\mathrm{mid}} + 1500\ \mathrm{Pa}}, \qquad S_{\mathrm{sun}} = \operatorname{clamp}\!\left(\frac{\bar{\mu}_{0,\mathrm{mid}} - 0.35}{0.55},\ 0,\ 1\right), \\
+\chi_L^* &= \operatorname{clamp}\!\Big(\chi_{\mathrm{light}} - 0.55(0.60 S_{\mathrm{dry}} + 0.40 S_{\mathrm{vpd}})(0.40 + 0.60 S_{\mathrm{sun}}),\ -0.40,\ +0.50\Big)
 \end{aligned} \tag{7.1}
+$$
+
+ここで $\mathrm{MI} = P_{\mathrm{ann}}/\mathrm{PET}_{\mathrm{ann}}$ は年水収支指数、$D_{\mathrm{mid}}, \bar{\mu}_{0,\mathrm{mid}}$ は南中 EMA 飽差および太陽天頂角余弦である。次に、水平一様・無限広がり群落（de Pury & Farquhar, 1997）が低 LAI 域（サバンナ・疎林・乾燥地）で受光量を過大評価するバイアスを PFT マップなしで除去するため、最小樹冠内葉密度 $L_{c,0} = 1.50\ \mathrm{m^2\ m^{-2}}$ をもつポアソン離散球状樹冠の幾何光学ギャップ理論（Li & Strahler, 1992; Nilson, 1999; Ni-Meister et al., 2010; Braghiere et al., 2019）により太陽天頂角依存の直達・散乱クランピング係数 $\Omega(\mu, L_c) \in [0.35, 1.0]$ を解析的に導出する：
+
+$$
+\begin{aligned}
+f_c(\mu) &= 1 - \exp\!\left(-\frac{L_c}{L_{c,0}\max(\mu,\ 0.15)}\right), \qquad k_0(\mu) = \frac{G(\mu;\chi_L)}{\mu}, \\
+P_{\mathrm{gap}}(\mu) &= \big(1 - f_c(\mu)\big) + f_c(\mu)\exp\!\left(-\frac{k_0(\mu)\,L_c}{f_c(\mu)}\right), \\
+\Omega(\mu, L_c) &= \frac{-\ln P_{\mathrm{gap}}(\mu)}{k_0(\mu)\,L_c}, \qquad \lim_{L_c\to 0}\Omega(\mu, L_c) = \frac{1 - e^{-G(\mu;\chi_L) L_{c,0}}}{G(\mu;\chi_L) L_{c,0}}
+\end{aligned} \tag{7.2}
+$$
+
+低 LAI では樹冠間の裸地ギャップと樹冠内自己遮蔽により $\Omega < 1$ が自動創発し、低太陽高度（小 $\mu$）では横影の重なりにより $\Omega$ が増大、閉鎖林冠（$L_c \gg L_{c,0}$）では $\Omega \to 1$ へ滑らかに収束する。McCree (1972) の光子換算係数（直達 $4.57$, 散乱 $4.24\ \mu\mathrm{mol\ J^{-1}}$）および葉面散乱係数（可視 $\sigma_{\mathrm{vis}} = 0.15$, 近赤外 $\sigma_{\mathrm{nir}} = 0.80$）に対し、クランピングおよび葉傾角を反映した直達消散係数 $k_{db}$、散乱補正消散係数 $k'_b$、散乱光消散係数 $k'_d$（散乱光代表余弦 $\mu_d = \operatorname{clamp}(0.55\bar{\mu}, 0.25, 0.90)$ に対する $\Omega_d = \Omega(\mu_d, L_c)$）、および直達・散乱群落頂面反射率 $(\rho_{cb}, \rho_{cd})$ を次式で定義する：
+
+$$
+\begin{aligned}
+k_{db} &= \Omega(\mu_0, L_c)\,\frac{G(\mu_0;\chi_L)}{\max(\mu_0,\ 0.01)}, \qquad k'_b = k_{db}\sqrt{1 - \sigma_{\mathrm{vis}}}, \qquad k'_d = \frac{0.719\,\Omega_d}{\bar{\mu}(\chi_L)}, \\
+\rho_h &= \frac{1 - \sqrt{1 - \sigma_{\mathrm{vis}}}}{1 + \sqrt{1 - \sigma_{\mathrm{vis}}}}, \qquad \rho_{cb} = \frac{2\rho_h k_{db}}{1 + k_{db}}, \qquad \rho_{cd} = 0.036
+\end{aligned} \tag{7.3}
 $$
 
 これらを用いて群落全体・陽葉・陰葉の吸収光合成有効光量子束密度 $(I_c, I_{\mathrm{sun}}, I_{\mathrm{sh}})$ および陽葉・陰葉面積指数 $(L_{\mathrm{sun}}, L_{\mathrm{sh}})$ を解析計算する：
@@ -823,7 +845,7 @@ $$
 \begin{aligned}
 I_c &= (1 - \rho_{cb}) I_{b0}\big(1 - e^{-k'_b L_c}\big) + (1 - \rho_{cd}) I_{d0}\big(1 - e^{-k'_d L_c}\big), \\
 L_{\mathrm{sun}} &= \frac{1 - e^{-k_{db} L_c}}{k_{db}}, \qquad L_{\mathrm{sh}} = L_c - L_{\mathrm{sun}}
-\end{aligned} \tag{7.2}
+\end{aligned} \tag{7.4}
 $$
 
 $$
@@ -831,7 +853,7 @@ $$
 I_{\mathrm{sun}} &= I_{b0}(1 - \sigma_{\mathrm{vis}})\big(1 - e^{-k_{db} L_c}\big) + I_{b0}\!\left[\frac{(1-\rho_{cb})k'_b\big(1 - e^{-(k'_b+k_{db})L_c}\big)}{k'_b+k_{db}} - \frac{1-\sigma_{\mathrm{vis}}}{2}\big(1 - e^{-2k_{db} L_c}\big)\right] \\
 &\quad + I_{d0}\,\frac{(1-\rho_{cd})k'_d\big(1 - e^{-(k'_d+k_{db})L_c}\big)}{k'_d+k_{db}}, \\
 I_{\mathrm{sh}} &= \max(I_c - I_{\mathrm{sun}},\ 0)
-\end{aligned} \tag{7.3}
+\end{aligned} \tag{7.5}
 $$
 
 群落全体の順化酵素容量 $X_{\mathrm{tot}}\in\{V_{c\max 25}, J_{\max 25}, V_{p\max 25}, R_{25}\}$ は、南中 EMA 平滑化入射放射 $(\tilde{I}_{b0}, \tilde{I}_{d0}, \tilde{k}'_b, \tilde{\rho}_{cb}, \tilde{I}_c)$ の鉛直吸収プロファイルに比例して最適配置されている（Field, 1983; Farquhar, 1989; de Pury & Farquhar, 1997）として、瞬間陽葉確率 $f_{\mathrm{sun}}(L) = e^{-k_{db} L}$ で積分した閉形式により陽葉・陰葉へ配分する：
@@ -840,10 +862,10 @@ $$
 \begin{aligned}
 X_{\mathrm{sun}} &= \frac{X_{\mathrm{tot}}}{\tilde{I}_c}\left[\frac{(1-\tilde{\rho}_{cb})\tilde{k}'_b\tilde{I}_{b0}}{\tilde{k}'_b + k_{db}}\big(1 - e^{-(\tilde{k}'_b+k_{db})L_c}\big) + \frac{(1-\rho_{cd})k'_d\tilde{I}_{d0}}{k'_d + k_{db}}\big(1 - e^{-(k'_d+k_{db})L_c}\big)\right], \\
 X_{\mathrm{sh}} &= \max(X_{\mathrm{tot}} - X_{\mathrm{sun}},\ 10^{-6})
-\end{aligned} \tag{7.4}
+\end{aligned} \tag{7.6}
 $$
 
-地表面 VIS/NIR 直達・散乱群落アルベドおよび林床透過率は、球面葉角分布（$G(\mu) = 0.5, \bar{\mu} = 1.0$）に対する Sellers (1985) / Dai, Dickinson & Wang (2004, App. A) の 2 ストリーム解析解（特異点判別式 $\sigma_{\mathrm{sing}} = (\bar{\mu} k_{\mathrm{opt}})^2 - (b^2 - c^2) \to 0$ を微小正則化）で計算する。
+地表面 VIS/NIR 直達・散乱群落アルベドおよび林床透過率は、一般 Ross–Goudriaan 投影 $(G(\mu_0;\chi_L), \bar{\mu}(\chi_L))$ およびクランピング実効光学厚さ（直達 $L_{\mathrm{dir}} = \Omega(\mu_0, L_c)L_c$、散乱 $L_{\mathrm{dif}} = \Omega_d L_c$）に対する Sellers (1985, Eq. 15) / Dai, Dickinson & Wang (2004, App. A) の 2 ストリーム解析解（特異点判別式 $\sigma_{\mathrm{sing}} = (\bar{\mu} k_{\mathrm{opt}})^2 - (b^2 - c^2) \to 0$ を微小正則化）で計算し、反射・透過・吸収の放射エネルギー保存を厳密維持する。
 
 ### 7.3 日次 EEO 光合成順化（$\mathrm{C}_3$ および $\mathrm{C}_4$ P-Model）と暗呼吸 (`src/aoba/biosphere.py`)
 
@@ -854,7 +876,7 @@ $$
 \eta^*(T) &= \frac{\exp\!\left(-3.719 + \dfrac{580}{T - 138}\right)}{\exp\!\left(-3.719 + \dfrac{580}{298.15 - 138}\right)}, \\
 \phi_{\mathrm{PSII}}(T) &= 0.257\,\frac{\max(0.352 + 0.022 T_C - 3.4\times 10^{-4} T_C^2,\ 0.02)}{0.656}, \\
 f_r(T) &= \exp\!\big(0.1012\,T_C - 0.0005\,T_C^2 - 2.2175\big)
-\end{aligned} \tag{7.5}
+\end{aligned} \tag{7.7}
 $$
 
 酵素活性のピーク型 Arrhenius 温度応答（Kumarathunge et al., 2019; Schneider, Gessler & Stocker, 2025; 失活エネルギー $H_d = 200\ \mathrm{kJ\ mol^{-1}}$, 基準温度 $T_0 = 298.15\ \mathrm{K}$）は、生育温度 $T_g$ および多年生育環境温度 $T_{\mathrm{home}}$ に順応した活性化エネルギー $H_a$ とエントロピー因子 $\Delta S$ を用いて次式で表される：
@@ -865,7 +887,7 @@ f_{\mathrm{enz}}(T; T_g, T_{\mathrm{home}}) &= \exp\!\left[\frac{H_a(T - T_0)}{R
 H_{a,V}(T_g) &= 42600 + 1140\,T_{g,C}, \qquad \Delta S_V(T_g) = 645.13 - 0.38\,T_{g,C}, \\
 H_{a,J} &= 40710, \qquad \Delta S_J(T_g, T_{\mathrm{home}}) = 658.77 - 0.84\,T_{\mathrm{home},C} - 0.52(T_{g,C} - T_{\mathrm{home},C}), \\
 H_{a,P} &= 55000, \qquad \Delta S_P(T_g) = \Delta S_V(T_g)
-\end{aligned} \tag{7.6}
+\end{aligned} \tag{7.8}
 $$
 
 **$\mathrm{C}_3$ P-Model（Smith et al., 2019, Eqs. 1–20）**：電子伝達速度 $J$ を非直角双曲線 $\theta J^2 - (\phi_{\mathrm{PSII}} I_{\mathrm{abs}} + J_{\max})J + \phi_{\mathrm{PSII}} I_{\mathrm{abs}} J_{\max} = 0$（曲率 $\theta = 0.85$、電子伝達限界コスト $c = 0.05336251$、水対カルボキシル化コスト比 $\beta_{\mathrm{C3}} = 146.0$）で表し、最小コスト仮説から気孔感度係数 $\xi_{\mathrm{C3}}$、最適葉内 $\mathrm{CO}_2$ 比 $\chi_{\mathrm{C3}}$、電子伝達因子 $m_{\mathrm{C3}}$ および閉形式最適係数 $(\omega, \omega^*)$ を算出する：
@@ -875,14 +897,14 @@ $$
 \xi_{\mathrm{C3}} &= \sqrt{\frac{\beta_{\mathrm{C3}}(K_{m,\mathrm{C3}} + \Gamma^*_{\mathrm{C3}})}{1.6\,\eta^*}}, \\
 \chi_{\mathrm{C3}} &= \operatorname{clamp}\!\left(\frac{\Gamma^*_{\mathrm{C3}}}{c_a} + \left(1 - \frac{\Gamma^*_{\mathrm{C3}}}{c_a}\right)\frac{\xi_{\mathrm{C3}}}{\xi_{\mathrm{C3}} + \sqrt{D}},\ 0.05,\ 0.95\right), \\
 m_{\mathrm{C3}} &= \frac{c_{i,\mathrm{C3}} - \Gamma^*_{\mathrm{C3}}}{c_{i,\mathrm{C3}} + 2\Gamma^*_{\mathrm{C3}}}, \qquad c_{i,\mathrm{C3}} = \chi_{\mathrm{C3}} c_a
-\end{aligned} \tag{7.7}
+\end{aligned} \tag{7.9}
 $$
 
 $$
 \begin{aligned}
 \omega &= -(1 - 2\theta) + \operatorname{sgn}\!\left(1 - 2\theta\frac{4c}{m}\right)\sqrt{(1 - \theta)\left[\frac{1}{\dfrac{4c}{m}\left(1 - \theta\dfrac{4c}{m}\right)} - 4\theta\right]}, \\
 \omega^* &= 1 + \omega - \sqrt{(1 + \omega)^2 - 4\theta\omega}
-\end{aligned} \tag{7.8}
+\end{aligned} \tag{7.10}
 $$
 
 協調仮説（$A_c = A_j$）のもとで最適順化酵素容量 $(J_{\max,\mathrm{opt}}^{\mathrm{C3}}, V_{c\max,\mathrm{opt}}^{\mathrm{C3}})$ および $25^\circ\mathrm{C}$ 基準夜間呼吸容量 $R_{25}$（$b_{\mathrm{resp}} = 0.018$; Ren et al., 2025, Eq. 13）は次式で求まる（$m \le 4c$ ではゼロ）：
@@ -893,7 +915,7 @@ J_{\max,\mathrm{opt}}^{\mathrm{C3}} &= \phi_{\mathrm{PSII}} I_{\mathrm{abs}}\,\o
 A_{j,\mathrm{opt}}^{\mathrm{C3}} &= \frac{\phi_{\mathrm{PSII}} I_{\mathrm{abs}}\,m_{\mathrm{C3}}\,\omega^*_{\mathrm{C3}}}{8\theta}, \\
 V_{c\max,\mathrm{opt}}^{\mathrm{C3}} &= A_{j,\mathrm{opt}}^{\mathrm{C3}}\,\frac{c_{i,\mathrm{C3}} + K_{m,\mathrm{C3}}}{c_{i,\mathrm{C3}} - \Gamma^*_{\mathrm{C3}}}, \\
 R_{25} &= \frac{b_{\mathrm{resp}}\,V_{c\max,\mathrm{opt}}}{f_r(T_{\mathrm{night}})}
-\end{aligned} \tag{7.9}
+\end{aligned} \tag{7.11}
 $$
 
 **$\mathrm{C}_4$ P-Model（Scott & Smith, 2022, JAMES, Eqs. 1–26; von Caemmerer, 2000）**：$\mathrm{C}_4$ 植物は葉肉細胞での PEPC 炭酸固定（ミカエリス定数 $K_{p25} = 60.5\ \mu\mathrm{mol\ mol^{-1}}$, $\Delta H_{a,K_p} = 27.2\ \mathrm{kJ\ mol^{-1}}$, $\beta_{\mathrm{C4}} = 166.0$）と維管束鞘細胞への $\mathrm{CO}_2$ 濃縮機構（漏出率 $\phi_L = 0.20$、維管束鞘コンダクタンス $g_{bs} = 0.003\ \mathrm{mol\ m^{-2}\ s^{-1}}$、$\Gamma^*_{25,\mathrm{C4}} = 2.60\ \mathrm{Pa}$, $K_{c25,\mathrm{C4}} = 121.0\ \mathrm{Pa}$, $K_{o25,\mathrm{C4}} = 29200\ \mathrm{Pa}$）を持つ。最適葉肉 $\mathrm{CO}_2$ 比 $\chi_{m,\mathrm{C4}}$ および葉肉分圧 $c_m = \chi_{m,\mathrm{C4}} c_a$ は次式で与えられる：
@@ -902,7 +924,7 @@ $$
 \begin{aligned}
 \xi_{\mathrm{C4}} &= \sqrt{\frac{\beta_{\mathrm{C4}} K_p}{1.6\,\eta^*}}, \\
 \chi_{m,\mathrm{C4}} &= \operatorname{clamp}\!\left(\frac{\xi_{\mathrm{C4}}}{\xi_{\mathrm{C4}} + \sqrt{D}},\ 0.05,\ 0.92\right)
-\end{aligned} \tag{7.10}
+\end{aligned} \tag{7.12}
 $$
 
 $\mathrm{C}_4$ の RuBP/PEP 再生に要する $5\ \mathrm{mol\ e^- / mol\ CO_2}$ 化学量論（比 $4/5 = 0.80$）、維管束鞘漏出 ATP 損失 $(1 - \phi_L)$（実効量子収率比 $0.64$）および低温感受性シグモイドゲート $g_{\mathrm{chill}}(T_g)$ を含め、2 回の不動点反復で維管束鞘 $\mathrm{CO}_2$ 分圧 $c_{bs}$ と光律速同化速度 $A_{l,\mathrm{opt}}^{\mathrm{C4}}$ を連立する：
@@ -912,14 +934,14 @@ $$
 g_{\mathrm{chill}}(T_g) &= \frac{1}{1 + \exp\!\big(-0.35(T_{g,C} - 12.0)\big)}, \\
 m_{\mathrm{C4}} &= 0.80(1 - \phi_L)\,g_{\mathrm{chill}}(T_g)\,\frac{c_{bs} - \Gamma^*_{\mathrm{C4}}}{c_{bs} + 2\Gamma^*_{\mathrm{C4}}}, \\
 A_{l,\mathrm{opt}}^{\mathrm{C4}} &= \frac{\phi_{\mathrm{PSII}} I_{\mathrm{abs}}\,m_{\mathrm{C4}}\,\omega^*_{\mathrm{C4}}}{8\theta}
-\end{aligned} \tag{7.11}
+\end{aligned} \tag{7.13}
 $$
 
 $$
 \begin{aligned}
 L_{\mathrm{leak}} &= \frac{\phi_L}{1 - \phi_L}\,A_{l,\mathrm{opt}}^{\mathrm{C4}}, \\
 c_{bs} &= c_m + \frac{L_{\mathrm{leak}}\times 10^{-6}}{g_{bs}\,\max(L_{\mathrm{exp}}, 0.1)}\,p_{\mathrm{sfc}}
-\end{aligned} \tag{7.12}
+\end{aligned} \tag{7.14}
 $$
 
 収束後の 3 酵素配位（電子伝達・PEPC・Rubisco）の最適容量は次式で決まり、$\mathrm{C}_3$ と同じく 15 日 EMA で $25^\circ\mathrm{C}$ 基準プールへ順化される：
@@ -929,7 +951,7 @@ $$
 J_{\max,\mathrm{opt}}^{\mathrm{C4}} &= \phi_{\mathrm{PSII}} I_{\mathrm{abs}}\,\omega_{\mathrm{C4}}, \\
 V_{p\max,\mathrm{opt}}^{\mathrm{C4}} &= \big(A_{l,\mathrm{opt}}^{\mathrm{C4}} + L_{\mathrm{leak}}\big)\frac{K_p + c_m}{c_m}, \\
 V_{c\max,\mathrm{opt}}^{\mathrm{C4}} &= A_{l,\mathrm{opt}}^{\mathrm{C4}}\,\frac{c_{bs} + K_{m,\mathrm{C4}}}{c_{bs} - \Gamma^*_{\mathrm{C4}}}
-\end{aligned} \tag{7.13}
+\end{aligned} \tag{7.15}
 $$
 
 **自律 $\mathrm{C}_4$ 優占度 $F_4$（Scott & Smith, 2022, Eq. 26; Luo et al., 2024; Lavergne et al., 2026）**：南中純同化速度の相対優位度 $\Delta A_{\mathrm{rel}}$ に、閉鎖林冠下での $\mathrm{C}_4$ 草本被陰を表現する Beer–Lambert ギャップ透過率 $e^{-k L}$（$k = 0.50$）を乗じた目標値 $F_{4,\mathrm{tgt}}$ へ約 60 日時定数（$0.25\alpha_{\mathrm{EMA}}$）で緩和する：
@@ -938,7 +960,7 @@ $$
 \begin{aligned}
 \Delta A_{\mathrm{rel}} &= \frac{A_{n,\mathrm{C4}}^{\mathrm{mid}} - A_{n,\mathrm{C3}}^{\mathrm{mid}}}{|A_{n,\mathrm{C3}}^{\mathrm{mid}}| + 1.0}, \\
 F_{4,\mathrm{tgt}} &= e^{-k L}\,\frac{1}{1 + \exp(-8\,\Delta A_{\mathrm{rel}})}
-\end{aligned} \tag{7.14}
+\end{aligned} \tag{7.16}
 $$
 
 ### 7.4 瞬間 2 葉ガス交換・$\mathrm{C}_3/\mathrm{C}_4$ リービッヒ共律速と重み付け混合・葉面境界層連成・土壌水分ストレス $\beta_{\mathrm{opt}}$
@@ -951,7 +973,7 @@ $$
 \begin{aligned}
 A_{c,\mathrm{C3}} &= V_{c,\mathrm{C3}}\,\max\!\left(\frac{c_{i,\mathrm{C3}} - \Gamma^*_{\mathrm{C3}}}{c_{i,\mathrm{C3}} + K_{m,\mathrm{C3}}},\ 0\right), \qquad A_{j,\mathrm{C3}} = \frac{J_{\mathrm{C3}}}{4}\,\max\!\left(\frac{c_{i,\mathrm{C3}} - \Gamma^*_{\mathrm{C3}}}{c_{i,\mathrm{C3}} + 2\Gamma^*_{\mathrm{C3}}},\ 0\right), \\
 A_{\mathrm{C3}} &= \min\!\big(A_{c,\mathrm{C3}},\ A_{j,\mathrm{C3}}\big)
-\end{aligned} \tag{7.15}
+\end{aligned} \tag{7.17}
 $$
 
 $$
@@ -959,10 +981,10 @@ $$
 A_{c,\mathrm{C4}} &= V_{c,\mathrm{C4}}, \qquad A_{l,\mathrm{C4}} = 0.20(1 - \phi_L)\,J_{\mathrm{C4}}\,g_{\mathrm{chill}}(T_l), \\
 A_{p,\mathrm{C4}} &= (1 - \phi_L)\,V_{p,\mathrm{C4}}\,\frac{c_{m,\mathrm{C4}}}{\max(c_{m,\mathrm{C4}} + K_p,\ 0.5)}, \\
 A_{\mathrm{C4}} &= \min\!\big(A_{c,\mathrm{C4}},\ A_{l,\mathrm{C4}},\ A_{p,\mathrm{C4}}\big)
-\end{aligned} \tag{7.16}
+\end{aligned} \tag{7.18}
 $$
 
-ここで $T_l$ は陽葉または陰葉の葉温である。式 (7.15)–(7.16) により、南中順化点における瞬時同化速度は式 (7.9) および式 (7.11) の協調順化速度へ厳密比 $1.000$ で一致する。各経路の気孔コンダクタンス（モル単位）および自律優占度 $F_4$ による $\mathrm{C}_3/\mathrm{C}_4$ 重み付け混合（総同化 $A_{\mathrm{mix}}$・葉呼吸 $R_{d,\mathrm{mix}}$・気孔コンダクタンス $g_{sw,\mathrm{mol}}$、残留クチクラ最小値 $g_0 = 0.002\,\beta_{\mathrm{opt}}\ \mathrm{mol\ m^{-2}\ s^{-1}}$）は次式で与えられる：
+ここで $T_l$ は陽葉または陰葉の葉温である。式 (7.17)–(7.18) により、南中順化点における瞬時同化速度は式 (7.11) および式 (7.13) の協調順化速度へ厳密比 $1.000$ で一致する。各経路の気孔コンダクタンス（モル単位）および自律優占度 $F_4$ による $\mathrm{C}_3/\mathrm{C}_4$ 重み付け混合（総同化 $A_{\mathrm{mix}}$・葉呼吸 $R_{d,\mathrm{mix}}$・気孔コンダクタンス $g_{sw,\mathrm{mol}}$、残留クチクラ最小値 $g_0 = 0.002\,\beta_{\mathrm{opt}}\ \mathrm{mol\ m^{-2}\ s^{-1}}$）は次式で与えられる：
 
 $$
 \begin{aligned}
@@ -971,7 +993,7 @@ g_{sw,4} &= \frac{1.6\,\max(A_{\mathrm{C4}} - R_{d,\mathrm{C4}},\ 0)\times 10^{-
 A_{\mathrm{mix}} &= (1 - F_4) A_{\mathrm{C3}} + F_4 A_{\mathrm{C4}}, \\
 R_{d,\mathrm{mix}} &= (1 - F_4) R_{d,\mathrm{C3}} + F_4 R_{d,\mathrm{C4}}, \\
 g_{sw,\mathrm{mol}} &= (1 - F_4) g_{sw,3} + F_4 g_{sw,4} + g_0
-\end{aligned} \tag{7.17}
+\end{aligned} \tag{7.19}
 $$
 
 さらに葉面境界層コンダクタンス $g_{bw}$ との直列連成を二重計上なく整合させるため、葉面 $\mathrm{CO}_2$ 分圧 $c_s$ および葉面飽差 $D_s$ について 2 回の不動点反復を実行する（$\mathrm{CO}_2$ 境界層コンダクタンス $g_{bc} = g_{bw}/1.37$; Dai et al., 2004, Eqs. 11, 45; Bonan et al., 2018）：
@@ -981,7 +1003,7 @@ $$
 c_s &= \operatorname{clamp}\!\left(c_a - \frac{\max(A_{\mathrm{mix}} - R_{d,\mathrm{mix}},\ 0)\times 10^{-6}}{g_{bc}}\,p_{\mathrm{sfc}},\ 0.35\,c_a,\ c_a\right), \\
 D_s &= \max\!\left(\frac{g_{bw}}{g_{bw} + g_{sw,\mathrm{mol}}}\,D_{\mathrm{af}},\ 20.0\right), \\
 g_{sw,\mathrm{ms}} &= g_{sw,\mathrm{mol}}\,\frac{R^* T_l}{p_{\mathrm{sfc}}}
-\end{aligned} \tag{7.18}
+\end{aligned} \tag{7.20}
 $$
 
 気孔土壌水分ストレス係数 $\beta_{\mathrm{opt}}\in[0,1]$ は経験的閾値を用いず、Holtzman et al. (2024, Eqs. 2, 7) および Lu, Duursma & Medlyn (2016) の時間積分最適気孔理論により、気候学的生育期最長無降雨日数 $D_{\max}$ から決まる乾燥時定数 $\tau$、15 日平均潜在蒸発散量 $E_{\mathrm{pot}}$、根圏貯水容量 $S_R$ および根圏有効液相水分 $W_{\mathrm{avail}}$（下限 $w_c = 0.05 S_R$）から求める：
@@ -990,7 +1012,7 @@ $$
 \begin{aligned}
 \tau &= 0.85\,D_{\max} + 6.59\ [\mathrm{days}], \\
 \beta_{\mathrm{opt}} &= \operatorname{clamp}\!\left(\sqrt{\frac{\max(W_{\mathrm{avail}} - w_c,\ 0)}{\max(\tau E_{\mathrm{pot}},\ 0.10 S_R)}},\ 0,\ 1\right)
-\end{aligned} \tag{7.19}
+\end{aligned} \tag{7.21}
 $$
 
 ### 7.5 予報 EEO 葉面積指数（Lambert-$W_0$ 導出）・常緑/落葉比・根圏容量 $S_R$・樹高 $h_c$
@@ -1001,7 +1023,7 @@ $$
 \begin{aligned}
 A_{0,\mathrm{day}} &= \mathrm{LUE}_{\mathrm{C3}}\,\mathrm{PPFD}_{\mathrm{day}}\,\frac{1}{1 + \exp\!\big(-0.5(T_C - 5.0)\big)}, \\
 A_{0,\mathrm{fav}} &= A_{0,\mathrm{day}}\,\beta_{\mathrm{opt}}
-\end{aligned} \tag{7.20}
+\end{aligned} \tag{7.22}
 $$
 
 **1. 年間上限 $\mathrm{fAPAR}_{\max}$ と $L_{\max}$（Cai et al., 2025, Eqs. 1–2, 12; Zhou et al., 2025, Eq. 6）**：乾燥指数 $\mathrm{AI} = \mathrm{PET}_{\mathrm{yr}} / P_{\mathrm{yr}}$ に対する利用可能降水率 $f_0(\mathrm{AI})$ から水律速上限 $\mathrm{fAPAR}_w$ を、葉の年次実効建設コスト $z_{\mathrm{eff}}$ から光・エネルギー律速上限 $\mathrm{fAPAR}_c$（限界利益条件 $\partial[A_{0,\mathrm{yr}}(1 - e^{-k L}) - z_{\mathrm{eff}} L]/\partial L = 0$ の解）を算出し、対数和指数平滑最小（$K_{\mathrm{lse}} = 10$）で結合する：
@@ -1011,14 +1033,14 @@ $$
 \mathrm{AI} &= \frac{\mathrm{PET}_{\mathrm{yr}}}{\max(P_{\mathrm{yr}},\ 1.0)}, \\
 f_0(\mathrm{AI}) &= 0.65\exp\!\left(-0.604169\left[\ln\frac{\max(\mathrm{AI},\ 1.9)}{1.9}\right]^2\right), \\
 \mathrm{fAPAR}_w &= \frac{f_0(\mathrm{AI})\,P_{\mathrm{mol,yr}}\,c_a(1 - \chi_{\mathrm{C3}})}{1.6\,D\,A_{0,\mathrm{yr}}}, \qquad \mathrm{fAPAR}_c = 1 - \frac{z_{\mathrm{eff}}}{k A_{0,\mathrm{yr}}}
-\end{aligned} \tag{7.21}
+\end{aligned} \tag{7.23}
 $$
 
 $$
 \begin{aligned}
 \mathrm{fAPAR}_{\max} &= \operatorname{clamp}\!\Big(\operatorname{lsemin}_{K=10}(\mathrm{fAPAR}_w,\ \mathrm{fAPAR}_c),\ 0,\ 0.96\Big), \\
 L_{\max} &= -\frac{1}{k}\ln(1 - \mathrm{fAPAR}_{\max})
-\end{aligned} \tag{7.22}
+\end{aligned} \tag{7.24}
 $$
 
 **2. 季節定常落葉葉面積指数 $L_s$ と Lambert-$W_0$ 厳密解の導出（Zhou et al., 2025, Eqs. 15–20）**：季節的な葉面積の炭素収支均衡は、1 日の光合成同化量 $A_{0,\mathrm{fav}}(1 - e^{-k L_s})$ に葉への炭素配分効率 $m_{\mathrm{alloc}}$（配分係数 $\sigma_{\mathrm{Zhou}} = 0.771$、生育期日数 $\mathrm{GSL}$）を乗じた葉生成量が現存葉面積 $L_s$ の代謝・落葉損失と釣り合う不動点方程式で与えられる：
@@ -1027,13 +1049,13 @@ $$
 \begin{aligned}
 m_{\mathrm{alloc}} &= \frac{\sigma_{\mathrm{Zhou}}\,\mathrm{GSL}\,L_{\max}}{A_{0,\mathrm{fav,yr}}\,\mathrm{fAPAR}_{\max}}, \qquad \mu = m_{\mathrm{alloc}}\,A_{0,\mathrm{day}}\,\beta_{\mathrm{opt}}, \\
 L_s &= \mu\left(1 - e^{-k L_s}\right)
-\end{aligned} \tag{7.23}
+\end{aligned} \tag{7.25}
 $$
 
-式 (7.23) を $k(L_s - \mu) = -k\mu e^{-k L_s} = -k\mu e^{-k\mu} e^{-k(L_s - \mu)}$ すなわち $[-k(L_s - \mu)]e^{-k(L_s - \mu)} = -k\mu e^{-k\mu}$ と変形すると、Lambert-$W$ 関数の主枝 $W_0$（$W_0(x)e^{W_0(x)} = x$, Halley 3 次反復 5 回で評価）により厳密閉形式解が得られる：
+式 (7.25) を $k(L_s - \mu) = -k\mu e^{-k L_s} = -k\mu e^{-k\mu} e^{-k(L_s - \mu)}$ すなわち $[-k(L_s - \mu)]e^{-k(L_s - \mu)} = -k\mu e^{-k\mu}$ と変形すると、Lambert-$W$ 関数の主枝 $W_0$（$W_0(x)e^{W_0(x)} = x$, Halley 3 次反復 5 回で評価）により厳密閉形式解が得られる：
 
 $$
-L_s = \min\!\left(\mu + \frac{1}{k} W_0\!\left(-k\mu e^{-k\mu}\right),\ L_{\max}\right) \tag{7.24}
+L_s = \min\!\left(\mu + \frac{1}{k} W_0\!\left(-k\mu e^{-k\mu}\right),\ L_{\max}\right) \tag{7.26}
 $$
 
 ここで $u = k\mu \le 1$ のとき $W_0(-u e^{-u}) = -u$ となって $L_s \equiv 0$（群落が自己維持できない休眠・乾燥状態）、$u > 1$ のとき $W_0(-u e^{-u}) \in (-1, 0) > -u$ となって正の定常葉面積 $L_s > 0$ が滑らかに立ち上がる。
@@ -1043,26 +1065,26 @@ $$
 $$
 \begin{aligned}
 f_{\mathrm{cold}} &= \sigma\!\left(\frac{273.15 - T_{\min,\mathrm{yr}}}{5.0}\right), \\
-c_{\mathrm{evg}} &= (1.35 + 0.55\,f_{\mathrm{cold}})\,c_{\mathrm{dec}}, \qquad \eta_{\mathrm{evg}} = 1 - 0.14\,f_{\mathrm{cold}}, \\
+c_{\mathrm{dec,eff}} &= c_{\mathrm{dec}}\big[1 + 0.80(1 - \phi_N)\big], \qquad c_{\mathrm{evg}} = \big[1.35 + 0.55\,f_{\mathrm{cold}} + 0.80(1 - \phi_N)\big]\,c_{\mathrm{dec}}, \qquad \eta_{\mathrm{evg}} = 1 - 0.14\,f_{\mathrm{cold}}, \\
 \mathrm{frost}_{\mathrm{pen}} &= 18.0\,\sigma\!\left(\frac{233.15 - T_{\min,\mathrm{yr}}}{4.0}\right)
-\end{aligned} \tag{7.25}
+\end{aligned} \tag{7.27}
 $$
 
 Kikuzawa (1991, Eq. 5) の最適常緑葉寿命 $\tau_{\mathrm{evg}}$（葉老化時定数 $b = 15\ \mathrm{yr}$）、非生育期維持呼吸 $f_{\mathrm{resp,off}}$（$Q_{10}\approx 2$）および落葉展葉遅延（25 日）を用いて常緑・落葉の年間純炭素利得 $(g_{\mathrm{evg}}, g_{\mathrm{dec}})$ と常緑優占度目標 $f_{\mathrm{evg,tgt}}$ を評価する：
 
 $$
 \begin{aligned}
-\tau_{\mathrm{evg}} &= \operatorname{clamp}\!\left(\sqrt{\frac{2 b\, c_{\mathrm{evg}}}{\eta_{\mathrm{evg}} a_{\mathrm{leaf}}}},\ 1,\ 7\right), \\
+\tau_{\mathrm{evg}} &= \operatorname{clamp}\!\left(\sqrt{\frac{2 b\, c_{\mathrm{evg}}}{\eta_{\mathrm{evg}} a_{\mathrm{leaf}}}},\ 1,\ 8\right), \\
 g_{\mathrm{evg}} &= \eta_{\mathrm{evg}}\!\left(1 - \frac{\tau_{\mathrm{evg}}}{2b}\right)a_{\mathrm{leaf}} - \frac{c_{\mathrm{evg}}}{\tau_{\mathrm{evg}}} - 32\,f_{\mathrm{resp,off}}(1 - f_{\mathrm{gsl}}) - \mathrm{frost}_{\mathrm{pen}}, \\
-g_{\mathrm{dec}} &= \left(1 - \frac{25}{365.2425 f_{\mathrm{gsl}}}\right)\!\left(1 - \frac{f_{\mathrm{gsl}}}{2 b_{\mathrm{dec}}}\right)a_{\mathrm{leaf}} - c_{\mathrm{dec}}, \\
+g_{\mathrm{dec}} &= \left(1 - \frac{25}{365.2425 f_{\mathrm{gsl}}}\right)\!\left(1 - \frac{f_{\mathrm{gsl}}}{2 b_{\mathrm{dec}}}\right)a_{\mathrm{leaf}} - c_{\mathrm{dec,eff}}, \\
 f_{\mathrm{evg,tgt}} &= \sigma\!\left(\frac{4(g_{\mathrm{evg}} - g_{\mathrm{dec}})}{c_{\mathrm{dec}}}\right)
-\end{aligned} \tag{7.26}
+\end{aligned} \tag{7.28}
 $$
 
 常緑葉の償却コスト・短生育期凍土ペナルティ・陸域 CN モデル（第 7.8 節）の窒素充足度 $\phi_N \in [0.25, 1.0]$（Stocker & Prentice, 2024）を統合して実効葉建設コスト $z_{\mathrm{eff}}$ を定め、常緑成分 $L_{\mathrm{evg}}$（時定数 $\tau_{\mathrm{evg}}$、$-40^\circ\mathrm{C}$ 急性凍死付き）と落葉成分 $L_{\mathrm{dec}}$（15 日 EMA）の 2 時間スケールで総葉面積 $L = L_{\mathrm{evg}} + L_{\mathrm{dec}}$ を予報する：
 
 $$
-z_{\mathrm{eff}} = \max\!\left((1 - f_{\mathrm{evg}})c_{\mathrm{dec}} + f_{\mathrm{evg}}\frac{c_{\mathrm{evg}}}{\tau_{\mathrm{evg}}},\ 0.55\,c_{\mathrm{dec}}\right)\Big[1 + 1.5\,\sigma\big(20(0.28 - f_{\mathrm{gsl}})\big)\Big]\Big[1 + 0.80(1 - \phi_N)\Big] \tag{7.27}
+z_{\mathrm{eff}} = \max\!\left((1 - f_{\mathrm{evg}})c_{\mathrm{dec}} + f_{\mathrm{evg}}\frac{c_{\mathrm{evg}}}{\tau_{\mathrm{evg}}},\ 0.55\,c_{\mathrm{dec}}\right)\Big[1 + 1.5\,\sigma\big(20(0.28 - f_{\mathrm{gsl}})\big)\Big]\Big[1 + 0.80(1 - \phi_N)\Big] \tag{7.29}
 $$
 
 **4. 最適耐乾根圏貯水容量 $S_R$（Gao et al., 2014; Davis et al., 2017）**：植物が乾季を乗り切るために発達させる最小限の根圏貯水容量を、日次の累積水不足量 $D_{\mathrm{cum}}$（蒸発散需要が降水量を上回る期間に積算され、湿潤期にゼロへ回復）から算出し、乾燥拡大時は 10 倍速い非対称ラチェット応答（$10\alpha_{\mathrm{yr}}$ 対 $\alpha_{\mathrm{yr}}$）で適応させる：
@@ -1071,7 +1093,7 @@ $$
 \begin{aligned}
 D_{\mathrm{cum}}^{n+1} &= \operatorname{clamp}\!\big(D_{\mathrm{cum}}^n + \mathrm{fAPAR}_{\max}\mathrm{PET}_{\mathrm{day}} - P_{\mathrm{day}},\ 0,\ 800\big)\ [\mathrm{mm}], \\
 S_{R,\mathrm{tgt}} &= \operatorname{clamp}\!\big(50 + 1.35\,D_{\mathrm{cum}},\ 50,\ 650\big)\ [\mathrm{kg\ m^{-2}}]
-\end{aligned} \tag{7.28}
+\end{aligned} \tag{7.30}
 $$
 
 **5. 利用可能水収支指数・生産指数および森林限界による潜在樹高 $h_c$（Kempes et al., 2011; Körner, 2012; Paulsen & Körner, 2014）**：樹木の最大到達樹高は、維管束水輸送の重力・摩擦損失を支える水収支余裕度（利用可能水収支指数 $\mathrm{MI}$：年降水量と年潜在蒸発散量の比で湿潤度を無次元化、$1.2$ で飽和）、幹・枝の木部建設を支える年間炭素供給量（群落生産指数 $\mathrm{PI}$：基準年生産 $180\ \mathrm{mol\ C\ m^{-2}\ yr^{-1}}$ に対する比）、および形成層木部細胞分裂の低温下限（日平均 $5^\circ\mathrm{C}$ 超の生育期間 $\ge 94$ 日すなわち $f_{\mathrm{gsl}} \approx 0.30$ での熱的森林限界ゲート）の積で決まり、1 年時定数 EMA で更新する：
@@ -1081,7 +1103,7 @@ $$
 \mathrm{MI} &= \operatorname{clamp}\!\left(\frac{P_{\mathrm{yr}}}{\max(\mathrm{PET}_{\mathrm{yr}},\ 1.0)},\ 0,\ 1.2\right), \\
 \mathrm{PI} &= \operatorname{clamp}\!\left(\frac{\mathrm{fAPAR}_{\max}\,A_{0,\mathrm{yr}}}{180.0},\ 0,\ 2.0\right), \\
 h_{c,\mathrm{tgt}} &= \operatorname{clamp}\!\Big(34.0\,\mathrm{MI}^{0.85}\,\mathrm{PI}^{0.75}\,\sigma\big(30(f_{\mathrm{gsl}} - 0.30)\big),\ 0.05,\ 40.0\Big)\ [\mathrm{m}]
-\end{aligned} \tag{7.29}
+\end{aligned} \tag{7.31}
 $$
 
 ### 7.6 3 源エネルギー収支・積雪ヒステリシス/SNICAR・5 層凍土 Richards 土壌 (`src/aoba/surface.py`)
@@ -1093,7 +1115,7 @@ $$
 N_{\mathrm{melt}} &= \frac{200}{\operatorname{clamp}(\sigma_{\mathrm{topo}},\ 10,\ 1000)}, \\
 A_{\mathrm{sn}} &= \min\!\left(\tanh\frac{S_n}{25},\ 1 - \left[\frac{\arccos(2 S_n/S_{n,\max} - 1)}{\pi}\right]^{N_{\mathrm{melt}}}\right), \\
 h_{\mathrm{exp}} &= (1 - A_{\mathrm{sn}})h_c + A_{\mathrm{sn}}\max(h_c - d_{\mathrm{sn}},\ 0), \qquad L_{\mathrm{exp}} = L\frac{h_{\mathrm{exp}}}{\max(h_c,\ 0.05)}
-\end{aligned} \tag{7.30}
+\end{aligned} \tag{7.32}
 $$
 
 積雪アルベドは Yang et al. (1997) / MATSIRO6 の無次元雪齢 $A_g$（時定数 $\tau_{\mathrm{age}} = 10^6\ \mathrm{s}$, 太陽天頂角補正 $0.4(1-\mu_0)^5$）で VIS ($0.90\to 0.65$)・NIR ($0.70\to 0.35$) を更新する。`enable_snow_bc_darkening = true` 時は表層 2 cm の黒色炭素・ダスト負荷 $(C_{\mathrm{BC}}, C_{\mathrm{dust}})$（新雪 $15\ \mathrm{kg\ m^{-2}}$ 埋没および 45 日流出で指数減衰）による SNICAR 可視暗化率 $d_{\mathrm{frac}}$（Flanner et al., 2007）を適用し、裸地アルベドは表層土壌飽和度 $s_0$ に応じた連続湿潤暗化（CLM4.5 Sec. 3.2）を用いる：
@@ -1102,7 +1124,7 @@ $$
 \begin{aligned}
 d_{\mathrm{frac}} &= \operatorname{clamp}\!\big(180\sqrt{C_{\mathrm{BC}}} + 3.5\sqrt{C_{\mathrm{dust}}},\ 0,\ 0.45\big), \\
 \alpha_{\mathrm{soil,vis}} &= 0.14 + 0.14(1 - s_0)^{1.5}, \qquad \alpha_{\mathrm{soil,nir}} = 0.28 + 0.22(1 - s_0)^{1.5}
-\end{aligned} \tag{7.31}
+\end{aligned} \tag{7.33}
 $$
 
 **CLM5 樹冠遮断・乾燥表層 (DSL) 土壌蒸発抵抗・3 源 $3\times 3$ Newton エネルギー収支**：液相樹冠遮断率 $f_{\mathrm{int}}$、最大貯水量 $W_{c,\max}$、湿潤葉面積割合 $f_{\mathrm{wet}}$（水収支制限付き $f_{\mathrm{wet,eff}}$; CLM5 Eqs. 7.4, 7.12, 7.23）、および裸地土壌蒸発における Kelvin 間隙相対湿度 $h_{\mathrm{soil}}$ と乾燥表層 (DSL) 土壌蒸発抵抗 $r_{\mathrm{soil}}$（Swenson & Lawrence, 2014; CLM5 Eqs. 5.72–5.81; 最大乾燥表層厚 $d_{\mathrm{sl}} \le 15\ \mathrm{mm}$、屈曲度 $\tau_{\mathrm{soil}}$、水蒸気拡散係数 $D_{\mathrm{vap}}(T)$）は次式で与えられる：
@@ -1111,13 +1133,13 @@ $$
 \begin{aligned}
 f_{\mathrm{int}} &= \tanh(L_{\mathrm{exp}}), \qquad W_{c,\max} = 0.10\,L_{\mathrm{exp}}, \qquad f_{\mathrm{wet}} = \left(\frac{W_c}{W_{c,\max}}\right)^{2/3}, \\
 h_{\mathrm{soil}} &= \exp\!\left(\frac{\psi_0 g}{R_v T_{s,0}}\right), \qquad r_{\mathrm{soil}} = \frac{d_{\mathrm{sl}}}{D_{\mathrm{vap}}(T_{s,0})\,\tau_{\mathrm{soil}}}
-\end{aligned} \tag{7.32}
+\end{aligned} \tag{7.34}
 $$
 
 林冠下空力抵抗 $r_{d,\mathrm{uc}}$ および陽葉・陰葉境界層コンダクタンス $(g_{b,\mathrm{sun}}, g_{b,\mathrm{sh}})$ のもとで、陽葉温度 $T_{\mathrm{sun}}$・陰葉温度 $T_{\mathrm{sh}}$・地表面温度 $T_{\mathrm{gnd}}$ の 3 源エネルギー収支および林冠空気 $(T_{\mathrm{af}}, q_{\mathrm{af}})$・気孔コンダクタンスを $3\times 3$ 余因子ヤコビアン Newton 法（`LAND_EB_ITERATIONS = 3`）で連成解法する：
 
 $$
-R_{n,i} - H_i(T_i, T_{\mathrm{af}}) - \lambda_i E_i(T_i, q_{\mathrm{af}}) - \delta_{i,2} G_0(T_{\mathrm{gnd}}, T_{s,0}) = 0, \qquad i \in \{\mathrm{sun}, \mathrm{sh}, \mathrm{gnd}\} \tag{7.33}
+R_{n,i} - H_i(T_i, T_{\mathrm{af}}) - \lambda_i E_i(T_i, q_{\mathrm{af}}) - \delta_{i,2} G_0(T_{\mathrm{gnd}}, T_{s,0}) = 0, \qquad i \in \{\mathrm{sun}, \mathrm{sh}, \mathrm{gnd}\} \tag{7.35}
 $$
 
 積雪融解時は $T_{\mathrm{gnd}} \le 273.15\ \mathrm{K}$ にクランプして余剰熱を融雪潜熱へ振り分け、積雪水量が上限 $S_{\max} = 1000\ \mathrm{kg\ m^{-2}}$ を超えた分を氷河流出（calving）として分離するとともに気候的表面質量収支 $\mathrm{SMB}$ を記録する。
@@ -1128,7 +1150,7 @@ $$
 \begin{aligned}
 z_{\mathrm{root}} &= \operatorname{clamp}\!\left(\frac{S_R}{\rho_w(\theta_{\mathrm{fc}} - \theta_{\mathrm{wp}})},\ 0.15,\ 3.0\right)\ [\mathrm{m}], \\
 f_{\mathrm{ice}} &= 10^{-6\,w_i/w_{\mathrm{sat}}}, \qquad f_{\mathrm{sat}} = (1 - f_{\mathrm{ice},0}) + f_{\mathrm{ice},0}\,s_0^4
-\end{aligned} \tag{7.34}
+\end{aligned} \tag{7.36}
 $$
 
 下端自由重力排水 $q_{\mathrm{drain}} = K_{\mathrm{bot}}$ を含む線形化陰的三重対角 Richards 方程式を解く：
@@ -1137,7 +1159,7 @@ $$
 \begin{aligned}
 \frac{\partial \theta_\ell}{\partial t} &= \frac{\partial}{\partial z}\left[f_{\mathrm{ice}} K_{\mathrm{sat}}\left(\frac{\theta_\ell}{w_{\mathrm{sat}}}\right)^{2b+3}\left(\frac{\partial \psi(\theta_\ell)}{\partial z} + 1\right)\right] - S_{\mathrm{root}}, \\
 \psi(\theta_\ell) &= \psi_s\left(\frac{\theta_\ell}{w_{\mathrm{sat}}}\right)^{-b}
-\end{aligned} \tag{7.35}
+\end{aligned} \tag{7.37}
 $$
 
 土壌熱伝導では SCALE-RM Sec. 8.7.1 および MATSIRO6 Ch. 10 に従い、層体積熱容量 $C_{\mathrm{vol},k}$ および氷融解潜熱を含む層内部エネルギー $U_k$ を厳密保存する $0^\circ\mathrm{C}$ 相変化（ゼロカーテン効果）を適用したのち、水分・氷依存熱伝導率 $\kappa_s$ による陰的 Fourier 熱拡散を 5 層 Thomas ソルバで積分する：
@@ -1147,7 +1169,7 @@ $$
 C_{\mathrm{vol},k} &= 1.26\times 10^6 + c_\ell\rho_w w_{\ell,k} + c_i\rho_i w_{i,k}, \\
 U_k &= C_{\mathrm{vol},k}(T_{s,k} - T_0) - L_{f0}\rho_i w_{i,k}, \\
 \kappa_{s,k} &= 0.30\left[1 + 5.5\tanh\!\left(\frac{w_{\ell,k} + w_{i,k}}{0.25}\right)\right] + 0.8\,w_{i,k}
-\end{aligned} \tag{7.36}
+\end{aligned} \tag{7.38}
 $$
 
 ### 7.7 MAML サブグリッド山岳微気候および動的湿地・湖沼 (`src/aoba/maml_land_subgrid.py`)
@@ -1158,7 +1180,7 @@ $$
 \begin{aligned}
 T_{\mathrm{air},m} &= T_{\mathrm{air}} - \Gamma_m\Delta z_m, \qquad p_{\mathrm{sfc},m} = p_{\mathrm{sfc}}\exp\!\left(-\frac{g\Delta z_m}{R_d T_{\mathrm{air}}}\right), \\
 s_{\mathrm{sw},m} &= 1 \pm 0.12\min\!\left(\frac{\sigma_{\mathrm{topo}}}{400},\ 1\right), \qquad \sum_{m=1}^{N_{\mathrm{sub}}}\Delta z_m = 0
-\end{aligned} \tag{7.37}
+\end{aligned} \tag{7.39}
 $$
 
 `enable_maml_wetlands_lakes = true` 時、TOPMODEL 原理（Beven & Kirkby, 1979）に基づく地形平坦度 $f_{\mathrm{flat}}$、表層土壌飽和超過項、谷底重み $w_{\mathrm{val}}$、融解因子 $f_{\mathrm{thaw}}$ および河川氾濫項 $f_{\mathrm{flood}}$ から目標冠水率 $f_{\mathrm{wet,tgt}}$ を算出し、時定数 $\tau_{\mathrm{wet}} = 10$ 日 の厳密指数緩和で動的湿地率 $f_{\mathrm{wet}} \in [0, 0.85]$ を更新する：
@@ -1168,7 +1190,7 @@ $$
 f_{\mathrm{flat}} &= \left(1 + \frac{\sigma_{\mathrm{topo}}}{80}\right)^{-1}, \qquad f_{\mathrm{flood}} = 0.35\,\frac{Q_{\mathrm{riv}}}{Q_{\mathrm{riv}} + 4000}, \\
 f_{\mathrm{thaw}} &= \operatorname{clamp}\!\left(\frac{T_{s,0} - 270.15}{5.0},\ 0.15,\ 1.0\right), \\
 f_{\mathrm{wet,tgt}} &= \operatorname{clamp}\!\left(f_{\mathrm{flat}}\,w_{\mathrm{val}}\,f_{\mathrm{thaw}}\left(\left[\frac{\max(s_0 - 0.58,\ 0)}{0.42}\right]^{1.6} + f_{\mathrm{flood}}\right),\ 0,\ 0.85\right)
-\end{aligned} \tag{7.38}
+\end{aligned} \tag{7.40}
 $$
 
 ### 7.8 陸域炭素–窒素循環・5 層永久凍土 C/N・MAML SPITFIRE 山火事 (`src/aoba/land_carbon.py`)
@@ -1179,7 +1201,7 @@ $$
 \begin{aligned}
 \frac{dC_{\mathrm{tot}}}{dt} &= \mathrm{GPP} - R_{a,\mathrm{eff}} - R_h - F_{\mathrm{fire,C}} \equiv \mathrm{NBP}, \\
 \frac{dN_{\mathrm{tot}}}{dt} &= F_{\mathrm{dep}} + F_{\mathrm{BNF}} - F_{\mathrm{leach}} - F_{\mathrm{denit}} - F_{\mathrm{fire,N}}
-\end{aligned} \tag{7.39}
+\end{aligned} \tag{7.41}
 $$
 
 1. **独立栄養呼吸および機能均衡動的炭素配分**：木部・細根維持呼吸（$Q_{10}=2.0$）と葉暗呼吸 $R_{\mathrm{leaf}}$ の和に対し正の余剰へ成長呼吸 $25\%$（Clark et al., 2011）を加える。新成長炭素の配分では樹高依存の基本木部配分 $f_{w0}$ に加え、窒素制限時（$\phi_N < 1$）に細根配分を自律増加させる機能均衡則（Stocker & Prentice, 2024）を適用する：
@@ -1188,18 +1210,18 @@ $$
 \begin{aligned}
 f_{w0} &= 0.05 + 0.42\,\frac{h_c}{h_c + 4.0}, \\
 f_{\mathrm{root}} &= \operatorname{clamp}\!\big(0.45(1 - f_{w0}) + 0.35(1 - \phi_N),\ 0.15,\ 0.72\big)
-\end{aligned} \tag{7.40}
+\end{aligned} \tag{7.42}
 $$
 
 2. **Stocker & Prentice (2024) 最適葉窒素需要・土壌溶質輸送窒素吸収・FUN/Houlton 生物的窒素固定 (BNF)**：Dong et al. (2022) に従い、順化 $V_{c\max 25}$ および創発葉面積重 $\mathrm{LMA}$ から最適葉窒素量 $N_{\mathrm{area,opt}}$ と最適葉 C:N 比 $\mathrm{CN}_{l,\mathrm{opt}} = \operatorname{clamp}(\mathrm{LMA}/N_{\mathrm{area,opt}}, 15, 65)$ を決定する（細根 $45$、木部 $250$、腐植土壌 $14$）。枯死回転時の内部再転流（葉 $50\%$・細根 $25\%$）を差し引いた正味窒素需要に対し、土壌無機窒素 $N_{\min}$ からの吸収を蒸散質量流 $u_{\mathrm{mass}}$ と細根拡散吸収 $u_{\mathrm{diff}}$ で評価する：
 
 $$
 \begin{aligned}
-\mathrm{LMA} &= 0.045 + 0.055\,f_{\mathrm{evg}} + 0.025\,f_{\mathrm{cold}}\ [\mathrm{kg\ C\ m^{-2}}], \\
+\mathrm{LMA} &= 0.045 + 0.055\,f_{\mathrm{evg}} + 0.025\,f_{\mathrm{cold}} + 0.035(1 - \phi_N)\ [\mathrm{kg\ C\ m^{-2}}], \qquad \tau_{\mathrm{leaf,eff}} = \tau_{\mathrm{leaf},0}\big[1 + 0.80(1 - \phi_N)\big], \\
 N_{\mathrm{area,opt}} &= 1.76\times 10^{-5}\,V_{c\max 25} + 0.016\,\mathrm{LMA}, \\
 u_{\mathrm{mass}} &= \Big[1 - \exp\!\left(-\frac{E_{\mathrm{tr}}\Delta t}{W_{\mathrm{root,col}}}\right)\Big]N_{\min}, \\
 k_{\mathrm{diff}} &= 8.0\,f_{\mathrm{moist}}\,f_{\mathrm{freeze}}\,\frac{C_r}{C_r + 0.25}, \qquad u_{\mathrm{diff}} = \big(1 - e^{-k_{\mathrm{diff}}\Delta t_{\mathrm{yr}}}\big)(N_{\min} - u_{\mathrm{mass}})
-\end{aligned} \tag{7.41}
+\end{aligned} \tag{7.43}
 $$
 
 不足需要には Houlton et al. (2008) および Fisher et al. (2010, FUN Eq. 6) の土壌温度依存共生 BNF 炭素コスト $\mathrm{cost}_{\mathrm{BNF}}(T_{s,0})$（$25.15^\circ\mathrm{C}$ で最小 $\sim 6.3\ \mathrm{kg\ C / kg\ N}$、$0^\circ\mathrm{C}$ で $\sim 187\ \mathrm{kg\ C / kg\ N}$）で最大 NPP の $2.2\%$ を投資し（消費炭素は $R_{a,\mathrm{eff}}$ に加算して厳密保存）、瞬間窒素充足度 $\phi_N^{\mathrm{inst}}$ を算出する：
@@ -1208,10 +1230,10 @@ $$
 \begin{aligned}
 \mathrm{cost}_{\mathrm{BNF}}(T_C) &= 5.0\,\exp\!\left(-\left[-3.62 + 0.27\,T_C\left(1 - \frac{T_C}{50.30}\right)\right]\right), \\
 \phi_N^{\mathrm{inst}} &= \operatorname{clamp}\!\left(\frac{N_{\mathrm{retrans}} + u_{\mathrm{soil}} + \mathrm{BNF}_{\mathrm{sym}}}{D_{N,\mathrm{gross}}},\ 0.15,\ 1.0\right)
-\end{aligned} \tag{7.42}
+\end{aligned} \tag{7.44}
 $$
 
-15 日 EMA 平滑化した窒素充足度 $\phi_N$ は式 (7.40) の細根配分および式 (7.27) の葉建設コスト $z_{\mathrm{eff}}$ へ双方向結合する。非共生自由生活 BNF（最大 $2\times 10^{-4}\ \mathrm{kg\ N\ m^{-2}\ yr^{-1}}$）、雷 $\mathrm{LNO}_x$ 大気沈着、有機態窒素の無機化・不動化、湿潤溶脱（$0.60\ \mathrm{yr^{-1}}$）および嫌気脱窒（$0.80\ \mathrm{yr^{-1}}$）が $N_{\min}$ 収支を閉じる。
+15 日 EMA 平滑化した窒素充足度 $\phi_N$ は式 (7.42) の細根配分および式 (7.29) の葉建設コスト $z_{\mathrm{eff}}$ へ双方向結合する。非共生自由生活 BNF（最大 $2\times 10^{-4}\ \mathrm{kg\ N\ m^{-2}\ yr^{-1}}$）、雷 $\mathrm{LNO}_x$ 大気沈着、有機態窒素の無機化・不動化、湿潤溶脱（$0.60\ \mathrm{yr^{-1}}$）および嫌気脱窒（$0.80\ \mathrm{yr^{-1}}$）が $N_{\min}$ 収支を閉じる。
 
 3. **5 層永久凍土土壌 C/N 分解および凍土撹乱（Koven et al., 2013）**：土壌 5 層（$0.05\text{–}1.60\ \mathrm{m}$）の分解速度は深さ減衰因子 $\exp(-z_{\mathrm{mid},k}/0.50\ \mathrm{m})$、$Q_{10}=2.0$ 温度応答、水分正弦応答および完全凍結時 $0.05$ への永久凍土抑制を受け、厳密指数分解と鉛直保存凍土撹乱（拡散係数 $D_{\mathrm{cryo}} = 5.0\times 10^{-4}\ \mathrm{m^2\ yr^{-1}}$）で炭素・窒素を同時更新する。
 
@@ -1222,7 +1244,7 @@ $$
 \mathrm{FDI} &= 1 - \exp(-3\times 10^{-4}\,\mathrm{DI}), \qquad A_{\mathrm{fire}} = \frac{\pi}{4 L_B}\big[(R_f + R_b)\,t_{\mathrm{fire}}\big]^2, \\
 I_B &= 18000\,F_c\,\frac{R_f}{60}\ [\mathrm{kW\ m^{-1}}], \\
 \mathrm{SH} &= 0.11\,I_B^{2/3}\ [\mathrm{m}], \qquad d_{\mathrm{bark}} = 0.8 + 1.8\left(\frac{h_c}{10}\right)^{0.6}\ [\mathrm{cm}]
-\end{aligned} \tag{7.43}
+\end{aligned} \tag{7.45}
 $$
 
 CRM 対地落雷（親セル平均 50% ブレンドによる乾燥雷着火）から離散 MAML パッチ累積ハザードおよび 2D 隣接乾燥パッチ延焼を判定し、燃焼パッチの $\mathrm{LAI}$・$h_c$ を直接低下させて森林–サバンナ双安定モザイクを創発させるとともに、燃焼炭素・BC/OC 煙および燃焼窒素（$85\%$ 揮散、$15\%$ 灰分として $N_{\min}$ 還元）を厳密保存計算する。
@@ -1236,7 +1258,66 @@ $$
 v_{\mathrm{riv},i} &= \operatorname{clamp}\!\left(0.50\sqrt{\frac{S_i}{10^{-3}}},\ 0.15,\ 2.00\right)\ [\mathrm{m\ s^{-1}}], \\
 f_{\mathrm{out},i} &= -\operatorname{expm1}\!\left(-\frac{v_{\mathrm{riv},i}}{L_i}\Delta t\right), \qquad Q_{\mathrm{out},i} = f_{\mathrm{out},i}\,S_{\mathrm{riv},i}, \\
 \Delta S_{\mathrm{riv},i} &= R_{\mathrm{liq},i} A_i \Delta t + \sum_{j\in\mathrm{up}(i)} Q_{\mathrm{out},j} - Q_{\mathrm{out},i}
-\end{aligned} \tag{7.44}
+\end{aligned} \tag{7.46}
+$$
+
+### 7.10 マップフリー自律動的湖沼モデル（地形凹地＋2 層 FLake 熱力学・湖氷、`src/aoba/lakes.py`, `enable_dynamic_lakes`）
+
+気候変化に伴う内陸湖の拡大・縮小・乾燥消失（例：完新世中期「緑のサハラ」のメガチャド湖、アラル海の干拓・乾燥化、氷床後退に伴う氷河湖アガシの形成と決壊）を湖沼分布マップや規定水深マップを一切用いずに表現する。固体地球の `Earth2014` 岩盤凹地（非海洋・非氷床ピクセルにおける $z_{\mathrm{SUR}} - z_{\mathrm{BED}} > 0.5\ \mathrm{m}$ の面積率 $f_{\mathrm{bed},i}$ と体積 $V_{\mathrm{bed},i}$）と、谷底標高 $z_{\mathrm{valley},i}$（粗格子でのアマゾン川・コンゴ川渓谷偽ダムを回避するセル内最小非海洋標高 `z_min_land`、氷床連動時は動的地形更新に追従）上の Barnes et al. (2014) Priority-Flood 閉凹地深さ $d_{\mathrm{pf},i} = \max(z_{\mathrm{filled},i} - z_{\mathrm{valley},i}, 0)$ から、各陸域 Voronoi セルの幾何学的最大貯留容量 $(f_{\mathrm{cap},i}, h_{\mathrm{cap},i}, V_{\mathrm{cap},i})$ を決定する：
+
+$$
+\begin{aligned}
+f_{\mathrm{pf},i} &= f_{\max}\,\frac{d_{\mathrm{pf},i}}{d_{\mathrm{pf},i} + \max(\sigma_{\mathrm{topo},i},\ 50\ \mathrm{m})}, \qquad V_{\mathrm{pf},i} = \frac{1}{1.5}\,(f_{\mathrm{pf},i} A_i)\,\min(d_{\mathrm{pf},i},\ d_{\max}), \\
+f_{\mathrm{cap},i} &= \min\!\big(f_{\max},\ \max(f_{\mathrm{bed},i},\ f_{\mathrm{pf},i})\big), \qquad h_{\mathrm{cap},i} = \operatorname{clamp}\!\left(\frac{\max(V_{\mathrm{bed},i}, V_{\mathrm{pf},i})}{f_{\mathrm{cap},i} A_i},\ 1.0,\ d_{\max}\right), \\
+V_{\mathrm{cap},i} &= f_{\mathrm{cap},i} A_i h_{\mathrm{cap},i}
+\end{aligned} \tag{7.47}
+$$
+
+ここで $f_{\max} = 0.85$（`lake_max_frac`）、$d_{\max} = 400\ \mathrm{m}$（`lake_max_depth_m`）である。予報液相＋湖氷水当量体積 $V_i \in [0, V_{\mathrm{cap},i}]$（Kahan 補償加算付き）から、放物面盆地の厳密体積保存ヒプソメトリ則により動的水面面積率 $f_{\mathrm{lake},i}$ と平均水深 $h_{\mathrm{lake},i}$ を診断し（$h_{\mathrm{lake},i} < 0.05\ \mathrm{m}$ で完全乾燥 $f_{\mathrm{lake},i} = 0$）、河川ルーティング（式 7.46）と溢流結合する：
+
+$$
+\begin{aligned}
+\phi_i &= \operatorname{clamp}\!\left(\frac{V_i}{V_{\mathrm{cap},i}},\ 0,\ 1\right), \qquad f_{\mathrm{lake},i} = f_{\mathrm{cap},i}\,\phi_i^{2/3}, \qquad h_{\mathrm{lake},i} = h_{\mathrm{cap},i}\,\phi_i^{1/3}, \\
+M_{\mathrm{in},i} &= (1 - f_{\mathrm{lake},i}) R_{\mathrm{liq},i} A_i \Delta t + \sum_{j\in\mathrm{up}(i)} Q_{\mathrm{out},j}, \qquad M_{\mathrm{spill},i} = \rho_w\max\!\left(V_i + \frac{M_{\mathrm{in},i}}{\rho_w} - V_{\mathrm{cap},i},\ 0\right)
+\end{aligned} \tag{7.48}
+$$
+
+$f_{\mathrm{lake},i} A_i h_{\mathrm{lake},i} \equiv V_i$ が恒等的に成り立ち、内陸閉鎖湖（$V_i < V_{\mathrm{cap},i} \Rightarrow M_{\mathrm{spill},i} = 0$; カスピ海・チャド湖・エア湖）と外洋流出湖（$V_i = V_{\mathrm{cap},i} \Rightarrow M_{\mathrm{spill},i} > 0$; 五大湖・バイカル湖）が同一方程式から自律創発する。
+
+熱力学は Mironov (2008, FLake) および Hostetler & Bartlein (1990) に基づく 2 層液相（表水層温度 $T_{\mathrm{ml}}$・深さ $h_{\mathrm{ml}}$、深水層温度 $T_{\mathrm{bot}}$・深さ $h_{\mathrm{bot}} = h_{\mathrm{liq}} - h_{\mathrm{ml}}$）および湖氷・氷上積雪層 $(h_{\mathrm{ice}}, \mathrm{SWE}_{\mathrm{ice}}, T_{\mathrm{ice}})$ で記述する。開水面では Beer–Lambert 短波透過分配 $f_{\mathrm{sw,ml}} = 1 - e^{-k_{\mathrm{ext}} h_{\mathrm{ml}}}$（既定 $k_{\mathrm{ext}} = 0.5\ \mathrm{m^{-1}}$）と無条件安定な陰的後退オイラー表面熱収支（降雪融解潜熱 $-L_f P_{\mathrm{snow}}$ を含む）により $T_{\mathrm{ml}}$ を更新し、$T_{\mathrm{ml}}^* < T_f$ の過冷却熱量から新湖氷を生成する：
+
+$$
+\begin{aligned}
+F_{\mathrm{net},0} &= f_{\mathrm{sw,ml}} F_{\mathrm{sw}} + \epsilon_l F_{\mathrm{lw}\downarrow} - \epsilon_l \sigma T_{\mathrm{ml}}^4 - c_p g_a (T_{\mathrm{ml}} - T_a) - L_v g_a\big(q_{\mathrm{sat}}(T_{\mathrm{ml}}) - q_v\big) - L_f P_{\mathrm{snow}}, \\
+\Delta T_{\mathrm{ml}} &= \frac{F_{\mathrm{net},0}\,\Delta t}{\rho_w c_{pw} h_{\mathrm{ml}} + \Delta t\left(4\epsilon_l\sigma T_{\mathrm{ml}}^3 + c_p g_a + L_v g_a \frac{\partial q_{\mathrm{sat}}}{\partial T}\right)}, \qquad \Delta h_{\mathrm{ice}} = \frac{\rho_w c_{pw} h_{\mathrm{ml}}\max(T_f - T_{\mathrm{ml}}^*,\ 0)}{\rho_{\mathrm{ice}} L_f}
+\end{aligned} \tag{7.49}
+$$
+
+結氷湖（$h_{\mathrm{ice}} > 10^{-4}\ \mathrm{m}$）では氷・積雪の直列実効熱伝導率 $k_{\mathrm{eff}} = (h_{\mathrm{ice}}/k_{\mathrm{ice}} + h_{\mathrm{snow}}/k_{\mathrm{snow}})^{-1}$ を含む陰的熱収支から氷面温度 $T_{\mathrm{ice}} \le T_f$、表面融雪・融氷、氷底伝導凍結および氷下水塊からの厳密指数融解熱束 $F_w$ を計算し、アルベドは開水面の Fresnel 反射（式 9.1）から裸湖氷（VIS $0.55$ / NIR $0.30$）・積雪湖氷（VIS $0.82$ / NIR $0.52$）へ滑らかに遷移させる：
+
+$$
+\begin{aligned}
+k_{\mathrm{eff}} &= \left(\frac{h_{\mathrm{ice}}}{k_{\mathrm{ice}}} + \frac{\mathrm{SWE}_{\mathrm{ice}}}{\rho_{\mathrm{snow}} k_{\mathrm{snow}}}\right)^{-1}, \qquad F_{\mathrm{cond}} = k_{\mathrm{eff}}(T_f - T_{\mathrm{ice}}), \\
+\Delta h_{\mathrm{ice,base}} &= \frac{F_{\mathrm{cond}}\,\Delta t - \rho_w c_{pw} h_{\mathrm{ml}}(T_{\mathrm{ml}} - T_f)\big(1 - e^{-\gamma_w \Delta t / h_{\mathrm{ml}}}\big)}{\rho_{\mathrm{ice}} L_f}
+\end{aligned} \tag{7.50}
+$$
+
+淡水の $T_{\mathrm{md}} = 277.13\ \mathrm{K}$（$3.98^\circ\mathrm{C}$）における密度極大を表す 2 次状態方程式 $\rho_f(T)$ を用い、表水層密度が深水層以上（$\rho_f(T_{\mathrm{ml}}) \ge \rho_f(T_{\mathrm{bot}})$）になった瞬間にエンタルピー厳密保存の春・秋全層対流転倒を行い、安定成層時には風応力–浮力平衡深さ $h_{\mathrm{eq}}$ への指数緩和によるエンタルピー保存エントレインメント／デトレインメントおよび解析的 2 層指数温度躍層拡散（$K_z = 2\times 10^{-5}\ \mathrm{m^2\ s^{-1}}$）を適用する：
+
+$$
+\begin{aligned}
+\rho_f(T) &= \rho_w\Big[1 - 6.8\times 10^{-6}\,(T - 277.13)^2\Big], \qquad T_{\mathrm{mix}} = \frac{h_{\mathrm{ml}} T_{\mathrm{ml}} + h_{\mathrm{bot}} T_{\mathrm{bot}}}{h_{\mathrm{ml}} + h_{\mathrm{bot}}}, \\
+h_{\mathrm{eq}} &= \operatorname{clamp}\!\left(\frac{0.25\,u_{*w}}{|f| + 0.15\,N + 10^{-4}},\ \min(1.0, h_{\mathrm{liq}}),\ h_{\mathrm{liq}}\right), \qquad d_{\mathrm{fac}} = -\operatorname{expm1}\!\left(-\frac{K_z\,\Delta t}{0.5\,h_{\mathrm{ml}} h_{\mathrm{bot}}}\right)
+\end{aligned} \tag{7.51}
+$$
+
+最後に、各陸域セルの地表面アルベド・射出温度・乱流フラックスおよび鉱物ダスト発生率を陸面 $(1 - f_{\mathrm{lake},i})$ と湖面 $f_{\mathrm{lake},i}$ で厳密面積重み付けタイリングし、単一起動融合 Metal/CUDA カーネル `dynamic_lake_step_col`（`src/aoba/kernels_esm.py`）で全セル同時積分する：
+
+$$
+\begin{aligned}
+\alpha_{\mathrm{cell}} &= (1 - f_{\mathrm{lake}})\,\alpha_{\mathrm{land}} + f_{\mathrm{lake}}\,\alpha_{\mathrm{lake}}, \qquad T_{\mathrm{rad,cell}}^4 = (1 - f_{\mathrm{lake}})\,T_{\mathrm{rad,land}}^4 + f_{\mathrm{lake}}\,T_{\mathrm{rad,lake}}^4, \\
+(H, \mathrm{LHF}, E, \boldsymbol{\tau})_{\mathrm{cell}} &= (1 - f_{\mathrm{lake}})\,(H, \mathrm{LHF}, E, \boldsymbol{\tau})_{\mathrm{land}} + f_{\mathrm{lake}}\,(H, \mathrm{LHF}, E, \boldsymbol{\tau})_{\mathrm{lake}}, \qquad F_{\mathrm{dust,eff}} = (1 - f_{\mathrm{lake}})\,F_{\mathrm{dust,land}}
+\end{aligned} \tag{7.52}
 $$
 
 ---

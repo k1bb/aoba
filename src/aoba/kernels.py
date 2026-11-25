@@ -60,6 +60,7 @@ from aoba.kernels_physics import (
 )
 from aoba.kernels_esm import (
     ESM_METAL_SHADER_SRC,
+    run_dynamic_lake_step_metal,
     run_microphysics_6class_metal,
     run_ozone_chem_metal,
     run_rad_ckd_hd_metal,
@@ -1002,6 +1003,12 @@ def dispatch_ozone_chem_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
     lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_ozone_chem_metal(lib, **kwargs)
+
+
+def dispatch_dynamic_lake_step_metal(**kwargs: Any) -> None:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    run_dynamic_lake_step_metal(lib, **kwargs)
 
 
 def dispatch_scvt_fast_acoustic_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:

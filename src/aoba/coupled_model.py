@@ -134,6 +134,11 @@ class AOBAConfig:
     solar_cycle_phase_yr: float = 0.0        # Solar cycle reference phase year [yr]
     enable_maml_subgrid_topo: bool = False   # MAML subgrid elevation lapse-rate & slope microclimate downscaling
     enable_maml_wetlands_lakes: bool = False # Dynamic MAML inundated wetlands/floodplains/lakes -> CH4 & evaporation
+    enable_dynamic_lakes: bool = False       # Map-free dynamic lakes (Earth2014/Priority-Flood basins + 2-layer FLake + ice)
+    lake_init_fill_frac: float = 0.50        # Uniform initial topographic basin fill fraction in [0, 1] [-]
+    lake_max_frac: float = 0.85              # Maximum lake area fraction of a land Voronoi cell [-]
+    lake_max_depth_m: float = 400.0          # Cap on full-spill mean basin depth [m]
+    lake_extinction_m1: float = 0.50         # Freshwater Beer-Lambert solar extinction coefficient [m^-1]
     enable_wave_coupling: bool = False       # Prognostic ocean waves H_s/T_p, Stokes Langmuir KPP mixing, & sea-spray flux
     enable_water_isotopes: bool = False      # Prognostic 3D H2^18O & HDO stable water isotopes + ice-core d18O archive
     planet_preset: str = "earth"             # "earth", "aquaplanet", "snowball_earth", "tidally_locked", "trappist1e", "mars_like"
@@ -233,6 +238,7 @@ class AOBAState:
     clim_sub: ClimateAccumulator | None = None
     icesheet: IceSheetState | None = None
     river: object | None = None
+    lakes: object | None = None
     land_carbon: object | None = None
     aerosols: object | None = None
     ozone: object | None = None
@@ -759,6 +765,18 @@ def init_aoba_model(
             if bool(cfg.enable_river_routing)
             else None
         ),
+        lakes=(
+            __import__("aoba.lakes", fromlist=["init_dynamic_lake_state"]).init_dynamic_lake_state(
+                mesh,
+                init_fill_frac=float(cfg.lake_init_fill_frac),
+                max_frac=float(cfg.lake_max_frac),
+                max_depth_m=float(cfg.lake_max_depth_m),
+                device=dev,
+                dtype=atmos.q_n.dtype,
+            )
+            if bool(cfg.enable_dynamic_lakes)
+            else None
+        ),
         land_carbon=None,
         aerosols=(
             __import__("aoba.aerosols", fromlist=["init_natural_aerosol_state"]).init_natural_aerosol_state(
@@ -838,9 +856,12 @@ def _apply_dynamic_icesheet_update(model: AOBAState) -> None:
     newly_glaciated_cell = (mesh.surf_type != SURF_ICESHEET) & (new_surf_type == SURF_ICESHEET)
     newly_deglaciated_cell = (mesh.surf_type == SURF_ICESHEET) & (new_surf_type == SURF_LAND)
 
+    old_z_topo = mesh.z_topo
     mesh.surf_type = new_surf_type
     mesh.z_topo = ice_diag["z_topo_new"]
     mesh.z_topo_smooth = ice_diag["z_topo_smooth_new"]
+    if mesh.z_min_land is not None:
+        mesh.z_min_land = mesh.z_min_land + (mesh.z_topo - old_z_topo)
     model.sfc.surf_type = new_surf_type
     model.sfc.z_topo = mesh.z_topo
 
@@ -886,6 +907,27 @@ def _apply_dynamic_icesheet_update(model: AOBAState) -> None:
         sfc_sub.swe_max_season = torch.where(is_ice_sub, torch.full_like(sfc_sub.swe_max_season, SWE_GLACIER_MAX), sfc_sub.swe_max_season)
 
     remap_atmosphere_and_crm_vertical(model.atmos, model.crm, mesh, model.vgrid, mesh.z_topo_smooth)
+    # Recompute Priority-Flood drainage & topographic lake basins after ice-sheet/isostasy topography shift
+    if model.river is not None:
+        from aoba.river_routing import init_river_routing_state
+        old_stor = model.river.storage_kg
+        old_comp = model.river.storage_comp
+        model.river = init_river_routing_state(mesh, device=mesh.z_topo.device, dtype=old_stor.dtype)
+        model.river.storage_kg = old_stor * model.river.is_land_river.to(old_stor.dtype)
+        model.river.storage_comp = old_comp * model.river.is_land_river.to(old_stor.dtype)
+    if model.lakes is not None:
+        from aoba.lakes import rebuild_lake_basins_from_topography
+        spill_m3 = rebuild_lake_basins_from_topography(
+            model.lakes,
+            mesh,
+            max_frac=float(cfg.lake_max_frac),
+            max_depth_m=float(cfg.lake_max_depth_m),
+        )
+        if model.river is not None:
+            from aoba.surface import _kahan_add
+            model.river.storage_kg, model.river.storage_comp = _kahan_add(
+                model.river.storage_kg, spill_m3 * 1000.0, model.river.storage_comp
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1081,13 +1123,40 @@ def step_aoba_model(
     # 3. Subcolumn surface albedos & ICA 4-band radiative transfer across all `[Nz, m_sub]`
     _pre_alb_sub = compute_surface_albedos(sfc_sub, mu0_sub)
     alb_vd, alb_vf, alb_nd, alb_nf, _, lai_exp_sub, _, f_ice_sub = _pre_alb_sub
+    _lake_f_sub_rad = None
+    _lake_trad_sub = None
+    if bool(cfg.enable_dynamic_lakes):
+        from aoba.lakes import EMISS_LAKE, compute_lake_surface_albedos, init_dynamic_lake_state
+        if model.lakes is None:
+            model.lakes = init_dynamic_lake_state(
+                mesh,
+                init_fill_frac=float(cfg.lake_init_fill_frac),
+                max_frac=float(cfg.lake_max_frac),
+                max_depth_m=float(cfg.lake_max_depth_m),
+                device=temp_sub_0.device,
+                dtype=temp_sub_0.dtype,
+            )
+        l_avd, l_avf, l_and, l_anf, l_trad = compute_lake_surface_albedos(model.lakes, mu0)
+        _lake_f_sub_rad = torch.clamp(_cell_to_sub(model.lakes.f_lake, nc, n_sub), 0.0, 1.0)
+        _lake_trad_sub = _cell_to_sub(l_trad, nc, n_sub)
+        omf_l = 1.0 - _lake_f_sub_rad
+        alb_vd = omf_l * alb_vd + _lake_f_sub_rad * _cell_to_sub(l_avd, nc, n_sub)
+        alb_vf = omf_l * alb_vf + _lake_f_sub_rad * _cell_to_sub(l_avf, nc, n_sub)
+        alb_nd = omf_l * alb_nd + _lake_f_sub_rad * _cell_to_sub(l_and, nc, n_sub)
+        alb_nf = omf_l * alb_nf + _lake_f_sub_rad * _cell_to_sub(l_anf, nc, n_sub)
     if need_rad:
         t_rad_ocn = ((1.0 - f_ice_sub) * (sfc_sub.t_ocean_ml ** 4) + f_ice_sub * (torch.clamp(sfc_sub.t_seaice, min=150.0) ** 4)) ** 0.25
-        t_rad_in = torch.where(sfc_sub.surf_type == SURF_OCEAN, t_rad_ocn, sfc_sub.t_canopy)
+        t_rad_land_eff = sfc_sub.t_canopy
+        if _lake_f_sub_rad is not None and _lake_trad_sub is not None:
+            t_rad_land_eff = ((1.0 - _lake_f_sub_rad) * (torch.clamp(t_rad_land_eff, min=150.0) ** 4) + _lake_f_sub_rad * (torch.clamp(_lake_trad_sub, min=150.0) ** 4)) ** 0.25
+        t_rad_in = torch.where(sfc_sub.surf_type == SURF_OCEAN, t_rad_ocn, t_rad_land_eff)
+        emiss_land_eff = torch.full_like(t_rad_in, EMISSIVITY_LAND)
+        if _lake_f_sub_rad is not None:
+            emiss_land_eff = (1.0 - _lake_f_sub_rad) * emiss_land_eff + _lake_f_sub_rad * EMISS_LAKE
         emiss_in = torch.where(
             sfc_sub.surf_type == SURF_OCEAN,
             torch.full_like(t_rad_in, EMISSIVITY_OCEAN),
-            torch.full_like(t_rad_in, EMISSIVITY_LAND),
+            emiss_land_eff,
         )
         pres_w_sub = torch.empty((nz + 1, m_sub), device=pres_sub.device, dtype=pres_sub.dtype)
         pres_w_sub[0] = pres_sfc_sub
@@ -1311,6 +1380,48 @@ def step_aoba_model(
         sfc_diag_sub.evap = sfc_diag_sub.evap * wet_boost
         sfc_diag_sub.lhf = sfc_diag_sub.lhf * wet_boost
 
+    # Optional map-free dynamic lakes (2-layer FLake + 4 C overturning + lake ice) tiled conservatively with land
+    if bool(cfg.enable_dynamic_lakes) and model.lakes is not None:
+        from aoba.lakes import step_dynamic_lakes
+
+        f_lake_pre_sub = torch.clamp(_cell_to_sub(model.lakes.f_lake, nc, n_sub), 0.0, 1.0)
+        step_dynamic_lakes(
+            lake=model.lakes,
+            u_1=_sub_to_cell(u_sub_0, nc, n_sub),
+            v_1=_sub_to_cell(v_sub_0, nc, n_sub),
+            temp_1=_sub_to_cell(temp_sub_0, nc, n_sub),
+            qv_1=_sub_to_cell(qv_sub[0], nc, n_sub),
+            pres_sfc=_sub_to_cell(pres_sfc_sub, nc, n_sub),
+            rho_1=_sub_to_cell(rho_sub[0] * (1.0 + qv_sub[0]), nc, n_sub),
+            z_ref_rel=_sub_to_cell(z_ref_rel_sub, nc, n_sub),
+            sw1_dir_dn=_sub_to_cell(sw1_dir_sub, nc, n_sub),
+            sw1_dif_dn=_sub_to_cell(sw1_dif_sub, nc, n_sub),
+            sw2_dir_dn=_sub_to_cell(sw2_dir_sub, nc, n_sub),
+            sw2_dif_dn=_sub_to_cell(sw2_dif_sub, nc, n_sub),
+            lw_dn=_sub_to_cell(lw_dn_sub, nc, n_sub),
+            precip_rain=_sub_to_cell(rain_prev_sub, nc, n_sub),
+            precip_snow=_sub_to_cell(snow_prev_sub, nc, n_sub),
+            mu0_cell=mu0,
+            area_cell=mesh.area_cell,
+            f_cor_cell=mesh.f_cell,
+            dt=dt,
+            k_ext_m1=float(cfg.lake_extinction_m1),
+        )
+        omf_l = 1.0 - f_lake_pre_sub
+        sfc_diag_sub.shf = omf_l * sfc_diag_sub.shf + f_lake_pre_sub * _cell_to_sub(model.lakes.shf, nc, n_sub)
+        sfc_diag_sub.lhf = omf_l * sfc_diag_sub.lhf + f_lake_pre_sub * _cell_to_sub(model.lakes.lhf, nc, n_sub)
+        sfc_diag_sub.evap = omf_l * sfc_diag_sub.evap + f_lake_pre_sub * _cell_to_sub(model.lakes.evap, nc, n_sub)
+        sfc_diag_sub.tau_x = omf_l * sfc_diag_sub.tau_x + f_lake_pre_sub * _cell_to_sub(model.lakes.tau_x, nc, n_sub)
+        sfc_diag_sub.tau_y = omf_l * sfc_diag_sub.tau_y + f_lake_pre_sub * _cell_to_sub(model.lakes.tau_y, nc, n_sub)
+        sfc_diag_sub.t_rad_sfc = (
+            omf_l * (torch.clamp(sfc_diag_sub.t_rad_sfc, min=150.0) ** 4)
+            + f_lake_pre_sub * (torch.clamp(_cell_to_sub(model.lakes.t_rad, nc, n_sub), min=150.0) ** 4)
+        ) ** 0.25
+        sfc_diag_sub.alb_vis_dir = omf_l * sfc_diag_sub.alb_vis_dir + f_lake_pre_sub * _cell_to_sub(model.lakes.alb_vis_dir, nc, n_sub)
+        sfc_diag_sub.alb_vis_dif = omf_l * sfc_diag_sub.alb_vis_dif + f_lake_pre_sub * _cell_to_sub(model.lakes.alb_vis_dif, nc, n_sub)
+        sfc_diag_sub.alb_nir_dir = omf_l * sfc_diag_sub.alb_nir_dir + f_lake_pre_sub * _cell_to_sub(model.lakes.alb_nir_dir, nc, n_sub)
+        sfc_diag_sub.alb_nir_dif = omf_l * sfc_diag_sub.alb_nir_dif + f_lake_pre_sub * _cell_to_sub(model.lakes.alb_nir_dif, nc, n_sub)
+
     langmuir_ocn = None
     if bool(cfg.enable_wave_coupling):
         from aoba.ocean_waves import compute_sea_spray_enthalpy_fluxes, init_ocean_wave_state, step_ocean_waves
@@ -1399,7 +1510,13 @@ def step_aoba_model(
             if model.river is None:
                 model.river = init_river_routing_state(mesh, device=runoff_tot_cell.device)
             runoff_liq_cell = torch.clamp(runoff_tot_cell - runoff_ice_cell, min=0.0)
-            river_mouth_flux = step_river_routing_voronoi(model.river, runoff_liq_cell, mesh.area_cell, dt)
+            river_mouth_flux = step_river_routing_voronoi(
+                model.river,
+                runoff_liq_cell,
+                mesh.area_cell,
+                dt,
+                lake_state=model.lakes if bool(cfg.enable_dynamic_lakes) else None,
+            )
 
         tau_x_ocn = _sub_to_cell(sfc_diag_sub.tau_x, nc, n_sub)
         tau_y_ocn = _sub_to_cell(sfc_diag_sub.tau_y, nc, n_sub)
@@ -1473,6 +1590,20 @@ def step_aoba_model(
             sfc.swe_seaice = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.swe_seaice, fallback_atm=sfc.swe_seaice)
             sfc.h_ocean_ml = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.h_ocean_ml, fallback_atm=sfc.h_ocean_ml)
     else:
+        if bool(cfg.enable_river_routing) and bool(cfg.enable_dynamic_lakes) and model.lakes is not None:
+            from aoba.river_routing import init_river_routing_state, step_river_routing_voronoi
+
+            runoff_tot_cell = _sub_to_cell(sfc_diag_sub.runoff_total, nc, n_sub)
+            runoff_ice_cell = _sub_to_cell(sfc_diag_sub.runoff_ice, nc, n_sub)
+            if model.river is None:
+                model.river = init_river_routing_state(mesh, device=runoff_tot_cell.device)
+            step_river_routing_voronoi(
+                model.river,
+                torch.clamp(runoff_tot_cell - runoff_ice_cell, min=0.0),
+                mesh.area_cell,
+                dt,
+                lake_state=model.lakes,
+            )
         step_ekman_ocean_voronoi(
             ocn=model.ocn,
             sfc=sfc,
@@ -1821,6 +1952,9 @@ def step_aoba_model(
             d_disp=sfc_diag_sub.d_disp,
             dust_emis_factor=cfg.dust_emis_factor,
         )
+        if bool(cfg.enable_dynamic_lakes) and model.lakes is not None:
+            # Active lakes suppress mineral dust; desiccated basins (f_lake -> 0) naturally expose dust sources
+            f_dust_sub = f_dust_sub * torch.clamp(1.0 - _cell_to_sub(model.lakes.f_lake, nc, n_sub), 0.0, 1.0)
         f_dust_emit_c = _sub_to_cell(f_dust_sub, nc, n_sub)
         dm_dust_c = torch.clamp(atmos.rho_d * atmos.dz_c, min=0.0)
         dust_col_pre = (dm_dust_c * torch.clamp(atmos.q_dust, min=0.0)).sum(dim=0)

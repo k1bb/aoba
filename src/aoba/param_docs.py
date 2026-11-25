@@ -354,6 +354,26 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "ja": "MAML 動的湿地・氾濫原・湖沼の冠水率診断（水面蒸発・湿地 CH₄ 放出への結合）を有効化。",
         "en": "Enable dynamic MAML inundated wetlands, floodplains, and lakes coupled to open-water evaporation and CH₄.",
     },
+    "enable_dynamic_lakes": {
+        "ja": "湖マップ不使用の自律動的湖沼モデル（Earth2014 岩盤凹地＋谷底 Priority-Flood 盆地貯留、2層 FLake 熱力学・4°C 密度最大転倒・湖氷アルベド・河川溢流結合・乾燥消失）を有効化。",
+        "en": "Enable map-free autonomous dynamic lakes (Earth2014 bedrock + valley-floor Priority-Flood basin storage, 2-layer FLake thermodynamics, 4 C overturning, lake ice/albedo, river sill-overflow, and desiccation).",
+    },
+    "lake_init_fill_frac": {
+        "ja": "動的湖沼の初期一律満水率 [0–1]（地域マップなしの全球スカラー。0 で乾燥状態から降水・流出のみで形成、0.5 で中立初期値から気候平衡へ緩和）。",
+        "en": "Uniform global initial fill fraction [0–1] for topographic lake basins (map-free scalar; 0 starts completely dry, 0.5 relaxes rapidly to wet/dry climate equilibrium).",
+    },
+    "lake_max_frac": {
+        "ja": "1陸域 Voronoi セル内で動的湖沼が占め得る最大面積率 [0–1]（既定 0.85）。上げると大盆地の最大水面拡大を許容。",
+        "en": "Maximum area fraction [0–1] of a land Voronoi cell allowed to flood as a dynamic lake (default 0.85).",
+    },
+    "lake_max_depth_m": {
+        "ja": "動的湖沼の満水時平均水深の上限 [m]（既定 400 m）。上げるとバイカル湖やカスピ海等の深湖の熱慣性が増大。",
+        "en": "Upper cap on full-spill mean dynamic lake depth [m] (default 400 m); raising increases thermal inertia of deep rift/tectonic basins.",
+    },
+    "lake_extinction_m1": {
+        "ja": "淡水湖の Beer–Lambert 短波消散係数 k_ext [m⁻¹]（既定 0.5 m⁻¹）。上げると日射が浅い混合層に集中し夏季成層が強まる。",
+        "en": "Freshwater Beer–Lambert shortwave extinction coefficient k_ext [m⁻¹] (default 0.5 m⁻¹); higher values concentrate solar heating in the epilimnion and strengthen summer stratification.",
+    },
     "enable_wave_coupling": {
         "ja": "予報海洋波浪 (H_s, T_p)・Stokes ドリフト Langmuir 混合・波齢粗度・強風時海塩飛沫フラックスを有効化。",
         "en": "Enable prognostic ocean waves (H_s, T_p), Stokes-drift Langmuir KPP mixing, wave drag, and sea-spray fluxes.",

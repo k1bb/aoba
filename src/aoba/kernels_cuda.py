@@ -53,6 +53,7 @@ _HEAVY_COL_KERNELS: frozenset[str] = frozenset({
     "rad_ckd_hd_col",
     "microphysics_6class_col",
     "ozone_chem_col",
+    "dynamic_lake_step_col",
 })
 
 

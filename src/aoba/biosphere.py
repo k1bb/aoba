@@ -39,7 +39,7 @@ Implements a fully parameter-table-free terrestrial biosphere combining:
    - Kempes, West, Crowell, & Girvan (2011, PLoS ONE, 6, e20551, Eqs. 2-5):
      Metabolic vs water-limited maximum canopy height `h_c`.
 
-AOBA Formulation Reference: Sec. 7.2-7.5, Eqs. (7.1)-(7.29) (Two-Leaf C3/C4 P-Model, Liebig Co-Limitation, Lambert-W0 LAI, Habit, S_R & Canopy Height h_c).
+AOBA Formulation Reference: Sec. 7.2-7.5, Eqs. (7.1)-(7.31) (Ross-Goudriaan Optimal Leaf Angle, Discrete-Crown Clumping, Two-Leaf C3/C4 P-Model, Liebig Co-Limitation, Lambert-W0 LAI, LES Habit, S_R & h_c).
 """
 
 from __future__ import annotations
@@ -250,6 +250,101 @@ class CanopyRadiationProfile:
     i_c: torch.Tensor        # Whole-canopy absorbed PPFD [umol m^-2 s^-1]
     i_sun: torch.Tensor      # Sunlit-fraction absorbed PPFD [umol m^-2 s^-1]
     i_sh: torch.Tensor       # Shaded-fraction absorbed PPFD [umol m^-2 s^-1]
+    kd_prime: torch.Tensor | None = None    # Clumped diffuse PAR extinction coefficient [m^2 m^-2]
+    omega_beam: torch.Tensor | None = None  # Direct-beam discrete-crown clumping index Omega(mu0, LAI) [-]
+
+
+# Universal discrete-crown packing scale L_{c,0} [m^2 m^-2] (Li & Strahler, 1992; Ni-Meister et al., 2010)
+CROWN_LAI_MIN: float = 1.50
+CHI_LEAF_MIN: float = -0.40
+CHI_LEAF_MAX: float = 0.50
+
+
+def ross_goudriaan_optics(
+    mu0: torch.Tensor,
+    chi_leaf: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Closed-form Ross (1975) / Goudriaan (1977) / Dai et al. (2004, Eq. A4) leaf projection optics.
+
+    Maps leaf orientation index `chi_L in [-0.4, +0.5]` (`0`: spherical, `<0`: erectophile,
+    `>0`: planophile) to `(G(mu0), mu_bar, phi_1, phi_2)` with smooth singularity-free Taylor
+    behavior as `phi_2 -> 0` (reducing identically to `G = 0.5, mu_bar = 1.0` at `chi_L = 0`).
+    """
+    mu_s = torch.clamp(mu0, min=0.01, max=1.0)
+    if chi_leaf is None:
+        phi1 = torch.full_like(mu_s, 0.5)
+        phi2 = torch.zeros_like(mu_s)
+        g_mu = torch.full_like(mu_s, 0.5)
+        mu_bar = torch.ones_like(mu_s)
+        return g_mu, mu_bar, phi1, phi2
+
+    chi = torch.clamp(chi_leaf, min=CHI_LEAF_MIN, max=CHI_LEAF_MAX)
+    phi1 = torch.clamp(0.5 - 0.633 * chi - 0.330 * chi * chi, min=0.05, max=0.95)
+    phi2 = 0.877 * (1.0 - 2.0 * phi1)
+    g_mu = torch.clamp(phi1 + phi2 * mu_s, min=0.05, max=1.2)
+
+    # Dai et al. (2004, Eq. A4c): mu_bar = (1/phi2) * [1 - (phi1/phi2)*ln(1 + phi2/phi1)]
+    # Written via u = phi2/phi1 -> (1/phi1) * (u - ln(1+u)) / u^2 with 3-term Taylor as |u| < 1e-3
+    u = torch.clamp(phi2 / phi1, min=-0.95, max=20.0)
+    u_safe = torch.where(torch.abs(u) < 1.0e-3, torch.ones_like(u), u)
+    mu_exact = (1.0 / phi1) * (u_safe - torch.log1p(u_safe)) / (u_safe * u_safe)
+    mu_taylor = (1.0 / phi1) * (0.5 - u * (1.0 / 3.0 - 0.25 * u))
+    mu_bar = torch.clamp(torch.where(torch.abs(u) < 1.0e-3, mu_taylor, mu_exact), min=0.4, max=2.5)
+    return g_mu, mu_bar, phi1, phi2
+
+
+def compute_discrete_crown_clumping(
+    mu0: torch.Tensor,
+    lai: torch.Tensor,
+    chi_leaf: torch.Tensor | None = None,
+    l_crown_min: float = CROWN_LAI_MIN,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Map-free geometric-optical discrete-crown clumping `(omega_beam, omega_diff, f_crown)`.
+
+    Follows Li & Strahler (1992), Nilson (1999), Ni-Meister et al. (2010), and Braghiere et al.
+    (2019, GMD) for Poisson-distributed finite crowns of minimum internal leaf density `L_{c,0}`:
+        f_c(mu) = 1 - exp(-L / (L_{c,0} * max(mu, 0.15))),
+        P_gap(mu) = (1 - f_c(mu)) + f_c(mu) * exp(-k_0(mu) * L / f_c(mu)),
+        Omega(mu, L) = -ln(P_gap(mu)) / (k_0(mu) * L).
+    Eliminates the low-LAI over-absorption bias of infinite turbid-medium canopies (`Omega < 1`
+    in sparse savannas/shrublands) while smoothly converging to `Omega -> 1` in closed forests
+    and remaining singularity-free down to `L -> 0` via the exact analytic limit
+    `Omega(L -> 0) = (1 - exp(-G * L_{c,0})) / (G * L_{c,0})`.
+    """
+    lc = torch.clamp(lai, min=0.0)
+    mu_s = torch.clamp(mu0, min=0.01, max=1.0)
+    g_mu, mu_bar, _, _ = ross_goudriaan_optics(mu_s, chi_leaf)
+    k_db0 = g_mu / mu_s
+
+    def _omega_for(k0: torch.Tensor, mu_proj: torch.Tensor, g_proj: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mu_p = torch.clamp(mu_proj, min=0.15, max=1.0)
+        lam_c = lc / (float(l_crown_min) * mu_p)
+        f_c = -torch.expm1(-torch.clamp(lam_c, max=40.0))
+        # Exact L -> 0 limit: (1 - exp(-G * L_{c,0})) / (G * L_{c,0})
+        gl0 = torch.clamp(g_proj * float(l_crown_min), min=1.0e-4)
+        om_lim0 = -torch.expm1(-gl0) / gl0
+
+        tau_tot = k0 * lc
+        f_c_safe = torch.clamp(f_c, min=1.0e-6)
+        tau_crown = torch.clamp(tau_tot / f_c_safe, max=40.0)
+        # P_gap = 1 - f_c * (1 - exp(-tau_crown)); compute -ln(P_gap) via -log1p(-abs_frac)
+        abs_frac = torch.clamp(f_c * (-torch.expm1(-tau_crown)), min=0.0, max=1.0 - 1.0e-7)
+        neg_ln_pgap = -torch.log1p(-abs_frac)
+        om_raw = neg_ln_pgap / torch.clamp(tau_tot, min=1.0e-6)
+        om = torch.where(
+            lc < 1.0e-3,
+            om_lim0,
+            torch.where((f_c > 0.9999) | (tau_tot > 25.0), torch.ones_like(om_raw), torch.clamp(om_raw, min=0.35, max=1.0)),
+        )
+        return om, f_c
+
+    omega_beam, f_crown = _omega_for(k_db0, mu_s, g_mu)
+    # Hemispherical diffuse clumping evaluated at effective diffuse cosine mu_d = min(0.5 / mu_bar, 1) -> 1/(2*G_d) ~ 0.55
+    mu_d = torch.clamp(0.55 * mu_bar, min=0.25, max=0.90)
+    k_d0 = 1.0 / mu_bar
+    g_d = k_d0 * mu_d
+    omega_diff, _ = _omega_for(k_d0, mu_d, g_d)
+    return omega_beam, omega_diff, f_crown
 
 
 def canopy_light_absorption_depury(
@@ -257,11 +352,15 @@ def canopy_light_absorption_depury(
     vis_diff_wm2: torch.Tensor,
     mu0: torch.Tensor,
     lai: torch.Tensor,
+    chi_leaf: torch.Tensor | None = None,
 ) -> CanopyRadiationProfile:
     """Compute whole-canopy, sunlit, and shaded absorbed PPFD [umol photon m^-2 s^-1].
 
-    Implements McCree (1972) & de Pury & Farquhar (1997, Plant Cell Environ., 20, 537-557),
-    matching Section A.1.1-A.1.3 (Eqs. A1.1-A1.22) of Hashimoto (2026, ATAMI).
+    Extends McCree (1972) & de Pury & Farquhar (1997, Plant Cell Environ., 20, 537-557) with
+    Ross-Goudriaan leaf orientation (`chi_leaf`) and map-free geometric-optical discrete-crown
+    clumping (`Omega(mu0, L)`; Li & Strahler, 1992; Ni-Meister et al., 2010; Braghiere et al.,
+    2019), eliminating the sparse-canopy over-absorption bias while preserving exact energy
+    conservation (`I_sun + I_sh == I_c`, `L_sun + L_sh == L`).
     Note: `vis_beam_wm2` and `vis_diff_wm2` are visible PAR (0.4-0.7 um) fluxes [W m^-2].
     """
     # Eqs. A1.1-A1.2 in umol photon m^-2 s^-1
@@ -271,16 +370,21 @@ def canopy_light_absorption_depury(
     lc = torch.clamp(lai, min=0.0)
     has_veg = lc >= 0.01
 
-    # Eqs. A1.3-A1.6
-    k_db = 0.5 / torch.clamp(mu0, min=0.01)
+    # Ross-Goudriaan projection G(mu0; chi_L) and discrete-crown clumping Omega(mu0, L)
+    mu_s = torch.clamp(mu0, min=0.01, max=1.0)
+    g_mu, mu_bar, _, _ = ross_goudriaan_optics(mu_s, chi_leaf)
+    omega_b, omega_d, _ = compute_discrete_crown_clumping(mu_s, lc, chi_leaf)
+
+    k_db = omega_b * (g_mu / mu_s)
     sqrt_1ms = math.sqrt(1.0 - LEAF_SCAT_VIS)
     k_b_prime = k_db * sqrt_1ms
+    kd_prime = omega_d * (KD_PRIME_PAR / mu_bar)
     rho_h = (1.0 - sqrt_1ms) / (1.0 + sqrt_1ms)
     rho_cb = 2.0 * rho_h * k_db / (1.0 + k_db)
 
     # Eqs. A1.11-A1.13: Canopy-integrated beam, diffuse, and total absorbed PPFD
     i_cb = (1.0 - rho_cb) * i_b0 * (1.0 - torch.exp(-torch.clamp(k_b_prime * lc, max=50.0)))
-    i_cd = (1.0 - RHO_CD_PAR) * i_d0 * (1.0 - torch.exp(-torch.clamp(KD_PRIME_PAR * lc, max=50.0)))
+    i_cd = (1.0 - RHO_CD_PAR) * i_d0 * (1.0 - torch.exp(-torch.clamp(kd_prime * lc, max=50.0)))
     i_c = torch.where(has_veg, i_cb + i_cd, torch.zeros_like(lc))
 
     # Eq. A1.15: Sunlit and shaded leaf area indices
@@ -288,9 +392,9 @@ def canopy_light_absorption_depury(
     l_sun_raw = torch.where(
         k_lc < 1.0e-4,
         lc * (1.0 - 0.5 * k_lc),
-        (1.0 - torch.exp(-torch.clamp(k_lc, max=50.0))) / k_db,
+        (1.0 - torch.exp(-torch.clamp(k_lc, max=50.0))) / torch.clamp(k_db, min=1.0e-4),
     )
-    l_sun = torch.where(has_veg, torch.clamp(l_sun_raw, min=0.0), torch.zeros_like(lc))
+    l_sun = torch.where(has_veg, torch.minimum(torch.clamp(l_sun_raw, min=0.0), lc), torch.zeros_like(lc))
     l_sh = torch.where(has_veg, torch.clamp(lc - l_sun, min=0.0), torch.zeros_like(lc))
 
     # Eqs. A1.17, A1.19, A1.20: Sunlit direct-beam, scattered-beam, and diffuse absorption
@@ -306,9 +410,9 @@ def canopy_light_absorption_depury(
     i_sun_d = (
         i_d0
         * (1.0 - RHO_CD_PAR)
-        * KD_PRIME_PAR
-        * (1.0 - torch.exp(-torch.clamp((KD_PRIME_PAR + k_db) * lc, max=50.0)))
-        / (KD_PRIME_PAR + k_db)
+        * kd_prime
+        * (1.0 - torch.exp(-torch.clamp((kd_prime + k_db) * lc, max=50.0)))
+        / (kd_prime + k_db)
     )
 
     i_sun = torch.where(has_veg, torch.minimum(i_sun_db + i_sun_sb + i_sun_d, i_c), torch.zeros_like(lc))
@@ -325,6 +429,8 @@ def canopy_light_absorption_depury(
         i_c=i_c,
         i_sun=i_sun,
         i_sh=i_sh,
+        kd_prime=kd_prime,
+        omega_beam=omega_b,
     )
 
 
@@ -334,18 +440,23 @@ def canopy_sunlit_sw_fraction(
     mu0: torch.Tensor,
     lai: torch.Tensor,
     leaf_scat: float,
+    chi_leaf: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Fraction of canopy-absorbed broadband SW absorbed by sunlit foliage (de Pury & Farquhar, 1997).
+    """Fraction of canopy-absorbed broadband SW absorbed by sunlit foliage (clumped Ross-Goudriaan).
 
     Applies the exact analytic beam + scattered-beam + diffuse two-stream integrals for arbitrary
-    leaf scattering coefficient `leaf_scat` (VIS = 0.15, NIR = 0.80) so that sunlit/shaded shortwave
-    absorption partitions total canopy absorption conservatively across both SW1 and SW2.
+    leaf scattering coefficient `leaf_scat` (VIS = 0.15, NIR = 0.80) using Ross-Goudriaan leaf
+    orientation `chi_leaf` and discrete-crown clumping `Omega(mu0, LAI)`.
     """
     lc = torch.clamp(lai, min=0.0)
-    k_db = 0.5 / torch.clamp(mu0, min=0.01)
+    mu_s = torch.clamp(mu0, min=0.01, max=1.0)
+    g_mu, mu_bar, _, _ = ross_goudriaan_optics(mu_s, chi_leaf)
+    omega_b, omega_d, _ = compute_discrete_crown_clumping(mu_s, lc, chi_leaf)
+
+    k_db = omega_b * (g_mu / mu_s)
     sqrt_1ms = math.sqrt(max(1.0 - leaf_scat, 1.0e-4))
     k_b_prime = k_db * sqrt_1ms
-    k_d_prime = (KD_PRIME_PAR / math.sqrt(1.0 - LEAF_SCAT_VIS)) * sqrt_1ms
+    k_d_prime = omega_d * ((KD_PRIME_PAR / math.sqrt(1.0 - LEAF_SCAT_VIS)) / mu_bar) * sqrt_1ms
     rho_h = (1.0 - sqrt_1ms) / (1.0 + sqrt_1ms)
     rho_cb = 2.0 * rho_h * k_db / (1.0 + k_db)
     rho_cd = 2.0 * rho_h * 0.78 / 1.78
@@ -412,12 +523,13 @@ def allocate_two_leaf_capacity(
         * (1.0 - torch.exp(-torch.clamp((acclim_rad.k_b_prime + k_db_inst) * lc, max=50.0)))
         / (acclim_rad.k_b_prime + k_db_inst)
     )
+    kd_a = acclim_rad.kd_prime if acclim_rad.kd_prime is not None else KD_PRIME_PAR
     term_d = (
         (1.0 - RHO_CD_PAR)
-        * KD_PRIME_PAR
+        * kd_a
         * acclim_rad.i_d0
-        * (1.0 - torch.exp(-torch.clamp((KD_PRIME_PAR + k_db_inst) * lc, max=50.0)))
-        / (KD_PRIME_PAR + k_db_inst)
+        * (1.0 - torch.exp(-torch.clamp((kd_a + k_db_inst) * lc, max=50.0)))
+        / (kd_a + k_db_inst)
     )
     x_sun_opt = x_total * (term_b + term_d) / torch.clamp(acclim_rad.i_c, min=1.0e-2)
     x_sun_area = x_total * (l_sun_inst / torch.clamp(lc, min=1.0e-4))
@@ -440,30 +552,34 @@ def canopy_two_stream_albedo_dai(
     mu0: torch.Tensor,
     alb_ground_vis: torch.Tensor,
     alb_ground_nir: torch.Tensor,
+    chi_leaf: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Singularity-free Sellers (1985) / Dai, Dickinson, & Wang (2004, App. A) 2-stream canopy albedos.
 
-    Assumes spherical leaf angle distribution (`chi_L = 0 -> phi_1 = 0.5, phi_2 = 0,
-    G(mu) = 0.5, mu_bar = 1.0` via Dai et al., 2004, Eq. A4c), avoiding all angle singularities,
-    and smoothly Regularizes `sigma = mu_bar^2 * K^2 - (b^2 - c^2) -> 0` (Dai et al., 2004, Eqs. A5-A6).
+    Supports Ross-Goudriaan leaf orientation (`chi_leaf in [-0.4, +0.5]`, Dai et al., 2004, Eq. A4)
+    and geometric-optical discrete-crown clumping (`Omega_b(mu0, L), Omega_d(L)`; Ni-Meister et al.,
+    2010; Braghiere et al., 2019), avoiding all angle/denominator singularities (`sigma -> 0`) while
+    strictly conserving radiative energy (`albedo + transmittance + absorption == 1`).
 
     Returns `(alb_dir_vis, alb_dif_vis, alb_dir_nir, alb_dif_nir, trans_vis, trans_nir)`.
     """
     lc = torch.clamp(lai, min=0.0)
-    mu_s = torch.clamp(mu0, min=0.02)
-    k_opt = 0.5 / mu_s  # Direct-beam optical depth per LAI (G=0.5)
-    mu_bar = 1.0        # Exact spherical limit of Eq. (A4c): 1 / (2 * 0.5) = 1.0
+    mu_s = torch.clamp(mu0, min=0.02, max=1.0)
+    g_mu, mu_bar, phi1, phi2 = ross_goudriaan_optics(mu_s, chi_leaf)
+    omega_b, omega_d, _ = compute_discrete_crown_clumping(mu_s, lc, chi_leaf)
+
+    k_opt = g_mu / mu_s        # Unclumped direct-beam optical depth per effective LAI
+    lc_dir = omega_b * lc      # Clumped effective direct-beam LAI (Nilson, 1971; Braghiere et al., 2019)
+    lc_dif = omega_d * lc      # Clumped effective diffuse LAI
 
     def _band_solve(omega: float, alb_g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Spherical leaves with equal leaf reflectance & transmittance (r_l = t_l = omega / 2):
-        # diffuse upscatter beta = 0.5, direct upscatter beta_0 = 0.5 * (1 + mu_bar * K) / (1 + mu_bar * K) ->
-        # Dickinson (1983) / Sellers (1985): beta_0 = ((1 + mu_bar * K) * a_s) / (omega * mu_bar * K)
+        # Equal leaf reflectance & transmittance (r_l = t_l = omega / 2): exact diffuse upscatter beta = 0.5
         beta = 0.5
-        # Single-scattering albedo of spherical leaves (Sellers, 1985, Eq. 15)
-        tmp_as = 0.5 * omega * (0.5 / (0.5 + mu_s)) * (
-            1.0 - (mu_s / (0.5 + mu_s)) * torch.log((0.5 + mu_s) / mu_s)
-        )
-        beta_0 = torch.clamp(((1.0 + mu_bar * k_opt) * tmp_as) / (omega * mu_bar * k_opt), 0.05, 0.95)
+        # Exact Sellers (1985, Eq. 15) / CLM5 (Eq. 3.16) single-scattering albedo for general Ross-Goudriaan G(mu)
+        b_ss = torch.clamp(g_mu + mu_s * phi2, min=1.0e-4)
+        a_ss = torch.clamp(mu_s * phi1, min=1.0e-5)
+        tmp_as = 0.5 * omega * (g_mu / b_ss) * (1.0 - (a_ss / b_ss) * torch.log1p(b_ss / a_ss))
+        beta_0 = torch.clamp(((1.0 + mu_bar * k_opt) * tmp_as) / torch.clamp(omega * mu_bar * k_opt, min=1.0e-5), 0.05, 0.95)
 
         b = 1.0 - (1.0 - beta) * omega
         c = omega * beta
@@ -471,20 +587,19 @@ def canopy_two_stream_albedo_dai(
         p1 = b + mu_bar * h
         p2 = b - mu_bar * h
 
-        s1 = torch.exp(-torch.clamp(h * lc, max=40.0))
-        s2 = torch.exp(-torch.clamp(k_opt * lc, max=40.0))
-
-        # Diffuse incident upward reflectance I_dif^up(0) and ground transmission
-        d1 = p1 * (1.0 - alb_g * p2 / c) / s1 - p2 * (1.0 - alb_g * p1 / c) * s1
+        # Diffuse stream uses clumped diffuse optical depth lc_dif
+        s1_d = torch.exp(-torch.clamp(h * lc_dif, max=40.0))
+        d1 = p1 * (1.0 - alb_g * p2 / c) / s1_d - p2 * (1.0 - alb_g * p1 / c) * s1_d
         d1_safe = torch.where(torch.abs(d1) < 1.0e-7, torch.full_like(d1, 1.0e-7), d1)
-        h7 = c * (1.0 - alb_g * p2 / c) / (d1_safe * s1)
-        h8 = -c * (1.0 - alb_g * p1 / c) * s1 / d1_safe
+        h7 = c * (1.0 - alb_g * p2 / c) / (d1_safe * s1_d)
+        h8 = -c * (1.0 - alb_g * p1 / c) * s1_d / d1_safe
         alb_dif = torch.clamp(h7 + h8, 0.0, 1.0)
-        trans_dif = torch.clamp((h7 * p1 / c) * s1 + (h8 * p2 / c) / s1, 0.0, 1.0)
+        trans_dif = torch.clamp((h7 * p1 / c) * s1_d + (h8 * p2 / c) / s1_d, 0.0, 1.0)
 
-        # Direct beam: avoid Dai et al. (2004, App. A) sigma = 0 singularity smoothly
+        # Direct-beam stream uses clumped direct optical depth lc_dir
+        s1 = torch.exp(-torch.clamp(h * lc_dir, max=40.0))
+        s2 = torch.exp(-torch.clamp(k_opt * lc_dir, max=40.0))
         sigma_raw = (mu_bar * k_opt) ** 2 - (b * b - c * c)
-        # Perturb k_opt by tiny 1e-4 relative offset if |sigma| < 1e-4 (smooth C^inf match to Eqs. A5-A6)
         k_reg = torch.where(torch.abs(sigma_raw) < 1.0e-4, k_opt + 2.0e-4, k_opt)
         sigma = (mu_bar * k_reg) ** 2 - (b * b - c * c)
 
@@ -492,7 +607,6 @@ def canopy_two_stream_albedo_dai(
         f_coef = omega * mu_bar * k_reg * (1.0 - beta_0)
         u1 = b - c / torch.clamp(alb_g, min=1.0e-4)
         u2 = b - c * alb_g
-        u3 = f_coef + c * alb_g
 
         h1 = -d_coef * (b - mu_bar * k_reg) - c * f_coef
         h4 = -f_coef * (b + mu_bar * k_reg) - c * d_coef
@@ -580,6 +694,8 @@ class BiosphereState:
     ema_temp_home: torch.Tensor | None = None     # Slow (~3-yr) climatological warm-season adaptation temperature [K]
     # CN-model nitrogen sufficiency factor phi_N in [0.15, 1.0] (Stocker & Prentice, 2024; 1.0 = N-replete / N-off)
     n_avail_fac: torch.Tensor | None = None       # 15-day EMA nitrogen availability factor [-]
+    # Non-iterative optimal Ross-Goudriaan leaf orientation index chi_L in [-0.4, +0.5] (0=spherical, <0=erect, >0=flat)
+    chi_leaf: torch.Tensor | None = None          # 30-day acclimated autonomous leaf inclination index [-]
 
 
 def init_biosphere_state(
@@ -631,6 +747,7 @@ def init_biosphere_state(
         ema_ann_a0_fav=_f(180.0),
         ema_temp_home=_f(293.15),
         n_avail_fac=_f(1.0),
+        chi_leaf=_f(0.0),
     )
 
 
@@ -698,9 +815,24 @@ def update_daily_acclimation_smith(
         thome_prev,
     )
 
+    # 1b. Non-iterative closed-form optimal Ross-Goudriaan leaf orientation chi_L in [-0.40, +0.50]
+    #     Balances canopy light distribution (erect at high LAI, flat at humid low LAI; Monsi & Saeki,
+    #     1953; Hikosaka & Hirose, 1997) against aridity/VPD/insolation heat-avoidance erectophily
+    #     (Ehleringer & Werk, 1986; Falster & Westoby, 2003; Pisek et al., 2013) with 30-day relaxation.
+    chi_light = 0.25 * torch.tanh((2.5 - torch.clamp(bio.lai, min=0.0)) / 2.0)
+    mi_ann = bio.ema_ann_precip / torch.clamp(bio.ema_ann_pet, min=10.0)
+    s_dry = torch.clamp((1.2 - mi_ann) / 1.2, 0.0, 1.0)
+    s_vpd = bio.ema_vpd_mid / (bio.ema_vpd_mid + 1500.0)
+    s_sun = torch.clamp((bio.ema_mu0_mid - 0.35) / 0.55, 0.0, 1.0)
+    chi_stress = -0.55 * (0.60 * s_dry + 0.40 * s_vpd) * (0.40 + 0.60 * s_sun)
+    chi_target = torch.clamp(chi_light + chi_stress, CHI_LEAF_MIN, CHI_LEAF_MAX)
+    chi_prev = bio.chi_leaf if bio.chi_leaf is not None else torch.zeros_like(chi_target)
+    alpha_chi = 0.5 * alpha_ema  # ~30-day leaf-orientation acclimation timescale
+    bio.chi_leaf = torch.where(veg, (1.0 - alpha_chi) * chi_prev + alpha_chi * chi_target, torch.zeros_like(chi_target))
+
     # 2. Compute acclimation canopy light absorption from EMA downward SW at current exposed LAI
     acclim_rad = canopy_light_absorption_depury(
-        bio.ema_vis_beam, bio.ema_vis_diff, bio.ema_mu0_mid, lai_exposed
+        bio.ema_vis_beam, bio.ema_vis_diff, bio.ema_mu0_mid, lai_exposed, chi_leaf=bio.chi_leaf
     )
     i_abs = acclim_rad.i_c  # Whole-canopy absorbed PPFD [umol m^-2 s^-1]
 
@@ -833,11 +965,12 @@ def prepare_two_leaf_allocation(
 ) -> TwoLeafAllocation:
     """Precompute sunlit/shaded PAR profiles and enzyme capacities once per timestep before EB iterations."""
     acclim_rad = canopy_light_absorption_depury(
-        bio.ema_vis_beam, bio.ema_vis_diff, bio.ema_mu0_mid, lai_exposed
+        bio.ema_vis_beam, bio.ema_vis_diff, bio.ema_mu0_mid, lai_exposed, chi_leaf=bio.chi_leaf
     )
-    inst_rad = canopy_light_absorption_depury(vis_beam_wm2, vis_diff_wm2, mu0, lai_exposed)
+    inst_rad = canopy_light_absorption_depury(vis_beam_wm2, vis_diff_wm2, mu0, lai_exposed, chi_leaf=bio.chi_leaf)
     k_db = inst_rad.k_db
     l_sun = inst_rad.l_sun
+    kd_acclim = acclim_rad.kd_prime if acclim_rad.kd_prime is not None else KD_PRIME_PAR
 
     lc = torch.clamp(lai_exposed, min=0.0)
     has_veg = lc >= 0.01
@@ -851,10 +984,10 @@ def prepare_two_leaf_allocation(
     )
     term_d = (
         (1.0 - RHO_CD_PAR)
-        * KD_PRIME_PAR
+        * kd_acclim
         * acclim_rad.i_d0
-        * (1.0 - torch.exp(-torch.clamp((KD_PRIME_PAR + k_db) * lc, max=50.0)))
-        / (KD_PRIME_PAR + k_db)
+        * (1.0 - torch.exp(-torch.clamp((kd_acclim + k_db) * lc, max=50.0)))
+        / (kd_acclim + k_db)
     )
     sun_frac_opt = (term_b + term_d) / torch.clamp(acclim_rad.i_c, min=1.0e-2)
     sun_frac_area = l_sun / torch.clamp(lc, min=1.0e-4)
@@ -1351,13 +1484,19 @@ def update_daily_lai_root_height(
     f_gsl = torch.clamp(bio.ema_gsl_frac, 0.05, 1.0)
     a0_fav_yr = torch.clamp(bio.ema_ann_a0_fav, min=1.0e-2)
     a_leaf = torch.clamp(a0_fav_yr * fapar_max0 / torch.clamp(lai_max0, min=0.50), min=1.0)
-    # Cold-hardening structural LMA investment & efficiency trade-off below 0 degC
+    # Cold-hardening & nutrient-conservation structural LMA investment & efficiency trade-off
+    # (Wright et al., 2004 LES; Givnish, 2002; Kikuzawa, 1991; Wang et al., 2023):
+    # Under N scarcity (phi_N < 1), plants invest in thicker, higher-LMA leaves that extend
+    # optimal evergreen lifespan tau_evg and penalize annual deciduous leaf-N turnover loss.
     f_cold = torch.sigmoid((C.T_FREEZE - ema_tmin_next) / 5.0)
+    n_fac = torch.clamp(bio.n_avail_fac, 0.25, 1.0) if bio.n_avail_fac is not None else None
+    n_scarcity = (1.0 - n_fac) if n_fac is not None else torch.zeros_like(f_cold)
     c_dec = Z_FOLIAGE_COST
-    c_evg = (EVG_COST_RATIO_BASE + EVG_COST_RATIO_COLD * f_cold) * c_dec
+    c_dec_eff = c_dec * (1.0 + 0.80 * n_scarcity)
+    c_evg = (EVG_COST_RATIO_BASE + EVG_COST_RATIO_COLD * f_cold + 0.80 * n_scarcity) * c_dec
     eta_evg = torch.clamp(1.0 - EVG_COLD_EFF_PENALTY * f_cold, min=0.40)
-    # Kikuzawa (1991, Eq. 5) optimal evergreen leaf lifespan tau_evg [yr]
-    tau_evg = torch.clamp(torch.sqrt(2.0 * LEAF_AGING_B_YR * c_evg / torch.clamp(eta_evg * a_leaf, min=1.0)), 1.0, 7.0)
+    # Kikuzawa (1991, Eq. 5) optimal evergreen leaf lifespan tau_evg [yr] (lengthens under cold or N scarcity)
+    tau_evg = torch.clamp(torch.sqrt(2.0 * LEAF_AGING_B_YR * c_evg / torch.clamp(eta_evg * a_leaf, min=1.0)), 1.0, 8.0)
     # Temperature-dependent off-season maintenance/stress cost (Q10 ~ 2.0, Heskel et al., 2016)
     f_resp_off = torch.exp(torch.clamp(0.0693 * (bio.ema_offseason_temp - 298.15), min=-6.0, max=3.0))
     # Extreme continental winter frost-damage penalty (Sakai & Larcher, 1987; Givnish, 2002; Larix belt)
@@ -1365,7 +1504,7 @@ def update_daily_lai_root_height(
 
     b_dec = max(LEAF_AGING_B_YR / 2.5, 1.0)
     flush_frac = torch.clamp(1.0 - DECID_FLUSH_DAYS / torch.clamp(365.2425 * f_gsl, min=15.0), min=0.0)
-    g_dec = flush_frac * (1.0 - f_gsl / (2.0 * b_dec)) * a_leaf - c_dec
+    g_dec = flush_frac * (1.0 - f_gsl / (2.0 * b_dec)) * a_leaf - c_dec_eff
     g_evg = (
         eta_evg * (1.0 - tau_evg / (2.0 * LEAF_AGING_B_YR)) * a_leaf
         - (c_evg / tau_evg)
@@ -1381,8 +1520,7 @@ def update_daily_lai_root_height(
     # floored at 0.55 * c_dec, elevated in permafrost/alpine short-GSL soils (Wang et al., 2023; Körner, 2012),
     # and modulated by CN-model nitrogen scarcity (Stocker & Prentice, 2024; n_cost_mult = 1.0 when N-replete).
     cold_soil_cost = 1.0 + 1.5 * torch.sigmoid(20.0 * (0.28 - f_gsl))
-    n_fac = torch.clamp(bio.n_avail_fac, 0.25, 1.0) if bio.n_avail_fac is not None else None
-    n_cost_mult = (1.0 + 0.80 * (1.0 - n_fac)) if n_fac is not None else 1.0
+    n_cost_mult = 1.0 + 0.80 * n_scarcity
     z_eff = (
         torch.clamp((1.0 - bio.f_evg) * c_dec + bio.f_evg * (c_evg / tau_evg), min=0.55 * c_dec)
         * cold_soil_cost

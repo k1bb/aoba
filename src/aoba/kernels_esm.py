@@ -1909,6 +1909,354 @@ kernel void ozone_chem_col(
     diag_out[2u * nc + col] = (chi_mid_0 * M_O3_AIR * dm_arr[0]) * k_dep_0;
     diag_out[3u * nc + col] = chem_sum / max(dt, 1.0f);
 }
+
+// -------------------------------------------------------------------------
+// 20e. Map-Free Autonomous Dynamic Lake 2-Layer FLake + Ice + Kahan Kernel
+// -------------------------------------------------------------------------
+inline void esm_qsat_lake(float temp_k, float pres_pa, bool over_ice, float t_freeze, float eps_w, float l_val, float rv, thread float& qs_out, thread float& dqs_out) {
+    float tc = clamp(temp_k - t_freeze, -90.0f, 60.0f);
+    float a = over_ice ? 21.875f : 17.269f;
+    float b = over_ice ? 265.5f : 237.3f;
+    float es = 610.94f * exp(a * tc / (tc + b));
+    float p_eff = max(pres_pa - (1.0f - eps_w) * es, 100.0f);
+    float qs = clamp(eps_w * es / p_eff, 1.0e-8f, 0.5f);
+    float tk = max(temp_k, 180.0f);
+    qs_out = qs;
+    dqs_out = qs * l_val / (rv * tk * tk);
+}
+
+kernel void dynamic_lake_step_col(
+    device const float* geom_in     [[buffer(0)]], // [3, nc]: f_cap, h_cap, v_cap_m3
+    device const float* force_in    [[buffer(1)]], // [17, nc]
+    device float* state_io          [[buffer(2)]], // [8, nc]: v_lake, v_comp, t_ml, t_bot, h_ml, h_ice, swe_ice, t_ice
+    device float* diag_out          [[buffer(3)]], // [13, nc]: f_lake, h_lake, f_ice, t_rad, alb4, shf, lhf, evap, taux, tauy
+    constant ulong4& u_p0           [[buffer(4)]], // [nc, 0, 0, 0]
+    constant float4& f_p0           [[buffer(5)]], // [dt, k_ext_m1, T_FREEZE, SIGMA_SB]
+    constant float4& f_p1           [[buffer(6)]], // [CP_D, L_V0, L_S0, L_F0]
+    constant float4& f_p2           [[buffer(7)]], // [GRAVITY, KAPPA, EPS_WATER, R_V]
+    uint col                        [[thread_position_in_grid]]
+) {
+    const uint nc = uint(u_p0.x);
+    if (col >= nc) return;
+
+    const float dt = f_p0.x;
+    const float k_ext = f_p0.y;
+    const float T_FREEZE = f_p0.z;
+    const float SIGMA_SB = f_p0.w;
+    const float CP_D = f_p1.x;
+    const float L_V0 = f_p1.y;
+    const float L_S0 = f_p1.z;
+    const float L_F0 = f_p1.w;
+    const float GRAVITY = f_p2.x;
+    const float KAPPA = f_p2.y;
+    const float EPS_W = f_p2.z;
+    const float R_V = f_p2.w;
+
+    const float RHO_W = 1000.0f;
+    const float CP_W = 4186.0f;
+    const float RHO_ICE = 917.0f;
+    const float CP_ICE = 2100.0f;
+    const float K_ICE = 2.2f;
+    const float K_SNOW = 0.25f;
+    const float RHO_SNOW = 300.0f;
+    const float EMISS = 0.985f;
+    const float T_MD = 277.13f;
+    const float ALPHA_RHO = 6.8e-6f;
+    const float H_MIN_ACT = 0.05f;
+    const float H_ML_MIN = 1.0f;
+    const float KZ_TH = 2.0e-5f;
+    const float GAMMA_W = 5.0e-5f;
+
+    float f_cap = geom_in[0u * nc + col];
+    float h_cap = geom_in[1u * nc + col];
+    float v_cap = geom_in[2u * nc + col];
+    bool is_basin = (v_cap > 0.0f) && (f_cap > 1.0e-4f);
+
+    float u1 = force_in[0u * nc + col];
+    float v1 = force_in[1u * nc + col];
+    float temp1 = force_in[2u * nc + col];
+    float qv1 = force_in[3u * nc + col];
+    float pres_sfc = force_in[4u * nc + col];
+    float rho1 = force_in[5u * nc + col];
+    float z_ref = force_in[6u * nc + col];
+    float sw1_dir = force_in[7u * nc + col];
+    float sw1_dif = force_in[8u * nc + col];
+    float sw2_dir = force_in[9u * nc + col];
+    float sw2_dif = force_in[10u * nc + col];
+    float lw_dn = force_in[11u * nc + col];
+    float pr_rain = max(force_in[12u * nc + col], 0.0f);
+    float pr_snow = max(force_in[13u * nc + col], 0.0f);
+    float mu0 = force_in[14u * nc + col];
+    float area_c = force_in[15u * nc + col];
+    float f_cor = force_in[16u * nc + col];
+
+    float v_lake = state_io[0u * nc + col];
+    float v_comp = state_io[1u * nc + col];
+    float t_ml = state_io[2u * nc + col];
+    float t_bot = state_io[3u * nc + col];
+    float h_ml = state_io[4u * nc + col];
+    float h_ice = state_io[5u * nc + col];
+    float swe_ice = state_io[6u * nc + col];
+    float t_ice = state_io[7u * nc + col];
+
+    // 1. Hypsometry before step
+    float phi = is_basin ? clamp(v_lake / max(v_cap, 1.0f), 0.0f, 1.0f) : 0.0f;
+    float phi13 = (phi > 0.0f) ? pow(phi, 1.0f / 3.0f) : 0.0f;
+    float f_raw = f_cap * phi13 * phi13;
+    float h_raw = h_cap * phi13;
+    bool active = is_basin && (h_raw >= H_MIN_ACT) && (f_raw > 1.0e-6f);
+    float f_lake = active ? f_raw : 0.0f;
+    float h_lake = active ? h_raw : 0.0f;
+
+    // 2. Surface albedos
+    float mu_s = clamp(mu0, 0.03f, 1.0f);
+    float alb_open_dir = clamp(0.026f / (pow(mu_s, 1.7f) + 0.065f) + 0.15f * (mu_s - 0.1f) * (mu_s - 0.5f) * (mu_s - 1.0f), 0.04f, 0.45f);
+    float alb_open_dif = 0.06f;
+    float f_sn_i = swe_ice / (swe_ice + 20.0f);
+    float alb_ice_v = 0.55f + (0.82f - 0.55f) * f_sn_i;
+    float alb_ice_n = 0.30f + (0.52f - 0.30f) * f_sn_i;
+    bool is_frozen = active && (h_ice > 1.0e-4f);
+
+    float alb_vd = is_frozen ? alb_ice_v : alb_open_dir;
+    float alb_vf = is_frozen ? alb_ice_v : alb_open_dif;
+    float alb_nd = is_frozen ? alb_ice_n : alb_open_dir;
+    float alb_nf = is_frozen ? alb_ice_n : alb_open_dif;
+
+    if (!active) {
+        float t_dry = clamp(temp1, T_FREEZE, 320.0f);
+        state_io[0u * nc + col] = is_basin ? max(v_lake, 0.0f) : 0.0f;
+        state_io[1u * nc + col] = is_basin ? v_comp : 0.0f;
+        state_io[2u * nc + col] = t_dry;
+        state_io[3u * nc + col] = t_dry;
+        state_io[4u * nc + col] = 0.0f;
+        state_io[5u * nc + col] = 0.0f;
+        state_io[6u * nc + col] = 0.0f;
+        state_io[7u * nc + col] = clamp(temp1, 180.0f, T_FREEZE);
+
+        diag_out[0u * nc + col] = 0.0f;
+        diag_out[1u * nc + col] = 0.0f;
+        diag_out[2u * nc + col] = 0.0f;
+        diag_out[3u * nc + col] = t_dry;
+        diag_out[4u * nc + col] = alb_vd;
+        diag_out[5u * nc + col] = alb_vf;
+        diag_out[6u * nc + col] = alb_nd;
+        diag_out[7u * nc + col] = alb_nf;
+        diag_out[8u * nc + col] = 0.0f;
+        diag_out[9u * nc + col] = 0.0f;
+        diag_out[10u * nc + col] = 0.0f;
+        diag_out[11u * nc + col] = 0.0f;
+        diag_out[12u * nc + col] = 0.0f;
+        return;
+    }
+
+    float area_lake = max(f_lake * area_c, 1.0f);
+    float sw_abs = max(
+        sw1_dir * (1.0f - alb_vd) + sw1_dif * (1.0f - alb_vf) +
+        sw2_dir * (1.0f - alb_nd) + sw2_dif * (1.0f - alb_nf),
+        0.0f
+    );
+
+    // 3. Bulk aerodynamic transfer
+    float z0 = is_frozen ? 1.0e-3f : 1.0e-4f;
+    float zr = max(z_ref, 2.0f);
+    float ln_z = log(zr / z0);
+    float cd_neut = (KAPPA / ln_z) * (KAPPA / ln_z);
+    float u_eff = sqrt(u1 * u1 + v1 * v1 + 0.25f);
+    float t_skin0 = is_frozen ? t_ice : t_ml;
+    float ri_b = GRAVITY * zr * (temp1 - t_skin0) / (max(temp1, 180.0f) * u_eff * u_eff);
+    float stab = (ri_b >= 0.0f) ? (1.0f / (1.0f + 5.0f * min(ri_b, 2.0f))) : min(1.0f - 2.0f * max(ri_b, -2.0f), 2.0f);
+    float cd = clamp(cd_neut * stab, 2.0e-4f, 5.0e-3f);
+    float ga = max(rho1, 0.1f) * cd * u_eff;
+    float tau_x = -ga * u1;
+    float tau_y = -ga * v1;
+
+    float h_liq = max(h_lake - (RHO_ICE / RHO_W) * h_ice, 0.0f);
+    float h_ml_c = clamp(h_ml, min(H_ML_MIN, h_liq), max(h_liq, 0.05f));
+    float h_bot_c = max(h_liq - h_ml_c, 0.0f);
+    float c_ml = RHO_W * CP_W * max(h_ml_c, H_MIN_ACT);
+
+    float shf_out = 0.0f, lhf_out = 0.0f, evap_out = 0.0f, dv_m3 = 0.0f;
+    float t_ml_n = t_ml, t_bot_n = t_bot, h_ice_n = h_ice, swe_n = swe_ice, t_ice_n = t_ice;
+
+    if (!is_frozen) {
+        float qs_w, dqs_w;
+        esm_qsat_lake(t_ml, pres_sfc, false, T_FREEZE, EPS_W, L_V0, R_V, qs_w, dqs_w);
+        float f_sw_ml = (h_bot_c > 1.0e-3f) ? (-esm_expm1(-k_ext * h_ml_c)) : 1.0f;
+        float sw_ml = f_sw_ml * sw_abs;
+        float sw_bot = (1.0f - f_sw_ml) * sw_abs;
+
+        float t0 = t_ml;
+        float t03 = t0 * t0 * t0;
+        float f_net0 = sw_ml + EMISS * lw_dn - EMISS * SIGMA_SB * t03 * t0 - CP_D * ga * (t0 - temp1) - L_V0 * ga * (qs_w - qv1) - L_F0 * pr_snow;
+        float df_dt = 4.0f * EMISS * SIGMA_SB * t03 + CP_D * ga + L_V0 * ga * dqs_w;
+        float dt_ml = (f_net0 * dt) / (c_ml + dt * df_dt);
+        float t_ml_star = t0 + dt_ml;
+
+        shf_out = CP_D * ga * (t_ml_star - temp1);
+        float evap_raw = ga * (qs_w + dqs_w * dt_ml - qv1);
+        float evap_max = (RHO_W * h_lake) / max(dt, 1.0f) + pr_rain + pr_snow;
+        evap_out = min(evap_raw, evap_max);
+        lhf_out = L_V0 * evap_out;
+        dv_m3 = ((pr_rain + pr_snow - evap_out) * area_lake * dt) / RHO_W;
+
+        t_bot_n = (h_bot_c > 1.0e-3f) ? (t_bot + (sw_bot * dt) / (RHO_W * CP_W * h_bot_c)) : t_ml_star;
+        float freeze_def = max(T_FREEZE - t_ml_star, 0.0f);
+        h_ice_n = min((c_ml * freeze_def) / (RHO_ICE * L_F0), (RHO_W / RHO_ICE) * h_lake);
+        t_ml_n = clamp(t_ml_star, T_FREEZE, 330.0f);
+        t_bot_n = clamp(t_bot_n, T_FREEZE, 330.0f);
+        swe_n = 0.0f;
+        t_ice_n = T_FREEZE;
+    } else {
+        swe_n = swe_ice + pr_snow * dt;
+        h_ice_n = h_ice;
+        float k_eff = 1.0f / (max(h_ice_n, 1.0e-3f) / K_ICE + (swe_n / RHO_SNOW) / K_SNOW);
+        float t0 = clamp(t_ice, 180.0f, T_FREEZE);
+        float qs_i, dqs_i;
+        esm_qsat_lake(t0, pres_sfc, true, T_FREEZE, EPS_W, L_S0, R_V, qs_i, dqs_i);
+        float t03 = t0 * t0 * t0;
+        float f_net0 = sw_abs + EMISS * lw_dn - EMISS * SIGMA_SB * t03 * t0 - CP_D * ga * (t0 - temp1) - L_S0 * ga * (qs_i - qv1) + k_eff * (T_FREEZE - t0);
+        float df_dt = 4.0f * EMISS * SIGMA_SB * t03 + CP_D * ga + L_S0 * ga * dqs_i + k_eff;
+        float c_skin = RHO_ICE * CP_ICE * clamp(h_ice_n, 0.01f, 0.10f);
+        float t_star = t0 + (f_net0 * dt) / (c_skin + dt * df_dt);
+
+        float e_melt = max(t_star - T_FREEZE, 0.0f) * (c_skin + dt * df_dt);
+        t_ice_n = clamp(t_star, 180.0f, T_FREEZE);
+        shf_out = CP_D * ga * (t_ice_n - temp1);
+        float evap_raw = ga * (qs_i + dqs_i * (t_ice_n - t0) - qv1);
+        float avail_si = swe_n + RHO_ICE * h_ice_n;
+        evap_out = min(evap_raw, avail_si / max(dt, 1.0f));
+        lhf_out = L_S0 * evap_out;
+
+        float sub_m = evap_out * dt;
+        float dm_sn_sub = (sub_m >= 0.0f) ? min(swe_n, sub_m) : sub_m;
+        swe_n = max(swe_n - dm_sn_sub, 0.0f);
+        float dm_ic_sub = max(sub_m - dm_sn_sub, 0.0f);
+        float dh_ic_sub = min(h_ice_n, dm_ic_sub / RHO_ICE);
+        h_ice_n = max(h_ice_n - dh_ic_sub, 0.0f);
+
+        float dm_sn_mlt = min(swe_n, e_melt / L_F0);
+        swe_n = max(swe_n - dm_sn_mlt, 0.0f);
+        float e_rem = max(e_melt - dm_sn_mlt * L_F0, 0.0f);
+        float dh_ic_mlt = min(h_ice_n, e_rem / (RHO_ICE * L_F0));
+        h_ice_n = max(h_ice_n - dh_ic_mlt, 0.0f);
+
+        float f_cond_b = k_eff * (T_FREEZE - t_ice_n);
+        float r_und = (GAMMA_W / max(h_ml_c, H_MIN_ACT)) * dt;
+        float fac_u = -esm_expm1(-min(max(r_und, 0.0f), 40.0f));
+        float dt_ml_u = max(t_ml - T_FREEZE, 0.0f) * fac_u;
+        float e_und = c_ml * dt_ml_u;
+        t_ml_n = max(t_ml - dt_ml_u, T_FREEZE);
+        t_bot_n = t_bot;
+        float dh_base = (f_cond_b * dt - e_und) / (RHO_ICE * L_F0);
+        h_ice_n = clamp(h_ice_n + dh_base, 0.0f, (RHO_W / RHO_ICE) * h_lake);
+
+        float dm_sn_dump = 0.0f;
+        if (h_ice_n <= 1.0e-4f) {
+            dm_sn_dump = swe_n;
+            swe_n = 0.0f;
+            h_ice_n = 0.0f;
+        }
+        dv_m3 = ((pr_rain * dt + dm_sn_mlt + dm_sn_dump - dh_ic_sub * RHO_ICE) * area_lake) / RHO_W;
+    }
+
+    // Neumaier/Kahan compensated volume addition
+    float y_k = dv_m3 + v_comp;
+    float t_k = v_lake + y_k;
+    float c_k = (fabs(v_lake) >= fabs(y_k)) ? ((v_lake - t_k) + y_k) : ((y_k - t_k) + v_lake);
+    float v_new = max(t_k, 0.0f);
+
+    // 5. Post-step hypsometry & 2-layer vertical mixing
+    float phi2 = clamp(v_new / max(v_cap, 1.0f), 0.0f, 1.0f);
+    float phi2_13 = (phi2 > 0.0f) ? pow(phi2, 1.0f / 3.0f) : 0.0f;
+    float f_raw2 = f_cap * phi2_13 * phi2_13;
+    float h_raw2 = h_cap * phi2_13;
+    bool act2 = (h_raw2 >= H_MIN_ACT) && (f_raw2 > 1.0e-6f);
+    float f_lake2 = act2 ? f_raw2 : 0.0f;
+    float h_lake2 = act2 ? h_raw2 : 0.0f;
+
+    if (!act2) {
+        h_ice_n = 0.0f;
+        swe_n = 0.0f;
+    } else {
+        h_ice_n = min(h_ice_n, (RHO_W / RHO_ICE) * h_lake2);
+    }
+
+    float h_liq2 = max(h_lake2 - (RHO_ICE / RHO_W) * h_ice_n, 0.0f);
+    float h_ml_min2 = min(H_ML_MIN, h_liq2);
+    float h_ml2 = clamp(h_ml_c, h_ml_min2, h_liq2);
+    float h_bot2 = max(h_liq2 - h_ml2, 0.0f);
+
+    float dm1 = t_ml_n - T_MD;
+    float dm2 = t_bot_n - T_MD;
+    float rho_ml = RHO_W * (1.0f - ALPHA_RHO * dm1 * dm1);
+    float rho_bot = RHO_W * (1.0f - ALPHA_RHO * dm2 * dm2);
+
+    float t_ml2 = t_ml_n;
+    float t_bot2 = t_bot_n;
+    bool overturn = act2 && (h_bot2 > 1.0e-3f) && (rho_ml >= rho_bot);
+    if (overturn) {
+        float t_mix = (h_ml2 * t_ml2 + h_bot2 * t_bot2) / max(h_liq2, 1.0e-3f);
+        t_ml2 = t_mix;
+        t_bot2 = t_mix;
+        h_ml2 = h_liq2;
+        h_bot2 = 0.0f;
+    } else if (act2 && (h_liq2 > H_ML_MIN + 1.0e-3f) && (h_ice_n <= 1.0e-4f)) {
+        float drho = max(rho_bot - rho_ml, 0.0f);
+        float n_bv = sqrt((GRAVITY / RHO_W) * drho / max(h_liq2, 1.0f));
+        float u_star_w = sqrt(max(rho1, 0.1f) / RHO_W) * sqrt(cd) * u_eff;
+        float h_eq = clamp((0.25f * u_star_w) / (fabs(f_cor) + 0.15f * n_bv + 1.0e-4f), h_ml_min2, h_liq2);
+        float rel_m = -esm_expm1(-dt / 86400.0f);
+        float h_ml_new = clamp(h_ml2 + (h_eq - h_ml2) * rel_m, h_ml_min2, h_liq2);
+        float dh = h_ml_new - h_ml2;
+        float h_bot_new = max(h_liq2 - h_ml_new, 0.0f);
+        if (dh > 0.0f) {
+            t_ml2 = (h_ml2 * t_ml2 + dh * t_bot2) / max(h_ml_new, 1.0e-3f);
+        } else if (dh < 0.0f && h_bot_new > 1.0e-3f) {
+            t_bot2 = (h_bot2 * t_bot2 + (-dh) * t_ml2) / max(h_bot_new, 1.0e-3f);
+        }
+        h_ml2 = h_ml_new;
+        h_bot2 = h_bot_new;
+    }
+
+    if (act2 && (h_ml2 > 1.0e-3f) && (h_bot2 > 1.0e-3f)) {
+        float h_harm = (h_ml2 * h_bot2) / max(h_liq2, 1.0e-3f);
+        float r_dif = KZ_TH / max(h_harm * 0.5f * h_liq2, 1.0e-2f);
+        float f_dif = -esm_expm1(-min(max(r_dif * dt, 0.0f), 40.0f));
+        float d_t = t_ml2 - t_bot2;
+        t_ml2 = t_ml2 - d_t * f_dif * (h_bot2 / max(h_liq2, 1.0e-3f));
+        t_bot2 = t_bot2 + d_t * f_dif * (h_ml2 / max(h_liq2, 1.0e-3f));
+    } else if (act2) {
+        t_bot2 = t_ml2;
+    }
+
+    t_ml2 = clamp(t_ml2, T_FREEZE, 330.0f);
+    t_bot2 = clamp(t_bot2, T_FREEZE, 330.0f);
+    float f_ice2 = (act2 && (h_ice_n > 1.0e-4f)) ? 1.0f : 0.0f;
+    float t_rad2 = (f_ice2 > 0.5f) ? t_ice_n : t_ml2;
+
+    state_io[0u * nc + col] = v_new;
+    state_io[1u * nc + col] = c_k;
+    state_io[2u * nc + col] = t_ml2;
+    state_io[3u * nc + col] = t_bot2;
+    state_io[4u * nc + col] = h_ml2;
+    state_io[5u * nc + col] = h_ice_n;
+    state_io[6u * nc + col] = swe_n;
+    state_io[7u * nc + col] = t_ice_n;
+
+    diag_out[0u * nc + col] = f_lake2;
+    diag_out[1u * nc + col] = h_lake2;
+    diag_out[2u * nc + col] = f_ice2;
+    diag_out[3u * nc + col] = t_rad2;
+    diag_out[4u * nc + col] = alb_vd;
+    diag_out[5u * nc + col] = alb_vf;
+    diag_out[6u * nc + col] = alb_nd;
+    diag_out[7u * nc + col] = alb_nf;
+    diag_out[8u * nc + col] = shf_out;
+    diag_out[9u * nc + col] = lhf_out;
+    diag_out[10u * nc + col] = evap_out;
+    diag_out[11u * nc + col] = tau_x;
+    diag_out[12u * nc + col] = tau_y;
+}
 """
 
 
@@ -2607,3 +2955,84 @@ def run_ozone_chem_metal(
         threads=nc,
     )
     return o3_out, diag_out[0], diag_out[1], diag_out[2], diag_out[3]
+
+
+def run_dynamic_lake_step_metal(
+    lib: Any,
+    lake: Any,
+    u_1: torch.Tensor,
+    v_1: torch.Tensor,
+    temp_1: torch.Tensor,
+    qv_1: torch.Tensor,
+    pres_sfc: torch.Tensor,
+    rho_1: torch.Tensor,
+    z_ref_rel: torch.Tensor,
+    sw1_dir_dn: torch.Tensor,
+    sw1_dif_dn: torch.Tensor,
+    sw2_dir_dn: torch.Tensor,
+    sw2_dif_dn: torch.Tensor,
+    lw_dn: torch.Tensor,
+    precip_rain: torch.Tensor,
+    precip_snow: torch.Tensor,
+    mu0_cell: torch.Tensor,
+    area_cell: torch.Tensor,
+    f_cor_cell: torch.Tensor,
+    dt: float,
+    *,
+    k_ext_m1: float = 0.5,
+) -> None:
+    """Execute single-launch fused Metal/CUDA 2-layer dynamic lake + ice + Kahan volume kernel."""
+    nc = int(temp_1.numel())
+    dev = temp_1.device
+    geom_in = torch.stack([lake.f_cap, lake.h_cap, lake.v_cap_m3], dim=0).contiguous()
+    force_in = torch.stack(
+        [
+            u_1, v_1, temp_1, qv_1, pres_sfc, rho_1, z_ref_rel,
+            sw1_dir_dn, sw1_dif_dn, sw2_dir_dn, sw2_dif_dn, lw_dn,
+            precip_rain, precip_snow, mu0_cell, area_cell, f_cor_cell,
+        ],
+        dim=0,
+    ).contiguous()
+    state_io = torch.stack(
+        [
+            lake.v_lake_m3, lake.v_lake_comp, lake.t_ml, lake.t_bot,
+            lake.h_ml, lake.h_ice, lake.swe_ice, lake.t_ice,
+        ],
+        dim=0,
+    ).contiguous()
+    diag_out = torch.empty((13, nc), dtype=torch.float32, device=dev)
+
+    lib.dynamic_lake_step_col(
+        geom_in,
+        force_in,
+        state_io,
+        diag_out,
+        [int(nc), 0, 0, 0],
+        [float(dt), float(k_ext_m1), float(C.T_FREEZE), float(C.STEFAN_BOLTZMANN)],
+        [float(C.CP_D), float(C.L_V0), float(C.L_S0), float(C.L_F0)],
+        [float(C.GRAVITY), float(C.VON_KARMAN), float(C.EPS_WATER), float(C.R_V)],
+        threads=nc,
+    )
+
+    lake.v_lake_m3 = state_io[0].contiguous()
+    lake.v_lake_comp = state_io[1].contiguous()
+    lake.t_ml = state_io[2].contiguous()
+    lake.t_bot = state_io[3].contiguous()
+    lake.h_ml = state_io[4].contiguous()
+    lake.h_ice = state_io[5].contiguous()
+    lake.swe_ice = state_io[6].contiguous()
+    lake.t_ice = state_io[7].contiguous()
+
+    lake.f_lake = diag_out[0].contiguous()
+    lake.h_lake = diag_out[1].contiguous()
+    lake.f_ice = diag_out[2].contiguous()
+    lake.t_rad = diag_out[3].contiguous()
+    lake.alb_vis_dir = diag_out[4].contiguous()
+    lake.alb_vis_dif = diag_out[5].contiguous()
+    lake.alb_nir_dir = diag_out[6].contiguous()
+    lake.alb_nir_dif = diag_out[7].contiguous()
+    lake.shf = diag_out[8].contiguous()
+    lake.lhf = diag_out[9].contiguous()
+    lake.evap = diag_out[10].contiguous()
+    lake.tau_x = diag_out[11].contiguous()
+    lake.tau_y = diag_out[12].contiguous()

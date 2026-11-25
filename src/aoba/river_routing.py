@@ -13,7 +13,7 @@ exponential-reservoir time integration (Mizukami et al., 2016, *Geosci. Model De
 plumes (Amazon, Congo, Yangtze, Siberian Arctic rivers) to coastal ocean Voronoi cells
 with exact float32 + Kahan mass conservation.
 
-AOBA Formulation Reference: Sec. 7.9, Eq. (7.44) (Priority-Flood SCVT Voronoi River Routing).
+AOBA Formulation Reference: Sec. 7.9, Eq. (7.46) (Priority-Flood SCVT Voronoi River Routing & Dynamic Lake Spill).
 """
 
 from __future__ import annotations
@@ -160,39 +160,144 @@ def init_river_routing_state(mesh, device: torch.device | None = None, dtype: to
     )
 
 
+def compute_priority_flood_depressions(
+    z_valley: torch.Tensor,
+    surf_type: torch.Tensor,
+    cells_on_edge: torch.Tensor,
+) -> np.ndarray:
+    """Compute exact Priority-Flood closed-depression fill depth `z_filled - z_valley` [m] on land cells.
+
+    Uses Barnes, Lehman, & Mulla (2014) Priority-Flood seeded at ocean cells (`surf_type == SURF_OCEAN`)
+    on valley-floor elevation `z_valley` (e.g., `Earth2014` subgrid minimum `z_min_land`, falling back to
+    `z_topo` for synthetic or dynamically evolved ice-sheet DEMs). Evaluating depressions on the valley
+    floor eliminates coarse-cell canyon-sill aliasing along deep river gorges (Amazon, Congo) while
+    preserving genuine closed endorheic basins (Caspian, Aral, Chad/Bodele, Eyre, Turpan, Qattara,
+    Death Valley, Dead Sea, and proglacial isostatic basins).
+    """
+    z_np = z_valley.detach().cpu().numpy().astype(np.float64)
+    st_np = surf_type.detach().cpu().numpy().astype(np.int64)
+    coe_np = cells_on_edge.detach().cpu().numpy().astype(np.int64)
+    nc = z_np.shape[0]
+
+    adj: list[list[int]] = [[] for _ in range(nc)]
+    for e in range(coe_np.shape[0]):
+        u, v = int(coe_np[e, 0]), int(coe_np[e, 1])
+        adj[u].append(v)
+        adj[v].append(u)
+
+    visited = np.zeros(nc, dtype=bool)
+    z_filled = z_np.copy()
+    heap: list[tuple[float, int]] = []
+    ocean_cells = np.nonzero(st_np == SURF_OCEAN)[0]
+    if ocean_cells.size == 0:
+        ocean_cells = np.array([int(np.argmin(z_np))], dtype=np.int64)
+
+    for c in ocean_cells:
+        ci = int(c)
+        visited[ci] = True
+        z_filled[ci] = 0.0
+        heapq.heappush(heap, (0.0, ci))
+
+    eps_z = 1.0e-3
+    while heap:
+        elev_u, u = heapq.heappop(heap)
+        for v in adj[u]:
+            if not visited[v]:
+                visited[v] = True
+                elev_v = max(float(z_np[v]), elev_u + eps_z)
+                z_filled[v] = elev_v
+                heapq.heappush(heap, (elev_v, v))
+
+    # Closed depression depth strictly on ice-free land cells (surf_type == 1)
+    d_pf = np.where(st_np == 1, np.maximum(z_filled - z_np, 0.0), 0.0)
+    return d_pf
+
+
 def step_river_routing_voronoi(
     river: RiverRoutingState,
     runoff_liquid_kgm2s: torch.Tensor,
     area_cell: torch.Tensor,
     dt: float,
+    *,
+    lake_state: object | None = None,
 ) -> torch.Tensor:
     """Advance Voronoi river channel storage by `dt` [s] and return ocean mouth flux [kg m^-2 s^-1].
 
     Uses exact exponential linear-reservoir outflow `f = -expm1(-v/L * dt)` per Voronoi cell,
     which is unconditionally positive and strictly conserves total liquid water mass
-    (channel storage + ocean river-mouth delivery == cumulative terrestrial runoff).
+    (channel storage + dynamic lake storage + ocean river-mouth delivery == cumulative terrestrial runoff).
+
+    When `lake_state` (`DynamicLakeState`) is provided, local terrestrial runoff (scaled by
+    `1 - f_lake`) and upstream river inflow enter topographic lake basins (`v_cap_m3 > 0`) first
+    via Kahan compensated summation. Endorheic basins (`v_lake < v_cap`) retain all inflow with
+    zero downstream spill, whereas filled exorheic basins (`v_lake > v_cap`) spill the exact excess
+    mass into the local river channel to drain downstream.
     """
     is_land_f = river.is_land_river.to(runoff_liquid_kgm2s.dtype)
     is_ocn_f = 1.0 - is_land_f
 
-    # 1. Add local terrestrial liquid runoff [kg] into river channel storage
-    inflow_local_kg = torch.clamp(runoff_liquid_kgm2s, min=0.0) * area_cell * dt * is_land_f
-    stor_mid, comp_mid = _kahan_add(river.storage_kg, inflow_local_kg, river.storage_comp)
-    stor_pos = torch.clamp(stor_mid, min=0.0) * is_land_f
+    if lake_state is None:
+        # 1. Add local terrestrial liquid runoff [kg] into river channel storage
+        inflow_local_kg = torch.clamp(runoff_liquid_kgm2s, min=0.0) * area_cell * dt * is_land_f
+        stor_mid, comp_mid = _kahan_add(river.storage_kg, inflow_local_kg, river.storage_comp)
+        stor_pos = torch.clamp(stor_mid, min=0.0) * is_land_f
 
-    # 2. Exact unconditional exponential outflow fraction f_out = 1 - exp(-(v / L) * dt)
-    k_rate = river.flow_vel_ms / torch.clamp(river.reach_len_m, min=1.0)
-    f_out = -torch.expm1(-torch.clamp(k_rate * dt, min=0.0, max=40.0))
-    outflow_kg = (stor_pos * f_out) * is_land_f
+        # 2. Exact unconditional exponential outflow fraction f_out = 1 - exp(-(v / L) * dt)
+        k_rate = river.flow_vel_ms / torch.clamp(river.reach_len_m, min=1.0)
+        f_out = -torch.expm1(-torch.clamp(k_rate * dt, min=0.0, max=40.0))
+        outflow_kg = (stor_pos * f_out) * is_land_f
 
-    # 3. Scatter outflow to downstream Voronoi cell (land -> channel storage; ocean -> river mouth)
-    inflow_up_kg = torch.zeros_like(outflow_kg)
-    inflow_up_kg.scatter_add_(0, river.downstream_idx, outflow_kg)
+        # 3. Scatter outflow to downstream Voronoi cell (land -> channel storage; ocean -> river mouth)
+        inflow_up_kg = torch.zeros_like(outflow_kg)
+        inflow_up_kg.scatter_add_(0, river.downstream_idx, outflow_kg)
 
-    net_land_delta_kg = (inflow_up_kg * is_land_f) - outflow_kg
-    stor_new, comp_new = _kahan_add(stor_mid, net_land_delta_kg, comp_mid)
-    river.storage_kg = torch.clamp(stor_new, min=0.0) * is_land_f
-    river.storage_comp = comp_new * is_land_f
+        net_land_delta_kg = (inflow_up_kg * is_land_f) - outflow_kg
+        stor_new, comp_new = _kahan_add(stor_mid, net_land_delta_kg, comp_mid)
+        river.storage_kg = torch.clamp(stor_new, min=0.0) * is_land_f
+        river.storage_comp = comp_new * is_land_f
+    else:
+        # Coupled dynamic lake <-> river sill-overflow routing (exact Kahan water conservation)
+        f_lake = getattr(lake_state, "f_lake")
+        v_cap_m3 = getattr(lake_state, "v_cap_m3")
+        v_lake_m3 = getattr(lake_state, "v_lake_m3")
+        v_lake_comp = getattr(lake_state, "v_lake_comp")
+        has_basin_f = (v_cap_m3 > 0.0).to(runoff_liquid_kgm2s.dtype) * is_land_f
+        no_basin_f = (1.0 - has_basin_f) * is_land_f
+
+        # Terrestrial runoff strictly from the non-lake fraction (1 - f_lake) of each land cell
+        runoff_land_kg = torch.clamp(runoff_liquid_kgm2s, min=0.0) * torch.clamp(1.0 - f_lake, min=0.0, max=1.0) * area_cell * dt * is_land_f
+
+        # 1. Existing channel water + non-basin local runoff drains via exact exponential reservoir
+        stor_pre, comp_pre = _kahan_add(river.storage_kg, runoff_land_kg * no_basin_f, river.storage_comp)
+        stor_pos = torch.clamp(stor_pre, min=0.0) * is_land_f
+        k_rate = river.flow_vel_ms / torch.clamp(river.reach_len_m, min=1.0)
+        f_out = -torch.expm1(-torch.clamp(k_rate * dt, min=0.0, max=40.0))
+        outflow_kg = (stor_pos * f_out) * is_land_f
+
+        # 2. Scatter channel outflow to downstream cells
+        inflow_up_kg = torch.zeros_like(outflow_kg)
+        inflow_up_kg.scatter_add_(0, river.downstream_idx, outflow_kg)
+
+        # 3. Basin cells intercept local terrestrial runoff + upstream river inflow into lake volume
+        lake_inflow_kg = (runoff_land_kg + inflow_up_kg) * has_basin_f
+        dv_in_m3 = lake_inflow_kg * 1.0e-3  # rho_w = 1000 kg m^-3
+        v_mid, v_comp_mid = _kahan_add(v_lake_m3, dv_in_m3, v_lake_comp)
+        # Sill overflow: exact excess above topographic capacity v_cap_m3 spills into river channel
+        dv_spill_m3 = torch.clamp(v_mid - v_cap_m3, min=0.0) * has_basin_f
+        v_new, v_comp_new = _kahan_add(v_mid, -dv_spill_m3, v_comp_mid)
+        lake_state.v_lake_m3 = torch.minimum(torch.clamp(v_new, min=0.0), v_cap_m3) * has_basin_f
+        lake_state.v_lake_comp = v_comp_new * has_basin_f
+        spill_kg = dv_spill_m3 * 1000.0
+
+        inv_dt_l = 1.0 / max(dt, 1.0)
+        lake_state.q_inflow_m3s = dv_in_m3 * inv_dt_l
+        lake_state.q_spill_m3s = dv_spill_m3 * inv_dt_l
+
+        # 4. Update river channel storage: non-basin cells receive inflow_up; basin cells receive spill_kg
+        net_land_delta_kg = (inflow_up_kg * no_basin_f) + spill_kg - outflow_kg
+        stor_new, comp_new = _kahan_add(stor_pre, net_land_delta_kg, comp_pre)
+        river.storage_kg = torch.clamp(stor_new, min=0.0) * is_land_f
+        river.storage_comp = comp_new * is_land_f
 
     inv_dt = 1.0 / max(dt, 1.0)
     river.discharge_m3s = (outflow_kg * inv_dt) * 1.0e-3  # rho_w = 1000 kg m^-3 -> m^3 s^-1

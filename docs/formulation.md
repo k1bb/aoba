@@ -806,15 +806,37 @@ AOBA's land system eliminates prescribed PFT and soil-texture maps, solving two-
 
 ![Figure 7.1: MAML Subgrid Land Surface, Autonomous EEO Biosphere, Soil Hydrology & Terrestrial C/N](assets/fig_05_land_maml_eeo.svg)
 
-### 7.2 Canopy Radiative Transfer, Two-Leaf Enzyme Allocation & Two-Stream Albedos (`src/aoba/biosphere.py`)
+### 7.2 Canopy Radiative Transfer, Discrete-Crown Clumping, Optimal Leaf Angle & Two-Leaf Allocation (`src/aoba/biosphere.py`)
 
-Using McCree (1972) photon conversions ($4.57$ direct, $4.24\ \mu\mathrm{mol\ J^{-1}}$ diffuse) and de Pury & Farquhar (1997) under a spherical leaf-angle distribution with exposed leaf area index $L_c$ and leaf scattering coefficients ($\sigma_{\mathrm{vis}} = 0.15$, $\sigma_{\mathrm{nir}} = 0.80$), direct extinction $k_{db}$, scattering-adjusted extinction $k'_b$, diffuse extinction $k'_d = 0.719$, and canopy top reflectances $(\rho_{cb}, \rho_{cd})$ are:
+Rather than imposing a fixed spherical leaf-angle distribution, leaf projection $G(\mu_0; \chi_L)$ and inverse diffuse optical depth $\bar{\mu}(\chi_L)$ follow Ross (1975), Goudriaan (1977), and Dai et al. (2004, Eq. A4c; smoothly evaluated via a 3-term Taylor expansion as $\phi_2 \to 0$ so $\bar{\mu} \to (2\phi_1)^{-1} = 1$) as functions of the leaf orientation index $\chi_L \in [-0.40, +0.50]$ ($0$: spherical, $<0$: erectophile, $>0$: planophile). A non-iterative closed-form optimality target $\chi_L^*$ balances high-LAI light penetration (Monsi & Saeki, 1953; Hikosaka & Hirose, 1997) against aridity, VPD, and high-insolation heat/transpiration avoidance (Ehleringer & Werk, 1986; Falster & Westoby, 2003; Pisek et al., 2013), acclimating daily on a 30-day timescale:
 
 $$
 \begin{aligned}
-k_{db} &= \frac{0.5}{\max(\mu_0,\ 0.01)}, \qquad k'_b = k_{db}\sqrt{1 - \sigma_{\mathrm{vis}}}, \\
-\rho_h &= \frac{1 - \sqrt{1 - \sigma_{\mathrm{vis}}}}{1 + \sqrt{1 - \sigma_{\mathrm{vis}}}}, \qquad \rho_{cb} = \frac{2\rho_h k_{db}}{1 + k_{db}}, \qquad \rho_{cd} = 0.036
+\phi_1 &= 0.5 - 0.633\,\chi_L - 0.330\,\chi_L^2, \qquad \phi_2 = 0.877(1 - 2\phi_1), \qquad G(\mu_0;\chi_L) = \phi_1 + \phi_2\,\mu_0, \\
+\bar{\mu}(\chi_L) &= \frac{1}{\phi_2}\left[1 - \frac{\phi_1}{\phi_2}\ln\!\left(1 + \frac{\phi_2}{\phi_1}\right)\right], \\
+\chi_{\mathrm{light}} &= 0.25\tanh\!\left(\frac{2.5 - L}{2.0}\right), \qquad S_{\mathrm{dry}} = \operatorname{clamp}\!\left(\frac{1.2 - \mathrm{MI}}{1.2},\ 0,\ 1\right), \\
+S_{\mathrm{vpd}} &= \frac{D_{\mathrm{mid}}}{D_{\mathrm{mid}} + 1500\ \mathrm{Pa}}, \qquad S_{\mathrm{sun}} = \operatorname{clamp}\!\left(\frac{\bar{\mu}_{0,\mathrm{mid}} - 0.35}{0.55},\ 0,\ 1\right), \\
+\chi_L^* &= \operatorname{clamp}\!\Big(\chi_{\mathrm{light}} - 0.55(0.60 S_{\mathrm{dry}} + 0.40 S_{\mathrm{vpd}})(0.40 + 0.60 S_{\mathrm{sun}}),\ -0.40,\ +0.50\Big)
 \end{aligned} \tag{7.1}
+$$
+
+where $\mathrm{MI} = P_{\mathrm{ann}}/\mathrm{PET}_{\mathrm{ann}}$ is the annual moisture index and $D_{\mathrm{mid}}, \bar{\mu}_{0,\mathrm{mid}}$ are EMA midday VPD and solar zenith cosine. To eliminate the sparse-canopy over-absorption bias of horizontally uniform infinite turbid-medium canopies (de Pury & Farquhar, 1997) without PFT lookup tables, Poisson-distributed discrete spherical crowns of minimum internal foliage density $L_{c,0} = 1.50\ \mathrm{m^2\ m^{-2}}$ yield a zenith-angle-dependent analytical clumping index $\Omega(\mu, L_c) \in [0.35, 1.0]$ (Li & Strahler, 1992; Nilson, 1999; Ni-Meister et al., 2010; Braghiere et al., 2019):
+
+$$
+\begin{aligned}
+f_c(\mu) &= 1 - \exp\!\left(-\frac{L_c}{L_{c,0}\max(\mu,\ 0.15)}\right), \qquad k_0(\mu) = \frac{G(\mu;\chi_L)}{\mu}, \\
+P_{\mathrm{gap}}(\mu) &= \big(1 - f_c(\mu)\big) + f_c(\mu)\exp\!\left(-\frac{k_0(\mu)\,L_c}{f_c(\mu)}\right), \\
+\Omega(\mu, L_c) &= \frac{-\ln P_{\mathrm{gap}}(\mu)}{k_0(\mu)\,L_c}, \qquad \lim_{L_c\to 0}\Omega(\mu, L_c) = \frac{1 - e^{-G(\mu;\chi_L) L_{c,0}}}{G(\mu;\chi_L) L_{c,0}}
+\end{aligned} \tag{7.2}
+$$
+
+In sparse savannas and shrublands, inter-crown bare gaps and intra-crown self-shading reduce $\Omega < 1$, whereas oblique low-sun angles increase shadow overlap and closed canopies ($L_c \gg L_{c,0}$) converge smoothly to $\Omega \to 1$. Using McCree (1972) photon conversions ($4.57$ direct, $4.24\ \mu\mathrm{mol\ J^{-1}}$ diffuse) and leaf scattering coefficients ($\sigma_{\mathrm{vis}} = 0.15$, $\sigma_{\mathrm{nir}} = 0.80$), clumped direct extinction $k_{db}$, scattering-adjusted extinction $k'_b$, diffuse extinction $k'_d$ (using diffuse clumping $\Omega_d = \Omega(\mu_d, L_c)$ at $\mu_d = \operatorname{clamp}(0.55\bar{\mu}, 0.25, 0.90)$), and canopy top reflectances $(\rho_{cb}, \rho_{cd})$ are:
+
+$$
+\begin{aligned}
+k_{db} &= \Omega(\mu_0, L_c)\,\frac{G(\mu_0;\chi_L)}{\max(\mu_0,\ 0.01)}, \qquad k'_b = k_{db}\sqrt{1 - \sigma_{\mathrm{vis}}}, \qquad k'_d = \frac{0.719\,\Omega_d}{\bar{\mu}(\chi_L)}, \\
+\rho_h &= \frac{1 - \sqrt{1 - \sigma_{\mathrm{vis}}}}{1 + \sqrt{1 - \sigma_{\mathrm{vis}}}}, \qquad \rho_{cb} = \frac{2\rho_h k_{db}}{1 + k_{db}}, \qquad \rho_{cd} = 0.036
+\end{aligned} \tag{7.3}
 $$
 
 Total, sunlit, and shaded absorbed PAR $(I_c, I_{\mathrm{sun}}, I_{\mathrm{sh}})$ and sunlit/shaded leaf area indices $(L_{\mathrm{sun}}, L_{\mathrm{sh}})$ are evaluated analytically:
@@ -823,7 +845,7 @@ $$
 \begin{aligned}
 I_c &= (1 - \rho_{cb}) I_{b0}\big(1 - e^{-k'_b L_c}\big) + (1 - \rho_{cd}) I_{d0}\big(1 - e^{-k'_d L_c}\big), \\
 L_{\mathrm{sun}} &= \frac{1 - e^{-k_{db} L_c}}{k_{db}}, \qquad L_{\mathrm{sh}} = L_c - L_{\mathrm{sun}}
-\end{aligned} \tag{7.2}
+\end{aligned} \tag{7.4}
 $$
 
 $$
@@ -831,7 +853,7 @@ $$
 I_{\mathrm{sun}} &= I_{b0}(1 - \sigma_{\mathrm{vis}})\big(1 - e^{-k_{db} L_c}\big) + I_{b0}\!\left[\frac{(1-\rho_{cb})k'_b\big(1 - e^{-(k'_b+k_{db})L_c}\big)}{k'_b+k_{db}} - \frac{1-\sigma_{\mathrm{vis}}}{2}\big(1 - e^{-2k_{db} L_c}\big)\right] \\
 &\quad + I_{d0}\,\frac{(1-\rho_{cd})k'_d\big(1 - e^{-(k'_d+k_{db})L_c}\big)}{k'_d+k_{db}}, \\
 I_{\mathrm{sh}} &= \max(I_c - I_{\mathrm{sun}},\ 0)
-\end{aligned} \tag{7.3}
+\end{aligned} \tag{7.5}
 $$
 
 Assuming optimal vertical enzyme allocation proportional to the EMA-smoothed midday absorbed irradiance profile $(\tilde{I}_{b0}, \tilde{I}_{d0}, \tilde{k}'_b, \tilde{\rho}_{cb}, \tilde{I}_c)$ (Field, 1983; Farquhar, 1989; de Pury & Farquhar, 1997), integrating against the instantaneous sunlit probability $f_{\mathrm{sun}}(L) = e^{-k_{db} L}$ partitions every whole-canopy capacity $X_{\mathrm{tot}}\in\{V_{c\max 25}, J_{\max 25}, V_{p\max 25}, R_{25}\}$ in closed form:
@@ -840,10 +862,10 @@ $$
 \begin{aligned}
 X_{\mathrm{sun}} &= \frac{X_{\mathrm{tot}}}{\tilde{I}_c}\left[\frac{(1-\tilde{\rho}_{cb})\tilde{k}'_b\tilde{I}_{b0}}{\tilde{k}'_b + k_{db}}\big(1 - e^{-(\tilde{k}'_b+k_{db})L_c}\big) + \frac{(1-\rho_{cd})k'_d\tilde{I}_{d0}}{k'_d + k_{db}}\big(1 - e^{-(k'_d+k_{db})L_c}\big)\right], \\
 X_{\mathrm{sh}} &= \max(X_{\mathrm{tot}} - X_{\mathrm{sun}},\ 10^{-6})
-\end{aligned} \tag{7.4}
+\end{aligned} \tag{7.6}
 $$
 
-Direct and diffuse VIS/NIR canopy albedos and forest-floor transmittances use the spherical-leaf ($G(\mu) = 0.5, \bar{\mu} = 1.0$) Sellers (1985) / Dai, Dickinson & Wang (2004, App. A) two-stream analytical solution with smooth regularization of the $\sigma_{\mathrm{sing}} = (\bar{\mu} k_{\mathrm{opt}})^2 - (b^2 - c^2) \to 0$ singularity.
+Direct and diffuse VIS/NIR canopy albedos and forest-floor transmittances use the general Ross–Goudriaan ($G(\mu_0;\chi_L), \bar{\mu}(\chi_L)$) Sellers (1985, Eq. 15) / Dai, Dickinson & Wang (2004, App. A) two-stream analytical solution evaluated at clumped effective optical depths ($L_{\mathrm{dir}} = \Omega(\mu_0, L_c)L_c$, $L_{\mathrm{dif}} = \Omega_d L_c$) with smooth regularization of the $\sigma_{\mathrm{sing}} = (\bar{\mu} k_{\mathrm{opt}})^2 - (b^2 - c^2) \to 0$ singularity, strictly conserving radiative energy.
 
 ### 7.3 Daily EEO Acclimation ($\mathrm{C}_3$ and $\mathrm{C}_4$ P-Model) and Leaf Respiration (`src/aoba/biosphere.py`)
 
@@ -854,7 +876,7 @@ $$
 \eta^*(T) &= \frac{\exp\!\left(-3.719 + \dfrac{580}{T - 138}\right)}{\exp\!\left(-3.719 + \dfrac{580}{298.15 - 138}\right)}, \\
 \phi_{\mathrm{PSII}}(T) &= 0.257\,\frac{\max(0.352 + 0.022 T_C - 3.4\times 10^{-4} T_C^2,\ 0.02)}{0.656}, \\
 f_r(T) &= \exp\!\big(0.1012\,T_C - 0.0005\,T_C^2 - 2.2175\big)
-\end{aligned} \tag{7.5}
+\end{aligned} \tag{7.7}
 $$
 
 Peaked Arrhenius enzyme kinetics (Kumarathunge et al., 2019; Schneider, Gessler & Stocker, 2025; deactivation energy $H_d = 200\ \mathrm{kJ\ mol^{-1}}$, reference $T_0 = 298.15\ \mathrm{K}$) incorporate acclimated activation energy $H_a$ and entropy $\Delta S$:
@@ -865,7 +887,7 @@ f_{\mathrm{enz}}(T; T_g, T_{\mathrm{home}}) &= \exp\!\left[\frac{H_a(T - T_0)}{R
 H_{a,V}(T_g) &= 42600 + 1140\,T_{g,C}, \qquad \Delta S_V(T_g) = 645.13 - 0.38\,T_{g,C}, \\
 H_{a,J} &= 40710, \qquad \Delta S_J(T_g, T_{\mathrm{home}}) = 658.77 - 0.84\,T_{\mathrm{home},C} - 0.52(T_{g,C} - T_{\mathrm{home},C}), \\
 H_{a,P} &= 55000, \qquad \Delta S_P(T_g) = \Delta S_V(T_g)
-\end{aligned} \tag{7.6}
+\end{aligned} \tag{7.8}
 $$
 
 **$\mathrm{C}_3$ P-Model (Smith et al., 2019, Eqs. 1–20)**: Solving the non-rectangular hyperbola $\theta J^2 - (\phi_{\mathrm{PSII}} I_{\mathrm{abs}} + J_{\max})J + \phi_{\mathrm{PSII}} I_{\mathrm{abs}} J_{\max} = 0$ ($\theta = 0.85$, marginal electron-transport cost $c = 0.05336251$, water-to-carboxylation cost ratio $\beta_{\mathrm{C3}} = 146.0$) under the least-cost hypothesis yields stomatal sensitivity $\xi_{\mathrm{C3}}$, optimal $\chi_{\mathrm{C3}}$, electron-transport factor $m_{\mathrm{C3}}$, and closed-form optimality coefficients $(\omega, \omega^*)$:
@@ -875,14 +897,14 @@ $$
 \xi_{\mathrm{C3}} &= \sqrt{\frac{\beta_{\mathrm{C3}}(K_{m,\mathrm{C3}} + \Gamma^*_{\mathrm{C3}})}{1.6\,\eta^*}}, \\
 \chi_{\mathrm{C3}} &= \operatorname{clamp}\!\left(\frac{\Gamma^*_{\mathrm{C3}}}{c_a} + \left(1 - \frac{\Gamma^*_{\mathrm{C3}}}{c_a}\right)\frac{\xi_{\mathrm{C3}}}{\xi_{\mathrm{C3}} + \sqrt{D}},\ 0.05,\ 0.95\right), \\
 m_{\mathrm{C3}} &= \frac{c_{i,\mathrm{C3}} - \Gamma^*_{\mathrm{C3}}}{c_{i,\mathrm{C3}} + 2\Gamma^*_{\mathrm{C3}}}, \qquad c_{i,\mathrm{C3}} = \chi_{\mathrm{C3}} c_a
-\end{aligned} \tag{7.7}
+\end{aligned} \tag{7.9}
 $$
 
 $$
 \begin{aligned}
 \omega &= -(1 - 2\theta) + \operatorname{sgn}\!\left(1 - 2\theta\frac{4c}{m}\right)\sqrt{(1 - \theta)\left[\frac{1}{\dfrac{4c}{m}\left(1 - \theta\dfrac{4c}{m}\right)} - 4\theta\right]}, \\
 \omega^* &= 1 + \omega - \sqrt{(1 + \omega)^2 - 4\theta\omega}
-\end{aligned} \tag{7.8}
+\end{aligned} \tag{7.10}
 $$
 
 Under the coordination hypothesis ($A_c = A_j$), optimal acclimated capacities $(J_{\max,\mathrm{opt}}^{\mathrm{C3}}, V_{c\max,\mathrm{opt}}^{\mathrm{C3}})$ and $25^\circ\mathrm{C}$ nighttime respiration capacity $R_{25}$ ($b_{\mathrm{resp}} = 0.018$; Ren et al., 2025, Eq. 13) are (zero when $m \le 4c$):
@@ -893,7 +915,7 @@ J_{\max,\mathrm{opt}}^{\mathrm{C3}} &= \phi_{\mathrm{PSII}} I_{\mathrm{abs}}\,\o
 A_{j,\mathrm{opt}}^{\mathrm{C3}} &= \frac{\phi_{\mathrm{PSII}} I_{\mathrm{abs}}\,m_{\mathrm{C3}}\,\omega^*_{\mathrm{C3}}}{8\theta}, \\
 V_{c\max,\mathrm{opt}}^{\mathrm{C3}} &= A_{j,\mathrm{opt}}^{\mathrm{C3}}\,\frac{c_{i,\mathrm{C3}} + K_{m,\mathrm{C3}}}{c_{i,\mathrm{C3}} - \Gamma^*_{\mathrm{C3}}}, \\
 R_{25} &= \frac{b_{\mathrm{resp}}\,V_{c\max,\mathrm{opt}}}{f_r(T_{\mathrm{night}})}
-\end{aligned} \tag{7.9}
+\end{aligned} \tag{7.11}
 $$
 
 **$\mathrm{C}_4$ P-Model (Scott & Smith, 2022, JAMES, Eqs. 1–26; von Caemmerer, 2000)**: Represents mesophyll PEPC carboxylation ($K_{p25} = 60.5\ \mu\mathrm{mol\ mol^{-1}}$, $\Delta H_{a,K_p} = 27.2\ \mathrm{kJ\ mol^{-1}}$, $\beta_{\mathrm{C4}} = 166.0$) pumping $\mathrm{CO}_2$ into bundle-sheath cells (leakiness $\phi_L = 0.20$, bundle-sheath conductance $g_{bs} = 0.003\ \mathrm{mol\ m^{-2}\ s^{-1}}$, $\Gamma^*_{25,\mathrm{C4}} = 2.60\ \mathrm{Pa}$, $K_{c25,\mathrm{C4}} = 121.0\ \mathrm{Pa}$, $K_{o25,\mathrm{C4}} = 29200\ \mathrm{Pa}$). Optimal mesophyll ratio $\chi_{m,\mathrm{C4}}$ and $c_m = \chi_{m,\mathrm{C4}} c_a$ are:
@@ -902,7 +924,7 @@ $$
 \begin{aligned}
 \xi_{\mathrm{C4}} &= \sqrt{\frac{\beta_{\mathrm{C4}} K_p}{1.6\,\eta^*}}, \\
 \chi_{m,\mathrm{C4}} &= \operatorname{clamp}\!\left(\frac{\xi_{\mathrm{C4}}}{\xi_{\mathrm{C4}} + \sqrt{D}},\ 0.05,\ 0.92\right)
-\end{aligned} \tag{7.10}
+\end{aligned} \tag{7.12}
 $$
 
 Incorporating the $5\ \mathrm{mol\ e^- / mol\ CO_2}$ RuBP/PEP stoichiometry ($4/5 = 0.80$), bundle-sheath leakage ATP overhead $(1 - \phi_L)$ (effective ratio $0.64$), and chilling sensitivity gate $g_{\mathrm{chill}}(T_g)$, two fixed-point iterations couple bundle-sheath $\mathrm{CO}_2$ partial pressure $c_{bs}$ and light-limited assimilation $A_{l,\mathrm{opt}}^{\mathrm{C4}}$:
@@ -912,14 +934,14 @@ $$
 g_{\mathrm{chill}}(T_g) &= \frac{1}{1 + \exp\!\big(-0.35(T_{g,C} - 12.0)\big)}, \\
 m_{\mathrm{C4}} &= 0.80(1 - \phi_L)\,g_{\mathrm{chill}}(T_g)\,\frac{c_{bs} - \Gamma^*_{\mathrm{C4}}}{c_{bs} + 2\Gamma^*_{\mathrm{C4}}}, \\
 A_{l,\mathrm{opt}}^{\mathrm{C4}} &= \frac{\phi_{\mathrm{PSII}} I_{\mathrm{abs}}\,m_{\mathrm{C4}}\,\omega^*_{\mathrm{C4}}}{8\theta}
-\end{aligned} \tag{7.11}
+\end{aligned} \tag{7.13}
 $$
 
 $$
 \begin{aligned}
 L_{\mathrm{leak}} &= \frac{\phi_L}{1 - \phi_L}\,A_{l,\mathrm{opt}}^{\mathrm{C4}}, \\
 c_{bs} &= c_m + \frac{L_{\mathrm{leak}}\times 10^{-6}}{g_{bs}\,\max(L_{\mathrm{exp}}, 0.1)}\,p_{\mathrm{sfc}}
-\end{aligned} \tag{7.12}
+\end{aligned} \tag{7.14}
 $$
 
 The resulting three-enzyme coordinated capacities ($J_{\max}$, $V_{p\max}$, $V_{c\max}$) acclimate into $25^\circ\mathrm{C}$ pools on the same 15-day EMA timescale:
@@ -929,7 +951,7 @@ $$
 J_{\max,\mathrm{opt}}^{\mathrm{C4}} &= \phi_{\mathrm{PSII}} I_{\mathrm{abs}}\,\omega_{\mathrm{C4}}, \\
 V_{p\max,\mathrm{opt}}^{\mathrm{C4}} &= \big(A_{l,\mathrm{opt}}^{\mathrm{C4}} + L_{\mathrm{leak}}\big)\frac{K_p + c_m}{c_m}, \\
 V_{c\max,\mathrm{opt}}^{\mathrm{C4}} &= A_{l,\mathrm{opt}}^{\mathrm{C4}}\,\frac{c_{bs} + K_{m,\mathrm{C4}}}{c_{bs} - \Gamma^*_{\mathrm{C4}}}
-\end{aligned} \tag{7.13}
+\end{aligned} \tag{7.15}
 $$
 
 **Autonomous $\mathrm{C}_4$ dominance $F_4$ (Scott & Smith, 2022, Eq. 26; Luo et al., 2024; Lavergne et al., 2026)**: Relaxes on an ~60-day ecological turnover timescale ($0.25\alpha_{\mathrm{EMA}}$) toward the midday relative net-assimilation advantage $\Delta A_{\mathrm{rel}}$ gated by Beer–Lambert canopy-gap openness $e^{-k L}$ ($k = 0.50$) that excludes $\mathrm{C}_4$ grasses beneath closed forests:
@@ -938,7 +960,7 @@ $$
 \begin{aligned}
 \Delta A_{\mathrm{rel}} &= \frac{A_{n,\mathrm{C4}}^{\mathrm{mid}} - A_{n,\mathrm{C3}}^{\mathrm{mid}}}{|A_{n,\mathrm{C3}}^{\mathrm{mid}}| + 1.0}, \\
 F_{4,\mathrm{tgt}} &= e^{-k L}\,\frac{1}{1 + \exp(-8\,\Delta A_{\mathrm{rel}})}
-\end{aligned} \tag{7.14}
+\end{aligned} \tag{7.16}
 $$
 
 ### 7.4 Sub-Daily Two-Leaf Gas Exchange, Liebig $\mathrm{C}_3/\mathrm{C}_4$ Co-Limitation & Weighted Mixing, Leaf Boundary Layer & Soil Water Stress $\beta_{\mathrm{opt}}$
@@ -951,7 +973,7 @@ $$
 \begin{aligned}
 A_{c,\mathrm{C3}} &= V_{c,\mathrm{C3}}\,\max\!\left(\frac{c_{i,\mathrm{C3}} - \Gamma^*_{\mathrm{C3}}}{c_{i,\mathrm{C3}} + K_{m,\mathrm{C3}}},\ 0\right), \qquad A_{j,\mathrm{C3}} = \frac{J_{\mathrm{C3}}}{4}\,\max\!\left(\frac{c_{i,\mathrm{C3}} - \Gamma^*_{\mathrm{C3}}}{c_{i,\mathrm{C3}} + 2\Gamma^*_{\mathrm{C3}}},\ 0\right), \\
 A_{\mathrm{C3}} &= \min\!\big(A_{c,\mathrm{C3}},\ A_{j,\mathrm{C3}}\big)
-\end{aligned} \tag{7.15}
+\end{aligned} \tag{7.17}
 $$
 
 $$
@@ -959,10 +981,10 @@ $$
 A_{c,\mathrm{C4}} &= V_{c,\mathrm{C4}}, \qquad A_{l,\mathrm{C4}} = 0.20(1 - \phi_L)\,J_{\mathrm{C4}}\,g_{\mathrm{chill}}(T_l), \\
 A_{p,\mathrm{C4}} &= (1 - \phi_L)\,V_{p,\mathrm{C4}}\,\frac{c_{m,\mathrm{C4}}}{\max(c_{m,\mathrm{C4}} + K_p,\ 0.5)}, \\
 A_{\mathrm{C4}} &= \min\!\big(A_{c,\mathrm{C4}},\ A_{l,\mathrm{C4}},\ A_{p,\mathrm{C4}}\big)
-\end{aligned} \tag{7.16}
+\end{aligned} \tag{7.18}
 $$
 
-where $T_l$ is sunlit or shaded leaf temperature. Eqs. (7.15)–(7.16) recover an exact $1.000$ ratio between midday instantaneous assimilation and the acclimation coordination targets of Eqs. (7.9) and (7.11). Pathway-specific molar stomatal conductances and $F_4$-weighted mixing of gross assimilation $A_{\mathrm{mix}}$, leaf dark respiration $R_{d,\mathrm{mix}}$, and stomatal conductance $g_{sw,\mathrm{mol}}$ (with minimum cuticular floor $g_0 = 0.002\,\beta_{\mathrm{opt}}\ \mathrm{mol\ m^{-2}\ s^{-1}}$) are:
+where $T_l$ is sunlit or shaded leaf temperature. Eqs. (7.17)–(7.18) recover an exact $1.000$ ratio between midday instantaneous assimilation and the acclimation coordination targets of Eqs. (7.11) and (7.13). Pathway-specific molar stomatal conductances and $F_4$-weighted mixing of gross assimilation $A_{\mathrm{mix}}$, leaf dark respiration $R_{d,\mathrm{mix}}$, and stomatal conductance $g_{sw,\mathrm{mol}}$ (with minimum cuticular floor $g_0 = 0.002\,\beta_{\mathrm{opt}}\ \mathrm{mol\ m^{-2}\ s^{-1}}$) are:
 
 $$
 \begin{aligned}
@@ -971,7 +993,7 @@ g_{sw,4} &= \frac{1.6\,\max(A_{\mathrm{C4}} - R_{d,\mathrm{C4}},\ 0)\times 10^{-
 A_{\mathrm{mix}} &= (1 - F_4) A_{\mathrm{C3}} + F_4 A_{\mathrm{C4}}, \\
 R_{d,\mathrm{mix}} &= (1 - F_4) R_{d,\mathrm{C3}} + F_4 R_{d,\mathrm{C4}}, \\
 g_{sw,\mathrm{mol}} &= (1 - F_4) g_{sw,3} + F_4 g_{sw,4} + g_0
-\end{aligned} \tag{7.17}
+\end{aligned} \tag{7.19}
 $$
 
 Two fixed-point passes couple the leaf-surface microclimate $(c_s, D_s)$ to finite leaf boundary-layer conductance $g_{bw}$ ($g_{bc} = g_{bw}/1.37$; Dai et al., 2004, Eqs. 11, 45; Bonan et al., 2018) and convert molar conductance to kinematic units $g_{sw,\mathrm{ms}}$:
@@ -981,7 +1003,7 @@ $$
 c_s &= \operatorname{clamp}\!\left(c_a - \frac{\max(A_{\mathrm{mix}} - R_{d,\mathrm{mix}},\ 0)\times 10^{-6}}{g_{bc}}\,p_{\mathrm{sfc}},\ 0.35\,c_a,\ c_a\right), \\
 D_s &= \max\!\left(\frac{g_{bw}}{g_{bw} + g_{sw,\mathrm{mol}}}\,D_{\mathrm{af}},\ 20.0\right), \\
 g_{sw,\mathrm{ms}} &= g_{sw,\mathrm{mol}}\,\frac{R^* T_l}{p_{\mathrm{sfc}}}
-\end{aligned} \tag{7.18}
+\end{aligned} \tag{7.20}
 $$
 
 Stomatal soil-water stress $\beta_{\mathrm{opt}}\in[0,1]$ follows time-integrated optimal stomatal theory (Holtzman et al., 2024, Eqs. 2, 7; Lu, Duursma & Medlyn, 2016) from climatological maximum growing-season dry-spell duration $D_{\max}$, 15-day mean potential ET $E_{\mathrm{pot}}$, root-zone capacity $S_R$, and available root-zone water $W_{\mathrm{avail}}$ ($w_c = 0.05 S_R$):
@@ -990,7 +1012,7 @@ $$
 \begin{aligned}
 \tau &= 0.85\,D_{\max} + 6.59\ [\mathrm{days}], \\
 \beta_{\mathrm{opt}} &= \operatorname{clamp}\!\left(\sqrt{\frac{\max(W_{\mathrm{avail}} - w_c,\ 0)}{\max(\tau E_{\mathrm{pot}},\ 0.10 S_R)}},\ 0,\ 1\right)
-\end{aligned} \tag{7.19}
+\end{aligned} \tag{7.21}
 $$
 
 ### 7.5 Prognostic EEO LAI (Lambert-$W_0$ Derivation), Evergreen–Deciduous Habit, $S_R$ & Canopy Height $h_c$
@@ -1001,7 +1023,7 @@ $$
 \begin{aligned}
 A_{0,\mathrm{day}} &= \mathrm{LUE}_{\mathrm{C3}}\,\mathrm{PPFD}_{\mathrm{day}}\,\frac{1}{1 + \exp\!\big(-0.5(T_C - 5.0)\big)}, \\
 A_{0,\mathrm{fav}} &= A_{0,\mathrm{day}}\,\beta_{\mathrm{opt}}
-\end{aligned} \tag{7.20}
+\end{aligned} \tag{7.22}
 $$
 
 **1. Annual Ceiling $\mathrm{fAPAR}_{\max}$ and $L_{\max}$ (Cai et al., 2025, Eqs. 1–2, 12; Zhou et al., 2025, Eq. 6)**: From aridity index $\mathrm{AI} = \mathrm{PET}_{\mathrm{yr}}/P_{\mathrm{yr}}$ and usable precipitation fraction $f_0(\mathrm{AI})$, water-limited $\mathrm{fAPAR}_w$ and energy-limited $\mathrm{fAPAR}_c$ (solving marginal profit $\partial[A_{0,\mathrm{yr}}(1 - e^{-k L}) - z_{\mathrm{eff}} L]/\partial L = 0$) combine via smooth log-sum-exp minimum ($K_{\mathrm{lse}} = 10$):
@@ -1011,14 +1033,14 @@ $$
 \mathrm{AI} &= \frac{\mathrm{PET}_{\mathrm{yr}}}{\max(P_{\mathrm{yr}},\ 1.0)}, \\
 f_0(\mathrm{AI}) &= 0.65\exp\!\left(-0.604169\left[\ln\frac{\max(\mathrm{AI},\ 1.9)}{1.9}\right]^2\right), \\
 \mathrm{fAPAR}_w &= \frac{f_0(\mathrm{AI})\,P_{\mathrm{mol,yr}}\,c_a(1 - \chi_{\mathrm{C3}})}{1.6\,D\,A_{0,\mathrm{yr}}}, \qquad \mathrm{fAPAR}_c = 1 - \frac{z_{\mathrm{eff}}}{k A_{0,\mathrm{yr}}}
-\end{aligned} \tag{7.21}
+\end{aligned} \tag{7.23}
 $$
 
 $$
 \begin{aligned}
 \mathrm{fAPAR}_{\max} &= \operatorname{clamp}\!\Big(\operatorname{lsemin}_{K=10}(\mathrm{fAPAR}_w,\ \mathrm{fAPAR}_c),\ 0,\ 0.96\Big), \\
 L_{\max} &= -\frac{1}{k}\ln(1 - \mathrm{fAPAR}_{\max})
-\end{aligned} \tag{7.22}
+\end{aligned} \tag{7.24}
 $$
 
 **2. Seasonal Steady-State Deciduous LAI $L_s$ & Lambert-$W_0$ Derivation (Zhou et al., 2025, Eqs. 15–20)**: Seasonal leaf-area carbon balance equates daily leaf production—daily assimilation $A_{0,\mathrm{fav}}(1 - e^{-k L_s})$ times allocation efficiency $m_{\mathrm{alloc}}$ ($\sigma_{\mathrm{Zhou}} = 0.771$)—to foliage turnover:
@@ -1027,13 +1049,13 @@ $$
 \begin{aligned}
 m_{\mathrm{alloc}} &= \frac{\sigma_{\mathrm{Zhou}}\,\mathrm{GSL}\,L_{\max}}{A_{0,\mathrm{fav,yr}}\,\mathrm{fAPAR}_{\max}}, \qquad \mu = m_{\mathrm{alloc}}\,A_{0,\mathrm{day}}\,\beta_{\mathrm{opt}}, \\
 L_s &= \mu\left(1 - e^{-k L_s}\right)
-\end{aligned} \tag{7.23}
+\end{aligned} \tag{7.25}
 $$
 
-Rewriting Eq. (7.23) as $k(L_s - \mu) = -k\mu e^{-k L_s} = -k\mu e^{-k\mu} e^{-k(L_s - \mu)}$, i.e., $[-k(L_s - \mu)]e^{-k(L_s - \mu)} = -k\mu e^{-k\mu}$, yields the exact closed-form solution via the principal Lambert-$W$ branch $W_0$ ($W_0(x)e^{W_0(x)} = x$, evaluated by five cubic Halley iterations):
+Rewriting Eq. (7.25) as $k(L_s - \mu) = -k\mu e^{-k L_s} = -k\mu e^{-k\mu} e^{-k(L_s - \mu)}$, i.e., $[-k(L_s - \mu)]e^{-k(L_s - \mu)} = -k\mu e^{-k\mu}$, yields the exact closed-form solution via the principal Lambert-$W$ branch $W_0$ ($W_0(x)e^{W_0(x)} = x$, evaluated by five cubic Halley iterations):
 
 $$
-L_s = \min\!\left(\mu + \frac{1}{k} W_0\!\left(-k\mu e^{-k\mu}\right),\ L_{\max}\right) \tag{7.24}
+L_s = \min\!\left(\mu + \frac{1}{k} W_0\!\left(-k\mu e^{-k\mu}\right),\ L_{\max}\right) \tag{7.26}
 $$
 
 For $u = k\mu \le 1$, $W_0(-u e^{-u}) = -u$ gives $L_s \equiv 0$ (dormancy/arid threshold), whereas for $u > 1$, $W_0(-u e^{-u}) \in (-1, 0) > -u$ produces a smooth positive leaf area $L_s > 0$.
@@ -1043,26 +1065,26 @@ For $u = k\mu \le 1$, $W_0(-u e^{-u}) = -u$ gives $L_s \equiv 0$ (dormancy/arid 
 $$
 \begin{aligned}
 f_{\mathrm{cold}} &= \sigma\!\left(\frac{273.15 - T_{\min,\mathrm{yr}}}{5.0}\right), \\
-c_{\mathrm{evg}} &= (1.35 + 0.55\,f_{\mathrm{cold}})\,c_{\mathrm{dec}}, \qquad \eta_{\mathrm{evg}} = 1 - 0.14\,f_{\mathrm{cold}}, \\
+c_{\mathrm{dec,eff}} &= c_{\mathrm{dec}}\big[1 + 0.80(1 - \phi_N)\big], \qquad c_{\mathrm{evg}} = \big[1.35 + 0.55\,f_{\mathrm{cold}} + 0.80(1 - \phi_N)\big]\,c_{\mathrm{dec}}, \qquad \eta_{\mathrm{evg}} = 1 - 0.14\,f_{\mathrm{cold}}, \\
 \mathrm{frost}_{\mathrm{pen}} &= 18.0\,\sigma\!\left(\frac{233.15 - T_{\min,\mathrm{yr}}}{4.0}\right)
-\end{aligned} \tag{7.25}
+\end{aligned} \tag{7.27}
 $$
 
 Kikuzawa (1991, Eq. 5) optimal evergreen leaf lifespan $\tau_{\mathrm{evg}}$ ($b = 15\ \mathrm{yr}$), off-season maintenance respiration $f_{\mathrm{resp,off}}$ ($Q_{10}\approx 2$), and 25-day deciduous leaf-out lag determine annual net carbon gains $(g_{\mathrm{evg}}, g_{\mathrm{dec}})$ and target evergreen fraction $f_{\mathrm{evg,tgt}}$:
 
 $$
 \begin{aligned}
-\tau_{\mathrm{evg}} &= \operatorname{clamp}\!\left(\sqrt{\frac{2 b\, c_{\mathrm{evg}}}{\eta_{\mathrm{evg}} a_{\mathrm{leaf}}}},\ 1,\ 7\right), \\
+\tau_{\mathrm{evg}} &= \operatorname{clamp}\!\left(\sqrt{\frac{2 b\, c_{\mathrm{evg}}}{\eta_{\mathrm{evg}} a_{\mathrm{leaf}}}},\ 1,\ 8\right), \\
 g_{\mathrm{evg}} &= \eta_{\mathrm{evg}}\!\left(1 - \frac{\tau_{\mathrm{evg}}}{2b}\right)a_{\mathrm{leaf}} - \frac{c_{\mathrm{evg}}}{\tau_{\mathrm{evg}}} - 32\,f_{\mathrm{resp,off}}(1 - f_{\mathrm{gsl}}) - \mathrm{frost}_{\mathrm{pen}}, \\
-g_{\mathrm{dec}} &= \left(1 - \frac{25}{365.2425 f_{\mathrm{gsl}}}\right)\!\left(1 - \frac{f_{\mathrm{gsl}}}{2 b_{\mathrm{dec}}}\right)a_{\mathrm{leaf}} - c_{\mathrm{dec}}, \\
+g_{\mathrm{dec}} &= \left(1 - \frac{25}{365.2425 f_{\mathrm{gsl}}}\right)\!\left(1 - \frac{f_{\mathrm{gsl}}}{2 b_{\mathrm{dec}}}\right)a_{\mathrm{leaf}} - c_{\mathrm{dec,eff}}, \\
 f_{\mathrm{evg,tgt}} &= \sigma\!\left(\frac{4(g_{\mathrm{evg}} - g_{\mathrm{dec}})}{c_{\mathrm{dec}}}\right)
-\end{aligned} \tag{7.26}
+\end{aligned} \tag{7.28}
 $$
 
 Amortized evergreen cost, short-season tundra penalty, and nitrogen sufficiency $\phi_N \in [0.25, 1.0]$ from the terrestrial CN model (Section 7.8; Stocker & Prentice, 2024) form the effective leaf cost $z_{\mathrm{eff}}$, prognosing total $L = L_{\mathrm{evg}} + L_{\mathrm{dec}}$ across dual timescales ($\tau_{\mathrm{evg}}$ with $-40^\circ\mathrm{C}$ acute frost-kill for $L_{\mathrm{evg}}$; 15-day EMA for $L_{\mathrm{dec}}$):
 
 $$
-z_{\mathrm{eff}} = \max\!\left((1 - f_{\mathrm{evg}})c_{\mathrm{dec}} + f_{\mathrm{evg}}\frac{c_{\mathrm{evg}}}{\tau_{\mathrm{evg}}},\ 0.55\,c_{\mathrm{dec}}\right)\Big[1 + 1.5\,\sigma\big(20(0.28 - f_{\mathrm{gsl}})\big)\Big]\Big[1 + 0.80(1 - \phi_N)\Big] \tag{7.27}
+z_{\mathrm{eff}} = \max\!\left((1 - f_{\mathrm{evg}})c_{\mathrm{dec}} + f_{\mathrm{evg}}\frac{c_{\mathrm{evg}}}{\tau_{\mathrm{evg}}},\ 0.55\,c_{\mathrm{dec}}\right)\Big[1 + 1.5\,\sigma\big(20(0.28 - f_{\mathrm{gsl}})\big)\Big]\Big[1 + 0.80(1 - \phi_N)\Big] \tag{7.29}
 $$
 
 **4. Optimal Drought-Bridging Root-Zone Storage $S_R$ (Gao et al., 2014; Davis et al., 2017)**: Accumulates seasonal cumulative water deficit $D_{\mathrm{cum}}$ whenever canopy evaporative demand exceeds precipitation and updates $S_R$ toward $S_{R,\mathrm{tgt}}$ with a $10\times$ faster asymmetric expansion ratchet under drying ($10\alpha_{\mathrm{yr}}$ vs. $\alpha_{\mathrm{yr}}$):
@@ -1071,7 +1093,7 @@ $$
 \begin{aligned}
 D_{\mathrm{cum}}^{n+1} &= \operatorname{clamp}\!\big(D_{\mathrm{cum}}^n + \mathrm{fAPAR}_{\max}\mathrm{PET}_{\mathrm{day}} - P_{\mathrm{day}},\ 0,\ 800\big)\ [\mathrm{mm}], \\
 S_{R,\mathrm{tgt}} &= \operatorname{clamp}\!\big(50 + 1.35\,D_{\mathrm{cum}},\ 50,\ 650\big)\ [\mathrm{kg\ m^{-2}}]
-\end{aligned} \tag{7.28}
+\end{aligned} \tag{7.30}
 $$
 
 **5. Available Water-Balance Index, Productivity Index & Thermal Treeline Canopy Height $h_c$ (Kempes et al., 2011; Körner, 2012; Paulsen & Körner, 2014)**: Potential maximum tree height reflects the balance of hydraulic water supply (available water-balance index $\mathrm{MI}$, the nondimensional precipitation-to-PET ratio saturating at $1.2$), annual carbon available for stem wood construction (canopy productivity index $\mathrm{PI}$ normalized by $180\ \mathrm{mol\ C\ m^{-2}\ yr^{-1}}$), and the thermal xylogenesis treeline threshold ($\ge 94$ days above $5^\circ\mathrm{C}$, $f_{\mathrm{gsl}} \approx 0.30$), updated via a 1-year EMA:
@@ -1081,7 +1103,7 @@ $$
 \mathrm{MI} &= \operatorname{clamp}\!\left(\frac{P_{\mathrm{yr}}}{\max(\mathrm{PET}_{\mathrm{yr}},\ 1.0)},\ 0,\ 1.2\right), \\
 \mathrm{PI} &= \operatorname{clamp}\!\left(\frac{\mathrm{fAPAR}_{\max}\,A_{0,\mathrm{yr}}}{180.0},\ 0,\ 2.0\right), \\
 h_{c,\mathrm{tgt}} &= \operatorname{clamp}\!\Big(34.0\,\mathrm{MI}^{0.85}\,\mathrm{PI}^{0.75}\,\sigma\big(30(f_{\mathrm{gsl}} - 0.30)\big),\ 0.05,\ 40.0\Big)\ [\mathrm{m}]
-\end{aligned} \tag{7.29}
+\end{aligned} \tag{7.31}
 $$
 
 ### 7.6 Three-Source Energy Balance, Hysteretic Snow/SNICAR & 5-Layer Freeze–Thaw Richards Soil (`src/aoba/surface.py`)
@@ -1093,7 +1115,7 @@ $$
 N_{\mathrm{melt}} &= \frac{200}{\operatorname{clamp}(\sigma_{\mathrm{topo}},\ 10,\ 1000)}, \\
 A_{\mathrm{sn}} &= \min\!\left(\tanh\frac{S_n}{25},\ 1 - \left[\frac{\arccos(2 S_n/S_{n,\max} - 1)}{\pi}\right]^{N_{\mathrm{melt}}}\right), \\
 h_{\mathrm{exp}} &= (1 - A_{\mathrm{sn}})h_c + A_{\mathrm{sn}}\max(h_c - d_{\mathrm{sn}},\ 0), \qquad L_{\mathrm{exp}} = L\frac{h_{\mathrm{exp}}}{\max(h_c,\ 0.05)}
-\end{aligned} \tag{7.30}
+\end{aligned} \tag{7.32}
 $$
 
 Snow albedo evolves with Yang et al. (1997) / MATSIRO6 snow age $A_g$ ($\tau_{\mathrm{age}} = 10^6\ \mathrm{s}$, zenith factor $0.4(1-\mu_0)^5$) across VIS ($0.90\to 0.65$) and NIR ($0.70\to 0.35$). When `enable_snow_bc_darkening = true`, top-2-cm BC and dust masses $(C_{\mathrm{BC}}, C_{\mathrm{dust}})$ (refreshed by $15\ \mathrm{kg\ m^{-2}}$ snowfall and 45-day washout) apply SNICAR visible darkening $d_{\mathrm{frac}}$ (Flanner et al., 2007), while bare-soil albedo darkens smoothly with surface saturation $s_0$ (CLM4.5 Sec. 3.2):
@@ -1102,7 +1124,7 @@ $$
 \begin{aligned}
 d_{\mathrm{frac}} &= \operatorname{clamp}\!\big(180\sqrt{C_{\mathrm{BC}}} + 3.5\sqrt{C_{\mathrm{dust}}},\ 0,\ 0.45\big), \\
 \alpha_{\mathrm{soil,vis}} &= 0.14 + 0.14(1 - s_0)^{1.5}, \qquad \alpha_{\mathrm{soil,nir}} = 0.28 + 0.22(1 - s_0)^{1.5}
-\end{aligned} \tag{7.31}
+\end{aligned} \tag{7.33}
 $$
 
 **CLM5 Canopy Interception, Dry Surface Layer (DSL) Resistance & $3\times 3$ Newton Energy Balance**: Canopy interception $f_{\mathrm{int}}$, maximum canopy water storage $W_{c,\max}$, wetted leaf fraction $f_{\mathrm{wet}}$ (CLM5 Eqs. 7.4, 7.12, 7.23), Kelvin soil-pore humidity $h_{\mathrm{soil}}$, and Swenson & Lawrence (2014; CLM5 Eqs. 5.72–5.81) DSL soil resistance $r_{\mathrm{soil}}$ ($d_{\mathrm{sl}} \le 15\ \mathrm{mm}$, tortuosity $\tau_{\mathrm{soil}}$, vapor diffusivity $D_{\mathrm{vap}}(T)$) are:
@@ -1111,13 +1133,13 @@ $$
 \begin{aligned}
 f_{\mathrm{int}} &= \tanh(L_{\mathrm{exp}}), \qquad W_{c,\max} = 0.10\,L_{\mathrm{exp}}, \qquad f_{\mathrm{wet}} = \left(\frac{W_c}{W_{c,\max}}\right)^{2/3}, \\
 h_{\mathrm{soil}} &= \exp\!\left(\frac{\psi_0 g}{R_v T_{s,0}}\right), \qquad r_{\mathrm{soil}} = \frac{d_{\mathrm{sl}}}{D_{\mathrm{vap}}(T_{s,0})\,\tau_{\mathrm{soil}}}
-\end{aligned} \tag{7.32}
+\end{aligned} \tag{7.34}
 $$
 
 Under-canopy aerodynamic resistance $r_{d,\mathrm{uc}}$ and leaf boundary-layer conductances $(g_{b,\mathrm{sun}}, g_{b,\mathrm{sh}})$ couple sunlit leaf ($T_{\mathrm{sun}}$), shaded leaf ($T_{\mathrm{sh}}$), and ground ($T_{\mathrm{gnd}}$) temperatures with canopy air $(T_{\mathrm{af}}, q_{\mathrm{af}})$ and stomatal conductance via a $3\times 3$ cofactor-Jacobian Newton solver (`LAND_EB_ITERATIONS = 3`):
 
 $$
-R_{n,i} - H_i(T_i, T_{\mathrm{af}}) - \lambda_i E_i(T_i, q_{\mathrm{af}}) - \delta_{i,2} G_0(T_{\mathrm{gnd}}, T_{s,0}) = 0, \qquad i \in \{\mathrm{sun}, \mathrm{sh}, \mathrm{gnd}\} \tag{7.33}
+R_{n,i} - H_i(T_i, T_{\mathrm{af}}) - \lambda_i E_i(T_i, q_{\mathrm{af}}) - \delta_{i,2} G_0(T_{\mathrm{gnd}}, T_{s,0}) = 0, \qquad i \in \{\mathrm{sun}, \mathrm{sh}, \mathrm{gnd}\} \tag{7.35}
 $$
 
 During snowmelt, $T_{\mathrm{gnd}}$ is clamped at $273.15\ \mathrm{K}$ with excess energy routed conservatively to melt; snowpack exceeding $S_{\max} = 1000\ \mathrm{kg\ m^{-2}}$ calves as glacial runoff while recording climatic surface mass balance $\mathrm{SMB}$.
@@ -1128,7 +1150,7 @@ $$
 \begin{aligned}
 z_{\mathrm{root}} &= \operatorname{clamp}\!\left(\frac{S_R}{\rho_w(\theta_{\mathrm{fc}} - \theta_{\mathrm{wp}})},\ 0.15,\ 3.0\right)\ [\mathrm{m}], \\
 f_{\mathrm{ice}} &= 10^{-6\,w_i/w_{\mathrm{sat}}}, \qquad f_{\mathrm{sat}} = (1 - f_{\mathrm{ice},0}) + f_{\mathrm{ice},0}\,s_0^4
-\end{aligned} \tag{7.34}
+\end{aligned} \tag{7.36}
 $$
 
 Linearized implicit tridiagonal Richards transport with bottom gravitational drainage ($q_{\mathrm{drain}} = K_{\mathrm{bot}}$) advances liquid soil moisture:
@@ -1137,7 +1159,7 @@ $$
 \begin{aligned}
 \frac{\partial \theta_\ell}{\partial t} &= \frac{\partial}{\partial z}\left[f_{\mathrm{ice}} K_{\mathrm{sat}}\left(\frac{\theta_\ell}{w_{\mathrm{sat}}}\right)^{2b+3}\left(\frac{\partial \psi(\theta_\ell)}{\partial z} + 1\right)\right] - S_{\mathrm{root}}, \\
 \psi(\theta_\ell) &= \psi_s\left(\frac{\theta_\ell}{w_{\mathrm{sat}}}\right)^{-b}
-\end{aligned} \tag{7.35}
+\end{aligned} \tag{7.37}
 $$
 
 Soil heat conduction conserves layer internal energy $U_k$ across the $0^\circ\mathrm{C}$ zero-curtain phase transition (SCALE-RM Sec. 8.7.1; MATSIRO6 Ch. 10) before integrating implicit 5-layer Fourier diffusion with moisture/ice-dependent thermal conductivity $\kappa_{s,k}$:
@@ -1147,7 +1169,7 @@ $$
 C_{\mathrm{vol},k} &= 1.26\times 10^6 + c_\ell\rho_w w_{\ell,k} + c_i\rho_i w_{i,k}, \\
 U_k &= C_{\mathrm{vol},k}(T_{s,k} - T_0) - L_{f0}\rho_i w_{i,k}, \\
 \kappa_{s,k} &= 0.30\left[1 + 5.5\tanh\!\left(\frac{w_{\ell,k} + w_{i,k}}{0.25}\right)\right] + 0.8\,w_{i,k}
-\end{aligned} \tag{7.36}
+\end{aligned} \tag{7.38}
 $$
 
 ### 7.7 MAML Subgrid Orography & Dynamic Wetlands/Lakes (`src/aoba/maml_land_subgrid.py`)
@@ -1158,7 +1180,7 @@ $$
 \begin{aligned}
 T_{\mathrm{air},m} &= T_{\mathrm{air}} - \Gamma_m\Delta z_m, \qquad p_{\mathrm{sfc},m} = p_{\mathrm{sfc}}\exp\!\left(-\frac{g\Delta z_m}{R_d T_{\mathrm{air}}}\right), \\
 s_{\mathrm{sw},m} &= 1 \pm 0.12\min\!\left(\frac{\sigma_{\mathrm{topo}}}{400},\ 1\right), \qquad \sum_{m=1}^{N_{\mathrm{sub}}}\Delta z_m = 0
-\end{aligned} \tag{7.37}
+\end{aligned} \tag{7.39}
 $$
 
 When `enable_maml_wetlands_lakes = true`, dynamic inundated fraction $f_{\mathrm{wet}} \in [0, 0.85]$ relaxes exponentially ($\tau_{\mathrm{wet}} = 10\ \mathrm{d}$) toward a TOPMODEL (Beven & Kirkby, 1979) target combining topographic flatness $f_{\mathrm{flat}}$, valley weight $w_{\mathrm{val}}$, thaw factor $f_{\mathrm{thaw}}$, soil saturation excess, and river overbank flooding $f_{\mathrm{flood}}$:
@@ -1168,7 +1190,7 @@ $$
 f_{\mathrm{flat}} &= \left(1 + \frac{\sigma_{\mathrm{topo}}}{80}\right)^{-1}, \qquad f_{\mathrm{flood}} = 0.35\,\frac{Q_{\mathrm{riv}}}{Q_{\mathrm{riv}} + 4000}, \\
 f_{\mathrm{thaw}} &= \operatorname{clamp}\!\left(\frac{T_{s,0} - 270.15}{5.0},\ 0.15,\ 1.0\right), \\
 f_{\mathrm{wet,tgt}} &= \operatorname{clamp}\!\left(f_{\mathrm{flat}}\,w_{\mathrm{val}}\,f_{\mathrm{thaw}}\left(\left[\frac{\max(s_0 - 0.58,\ 0)}{0.42}\right]^{1.6} + f_{\mathrm{flood}}\right),\ 0,\ 0.85\right)
-\end{aligned} \tag{7.38}
+\end{aligned} \tag{7.40}
 $$
 
 ### 7.8 Coupled Terrestrial Carbon–Nitrogen Cycle, 5-Layer Permafrost C/N & MAML SPITFIRE Wildfire (`src/aoba/land_carbon.py`)
@@ -1179,7 +1201,7 @@ $$
 \begin{aligned}
 \frac{dC_{\mathrm{tot}}}{dt} &= \mathrm{GPP} - R_{a,\mathrm{eff}} - R_h - F_{\mathrm{fire,C}} \equiv \mathrm{NBP}, \\
 \frac{dN_{\mathrm{tot}}}{dt} &= F_{\mathrm{dep}} + F_{\mathrm{BNF}} - F_{\mathrm{leach}} - F_{\mathrm{denit}} - F_{\mathrm{fire,N}}
-\end{aligned} \tag{7.39}
+\end{aligned} \tag{7.41}
 $$
 
 1. **Autotrophic respiration & functional-balance dynamic allocation**: Combines leaf respiration, $Q_{10}=2.0$ wood/root maintenance respiration, and $25\%$ growth respiration (Clark et al., 2011). Height-dependent baseline wood allocation $f_{w0}$ and nitrogen-responsive fine-root functional balance (Stocker & Prentice, 2024) shift carbon into roots under N scarcity ($\phi_N < 1$):
@@ -1188,18 +1210,18 @@ $$
 \begin{aligned}
 f_{w0} &= 0.05 + 0.42\,\frac{h_c}{h_c + 4.0}, \\
 f_{\mathrm{root}} &= \operatorname{clamp}\!\big(0.45(1 - f_{w0}) + 0.35(1 - \phi_N),\ 0.15,\ 0.72\big)
-\end{aligned} \tag{7.40}
+\end{aligned} \tag{7.42}
 $$
 
 2. **Stocker & Prentice (2024) CN-Model & FUN/Houlton BNF**: Optimal foliar N demand follows Dong et al. (2022) from $V_{c\max 25}$ and emergent leaf mass per area $\mathrm{LMA}$ ($\mathrm{CN}_{l,\mathrm{opt}} = \operatorname{clamp}(\mathrm{LMA}/N_{\mathrm{area,opt}}, 15, 65)$; fixed root $45$, wood $250$, soil $14$). After internal resorption ($50\%$ leaf, $25\%$ root), soil $N_{\min}$ uptake combines transpiration mass flow $u_{\mathrm{mass}}$ and fine-root diffusion $u_{\mathrm{diff}}$:
 
 $$
 \begin{aligned}
-\mathrm{LMA} &= 0.045 + 0.055\,f_{\mathrm{evg}} + 0.025\,f_{\mathrm{cold}}\ [\mathrm{kg\ C\ m^{-2}}], \\
+\mathrm{LMA} &= 0.045 + 0.055\,f_{\mathrm{evg}} + 0.025\,f_{\mathrm{cold}} + 0.035(1 - \phi_N)\ [\mathrm{kg\ C\ m^{-2}}], \qquad \tau_{\mathrm{leaf,eff}} = \tau_{\mathrm{leaf},0}\big[1 + 0.80(1 - \phi_N)\big], \\
 N_{\mathrm{area,opt}} &= 1.76\times 10^{-5}\,V_{c\max 25} + 0.016\,\mathrm{LMA}, \\
 u_{\mathrm{mass}} &= \Big[1 - \exp\!\left(-\frac{E_{\mathrm{tr}}\Delta t}{W_{\mathrm{root,col}}}\right)\Big]N_{\min}, \\
 k_{\mathrm{diff}} &= 8.0\,f_{\mathrm{moist}}\,f_{\mathrm{freeze}}\,\frac{C_r}{C_r + 0.25}, \qquad u_{\mathrm{diff}} = \big(1 - e^{-k_{\mathrm{diff}}\Delta t_{\mathrm{yr}}}\big)(N_{\min} - u_{\mathrm{mass}})
-\end{aligned} \tag{7.41}
+\end{aligned} \tag{7.43}
 $$
 
 Remaining demand invests up to $2.2\%$ of positive NPP in symbiotic BNF at the Houlton et al. (2008) / Fisher et al. (2010, FUN Eq. 6) temperature-dependent carbon cost (minimum $\sim 6.3\ \mathrm{kg\ C / kg\ N}$ at $25.15^\circ\mathrm{C}$, rising steeply to $\sim 187$ at $0^\circ\mathrm{C}$, added to $R_{a,\mathrm{eff}}$), diagnosing instantaneous N sufficiency $\phi_N^{\mathrm{inst}}$:
@@ -1208,10 +1230,10 @@ $$
 \begin{aligned}
 \mathrm{cost}_{\mathrm{BNF}}(T_C) &= 5.0\,\exp\!\left(-\left[-3.62 + 0.27\,T_C\left(1 - \frac{T_C}{50.30}\right)\right]\right), \\
 \phi_N^{\mathrm{inst}} &= \operatorname{clamp}\!\left(\frac{N_{\mathrm{retrans}} + u_{\mathrm{soil}} + \mathrm{BNF}_{\mathrm{sym}}}{D_{N,\mathrm{gross}}},\ 0.15,\ 1.0\right)
-\end{aligned} \tag{7.42}
+\end{aligned} \tag{7.44}
 $$
 
-The 15-day EMA nitrogen sufficiency $\phi_N$ feeds back into both Eq. (7.40) ($f_{\mathrm{root}}$) and Eq. (7.27) ($z_{\mathrm{eff}}$). Asymbiotic BNF, lightning $\mathrm{LNO}_x$ deposition, mineralization/immobilization, wet leaching ($0.60\ \mathrm{yr^{-1}}$), and anaerobic denitrification ($0.80\ \mathrm{yr^{-1}}$) close the $N_{\min}$ budget.
+The 15-day EMA nitrogen sufficiency $\phi_N$ feeds back into both Eq. (7.42) ($f_{\mathrm{root}}$) and Eq. (7.29) ($z_{\mathrm{eff}}$). Asymbiotic BNF, lightning $\mathrm{LNO}_x$ deposition, mineralization/immobilization, wet leaching ($0.60\ \mathrm{yr^{-1}}$), and anaerobic denitrification ($0.80\ \mathrm{yr^{-1}}$) close the $N_{\min}$ budget.
 
 3. **Five-layer permafrost soil C/N (Koven et al., 2013)**: Layer decomposition includes depth attenuation $\exp(-z_{\mathrm{mid},k}/0.50\ \mathrm{m})$, $Q_{10}=2.0$, moisture scaling, frozen-soil permafrost suppression ($0.05$), and conservative vertical cryoturbation ($D_{\mathrm{cryo}} = 5.0\times 10^{-4}\ \mathrm{m^2\ yr^{-1}}$).
 
@@ -1222,7 +1244,7 @@ $$
 \mathrm{FDI} &= 1 - \exp(-3\times 10^{-4}\,\mathrm{DI}), \qquad A_{\mathrm{fire}} = \frac{\pi}{4 L_B}\big[(R_f + R_b)\,t_{\mathrm{fire}}\big]^2, \\
 I_B &= 18000\,F_c\,\frac{R_f}{60}\ [\mathrm{kW\ m^{-1}}], \\
 \mathrm{SH} &= 0.11\,I_B^{2/3}\ [\mathrm{m}], \qquad d_{\mathrm{bark}} = 0.8 + 1.8\left(\frac{h_c}{10}\right)^{0.6}\ [\mathrm{cm}]
-\end{aligned} \tag{7.43}
+\end{aligned} \tag{7.45}
 $$
 
 Cloud-to-ground lightning (blended 50/50 with parent-cell mean for dry-lightning ignition) advances discrete MAML patch burn-hazard accumulators with 2D neighbor fire spread, emitting pyrogenic C, BC/OC smoke, and volatilized N ($85\%$ volatilized, $15\%$ returned to $N_{\min}$ as ash) while directly resetting burnt-patch $\mathrm{LAI}$ and $h_c$.
@@ -1236,7 +1258,66 @@ $$
 v_{\mathrm{riv},i} &= \operatorname{clamp}\!\left(0.50\sqrt{\frac{S_i}{10^{-3}}},\ 0.15,\ 2.00\right)\ [\mathrm{m\ s^{-1}}], \\
 f_{\mathrm{out},i} &= -\operatorname{expm1}\!\left(-\frac{v_{\mathrm{riv},i}}{L_i}\Delta t\right), \qquad Q_{\mathrm{out},i} = f_{\mathrm{out},i}\,S_{\mathrm{riv},i}, \\
 \Delta S_{\mathrm{riv},i} &= R_{\mathrm{liq},i} A_i \Delta t + \sum_{j\in\mathrm{up}(i)} Q_{\mathrm{out},j} - Q_{\mathrm{out},i}
-\end{aligned} \tag{7.44}
+\end{aligned} \tag{7.46}
+$$
+
+### 7.10 Map-Free Autonomous Dynamic Lake Model (Topographic Depressions & 2-Layer FLake Thermodynamics, `src/aoba/lakes.py`, `enable_dynamic_lakes`)
+
+Inland lakes expand, contract, freeze, overflow, or desiccate completely in response to climate and topographic evolution (e.g., Green Sahara Mega-Lake Chad, Aral Sea desiccation, proglacial Lake Agassiz) without prescribed lake-mask or depth lookup maps. Maximum geometric basin capacities $(f_{\mathrm{cap},i}, h_{\mathrm{cap},i}, V_{\mathrm{cap},i})$ emerge solely from solid-Earth `Earth2014` bedrock depressions ($z_{\mathrm{SUR}} - z_{\mathrm{BED}} > 0.5\ \mathrm{m}$ on non-ocean, non-ice pixels yielding $f_{\mathrm{bed},i}, V_{\mathrm{bed},i}$) combined with Barnes et al. (2014) Priority-Flood closed-depression sill depth $d_{\mathrm{pf},i} = \max(z_{\mathrm{filled},i} - z_{\mathrm{valley},i}, 0)$ evaluated on valley-floor elevation $z_{\mathrm{valley},i}$ (`z_min_land`, eliminating coarse-mesh river-canyon aliasing along the Amazon and Congo while updating dynamically under glacial isostasy):
+
+$$
+\begin{aligned}
+f_{\mathrm{pf},i} &= f_{\max}\,\frac{d_{\mathrm{pf},i}}{d_{\mathrm{pf},i} + \max(\sigma_{\mathrm{topo},i},\ 50\ \mathrm{m})}, \qquad V_{\mathrm{pf},i} = \frac{1}{1.5}\,(f_{\mathrm{pf},i} A_i)\,\min(d_{\mathrm{pf},i},\ d_{\max}), \\
+f_{\mathrm{cap},i} &= \min\!\big(f_{\max},\ \max(f_{\mathrm{bed},i},\ f_{\mathrm{pf},i})\big), \qquad h_{\mathrm{cap},i} = \operatorname{clamp}\!\left(\frac{\max(V_{\mathrm{bed},i}, V_{\mathrm{pf},i})}{f_{\mathrm{cap},i} A_i},\ 1.0,\ d_{\max}\right), \\
+V_{\mathrm{cap},i} &= f_{\mathrm{cap},i} A_i h_{\mathrm{cap},i}
+\end{aligned} \tag{7.47}
+$$
+
+with $f_{\max} = 0.85$ (`lake_max_frac`) and $d_{\max} = 400\ \mathrm{m}$ (`lake_max_depth_m`). Prognostic liquid-plus-ice water-equivalent basin volume $V_i \in [0, V_{\mathrm{cap},i}]$ (updated with Kahan compensation) maps via exact parabolic-bowl hypsometry to lake area fraction $f_{\mathrm{lake},i}$ and mean depth $h_{\mathrm{lake},i}$ ($f_{\mathrm{lake},i} = 0$ when $h_{\mathrm{lake},i} < 0.05\ \mathrm{m}$), coupled conservatively to Priority-Flood river routing (Eq. 7.46):
+
+$$
+\begin{aligned}
+\phi_i &= \operatorname{clamp}\!\left(\frac{V_i}{V_{\mathrm{cap},i}},\ 0,\ 1\right), \qquad f_{\mathrm{lake},i} = f_{\mathrm{cap},i}\,\phi_i^{2/3}, \qquad h_{\mathrm{lake},i} = h_{\mathrm{cap},i}\,\phi_i^{1/3}, \\
+M_{\mathrm{in},i} &= (1 - f_{\mathrm{lake},i}) R_{\mathrm{liq},i} A_i \Delta t + \sum_{j\in\mathrm{up}(i)} Q_{\mathrm{out},j}, \qquad M_{\mathrm{spill},i} = \rho_w\max\!\left(V_i + \frac{M_{\mathrm{in},i}}{\rho_w} - V_{\mathrm{cap},i},\ 0\right)
+\end{aligned} \tag{7.48}
+$$
+
+satisfying $f_{\mathrm{lake},i} A_i h_{\mathrm{lake},i} \equiv V_i$ identically so both endorheic closed basins ($V_i < V_{\mathrm{cap},i} \Rightarrow M_{\mathrm{spill},i} = 0$; Caspian, Chad, Eyre) and exorheic through-flow lakes ($V_i = V_{\mathrm{cap},i} \Rightarrow M_{\mathrm{spill},i} > 0$; Great Lakes, Baikal) emerge from a single governing balance.
+
+Lake thermodynamics follows Mironov (2008, FLake) and Hostetler & Bartlein (1990) with a two-layer liquid column (epilimnion $T_{\mathrm{ml}}, h_{\mathrm{ml}}$; hypolimnion $T_{\mathrm{bot}}, h_{\mathrm{bot}} = h_{\mathrm{liq}} - h_{\mathrm{ml}}$) and prognostic lake-ice/snow cover $(h_{\mathrm{ice}}, \mathrm{SWE}_{\mathrm{ice}}, T_{\mathrm{ice}})$. Over open water, Beer–Lambert solar penetration ($f_{\mathrm{sw,ml}} = 1 - e^{-k_{\mathrm{ext}} h_{\mathrm{ml}}}$, default $k_{\mathrm{ext}} = 0.5\ \mathrm{m^{-1}}$) and an unconditionally stable implicit backward-Euler surface heat balance (including snowfall melting $-L_f P_{\mathrm{snow}}$) advance $T_{\mathrm{ml}}$ and initiate surface ice whenever $T_{\mathrm{ml}}^* < T_f$:
+
+$$
+\begin{aligned}
+F_{\mathrm{net},0} &= f_{\mathrm{sw,ml}} F_{\mathrm{sw}} + \epsilon_l F_{\mathrm{lw}\downarrow} - \epsilon_l \sigma T_{\mathrm{ml}}^4 - c_p g_a (T_{\mathrm{ml}} - T_a) - L_v g_a\big(q_{\mathrm{sat}}(T_{\mathrm{ml}}) - q_v\big) - L_f P_{\mathrm{snow}}, \\
+\Delta T_{\mathrm{ml}} &= \frac{F_{\mathrm{net},0}\,\Delta t}{\rho_w c_{pw} h_{\mathrm{ml}} + \Delta t\left(4\epsilon_l\sigma T_{\mathrm{ml}}^3 + c_p g_a + L_v g_a \frac{\partial q_{\mathrm{sat}}}{\partial T}\right)}, \qquad \Delta h_{\mathrm{ice}} = \frac{\rho_w c_{pw} h_{\mathrm{ml}}\max(T_f - T_{\mathrm{ml}}^*,\ 0)}{\rho_{\mathrm{ice}} L_f}
+\end{aligned} \tag{7.49}
+$$
+
+On ice-covered lakes ($h_{\mathrm{ice}} > 10^{-4}\ \mathrm{m}$), an implicit skin balance with series snow-plus-ice conductivity $k_{\mathrm{eff}}$ determines $T_{\mathrm{ice}} \le T_f$, surface snow/ice melt, basal conductive freezing, and exact exponential under-ice water melt, transitioning smoothly from Fresnel open-water albedo (Eq. 9.1) to bare ice (VIS $0.55$ / NIR $0.30$) and snow-covered ice (VIS $0.82$ / NIR $0.52$):
+
+$$
+\begin{aligned}
+k_{\mathrm{eff}} &= \left(\frac{h_{\mathrm{ice}}}{k_{\mathrm{ice}}} + \frac{\mathrm{SWE}_{\mathrm{ice}}}{\rho_{\mathrm{snow}} k_{\mathrm{snow}}}\right)^{-1}, \qquad F_{\mathrm{cond}} = k_{\mathrm{eff}}(T_f - T_{\mathrm{ice}}), \\
+\Delta h_{\mathrm{ice,base}} &= \frac{F_{\mathrm{cond}}\,\Delta t - \rho_w c_{pw} h_{\mathrm{ml}}(T_{\mathrm{ml}} - T_f)\big(1 - e^{-\gamma_w \Delta t / h_{\mathrm{ml}}}\big)}{\rho_{\mathrm{ice}} L_f}
+\end{aligned} \tag{7.50}
+$$
+
+Using the quadratic freshwater equation of state $\rho_f(T)$ with maximum density at $T_{\mathrm{md}} = 277.13\ \mathrm{K}$ ($3.98^\circ\mathrm{C}$), instantaneous enthalpy-conserving convective overturning mixes the column whenever $\rho_f(T_{\mathrm{ml}}) \ge \rho_f(T_{\mathrm{bot}})$; under stable stratification, wind–buoyancy mixed-layer entrainment/detrainment toward $h_{\mathrm{eq}}$ and exact analytical two-layer exponential thermocline diffusion ($K_z = 2\times 10^{-5}\ \mathrm{m^2\ s^{-1}}$) conserve total column heat identically:
+
+$$
+\begin{aligned}
+\rho_f(T) &= \rho_w\Big[1 - 6.8\times 10^{-6}\,(T - 277.13)^2\Big], \qquad T_{\mathrm{mix}} = \frac{h_{\mathrm{ml}} T_{\mathrm{ml}} + h_{\mathrm{bot}} T_{\mathrm{bot}}}{h_{\mathrm{ml}} + h_{\mathrm{bot}}}, \\
+h_{\mathrm{eq}} &= \operatorname{clamp}\!\left(\frac{0.25\,u_{*w}}{|f| + 0.15\,N + 10^{-4}},\ \min(1.0, h_{\mathrm{liq}}),\ h_{\mathrm{liq}}\right), \qquad d_{\mathrm{fac}} = -\operatorname{expm1}\!\left(-\frac{K_z\,\Delta t}{0.5\,h_{\mathrm{ml}} h_{\mathrm{bot}}}\right)
+\end{aligned} \tag{7.51}
+$$
+
+Finally, cell albedos, thermal emission, turbulent fluxes, and mineral dust emission are conservatively tiled between land $(1 - f_{\mathrm{lake},i})$ and lake $f_{\mathrm{lake},i}$ (so desiccated basins automatically expose dust sources), executed on GPUs in one fused launch via `dynamic_lake_step_col` (`src/aoba/kernels_esm.py`):
+
+$$
+\begin{aligned}
+\alpha_{\mathrm{cell}} &= (1 - f_{\mathrm{lake}})\,\alpha_{\mathrm{land}} + f_{\mathrm{lake}}\,\alpha_{\mathrm{lake}}, \qquad T_{\mathrm{rad,cell}}^4 = (1 - f_{\mathrm{lake}})\,T_{\mathrm{rad,land}}^4 + f_{\mathrm{lake}}\,T_{\mathrm{rad,lake}}^4, \\
+(H, \mathrm{LHF}, E, \boldsymbol{\tau})_{\mathrm{cell}} &= (1 - f_{\mathrm{lake}})\,(H, \mathrm{LHF}, E, \boldsymbol{\tau})_{\mathrm{land}} + f_{\mathrm{lake}}\,(H, \mathrm{LHF}, E, \boldsymbol{\tau})_{\mathrm{lake}}, \qquad F_{\mathrm{dust,eff}} = (1 - f_{\mathrm{lake}})\,F_{\mathrm{dust,land}}
+\end{aligned} \tag{7.52}
 $$
 
 ---

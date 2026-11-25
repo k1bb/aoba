@@ -38,7 +38,7 @@ Strictly conserves total land carbon and nitrogen via Neumaier/Kahan float32 sum
     d(C_total) / dt == GPP - R_a_eff - R_h - F_fire_C == NBP
     d(N_total) / dt == F_dep + F_BNF - F_leach - F_denit - F_fire_N
 
-AOBA Formulation Reference: Sec. 7.8, Eqs. (7.39)-(7.43) (Stocker-Prentice C/N, FUN BNF, 5-Layer Permafrost & MAML SPITFIRE Wildfire).
+AOBA Formulation Reference: Sec. 7.8, Eqs. (7.41)-(7.45) (Stocker-Prentice C/N, LES LMA/Lifespan, FUN BNF, 5-Layer Permafrost & MAML SPITFIRE Wildfire).
 """
 
 from __future__ import annotations
@@ -418,7 +418,9 @@ def step_land_carbon_and_fire(
     pos_in = torch.clamp(d_npp, min=0.0)
 
     # 3. Tissue Turnover (exact exponential fractions) & Leaf/Root N Retranslocation
-    f_turn_l = -math.expm1(-dt_yr / TAU_LEAF_YR)
+    # Under N scarcity (phi_N < 1), thicker high-LMA leaves extend leaf lifespan and reduce leaf N turnover (Wright et al., 2004 LES)
+    tau_leaf_eff = TAU_LEAF_YR * (1.0 + 0.80 * (1.0 - phi_prev))
+    f_turn_l = -torch.expm1(-dt_yr / tau_leaf_eff)
     f_turn_r = -math.expm1(-dt_yr / TAU_ROOT_YR)
     f_turn_w = -math.expm1(-dt_yr / TAU_WOOD_YR)
 
@@ -444,10 +446,11 @@ def step_land_carbon_and_fire(
         assert lc.n_lit_fast_comp is not None and lc.n_lit_slow_comp is not None
         assert lc.n_soil_comp is not None and lc.n_min_comp is not None
 
-        # Optimal leaf C:N from Dong et al. (2022) & Stocker & Prentice (2024): N_area = n_rub*Vcmax25 + n_struct*LMA
+        # Optimal leaf C:N from Dong et al. (2022), Wright et al. (2004 LES) & Stocker & Prentice (2024):
+        # N_area = n_rub*Vcmax25 + n_struct*LMA, with LMA increasing under evergreen habit, cold, or N scarcity
         fevg_v = torch.clamp(f_evg, 0.0, 1.0) if f_evg is not None else torch.full_like(hc_pos, 0.5)
         f_cold_n = torch.sigmoid((-t0_c) / 5.0)
-        lma_kgc = 0.045 + 0.055 * fevg_v + 0.025 * f_cold_n
+        lma_kgc = 0.045 + 0.055 * fevg_v + 0.025 * f_cold_n + 0.035 * (1.0 - phi_prev)
         vc25 = torch.clamp(vcmax25_eff, min=5.0, max=200.0) if vcmax25_eff is not None else torch.full_like(hc_pos, 45.0)
         n_area_opt = N_RUBISCO_SLOPE * vc25 + N_STRUCT_SLOPE * lma_kgc
         cn_leaf_opt = torch.clamp(lma_kgc / torch.clamp(n_area_opt, min=1.0e-4), CN_LEAF_MIN, CN_LEAF_MAX)

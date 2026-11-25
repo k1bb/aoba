@@ -169,6 +169,7 @@ def export_aoba_snapshot_xarray(
             "vcmax25_c3": (("time", "n_cell"), _c1(sfc.bio.vcmax25_c3), {"units": "umol m-2 s-1"}),
             "f_c4": (("time", "n_cell"), _c1(sfc.bio.f_c4), {"units": "1"}),
             "f_evg": (("time", "n_cell"), _c1(sfc.bio.f_evg if sfc.bio.f_evg is not None else sfc.bio.f_c4 * 0.0), {"units": "1"}),
+            "chi_leaf": (("time", "n_cell"), _c1(sfc.bio.chi_leaf if sfc.bio.chi_leaf is not None else sfc.bio.f_c4 * 0.0), {"units": "1"}),
             "koppen_code": (("time", "n_cell"), _c1(kg30), {"long_name": "Beck et al. (2018) 1..30 class"}),
             "koppen_major": (("time", "n_cell"), _c1(kg5), {"long_name": "1=A, 2=B, 3=C, 4=D, 5=E"}),
         })
@@ -184,6 +185,11 @@ def export_aoba_snapshot_xarray(
         if getattr(model, "maml_land", None) is not None:
             fw_c = model.maml_land.f_wetland.reshape(mesh.n_cells, -1).mean(dim=-1)
             data_vars["f_wetland"] = (("time", "n_cell"), _c1(fw_c), {"units": "1"})
+        if getattr(model, "lakes", None) is not None:
+            data_vars["f_lake"] = (("time", "n_cell"), _c1(model.lakes.f_lake), {"units": "1"})
+            data_vars["h_lake"] = (("time", "n_cell"), _c1(model.lakes.h_lake), {"units": "m"})
+            data_vars["t_lake_ml"] = (("time", "n_cell"), _c1(model.lakes.t_ml), {"units": "K"})
+            data_vars["h_lake_ice"] = (("time", "n_cell"), _c1(model.lakes.h_ice), {"units": "m"})
         if getattr(model, "water_isotopes", None) is not None:
             data_vars["d18o_precip_permil"] = (("time", "n_cell"), _c1(model.water_isotopes.d18o_precip_permil), {"units": "permil"})
             data_vars["d18o_snow_permil"] = (("time", "n_cell"), _c1(model.water_isotopes.d18o_snow_permil), {"units": "permil"})

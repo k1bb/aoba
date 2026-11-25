@@ -101,6 +101,9 @@ class SCVTMesh:
     coastal_ocean_idx: torch.Tensor # [n_cells] int64 nearest ocean cell index for river/glacier runoff
     z_bed: torch.Tensor | None = None       # Cell-mean subglacial bedrock/bathymetry elevation [m] (Earth2014 BED2014)
     h_ice_init: torch.Tensor | None = None  # Cell-mean initial ice-sheet thickness [m] (Earth2014 ICE2014)
+    z_min_land: torch.Tensor | None = None  # Minimum non-ocean surface elevation in cell [m] (Earth2014 SUR2014 valley floor)
+    lake_basin_frac_bed: torch.Tensor | None = None  # Solid-Earth bedrock depression area fraction (SUR > BED, non-ocean/ice) [-]
+    lake_basin_vol_bed: torch.Tensor | None = None   # Cell-mean bedrock depression depth (volume / area_cell) [m]
 
     def to(self, device: torch.device | str, dtype: torch.dtype = torch.float32) -> "SCVTMesh":
         """Move all mesh tensors to target compute device (`cpu` or `mps`) and float `dtype`."""
@@ -520,8 +523,10 @@ def _aggregate_earth2014_to_scvt(
     dh_dy = np.zeros_like(sur_full)
     dh_dy[1:-1] = (sur_full[2:] - sur_full[:-2]) / (2.0 * dy_m)
 
-    is_ocean_px = ((sur_full == 0.0) & (tbi_full < 0.0) & (ice_full == 0.0)).astype(np.float32)
+    is_ocean_px = ((sur_full == 0.0) & ((tbi_full < 0.0) | (bed_full < 0.0)) & (ice_full == 0.0)).astype(np.float32)
     is_ice_px = ((ice_full > 0.0) & (sur_full > 0.0)).astype(np.float32)
+    # Pure solid-Earth bedrock depression depth (SUR > BED on non-ocean, non-ice pixels; zero prescribed lake masks)
+    d_bath_px = np.where((is_ocean_px == 0.0) & (is_ice_px == 0.0) & (sur_full != 0.0), np.maximum(sur_full - bed_full, 0.0), 0.0).astype(np.float32)
 
     # Assign every 5-arc-min pixel to its nearest Voronoi generator on the unit sphere (exact Voronoi definition!)
     tree = cKDTree(xyz_cell)
@@ -535,6 +540,9 @@ def _aggregate_earth2014_to_scvt(
     sum_hx2 = np.zeros(n_cells, dtype=np.float64)
     sum_hy2 = np.zeros(n_cells, dtype=np.float64)
     sum_hxy = np.zeros(n_cells, dtype=np.float64)
+    sum_bath_frac = np.zeros(n_cells, dtype=np.float64)
+    sum_bath_vol = np.zeros(n_cells, dtype=np.float64)
+    z_min_land = np.full(n_cells, 1.0e9, dtype=np.float64)
 
     cos_lons = np.cos(lons)
     sin_lons = np.sin(lons)
@@ -555,9 +563,11 @@ def _aggregate_earth2014_to_scvt(
         h_c = sur_full[j0:j1].ravel().astype(np.float64)
         hx_c = dh_dx[j0:j1].ravel().astype(np.float64)
         hy_c = dh_dy[j0:j1].ravel().astype(np.float64)
+        ocn_c = is_ocean_px[j0:j1].ravel()
+        db_c = d_bath_px[j0:j1].ravel().astype(np.float64)
 
         np.add.at(w_tot, cid, w_px)
-        np.add.at(sum_ocn, cid, w_px * is_ocean_px[j0:j1].ravel())
+        np.add.at(sum_ocn, cid, w_px * ocn_c)
         np.add.at(sum_ice, cid, w_px * is_ice_px[j0:j1].ravel())
         np.add.at(sum_ice_h, cid, w_px * (is_ice_px[j0:j1] * np.maximum(ice_full[j0:j1], 0.0)).ravel())
         np.add.at(sum_bed, cid, w_px * bed_full[j0:j1].ravel())
@@ -566,6 +576,11 @@ def _aggregate_earth2014_to_scvt(
         np.add.at(sum_hx2, cid, w_px * hx_c * hx_c)
         np.add.at(sum_hy2, cid, w_px * hy_c * hy_c)
         np.add.at(sum_hxy, cid, w_px * hx_c * hy_c)
+        np.add.at(sum_bath_frac, cid, w_px * (db_c > 0.5))
+        np.add.at(sum_bath_vol, cid, w_px * db_c)
+        non_ocn = ocn_c == 0.0
+        if np.any(non_ocn):
+            np.minimum.at(z_min_land, cid[non_ocn], h_c[non_ocn])
 
     w_safe = np.maximum(w_tot, 1.0e-12)
     ocean_frac = np.clip(sum_ocn / w_safe, 0.0, 1.0)
@@ -580,6 +595,9 @@ def _aggregate_earth2014_to_scvt(
     z_topo = np.where(surf_type == 0, 0.0, z_topo)
     h_ice_init = np.where(surf_type == 0, 0.0, np.maximum(sum_ice_h / w_safe, 0.0))
     z_bed = sum_bed / w_safe
+    z_min_land = np.where((surf_type == 0) | (z_min_land > 1.0e8), z_topo, z_min_land)
+    lake_basin_frac_bed = np.where(surf_type == 1, np.clip(sum_bath_frac / w_safe, 0.0, 1.0), 0.0)
+    lake_basin_vol_bed = np.where(surf_type == 1, np.maximum(sum_bath_vol / w_safe, 0.0), 0.0)
 
     var_h = np.maximum(sum_h2 / w_safe - (sum_h / w_safe) ** 2, 0.0)
     sigma_topo = np.where(surf_type == 0, 0.0, np.sqrt(var_h))
@@ -638,6 +656,9 @@ def _aggregate_earth2014_to_scvt(
         "coastal_ocean_idx": coastal_ocean_idx,
         "z_bed": z_bed,
         "h_ice_init": h_ice_init,
+        "z_min_land": z_min_land,
+        "lake_basin_frac_bed": lake_basin_frac_bed,
+        "lake_basin_vol_bed": lake_basin_vol_bed,
     }
 
 
@@ -694,6 +715,9 @@ def build_scvt_mesh(
             "coastal_ocean_idx": np.arange(n_cells, dtype=np.int64),
             "z_bed": np.full(n_cells, -4000.0, dtype=np.float64),
             "h_ice_init": np.zeros(n_cells, dtype=np.float64),
+            "z_min_land": np.zeros(n_cells, dtype=np.float64),
+            "lake_basin_frac_bed": np.zeros(n_cells, dtype=np.float64),
+            "lake_basin_vol_bed": np.zeros(n_cells, dtype=np.float64),
         }
 
     dev = torch.device(device)
@@ -748,6 +772,9 @@ def build_scvt_mesh(
         coastal_ocean_idx=_ti(bndry["coastal_ocean_idx"]),
         z_bed=_tf(bndry["z_bed"]),
         h_ice_init=_tf(bndry["h_ice_init"]),
+        z_min_land=_tf(bndry["z_min_land"]),
+        lake_basin_frac_bed=_tf(bndry["lake_basin_frac_bed"]),
+        lake_basin_vol_bed=_tf(bndry["lake_basin_vol_bed"]),
     )
 
 
