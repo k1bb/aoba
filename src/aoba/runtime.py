@@ -304,13 +304,15 @@ def compute_optimal_chunks(
 _CUDA_COMPILED_FN_CACHE: dict[int, object] = {}
 _CUDA_GRAPH_CACHE: dict[tuple, dict[str, object]] = {}
 _CUDA_GRAPH_POOL: object | None = None
+_CUDA_GRAPH_TRAIN_POOL: object | None = None
 
 
 def clear_cuda_graph_cache() -> None:
-    """Release all captured CUDA Graphs and reset the shared memory pool handle safely."""
-    global _CUDA_GRAPH_POOL
+    """Release all captured CUDA Graphs and reset the shared memory pool handles safely."""
+    global _CUDA_GRAPH_POOL, _CUDA_GRAPH_TRAIN_POOL
     _CUDA_GRAPH_CACHE.clear()
     _CUDA_GRAPH_POOL = None
+    _CUDA_GRAPH_TRAIN_POOL = None
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -407,7 +409,7 @@ def run_cuda_graph_train_step(
     capture only records kernels without executing them, calling `g.replay()` immediately after
     capture applies the exact single gradient update for the capture step with zero extra steps.
     """
-    global _CUDA_GRAPH_POOL
+    global _CUDA_GRAPH_TRAIN_POOL
     slot = _CUDA_GRAPH_CACHE.get(key)
     if slot is not None and slot.get("failed", False):
         return train_body_fn(live_inputs)
@@ -430,14 +432,14 @@ def run_cuda_graph_train_step(
             torch.cuda.current_stream().wait_stream(cap_stream)
             return out_w
         try:
-            if _CUDA_GRAPH_POOL is None:
-                _CUDA_GRAPH_POOL = torch.cuda.graphs.graph_pool_handle()
+            if _CUDA_GRAPH_TRAIN_POOL is None:
+                _CUDA_GRAPH_TRAIN_POOL = torch.cuda.graphs.graph_pool_handle()
             static_in = [t.detach().clone() for t in live_inputs]
             torch.cuda.synchronize()
             cap_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(cap_stream):
                 g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g, pool=_CUDA_GRAPH_POOL):
+                with torch.cuda.graph(g, pool=_CUDA_GRAPH_TRAIN_POOL):
                     static_out = train_body_fn(static_in)
             torch.cuda.current_stream().wait_stream(cap_stream)
             slot["graph"] = g

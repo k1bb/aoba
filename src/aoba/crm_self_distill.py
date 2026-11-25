@@ -366,9 +366,14 @@ def apply_exact_conservation_closure(
 
     w_prov = (dm * (qn_prov + qp_prov)).sum(dim=0)
     w_target = torch.clamp(w_avail - p_tot_mass, min=0.0)
-    scale_w = w_target / torch.clamp(w_prov, min=1.0e-10)
-    # Guard extreme rescaling when column is nearly bone-dry
-    zero_prov = w_prov <= 1.0e-10
+    # Guard extreme rescaling and FP32 backward overflow (1/w_prov^2) when column is nearly bone-dry
+    zero_prov = w_prov <= 1.0e-5
+    w_prov_safe = torch.where(zero_prov, torch.ones_like(w_prov), w_prov)
+    scale_w = torch.where(
+        zero_prov,
+        torch.ones_like(w_target),
+        torch.clamp(w_target / torch.clamp(w_prov_safe, min=1.0e-5), min=0.0, max=50.0),
+    )
     qn_new = torch.where(zero_prov.unsqueeze(0), qn_base, qn_prov * scale_w.unsqueeze(0))
     qp_new = torch.where(zero_prov.unsqueeze(0), qp_pre, qp_prov * scale_w.unsqueeze(0))
     # Recompute exact residual precipitation if zero_prov triggered
@@ -1469,10 +1474,11 @@ def train_student_online(
         lv = float(last_loss.detach().item())
         rt = float(last_rthm.detach().item())
         rq = float(last_rqn.detach().item())
-        alpha = 0.2
-        state.ema_loss = (1.0 - alpha) * state.ema_loss + alpha * lv
-        state.ema_val_rmse_thm = (1.0 - alpha) * state.ema_val_rmse_thm + alpha * rt
-        state.ema_val_rmse_qn = (1.0 - alpha) * state.ema_val_rmse_qn + alpha * rq
+        if math.isfinite(lv) and math.isfinite(rt) and math.isfinite(rq):
+            alpha = 0.2
+            state.ema_loss = (1.0 - alpha) * state.ema_loss + alpha * lv
+            state.ema_val_rmse_thm = (1.0 - alpha) * state.ema_val_rmse_thm + alpha * rt
+            state.ema_val_rmse_qn = (1.0 - alpha) * state.ema_val_rmse_qn + alpha * rq
 
 
 @torch.no_grad()
@@ -2218,10 +2224,11 @@ def train_rad_student_online(
         lv = float(last_loss.detach().item())
         ro = float(last_olr.detach().item())
         ra = float(last_asr.detach().item())
-        alpha = 0.2
-        state.ema_loss = (1.0 - alpha) * state.ema_loss + alpha * lv
-        state.ema_val_rmse_olr = (1.0 - alpha) * state.ema_val_rmse_olr + alpha * ro
-        state.ema_val_rmse_asr = (1.0 - alpha) * state.ema_val_rmse_asr + alpha * ra
+        if math.isfinite(lv) and math.isfinite(ro) and math.isfinite(ra):
+            alpha = 0.2
+            state.ema_loss = (1.0 - alpha) * state.ema_loss + alpha * lv
+            state.ema_val_rmse_olr = (1.0 - alpha) * state.ema_val_rmse_olr + alpha * ro
+            state.ema_val_rmse_asr = (1.0 - alpha) * state.ema_val_rmse_asr + alpha * ra
 
 
 @torch.no_grad()
