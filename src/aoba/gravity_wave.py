@@ -39,7 +39,10 @@ import torch
 
 from aoba import constants as C
 from aoba.kernels import can_use_crm_metal, dispatch_ngwd_propagate_metal
+from aoba.runtime import can_use_cuda_graph, run_cuda_graph_cached
 from aoba.scvt_mesh import SCVTMesh
+
+_NGWD_EFF_CACHE: dict[tuple[str, int, torch.dtype, tuple[float, ...]], torch.Tensor] = {}
 
 
 # Flow-dependent non-orographic GWD global parameters (synchronized via `[gravity_wave]` in TOML)
@@ -225,6 +228,56 @@ def compute_nonorographic_gwd(
         z = torch.zeros_like(u_cell)
         return z, z
 
+    if can_use_cuda_graph(device):
+        has_q = q_conv_c is not None
+        live_in = [rho_d, pres_c, u_cell, v_cell, theta_m, z_rel_c, dz_c]
+        if has_q:
+            assert q_conv_c is not None
+            live_in.append(q_conv_c)
+        g_key = (
+            "nonoro_gwd",
+            nz,
+            n_cells,
+            int(mesh.cells_on_edge.data_ptr()),
+            str(device),
+            str(dtype),
+            bool(has_q),
+            int(n_phase_bins),
+            round(float(dt), 6),
+        )
+
+        def _cg_body(inp: list[torch.Tensor]) -> list[torch.Tensor]:
+            du_o, dv_o = _compute_nonorographic_gwd_impl(
+                mesh, inp[0], inp[1], inp[2], inp[3], inp[4], inp[5], inp[6],
+                inp[7] if has_q else None, dt, n_phase_bins,
+            )
+            return [du_o, dv_o]
+
+        out = run_cuda_graph_cached(g_key, live_in, _cg_body, warmup_calls=2, clone_outputs=True)
+        return out[0], out[1]
+
+    return _compute_nonorographic_gwd_impl(
+        mesh, rho_d, pres_c, u_cell, v_cell, theta_m, z_rel_c, dz_c, q_conv_c, dt, n_phase_bins
+    )
+
+
+def _compute_nonorographic_gwd_impl(
+    mesh: SCVTMesh,
+    rho_d: torch.Tensor,
+    pres_c: torch.Tensor,
+    u_cell: torch.Tensor,
+    v_cell: torch.Tensor,
+    theta_m: torch.Tensor,
+    z_rel_c: torch.Tensor,
+    dz_c: torch.Tensor,
+    q_conv_c: torch.Tensor | None,
+    dt: float,
+    n_phase_bins: int = 17,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    nz, n_cells = rho_d.shape
+    dtype = rho_d.dtype
+    device = rho_d.device
+
     # 1. Brunt-Vaisala frequency N at internal interfaces [Nz - 1, N_cells]
     dz_int = torch.clamp(z_rel_c[1:] - z_rel_c[:-1], min=10.0)
     thm_int = torch.clamp(0.5 * (theta_m[1:] + theta_m[:-1]), min=180.0)
@@ -318,7 +371,11 @@ def compute_nonorographic_gwd(
         z = torch.zeros_like(u_cell)
         return z, z
 
-    eff_t = torch.tensor(eff_list, device=device, dtype=dtype)
+    eff_key = (device.type, device.index or 0, dtype, tuple(float(v) for v in eff_list))
+    eff_t = _NGWD_EFF_CACHE.get(eff_key)
+    if eff_t is None:
+        eff_t = torch.tensor(eff_list, device=device, dtype=dtype)
+        _NGWD_EFF_CACHE[eff_key] = eff_t
     acc_all = _propagate_spectral_batched(
         rho_d=rho_d,
         u_proj_b=torch.stack(u_proj_list, dim=0),

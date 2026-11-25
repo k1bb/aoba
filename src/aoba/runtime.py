@@ -404,22 +404,27 @@ def run_cuda_graph_train_step(
         return train_body_fn(live_inputs)
 
     if slot is None:
-        slot = {"seen": 0, "graph": None, "failed": False}
+        slot = {"seen": 0, "graph": None, "failed": False, "stream": torch.cuda.Stream()}
         _CUDA_GRAPH_CACHE[key] = slot
 
     if slot["graph"] is None:
         seen = int(slot["seen"])
+        cap_stream = slot["stream"]
         if seen < warmup_calls:
             if seen == 0:
                 torch.backends.cudnn.benchmark = True
             slot["seen"] = seen + 1
-            return train_body_fn(live_inputs)
+            # Run warmup on the dedicated side stream so AccumulateGrad nodes bind to cap_stream
+            cap_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(cap_stream):
+                out_w = train_body_fn(live_inputs)
+            torch.cuda.current_stream().wait_stream(cap_stream)
+            return out_w
         try:
             if _CUDA_GRAPH_POOL is None:
                 _CUDA_GRAPH_POOL = torch.cuda.graphs.graph_pool_handle()
             static_in = [t.detach().clone() for t in live_inputs]
             torch.cuda.synchronize()
-            cap_stream = torch.cuda.Stream()
             cap_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(cap_stream):
                 g = torch.cuda.CUDAGraph()

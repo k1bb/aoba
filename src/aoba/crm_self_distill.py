@@ -1209,6 +1209,24 @@ def select_teacher_indices(
     return res
 
 
+_DISTILL_LOSS_W_CACHE: dict[tuple[str, str, int, torch.dtype], torch.Tensor] = {}
+
+
+def _cached_loss_weights(
+    tag: str,
+    vals: tuple[float, ...],
+    shape: tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    key = (tag, device.type, device.index or 0, dtype)
+    w = _DISTILL_LOSS_W_CACHE.get(key)
+    if w is None:
+        w = torch.tensor(vals, device=device, dtype=dtype).view(shape)
+        _DISTILL_LOSS_W_CACHE[key] = w
+    return w
+
+
 def _compute_distill_loss(
     pred_a: dict[str, torch.Tensor],
     pred_b: dict[str, torch.Tensor],
@@ -1239,9 +1257,9 @@ def _compute_distill_loss(
         ],
         dim=0,
     )  # [8, nz, 2*B]
-    w_prof = torch.tensor(
-        [2.0, 2.5, 0.8, 1.5, 1.5, 0.5, 0.5, 1.8], device=tp.device, dtype=tp.dtype
-    ).view(8, 1, 1)
+    w_prof = _cached_loss_weights(
+        "crm_prof", (2.0, 2.5, 0.8, 1.5, 1.5, 0.5, 0.5, 1.8), (8, 1, 1), tp.device, tp.dtype
+    )
     l_prof = (F.smooth_l1_loss(prof_p2, prof_t2, reduction="none") * w_prof).mean(dim=(1, 2)).sum()
 
     scal_t = torch.stack(
@@ -1261,7 +1279,7 @@ def _compute_distill_loss(
         ],
         dim=0,
     )  # [3, 2*B]
-    w_scal = torch.tensor([1.2, 1.2, 0.8], device=tp.device, dtype=tp.dtype).view(3, 1)
+    w_scal = _cached_loss_weights("crm_scal", (1.2, 1.2, 0.8), (3, 1), tp.device, tp.dtype)
     l_scal = (F.smooth_l1_loss(scal_p2, scal_t2, reduction="none") * w_scal).mean(dim=1).sum()
     loss = l_prof + l_scal
 
@@ -2089,7 +2107,7 @@ def _compute_rad_distill_loss(
     )
     sp2 = torch.cat([sp_a, sp_b], dim=0) * s_scale
     st2 = torch.cat([tgt_s, tgt_s], dim=0) * s_scale
-    w_s = torch.tensor([2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0], device=tgt_s.device, dtype=tgt_s.dtype).unsqueeze(0)
+    w_s = _cached_loss_weights("rad_scal", (2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0), (1, 7), tgt_s.device, tgt_s.dtype)
     l_scal = (F.smooth_l1_loss(sp2, st2, beta=0.05, reduction="none") * w_s).mean(dim=0).sum()
 
     loss = 1.5 * l_qr_unif + 2.5 * l_qr_mass + l_scal

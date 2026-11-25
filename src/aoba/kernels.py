@@ -1560,6 +1560,9 @@ def dispatch_rad_distill_closure_metal(**kwargs: Any) -> dict[str, torch.Tensor]
     return run_rad_distill_closure_metal(lib, **kwargs)
 
 
+_WEIGHTED_EDGE_SUM_UP_CACHE: dict[tuple[str, int, int, int, int], torch.Tensor] = {}
+
+
 def dispatch_scvt_weighted_edge_sum_metal(
     mesh: Any,
     edge_field: torch.Tensor,
@@ -1573,7 +1576,11 @@ def dispatch_scvt_weighted_edge_sum_metal(
     nc = int(mc["n_cells"])
     ne = int(mc["n_edges"])
     out = torch.empty((nz, nc), device=edge_field.device, dtype=edge_field.dtype)
-    up = torch.tensor([nz, nc, ne], device=edge_field.device, dtype=torch.uint32)
+    up_key = (edge_field.device.type, edge_field.device.index or 0, nz, nc, ne)
+    up = _WEIGHTED_EDGE_SUM_UP_CACHE.get(up_key)
+    if up is None:
+        up = torch.tensor([nz, nc, ne], device=edge_field.device, dtype=torch.uint32)
+        _WEIGHTED_EDGE_SUM_UP_CACHE[up_key] = up
     lib.scvt_div_cell(mc["eoc"], weights_cell.contiguous(), edge_field.contiguous(), out, up, threads=nz * nc)
     return out
 
