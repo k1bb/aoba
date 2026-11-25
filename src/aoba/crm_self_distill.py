@@ -130,14 +130,17 @@ def compute_periodic_spatial_stats(
 
 
 def compute_subgrid_structure_features(
-    shf_3d: torch.Tensor,       # [N, ny, nx] sensible heat flux [W m^-2]
-    lhf_3d: torch.Tensor,       # [N, ny, nx] latent heat flux [W m^-2]
-    t_rad_3d: torch.Tensor,     # [N, ny, nx] radiative surface temperature [K]
-    alb_vis_3d: torch.Tensor,   # [N, ny, nx] visible direct albedo [-]
+    shf_3d: torch.Tensor,       # [N, ny_s, nx_s] sensible heat flux [W m^-2]
+    lhf_3d: torch.Tensor,       # [N, ny_s, nx_s] latent heat flux [W m^-2]
+    t_rad_3d: torch.Tensor,     # [N, ny_s, nx_s] radiative surface temperature [K]
+    alb_vis_3d: torch.Tensor,   # [N, ny_s, nx_s] visible direct albedo [-]
     qn_4d: torch.Tensor,        # [nz, N, ny, nx] total non-precipitating water [kg kg^-1]
     w_4d: torch.Tensor,         # [nz+1, N, ny, nx] vertical velocity [m s^-1]
     dx: float,
     dy: float | None = None,
+    *,
+    dx_sfc: float | None = None,
+    dy_sfc: float | None = None,
 ) -> torch.Tensor:
     """Build universal `[N, 16]` dimensionless 2D/3D surface-heterogeneity & organization features.
 
@@ -147,10 +150,12 @@ def compute_subgrid_structure_features(
     Bowen-ratio contrast (e.g., wildfire bare patch vs forest: $\\rho \\approx -1$) from cloud
     shadowing ($\\rho \\approx +1$).
     """
-    shf_std, shf_mi, shf_lp = compute_periodic_spatial_stats(shf_3d, dx, dy)
-    lhf_std, lhf_mi, lhf_lp = compute_periodic_spatial_stats(lhf_3d, dx, dy)
-    tr_std, tr_mi, tr_lp = compute_periodic_spatial_stats(t_rad_3d, dx, dy)
-    alb_std, alb_mi, _ = compute_periodic_spatial_stats(alb_vis_3d, dx, dy)
+    dxs = dx if dx_sfc is None else dx_sfc
+    dys = dy if dy_sfc is None else dy_sfc
+    shf_std, shf_mi, shf_lp = compute_periodic_spatial_stats(shf_3d, dxs, dys)
+    lhf_std, lhf_mi, lhf_lp = compute_periodic_spatial_stats(lhf_3d, dxs, dys)
+    tr_std, tr_mi, tr_lp = compute_periodic_spatial_stats(t_rad_3d, dxs, dys)
+    alb_std, alb_mi, _ = compute_periodic_spatial_stats(alb_vis_3d, dxs, dys)
 
     # Spatial cross-correlation rho(SHF, LHF) in [-1, +1]
     a_shf = shf_3d - shf_3d.mean(dim=(-2, -1), keepdim=True)
@@ -944,43 +949,66 @@ def init_crm_self_distill_state(
     )
 
 
-def select_teacher_indices(state: CRMSelfDistillState) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return `(teacher_idx, student_idx)` or `None` during warmup (100% genuine 2D/3D CRM).
+def _select_hybrid_teacher_indices(
+    cohort_id: torch.Tensor,
+    unc_vec: torch.Tensor,
+    n_cells: int,
+    stride: int,
+    steps_seen: int,
+    warmup_steps: int,
+    dwell_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Select `(teacher_idx, student_idx)` with optional persistent RCEMIP self-aggregation anchor.
 
-    Selects a fixed-size teacher set of `n_teach = ceil(n_cells / stride)` columns:
-    - 85% from the current spatially stratified rotating cohort (unbroken convective memory
-      across `dwell_steps` continuous steps),
-    - 15% from the highest epistemic-uncertainty columns globally (active OOD fallback).
+    - Standard mode (`dwell_steps < 48`): 85% rotating spatially stratified cohort + 15% top-OOD.
+    - Multi-day self-aggregation mode (`dwell_steps >= 48`, e.g. `RCE_large`): 50% persistent
+      globally stratified anchor backbone (`cohort_id == 0`, uninterrupted multi-week/seasonal
+      convective self-aggregation memory) + 35% multi-day rotating cohort (`1..stride-1`) + 15%
+      top-OOD active fallback.
     """
-    if state.steps_seen < state.warmup_steps:
+    if steps_seen < warmup_steps:
         return None
-    nc = state.n_cells
-    n_teach = max(1, (nc + state.stride - 1) // state.stride)
-    if n_teach >= nc:
+    n_teach = max(1, (n_cells + stride - 1) // stride)
+    if n_teach >= n_cells:
         return None
-
-    active_cohort = ((state.steps_seen - state.warmup_steps) // state.dwell_steps) % state.stride
-    rot_mask = state.cohort_id == active_cohort
-    rot_idx = torch.nonzero(rot_mask, as_tuple=False).squeeze(-1)
 
     n_ood = max(1, n_teach // 6) if n_teach >= 12 else 0
-    n_rot_keep = min(int(rot_idx.numel()), max(n_teach - n_ood, 1))
-    rot_sel = rot_idx[:n_rot_keep]
+    if dwell_steps >= 48 and stride >= 3 and n_teach >= 8:
+        anchor_all = torch.nonzero(cohort_id == 0, as_tuple=False).squeeze(-1)
+        n_anchor = min(int(anchor_all.numel()), max(n_teach // 2, 1))
+        anchor_sel = anchor_all[:n_anchor]
 
-    n_rem = n_teach - n_rot_keep
-    if n_rem > 0:
-        # Mask out already-selected rotating cohort and pick highest-uncertainty OOD columns
-        unc = state.last_uncertainty.clone()
-        unc[rot_sel] = -1.0e9
-        _, ood_sel = torch.topk(unc, k=n_rem, largest=True, sorted=False)
-        teacher_idx = torch.cat([rot_sel, ood_sel], dim=0)
+        rot_cohort = 1 + (((steps_seen - warmup_steps) // dwell_steps) % (stride - 1))
+        rot_all = torch.nonzero(cohort_id == rot_cohort, as_tuple=False).squeeze(-1)
+        n_rot_keep = min(int(rot_all.numel()), max(n_teach - n_anchor - n_ood, 0))
+        base_sel = torch.cat([anchor_sel, rot_all[:n_rot_keep]], dim=0) if n_rot_keep > 0 else anchor_sel
     else:
-        teacher_idx = rot_sel
+        active_cohort = ((steps_seen - warmup_steps) // dwell_steps) % stride
+        rot_idx = torch.nonzero(cohort_id == active_cohort, as_tuple=False).squeeze(-1)
+        n_rot_keep = min(int(rot_idx.numel()), max(n_teach - n_ood, 1))
+        base_sel = rot_idx[:n_rot_keep]
 
-    teach_mask = torch.zeros(nc, device=teacher_idx.device, dtype=torch.bool)
+    n_rem = n_teach - int(base_sel.numel())
+    if n_rem > 0:
+        unc = unc_vec.clone()
+        unc[base_sel] = -1.0e9
+        _, ood_sel = torch.topk(unc, k=n_rem, largest=True, sorted=False)
+        teacher_idx = torch.cat([base_sel, ood_sel], dim=0)
+    else:
+        teacher_idx = base_sel
+
+    teach_mask = torch.zeros(n_cells, device=teacher_idx.device, dtype=torch.bool)
     teach_mask[teacher_idx] = True
     student_idx = torch.nonzero(~teach_mask, as_tuple=False).squeeze(-1)
     return teacher_idx, student_idx
+
+
+def select_teacher_indices(state: CRMSelfDistillState) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return `(teacher_idx, student_idx)` or `None` during warmup (100% genuine 2D/3D CRM)."""
+    return _select_hybrid_teacher_indices(
+        state.cohort_id, state.last_uncertainty,
+        state.n_cells, state.stride, state.steps_seen, state.warmup_steps, state.dwell_steps,
+    )
 
 
 def _compute_distill_loss(
@@ -1627,50 +1655,15 @@ def select_rad_teacher_indices(
     if state.steps_seen < state.warmup_steps:
         return None
     if crm_state is not None and crm_state.stride == state.stride and crm_state.steps_seen >= crm_state.warmup_steps:
-        # Synchronize radiation teachers with active CRM teacher cohort + combined epistemic OOD
-        nc = state.n_cells
-        n_teach = max(1, (nc + state.stride - 1) // state.stride)
-        if n_teach >= nc:
-            return None
-        active_cohort = ((crm_state.steps_seen - crm_state.warmup_steps) // crm_state.dwell_steps) % crm_state.stride
-        rot_idx = torch.nonzero(crm_state.cohort_id == active_cohort, as_tuple=False).squeeze(-1)
-        n_ood = max(1, n_teach // 6) if n_teach >= 12 else 0
-        n_rot_keep = min(int(rot_idx.numel()), max(n_teach - n_ood, 1))
-        rot_sel = rot_idx[:n_rot_keep]
-        n_rem = n_teach - n_rot_keep
-        if n_rem > 0:
-            unc = state.last_uncertainty + 0.5 * crm_state.last_uncertainty
-            unc[rot_sel] = -1.0e9
-            _, ood_sel = torch.topk(unc, k=n_rem, largest=True, sorted=False)
-            teacher_idx = torch.cat([rot_sel, ood_sel], dim=0)
-        else:
-            teacher_idx = rot_sel
-        teach_mask = torch.zeros(nc, device=teacher_idx.device, dtype=torch.bool)
-        teach_mask[teacher_idx] = True
-        student_idx = torch.nonzero(~teach_mask, as_tuple=False).squeeze(-1)
-        return teacher_idx, student_idx
-
-    nc = state.n_cells
-    n_teach = max(1, (nc + state.stride - 1) // state.stride)
-    if n_teach >= nc:
-        return None
-    active_cohort = ((state.steps_seen - state.warmup_steps) // state.dwell_steps) % state.stride
-    rot_idx = torch.nonzero(state.cohort_id == active_cohort, as_tuple=False).squeeze(-1)
-    n_ood = max(1, n_teach // 6) if n_teach >= 12 else 0
-    n_rot_keep = min(int(rot_idx.numel()), max(n_teach - n_ood, 1))
-    rot_sel = rot_idx[:n_rot_keep]
-    n_rem = n_teach - n_rot_keep
-    if n_rem > 0:
-        unc = state.last_uncertainty.clone()
-        unc[rot_sel] = -1.0e9
-        _, ood_sel = torch.topk(unc, k=n_rem, largest=True, sorted=False)
-        teacher_idx = torch.cat([rot_sel, ood_sel], dim=0)
-    else:
-        teacher_idx = rot_sel
-    teach_mask = torch.zeros(nc, device=teacher_idx.device, dtype=torch.bool)
-    teach_mask[teacher_idx] = True
-    student_idx = torch.nonzero(~teach_mask, as_tuple=False).squeeze(-1)
-    return teacher_idx, student_idx
+        return _select_hybrid_teacher_indices(
+            crm_state.cohort_id,
+            state.last_uncertainty + 0.5 * crm_state.last_uncertainty,
+            state.n_cells, crm_state.stride, crm_state.steps_seen, crm_state.warmup_steps, crm_state.dwell_steps,
+        )
+    return _select_hybrid_teacher_indices(
+        state.cohort_id, state.last_uncertainty,
+        state.n_cells, state.stride, state.steps_seen, state.warmup_steps, state.dwell_steps,
+    )
 
 
 def _compute_rad_distill_loss(

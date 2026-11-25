@@ -182,6 +182,10 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "ja": "埋め込み CRM による超パラメタリゼーション (SP) の有効化。false にすると単独の全球雲解像モデルモードになる。",
         "en": "Enable embedded-CRM superparameterization (SP). False switches AOBA into standalone global CRM mode.",
     },
+    "crm_sfc_tiles": {
+        "ja": "大規模ドメイン CRM（例：RCE_large, crm_nx=64〜128）使用時の 1 セルあたり独立陸面・海氷タイル数 [-]。0 は CRM サブカラムと 1:1 結合（既定）。8 等を指定すると連続ブロック単位で結合し、陸面計算量とメモリを抑えつつパッチ不均一性を維持する。",
+        "en": "Number of independent MAML land/sea-ice surface tiles per host cell [-] for large-domain CRMs (e.g. RCE_large with crm_nx=64-128). 0 couples 1:1 with crm_ny*crm_nx (default); setting e.g. 8 tiles contiguous CRM blocks to keep land cost bounded while preserving patch heterogeneity.",
+    },
     "enable_crm_self_distill": {
         "ja": "オンライン自己蒸留・Active-Learning 2D/3D CRM 加速の有効化（既定 false）。一部の列のみ本物 CRM を連続実行し、残りを保存則制約付き密行列積 MLP＋周期 2D 空間ヘッド（地表面不均一性の空間配置・植生風・森林ロック対応）で推論しながら同時学習する。",
         "en": "Enable online self-distilling / active-learning 2D/3D CRM acceleration (default false). Runs the genuine CRM on a rotating + high-uncertainty teacher subset while a conservation-constrained dense-GEMM MLP and periodic 2D spatial head (resolving surface patch clustering, vegetation breezes, and forest-locking) emulate the rest and learn online.",
@@ -197,6 +201,10 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
     "crm_distill_warmup_steps": {
         "ja": "自己蒸留 CRM の初期ウォームアップステップ数 [-]。この期間中は全列で本物 2D CRM を実行してリプレイバッファを充填し学生モデルを事前学習する（既定 24）。",
         "en": "Initial warmup steps [-] running 100% genuine 2D CRM to populate the GPU replay buffer and pre-train the student before activating surrogate inference (default 24).",
+    },
+    "crm_distill_dwell_steps": {
+        "ja": "自己蒸留 CRM 教師ローテーション班の連続滞在ステップ数 [-]（既定 12）。48 以上（例：240 ≒ 5日）にすると教師の 50% を全球層化永続アンカー列として固定し、RCE_large の対流自己組織化を長期連続発展させながら学習できる。",
+        "en": "Continuous teacher dwell steps [-] per rotating cohort (default 12). Values >= 48 (e.g., 240 ≈ 5 days) activate a 50% globally stratified persistent anchor cohort so RCEMIP-class convective self-aggregation matures uninterrupted.",
     },
     "crm_distill_hidden_dim": {
         "ja": "自己蒸留 CRM 学生ネットワーク（純粋密行列積 Residual Column MLP）の隠れ層幅 [-]（既定 192）。増やすと表現力が上がり、減らすと推論が高速化する。",

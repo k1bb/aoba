@@ -2337,6 +2337,203 @@ kernel void crm_2d_fast_hevi_loop_64(
     }
 }
 
+// 128-thread fused 2D acoustic-HEVI loop for RCE_large (`ny == 1, nx in {64, 128}, nz <= 64`).
+// Uses only 512 bytes of threadgroup SRAM (`tg_row[128]`) for peak occupancy on Apple Silicon & A100.
+kernel void crm_2d_fast_hevi_loop_tg128(
+    device float* rho_s            [[buffer(0)]],
+    device float* Thm_s            [[buffer(1)]],
+    device float* u_s              [[buffer(2)]],
+    device float* v_s              [[buffer(3)]],
+    device float* w_s              [[buffer(4)]],
+    device const float* rho_x      [[buffer(5)]],
+    device const float* rtot_x_inv [[buffer(6)]],
+    device const float* thm_x_eff  [[buffer(7)]],
+    device const float* a_p_s      [[buffer(8)]],
+    device const float* dp_dThm_s  [[buffer(9)]],
+    device const float* q_load     [[buffer(10)]],
+    device const float* tend_u_sl  [[buffer(11)]],
+    device const float* tend_v_sl  [[buffer(12)]],
+    device const float* tend_w_sl  [[buffer(13)]],
+    device const float* tend_Thm   [[buffer(14)]],
+    device const float* rho_dw     [[buffer(15)]],
+    device const float* rho_tot_w  [[buffer(16)]],
+    device const float* thm_w      [[buffer(17)]],
+    device const float* dl         [[buffer(18)]],
+    device const float* inv_den_b  [[buffer(19)]],
+    device const float* c_star_b   [[buffer(20)]],
+    device const float* dz_c       [[buffer(21)]],
+    device const float* dz_w_int   [[buffer(22)]],
+    device const float* sponge_w   [[buffer(23)]],
+    device float* fx_acc           [[buffer(24)]],
+    device float* fy_acc           [[buffer(25)]],
+    device float* fz_acc           [[buffer(26)]],
+    constant ulong4& u_p0          [[buffer(27)]],
+    constant float4& f_p           [[buffer(28)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tg_id [[threadgroup_position_in_grid]])
+{
+    uint nz = uint(u_p0.x);
+    uint n_col = uint(u_p0.y);
+    uint nx = uint(u_p0.z);
+    uint pk = uint(u_p0.w);
+    uint dz_cols = pk >> 16u;
+    uint n_ac = (pk >> 1u) & 0x7FFFu;
+    uint accum = pk & 1u;
+
+    uint local_c = lid / nx;
+    uint ix = lid - local_c * nx;
+    uint c_tg = 128u / nx;
+    uint col = tg_id * c_tg + local_c;
+    bool active = (col < n_col);
+
+    uint ix_m1 = (ix > 0u) ? (ix - 1u) : (nx - 1u);
+    uint ix_p1 = (ix + 1u < nx) ? (ix + 1u) : 0u;
+    uint lid_xm1 = local_c * nx + ix_m1;
+    uint lid_xp1 = local_c * nx + ix_p1;
+    uint M = n_col * nx;
+    uint tid = active ? (col * nx + ix) : 0u;
+    uint col_dz = (dz_cols > 1u && active) ? col : 0u;
+
+    float dt_ac = f_p.x;
+    float beta = f_p.y;
+    float gravity = f_p.z;
+    float inv_dx = 1.0f / f_p.w;
+
+    threadgroup float tg_row[128];
+    float d_star[64];
+
+    for (uint ac = 0u; ac < n_ac; ++ac) {
+        bool last_ac = (ac + 1u == n_ac);
+        float n_ac_f = float(n_ac);
+
+        float p_blend_prev = 0.0f;
+        float rtot_blend_prev = 0.0f;
+        float fz_old_below = 0.0f;
+        float thm_w_below = 0.0f;
+        float d_prev = 0.0f;
+
+        for (uint k = 0u; k < nz; ++k) {
+            uint idx = k * M + tid;
+            float r_cur = active ? rho_s[idx] : 1.0f;
+            float T_cur = active ? Thm_s[idx] : 300.0f;
+            float ap = active ? a_p_s[idx] : 0.0f;
+            float dp = active ? dp_dThm_s[idx] : 0.0f;
+            float p_k0 = fma(dp, T_cur, ap);
+            tg_row[lid] = p_k0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float fx_0 = 0.0f;
+            if (active) {
+                float p_k1 = tg_row[lid_xp1];
+                float pgf_u = -(p_k1 - p_k0) * inv_dx * rtot_x_inv[idx];
+                float u0 = u_s[idx];
+                float u_n = u0 + dt_ac * (tend_u_sl[idx] + pgf_u);
+                fx_0 = rho_x[idx] * (1.10f * u_n - 0.10f * u0);
+                if (accum != 0u) {
+                    fx_acc[idx] += fx_0;
+                }
+                u_s[idx] = u_n;
+                if (last_ac) {
+                    float v0 = v_s[idx];
+                    float tv = tend_v_sl[idx];
+                    float v_n = v0 + (n_ac_f * dt_ac) * tv;
+                    v_s[idx] = v_n;
+                    if (accum != 0u) {
+                        fy_acc[idx] += n_ac_f * r_cur * (v0 + (0.5f * n_ac_f + 0.6f) * dt_ac * tv);
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            tg_row[lid] = fx_0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (active) {
+                uint idx_xm = k * M + col * nx + ix_m1;
+                float fx_m = tg_row[lid_xm1];
+                float div_h_rho = (fx_0 - fx_m) * inv_dx;
+                float div_h_Thm = (fx_0 * thm_x_eff[idx] - fx_m * thm_x_eff[idx_xm]) * inv_dx;
+
+                float fz_old_above = 0.0f;
+                float thm_w_above = 0.0f;
+                if (k < nz - 1u) {
+                    fz_old_above = rho_dw[idx] * w_s[(k + 1u) * M + tid];
+                    thm_w_above = thm_w[idx];
+                }
+
+                float dz_val = dz_c[k * dz_cols + col_dz];
+                float r_dag = r_cur - dt_ac * (div_h_rho + (fz_old_above - fz_old_below) / dz_val);
+                float T_dag = T_cur + dt_ac * (
+                    -div_h_Thm
+                    - (thm_w_above * fz_old_above - thm_w_below * fz_old_below) / dz_val
+                    + tend_Thm[idx]
+                );
+                rho_s[idx] = r_dag;
+                Thm_s[idx] = T_dag;
+
+                float p_blend = fma(dp, (1.0f - beta) * T_cur + beta * T_dag, ap);
+                float rtot_blend = ((1.0f - beta) * r_cur + beta * r_dag) * q_load[idx];
+
+                if (k >= 1u) {
+                    uint um = k - 1u;
+                    uint idx_m = um * M + tid;
+                    float dz_w_val = dz_w_int[um * dz_cols + col_dz];
+                    float nh_imb = (p_blend - p_blend_prev) / dz_w_val + 0.5f * (rtot_blend + rtot_blend_prev) * gravity;
+                    float rdw_m = rho_dw[idx_m];
+                    float rtw_m = max(rho_tot_w[idx_m], 1.0e-5f);
+                    float rhs_m = dt_ac * (
+                        rdw_m * tend_w_sl[idx_m]
+                        - (rdw_m / rtw_m) * nh_imb
+                        - sponge_w[um] * fz_old_below
+                    );
+                    float inv_den = inv_den_b[idx_m];
+                    d_prev = (um == 0u) ? (rhs_m * inv_den) : ((rhs_m - dl[idx_m] * d_prev) * inv_den);
+                    d_star[um] = d_prev;
+                }
+                p_blend_prev = p_blend;
+                rtot_blend_prev = rtot_blend;
+                fz_old_below = fz_old_above;
+                thm_w_below = thm_w_above;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (active) {
+            w_s[tid] = 0.0f;
+            w_s[nz * M + tid] = 0.0f;
+
+            float dfz_above = 0.0f;
+            float thm_w_above = 0.0f;
+            for (int m = int(nz) - 2; m >= 0; --m) {
+                uint um = uint(m);
+                uint idx_m = um * M + tid;
+                float dfz_cur = (m == int(nz) - 2) ? d_star[um] : (d_star[um] - c_star_b[idx_m] * dfz_above);
+                float rdw_m = rho_dw[idx_m];
+                uint w_idx = (um + 1u) * M + tid;
+                float fz_old_m = rdw_m * w_s[w_idx];
+                float fz_new_m = fz_old_m + dfz_cur;
+                w_s[w_idx] = fz_new_m / max(rdw_m, 1.0e-5f);
+                if (accum != 0u) {
+                    fz_acc[w_idx] += (fz_old_m + beta * dfz_cur);
+                }
+
+                uint k_layer = um + 1u;
+                uint idx_l = k_layer * M + tid;
+                float thm_w_m = thm_w[idx_m];
+                float dz_val = dz_c[k_layer * dz_cols + col_dz];
+                rho_s[idx_l] = max(rho_s[idx_l] - beta * dt_ac * (dfz_above - dfz_cur) / dz_val, 1.0e-5f);
+                Thm_s[idx_l] = Thm_s[idx_l] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) / dz_val;
+
+                dfz_above = dfz_cur;
+                thm_w_above = thm_w_m;
+            }
+            float dz_0 = dz_c[col_dz];
+            rho_s[tid] = max(rho_s[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-5f);
+            Thm_s[tid] = Thm_s[tid] - beta * dt_ac * (thm_w_above * dfz_above) / dz_0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // =========================================================================
 // 10b. Zero-Shared-Memory SIMD-Shuffle Fused 2D CRM Kernels
 //      (ny == 1, nx in {2,4,8,16,32}, nz <= 48, 0 KB threadgroup memory)

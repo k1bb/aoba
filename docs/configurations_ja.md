@@ -2,7 +2,7 @@
 
 AOBA は単一のコードベースと統一パラメータレジストリ（`config/aoba_default.toml`）から、個人ラップトップ（Apple Silicon Mac）での手軽な物理確認から、スーパーコンピュータ（NVIDIA A100/H100）を用いた HighResMIP 級の高解像度大循環創発実験や完全結合地球システムモデル（Full ESM）実験までシームレスに構成できる。
 
-本章では代表的な 6 つの実験構成について、物理設計の意図・具体的な TOML パラメータ設定・推奨計算資源と実行速度の目安をまとめる。すべての構成は `config/presets/` に即実行可能な TOML ファイルとして同梱されており、`python scripts/run_g5_30yr.py --config config/presets/<file>.toml` または AOBA Studio の設定読込からそのまま起動できる。
+本章では代表的な 7 つの実験構成について、物理設計の意図・具体的な TOML パラメータ設定・推奨計算資源と実行速度の目安をまとめる。すべての構成は `config/presets/` に即実行可能な TOML ファイルとして同梱されており、`python scripts/run_g5_30yr.py --config config/presets/<file>.toml` または AOBA Studio の設定読込からそのまま起動できる。
 
 ---
 
@@ -16,6 +16,7 @@ AOBA は単一のコードベースと統一パラメータレジストリ（`co
 | **4. 長期結合バランス構成（Phase-1 PI-Control）** | `earth_g5_phase1_picontrol.toml` | `5` (110 km) / `44` (48 km) / `8×1` | `0` (同 110 km) / `18` | `ckd` (50 g-pt) / `latitude_seasonal` | 生物物理＋ダスト＋自然エアロゾル＋EVP 海氷 | NVIDIA A100 (40 GB) | **~2.2 時間/年**（A100 実測 `21.8 秒/日`） |
 | **5. フル ESM 構成** | `earth_full_esm.toml` | `5–6` / `56` (65 km) / `8×1` | `6–7` / `32–36` | `rrtmgp` or `ckd_hd` / `prognostic` | 全 BGC・動的湖・MAML・波浪・同位体・氷床オン | NVIDIA A100/H100 (40–80 GB) | ~6–28 時間/年 |
 | **6. 古気候（6 ka 緑のサハラ）・系外惑星** | `paleo_green_sahara_6ka.toml` | `4–5` / `44` (48 km) / `8×1` | `0` (`ogcm_3d` 18層 or `ekman_sw`) | `ckd` or `rrtmgp` / `prognostic` | 軌道進化＋動的湖沼（`init_fill=0`）、または `planet_preset` | Mac MPS / A100 | ~1–4 時間/年 |
+| **7. 対流自己組織化（`RCE_large`）＋渦許容海洋** | `earth_g5_rcelarge_g7ocn.toml` | `5` (110 km) / `44` (48 km) / `64×1` (256 km, `sfc_tiles=8`) | `7` (28 km, 渦許容) / `18` | `ckd` / `latitude_seasonal`（CRM＋放射ペア蒸留 `1/31`, `dwell=240`） | 生物物理＋ダスト＋自然エアロゾル＋EVP 海氷＋50% 永続 RCEMIP アンカー | Apple M4 Pro / NVIDIA A100 | **~15.8 時間/年**（M4 Pro MPS 実測 `1.30 秒/step`, 初期化 `1.28 秒`; A100 推定 ~3 時間/年） |
 
 > **生物物理（Biogeophysics）の常時稼働について**：2 葉 $\mathrm{C}_3/\mathrm{C}_4$ P-Model 光合成・熱順化 $T_{\mathrm{home}}$・Lambert-$W_0$ 予報 LAI・常緑/落葉葉習性 $f_{\mathrm{evg}}$・樹高 $h_c$・根圏容量 $S_R$・離散樹冠クランピング $\Omega(\mu_0, L)$・非反復最適葉傾角 $\chi_L$ は陸面コア（`surface.py` + `biosphere.py`）に統合されているため、陸域炭素・窒素・海洋 BGC・エアロゾル・ダスト・雷をすべてオフにしても陸面の植生・アルベド・蒸散・粗度フィードバックは完全に動作する。
 

@@ -1439,19 +1439,26 @@ def run_crm_rk3_hevi_metal(
 
         accum = stage_idx == 2
         accum_i = 1 if accum else 0
-        if ny == 1 and 1 < nx <= 32 and nz <= 48 and (64 % nx == 0):
-            c_tg = 64 // nx
-            n_tg = (n_col + c_tg - 1) // c_tg
+        if ny == 1 and 1 < nx <= 128 and nz <= 64 and (128 % nx == 0):
             u_2d4 = [nz, n_col, nx, (int(dz_cols) << 16) | (int(n_ac) << 1) | accum_i]
             f_2d4 = [float(dt_ac), float(beta_hevi), float(gravity), float(dx)]
-            kern_2d = lib.crm_2d_fast_hevi_loop if nz <= 32 else lib.crm_2d_fast_hevi_loop_64
+            if nx <= 64 and nz <= 48 and (64 % nx == 0):
+                c_tg = 64 // nx
+                n_tg = (n_col + c_tg - 1) // c_tg
+                kern_2d = lib.crm_2d_fast_hevi_loop if nz <= 32 else lib.crm_2d_fast_hevi_loop_64
+                grp = 64
+            else:
+                c_tg = 128 // nx
+                n_tg = (n_col + c_tg - 1) // c_tg
+                kern_2d = lib.crm_2d_fast_hevi_loop_tg128
+                grp = 128
             kern_2d(
                 rho_a, Thm_a, u_a, v_a, w_a,
                 rho_x, rtot_x_inv, thm_x_eff, a_p_s, dp_dThm_s, ql_c,
                 tend_u_slow, tend_v_slow, tend_w_slow, tTh_c,
                 rho_dw, rho_tot_w, thm_w, dl, diag, du, dzc_c, dzw_c, spw_c,
                 fx_acc, fy_acc, fz_acc, u_2d4, f_2d4,
-                threads=(n_tg * 64,), group_size=(64,),
+                threads=(n_tg * grp,), group_size=(grp,),
             )
             rho_s, Thm_s, u_s, v_s, w_s = rho_a, Thm_a, u_a, v_a, w_a
         else:

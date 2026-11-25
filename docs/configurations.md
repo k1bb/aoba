@@ -2,7 +2,7 @@
 
 From a single codebase and centralized parameter registry (`config/aoba_default.toml`), AOBA scales seamlessly from exploratory laptop runs on Apple Silicon Macs to HighResMIP-class general-circulation emergence experiments and full Earth System Model (ESM) integrations on NVIDIA A100/H100 clusters.
 
-This guide summarizes six reference configurations, including their physical design rationale, concrete TOML settings, hardware requirements, and expected throughput. Every preset is shipped as a ready-to-run TOML file under `config/presets/` and can be launched directly via `python scripts/run_g5_30yr.py --config config/presets/<file>.toml` or loaded in AOBA Studio.
+This guide summarizes seven reference configurations, including their physical design rationale, concrete TOML settings, hardware requirements, and expected throughput. Every preset is shipped as a ready-to-run TOML file under `config/presets/` and can be launched directly via `python scripts/run_g5_30yr.py --config config/presets/<file>.toml` or loaded in AOBA Studio.
 
 ---
 
@@ -16,6 +16,7 @@ This guide summarizes six reference configurations, including their physical des
 | **4. Balanced Multi-Decadal Spinup (Phase-1 PI-Control)** | `earth_g5_phase1_picontrol.toml` | `5` (110 km) / `44` (48 km) / `8×1` | `0` (same 110 km) / `18` | `ckd` (50 g-pt) / `latitude_seasonal` | Biogeophysics + dust + nat. aerosols + EVP ice | NVIDIA A100 (40 GB) | **~2.2 h/yr** (A100 measured `21.8 s/day`) |
 | **5. Full ESM** | `earth_full_esm.toml` | `5–6` / `56` (65 km) / `8×1` | `6–7` / `32–36` | `rrtmgp` or `ckd_hd` / `prognostic` | All BGC, dynamic lakes, MAML, waves, isotopes, ice sheet ON | NVIDIA A100/H100 (40–80 GB) | ~6–28 h/yr |
 | **6. Paleoclimate (6 ka Green Sahara) & Exoplanet** | `paleo_green_sahara_6ka.toml` | `4–5` / `44` (48 km) / `8×1` | `0` (`ogcm_3d` 18-lvl or `ekman_sw`) | `ckd` or `rrtmgp` / `prognostic` | Orbital forcing + dynamic lakes (`init_fill=0`), or `planet_preset` | Mac MPS / A100 | ~1–4 h/yr |
+| **7. Organized Convection (`RCE_large`) + Eddy-Permitting Ocean** | `earth_g5_rcelarge_g7ocn.toml` | `5` (110 km) / `44` (48 km) / `64×1` (256 km, `sfc_tiles=8`) | `7` (28 km, eddy-permitting) / `18` | `ckd` / `latitude_seasonal` (paired CRM+Rad distill `1/31`, `dwell=240`) | Biogeophysics + dust + nat. aerosols + EVP ice + 50% persistent RCEMIP anchor | Apple M4 Pro / NVIDIA A100 | **~15.8 h/yr** (M4 Pro MPS measured `1.30 s/step`, `1.28 s` init; ~3 h/yr est. on A100) |
 
 > **Always-On Biogeophysics**: Two-leaf $\mathrm{C}_3/\mathrm{C}_4$ P-Model photosynthesis, thermal acclimation $T_{\mathrm{home}}$, Lambert-$W_0$ prognostic LAI, evergreen/deciduous habit $f_{\mathrm{evg}}$, canopy height $h_c$, root capacity $S_R$, discrete-crown clumping $\Omega(\mu_0, L)$, and non-iterative optimal leaf orientation $\chi_L$ reside directly in the land-surface physics core (`surface.py` + `biosphere.py`). Turning off terrestrial carbon/nitrogen, marine BGC, aerosols, dust, and lightning leaves all vegetation–albedo–transpiration–roughness feedbacks fully active.
 

@@ -314,6 +314,67 @@ def test_coupled_self_distill_vs_full_crm() -> None:
     )
 
 
+def test_rcelarge_decoupled_surface_tiles_and_persistent_anchor() -> None:
+    """Verify RCE_large (nx=64, 256 km) with crm_sfc_tiles=8 and 50% persistent anchor cohort."""
+    dev = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    torch.manual_seed(13)
+    cfg = AOBAConfig(
+        glevel=2,
+        nz=20,
+        z_top=36000.0,
+        z_sponge_base=28000.0,
+        crm_nx=64,
+        crm_ny=1,
+        crm_dx=4000.0,
+        crm_sfc_tiles=8,
+        dt_host=600.0,
+        n_host_dyn_substeps=1,
+        n_crm_dyn_substeps=4,
+        rad_stride=2,
+        rad_scheme="four_band",
+        microphysics_scheme="two_moment",
+        ocean_mode="ekman_sw",
+        use_earth2014=False,
+        enable_dust=False,
+        enable_natural_aerosols=False,
+        enable_land_carbon=False,
+        enable_ocean_bgc=False,
+        enable_river_routing=False,
+        enable_crm_self_distill=True,
+        enable_rad_self_distill=True,
+        crm_distill_stride=7,
+        crm_distill_warmup_steps=4,
+        crm_distill_dwell_steps=64,
+        crm_distill_hidden_dim=48,
+        crm_distill_replay_size=2048,
+    )
+    m = init_aoba_model(cfg, device=dev)
+    assert m.sfc_sub is not None
+    assert m.sfc_sub.t_canopy.shape == (m.mesh.n_cells * 8,)
+    assert m.crm.theta_m.shape == (20, m.mesh.n_cells, 1, 64)
+
+    # Verify persistent anchor cohort (cohort_id == 0) remains continuously in teacher_idx across dwell windows
+    from aoba.crm_self_distill import select_teacher_indices
+
+    for _ in range(10):
+        d = step_aoba_model(m)
+
+    assert m.crm_distill is not None and m.rad_distill is not None
+    assert torch.isfinite(m.atmos.theta_m).all()
+    assert torch.isfinite(m.crm.theta_m).all()
+    m.crm_distill.steps_seen = 10
+    t1, _ = select_teacher_indices(m.crm_distill)
+    m.crm_distill.steps_seen = 10 + 64
+    t2, _ = select_teacher_indices(m.crm_distill)
+    anchors = set(torch.nonzero(m.crm_distill.cohort_id == 0, as_tuple=False).squeeze(-1).tolist())
+    assert len(anchors.intersection(set(t1.tolist()))) >= 1
+    assert anchors.intersection(set(t1.tolist())) == anchors.intersection(set(t2.tolist()))
+    print(
+        f"  [PASS] RCE_large (nx=64, sfc_tiles=8, dwell=64 persistent anchor) ({dev}): "
+        f"Ts={d.global_mean_t_sfc_k:.2f}K OLR={d.global_mean_olr_wm2:.1f} ASR={d.global_mean_asr_wm2:.1f}"
+    )
+
+
 if __name__ == "__main__":
     test_exact_column_conservation_closure()
     print("  [PASS] Exact column conservation closure (water, enthalpy, momentum, non-negativity)")
@@ -324,4 +385,5 @@ if __name__ == "__main__":
     test_exact_radiation_conservation_closure()
     print("  [PASS] Exact per-subcolumn radiative energy closure, zero night SW, wildfire albedo response")
     test_coupled_self_distill_vs_full_crm()
+    test_rcelarge_decoupled_surface_tiles_and_persistent_anchor()
     print("ALL CRM + RADIATION SELF-DISTILLATION TESTS PASSED!")

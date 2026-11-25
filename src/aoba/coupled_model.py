@@ -189,10 +189,12 @@ class AOBAConfig:
     earth2014_dir: str = "data/boundary/earth2014_5min"
     earth2014_stride: int = 2
     enable_superparam: bool = True           # 1:1 embedded 3D CRM in every SCVT cell
+    crm_sfc_tiles: int = 0                   # Surface tiles/cell for large CRMs (0 = 1:1 with crm_ny*crm_nx; e.g. 8 for RCE_large)
     enable_crm_self_distill: bool = False    # Online self-distilling / active-learning 2D/3D CRM acceleration
     enable_rad_self_distill: bool = False    # Online per-subcolumn ICA radiation self-distillation paired with CRM
     crm_distill_stride: int = 13             # Teacher column stride (1 in `stride` columns run genuine CRM/Rad/step)
     crm_distill_warmup_steps: int = 24       # Initial 100%-CRM warmup steps before activating student inference
+    crm_distill_dwell_steps: int = 12        # Continuous teacher dwell steps (>=48 enables 50% persistent RCEMIP anchor)
     crm_distill_hidden_dim: int = 192        # Hidden width of pure-GEMM residual column MLP student
     crm_distill_replay_size: int = 65536     # GPU-resident stratified replay buffer capacity [columns]
     enable_dust: bool = True                 # Map-free global-parameter mineral dust aerosol + radiative coupling
@@ -292,6 +294,39 @@ class AOBAState:
         return float(self.cfg.n2o_ppmv)
 
 
+def resolve_crm_sfc_tiles(cfg: AOBAConfig) -> int:
+    """Return surface-tile count `n_sfc` per host cell (`<= crm_ny * crm_nx`, exact divisor)."""
+    n_crm = max(int(cfg.crm_ny * cfg.crm_nx), 1)
+    req = int(getattr(cfg, "crm_sfc_tiles", 0))
+    if 0 < req < n_crm and (n_crm % req == 0):
+        return req
+    return n_crm
+
+
+def _crm_to_sfc_tile(x: torch.Tensor, nc: int, n_sfc: int, n_crm: int) -> torch.Tensor:
+    """Block-average `[..., nc * n_crm]` (or `[..., nc, ny, nx]`) onto `[..., nc * n_sfc]`."""
+    if n_sfc == n_crm:
+        if x.ndim >= 1 and x.shape[-1] == nc * n_crm:
+            return x
+        return x.reshape(*x.shape[:-3], nc * n_sfc)
+    block = n_crm // n_sfc
+    if x.ndim >= 1 and x.shape[-1] == nc * n_crm:
+        return x.reshape(*x.shape[:-1], nc, n_sfc, block).mean(dim=-1).reshape(*x.shape[:-1], nc * n_sfc)
+    return x.reshape(*x.shape[:-3], nc, n_sfc, block).mean(dim=-1).reshape(*x.shape[:-3], nc * n_sfc)
+
+
+def _sfc_tile_to_crm(x: torch.Tensor, nc: int, n_sfc: int, n_crm: int) -> torch.Tensor:
+    """Tile-repeat `[..., nc * n_sfc]` onto contiguous blocks `[..., nc * n_crm]`."""
+    if n_sfc == n_crm:
+        return x
+    block = n_crm // n_sfc
+    return (
+        x.reshape(*x.shape[:-1], nc, n_sfc, 1)
+        .expand(*x.shape[:-1], nc, n_sfc, block)
+        .reshape(*x.shape[:-1], nc * n_crm)
+    )
+
+
 def _cell_to_sub(x: torch.Tensor, nc: int, n_sub: int) -> torch.Tensor:
     """Expand host `[..., nc]` tensor to flattened subcolumns `[..., nc * n_sub]`."""
     return x.unsqueeze(-1).expand(*x.shape, n_sub).reshape(*x.shape[:-1], nc * n_sub)
@@ -322,11 +357,11 @@ def _sync_host_surface_from_subgrid(
 
 
 def broadcast_host_surface_to_subgrid(model: AOBAState) -> None:
-    """Broadcast host `[nc]` `model.sfc` & `bio` across all CRM subcolumns in `model.sfc_sub`."""
+    """Broadcast host `[nc]` `model.sfc` & `bio` across all surface tiles in `model.sfc_sub`."""
     if model.sfc_sub is None:
         return
     nc = model.mesh.n_cells
-    n_sub = model.cfg.crm_ny * model.cfg.crm_nx
+    n_sub = resolve_crm_sfc_tiles(model.cfg)
     for attr in model.sfc.__dataclass_fields__:
         if attr == "bio":
             continue
@@ -593,8 +628,13 @@ def init_aoba_model(
     nz = cfg.nz
     nc = mesh.n_cells
     ny, nx = cfg.crm_ny, cfg.crm_nx
-    n_sub = ny * nx
+    n_crm = ny * nx
+    m_crm = nc * n_crm
+    n_sub = resolve_crm_sfc_tiles(cfg)
     m_sub = nc * n_sub
+    ny_t = 1 if n_sub < n_crm else ny
+    nx_t = n_sub if n_sub < n_crm else nx
+    tile_block = n_crm // n_sub
     shape4 = (nz, nc, ny, nx)
 
     # Initialize host-mean surface summary `[nc]` & subgrid MAML surface `[nc * ny * nx]`
@@ -827,16 +867,19 @@ def init_aoba_model(
     if bool(cfg.enable_superparam) and bool(cfg.enable_crm_self_distill):
         from aoba.crm_self_distill import init_crm_self_distill_state
 
+        ny_sp = 1 if n_sub < n_crm else ny
+        nx_sp = n_sub if n_sub < n_crm else nx
         model.crm_distill = init_crm_self_distill_state(
             n_cells=nc,
             nz=nz,
             device=dev,
             stride=int(cfg.crm_distill_stride),
             warmup_steps=int(cfg.crm_distill_warmup_steps),
+            dwell_steps=int(cfg.crm_distill_dwell_steps),
             hidden_dim=int(cfg.crm_distill_hidden_dim),
             replay_size=int(cfg.crm_distill_replay_size),
-            ny=int(cfg.crm_ny),
-            nx=int(cfg.crm_nx),
+            ny=ny_sp,
+            nx=nx_sp,
         )
     if bool(cfg.enable_rad_self_distill):
         from aoba.crm_self_distill import init_rad_self_distill_state
@@ -848,7 +891,7 @@ def init_aoba_model(
             device=dev,
             stride=int(cfg.crm_distill_stride),
             warmup_steps=max(int(cfg.crm_distill_warmup_steps) // r_stride, 6),
-            dwell_steps=max(12 // r_stride, 4),
+            dwell_steps=max(int(cfg.crm_distill_dwell_steps) // r_stride, 4),
             hidden_dim=min(max(int(cfg.crm_distill_hidden_dim) * 2 // 3, 64), 192),
             replay_size=int(cfg.crm_distill_replay_size),
         )
@@ -863,7 +906,7 @@ def _apply_dynamic_icesheet_update(model: AOBAState) -> None:
     cfg = model.cfg
     mesh = model.mesh
     nc = mesh.n_cells
-    n_sub = cfg.crm_ny * cfg.crm_nx
+    n_sub = resolve_crm_sfc_tiles(cfg)
 
     sim_yr = model.sim_time_sec / (C.DAYS_PER_YEAR * C.SECONDS_PER_DAY)
     if cfg.icesheet_accel_spinup_years > 0.0:
@@ -1075,8 +1118,13 @@ def step_aoba_model(
 
     dt = cfg.dt_host
     nz, nc, ny, nx = crm.rho_d.shape
-    n_sub = ny * nx
+    n_crm = ny * nx
+    m_crm = nc * n_crm
+    n_sub = resolve_crm_sfc_tiles(cfg)
     m_sub = nc * n_sub
+    ny_t = 1 if n_sub < n_crm else ny
+    nx_t = n_sub if n_sub < n_crm else nx
+    tile_block = n_crm // n_sub
 
     # 1. Orbital solar geometry & zero-sync CPU local solar noon detection
     yr_sec_trop = C.DAYS_PER_YEAR * C.SECONDS_PER_DAY
@@ -1135,24 +1183,25 @@ def step_aoba_model(
     s_toa_sub = _cell_to_sub(s_toa, nc, n_sub)
 
     # 2. Subcolumn CRM lowest-layer meteorology & host cell reference heights
-    u_sub_0 = (0.5 * (crm.u[0] + torch.roll(crm.u[0], 1, dims=-1))).reshape(m_sub)
-    v_sub_0 = (0.5 * (crm.v[0] + torch.roll(crm.v[0], 1, dims=-2))).reshape(m_sub)
-    rho_sub = crm.rho_d.reshape(nz, m_sub)
-    thm_sub = crm.theta_m.reshape(nz, m_sub)
-    qv_sub = crm.q_v.reshape(nz, m_sub)
-    qc_sub = crm.q_c.reshape(nz, m_sub)
-    qi_sub = crm.q_i.reshape(nz, m_sub)
+    u_crm_0 = (0.5 * (crm.u[0] + torch.roll(crm.u[0], 1, dims=-1))).reshape(m_crm)
+    v_crm_0 = (0.5 * (crm.v[0] + torch.roll(crm.v[0], 1, dims=-2))).reshape(m_crm)
+    u_sub_0 = _crm_to_sfc_tile(u_crm_0, nc, n_sub, n_crm)
+    v_sub_0 = _crm_to_sfc_tile(v_crm_0, nc, n_sub, n_crm)
+    rho_crm_flat = crm.rho_d.reshape(nz, m_crm)
+    thm_crm_flat = crm.theta_m.reshape(nz, m_crm)
+    qv_crm_flat = crm.q_v.reshape(nz, m_crm)
+    qc_crm_flat = crm.q_c.reshape(nz, m_crm)
+    qi_crm_flat = crm.q_i.reshape(nz, m_crm)
+
+    rho_sub_0 = _crm_to_sfc_tile(rho_crm_flat[0], nc, n_sub, n_crm)
+    thm_sub_0 = _crm_to_sfc_tile(thm_crm_flat[0], nc, n_sub, n_crm)
+    qv_sub_0 = _crm_to_sfc_tile(qv_crm_flat[0], nc, n_sub, n_crm)
 
     need_rad = (not model.rad_cache) or ("q_rad_sub" not in model.rad_cache) or (model.step_count % max(cfg.rad_stride, 1) == 0)
-    if need_rad:
-        pres_sub, _, temp_sub = diagnose_pressure_temperature(rho_sub, thm_sub, qv_sub)
-        pres_sub_0 = pres_sub[0]
-        temp_sub_0 = temp_sub[0]
-    else:
-        pres_sub_0, _, temp_sub_0 = diagnose_pressure_temperature(rho_sub[0], thm_sub[0], qv_sub[0])
+    pres_sub_0, _, temp_sub_0 = diagnose_pressure_temperature(rho_sub_0, thm_sub_0, qv_sub_0)
     dz0_col = atmos.z_c[0] - atmos.z_w[0]
     dz0_sub = _cell_to_sub(dz0_col, nc, n_sub)
-    pres_sfc_sub = pres_sub_0 + C.GRAVITY * rho_sub[0] * (1.0 + qv_sub[0]) * dz0_sub
+    pres_sfc_sub = pres_sub_0 + C.GRAVITY * rho_sub_0 * (1.0 + qv_sub_0) * dz0_sub
     z_rel_c = atmos.z_c - atmos.z_w[0:1]
     z_ref_rel_sub = torch.clamp(_cell_to_sub(z_rel_c[0], nc, n_sub) - 0.65 * sfc_sub.bio.h_canopy, min=5.0)
 
@@ -1194,81 +1243,37 @@ def step_aoba_model(
             torch.full_like(t_rad_in, EMISSIVITY_OCEAN),
             emiss_land_eff,
         )
-        pres_w_sub = torch.empty((nz + 1, m_sub), device=pres_sub.device, dtype=pres_sub.dtype)
-        pres_w_sub[0] = pres_sfc_sub
-        pres_w_sub[1:-1] = torch.sqrt(torch.clamp(pres_sub[:-1] * pres_sub[1:], min=1.0))
-        pres_w_sub[-1] = torch.clamp(0.5 * pres_sub[-1], min=10.0)
 
-        temp_w_sub = torch.empty((nz + 1, m_sub), device=temp_sub.device, dtype=temp_sub.dtype)
-        temp_w_sub[0] = temp_sub[0]
-        temp_w_sub[1:-1] = 0.5 * (temp_sub[:-1] + temp_sub[1:])
-        temp_w_sub[-1] = temp_sub[-1]
-
+        # Prepare host-cell [nz, nc] aerosol, dust, and ozone fields once before expanding only needed columns
         if cfg.enable_dust and atmos.q_dust is None:
             atmos.q_dust = torch.zeros_like(atmos.q_n)
-        q_dust_rad = _cell_to_sub(atmos.q_dust, nc, n_sub) if (cfg.enable_dust and atmos.q_dust is not None) else None
-        if str(cfg.microphysics_scheme).strip().lower() in ("two_moment", "six_class_2m") and crm.n_c is not None and crm.n_i is not None:
-            re_liq_rad, re_ice_rad = diagnose_cloud_effective_radii(
-                rho_sub, qc_sub, qi_sub,
-                crm.n_c.reshape(nz, m_sub), crm.n_i.reshape(nz, m_sub),
-                re_liq_fallback=cfg.re_liq_um, re_ice_fallback=cfg.re_ice_um,
-            )
-        else:
-            re_liq_rad = cfg.re_liq_um
-            re_ice_rad = cfg.re_ice_um
-        # Optional 3D CRM Tilted Independent Column Approximation (Várnai & Davies, 1999)
-        qc_rad, qi_rad = qc_sub, qi_sub
-        if bool(cfg.enable_rad_3d_tica) and n_sub > 1:
-            from aoba.radiation_hd import apply_3d_tica_cloud_shift
-
-            qc_rad, qi_rad = apply_3d_tica_cloud_shift(
-                qc_sub, qi_sub, z_rel_c, mu0, hour_angle_cell, nc, ny, nx, float(cfg.crm_dx)
-            )
-        # Optional 5-species natural + stratospheric volcanic aerosol direct SW+LW radiative optics
-        aero_opt_rad = None
+        q_dust_cell = atmos.q_dust if (cfg.enable_dust and atmos.q_dust is not None) else None
+        aero_opt_cell = None
         if bool(cfg.enable_aerosol_rad_forcing) and bool(cfg.enable_natural_aerosols) and model.aerosols is not None:
             from aoba.aerosols import compute_aerosol_radiative_optics
 
-            tau_a, scat_a, asym_a, lw_a = compute_aerosol_radiative_optics(model.aerosols, atmos.rho_d, atmos.dz_c)
-            aero_opt_rad = (
-                _cell_to_sub(tau_a, nc, n_sub),
-                _cell_to_sub(scat_a, nc, n_sub),
-                _cell_to_sub(asym_a, nc, n_sub),
-                _cell_to_sub(lw_a, nc, n_sub),
-            )
+            aero_opt_cell = compute_aerosol_radiative_optics(model.aerosols, atmos.rho_d, atmos.dz_c)
         if bool(cfg.enable_volcanic_aerosols) and model.volcanic_solar is not None:
             from aoba.volcanic_solar import compute_volcanic_rad_optics_and_sad
 
             pres_host_v, _, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
-            (v_tsw, v_ssw, v_asw, v_tlw), _ = compute_volcanic_rad_optics_and_sad(
-                model.volcanic_solar, pres_host_v, atmos.dz_c
-            )
-            v_sub = (
-                _cell_to_sub(v_tsw, nc, n_sub),
-                _cell_to_sub(v_ssw, nc, n_sub),
-                _cell_to_sub(v_asw, nc, n_sub),
-                _cell_to_sub(v_tlw, nc, n_sub),
-            )
-            if aero_opt_rad is None:
-                aero_opt_rad = v_sub
-            else:
-                aero_opt_rad = tuple(a + b for a, b in zip(aero_opt_rad, v_sub))
-        o3_vmr_rad = None
+            v_cell, _ = compute_volcanic_rad_optics_and_sad(model.volcanic_solar, pres_host_v, atmos.dz_c)
+            aero_opt_cell = v_cell if aero_opt_cell is None else tuple(a + b for a, b in zip(aero_opt_cell, v_cell))
+
+        o3_prog_cell = None
+        o3_use_provider = False
+        doy_now_rad = 0.0
         if str(cfg.o3_mode).strip().lower() == "prognostic":
             if model.ozone is None:
                 from aoba.ozone_chemistry import init_prognostic_ozone_state
 
                 pres_host_oz, _, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
                 model.ozone = init_prognostic_ozone_state(pres_host_oz, atmos.rho_d, atmos.dz_c)
-            o3_vmr_rad = _cell_to_sub(model.ozone.o3_vmr, nc, n_sub)
+            o3_prog_cell = model.ozone.o3_vmr
         elif model.o3_provider is not None and model.o3_provider.mode != "rcemip":
-            doy_now = float(model.calendar.date_at(model.sim_time_sec).doy)
-            o3_vmr_rad = model.o3_provider.compute_vmr(
-                pres_sub,
-                lat_rad=_cell_to_sub(mesh.lat_cell, nc, n_sub),
-                doy=doy_now,
-            )
-        dz_rad_sub = _cell_to_sub(atmos.dz_c, nc, n_sub)
+            o3_use_provider = True
+            doy_now_rad = float(model.calendar.date_at(model.sim_time_sec).doy)
+
         co2_rad_now = model.current_co2_ppmv()
         ch4_rad_now = model.current_ch4_ppmv()
         n2o_rad_now = model.current_n2o_ppmv()
@@ -1280,10 +1285,10 @@ def step_aoba_model(
             model.rad_distill = init_rad_self_distill_state(
                 n_cells=nc,
                 nz=nz,
-                device=pres_sub.device,
+                device=rho_crm_flat.device,
                 stride=int(cfg.crm_distill_stride),
                 warmup_steps=max(int(cfg.crm_distill_warmup_steps) // r_stride, 6),
-                dwell_steps=max(12 // r_stride, 4),
+                dwell_steps=max(int(cfg.crm_distill_dwell_steps) // r_stride, 4),
                 hidden_dim=min(max(int(cfg.crm_distill_hidden_dim) * 2 // 3, 64), 192),
                 replay_size=int(cfg.crm_distill_replay_size),
             )
@@ -1297,67 +1302,147 @@ def step_aoba_model(
                 train_rad_student_online,
             )
 
-            x_rad_all, cp_layer_all, s_inc_all = extract_rad_distill_features(
-                pres_sub, temp_sub, dz_rad_sub, rho_sub, qv_sub, qc_rad, qi_rad,
-                t_rad_in, alb_vd, alb_vf, alb_nd, alb_nf, emiss_in, mu0_sub, s_toa_sub,
-                co2_ppmv=co2_rad_now, ch4_ppmv=ch4_rad_now, n2o_ppmv=n2o_rad_now,
-                o3_vmr_c=o3_vmr_rad, q_dust_c=q_dust_rad,
-                tau_aero_sw_c=(aero_opt_rad[0] if aero_opt_rad is not None else None),
-            )
             rad_sel = select_rad_teacher_indices(model.rad_distill, crm_state=model.crm_distill)
+
+        use_2m_re = (
+            str(cfg.microphysics_scheme).strip().lower() in ("two_moment", "six_class_2m")
+            and crm.n_c is not None
+            and crm.n_i is not None
+        )
 
         if rad_sel is not None and model.rad_distill is not None:
             t_ridx, s_ridx = rad_sel
-            sub_off = torch.arange(n_sub, device=pres_sub.device, dtype=torch.int64).unsqueeze(0)
-            t_sub = (t_ridx.unsqueeze(1) * n_sub + sub_off).reshape(-1)
-            s_sub = (s_ridx.unsqueeze(1) * n_sub + sub_off).reshape(-1)
+            n_tr = int(t_ridx.numel())
+            n_sr = int(s_ridx.numel())
+            dev_r = rho_crm_flat.device
+            crm_off = torch.arange(n_crm, device=dev_r, dtype=torch.int64).unsqueeze(0)
+            sfc_off = torch.arange(n_sub, device=dev_r, dtype=torch.int64).unsqueeze(0)
+            t_crm = (t_ridx.unsqueeze(1) * n_crm + crm_off).reshape(-1)
+            s_crm = (s_ridx.unsqueeze(1) * n_crm + crm_off).reshape(-1)
+            t_sfc = (t_ridx.unsqueeze(1) * n_sub + sfc_off).reshape(-1)
+            s_sfc = (s_ridx.unsqueeze(1) * n_sub + sfc_off).reshape(-1)
+
+            # 3a. Teacher cells: 100% genuine full-n_crm ICA radiation (resolving full RCE_large self-aggregation!)
+            rho_t = rho_crm_flat[:, t_crm]
+            thm_t = thm_crm_flat[:, t_crm]
+            qv_t = qv_crm_flat[:, t_crm]
+            qc_t = qc_crm_flat[:, t_crm]
+            qi_t = qi_crm_flat[:, t_crm]
+            pres_t, _, temp_t = diagnose_pressure_temperature(rho_t, thm_t, qv_t)
+            dz_t = _cell_to_sub(atmos.dz_c[:, t_ridx], n_tr, n_crm)
+            pres_sfc_t = pres_t[0] + C.GRAVITY * rho_t[0] * (1.0 + qv_t[0]) * dz_t[0]
+            pres_w_t = torch.empty((nz + 1, n_tr * n_crm), device=dev_r, dtype=pres_t.dtype)
+            pres_w_t[0] = pres_sfc_t
+            pres_w_t[1:-1] = torch.sqrt(torch.clamp(pres_t[:-1] * pres_t[1:], min=1.0))
+            pres_w_t[-1] = torch.clamp(0.5 * pres_t[-1], min=10.0)
+            temp_w_t = torch.empty((nz + 1, n_tr * n_crm), device=dev_r, dtype=temp_t.dtype)
+            temp_w_t[0] = temp_t[0]
+            temp_w_t[1:-1] = 0.5 * (temp_t[:-1] + temp_t[1:])
+            temp_w_t[-1] = temp_t[-1]
+
+            if bool(cfg.enable_rad_3d_tica) and n_crm > 1:
+                from aoba.radiation_hd import apply_3d_tica_cloud_shift
+
+                qc_t, qi_t = apply_3d_tica_cloud_shift(
+                    qc_t, qi_t, z_rel_c[:, t_ridx], mu0[t_ridx], hour_angle_cell[t_ridx],
+                    n_tr, ny, nx, float(cfg.crm_dx),
+                )
+            if use_2m_re:
+                re_l_t, re_i_t = diagnose_cloud_effective_radii(
+                    rho_t, qc_t, qi_t,
+                    crm.n_c[:, t_ridx].reshape(nz, n_tr * n_crm),
+                    crm.n_i[:, t_ridx].reshape(nz, n_tr * n_crm),
+                    re_liq_fallback=cfg.re_liq_um, re_ice_fallback=cfg.re_ice_um,
+                )
+            else:
+                re_l_t, re_i_t = cfg.re_liq_um, cfg.re_ice_um
+
+            t_rad_t = _sfc_tile_to_crm(t_rad_in[t_sfc], n_tr, n_sub, n_crm)
+            emiss_t = _sfc_tile_to_crm(emiss_in[t_sfc], n_tr, n_sub, n_crm)
+            alb_vd_t = _sfc_tile_to_crm(alb_vd[t_sfc], n_tr, n_sub, n_crm)
+            alb_vf_t = _sfc_tile_to_crm(alb_vf[t_sfc], n_tr, n_sub, n_crm)
+            alb_nd_t = _sfc_tile_to_crm(alb_nd[t_sfc], n_tr, n_sub, n_crm)
+            alb_nf_t = _sfc_tile_to_crm(alb_nf[t_sfc], n_tr, n_sub, n_crm)
+            mu0_t = _cell_to_sub(mu0[t_ridx], n_tr, n_crm)
+            s_toa_t = _cell_to_sub(s_toa[t_ridx], n_tr, n_crm)
+            qd_t = _cell_to_sub(q_dust_cell[:, t_ridx], n_tr, n_crm) if q_dust_cell is not None else None
+            ao_t = tuple(_cell_to_sub(a[:, t_ridx], n_tr, n_crm) for a in aero_opt_cell) if aero_opt_cell is not None else None
+            if o3_prog_cell is not None:
+                o3_t = _cell_to_sub(o3_prog_cell[:, t_ridx], n_tr, n_crm)
+            elif o3_use_provider:
+                o3_t = model.o3_provider.compute_vmr(
+                    pres_t, lat_rad=_cell_to_sub(mesh.lat_cell[t_ridx], n_tr, n_crm), doy=doy_now_rad
+                )
+            else:
+                o3_t = None
 
             q_rad_t, sw1d_t, sw1f_t, sw2d_t, sw2f_t, lwd_t, olr_t, asr_t = (
                 _compute_four_band_radiation_chunked(
-                    pres_c=pres_sub[:, t_sub],
-                    pres_w=pres_w_sub[:, t_sub],
-                    temp_c=temp_sub[:, t_sub],
-                    temp_w=temp_w_sub[:, t_sub],
-                    dz_c=dz_rad_sub[:, t_sub],
-                    rho_d_c=rho_sub[:, t_sub],
-                    qv_c=qv_sub[:, t_sub],
-                    qc_c=qc_rad[:, t_sub],
-                    qi_c=qi_rad[:, t_sub],
-                    t_sfc=t_rad_in[t_sub],
-                    albedo_vis=alb_vd[t_sub],
-                    albedo_nir=alb_nd[t_sub],
-                    mu0=mu0_sub[t_sub],
-                    s_toa=s_toa_sub[t_sub],
-                    co2_ppmv=co2_rad_now,
-                    emiss_sfc=emiss_in[t_sub],
-                    albedo_vis_dif=alb_vf[t_sub],
-                    albedo_nir_dif=alb_nf[t_sub],
-                    col_chunk=cfg.rad_col_chunk,
-                    re_liq_um=(re_liq_rad[:, t_sub] if isinstance(re_liq_rad, torch.Tensor) else re_liq_rad),
-                    re_ice_um=(re_ice_rad[:, t_sub] if isinstance(re_ice_rad, torch.Tensor) else re_ice_rad),
-                    cloud_sw_inhomog=cfg.cloud_sw_inhomog,
-                    q_dust_c=(q_dust_rad[:, t_sub] if q_dust_rad is not None else None),
-                    o3_vmr_c=(o3_vmr_rad[:, t_sub] if o3_vmr_rad is not None else None),
-                    o3_lw_coupling=cfg.o3_lw_coupling,
-                    rad_scheme=cfg.rad_scheme,
-                    ch4_ppmv=ch4_rad_now,
-                    n2o_ppmv=n2o_rad_now,
-                    aero_opt=(tuple(a[:, t_sub] for a in aero_opt_rad) if aero_opt_rad is not None else None),
+                    pres_c=pres_t, pres_w=pres_w_t, temp_c=temp_t, temp_w=temp_w_t,
+                    dz_c=dz_t, rho_d_c=rho_t, qv_c=qv_t, qc_c=qc_t, qi_c=qi_t,
+                    t_sfc=t_rad_t, albedo_vis=alb_vd_t, albedo_nir=alb_nd_t,
+                    mu0=mu0_t, s_toa=s_toa_t, co2_ppmv=co2_rad_now, emiss_sfc=emiss_t,
+                    albedo_vis_dif=alb_vf_t, albedo_nir_dif=alb_nf_t, col_chunk=cfg.rad_col_chunk,
+                    re_liq_um=re_l_t, re_ice_um=re_i_t, cloud_sw_inhomog=cfg.cloud_sw_inhomog,
+                    q_dust_c=qd_t, o3_vmr_c=o3_t, o3_lw_coupling=cfg.o3_lw_coupling,
+                    rad_scheme=cfg.rad_scheme, ch4_ppmv=ch4_rad_now, n2o_ppmv=n2o_rad_now, aero_opt=ao_t,
                 )
             )
+            # Train radiation student online from stratified teacher subcolumns (capped at 6144 for speed)
+            m_tr_tot = n_tr * n_crm
+            if m_tr_tot > 6144:
+                tr_s = torch.randperm(m_tr_tot, device=dev_r)[:6144]
+            else:
+                tr_s = slice(None)
+            x_rt, cp_rt_raw, s_inc_rt = extract_rad_distill_features(
+                pres_t[:, tr_s], temp_t[:, tr_s], dz_t[:, tr_s], rho_t[:, tr_s],
+                qv_t[:, tr_s], qc_t[:, tr_s], qi_t[:, tr_s],
+                t_rad_t[tr_s], alb_vd_t[tr_s], alb_vf_t[tr_s], alb_nd_t[tr_s], alb_nf_t[tr_s],
+                emiss_t[tr_s], mu0_t[tr_s], s_toa_t[tr_s],
+                co2_ppmv=co2_rad_now, ch4_ppmv=ch4_rad_now, n2o_ppmv=n2o_rad_now,
+                o3_vmr_c=(o3_t[:, tr_s] if o3_t is not None else None),
+                q_dust_c=(qd_t[:, tr_s] if qd_t is not None else None),
+                tau_aero_sw_c=(ao_t[0][:, tr_s] if ao_t is not None else None),
+            )
             cp_rt, cs_rt, tqr_rt, ts_rt = pack_rad_teacher_context_and_targets(
-                cp_layer_all[:, t_sub], s_inc_all[t_sub],
-                alb_vd[t_sub], alb_vf[t_sub], alb_nd[t_sub], alb_nf[t_sub], emiss_in[t_sub], t_rad_in[t_sub],
-                q_rad_t, sw1d_t, sw1f_t, sw2d_t, sw2f_t, lwd_t, olr_t, asr_t,
+                cp_rt_raw, s_inc_rt,
+                alb_vd_t[tr_s], alb_vf_t[tr_s], alb_nd_t[tr_s], alb_nf_t[tr_s], emiss_t[tr_s], t_rad_t[tr_s],
+                q_rad_t[:, tr_s], sw1d_t[tr_s], sw1f_t[tr_s], sw2d_t[tr_s], sw2f_t[tr_s],
+                lwd_t[tr_s], olr_t[tr_s], asr_t[tr_s],
             )
-            train_rad_student_online(model.rad_distill, x_rad_all[t_sub], cp_rt, cs_rt, tqr_rt, ts_rt)
+            train_rad_student_online(model.rad_distill, x_rt, cp_rt, cs_rt, tqr_rt, ts_rt)
 
-            rad_stu_out, rad_stu_unc = predict_rad_student_columns(
-                model.rad_distill,
-                x_rad_all[s_sub], cp_layer_all[:, s_sub], s_inc_all[s_sub],
-                alb_vd[s_sub], alb_vf[s_sub], alb_nd[s_sub], alb_nf[s_sub], emiss_in[s_sub], t_rad_in[s_sub],
+            # 3b. Student cells: fast per-surface-tile (`n_sub`) RadSelfDistillNet inference
+            rho_s = _crm_to_sfc_tile(rho_crm_flat[:, s_crm], n_sr, n_sub, n_crm)
+            thm_s = _crm_to_sfc_tile(thm_crm_flat[:, s_crm], n_sr, n_sub, n_crm)
+            qv_s = _crm_to_sfc_tile(qv_crm_flat[:, s_crm], n_sr, n_sub, n_crm)
+            qc_s = _crm_to_sfc_tile(qc_crm_flat[:, s_crm], n_sr, n_sub, n_crm)
+            qi_s = _crm_to_sfc_tile(qi_crm_flat[:, s_crm], n_sr, n_sub, n_crm)
+            pres_s, _, temp_s = diagnose_pressure_temperature(rho_s, thm_s, qv_s)
+            dz_s = _cell_to_sub(atmos.dz_c[:, s_ridx], n_sr, n_sub)
+            qd_s = _cell_to_sub(q_dust_cell[:, s_ridx], n_sr, n_sub) if q_dust_cell is not None else None
+            tau_aero_s = _cell_to_sub(aero_opt_cell[0][:, s_ridx], n_sr, n_sub) if aero_opt_cell is not None else None
+            if o3_prog_cell is not None:
+                o3_s = _cell_to_sub(o3_prog_cell[:, s_ridx], n_sr, n_sub)
+            elif o3_use_provider:
+                o3_s = model.o3_provider.compute_vmr(
+                    pres_s, lat_rad=_cell_to_sub(mesh.lat_cell[s_ridx], n_sr, n_sub), doy=doy_now_rad
+                )
+            else:
+                o3_s = None
+            x_rs, cp_rs, s_inc_rs = extract_rad_distill_features(
+                pres_s, temp_s, dz_s, rho_s, qv_s, qc_s, qi_s,
+                t_rad_in[s_sfc], alb_vd[s_sfc], alb_vf[s_sfc], alb_nd[s_sfc], alb_nf[s_sfc],
+                emiss_in[s_sfc], mu0_sub[s_sfc], s_toa_sub[s_sfc],
+                co2_ppmv=co2_rad_now, ch4_ppmv=ch4_rad_now, n2o_ppmv=n2o_rad_now,
+                o3_vmr_c=o3_s, q_dust_c=qd_s, tau_aero_sw_c=tau_aero_s,
             )
-            q_rad_sub = torch.empty_like(pres_sub)
+            rad_stu_out, rad_stu_unc = predict_rad_student_columns(
+                model.rad_distill, x_rs, cp_rs, s_inc_rs,
+                alb_vd[s_sfc], alb_vf[s_sfc], alb_nd[s_sfc], alb_nf[s_sfc], emiss_in[s_sfc], t_rad_in[s_sfc],
+            )
+
+            q_rad_sub = torch.empty((nz, m_crm), device=dev_r, dtype=rho_crm_flat.dtype)
             sw1_dir_sub = torch.empty_like(t_rad_in)
             sw1_dif_sub = torch.empty_like(t_rad_in)
             sw2_dir_sub = torch.empty_like(t_rad_in)
@@ -1366,77 +1451,124 @@ def step_aoba_model(
             olr_sub = torch.empty_like(t_rad_in)
             asr_sub = torch.empty_like(t_rad_in)
 
-            q_rad_sub[:, t_sub] = q_rad_t
-            sw1_dir_sub[t_sub] = sw1d_t
-            sw1_dif_sub[t_sub] = sw1f_t
-            sw2_dir_sub[t_sub] = sw2d_t
-            sw2_dif_sub[t_sub] = sw2f_t
-            lw_dn_sub[t_sub] = lwd_t
-            olr_sub[t_sub] = olr_t
-            asr_sub[t_sub] = asr_t
+            q_rad_sub[:, t_crm] = q_rad_t
+            sw1_dir_sub[t_sfc] = _crm_to_sfc_tile(sw1d_t, n_tr, n_sub, n_crm)
+            sw1_dif_sub[t_sfc] = _crm_to_sfc_tile(sw1f_t, n_tr, n_sub, n_crm)
+            sw2_dir_sub[t_sfc] = _crm_to_sfc_tile(sw2d_t, n_tr, n_sub, n_crm)
+            sw2_dif_sub[t_sfc] = _crm_to_sfc_tile(sw2f_t, n_tr, n_sub, n_crm)
+            lw_dn_sub[t_sfc] = _crm_to_sfc_tile(lwd_t, n_tr, n_sub, n_crm)
+            olr_sub[t_sfc] = _crm_to_sfc_tile(olr_t, n_tr, n_sub, n_crm)
+            asr_sub[t_sfc] = _crm_to_sfc_tile(asr_t, n_tr, n_sub, n_crm)
 
-            q_rad_sub[:, s_sub] = rad_stu_out["q_rad"]
-            sw1_dir_sub[s_sub] = rad_stu_out["sw1_dir"]
-            sw1_dif_sub[s_sub] = rad_stu_out["sw1_dif"]
-            sw2_dir_sub[s_sub] = rad_stu_out["sw2_dir"]
-            sw2_dif_sub[s_sub] = rad_stu_out["sw2_dif"]
-            lw_dn_sub[s_sub] = rad_stu_out["lw_dn"]
-            olr_sub[s_sub] = rad_stu_out["olr"]
-            asr_sub[s_sub] = rad_stu_out["asr"]
+            q_rad_sub[:, s_crm] = _sfc_tile_to_crm(rad_stu_out["q_rad"], n_sr, n_sub, n_crm)
+            sw1_dir_sub[s_sfc] = rad_stu_out["sw1_dir"]
+            sw1_dif_sub[s_sfc] = rad_stu_out["sw1_dif"]
+            sw2_dir_sub[s_sfc] = rad_stu_out["sw2_dir"]
+            sw2_dif_sub[s_sfc] = rad_stu_out["sw2_dif"]
+            lw_dn_sub[s_sfc] = rad_stu_out["lw_dn"]
+            olr_sub[s_sfc] = rad_stu_out["olr"]
+            asr_sub[s_sfc] = rad_stu_out["asr"]
 
             model.rad_distill.last_uncertainty.zero_()
-            model.rad_distill.last_uncertainty[s_ridx] = rad_stu_unc.reshape(int(s_ridx.numel()), n_sub).mean(dim=-1)
-            model.rad_distill.teacher_frac_last = float(t_ridx.numel()) / float(max(nc, 1))
+            model.rad_distill.last_uncertainty[s_ridx] = rad_stu_unc.reshape(n_sr, n_sub).mean(dim=-1)
+            model.rad_distill.teacher_frac_last = float(n_tr) / float(max(nc, 1))
             model.rad_distill.steps_seen += 1
         else:
-            q_rad_sub, sw1_dir_sub, sw1_dif_sub, sw2_dir_sub, sw2_dif_sub, lw_dn_sub, olr_sub, asr_sub = (
+            # Full-physics / warmup ICA radiation across `[nz, m_crm]`
+            pres_crm, _, temp_crm = diagnose_pressure_temperature(rho_crm_flat, thm_crm_flat, qv_crm_flat)
+            dz_rad_crm = _cell_to_sub(atmos.dz_c, nc, n_crm)
+            pres_sfc_crm = pres_crm[0] + C.GRAVITY * rho_crm_flat[0] * (1.0 + qv_crm_flat[0]) * dz_rad_crm[0]
+            pres_w_crm = torch.empty((nz + 1, m_crm), device=pres_crm.device, dtype=pres_crm.dtype)
+            pres_w_crm[0] = pres_sfc_crm
+            pres_w_crm[1:-1] = torch.sqrt(torch.clamp(pres_crm[:-1] * pres_crm[1:], min=1.0))
+            pres_w_crm[-1] = torch.clamp(0.5 * pres_crm[-1], min=10.0)
+            temp_w_crm = torch.empty((nz + 1, m_crm), device=temp_crm.device, dtype=temp_crm.dtype)
+            temp_w_crm[0] = temp_crm[0]
+            temp_w_crm[1:-1] = 0.5 * (temp_crm[:-1] + temp_crm[1:])
+            temp_w_crm[-1] = temp_crm[-1]
+
+            qc_rad, qi_rad = qc_crm_flat, qi_crm_flat
+            if bool(cfg.enable_rad_3d_tica) and n_crm > 1:
+                from aoba.radiation_hd import apply_3d_tica_cloud_shift
+
+                qc_rad, qi_rad = apply_3d_tica_cloud_shift(
+                    qc_crm_flat, qi_crm_flat, z_rel_c, mu0, hour_angle_cell, nc, ny, nx, float(cfg.crm_dx)
+                )
+            if use_2m_re:
+                re_liq_rad, re_ice_rad = diagnose_cloud_effective_radii(
+                    rho_crm_flat, qc_crm_flat, qi_crm_flat,
+                    crm.n_c.reshape(nz, m_crm), crm.n_i.reshape(nz, m_crm),
+                    re_liq_fallback=cfg.re_liq_um, re_ice_fallback=cfg.re_ice_um,
+                )
+            else:
+                re_liq_rad, re_ice_rad = cfg.re_liq_um, cfg.re_ice_um
+
+            t_rad_crm = _sfc_tile_to_crm(t_rad_in, nc, n_sub, n_crm)
+            emiss_crm = _sfc_tile_to_crm(emiss_in, nc, n_sub, n_crm)
+            alb_vd_crm = _sfc_tile_to_crm(alb_vd, nc, n_sub, n_crm)
+            alb_vf_crm = _sfc_tile_to_crm(alb_vf, nc, n_sub, n_crm)
+            alb_nd_crm = _sfc_tile_to_crm(alb_nd, nc, n_sub, n_crm)
+            alb_nf_crm = _sfc_tile_to_crm(alb_nf, nc, n_sub, n_crm)
+            mu0_crm = _cell_to_sub(mu0, nc, n_crm)
+            s_toa_crm = _cell_to_sub(s_toa, nc, n_crm)
+            q_dust_rad = _cell_to_sub(q_dust_cell, nc, n_crm) if q_dust_cell is not None else None
+            aero_opt_rad = tuple(_cell_to_sub(a, nc, n_crm) for a in aero_opt_cell) if aero_opt_cell is not None else None
+            if o3_prog_cell is not None:
+                o3_vmr_rad = _cell_to_sub(o3_prog_cell, nc, n_crm)
+            elif o3_use_provider:
+                o3_vmr_rad = model.o3_provider.compute_vmr(
+                    pres_crm, lat_rad=_cell_to_sub(mesh.lat_cell, nc, n_crm), doy=doy_now_rad
+                )
+            else:
+                o3_vmr_rad = None
+
+            q_rad_sub, sw1d_c, sw1f_c, sw2d_c, sw2f_c, lwd_c, olr_c, asr_c = (
                 _compute_four_band_radiation_chunked(
-                    pres_c=pres_sub,
-                    pres_w=pres_w_sub,
-                    temp_c=temp_sub,
-                    temp_w=temp_w_sub,
-                    dz_c=dz_rad_sub,
-                    rho_d_c=rho_sub,
-                    qv_c=qv_sub,
-                    qc_c=qc_rad,
-                    qi_c=qi_rad,
-                    t_sfc=t_rad_in,
-                    albedo_vis=alb_vd,
-                    albedo_nir=alb_nd,
-                    mu0=mu0_sub,
-                    s_toa=s_toa_sub,
-                    co2_ppmv=co2_rad_now,
-                    emiss_sfc=emiss_in,
-                    albedo_vis_dif=alb_vf,
-                    albedo_nir_dif=alb_nf,
-                    col_chunk=cfg.rad_col_chunk,
-                    re_liq_um=re_liq_rad,
-                    re_ice_um=re_ice_rad,
-                    cloud_sw_inhomog=cfg.cloud_sw_inhomog,
-                    q_dust_c=q_dust_rad,
-                    o3_vmr_c=o3_vmr_rad,
-                    o3_lw_coupling=cfg.o3_lw_coupling,
-                    rad_scheme=cfg.rad_scheme,
-                    ch4_ppmv=ch4_rad_now,
-                    n2o_ppmv=n2o_rad_now,
-                    aero_opt=aero_opt_rad,
+                    pres_c=pres_crm, pres_w=pres_w_crm, temp_c=temp_crm, temp_w=temp_w_crm,
+                    dz_c=dz_rad_crm, rho_d_c=rho_crm_flat, qv_c=qv_crm_flat, qc_c=qc_rad, qi_c=qi_rad,
+                    t_sfc=t_rad_crm, albedo_vis=alb_vd_crm, albedo_nir=alb_nd_crm,
+                    mu0=mu0_crm, s_toa=s_toa_crm, co2_ppmv=co2_rad_now, emiss_sfc=emiss_crm,
+                    albedo_vis_dif=alb_vf_crm, albedo_nir_dif=alb_nf_crm, col_chunk=cfg.rad_col_chunk,
+                    re_liq_um=re_liq_rad, re_ice_um=re_ice_rad, cloud_sw_inhomog=cfg.cloud_sw_inhomog,
+                    q_dust_c=q_dust_rad, o3_vmr_c=o3_vmr_rad, o3_lw_coupling=cfg.o3_lw_coupling,
+                    rad_scheme=cfg.rad_scheme, ch4_ppmv=ch4_rad_now, n2o_ppmv=n2o_rad_now, aero_opt=aero_opt_rad,
                 )
             )
             if use_rad_distill and model.rad_distill is not None:
-                n_rsamp = min(m_sub, 4096)
-                if n_rsamp < m_sub:
-                    rw_idx = torch.randperm(m_sub, device=pres_sub.device)[:n_rsamp]
-                else:
-                    rw_idx = torch.arange(m_sub, device=pres_sub.device)
-                cp_rw, cs_rw, tqr_rw, ts_rw = pack_rad_teacher_context_and_targets(
-                    cp_layer_all[:, rw_idx], s_inc_all[rw_idx],
-                    alb_vd[rw_idx], alb_vf[rw_idx], alb_nd[rw_idx], alb_nf[rw_idx], emiss_in[rw_idx], t_rad_in[rw_idx],
-                    q_rad_sub[:, rw_idx], sw1_dir_sub[rw_idx], sw1_dif_sub[rw_idx],
-                    sw2_dir_sub[rw_idx], sw2_dif_sub[rw_idx], lw_dn_sub[rw_idx], olr_sub[rw_idx], asr_sub[rw_idx],
+                n_rsamp = min(m_crm, 4096)
+                rw_idx = (
+                    torch.randperm(m_crm, device=pres_crm.device)[:n_rsamp]
+                    if n_rsamp < m_crm
+                    else torch.arange(m_crm, device=pres_crm.device)
                 )
-                train_rad_student_online(model.rad_distill, x_rad_all[rw_idx], cp_rw, cs_rw, tqr_rw, ts_rw)
+                x_rw, cp_rw_raw, s_inc_rw = extract_rad_distill_features(
+                    pres_crm[:, rw_idx], temp_crm[:, rw_idx], dz_rad_crm[:, rw_idx], rho_crm_flat[:, rw_idx],
+                    qv_crm_flat[:, rw_idx], qc_rad[:, rw_idx], qi_rad[:, rw_idx],
+                    t_rad_crm[rw_idx], alb_vd_crm[rw_idx], alb_vf_crm[rw_idx], alb_nd_crm[rw_idx], alb_nf_crm[rw_idx],
+                    emiss_crm[rw_idx], mu0_crm[rw_idx], s_toa_crm[rw_idx],
+                    co2_ppmv=co2_rad_now, ch4_ppmv=ch4_rad_now, n2o_ppmv=n2o_rad_now,
+                    o3_vmr_c=(o3_vmr_rad[:, rw_idx] if o3_vmr_rad is not None else None),
+                    q_dust_c=(q_dust_rad[:, rw_idx] if q_dust_rad is not None else None),
+                    tau_aero_sw_c=(aero_opt_rad[0][:, rw_idx] if aero_opt_rad is not None else None),
+                )
+                cp_rw, cs_rw, tqr_rw, ts_rw = pack_rad_teacher_context_and_targets(
+                    cp_rw_raw, s_inc_rw,
+                    alb_vd_crm[rw_idx], alb_vf_crm[rw_idx], alb_nd_crm[rw_idx], alb_nf_crm[rw_idx],
+                    emiss_crm[rw_idx], t_rad_crm[rw_idx],
+                    q_rad_sub[:, rw_idx], sw1d_c[rw_idx], sw1f_c[rw_idx],
+                    sw2d_c[rw_idx], sw2f_c[rw_idx], lwd_c[rw_idx], olr_c[rw_idx], asr_c[rw_idx],
+                )
+                train_rad_student_online(model.rad_distill, x_rw, cp_rw, cs_rw, tqr_rw, ts_rw)
                 model.rad_distill.teacher_frac_last = 1.0
                 model.rad_distill.steps_seen += 1
+
+            sw1_dir_sub = _crm_to_sfc_tile(sw1d_c, nc, n_sub, n_crm)
+            sw1_dif_sub = _crm_to_sfc_tile(sw1f_c, nc, n_sub, n_crm)
+            sw2_dir_sub = _crm_to_sfc_tile(sw2d_c, nc, n_sub, n_crm)
+            sw2_dif_sub = _crm_to_sfc_tile(sw2f_c, nc, n_sub, n_crm)
+            lw_dn_sub = _crm_to_sfc_tile(lwd_c, nc, n_sub, n_crm)
+            olr_sub = _crm_to_sfc_tile(olr_c, nc, n_sub, n_crm)
+            asr_sub = _crm_to_sfc_tile(asr_c, nc, n_sub, n_crm)
         model.rad_cache["q_rad_sub"] = q_rad_sub
         model.rad_cache["sw1_dir_sub"] = sw1_dir_sub
         model.rad_cache["sw1_dif_sub"] = sw1_dif_sub
@@ -1520,7 +1652,7 @@ def step_aoba_model(
         u_1=u_sub_0 - u_ocn_sub,
         v_1=v_sub_0 - v_ocn_sub,
         temp_1=temp_sfc_in,
-        qv_1=qv_sub[0],
+        qv_1=qv_sub_0,
         pres_1=pres_sub_0,
         pres_sfc=pres_sfc_in,
         z_ref_rel=z_ref_rel_sub,
@@ -1562,9 +1694,9 @@ def step_aoba_model(
             u_1=_sub_to_cell(u_sub_0, nc, n_sub),
             v_1=_sub_to_cell(v_sub_0, nc, n_sub),
             temp_1=_sub_to_cell(temp_sub_0, nc, n_sub),
-            qv_1=_sub_to_cell(qv_sub[0], nc, n_sub),
+            qv_1=_sub_to_cell(qv_sub_0, nc, n_sub),
             pres_sfc=_sub_to_cell(pres_sfc_sub, nc, n_sub),
-            rho_1=_sub_to_cell(rho_sub[0] * (1.0 + qv_sub[0]), nc, n_sub),
+            rho_1=_sub_to_cell(rho_sub_0 * (1.0 + qv_sub_0), nc, n_sub),
             z_ref_rel=_sub_to_cell(z_ref_rel_sub, nc, n_sub),
             sw1_dir_dn=_sub_to_cell(sw1_dir_sub, nc, n_sub),
             sw1_dif_dn=_sub_to_cell(sw1_dif_sub, nc, n_sub),
@@ -1602,7 +1734,7 @@ def step_aoba_model(
         open_ocn_sub = torch.clamp(1.0 - torch.clamp(sfc_diag_sub.f_seaice, 0.0, 1.0), 0.0, 1.0) * is_ocn_wave_sub.to(temp_sub_0.dtype)
         u10_rel_sub = torch.hypot(u_sub_0 - u_ocn_sub, v_sub_0 - v_ocn_sub)
         d_lh_sp, d_sh_sp = compute_sea_spray_enthalpy_fluxes(
-            u10_rel_sub, sfc_sub.t_ocean_ml, temp_sub_0, qv_sub[0], pres_sfc_sub, open_ocn_sub
+            u10_rel_sub, sfc_sub.t_ocean_ml, temp_sub_0, qv_sub_0, pres_sfc_sub, open_ocn_sub
         )
         sfc_diag_sub.lhf = sfc_diag_sub.lhf + d_lh_sp
         sfc_diag_sub.shf = sfc_diag_sub.shf + d_sh_sp
@@ -1929,18 +2061,47 @@ def step_aoba_model(
     sfc_diag_sub.tau_x = -drag_c_sub * u_sub_post
     sfc_diag_sub.tau_y = -drag_c_sub * v_sub_post
 
-    # 7. 1:1 Embedded 3D CRM Physics & Convective Transport with Subgrid Surface & ICA Radiation
+    # 7. Embedded 2D/3D CRM Physics & Convective Transport with Subgrid Surface Tiles & ICA Radiation
     rain_new_sub = torch.zeros_like(pres_sfc_sub)
     snow_new_sub = torch.zeros_like(pres_sfc_sub)
     q_rad_4d = q_rad_sub.reshape(nz, nc, ny, nx)
+
+    def _tile3d_to_crm3d(t: torch.Tensor) -> torch.Tensor:
+        if n_sub == n_crm:
+            return t
+        return (
+            t.reshape(t.shape[0], n_sub, 1)
+            .expand(t.shape[0], n_sub, tile_block)
+            .reshape(t.shape[0], ny, nx)
+            .contiguous()
+        )
+
+    def _crm3d_to_tile3d(t: torch.Tensor) -> torch.Tensor:
+        if n_sub == n_crm:
+            return t
+        return t.reshape(t.shape[0], n_sub, tile_block).mean(dim=-1).reshape(t.shape[0], ny_t, nx_t)
+
+    def _crm4d_to_tile4d(t: torch.Tensor) -> torch.Tensor:
+        if n_sub == n_crm:
+            return t
+        return t.reshape(t.shape[0], t.shape[1], n_sub, tile_block).mean(dim=-1).reshape(t.shape[0], t.shape[1], ny_t, nx_t)
+
+    def _tile4d_to_crm4d(t: torch.Tensor) -> torch.Tensor:
+        if n_sub == n_crm:
+            return t
+        return (
+            t.reshape(t.shape[0], t.shape[1], n_sub, 1)
+            .expand(t.shape[0], t.shape[1], n_sub, tile_block)
+            .reshape(t.shape[0], t.shape[1], ny, nx)
+        )
 
     if cfg.enable_superparam:
         thm_before_crm = atmos.theta_m.clone()
         du_crm_c = torch.zeros_like(u_host_new)
         dv_crm_c = torch.zeros_like(v_host_new)
-        sfc_diag_3d = {k: v.reshape(nc, ny, nx) for k, v in sfc_diag_sub.__dict__.items()}
-        is_ocn_3d = is_ocn_sub.reshape(nc, ny, nx)
-        u_sfc_3d = torch.hypot(u_sub_post, v_sub_post).reshape(nc, ny, nx)
+        sfc_diag_tile = {k: v.reshape(nc, ny_t, nx_t) for k, v in sfc_diag_sub.__dict__.items()}
+        is_ocn_tile = is_ocn_sub.reshape(nc, ny_t, nx_t)
+        u_sfc_tile = torch.hypot(u_sub_post, v_sub_post).reshape(nc, ny_t, nx_t)
         q_dust_4d = (
             atmos.q_dust.unsqueeze(-1).unsqueeze(-1).expand(nz, nc, ny, nx)
             if (cfg.enable_dust and atmos.q_dust is not None)
@@ -1958,10 +2119,11 @@ def step_aoba_model(
                 device=atmos.rho_d.device,
                 stride=int(cfg.crm_distill_stride),
                 warmup_steps=int(cfg.crm_distill_warmup_steps),
+                dwell_steps=int(cfg.crm_distill_dwell_steps),
                 hidden_dim=int(cfg.crm_distill_hidden_dim),
                 replay_size=int(cfg.crm_distill_replay_size),
-                ny=ny,
-                nx=nx,
+                ny=ny_t,
+                nx=nx_t,
             )
         distill_sel = None
         sub_maps_all_sd = None
@@ -1979,7 +2141,7 @@ def step_aoba_model(
                 train_student_online,
             )
 
-            q_rad_cell_pre = _sub_to_cell(q_rad_sub, nc, n_sub)
+            q_rad_cell_pre = _sub_to_cell(q_rad_sub, nc, n_crm)
             shf_cell_pre = _sub_to_cell(sfc_diag_sub.shf, nc, n_sub)
             lhf_cell_pre = _sub_to_cell(sfc_diag_sub.lhf, nc, n_sub)
             evap_cell_pre = _sub_to_cell(sfc_diag_sub.evap, nc, n_sub)
@@ -1995,23 +2157,25 @@ def step_aoba_model(
             qc_pre_sd = atmos.q_c.clone()
             qi_pre_sd = atmos.q_i.clone()
             subgrid_struct_sd = compute_subgrid_structure_features(
-                sfc_diag_3d["shf"],
-                sfc_diag_3d["lhf"],
-                sfc_diag_3d["t_rad_sfc"],
-                sfc_diag_3d["alb_vis_dir"],
+                sfc_diag_tile["shf"],
+                sfc_diag_tile["lhf"],
+                sfc_diag_tile["t_rad_sfc"],
+                sfc_diag_tile["alb_vis_dir"],
                 crm.q_n,
                 crm.w,
                 dx=float(cfg.crm_dx),
                 dy=float(cfg.crm_dx),
+                dx_sfc=float(cfg.crm_dx) * float(tile_block),
+                dy_sfc=float(cfg.crm_dx) * float(tile_block),
             )
             if n_sub > 1:
                 sub_maps_all_sd = extract_subgrid_spatial_maps(
-                    sfc_diag_3d["shf"],
-                    sfc_diag_3d["lhf"],
-                    sfc_diag_3d["t_rad_sfc"],
-                    sfc_diag_3d["alb_vis_dir"],
-                    crm.q_n,
-                    crm.w,
+                    sfc_diag_tile["shf"],
+                    sfc_diag_tile["lhf"],
+                    sfc_diag_tile["t_rad_sfc"],
+                    sfc_diag_tile["alb_vis_dir"],
+                    _crm4d_to_tile4d(crm.q_n),
+                    _crm4d_to_tile4d(crm.w),
                 )
             x_all_sd, exner_all_sd, temp_all_sd = extract_crm_distill_features(
                 rho_pre_sd, thm_pre_sd, qv_pre_sd, qc_pre_sd, qi_pre_sd, qp_pre_sd,
@@ -2025,10 +2189,10 @@ def step_aoba_model(
 
         if distill_sel is not None and model.crm_distill is not None:
             t_idx, s_idx = distill_sel
-            rain_3d = rain_new_sub.reshape(nc, ny, nx)
-            snow_3d = snow_new_sub.reshape(nc, ny, nx)
+            rain_3d = rain_new_sub.reshape(nc, ny_t, nx_t)
+            snow_3d = snow_new_sub.reshape(nc, ny_t, nx_t)
 
-            # 7a-i. Execute genuine 2D CRM strictly on the active teacher subset (`1 / stride` columns)
+            # 7a-i. Execute genuine 2D/3D CRM strictly on the active teacher subset (`1 / stride` columns)
             rho_crm_t = crm.rho_d[:, t_idx]
             drho_t = (atmos.rho_d[:, t_idx] - rho_crm_t.mean(dim=(-2, -1))).unsqueeze(-1).unsqueeze(-1)
             sub_crm_t = CRMState(
@@ -2049,7 +2213,7 @@ def step_aoba_model(
                 n_c=crm.n_c[:, t_idx] if crm.n_c is not None else None,
                 n_i=crm.n_i[:, t_idx] if crm.n_i is not None else None,
             )
-            sub_sfc_t = SurfaceFluxDiagnostics(**{k: v[t_idx] for k, v in sfc_diag_3d.items()})
+            sub_sfc_t = SurfaceFluxDiagnostics(**{k: _tile3d_to_crm3d(v[t_idx]) for k, v in sfc_diag_tile.items()})
             sp_t = step_crm_physics_and_dynamics(
                 crm=sub_crm_t,
                 vgrid=vgrid,
@@ -2066,8 +2230,8 @@ def step_aoba_model(
                 z_w_col=atmos.z_w[:, t_idx],
                 dz_c_col=atmos.dz_c[:, t_idx],
                 microphysics_scheme=cfg.microphysics_scheme,
-                is_ocean_sub=is_ocn_3d[t_idx],
-                u_sfc_sub=u_sfc_3d[t_idx],
+                is_ocean_sub=_tile3d_to_crm3d(is_ocn_tile[t_idx]),
+                u_sfc_sub=_tile3d_to_crm3d(u_sfc_tile[t_idx]),
                 q_dust_sub=q_dust_4d[:, t_idx] if q_dust_4d is not None else None,
             )
             crm.rho_d[:, t_idx] = sub_crm_t.rho_d
@@ -2111,14 +2275,13 @@ def step_aoba_model(
             du_crm_c[:, t_idx] = (u_t_post - u_host_new[:, t_idx]) / dt
             dv_crm_c[:, t_idx] = (v_t_post - v_host_new[:, t_idx]) / dt
             if sp_t.precip_rain_sub is not None and sp_t.precip_snow_sub is not None:
-                rain_3d[t_idx] = sp_t.precip_rain_sub
-                snow_3d[t_idx] = sp_t.precip_snow_sub
+                rain_3d[t_idx] = _crm3d_to_tile3d(sp_t.precip_rain_sub)
+                snow_3d[t_idx] = _crm3d_to_tile3d(sp_t.precip_snow_sub)
             else:
                 rain_3d[t_idx] = sp_t.precip_rain.unsqueeze(-1).unsqueeze(-1)
                 snow_3d[t_idx] = sp_t.precip_snow.unsqueeze(-1).unsqueeze(-1)
 
             # 7a-ii. Online self-distillation update from fresh teacher CRM + GPU replay buffer
-            # Extract exact subgrid cloud area fraction f_cld [nz, N_t] and precipitation fraction f_prec [N_t]
             f_cld_t = ((sub_crm_t.q_c + sub_crm_t.q_i) > 1.0e-6).to(atmos.q_n.dtype).mean(dim=(-2, -1))
             if sp_t.precip_rain_sub is not None and sp_t.precip_snow_sub is not None:
                 f_prec_t = ((sp_t.precip_rain_sub + sp_t.precip_snow_sub) > 1.0e-7).to(atmos.q_n.dtype).mean(dim=(-2, -1))
@@ -2134,7 +2297,8 @@ def step_aoba_model(
             )
             tgt_maps_t, has_map_t = (
                 extract_spatial_targets(
-                    sub_crm_t.q_c, sub_crm_t.q_i, rain_3d[t_idx], snow_3d[t_idx],
+                    _crm4d_to_tile4d(sub_crm_t.q_c), _crm4d_to_tile4d(sub_crm_t.q_i),
+                    rain_3d[t_idx], snow_3d[t_idx],
                     rho_pre_sd[:, t_idx] * atmos.dz_c[:, t_idx],
                 )
                 if sub_maps_all_sd is not None
@@ -2167,37 +2331,35 @@ def step_aoba_model(
             du_crm_c[:, s_idx] = (stu_out["u"] - u_host_new[:, s_idx]) / dt
             dv_crm_c[:, s_idx] = (stu_out["v"] - v_host_new[:, s_idx]) / dt
 
-            # Reconstruct exact mass-conserving clear/cloudy & dry/rainy subcolumn heterogeneity
-            # using learned periodic spatial placement scores (forest-locking, vegetation breeze, moist clusters)
+            # Reconstruct exact mass-conserving clear/cloudy & dry/rainy tile heterogeneity
             qn_4s, qp_4s, qv_4s, qc_4s, qi_4s, rain_3s, snow_3s = reconstruct_subgrid_heterogeneity(
                 stu_out["q_v"], stu_out["q_c"], stu_out["q_i"], stu_out["q_p"], stu_out["f_cld"],
                 stu_out["precip_rain"], stu_out["precip_snow"], stu_out["f_prec"],
-                s_idx, ny, nx, step_count=model.step_count,
+                s_idx, ny_t, nx_t, step_count=model.step_count,
                 score_cld=stu_out.get("score_cld"),
                 score_prec=stu_out.get("score_prec"),
             )
             rain_3d[s_idx] = rain_3s
             snow_3d[s_idx] = snow_3s
             crm.rho_d[:, s_idx] = atmos.rho_d[:, s_idx].unsqueeze(-1).unsqueeze(-1)
-            crm_thm_s = crm.theta_m[:, s_idx]
-            thm_s_new = stu_out["theta_m"].unsqueeze(-1).unsqueeze(-1) + 0.85 * (
-                crm_thm_s - crm_thm_s.mean(dim=(-2, -1), keepdim=True)
+            crm_thm_tile_s = _crm4d_to_tile4d(crm.theta_m[:, s_idx])
+            thm_t_new = stu_out["theta_m"].unsqueeze(-1).unsqueeze(-1) + 0.85 * (
+                crm_thm_tile_s - crm_thm_tile_s.mean(dim=(-2, -1), keepdim=True)
             )
-            # Inject exact zero-mean near-surface microclimate (T', q_v') from each tile's (SHF', evap')
             thm_0_mc, qv_0_mc = apply_subgrid_surface_microclimate(
-                thm_s_new[0], qv_4s[0],
+                thm_t_new[0], qv_4s[0],
                 rho_pre_sd[0, s_idx], atmos.dz_c[0, s_idx], exner_all_sd[0, s_idx],
-                sfc_diag_3d["shf"][s_idx], sfc_diag_3d["evap"][s_idx], dt,
+                sfc_diag_tile["shf"][s_idx], sfc_diag_tile["evap"][s_idx], dt,
             )
-            thm_s_new[0] = thm_0_mc
+            thm_t_new[0] = thm_0_mc
             qv_4s[0] = qv_0_mc
             qn_4s[0] = qv_0_mc + qc_4s[0] + qi_4s[0]
-            crm.theta_m[:, s_idx] = thm_s_new
-            crm.q_n[:, s_idx] = qn_4s
-            crm.q_p[:, s_idx] = qp_4s
-            crm.q_v[:, s_idx] = qv_4s
-            crm.q_c[:, s_idx] = qc_4s
-            crm.q_i[:, s_idx] = qi_4s
+            crm.theta_m[:, s_idx] = _tile4d_to_crm4d(thm_t_new)
+            crm.q_n[:, s_idx] = _tile4d_to_crm4d(qn_4s)
+            crm.q_p[:, s_idx] = _tile4d_to_crm4d(qp_4s)
+            crm.q_v[:, s_idx] = _tile4d_to_crm4d(qv_4s)
+            crm.q_c[:, s_idx] = _tile4d_to_crm4d(qc_4s)
+            crm.q_i[:, s_idx] = _tile4d_to_crm4d(qi_4s)
             crm_u_s = crm.u[:, s_idx]
             crm_v_s = crm.v[:, s_idx]
             crm.u[:, s_idx] = stu_out["u"].unsqueeze(-1).unsqueeze(-1) + 0.85 * (crm_u_s - crm_u_s.mean(dim=(-2, -1), keepdim=True))
@@ -2208,7 +2370,7 @@ def step_aoba_model(
             model.crm_distill.last_uncertainty[s_idx] = stu_unc
             model.crm_distill.teacher_frac_last = float(t_idx.numel()) / float(max(nc, 1))
             model.crm_distill.steps_seen += 1
-        elif chunk >= nc:
+        elif chunk >= nc and n_sub == n_crm:
             drho_mean = (atmos.rho_d - crm.rho_d.mean(dim=(-2, -1))).unsqueeze(-1).unsqueeze(-1)
             crm.rho_d = torch.clamp(crm.rho_d + drho_mean, min=1.0e-5)
             crm.f_coriolis = mesh.f_cell
@@ -2222,19 +2384,16 @@ def step_aoba_model(
                 tau_sp_mom=dt,
                 dtheta_m_ls_dt=dthm_ls,
                 dq_n_ls_dt=dqn_ls,
-                sfc_fluxes=SurfaceFluxDiagnostics(**sfc_diag_3d),
+                sfc_fluxes=SurfaceFluxDiagnostics(**sfc_diag_tile),
                 rad_heating_k_s=q_rad_4d,
                 z_c_col=atmos.z_c,
                 z_w_col=atmos.z_w,
                 dz_c_col=atmos.dz_c,
                 microphysics_scheme=cfg.microphysics_scheme,
-                is_ocean_sub=is_ocn_3d,
-                u_sfc_sub=u_sfc_3d,
+                is_ocean_sub=is_ocn_tile,
+                u_sfc_sub=u_sfc_tile,
                 q_dust_sub=q_dust_4d,
             )
-            # Sync mass-weighted CRM column mean (including hydrostatic rho_d adjustment!) back to host.
-            # Omitting atmos.rho_d here creates a thermodynamic ratchet when drho_mean lifts cooled mass
-            # back into high-theta upper levels on the next step (~+47 W m^-2 spurious stratospheric heating).
             rho_crm_mean = crm.rho_d.mean(dim=(-2, -1))
             inv_rho_crm = 1.0 / torch.clamp(rho_crm_mean, min=1.0e-5)
             atmos.rho_d = rho_crm_mean
@@ -2253,10 +2412,11 @@ def step_aoba_model(
                 rain_new_sub = _cell_to_sub(sp.precip_rain, nc, n_sub)
                 snow_new_sub = _cell_to_sub(sp.precip_snow, nc, n_sub)
         else:
-            rain_3d = rain_new_sub.reshape(nc, ny, nx)
-            snow_3d = snow_new_sub.reshape(nc, ny, nx)
-            for i0 in range(0, nc, chunk):
-                i1 = min(i0 + chunk, nc)
+            rain_3d = rain_new_sub.reshape(nc, ny_t, nx_t)
+            snow_3d = snow_new_sub.reshape(nc, ny_t, nx_t)
+            eff_chunk = min(chunk, max(1, 32768 // max(n_crm, 1))) if n_sub < n_crm else chunk
+            for i0 in range(0, nc, eff_chunk):
+                i1 = min(i0 + eff_chunk, nc)
                 sl = slice(i0, i1)
                 rho_crm_sl = crm.rho_d[:, sl]
                 drho_mean = (atmos.rho_d[:, sl] - rho_crm_sl.mean(dim=(-2, -1))).unsqueeze(-1).unsqueeze(-1)
@@ -2278,7 +2438,7 @@ def step_aoba_model(
                     n_c=crm.n_c[:, sl] if crm.n_c is not None else None,
                     n_i=crm.n_i[:, sl] if crm.n_i is not None else None,
                 )
-                sub_sfc = SurfaceFluxDiagnostics(**{k: v[sl] for k, v in sfc_diag_3d.items()})
+                sub_sfc = SurfaceFluxDiagnostics(**{k: _tile3d_to_crm3d(v[sl]) for k, v in sfc_diag_tile.items()})
                 sp = step_crm_physics_and_dynamics(
                     crm=sub_crm,
                     vgrid=vgrid,
@@ -2295,8 +2455,8 @@ def step_aoba_model(
                     z_w_col=atmos.z_w[:, sl],
                     dz_c_col=atmos.dz_c[:, sl],
                     microphysics_scheme=cfg.microphysics_scheme,
-                    is_ocean_sub=is_ocn_3d[sl],
-                    u_sfc_sub=u_sfc_3d[sl],
+                    is_ocean_sub=_tile3d_to_crm3d(is_ocn_tile[sl]),
+                    u_sfc_sub=_tile3d_to_crm3d(u_sfc_tile[sl]),
                     q_dust_sub=q_dust_4d[:, sl] if q_dust_4d is not None else None,
                 )
                 crm.rho_d[:, sl] = sub_crm.rho_d
@@ -2332,14 +2492,14 @@ def step_aoba_model(
                 du_crm_c[:, sl] = (sub_crm.u.mean(dim=(-2, -1)) - u_host_new[:, sl]) / dt
                 dv_crm_c[:, sl] = (sub_crm.v.mean(dim=(-2, -1)) - v_host_new[:, sl]) / dt
                 if sp.precip_rain_sub is not None and sp.precip_snow_sub is not None:
-                    rain_3d[sl] = sp.precip_rain_sub
-                    snow_3d[sl] = sp.precip_snow_sub
+                    rain_3d[sl] = _crm3d_to_tile3d(sp.precip_rain_sub)
+                    snow_3d[sl] = _crm3d_to_tile3d(sp.precip_snow_sub)
                 else:
                     rain_3d[sl] = sp.precip_rain.unsqueeze(-1).unsqueeze(-1)
                     snow_3d[sl] = sp.precip_snow.unsqueeze(-1).unsqueeze(-1)
 
         if use_distill and distill_sel is None and model.crm_distill is not None:
-            # Warmup phase: 100% genuine 2D CRM ran above; collect stratified teacher pairs and pre-train student
+            # Warmup phase: 100% genuine CRM ran above; collect stratified teacher pairs and pre-train student
             rain_cell_w = _sub_to_cell(rain_new_sub, nc, n_sub)
             snow_cell_w = _sub_to_cell(snow_new_sub, nc, n_sub)
             n_samp = min(nc, 2048)
@@ -2351,7 +2511,7 @@ def step_aoba_model(
             v_post_w = v_host_new[:, w_idx] + dt * dv_crm_c[:, w_idx]
             f_cld_w = ((crm.q_c[:, w_idx] + crm.q_i[:, w_idx]) > 1.0e-6).to(atmos.q_n.dtype).mean(dim=(-2, -1))
             f_prec_w = (
-                (rain_new_sub.reshape(nc, ny, nx)[w_idx] + snow_new_sub.reshape(nc, ny, nx)[w_idx]) > 1.0e-7
+                (rain_new_sub.reshape(nc, ny_t, nx_t)[w_idx] + snow_new_sub.reshape(nc, ny_t, nx_t)[w_idx]) > 1.0e-7
             ).to(atmos.q_n.dtype).mean(dim=(-2, -1))
             ctx_p_w, ctx_s_w, tgt_p_w, tgt_s_w = pack_teacher_context_and_targets(
                 rho_pre_sd[:, w_idx], atmos.dz_c[:, w_idx], exner_all_sd[:, w_idx], temp_all_sd[0, w_idx],
@@ -2364,9 +2524,9 @@ def step_aoba_model(
             )
             tgt_maps_w, has_map_w = (
                 extract_spatial_targets(
-                    crm.q_c[:, w_idx], crm.q_i[:, w_idx],
-                    rain_new_sub.reshape(nc, ny, nx)[w_idx],
-                    snow_new_sub.reshape(nc, ny, nx)[w_idx],
+                    _crm4d_to_tile4d(crm.q_c[:, w_idx]), _crm4d_to_tile4d(crm.q_i[:, w_idx]),
+                    rain_new_sub.reshape(nc, ny_t, nx_t)[w_idx],
+                    snow_new_sub.reshape(nc, ny_t, nx_t)[w_idx],
                     rho_pre_sd[:, w_idx] * atmos.dz_c[:, w_idx],
                 )
                 if sub_maps_all_sd is not None
@@ -2383,10 +2543,8 @@ def step_aoba_model(
 
         du_sp_edge = project_cell_vectors_to_edges(mesh, du_crm_c, dv_crm_c)
         atmos.u_edge = atmos.u_edge + dt * du_sp_edge
-        # Diagnose net 1:1 CRM convective diabatic heating [K s^-1] (excluding radiative heating)
-        # for map-free Beres et al. (2004, 2005) convective gravity-wave source parameterization
         _, pi_post_crm, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
-        q_rad_cell = _sub_to_cell(q_rad_sub, nc, n_sub)
+        q_rad_cell = _sub_to_cell(q_rad_sub, nc, n_crm)
         model.q_conv_diag = torch.clamp(((atmos.theta_m - thm_before_crm) / dt) * pi_post_crm - q_rad_cell, min=0.0)
 
     rain_new = _sub_to_cell(rain_new_sub, nc, n_sub)
@@ -2422,7 +2580,7 @@ def step_aoba_model(
             w_liq_soil_top=sfc_sub.w_liq_soil[0],
             w_ice_soil_top=sfc_sub.w_ice_soil[0],
             u_star=sfc_diag_sub.u_star,
-            rho_atm=rho_sub[0] * (1.0 + qv_sub[0]),
+            rho_atm=rho_sub_0 * (1.0 + qv_sub_0),
             z0m=sfc_diag_sub.z0m,
             d_disp=sfc_diag_sub.d_disp,
             dust_emis_factor=cfg.dust_emis_factor,
@@ -2465,9 +2623,9 @@ def step_aoba_model(
     model.last_s_toa = s_toa
 
     # 8. Subgrid Solar Noon EEO Acclimation, Daily LAI/Root Phenology, Host Sync, & Monthly Köppen
-    rho_post_0 = crm.rho_d[0].reshape(m_sub)
-    thm_post_0 = crm.theta_m[0].reshape(m_sub)
-    qv_post_0 = crm.q_v[0].reshape(m_sub)
+    rho_post_0 = _crm_to_sfc_tile(crm.rho_d[0].reshape(m_crm), nc, n_sub, n_crm)
+    thm_post_0 = _crm_to_sfc_tile(crm.theta_m[0].reshape(m_crm), nc, n_sub, n_crm)
+    qv_post_0 = _crm_to_sfc_tile(crm.q_v[0].reshape(m_crm), nc, n_sub, n_crm)
     post_accum_fn = maybe_cuda_compile(_coupled_post_crm_accum_core, device=rho_post_0.device)
     (
         t_air_sub, pres_sfc_post_sub, vpd_sub,
@@ -2556,12 +2714,12 @@ def step_aoba_model(
                 vcmax25_eff=vc25_eff_sub,
                 f_evg=sfc_sub.bio.f_evg,
                 transp_kgm2s=torch.clamp(sfc_diag_sub.evap, min=0.0),
-                n_dep_kgn_m2s=light_diag.n_dep_lnox_sub.reshape(m_sub) if light_diag is not None else None,
-                flash_cg_m2s=light_diag.flash_cg_sub.reshape(m_sub) if light_diag is not None else None,
+                n_dep_kgn_m2s=_crm_to_sfc_tile(light_diag.n_dep_lnox_sub.reshape(m_crm), nc, n_sub, n_crm) if light_diag is not None else None,
+                flash_cg_m2s=_crm_to_sfc_tile(light_diag.flash_cg_sub.reshape(m_crm), nc, n_sub, n_crm) if light_diag is not None else None,
                 bio=sfc_sub.bio,
                 enable_fire_veg_feedback=bool(cfg.enable_fire_veg_feedback),
-                maml_shape=(nc, ny, nx),
-                crm_dx_m=float(cfg.crm_dx),
+                maml_shape=(nc, ny_t, nx_t),
+                crm_dx_m=float(cfg.crm_dx) * float(tile_block),
             )
             # Mirror updated MAML LAI / canopy height / N availability back to host summary
             sfc.bio.lai = _sub_to_cell(sfc_sub.bio.lai, nc, n_sub)

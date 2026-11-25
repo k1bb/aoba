@@ -836,17 +836,22 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
     model.crm.dy = float(model.cfg.crm_dx)
 
     # 3. Surface states (`sfc`, `sfc_sub`, `ocn_sfc`)
+    from aoba.coupled_model import resolve_crm_sfc_tiles
+
+    n_sfc_new = resolve_crm_sfc_tiles(model.cfg)
     _restore_surface(model.sfc, ckpt["sfc"], device, h_idx=atm_h_idx, n_old=nc_old)
     if model.sfc_sub is not None:
         if ckpt.get("sfc_sub") is not None:
+            ck_sfc_sub = ckpt["sfc_sub"]
+            n_sfc_old = max(int(ck_sfc_sub["t_canopy"].shape[-1]) // max(nc_old, 1), 1)
             _restore_surface(
                 model.sfc_sub,
-                ckpt["sfc_sub"],
+                ck_sfc_sub,
                 device,
                 h_idx=atm_h_idx,
                 n_old=nc_old,
-                n_sub_old=n_sub_old,
-                n_sub_new=n_sub_new,
+                n_sub_old=n_sfc_old,
+                n_sub_new=n_sfc_new,
             )
         else:
             _restore_surface(
@@ -856,7 +861,7 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
                 h_idx=atm_h_idx,
                 n_old=nc_old,
                 n_sub_old=1,
-                n_sub_new=n_sub_new,
+                n_sub_new=n_sfc_new,
             )
 
     # Build ocean horizontal remap index when ocean mesh changed (or transitioning from unified -> high-res ocean)
