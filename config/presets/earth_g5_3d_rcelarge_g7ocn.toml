@@ -1,7 +1,7 @@
 # =============================================================================
 # AOBA Coupled Earth System Model — Unified Configuration & Parameter Registry
 # High-Top G5 Atmosphere + 3D RCE_large (16x64 @ 4 km) CRM + G7 28 km OGCM
-# with Prognostic Ozone, RRTMGP + 3D TICA, 2-Moment Microphysics, and Paired
+# with Prognostic Ozone, RRTMGP + 3D TICA, 6-Class 2M Microphysics, and Paired
 # Online CRM + ICA Radiation Self-Distillation.
 # =============================================================================
 
@@ -56,7 +56,7 @@ enable_superparam = true
 crm_sfc_tiles = 16
 enable_crm_self_distill = true
 enable_rad_self_distill = true
-crm_distill_stride = 160
+crm_distill_stride = 325
 crm_distill_warmup_steps = 24
 crm_distill_dwell_steps = 240
 crm_distill_hidden_dim = 256
@@ -67,6 +67,7 @@ h_ml_ocean = 15.0
 ocean_mode = "ogcm_3d"
 ocean_glevel = 7
 ocean_nz = 36
+ocean_stride = 3
 enable_seaice_drift = true
 enable_ocean_bgc = false
 enable_river_routing = true
@@ -121,7 +122,7 @@ milankovitch_accel_factor = 1.0
 re_liq_um = 10.0
 re_ice_um = 48.0
 cloud_sw_inhomog = 0.62
-microphysics_scheme = "two_moment"
+microphysics_scheme = "six_class_2m"
 
 # --- Dynamic Equilibrium / Accelerated SIA Ice-Sheet Options ---
 [icesheet]

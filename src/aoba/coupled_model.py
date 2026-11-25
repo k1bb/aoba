@@ -98,6 +98,7 @@ class AOBAConfig:
     ocean_mode: str = "ogcm_3d"              # Ocean model: "ogcm_3d" (3D multi-layer OGCM) or "ekman_sw" (1.5-layer shallow-water)
     ocean_glevel: int = 0                    # Independent ocean SCVT glevel (0 = share host glevel; >0 = e.g. G6/G7/G8 high-res OGCM)
     ocean_nz: int = 18                       # Vertical z-levels when ocean_mode="ogcm_3d" (0..6000 m)
+    ocean_stride: int = 1                    # Conservative async 3D OGCM coupling interval [host steps] (1=every step, 2-3=faster)
     enable_seaice_drift: bool = True         # Enable dynamic wind/current sea-ice drift in 3D OGCM mode
     enable_ocean_bgc: bool = True            # FlexPFT marine biogeochemistry & OMIP/mocsy 2.0 carbonate chemistry
     enable_river_routing: bool = True        # Map-free Priority-Flood Voronoi river routing
@@ -270,6 +271,7 @@ class AOBAState:
     crm_distill: object | None = None                        # Optional online self-distilling 2D/3D CRM controller
     rad_distill: object | None = None                        # Optional online per-subcolumn ICA radiation controller
     sparse_crm_pool: object | None = None                    # Teacher-only full-3D CRM pool (when n_sub < n_crm in 3D)
+    ocn_flux_accum: dict[str, object] = field(default_factory=dict)  # Conservative flux accumulator for ocean_stride > 1
 
     def current_co2_ppmv(self, sim_time_sec: float | None = None) -> float:
         """Return active atmospheric CO2 [ppmv] at ``sim_time_sec`` (or ``self.sim_time_sec``)."""
@@ -2207,51 +2209,108 @@ def step_aoba_model(
                 m_ice_cell_before - m_ice_pre_sfc,
                 swe_ice_cell_before - swe_ice_pre_sfc,
             )
-            tau_x_ocn = atm_to_ocn_intensive(coupler, tau_x_ocn)
-            tau_y_ocn = atm_to_ocn_intensive(coupler, tau_y_ocn)
-            f_ice_ocn = atm_to_ocn_intensive(coupler, f_ice_ocn)
-            evap_ocn = atm_to_ocn_intensive(coupler, evap_ocn)
-            precip_ocn = atm_to_ocn_intensive(coupler, precip_ocn)
-            sw_net_ocn = atm_to_ocn_intensive(coupler, sw_net_ocn)
-            if sw_par_ocn is not None:
-                sw_par_ocn = atm_to_ocn_intensive(coupler, sw_par_ocn)
-            if u10_ocn is not None:
-                u10_ocn = atm_to_ocn_intensive(coupler, u10_ocn)
-            runoff_tot_ocn = atm_to_ocn_conservative_flux(coupler, runoff_tot_cell, ocean_only_source=False)
-            runoff_ice_ocn = atm_to_ocn_conservative_flux(coupler, runoff_ice_cell, ocean_only_source=False)
-            if river_mouth_flux is not None:
-                river_mouth_ocn = atm_to_ocn_conservative_flux(coupler, river_mouth_flux, ocean_only_source=True)
 
-        step_ogcm_voronoi(
-            ogcm=model.ogcm,
-            sfc=active_ocn_sfc,
-            mesh=active_ocn_mesh,
-            tau_x_sfc=tau_x_ocn,
-            tau_y_sfc=tau_y_ocn,
-            f_seaice=f_ice_ocn,
-            evap_cell=evap_ocn,
-            precip_cell=precip_ocn,
-            runoff_total=runoff_tot_ocn,
-            runoff_glacier=runoff_ice_ocn,
-            dt=dt,
-            enable_seaice_drift=bool(cfg.enable_seaice_drift),
-            sw_net_ocn=sw_net_ocn,
-            sw_par_ocn=sw_par_ocn,
-            u10_ocn=u10_ocn,
-            co2_ppmv=model.current_co2_ppmv(),
-            river_mouth_flux=river_mouth_ocn,
-            enable_fct_zstar=bool(cfg.enable_ogcm_fct_zstar),
-            enable_scale_aware_gm=bool(cfg.enable_ogcm_scale_aware_gm),
-            enable_submeso=bool(cfg.enable_ogcm_submeso),
-            enable_tidal_mixing=bool(cfg.enable_ogcm_tidal_mixing),
-            enable_o2_omz=bool(cfg.enable_ocean_o2_omz),
-            langmuir_fac=langmuir_ocn,
-        )
-        if has_indep_ocn:
-            sfc.t_ocean_ml = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.t_ocean_ml, fallback_atm=sfc.t_ocean_ml)
-            sfc.m_seaice = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.m_seaice, fallback_atm=sfc.m_seaice)
-            sfc.swe_seaice = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.swe_seaice, fallback_atm=sfc.swe_seaice)
-            sfc.h_ocean_ml = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.h_ocean_ml, fallback_atm=sfc.h_ocean_ml)
+        ocn_stride = max(int(getattr(cfg, "ocean_stride", 1)), 1)
+        if ocn_stride > 1:
+            acc = model.ocn_flux_accum
+            cur_cnt = int(acc.get("count", 0))
+            flux_bundle: dict[str, torch.Tensor | None] = {
+                "tau_x": tau_x_ocn,
+                "tau_y": tau_y_ocn,
+                "f_ice": f_ice_ocn,
+                "evap": evap_ocn,
+                "precip": precip_ocn,
+                "sw_net": sw_net_ocn,
+                "runoff_tot": runoff_tot_ocn,
+                "runoff_ice": runoff_ice_ocn,
+                "river_mouth": river_mouth_ocn,
+                "sw_par": sw_par_ocn,
+                "u10": u10_ocn,
+                "langmuir": langmuir_ocn,
+            }
+            if cur_cnt == 0:
+                for fk, fv in flux_bundle.items():
+                    acc[fk] = fv.clone() if fv is not None else None
+            else:
+                for fk, fv in flux_bundle.items():
+                    if fv is not None:
+                        prev_v = acc.get(fk)
+                        acc[fk] = (prev_v + fv) if isinstance(prev_v, torch.Tensor) else fv.clone()
+            cur_cnt += 1
+            acc["count"] = cur_cnt
+            do_step_ogcm = cur_cnt >= ocn_stride
+            if do_step_ogcm:
+                inv_cnt = 1.0 / float(cur_cnt)
+                tau_x_ocn = acc["tau_x"] * inv_cnt  # type: ignore[operator]
+                tau_y_ocn = acc["tau_y"] * inv_cnt  # type: ignore[operator]
+                f_ice_ocn = acc["f_ice"] * inv_cnt  # type: ignore[operator]
+                evap_ocn = acc["evap"] * inv_cnt    # type: ignore[operator]
+                precip_ocn = acc["precip"] * inv_cnt  # type: ignore[operator]
+                sw_net_ocn = acc["sw_net"] * inv_cnt  # type: ignore[operator]
+                runoff_tot_ocn = acc["runoff_tot"] * inv_cnt  # type: ignore[operator]
+                runoff_ice_ocn = acc["runoff_ice"] * inv_cnt  # type: ignore[operator]
+                river_mouth_ocn = (acc["river_mouth"] * inv_cnt) if isinstance(acc.get("river_mouth"), torch.Tensor) else None
+                sw_par_ocn = (acc["sw_par"] * inv_cnt) if isinstance(acc.get("sw_par"), torch.Tensor) else None
+                u10_ocn = (acc["u10"] * inv_cnt) if isinstance(acc.get("u10"), torch.Tensor) else None
+                langmuir_use = (acc["langmuir"] * inv_cnt) if isinstance(acc.get("langmuir"), torch.Tensor) else None
+                dt_ocn = dt * float(cur_cnt)
+                acc.clear()
+                acc["count"] = 0
+            else:
+                dt_ocn = dt
+                langmuir_use = langmuir_ocn
+        else:
+            do_step_ogcm = True
+            dt_ocn = dt
+            langmuir_use = langmuir_ocn
+
+        if do_step_ogcm:
+            if has_indep_ocn:
+                tau_x_ocn = atm_to_ocn_intensive(coupler, tau_x_ocn)
+                tau_y_ocn = atm_to_ocn_intensive(coupler, tau_y_ocn)
+                f_ice_ocn = atm_to_ocn_intensive(coupler, f_ice_ocn)
+                evap_ocn = atm_to_ocn_intensive(coupler, evap_ocn)
+                precip_ocn = atm_to_ocn_intensive(coupler, precip_ocn)
+                sw_net_ocn = atm_to_ocn_intensive(coupler, sw_net_ocn)
+                if sw_par_ocn is not None:
+                    sw_par_ocn = atm_to_ocn_intensive(coupler, sw_par_ocn)
+                if u10_ocn is not None:
+                    u10_ocn = atm_to_ocn_intensive(coupler, u10_ocn)
+                runoff_tot_ocn = atm_to_ocn_conservative_flux(coupler, runoff_tot_ocn, ocean_only_source=False)
+                runoff_ice_ocn = atm_to_ocn_conservative_flux(coupler, runoff_ice_ocn, ocean_only_source=False)
+                if river_mouth_ocn is not None:
+                    river_mouth_ocn = atm_to_ocn_conservative_flux(coupler, river_mouth_ocn, ocean_only_source=True)
+
+            step_ogcm_voronoi(
+                ogcm=model.ogcm,
+                sfc=active_ocn_sfc,
+                mesh=active_ocn_mesh,
+                tau_x_sfc=tau_x_ocn,
+                tau_y_sfc=tau_y_ocn,
+                f_seaice=f_ice_ocn,
+                evap_cell=evap_ocn,
+                precip_cell=precip_ocn,
+                runoff_total=runoff_tot_ocn,
+                runoff_glacier=runoff_ice_ocn,
+                dt=dt_ocn,
+                enable_seaice_drift=bool(cfg.enable_seaice_drift),
+                sw_net_ocn=sw_net_ocn,
+                sw_par_ocn=sw_par_ocn,
+                u10_ocn=u10_ocn,
+                co2_ppmv=model.current_co2_ppmv(),
+                river_mouth_flux=river_mouth_ocn,
+                enable_fct_zstar=bool(cfg.enable_ogcm_fct_zstar),
+                enable_scale_aware_gm=bool(cfg.enable_ogcm_scale_aware_gm),
+                enable_submeso=bool(cfg.enable_ogcm_submeso),
+                enable_tidal_mixing=bool(cfg.enable_ogcm_tidal_mixing),
+                enable_o2_omz=bool(cfg.enable_ocean_o2_omz),
+                langmuir_fac=langmuir_use,
+            )
+            if has_indep_ocn:
+                sfc.t_ocean_ml = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.t_ocean_ml, fallback_atm=sfc.t_ocean_ml)
+                sfc.m_seaice = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.m_seaice, fallback_atm=sfc.m_seaice)
+                sfc.swe_seaice = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.swe_seaice, fallback_atm=sfc.swe_seaice)
+                sfc.h_ocean_ml = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.h_ocean_ml, fallback_atm=sfc.h_ocean_ml)
     else:
         if bool(cfg.enable_river_routing) and bool(cfg.enable_dynamic_lakes) and model.lakes is not None:
             from aoba.river_routing import init_river_routing_state, step_river_routing_voronoi

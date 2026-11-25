@@ -238,6 +238,10 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "ja": "3D OGCM の鉛直層数 [-]（既定 18 層、表層〜深海 5000 m）。",
         "en": "Number of vertical depth layers [-] in the 3D OGCM (default 18 layers spanning surface to abyss).",
     },
+    "ocean_stride": {
+        "ja": "3D OGCM 力学・トレーサー更新の非同期結合間隔 [大気ステップ数]（既定 1＝毎ステップ、2〜3 で大気→海洋フラックスを厳密時間平均して dt_ocn = dt_host × ocean_stride で更新し海洋コストを 1/ocean_stride に削減）。",
+        "en": "Conservative asynchronous 3D OGCM coupling interval [host steps] (default 1; values 2-3 strictly time-average atmosphere-to-ocean heat/water/salt/momentum fluxes and advance the 3D OGCM with dt_ocn = dt_host * ocean_stride).",
+    },
     "enable_seaice_drift": {
         "ja": "風応力・海流による海氷の水平力学移流（漂流）を有効化する。",
         "en": "Enable wind- and current-driven horizontal sea-ice dynamical drift.",

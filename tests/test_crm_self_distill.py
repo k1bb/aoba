@@ -483,6 +483,79 @@ def test_sparse_3d_crm_pool_slot_preservation_and_coupled_tica() -> None:
         )
 
 
+def test_ogcm_gpu_fused_parity_and_async_ocean_stride() -> None:
+    """Verify fused GPU 3D OGCM CPU-vs-GPU parity and conservative ocean_stride=3 with six_class_2m."""
+    from aoba.ocean_ogcm import init_ogcm_state, step_ogcm_voronoi
+    from aoba.scvt_mesh import build_scvt_mesh
+    from aoba.surface import init_surface_state
+
+    has_gpu = torch.backends.mps.is_available() or torch.cuda.is_available()
+    gpu_dev = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+
+    def _run_ogcm(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        torch.manual_seed(42)
+        mesh = build_scvt_mesh(glevel=2, n_lloyd_iter=4, use_earth2014=False, device=dev)
+        is_land = (mesh.lat_cell > 0.2) & (mesh.lat_cell < 0.8) & (mesh.lon_cell > 0.0) & (mesh.lon_cell < 1.2)
+        mesh.surf_type = torch.where(is_land, torch.ones_like(mesh.surf_type), torch.zeros_like(mesh.surf_type))
+        mesh.z_topo = torch.where(is_land, torch.full_like(mesh.z_topo, 500.0), torch.full_like(mesh.z_topo, -4000.0))
+        sfc = init_surface_state(mesh.surf_type, z_topo=mesh.z_topo, t_init=290.0, h_ml_ocean=15.0)
+        sfc.t_ocean_ml = 295.0 - 20.0 * (torch.sin(mesh.lat_cell) ** 2)
+        ogcm = init_ogcm_state(sfc, mesh, nz_ocn=12)
+        ogcm.u_edge = 0.2 * torch.sin(mesh.lat_cell[mesh.cells_on_edge[:, 0]]).unsqueeze(0).expand_as(ogcm.u_edge).clone() * ogcm.wet_e.float()
+        tau_x = 0.08 * torch.cos(3.0 * mesh.lat_cell)
+        tau_y = 0.03 * torch.sin(2.0 * mesh.lon_cell)
+        z0 = torch.zeros_like(tau_x)
+        evap = torch.full_like(tau_x, 3.0e-5)
+        precip = torch.full_like(tau_x, 3.0e-5)
+        sw_net = torch.clamp(200.0 * torch.cos(mesh.lat_cell), min=0.0)
+        for _ in range(3):
+            step_ogcm_voronoi(
+                ogcm=ogcm, sfc=sfc, mesh=mesh,
+                tau_x_sfc=tau_x, tau_y_sfc=tau_y, f_seaice=z0,
+                evap_cell=evap, precip_cell=precip, runoff_total=z0, runoff_glacier=z0,
+                dt=1440.0, sw_net_ocn=sw_net,
+                enable_fct_zstar=True, enable_scale_aware_gm=True,
+                enable_submeso=True, enable_tidal_mixing=True,
+            )
+        return ogcm.temp.cpu(), ogcm.sal.cpu(), ogcm.u_edge.cpu()
+
+    if has_gpu:
+        t_c, s_c, u_c = _run_ogcm(torch.device("cpu"))
+        t_g, s_g, u_g = _run_ogcm(gpu_dev)
+        rel_t = float((t_c - t_g).abs().max() / t_c.abs().max())
+        err_s = float((s_c - s_g).abs().max())
+        err_u = float((u_c - u_g).abs().max())
+        assert rel_t < 1.0e-5 and err_s < 1.0e-4 and err_u < 1.0e-4, (
+            f"OGCM GPU parity failed: rel_T={rel_t:.2e}, dS={err_s:.2e}, du={err_u:.2e}"
+        )
+
+    # Coupled conservative ocean_stride=3 with 3D 8x8 + six_class_2m + SparseCRMPool
+    cfg = AOBAConfig(
+        glevel=1, nz=16, z_top=30000.0, z_sponge_base=24000.0,
+        crm_ny=8, crm_nx=8, crm_dx=4000.0, crm_sfc_tiles=16,
+        dt_host=720.0, n_host_dyn_substeps=1, n_crm_dyn_substeps=4,
+        rad_stride=2, rad_scheme="four_band", enable_rad_3d_tica=True,
+        o3_mode="prognostic", microphysics_scheme="six_class_2m",
+        ocean_mode="ogcm_3d", ocean_nz=8, ocean_stride=3,
+        use_earth2014=False, enable_dust=False, enable_natural_aerosols=False,
+        enable_land_carbon=False, enable_ocean_bgc=False, enable_river_routing=False,
+        enable_crm_self_distill=True, enable_rad_self_distill=True,
+        crm_distill_stride=8, crm_distill_warmup_steps=3, crm_distill_dwell_steps=48,
+        crm_distill_hidden_dim=48, crm_distill_replay_size=2048,
+    )
+    m = init_aoba_model(cfg, device=gpu_dev)
+    for _ in range(6):
+        d = step_aoba_model(m)
+    assert int(m.ocn_flux_accum.get("count", 0)) == 0
+    assert torch.isfinite(m.atmos.theta_m).all()
+    assert m.ogcm is not None and torch.isfinite(m.ogcm.temp).all()
+    assert m.sparse_crm_pool is not None and m.sparse_crm_pool.crm.q_r is not None
+    print(
+        f"  [PASS] Fused GPU OGCM parity + conservative ocean_stride=3 + 3D 8x8 six_class_2m ({gpu_dev}): "
+        f"Ts={d.global_mean_t_sfc_k:.2f}K OLR={d.global_mean_olr_wm2:.1f}"
+    )
+
+
 if __name__ == "__main__":
     test_exact_column_conservation_closure()
     print("  [PASS] Exact column conservation closure (water, enthalpy, momentum, non-negativity)")
@@ -497,4 +570,5 @@ if __name__ == "__main__":
     test_2d_isotropic_surface_tile_grid_and_kronecker_ops()
     print("  [PASS] General 2D isotropic surface-tile grid & exact Kronecker block avg/expand")
     test_sparse_3d_crm_pool_slot_preservation_and_coupled_tica()
+    test_ogcm_gpu_fused_parity_and_async_ocean_stride()
     print("ALL CRM + RADIATION SELF-DISTILLATION TESTS PASSED!")

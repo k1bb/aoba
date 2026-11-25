@@ -47,6 +47,7 @@ from aoba.kernels_physics import (
     run_ngwd_propagate_metal,
     run_ocean_bgc_column_metal,
     run_ogcm_barotropic_rk3_metal,
+    run_ogcm_fct_zstar_metal,
     run_oro_gwd_metal,
     run_rad_ckd_metal,
     run_rad_four_band_metal,
@@ -1175,6 +1176,30 @@ def dispatch_ogcm_barotropic_rk3_metal(**kwargs: Any) -> tuple[torch.Tensor, tor
     lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_ogcm_barotropic_rk3_metal(lib, **kwargs)
+
+
+def dispatch_ogcm_fct_zstar_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_ogcm_fct_zstar_metal(lib, **kwargs)
+
+
+def dispatch_scvt_weighted_edge_sum_metal(
+    mesh: Any,
+    edge_field: torch.Tensor,
+    weights_cell: torch.Tensor,
+) -> torch.Tensor:
+    """Compute `(edge_field[:, eoc] * weights_cell).sum(dim=-1)` via fused `scvt_div_cell`."""
+    lib = _get_gpu_lib(edge_field.device)
+    assert lib is not None
+    mc = _get_scvt_mesh_cache(mesh)
+    nz = int(edge_field.shape[0])
+    nc = int(mc["n_cells"])
+    ne = int(mc["n_edges"])
+    out = torch.empty((nz, nc), device=edge_field.device, dtype=edge_field.dtype)
+    up = torch.tensor([nz, nc, ne], device=edge_field.device, dtype=torch.uint32)
+    lib.scvt_div_cell(mc["eoc"], weights_cell.contiguous(), edge_field.contiguous(), out, up, threads=nz * nc)
+    return out
 
 
 def dispatch_ocean_bgc_column_metal(**kwargs: Any):

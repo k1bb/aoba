@@ -1,0 +1,369 @@
+# =============================================================================
+# AOBA Coupled Earth System Model — Unified Configuration & Parameter Registry
+# High-Top G5 Atmosphere + 3D 8x8 @ 4 km CRM (Baseline) + G7 28 km 36-lvl OGCM
+# with Prognostic Ozone, RRTMGP + 3D TICA, 6-Class 2M Microphysics, and Paired
+# Online CRM + ICA Radiation Self-Distillation.
+# =============================================================================
+
+# --- Horizontal, Vertical & Subgrid CRM Mesh Settings ---
+[grid]
+glevel = 5
+nz = 56
+z_top = 65000.0
+dz_min = 60.0
+z_sponge_base = 52000.0
+tau_sponge_min = 300.0
+terrain_scale_exp = 1.5
+crm_nx = 8
+crm_ny = 8
+crm_dx = 4000.0
+dt_host = 720.0
+n_host_dyn_substeps = 1
+n_crm_dyn_substeps = 12
+rad_stride = 5
+crm_col_chunk = 512
+rad_col_chunk = 32768
+
+# --- Planetary Boundary, Orbital & Atmospheric Forcing ---
+[forcing]
+co2_ppmv = 284.3
+co2_mode = "constant"
+co2_scenario = "obs_historical_noaa"
+co2_csv_path = ""
+ch4_ppmv = 0.80825
+n2o_ppmv = 0.27302
+rad_scheme = "rrtmgp"
+enable_rad_3d_tica = true
+o3_mode = "prognostic"
+o3_file_path = ""
+o3_lw_coupling = true
+o3_ecl_ppbv = 0.55
+enable_nonoro_gwd = true
+solar_constant = 1361.0
+omega = 7.292115e-05
+obliquity_deg = 23.44
+eccentricity = 0.0167
+perihelion_deg = 283.0
+start_date = "2000-03-20"
+calendar_type = "gregorian"
+insolation_mode = "seasonal"
+fixed_insolation_date = "2000-03-20"
+diurnal_cycle = true
+use_earth2014 = true
+earth2014_dir = "data/boundary/earth2014_5min"
+earth2014_stride = 2
+enable_superparam = true
+crm_sfc_tiles = 16
+enable_crm_self_distill = true
+enable_rad_self_distill = true
+crm_distill_stride = 325
+crm_distill_warmup_steps = 24
+crm_distill_dwell_steps = 240
+crm_distill_hidden_dim = 256
+crm_distill_replay_size = 65536
+enable_dust = false
+dust_emis_factor = 2.5e-06
+h_ml_ocean = 15.0
+ocean_mode = "ogcm_3d"
+ocean_glevel = 7
+ocean_nz = 36
+ocean_stride = 3
+enable_seaice_drift = true
+enable_ocean_bgc = false
+enable_river_routing = true
+enable_land_carbon = false
+enable_land_nitrogen = false
+enable_lightning = false
+enable_fire_veg_feedback = false
+enable_seaice_evp_itd = true
+enable_ogcm_fct_zstar = true
+enable_ogcm_scale_aware_gm = true
+enable_ogcm_submeso = true
+enable_ogcm_tidal_mixing = true
+enable_current_rel_wind = true
+enable_natural_aerosols = false
+enable_aerosol_rad_forcing = false
+enable_snow_bc_darkening = false
+enable_bgc_fe_lnox_coupling = false
+enable_bvoc_soa = false
+enable_prognostic_ch4_n2o = false
+enable_silicate_weathering = false
+enable_co2_3d_transport = false
+co2_anthro_pgc_yr = 0.0
+enable_ocean_o2_omz = false
+enable_volcanic_aerosols = false
+volcanic_eruption_year = -1.0
+volcanic_so2_tg = 0.0
+volcanic_eruption_lat_deg = 15.0
+volcanic_eruption_width_deg = 15.0
+sai_so2_tg_yr = 0.0
+sai_lat_band_deg = 20.0
+enable_solar_cycle = false
+solar_cycle_amp_wm2 = 1.0
+solar_cycle_period_yr = 11.0
+solar_cycle_phase_yr = 0.0
+volcanic_co2_pgc_yr = 0.03
+enable_maml_subgrid_topo = false
+enable_maml_wetlands_lakes = false
+enable_dynamic_lakes = false
+lake_init_fill_frac = 0.5
+lake_max_frac = 0.85
+lake_max_depth_m = 400.0
+lake_extinction_m1 = 0.5
+enable_wave_coupling = false
+enable_water_isotopes = false
+planet_preset = "earth"
+enable_tidal_lock = false
+substellar_lon_deg = 0.0
+weathering_accel_factor = 1.0
+enable_milankovitch_orbit = false
+milankovitch_start_kyr = 0.0
+milankovitch_accel_factor = 1.0
+re_liq_um = 10.0
+re_ice_um = 48.0
+cloud_sw_inhomog = 0.62
+microphysics_scheme = "six_class_2m"
+
+# --- Dynamic Equilibrium / Accelerated SIA Ice-Sheet Options ---
+[icesheet]
+enable_dynamic_icesheet = false
+icesheet_ema_years = 5.0
+icesheet_accel_factor = 100.0
+icesheet_accel_spinup_years = 0.0
+icesheet_isostasy_tau_yr = 1000.0
+
+# --- Output Files, Time Intervals (Mean vs Instantaneous) & Restart ---
+[output]
+out_dir = ""
+years = 5
+end_date = ""
+days_per_year = 365.2425
+zarr_dir_partition = "yearly"
+daily_csv_enabled = true
+daily_csv_interval_days = 1.0
+monthly_mean_enabled = true
+monthly_mean_periods_per_year = 12
+monthly_mean_sample_hours = 6.0
+monthly_mean_include_2d = true
+monthly_mean_include_3d = true
+monthly_mean_include_subgrid_2d = false
+snapshots_enabled = true
+snapshots_periods_per_year = 12
+snapshots_include_2d = true
+snapshots_include_3d = true
+snapshots_include_subgrid_2d = false
+restart_interval_years = 1
+restart_monthly = true
+cmip7_output_enabled = false
+cmip7_include_plev19 = true
+cmip7_include_ocean_3d = true
+
+# --- Fundamental Physical & Planetary Constants ---
+[constants]
+earth_radius = 6371000.0
+gravity = 9.79764
+omega_earth = 7.292115e-05
+seconds_per_day = 86400.0
+days_per_year = 365.2425
+r_d = 287.04
+cp_d = 1004.64
+r_v = 461.5
+cp_v = 1846.0
+p_ref = 100000.0
+t_freeze = 273.15
+t_triple = 273.16
+e_triple = 611.2
+l_v0 = 2501000.0
+l_f0 = 3337000.0
+t_ice_all = 253.15
+t_liq_all = 273.16
+stefan_boltzmann = 5.670374419e-08
+von_karman = 0.4
+rho_seawater = 1025.0
+cp_seawater = 3990.0
+t_freeze_ocean = 271.35
+rho_seaice = 917.0
+k_therm_seaice = 2.034
+k_therm_snow = 0.3096
+o2_mixing_ratio = 0.20946
+
+# --- 4-Band Analytic Two-Stream Radiation Parameters ---
+[radiation]
+solar_frac_sw1 = 0.45976
+lw_window_frac = 0.32
+o3_g1 = 3.6478
+o3_g2 = 0.83209
+o3_g3 = 11.3515
+par_frac_of_sw1 = 0.88
+umol_per_joule_par = 4.57
+
+# --- KR03 1-Moment Mixed-Phase Cloud Microphysics Parameters ---
+[microphysics]
+rho_rain = 1000.0
+rho_snow = 100.0
+rho_graupel = 400.0
+n0_rain = 8000000.0
+n0_snow = 3000000.0
+n0_graupel = 4000000.0
+a_fall_rain = 842.0
+b_fall_rain = 0.8
+a_fall_snow = 4.84
+b_fall_snow = 0.25
+a_fall_graupel = 94.5
+b_fall_graupel = 0.5
+e_rc = 1.0
+e_sc = 1.0
+e_gc = 1.0
+e_ri = 1.0
+e_si = 0.1
+e_gi = 0.1
+qc_autoconv_thresh = 0.001
+qi_aggreg_thresh = 0.0001
+rate_autoconv = 0.001
+rate_ice_aggreg = 0.001
+vt_cloud_ice = 0.75
+cloud_droplet_conc_cm3 = 60.0
+ccn_ocean_base_cm3 = 30.0
+ccn_land_base_cm3 = 95.0
+ccn_dust_scale_cm3 = 120.0
+inp_dust_enhance = 4.0
+t0_precip = 283.16
+t00_precip = 268.16
+t0_graupel = 283.16
+t00_graupel = 223.16
+
+# --- MYNN Level 2.5 & De Ridder (2010) RSL Parameters ---
+[turbulence]
+mynn_b1 = 24.0
+mynn_b2 = 15.0
+mynn_c2 = 0.75
+mynn_c3 = 0.352
+mynn_c5 = 0.2
+mynn_gamma1 = 0.235
+mynn_pr_n = 0.74
+tke_min = 0.0001
+rsl_mu_m = 2.59
+rsl_mu_h = 0.95
+rsl_nu = 0.5
+rsl_lambda = 1.5
+kinematic_visc_air = 1.5e-05
+
+# --- 5-Layer Soil, Snowpack, Canopy Interception & Sea-Ice Parameters ---
+[surface]
+cs_dry_soil = 1260000.0
+kappa_dry_soil = 0.3
+soil_porosity = 0.43
+psi_sat_soil = -0.2
+b_clapp_soil = 5.39
+k_sat_soil = 7e-06
+ice_impedance_omega = 6.0
+wc_max_per_lai = 0.1
+alpha_intercept_liq = 1.0
+f_wet_max = 1.0
+dsl_dmax_mm = 15.0
+land_eb_iterations = 3
+rho_snowpack = 250.0
+swe_glacier_max = 1000.0
+tau_snow_age = 1000000.0
+alb_snow_vis_new = 0.9
+alb_snow_nir_new = 0.7
+alb_snow_vis_old = 0.65
+alb_snow_nir_old = 0.35
+emissivity_land = 0.98
+emissivity_ocean = 0.985
+mc_seaice_crit = 450.0
+alb_seaice_vis = 0.72
+alb_seaice_nir = 0.42
+
+# --- Two-Leaf Non-Rectangular-Hyperbola EEO Biosphere Parameters ---
+[biosphere]
+theta_nrh = 0.85
+cost_c_smith = 0.05336251
+phi_psii_ref_c3 = 0.257
+beta_c3 = 146.0
+beta_c4 = 166.0
+gamma_star25_c3 = 4.332
+kc25_c3 = 41.03
+ko25_c3 = 28210.0
+dha_gamma = 37830.0
+dha_kc_c3 = 79430.0
+dha_ko_c3 = 36380.0
+gamma_star25_c4 = 2.6
+kp25_umol_c4 = 60.5
+dha_kp_c4 = 27200.0
+kc25_c4 = 121.0
+dha_kc_c4 = 64200.0
+ko25_c4 = 29200.0
+dha_ko_c4 = 10500.0
+phi_leak_c4 = 0.2
+gbs_c4 = 0.003
+ha_vcmax = 71513.0
+ha_jmax = 40710.0
+ha_vpmax = 55000.0
+hd_enzyme = 200000.0
+b_resp_ren = 0.018
+leaf_scat_vis = 0.15
+leaf_scat_nir = 0.8
+kd_prime_par = 0.719
+rho_cd_par = 0.036
+z_foliage_cost = 12.227
+k_beer_lai = 0.5
+sigma_zhou = 0.771
+alpha_ema_acclim = 0.067
+evg_cost_ratio_base = 1.35
+evg_cost_ratio_cold = 0.55
+evg_cold_eff_penalty = 0.14
+leaf_aging_b_yr = 15.0
+decid_flush_days = 25.0
+evg_offseason_resp25 = 32.0
+evg_frost_crit_k = 233.15
+evg_frost_cost = 18.0
+
+# --- Codron (2012) 1.5-Layer Wind-Driven Voronoi Ekman Ocean Parameters ---
+[ocean_ekman]
+h_thermocline = 200.0
+r_ekman_damp_days = 2.0
+kappa_ocn_horiz = 2000.0
+kappa_ocn_vert = 2e-05
+g_prime_ocn = 0.03
+tau_sw_drag_days = 180.0
+enable_shallow_water_ocn = true
+kappa_gm = 800.0
+kappa_redi_horiz = 1000.0
+enable_full_redi = true
+kpp_ri_crit = 0.3
+kpp_cs_nonlocal = 6.33
+shear_nu_0 = 0.005
+tidal_e0_wm2 = 0.008
+sw_pen_zeta2_m = 23.0
+kappa_v_bg = 1.5e-05
+kappa_v_abyss = 3e-05
+seaice_h_ridge_m = 3.0
+
+# --- Lott & Miller (1997) Subgrid Orographic Drag Parameters ---
+[orography]
+hn_crit = 0.5
+cd_block = 1.0
+g_wave = 0.8
+
+# --- Map-Free Flow-Dependent Non-Orographic GWD (Beres 2004; Charron & Manzini 2002; Richter 2010) ---
+[gravity_wave]
+ngwd_front_thresh = 1.25e-15
+ngwd_front_launch_hpa = 600.0
+ngwd_front_tau0 = 0.0015
+ngwd_front_cw = 30.0
+ngwd_front_eff = 0.1
+ngwd_conv_tau0 = 0.002
+ngwd_conv_qref = 0.0002
+ngwd_conv_eff = 0.25
+ngwd_wavelength_m = 200000.0
+ngwd_cmax = 80.0
+ngwd_tend_max = 0.001157
+
+# --- Glen Flow Law & Lithospheric Isostasy Physics Constants ---
+[icesheet_physics]
+rho_ice = 917.0
+rho_mantle = 3300.0
+a_glen_per_year = 1e-16
+h_ice_threshold_m = 5.0
+h_ice_max_m = 6000.0
