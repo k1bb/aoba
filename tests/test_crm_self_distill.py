@@ -33,8 +33,8 @@ def test_exact_column_conservation_closure() -> None:
     thm_post_ls = torch.linspace(290.0, 650.0, nz).unsqueeze(1).expand(nz, n_col).clone()
     qn_post_ls = torch.linspace(1.5e-2, 1.0e-5, nz).unsqueeze(1).expand(nz, n_col).clone()
     qp_pre = torch.full((nz, n_col), 2.0e-5)
-    qc_pre = torch.full((nz, n_col), 5.0e-5)
-    qi_pre = torch.full((nz, n_col), 2.0e-5)
+    qc_pre = torch.minimum(torch.full((nz, n_col), 5.0e-5), 0.25 * qn_post_ls)
+    qi_pre = torch.minimum(torch.full((nz, n_col), 2.0e-5), 0.15 * qn_post_ls)
     u_pre = torch.randn(nz, n_col) * 10.0
     v_pre = torch.randn(nz, n_col) * 5.0
     shf = torch.randn(n_col) * 80.0
@@ -54,7 +54,10 @@ def test_exact_column_conservation_closure() -> None:
     rel_w_err = float(((w_post - w_pre).abs() / torch.clamp(w_pre, min=1.0)).max())
     assert rel_w_err < 1.0e-5, f"Water conservation error too large: {rel_w_err}"
 
-    # 2. Exact moist enthalpy conservation
+    # 2. Exact moist sensible-enthalpy conservation in true temperature space T = theta_m*exner/(1 + RV/RD * qv)
+    qv_pre = torch.clamp(qn_post_ls - qc_pre - qi_pre, min=0.0)
+    t_post_ls = (thm_post_ls * exner) / (1.0 + C.RV_OVER_RD * qv_pre)
+    t_new = (out["theta_m"] * exner) / (1.0 + C.RV_OVER_RD * out["q_v"])
     d_m_cond = (dm * ((out["q_c"] + out["q_i"] + out["q_p"]) - (qc_pre + qi_pre + qp_pre))).sum(dim=0)
     d_m_ice = (dm * (out["q_i"] - qi_pre)).sum(dim=0)
     dh_expected = (
@@ -62,9 +65,16 @@ def test_exact_column_conservation_closure() -> None:
         + C.L_V0 * ((out["precip_rain"] + out["precip_snow"]) * dt + d_m_cond)
         + C.L_F0 * (out["precip_snow"] * dt + d_m_ice)
     )
-    dh_actual = C.CP_D * (dm * exner * (out["theta_m"] - thm_post_ls)).sum(dim=0)
+    dh_actual = C.CP_D * (dm * (t_new - t_post_ls)).sum(dim=0)
     rel_h_err = float(((dh_actual - dh_expected).abs() / torch.clamp(dh_expected.abs(), min=1.0e5)).max())
     assert rel_h_err < 1.0e-4, f"Enthalpy conservation error too large: {rel_h_err}"
+
+    # 2b. Exact stratosphere/mesosphere invariance (exner <= 0.50)
+    strat = exner <= 0.50
+    assert bool(strat.any())
+    assert float((out["theta_m"][strat] - thm_post_ls[strat]).abs().max()) == 0.0
+    assert float((out["q_n"][strat] - qn_post_ls[strat]).abs().max()) == 0.0
+    assert float((out["q_v"][strat] - qv_pre[strat]).abs().max()) == 0.0
 
     # 3. Exact horizontal momentum impulse conservation
     du_imp = (dm * (out["u"] - u_pre)).sum(dim=0)

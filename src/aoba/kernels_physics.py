@@ -5488,6 +5488,7 @@ kernel void crm_distill_closure_col(
     device float* out_scal          [[buffer(14)]],  // [3, N]: precip_rain, precip_snow, f_prec
     constant ulong4& u_pack         [[buffer(15)]],  // [nz, N, 0, 0]
     constant float4& f_p            [[buffer(16)]],  // [dt, cp_d, l_v0, l_f0]
+    constant float4& f_p1           [[buffer(17)]],  // [rv_over_rd, p_ref, t_freeze, eps_water]
     uint c                          [[thread_position_in_grid]])
 {
     uint nz = uint(u_pack.x);
@@ -5498,6 +5499,10 @@ kernel void crm_distill_closure_col(
     float cp_d = f_p.y;
     float l_v0 = f_p.z;
     float l_f0 = f_p.w;
+    float rv_rd = f_p1.x;
+    float p_ref = f_p1.y;
+    float t_frz = f_p1.z;
+    float eps_w = f_p1.w;
 
     float temp_sfc = sfc_5[c];
     float shf      = sfc_5[N + c];
@@ -5509,10 +5514,11 @@ kernel void crm_distill_closure_col(
     uint rs_base = c * 3u;
     uint plane = nz * N;
 
-    // Pass 1: column integrals for water, enthalpy, momentum
+    // Pass 1: column integrals for convective water, PBL SHF weight, sensible enthalpy, momentum
     float dm_sum_m = 0.0f;
-    float w_pre = 0.0f;
-    float w_prov = 0.0f;
+    float dm_pbl_sum = 0.0f;
+    float w_pre_conv = 0.0f;
+    float w_prov_conv = 0.0f;
     float dh_raw = 0.0f;
     float denom_h = 0.0f;
     float du_imp = 0.0f;
@@ -5520,6 +5526,8 @@ kernel void crm_distill_closure_col(
 
     float dm0 = max(rho_d[c] * dz_c[c], 1.0e-6f);
     float dq_evap0 = (evap * dt) / max(dm0, 1.0e-4f);
+    float ex0 = max(exner[c], 0.10f);
+    float inv_pbl_ex = 1.0f / (0.015f * ex0);
 
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * N + c;
@@ -5528,47 +5536,62 @@ kernel void crm_distill_closure_col(
         float ex_safe = max(ex, 0.05f);
         float s_lin = clamp((ex - 0.50f) / 0.14f, 0.0f, 1.0f);
         float s_conv = s_lin * s_lin;
-        float t_env = clamp(thm_post_ls[idx] * ex_safe, 180.0f, 340.0f);
-        float p_env = 100000.0f * pow(ex_safe, 3.5f);
-        float es_arg = (t_env >= 273.15f)
-            ? clamp(17.67f * (t_env - 273.15f) / max(t_env - 29.65f, 20.0f), -25.0f, 12.0f)
-            : clamp(21.875f * (t_env - 273.15f) / max(t_env - 7.66f, 20.0f), -25.0f, 12.0f);
-        float es_env = 611.2f * exp(es_arg);
-        float qsat_env = clamp(0.622f * es_env / max(p_env - es_env, 100.0f), 1.0e-7f, 0.10f);
+        float pbl_sh = clamp(1.0f - (ex0 - ex) * inv_pbl_ex, 0.0f, 1.0f) * s_conv;
 
-        float qn0 = max(qn_post_ls[idx], 0.0f);
-        float qp0 = max(qp_pre[idx], 0.0f);
         dm_sum_m += dm * s_conv;
-        w_pre += dm * (qn0 + qp0);
+        dm_pbl_sum += dm * pbl_sh;
 
-        float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
-        float dq_lim = min(1.5f * qsat_env + 0.5f * qnb, 5.0e-3f);
-        float dqn_r = s_conv * tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * dq_lim;
-        float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.5f);
-        float qn_p = max(qnb + dqn_r, 0.0f);
-        float qp_p = s_conv * min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig));
-        w_prov += dm * (qn_p + qp_p);
+        if (s_conv > 0.0f) {
+            float qn0 = max(qn_post_ls[idx], 0.0f);
+            float qp0 = max(qp_pre[idx], 0.0f);
+            float qc0 = max(qc_pre[idx], 0.0f);
+            float qi0 = max(qi_pre[idx], 0.0f);
+            float qci0 = qc0 + qi0;
+            if (qci0 > qn0) {
+                float sc = qn0 / max(qci0, 1.0e-12f);
+                qc0 *= sc;
+                qi0 *= sc;
+            }
+            float qv0 = max(qn0 - qc0 - qi0, 0.0f);
+            float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
+            float t_env = clamp(t_post_ls, 180.0f, 340.0f);
+            float p_env = p_ref * pow(ex_safe, 3.5f);
+            float es_arg = (t_env >= t_frz)
+                ? clamp(17.67f * (t_env - t_frz) / max(t_env - 29.65f, 20.0f), -25.0f, 12.0f)
+                : clamp(21.875f * (t_env - t_frz) / max(t_env - 7.66f, 20.0f), -25.0f, 12.0f);
+            float es_env = 611.2f * exp(es_arg);
+            float qsat_env = clamp(eps_w * es_env / max(p_env - es_env, 100.0f), 1.0e-7f, 0.10f);
 
-        float d_thm_r = (s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 5.0f) / ex_safe;
-        dh_raw += cp_d * dm * ex * d_thm_r;
-        denom_h += cp_d * dm * ex * ex * s_conv;
+            w_pre_conv += dm * (qn0 + qp0);
+            float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
+            float dq_lim = min(1.5f * qsat_env + 0.5f * qnb, 5.0e-3f);
+            float dqn_r = s_conv * tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * dq_lim;
+            float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.5f);
+            float qn_p = max(qnb + dqn_r, 0.0f);
+            float qp_p = s_conv * min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig));
+            w_prov_conv += dm * (qn_p + qp_p);
 
-        float du_r = s_conv * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 8.0f;
-        float dv_r = s_conv * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 8.0f;
-        du_imp += dm * du_r;
-        dv_imp += dm * dv_r;
+            float d_temp_r = s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 2.5f;
+            dh_raw += cp_d * dm * d_temp_r;
+            denom_h += cp_d * dm * s_conv;
+
+            float du_r = s_conv * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 8.0f;
+            float dv_r = s_conv * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 8.0f;
+            du_imp += dm * du_r;
+            dv_imp += dm * dv_r;
+        }
     }
 
     float dm_sum_safe = max(dm_sum_m, 1.0e-3f);
-    float w_avail = max(w_pre + evap * dt, 1.0e-8f);
+    float w_avail_conv = max(w_pre_conv + evap * dt, 1.0e-8f);
     float p_frac = 0.35f * aoba_sigmoid(raw_scal[rs_base + 0u] - 4.0f);
-    float p_tot_mass = (w_avail > 0.05f) ? max(p_frac * w_avail, 0.0f) : 0.0f;
-    float w_target = max(w_avail - p_tot_mass, 0.0f);
-    bool zero_prov = (w_prov <= 1.0e-5f);
-    float scale_w = clamp(w_target / max(w_prov, 1.0e-5f), 0.0f, 50.0f);
+    float p_tot_mass = (w_avail_conv > 0.05f) ? max(p_frac * w_avail_conv, 0.0f) : 0.0f;
+    float w_target_conv = max(w_avail_conv - p_tot_mass, 0.0f);
+    bool zero_prov = (w_prov_conv <= 1.0e-5f);
+    float scale_w = clamp(w_target_conv / max(w_prov_conv, 1.0e-5f), 0.0f, 50.0f);
 
-    // Pass 2: compute exact rescaled water, condensate partition, and latent-heat integrals
-    float w_post_check = 0.0f;
+    // Pass 2: convective rescaled water, condensate partition, and latent-heat integrals
+    float w_post_conv = 0.0f;
     float d_m_cond = 0.0f;
     float d_m_ice = 0.0f;
 
@@ -5579,34 +5602,54 @@ kernel void crm_distill_closure_col(
         float ex_safe = max(ex, 0.05f);
         float s_lin = clamp((ex - 0.50f) / 0.14f, 0.0f, 1.0f);
         float s_conv = s_lin * s_lin;
-        float t_env = clamp(thm_post_ls[idx] * ex_safe, 180.0f, 340.0f);
-        float p_env = 100000.0f * pow(ex_safe, 3.5f);
-        float es_arg = (t_env >= 273.15f)
-            ? clamp(17.67f * (t_env - 273.15f) / max(t_env - 29.65f, 20.0f), -25.0f, 12.0f)
-            : clamp(21.875f * (t_env - 273.15f) / max(t_env - 7.66f, 20.0f), -25.0f, 12.0f);
-        float es_env = 611.2f * exp(es_arg);
-        float qsat_env = clamp(0.622f * es_env / max(p_env - es_env, 100.0f), 1.0e-7f, 0.10f);
 
         float qn0 = max(qn_post_ls[idx], 0.0f);
         float qp0 = max(qp_pre[idx], 0.0f);
-        float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
-        float dq_lim = min(1.5f * qsat_env + 0.5f * qnb, 5.0e-3f);
-        float dqn_r = s_conv * tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * dq_lim;
-        float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.5f);
-        float qn_n = zero_prov ? qnb : (max(qnb + dqn_r, 0.0f) * scale_w);
-        float qp_n = zero_prov ? qp0 : (s_conv * min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig)) * scale_w);
-        w_post_check += dm * (qn_n + qp_n);
+        float qc0 = max(qc_pre[idx], 0.0f);
+        float qi0 = max(qi_pre[idx], 0.0f);
+        float qci0 = qc0 + qi0;
+        if (qci0 > qn0) {
+            float sc = qn0 / max(qci0, 1.0e-12f);
+            qc0 *= sc;
+            qi0 *= sc;
+        }
+        float qv0 = max(qn0 - qc0 - qi0, 0.0f);
 
-        float fc_sig = aoba_sigmoid(raw_prof[rp_base + 3u * nz + k] - 2.5f);
-        float f_cond = s_conv * 0.95f * (fc_sig * fc_sig);
-        float f_ice = aoba_sigmoid(raw_prof[rp_base + 4u * nz + k]);
-        float q_cond = qn_n * f_cond;
-        float qc_n = q_cond * (1.0f - f_ice);
-        float qi_n = q_cond * f_ice;
-        float qv_n = max(qn_n - qc_n - qi_n, 0.0f);
+        float qn_n = qn0;
+        float qp_n = qp0;
+        float qc_n = qc0;
+        float qi_n = qi0;
+        float qv_n = qv0;
 
-        d_m_cond += dm * ((qc_n + qi_n + qp_n) - (qc_pre[idx] + qi_pre[idx] + qp_pre[idx]));
-        d_m_ice  += dm * (qi_n - qi_pre[idx]);
+        if (s_conv > 0.0f) {
+            float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
+            float t_env = clamp(t_post_ls, 180.0f, 340.0f);
+            float p_env = p_ref * pow(ex_safe, 3.5f);
+            float es_arg = (t_env >= t_frz)
+                ? clamp(17.67f * (t_env - t_frz) / max(t_env - 29.65f, 20.0f), -25.0f, 12.0f)
+                : clamp(21.875f * (t_env - t_frz) / max(t_env - 7.66f, 20.0f), -25.0f, 12.0f);
+            float es_env = 611.2f * exp(es_arg);
+            float qsat_env = clamp(eps_w * es_env / max(p_env - es_env, 100.0f), 1.0e-7f, 0.10f);
+
+            float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
+            float dq_lim = min(1.5f * qsat_env + 0.5f * qnb, 5.0e-3f);
+            float dqn_r = s_conv * tanh(raw_prof[rp_base + 1u * nz + k] * 0.2f) * dq_lim;
+            float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.5f);
+            qn_n = zero_prov ? qnb : (max(qnb + dqn_r, 0.0f) * scale_w);
+            qp_n = zero_prov ? qp0 : (s_conv * min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig)) * scale_w);
+            w_post_conv += dm * (qn_n + qp_n);
+
+            float fc_sig = aoba_sigmoid(raw_prof[rp_base + 3u * nz + k] - 2.5f);
+            float f_cond = s_conv * 0.95f * (fc_sig * fc_sig);
+            float f_ice = aoba_sigmoid(raw_prof[rp_base + 4u * nz + k]);
+            float q_cond = qn_n * f_cond;
+            qc_n = q_cond * (1.0f - f_ice);
+            qi_n = q_cond * f_ice;
+            qv_n = max(qn_n - qc_n - qi_n, 0.0f);
+
+            d_m_cond += dm * ((qc_n + qi_n + qp_n) - (qc0 + qi0 + qp0));
+            d_m_ice  += dm * (qi_n - qi0);
+        }
 
         out_prof[1u * plane + idx] = qn_n;
         out_prof[2u * plane + idx] = qp_n;
@@ -5616,29 +5659,52 @@ kernel void crm_distill_closure_col(
         out_prof[8u * plane + idx] = s_conv * aoba_sigmoid(raw_prof[rp_base + 7u * nz + k] - 1.0f);
     }
 
-    float p_tot_fin = max(w_avail - w_post_check, 0.0f);
+    float p_tot_fin = max(w_avail_conv - w_post_conv, 0.0f);
     float f_snow = aoba_sigmoid(raw_scal[rs_base + 1u]) * clamp((278.0f - temp_sfc) / 6.0f, 0.0f, 1.0f);
     out_scal[c]          = (p_tot_fin * (1.0f - f_snow)) / dt;
     out_scal[N + c]      = (p_tot_fin * f_snow) / dt;
     out_scal[2u * N + c] = aoba_sigmoid(raw_scal[rs_base + 2u] - 1.0f);
 
-    float dh_exact = shf * dt + l_v0 * (p_tot_fin + d_m_cond) + l_f0 * (p_tot_fin * f_snow + d_m_ice);
-    float h_corr = (dh_exact - dh_raw) / max(denom_h, 1.0f);
+    float dh_lat = l_v0 * (p_tot_fin + d_m_cond) + l_f0 * (p_tot_fin * f_snow + d_m_ice);
+    float h_corr = (dh_lat - dh_raw) / max(denom_h, 1.0f);
+    float dT_shf_scale = (shf * dt) / (cp_d * max(dm_pbl_sum, 1.0e-3f));
     float u_corr = (tau_x * dt - du_imp) / dm_sum_safe;
     float v_corr = (tau_y * dt - dv_imp) / dm_sum_safe;
 
-    // Pass 3: write enthalpy-closed theta_m and momentum-closed u, v
+    // Pass 3: write true-temperature enthalpy-closed moist theta_m and momentum-closed u, v
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * N + c;
         float ex = exner[idx];
+        float ex_safe = max(ex, 0.05f);
         float s_lin = clamp((ex - 0.50f) / 0.14f, 0.0f, 1.0f);
         float s_conv = s_lin * s_lin;
-        float d_thm_r = (s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 5.0f) / max(ex, 0.05f);
-        float du_r = s_conv * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 8.0f;
-        float dv_r = s_conv * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 8.0f;
-        out_prof[idx]              = clamp(thm_post_ls[idx] + d_thm_r + h_corr * ex * s_conv, 150.0f, 10000.0f);
-        out_prof[6u * plane + idx] = u_pre[idx] + du_r + u_corr * s_conv;
-        out_prof[7u * plane + idx] = v_pre[idx] + dv_r + v_corr * s_conv;
+        if (s_conv > 0.0f) {
+            float qn0 = max(qn_post_ls[idx], 0.0f);
+            float qc0 = max(qc_pre[idx], 0.0f);
+            float qi0 = max(qi_pre[idx], 0.0f);
+            float qci0 = qc0 + qi0;
+            if (qci0 > qn0) {
+                float sc = qn0 / max(qci0, 1.0e-12f);
+                qc0 *= sc;
+                qi0 *= sc;
+            }
+            float qv0 = max(qn0 - qc0 - qi0, 0.0f);
+            float qv_n = out_prof[3u * plane + idx];
+            float pbl_sh = clamp(1.0f - (ex0 - ex) * inv_pbl_ex, 0.0f, 1.0f) * s_conv;
+            float d_temp_r = s_conv * tanh(raw_prof[rp_base + 0u * nz + k] * 0.2f) * 2.5f;
+            float d_temp_cons = dT_shf_scale * pbl_sh + d_temp_r + h_corr * s_conv;
+            float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
+            float d_thm_exact = (d_temp_cons * (1.0f + rv_rd * qv_n) + t_post_ls * rv_rd * (qv_n - qv0)) / ex_safe;
+            float du_r = s_conv * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 8.0f;
+            float dv_r = s_conv * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 8.0f;
+            out_prof[idx]              = clamp(thm_post_ls[idx] + d_thm_exact, 150.0f, 10000.0f);
+            out_prof[6u * plane + idx] = u_pre[idx] + du_r + u_corr * s_conv;
+            out_prof[7u * plane + idx] = v_pre[idx] + dv_r + v_corr * s_conv;
+        } else {
+            out_prof[idx]              = clamp(thm_post_ls[idx], 150.0f, 10000.0f);
+            out_prof[6u * plane + idx] = u_pre[idx];
+            out_prof[7u * plane + idx] = v_pre[idx];
+        }
     }
 }
 
@@ -7623,6 +7689,7 @@ def run_crm_distill_closure_metal(
         out_prof, out_scal,
         [nz, n_col, 0, 0],
         [float(dt), float(C.CP_D), float(C.L_V0), float(C.L_F0)],
+        [float(C.RV_OVER_RD), float(C.P_REF), float(C.T_FREEZE), float(C.EPS_WATER)],
         threads=n_col,
     )
     return {
