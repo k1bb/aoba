@@ -425,7 +425,7 @@ kernel void crm_3d_fast_hevi_loop(
     uint accum = uint(u_pack.w & 1u);
     uint stride_c = ny * nx;
     uint M = n_col * stride_c;
-    if (tid >= M || K < 2u || K > 64u) return;
+    if (tid >= M || K < 2u || K > 64u || stride_c > 64u) return;
 
     uint col = tid / stride_c;
     uint rem = tid - col * stride_c;
@@ -480,7 +480,7 @@ kernel void crm_3d_fast_hevi_loop(
     float inv_dy = 1.0f / f_p1.x;
     float inv_nac = f_p1.y;
 
-    float d_star[64];
+    threadgroup float sm_dstar[64u * 64u];
 
     for (uint ac = 0u; ac < n_ac; ++ac) {
         // Step A: Horizontal acoustic PGF + u/v update + forward-backward mass flux (fx, fy)
@@ -583,7 +583,7 @@ kernel void crm_3d_fast_hevi_loop(
                 );
                 float id = diag[idx_m];
                 d_prev = (um == 0u) ? (rhs_m * id) : ((rhs_m - dl[idx_m] * d_prev) * id);
-                d_star[um] = d_prev;
+                sm_dstar[um * stride_c + rem] = d_prev;
             }
             p_blend_prev = p_blend;
             rtot_blend_prev = rtot_blend;
@@ -603,7 +603,8 @@ kernel void crm_3d_fast_hevi_loop(
         for (int m = int(K) - 2; m >= 0; --m) {
             uint um = uint(m);
             uint idx_m = um * M + tid;
-            float dfz_cur = (m == int(K) - 2) ? d_star[um] : (d_star[um] - du[idx_m] * dfz_above);
+            float ds_val = sm_dstar[um * stride_c + rem];
+            float dfz_cur = (m == int(K) - 2) ? ds_val : (ds_val - du[idx_m] * dfz_above);
             float rdw_m = rho_dw[idx_m];
             float fz_old_m = rdw_m * w_a[(um + 1u) * M + tid];
             float fz_new_m = fz_old_m + dfz_cur;
@@ -1844,7 +1845,7 @@ def run_crm_rk3_hevi_metal(
     n_int = nz - 1
 
     use_2d_tg_loop = (ny == 1 and 1 < nx <= 128 and nz <= 64 and (128 % nx == 0))
-    use_3d_tg_loop = (ny > 1 and nx > 1 and (ny * nx) <= 256 and nz <= 64)
+    use_3d_tg_loop = (ny > 1 and nx > 1 and (ny * nx) <= 64 and nz <= 64)
     if use_2d_tg_loop:
         fx_acc.zero_()
         fy_acc.zero_()

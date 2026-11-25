@@ -4538,7 +4538,8 @@ kernel void crm_student_tile_update_col(
     device float* snow_3d           [[buffer(27)]],  // [nc, n_sub] (out)
     constant ulong4& u_pack         [[buffer(28)]],  // [nz, nc, (ny<<16)|nx, (step_shift<<3)|(has_cp<<2)|(has_sp<<1)|has_sc]
     constant float4& f_p            [[buffer(29)]],  // [dt, cp_d, damp_anom, 0]
-    uint c                          [[thread_position_in_grid]])
+    uint c                          [[threadgroup_position_in_grid]],
+    uint s                          [[thread_position_in_threadgroup]])
 {
     uint nz = uint(u_pack.x);
     uint nc = uint(u_pack.y);
@@ -4550,83 +4551,68 @@ kernel void crm_student_tile_update_col(
     uint has_sp = (flags >> 1u) & 1u;
     uint has_cp = (flags >> 2u) & 1u;
     uint step_shift = flags >> 3u;
-    if (c >= nc || n_sub <= 1u || n_sub > 64u) return;
+    if (c >= nc || s >= n_sub || n_sub <= 1u || n_sub > 64u) return;
+
+    threadgroup float sm_a[64];
+    threadgroup float sm_b[64];
+    threadgroup float sm_c[64];
+    threadgroup float sm_d[64];
+    threadgroup float sm_red[4];
 
     float fn_sub = float(n_sub);
     float inv_nsub = 1.0f / fn_sub;
     uint shift = (c + step_shift) % n_sub;
     uint base_c = c * n_sub;
+    float rfb_s = float((s + shift) % n_sub);
+    float tb_s = (1.0f - rfb_s * inv_nsub) * 1.0e-4f;
 
-    float rank_cld[64];
-    float key_buf[64];
-
+    // Parallel cloud rank across all n_sub tiles in shared memory (O(n_sub) per thread)
+    float rank_cld_s = rfb_s;
     if (has_sc != 0u) {
-        for (uint s = 0u; s < n_sub; ++s) {
-            float rfb = float((s + shift) % n_sub);
-            float tb = (1.0f - rfb * inv_nsub) * 1.0e-4f;
-            key_buf[s] = score_cld[base_c + s] + tb;
+        float ks = score_cld[base_c + s] + tb_s;
+        sm_a[s] = ks;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float r = 0.0f;
+        for (uint j = 0u; j < n_sub; ++j) {
+            float kj = sm_a[j];
+            if (kj > ks || (kj == ks && j < s)) r += 1.0f;
         }
-        for (uint s = 0u; s < n_sub; ++s) {
-            float ks = key_buf[s];
-            float r = 0.0f;
-            for (uint j = 0u; j < n_sub; ++j) {
-                float kj = key_buf[j];
-                if (kj > ks || (kj == ks && j < s)) r += 1.0f;
-            }
-            rank_cld[s] = r;
-        }
-    } else {
-        for (uint s = 0u; s < n_sub; ++s) {
-            rank_cld[s] = float((s + shift) % n_sub);
-        }
+        rank_cld_s = r;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Precipitation subcolumn multipliers -> rain_3d, snow_3d
+    // Parallel precipitation subcolumn multipliers -> rain_3d, snow_3d (coalesced)
     float rain_c = stu_1d[c];
     float snow_c = stu_1d[nc + c];
     float f_p_eff = clamp(stu_1d[2u * nc + c], inv_nsub, 1.0f);
     float fp_n = f_p_eff * fn_sub;
-    float sum_wp = 0.0f;
+    float rank_prec_s = rank_cld_s;
     if (has_sp != 0u) {
-        for (uint s = 0u; s < n_sub; ++s) {
-            float rfb = float((s + shift) % n_sub);
-            float tb = (1.0f - rfb * inv_nsub) * 1.0e-4f;
-            key_buf[s] = score_prec[base_c + s] + tb;
+        float ks = score_prec[base_c + s] + tb_s;
+        sm_a[s] = ks;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float rp = 0.0f;
+        for (uint j = 0u; j < n_sub; ++j) {
+            float kj = sm_a[j];
+            if (kj > ks || (kj == ks && j < s)) rp += 1.0f;
         }
-        for (uint s = 0u; s < n_sub; ++s) {
-            float ks = key_buf[s];
-            float rp = 0.0f;
-            for (uint j = 0u; j < n_sub; ++j) {
-                float kj = key_buf[j];
-                if (kj > ks || (kj == ks && j < s)) rp += 1.0f;
-            }
-            sum_wp += clamp(fp_n - rp, 0.0f, 1.0f);
-        }
-        float inv_wp = 1.0f / max(sum_wp * inv_nsub, 1.0e-6f);
-        for (uint s = 0u; s < n_sub; ++s) {
-            float ks = key_buf[s];
-            float rp = 0.0f;
-            for (uint j = 0u; j < n_sub; ++j) {
-                float kj = key_buf[j];
-                if (kj > ks || (kj == ks && j < s)) rp += 1.0f;
-            }
-            float m_p = clamp(fp_n - rp, 0.0f, 1.0f) * inv_wp;
-            rain_3d[base_c + s] = rain_c * m_p;
-            snow_3d[base_c + s] = snow_c * m_p;
-        }
-    } else {
-        for (uint s = 0u; s < n_sub; ++s) {
-            sum_wp += clamp(fp_n - rank_cld[s], 0.0f, 1.0f);
-        }
-        float inv_wp = 1.0f / max(sum_wp * inv_nsub, 1.0e-6f);
-        for (uint s = 0u; s < n_sub; ++s) {
-            float m_p = clamp(fp_n - rank_cld[s], 0.0f, 1.0f) * inv_wp;
-            rain_3d[base_c + s] = rain_c * m_p;
-            snow_3d[base_c + s] = snow_c * m_p;
-        }
+        rank_prec_s = rp;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    float wp_s = clamp(fp_n - rank_prec_s, 0.0f, 1.0f);
+    sm_a[s] = wp_s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (s == 0u) {
+        float sw = 0.0f;
+        for (uint j = 0u; j < n_sub; ++j) sw += sm_a[j];
+        sm_red[0] = 1.0f / max(sw * inv_nsub, 1.0e-6f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m_p_s = wp_s * sm_red[0];
+    rain_3d[base_c + s] = rain_c * m_p_s;
+    snow_3d[base_c + s] = snow_c * m_p_s;
 
-    // Surface microclimate + cold-pool (k == 0) precomputation
+    // Surface microclimate + cold-pool (k == 0) precomputation in shared memory
     float dt = f_p.x;
     float cp_d = f_p.y;
     float damp = f_p.z;
@@ -4635,110 +4621,127 @@ kernel void crm_student_tile_update_col(
     float inv_cp_dm_ex = dt / (cp_d * dm_0 * ex_0);
     float inv_dm = dt / dm_0;
 
-    float shf_sum = 0.0f;
-    float evap_sum = 0.0f;
-    for (uint s = 0u; s < n_sub; ++s) {
-        shf_sum += shf_tile[base_c + s];
-        evap_sum += evap_tile[base_c + s];
-    }
-    float shf_mean = shf_sum * inv_nsub;
-    float evap_mean = evap_sum * inv_nsub;
-
-    float dthm_sum = 0.0f;
-    float dqv_sum = 0.0f;
-    for (uint s = 0u; s < n_sub; ++s) {
-        float dt_v = clamp((shf_tile[base_c + s] - shf_mean) * inv_cp_dm_ex, -3.0f, 3.0f);
-        float dq_v = clamp((evap_tile[base_c + s] - evap_mean) * inv_dm, -2.0e-3f, 2.0e-3f);
-        if (has_cp != 0u) {
-            dt_v = clamp(dt_v + dthm_cp[base_c + s], -8.0f, 8.0f);
-            dq_v = clamp(dq_v + dqv_cp[base_c + s], -6.0e-3f, 6.0e-3f);
+    float shf_s = shf_tile[base_c + s];
+    float evap_s = evap_tile[base_c + s];
+    sm_a[s] = shf_s;
+    sm_b[s] = evap_s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (s == 0u) {
+        float s_shf = 0.0f;
+        float s_evap = 0.0f;
+        for (uint j = 0u; j < n_sub; ++j) {
+            s_shf += sm_a[j];
+            s_evap += sm_b[j];
         }
-        dthm_sum += dt_v;
-        dqv_sum += dq_v;
+        sm_red[0] = s_shf * inv_nsub;
+        sm_red[1] = s_evap * inv_nsub;
     }
-    float dthm_mean = dthm_sum * inv_nsub;
-    float dqv_mean = dqv_sum * inv_nsub;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float shf_mean = sm_red[0];
+    float evap_mean = sm_red[1];
+
+    float dt_v_s = clamp((shf_s - shf_mean) * inv_cp_dm_ex, -3.0f, 3.0f);
+    float dq_v_s = clamp((evap_s - evap_mean) * inv_dm, -2.0e-3f, 2.0e-3f);
+    float dthm_cp_s = 0.0f;
+    if (has_cp != 0u) {
+        dthm_cp_s = dthm_cp[base_c + s];
+        dt_v_s = clamp(dt_v_s + dthm_cp_s, -8.0f, 8.0f);
+        dq_v_s = clamp(dq_v_s + dqv_cp[base_c + s], -6.0e-3f, 6.0e-3f);
+    }
+    sm_a[s] = dt_v_s;
+    sm_b[s] = dq_v_s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (s == 0u) {
+        float s_dt = 0.0f;
+        float s_dq = 0.0f;
+        for (uint j = 0u; j < n_sub; ++j) {
+            s_dt += sm_a[j];
+            s_dq += sm_b[j];
+        }
+        sm_red[0] = s_dt * inv_nsub;
+        sm_red[1] = s_dq * inv_nsub;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float dthm_anom_s = dt_v_s - sm_red[0];
+    float dqv_anom_s = dq_v_s - sm_red[1];
 
     float qv_0_c = stu_qv[c];
-    float qvc_sum = 0.0f;
-    for (uint s = 0u; s < n_sub; ++s) {
-        float dq_v = clamp((evap_tile[base_c + s] - evap_mean) * inv_dm, -2.0e-3f, 2.0e-3f);
-        if (has_cp != 0u) dq_v = clamp(dq_v + dqv_cp[base_c + s], -6.0e-3f, 6.0e-3f);
-        qvc_sum += max(qv_0_c + (dq_v - dqv_mean), 0.0f);
+    float qv_cand_s = max(qv_0_c + dqv_anom_s, 0.0f);
+    sm_a[s] = qv_cand_s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (s == 0u) {
+        float s_qvc = 0.0f;
+        for (uint j = 0u; j < n_sub; ++j) s_qvc += sm_a[j];
+        float qcm = s_qvc * inv_nsub;
+        sm_red[0] = (qcm > 1.0e-10f) ? (qv_0_c / max(qcm, 1.0e-10f)) : -1.0f;
     }
-    float qv_cand_mean = qvc_sum * inv_nsub;
-    bool use_qv_mc = (qv_cand_mean > 1.0e-10f);
-    float qv_scale = use_qv_mc ? (qv_0_c / max(qv_cand_mean, 1.0e-10f)) : 1.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float qv_scale_0 = sm_red[0];
+    float qv_0_mc_s = (qv_scale_0 >= 0.0f) ? (qv_cand_s * qv_scale_0) : qv_0_c;
 
-    // Cold-pool radial density-current outflow precomputation at k == 0
-    float mean_ur = 0.0f;
-    float mean_vr = 0.0f;
-    float cp_u_scale = 0.0f;
-    float two_pi_inv = 6.28318530718f * inv_nsub;
+    // Cold-pool radial density-current outflow at k == 0 (single shared-mem neighbor stencil)
+    float u_cp_anom_s = 0.0f;
+    float v_cp_anom_s = 0.0f;
     if (has_cp != 0u) {
-        float sum_ur = 0.0f;
-        float sum_vr = 0.0f;
-        float sum_ug2 = 0.0f;
-        for (uint s = 0u; s < n_sub; ++s) {
-            uint iy = s / nx_t;
-            uint ix = s - iy * nx_t;
-            float gx = 0.0f;
-            float gy = 0.0f;
-            if (nx_t > 1u) {
-                uint ixp = (ix + 1u < nx_t) ? (ix + 1u) : 0u;
-                uint ixm = (ix > 0u) ? (ix - 1u) : (nx_t - 1u);
-                gx = 0.5f * (dthm_cp[base_c + iy * nx_t + ixp] - dthm_cp[base_c + iy * nx_t + ixm]);
-            }
-            if (ny_t > 1u) {
-                uint iyp = (iy + 1u < ny_t) ? (iy + 1u) : 0u;
-                uint iym = (iy > 0u) ? (iy - 1u) : (ny_t - 1u);
-                gy = 0.5f * (dthm_cp[base_c + iyp * nx_t + ix] - dthm_cp[base_c + iym * nx_t + ix]);
-            }
-            float gn = sqrt(gx * gx + gy * gy);
-            float ang = two_pi_inv * float(s + shift);
-            float ex = (gn > 1.0e-4f) ? (gx / max(gn, 1.0e-4f)) : cos(ang);
-            float ey = (gn > 1.0e-4f) ? (gy / max(gn, 1.0e-4f)) : sin(ang);
-            float ug = u_gust[base_c + s];
-            sum_ur += ug * ex;
-            sum_vr += ug * ey;
-            sum_ug2 += ug * ug;
+        sm_d[s] = dthm_cp_s;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint iy = s / nx_t;
+        uint ix = s - iy * nx_t;
+        float gx = 0.0f;
+        float gy = 0.0f;
+        if (nx_t > 1u) {
+            uint ixp = (ix + 1u < nx_t) ? (ix + 1u) : 0u;
+            uint ixm = (ix > 0u) ? (ix - 1u) : (nx_t - 1u);
+            gx = 0.5f * (sm_d[iy * nx_t + ixp] - sm_d[iy * nx_t + ixm]);
         }
-        mean_ur = sum_ur * inv_nsub;
-        mean_vr = sum_vr * inv_nsub;
-        float sum_eke = 0.0f;
-        for (uint s = 0u; s < n_sub; ++s) {
-            uint iy = s / nx_t;
-            uint ix = s - iy * nx_t;
-            float gx = 0.0f;
-            float gy = 0.0f;
-            if (nx_t > 1u) {
-                uint ixp = (ix + 1u < nx_t) ? (ix + 1u) : 0u;
-                uint ixm = (ix > 0u) ? (ix - 1u) : (nx_t - 1u);
-                gx = 0.5f * (dthm_cp[base_c + iy * nx_t + ixp] - dthm_cp[base_c + iy * nx_t + ixm]);
-            }
-            if (ny_t > 1u) {
-                uint iyp = (iy + 1u < ny_t) ? (iy + 1u) : 0u;
-                uint iym = (iy > 0u) ? (iy - 1u) : (ny_t - 1u);
-                gy = 0.5f * (dthm_cp[base_c + iyp * nx_t + ix] - dthm_cp[base_c + iym * nx_t + ix]);
-            }
-            float gn = sqrt(gx * gx + gy * gy);
-            float ang = two_pi_inv * float(s + shift);
-            float ex = (gn > 1.0e-4f) ? (gx / max(gn, 1.0e-4f)) : cos(ang);
-            float ey = (gn > 1.0e-4f) ? (gy / max(gn, 1.0e-4f)) : sin(ang);
-            float ug = u_gust[base_c + s];
-            float up = ug * ex - mean_ur;
-            float vp = ug * ey - mean_vr;
-            sum_eke += up * up + vp * vp;
+        if (ny_t > 1u) {
+            uint iyp = (iy + 1u < ny_t) ? (iy + 1u) : 0u;
+            uint iym = (iy > 0u) ? (iy - 1u) : (ny_t - 1u);
+            gy = 0.5f * (sm_d[iyp * nx_t + ix] - sm_d[iym * nx_t + ix]);
         }
-        float eke_cur = sum_eke * inv_nsub;
-        float eke_tgt = sum_ug2 * inv_nsub;
-        cp_u_scale = (eke_cur > 1.0e-8f) ? min(sqrt(eke_tgt / max(eke_cur, 1.0e-8f)), 2.0f) : 0.0f;
+        float gn = sqrt(gx * gx + gy * gy);
+        float ang = (6.28318530718f * inv_nsub) * float(s + shift);
+        float ex = (gn > 1.0e-4f) ? (gx / max(gn, 1.0e-4f)) : cos(ang);
+        float ey = (gn > 1.0e-4f) ? (gy / max(gn, 1.0e-4f)) : sin(ang);
+        float ug = u_gust[base_c + s];
+        float ur_s = ug * ex;
+        float vr_s = ug * ey;
+        sm_a[s] = ur_s;
+        sm_b[s] = vr_s;
+        sm_c[s] = ug * ug;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s == 0u) {
+            float s_ur = 0.0f, s_vr = 0.0f, s_ug2 = 0.0f;
+            for (uint j = 0u; j < n_sub; ++j) {
+                s_ur += sm_a[j];
+                s_vr += sm_b[j];
+                s_ug2 += sm_c[j];
+            }
+            sm_red[0] = s_ur * inv_nsub;
+            sm_red[1] = s_vr * inv_nsub;
+            sm_red[2] = s_ug2 * inv_nsub;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float up_s = ur_s - sm_red[0];
+        float vp_s = vr_s - sm_red[1];
+        float eke_tgt = sm_red[2];
+        sm_a[s] = up_s * up_s + vp_s * vp_s;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s == 0u) {
+            float s_eke = 0.0f;
+            for (uint j = 0u; j < n_sub; ++j) s_eke += sm_a[j];
+            float eke_cur = s_eke * inv_nsub;
+            sm_red[3] = (eke_cur > 1.0e-8f) ? min(sqrt(eke_tgt / max(eke_cur, 1.0e-8f)), 2.0f) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        u_cp_anom_s = up_s * sm_red[3];
+        v_cp_anom_s = vp_s * sm_red[3];
     }
 
-    // Vertical column update (k = 0..nz-1)
+    // Vertical column update (k = 0..nz-1): 100% coalesced across tile index s
     for (uint k = 0u; k < nz; ++k) {
         uint kc = k * nc + c;
-        uint base = kc * n_sub;
+        uint idx = kc * n_sub + s;
         float rho_c = atmos_rho[kc];
         float thm_c = stu_thm[kc];
         float qv_c  = stu_qv[kc];
@@ -4749,75 +4752,55 @@ kernel void crm_student_tile_update_col(
         float v_c   = stu_v[kc];
         float fc_n  = clamp(stu_fcld[kc], inv_nsub, 1.0f) * fn_sub;
 
-        float sum_thm = 0.0f;
-        float sum_u = 0.0f;
-        float sum_v = 0.0f;
-        float sum_wc = 0.0f;
-        for (uint s = 0u; s < n_sub; ++s) {
-            uint idx = base + s;
-            sum_thm += crm_thm[idx];
-            sum_u += crm_u[idx];
-            sum_v += crm_v[idx];
-            sum_wc += clamp(fc_n - rank_cld[s], 0.0f, 1.0f);
-        }
-        float mean_thm = sum_thm * inv_nsub;
-        float mean_u = sum_u * inv_nsub;
-        float mean_v = sum_v * inv_nsub;
-        float inv_wc = 1.0f / max(sum_wc * inv_nsub, 1.0e-6f);
-
-        for (uint s = 0u; s < n_sub; ++s) {
-            uint idx = base + s;
-            float m_c = clamp(fc_n - rank_cld[s], 0.0f, 1.0f) * inv_wc;
-            float qc_s = qc_c * m_c;
-            float qi_s = qi_c * m_c;
-            float qp_s = qp_c * m_c;
-            float thm_s = thm_c + damp * (crm_thm[idx] - mean_thm);
-            float qv_s = qv_c;
-            float u_s = u_c + damp * (crm_u[idx] - mean_u);
-            float v_s = v_c + damp * (crm_v[idx] - mean_v);
-            if (k == 0u) {
-                float dt_v = clamp((shf_tile[base_c + s] - shf_mean) * inv_cp_dm_ex, -3.0f, 3.0f);
-                if (has_cp != 0u) dt_v = clamp(dt_v + dthm_cp[base_c + s], -8.0f, 8.0f);
-                thm_s += (dt_v - dthm_mean);
-                if (use_qv_mc) {
-                    float dq_v = clamp((evap_tile[base_c + s] - evap_mean) * inv_dm, -2.0e-3f, 2.0e-3f);
-                    if (has_cp != 0u) dq_v = clamp(dq_v + dqv_cp[base_c + s], -6.0e-3f, 6.0e-3f);
-                    qv_s = max(qv_c + (dq_v - dqv_mean), 0.0f) * qv_scale;
-                }
-                if (has_cp != 0u) {
-                    uint iy = s / nx_t;
-                    uint ix = s - iy * nx_t;
-                    float gx = 0.0f;
-                    float gy = 0.0f;
-                    if (nx_t > 1u) {
-                        uint ixp = (ix + 1u < nx_t) ? (ix + 1u) : 0u;
-                        uint ixm = (ix > 0u) ? (ix - 1u) : (nx_t - 1u);
-                        gx = 0.5f * (dthm_cp[base_c + iy * nx_t + ixp] - dthm_cp[base_c + iy * nx_t + ixm]);
-                    }
-                    if (ny_t > 1u) {
-                        uint iyp = (iy + 1u < ny_t) ? (iy + 1u) : 0u;
-                        uint iym = (iy > 0u) ? (iy - 1u) : (ny_t - 1u);
-                        gy = 0.5f * (dthm_cp[base_c + iyp * nx_t + ix] - dthm_cp[base_c + iym * nx_t + ix]);
-                    }
-                    float gn = sqrt(gx * gx + gy * gy);
-                    float ang = two_pi_inv * float(s + shift);
-                    float ex = (gn > 1.0e-4f) ? (gx / max(gn, 1.0e-4f)) : cos(ang);
-                    float ey = (gn > 1.0e-4f) ? (gy / max(gn, 1.0e-4f)) : sin(ang);
-                    float ug = u_gust[base_c + s];
-                    u_s = u_c + (ug * ex - mean_ur) * cp_u_scale;
-                    v_s = v_c + (ug * ey - mean_vr) * cp_u_scale;
-                }
+        float thm_old = crm_thm[idx];
+        float u_old   = crm_u[idx];
+        float v_old   = crm_v[idx];
+        float wc_s    = clamp(fc_n - rank_cld_s, 0.0f, 1.0f);
+        sm_a[s] = thm_old;
+        sm_b[s] = u_old;
+        sm_c[s] = v_old;
+        sm_d[s] = wc_s;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s == 0u) {
+            float s_thm = 0.0f, s_u = 0.0f, s_v = 0.0f, s_wc = 0.0f;
+            for (uint j = 0u; j < n_sub; ++j) {
+                s_thm += sm_a[j];
+                s_u   += sm_b[j];
+                s_v   += sm_c[j];
+                s_wc  += sm_d[j];
             }
-            crm_rho[idx] = rho_c;
-            crm_thm[idx] = thm_s;
-            crm_qv[idx]  = qv_s;
-            crm_qc[idx]  = qc_s;
-            crm_qi[idx]  = qi_s;
-            crm_qp[idx]  = qp_s;
-            crm_qn[idx]  = qv_s + qc_s + qi_s;
-            crm_u[idx]   = u_s;
-            crm_v[idx]   = v_s;
+            sm_red[0] = s_thm * inv_nsub;
+            sm_red[1] = s_u * inv_nsub;
+            sm_red[2] = s_v * inv_nsub;
+            sm_red[3] = 1.0f / max(s_wc * inv_nsub, 1.0e-6f);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float m_c = wc_s * sm_red[3];
+        float qc_s = qc_c * m_c;
+        float qi_s = qi_c * m_c;
+        float qp_s = qp_c * m_c;
+        float thm_s = thm_c + damp * (thm_old - sm_red[0]);
+        float qv_s = qv_c;
+        float u_s = u_c + damp * (u_old - sm_red[1]);
+        float v_s = v_c + damp * (v_old - sm_red[2]);
+        if (k == 0u) {
+            thm_s += dthm_anom_s;
+            qv_s = qv_0_mc_s;
+            if (has_cp != 0u) {
+                u_s = u_c + u_cp_anom_s;
+                v_s = v_c + v_cp_anom_s;
+            }
+        }
+        crm_rho[idx] = rho_c;
+        crm_thm[idx] = thm_s;
+        crm_qv[idx]  = qv_s;
+        crm_qc[idx]  = qc_s;
+        crm_qi[idx]  = qi_s;
+        crm_qp[idx]  = qp_s;
+        crm_qn[idx]  = qv_s + qc_s + qi_s;
+        crm_u[idx]   = u_s;
+        crm_v[idx]   = v_s;
     }
 }
 
@@ -5610,7 +5593,8 @@ kernel void rad_distill_extract_col(
     constant ulong4& u_pack        [[buffer(14)]],  // [nz, M, d_in, (has_aero<<2)|(has_dust<<1)|has_o3]
     constant float4& f_p0          [[buffer(15)]],  // [cp_d, cp_v, co2_f, ch4_f]
     constant float4& f_p1          [[buffer(16)]],  // [n2o_f, 0, 0, 0]
-    uint c                         [[thread_position_in_grid]])
+    uint grp                       [[threadgroup_position_in_grid]],
+    uint lane                      [[thread_position_in_threadgroup]])
 {
     uint nz = uint(u_pack.x);
     uint M = uint(u_pack.y);
@@ -5619,56 +5603,190 @@ kernel void rad_distill_extract_col(
     bool has_o3   = (flags & 1u) != 0u;
     bool has_dust = (flags & 2u) != 0u;
     bool has_aero = (flags & 4u) != 0u;
-    if (c >= M) return;
+    uint c0 = grp * 32u;
+    if (c0 >= M) return;
+    uint n_valid = (c0 + 32u <= M) ? 32u : (M - c0);
+    uint c = c0 + lane;
+    bool active = (lane < n_valid);
+
+    threadgroup float sm_t[32u * 33u];
 
     float cp_d = f_p0.x;
     float cp_v = f_p0.y;
-    uint x_base = c * d_in;
     float cwp_tot = 0.0f;
 
-    for (uint k = 0u; k < nz; ++k) {
-        uint idx = k * M + c;
-        float p = pres_c[idx];
-        float T = temp_c[idx];
-        float qv = max(qv_c[idx], 0.0f);
-        float qc = max(qc_c[idx], 0.0f);
-        float qi = max(qi_c[idx], 0.0f);
-        float dm = max(rho_d_c[idx] * dz_c[idx], 1.0e-6f);
-        cp_layer_out[idx] = (cp_d + cp_v * qv) * dm;
-        cwp_tot += (qc + qi) * dm;
+    // Warp-tiled 32x32 shared-memory transpose: 100% coalesced reads [nz, M] AND 100% coalesced writes [M, d_in]
+    for (uint k0 = 0u; k0 < nz; k0 += 32u) {
+        uint klen = (k0 + 32u <= nz) ? 32u : (nz - k0);
 
-        x_out[x_base + 0u * nz + k] = (T - 250.0f) * 0.02f;
-        x_out[x_base + 1u * nz + k] = (log(max(p, 1.0f)) - 10.0f) * 0.4f;
-        x_out[x_base + 2u * nz + k] = aoba_log1p(qv * 1.0e3f);
-        x_out[x_base + 3u * nz + k] = aoba_log1p(qc * 1.0e4f);
-        x_out[x_base + 4u * nz + k] = aoba_log1p(qi * 1.0e4f);
-        x_out[x_base + 5u * nz + k] = aoba_log1p(dm * 1.0e-3f);
-        x_out[x_base + 6u * nz + k] = has_o3   ? aoba_log1p(max(o3_c[idx], 0.0f) * 1.0e6f)      : 0.0f;
-        x_out[x_base + 7u * nz + k] = has_dust ? aoba_log1p(max(q_dust_c[idx], 0.0f) * 1.0e6f)  : 0.0f;
-        x_out[x_base + 8u * nz + k] = has_aero ? aoba_log1p(max(tau_aero_c[idx], 0.0f) * 10.0f) : 0.0f;
+        // 0: temperature
+        if (active) {
+            for (uint dk = 0u; dk < klen; ++dk) {
+                sm_t[lane * 33u + dk] = (temp_c[(k0 + dk) * M + c] - 250.0f) * 0.02f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < klen) {
+            uint fcol = 0u * nz + k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 1: log(pressure)
+        if (active) {
+            for (uint dk = 0u; dk < klen; ++dk) {
+                sm_t[lane * 33u + dk] = (log(max(pres_c[(k0 + dk) * M + c], 1.0f)) - 10.0f) * 0.4f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < klen) {
+            uint fcol = 1u * nz + k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2: qv
+        if (active) {
+            for (uint dk = 0u; dk < klen; ++dk) {
+                sm_t[lane * 33u + dk] = aoba_log1p(max(qv_c[(k0 + dk) * M + c], 0.0f) * 1.0e3f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < klen) {
+            uint fcol = 2u * nz + k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 3: qc
+        if (active) {
+            for (uint dk = 0u; dk < klen; ++dk) {
+                sm_t[lane * 33u + dk] = aoba_log1p(max(qc_c[(k0 + dk) * M + c], 0.0f) * 1.0e4f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < klen) {
+            uint fcol = 3u * nz + k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 4: qi
+        if (active) {
+            for (uint dk = 0u; dk < klen; ++dk) {
+                sm_t[lane * 33u + dk] = aoba_log1p(max(qi_c[(k0 + dk) * M + c], 0.0f) * 1.0e4f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < klen) {
+            uint fcol = 4u * nz + k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 5: dm + cp_layer_out + cwp_tot accumulation
+        if (active) {
+            for (uint dk = 0u; dk < klen; ++dk) {
+                uint idx = (k0 + dk) * M + c;
+                float dm = max(rho_d_c[idx] * dz_c[idx], 1.0e-6f);
+                float qv = max(qv_c[idx], 0.0f);
+                float qc = max(qc_c[idx], 0.0f);
+                float qi = max(qi_c[idx], 0.0f);
+                cp_layer_out[idx] = (cp_d + cp_v * qv) * dm;
+                cwp_tot += (qc + qi) * dm;
+                sm_t[lane * 33u + dk] = aoba_log1p(dm * 1.0e-3f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < klen) {
+            uint fcol = 5u * nz + k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 6: o3
+        if (has_o3) {
+            if (active) {
+                for (uint dk = 0u; dk < klen; ++dk) {
+                    sm_t[lane * 33u + dk] = aoba_log1p(max(o3_c[(k0 + dk) * M + c], 0.0f) * 1.0e6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane < klen) {
+                uint fcol = 6u * nz + k0 + lane;
+                for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else if (lane < klen) {
+            uint fcol = 6u * nz + k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = 0.0f;
+        }
+
+        // 7: dust
+        if (has_dust) {
+            if (active) {
+                for (uint dk = 0u; dk < klen; ++dk) {
+                    sm_t[lane * 33u + dk] = aoba_log1p(max(q_dust_c[(k0 + dk) * M + c], 0.0f) * 1.0e6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane < klen) {
+                uint fcol = 7u * nz + k0 + lane;
+                for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else if (lane < klen) {
+            uint fcol = 7u * nz + k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = 0.0f;
+        }
+
+        // 8: aerosol optical depth
+        if (has_aero) {
+            if (active) {
+                for (uint dk = 0u; dk < klen; ++dk) {
+                    sm_t[lane * 33u + dk] = aoba_log1p(max(tau_aero_c[(k0 + dk) * M + c], 0.0f) * 10.0f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane < klen) {
+                uint fcol = 8u * nz + k0 + lane;
+                for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else if (lane < klen) {
+            uint fcol = 8u * nz + k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = 0.0f;
+        }
     }
 
-    float t_sfc = sfc_8[0u * M + c];
-    float mu0   = sfc_8[6u * M + c];
-    float s_toa = sfc_8[7u * M + c];
-    float mu_c  = clamp(mu0, 0.0f, 1.0f);
-    float s_inc = mu_c * max(s_toa, 0.0f);
-    s_inc_out[c] = s_inc;
-
-    uint s_off = x_base + 9u * nz;
-    x_out[s_off + 0u]  = mu_c;
-    x_out[s_off + 1u]  = clamp(s_inc * (1.0f / 1361.0f), 0.0f, 4.0f);
-    x_out[s_off + 2u]  = (mu0 > 1.0e-4f) ? 1.0f : 0.0f;
-    x_out[s_off + 3u]  = clamp(sfc_8[1u * M + c], 0.0f, 1.0f);
-    x_out[s_off + 4u]  = clamp(sfc_8[2u * M + c], 0.0f, 1.0f);
-    x_out[s_off + 5u]  = clamp(sfc_8[3u * M + c], 0.0f, 1.0f);
-    x_out[s_off + 6u]  = clamp(sfc_8[4u * M + c], 0.0f, 1.0f);
-    x_out[s_off + 7u]  = clamp(sfc_8[5u * M + c], 0.0f, 1.0f);
-    x_out[s_off + 8u]  = clamp((t_sfc - 280.0f) * 0.03f, -6.0f, 6.0f);
-    x_out[s_off + 9u]  = f_p0.z;
-    x_out[s_off + 10u] = f_p0.w;
-    x_out[s_off + 11u] = f_p1.x;
-    x_out[s_off + 12u] = aoba_log1p(max(cwp_tot, 0.0f) * 10.0f);
+    // 13 trailing surface & greenhouse-gas scalars (transposed via sm_t)
+    if (active) {
+        float t_sfc = sfc_8[0u * M + c];
+        float mu0   = sfc_8[6u * M + c];
+        float s_toa = sfc_8[7u * M + c];
+        float mu_c  = clamp(mu0, 0.0f, 1.0f);
+        float s_inc = mu_c * max(s_toa, 0.0f);
+        s_inc_out[c] = s_inc;
+        uint row_s = lane * 33u;
+        sm_t[row_s + 0u]  = mu_c;
+        sm_t[row_s + 1u]  = clamp(s_inc * (1.0f / 1361.0f), 0.0f, 4.0f);
+        sm_t[row_s + 2u]  = (mu0 > 1.0e-4f) ? 1.0f : 0.0f;
+        sm_t[row_s + 3u]  = clamp(sfc_8[1u * M + c], 0.0f, 1.0f);
+        sm_t[row_s + 4u]  = clamp(sfc_8[2u * M + c], 0.0f, 1.0f);
+        sm_t[row_s + 5u]  = clamp(sfc_8[3u * M + c], 0.0f, 1.0f);
+        sm_t[row_s + 6u]  = clamp(sfc_8[4u * M + c], 0.0f, 1.0f);
+        sm_t[row_s + 7u]  = clamp(sfc_8[5u * M + c], 0.0f, 1.0f);
+        sm_t[row_s + 8u]  = clamp((t_sfc - 280.0f) * 0.03f, -6.0f, 6.0f);
+        sm_t[row_s + 9u]  = f_p0.z;
+        sm_t[row_s + 10u] = f_p0.w;
+        sm_t[row_s + 11u] = f_p1.x;
+        sm_t[row_s + 12u] = aoba_log1p(max(cwp_tot, 0.0f) * 10.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 13u) {
+        uint fcol = 9u * nz + lane;
+        for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+    }
 }
 
 kernel void rad_distill_closure_col(
@@ -7231,7 +7349,8 @@ def run_crm_student_tile_update_metal(
         rain_3d, snow_3d,
         [nz, nc, (int(ny_t) << 16) | int(nx_t), flags],
         [float(dt), float(C.CP_D), 0.85, 0.0],
-        threads=nc,
+        threads=(nc * n_sub,),
+        group_size=(n_sub,),
     )
 
 
@@ -7485,6 +7604,7 @@ def run_rad_distill_extract_metal(
     x_out = torch.empty((m_col, d_in), device=dev, dtype=dtype)
     cp_layer = torch.empty((nz, m_col), device=dev, dtype=dtype)
     s_inc = torch.empty((m_col,), device=dev, dtype=dtype)
+    n_thr = ((m_col + 31) // 32) * 32
     lib.rad_distill_extract_col(
         pres_c.contiguous(), temp_c.contiguous(), dz_c.contiguous(),
         rho_d_c.contiguous(), qv_c.contiguous(), qc_c.contiguous(), qi_c.contiguous(),
@@ -7495,7 +7615,8 @@ def run_rad_distill_extract_metal(
         [nz, m_col, d_in, flags],
         [float(C.CP_D), float(C.CP_V), float(co2_f), float(ch4_f)],
         [float(n2o_f), 0.0, 0.0, 0.0],
-        threads=m_col,
+        threads=(n_thr,),
+        group_size=(32,),
     )
     return x_out, cp_layer, s_inc
 
