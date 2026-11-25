@@ -1456,9 +1456,9 @@ $$
 | `true` *(既定：超パラメタリゼーション SP)* | 粗い全球親格子（G3–G5）＋各セル内埋め込み CRM（任意 `crm_dx`、既定 $4\ \mathrm{km}$）＋MAML | 数十年〜数百年の多世紀気候積分を単一 GPU で実行しつつ、積雲パラメタリゼーションなしで深い対流・MJO・日周対流・サブグリッド陸面不均一性を陽的に表現できる。 | 2D カーテン（`crm_ny=1`）では CRM 内の 3 次元回転力学・メソ対流系回転が簡略化され、親セル間の直接的なサブグリッド水平伝播は親格子平均場を介する。 |
 | `false`（単独全球雲解像 GCRM） | 埋め込み CRM なし・全球 SCVT 格子単体 | 親–子スケール分離や周期境界仮定が一切存在せず、高解像度格子（G8–G10 相当）で全球の対流・前線・地形流を連続 3 次元解像できる。 | 対流を陽的に解像するには水平格子幅 $\le 4\text{–}10\ \mathrm{km}$ が必要となり、粗い格子（G3–G5）で単独実行すると格子スケール対流が過大または遅延する。 |
 
-### 8.7 ペア型オンライン能動学習 CRM・ICA 放射代理モデル (`src/aoba/crm_self_distill.py`)
+### 8.7 オンライン代理超パラメタリゼーション（Online Surrogate Superparameterization, OSSP; `src/aoba/crm_self_distill.py`）
 
-`enable_crm_self_distill = true` および `enable_rad_self_distill = true` のとき、空間層化ローテーションと高エピステミック不確実性（OOD）選択によって抽出した教師親セル（`1 / crm_distill_stride`）のみで本物の 2D/3D CRM と厳密 ICA / 3D-TICA 放射伝達を実行し、残りのセルを GPU リング・リザーバ再生バッファ付き 2 ヘッド残差 MLP（`CRMSelfDistillNet` と `RadSelfDistillNet`）でオンライン推論する。事前学習済み重みを持たないため、惑星気候・古気候・急激な放射強制変化にも実行中に自律適応する。
+`enable_crm_self_distill = true` および `enable_rad_self_distill = true` のとき、AOBA はオンライン代理超パラメタリゼーション（OSSP）を有効化し、空間層化ローテーションと高エピステミック不確実性（OOD）選択によって抽出した教師親セル（`1 / crm_distill_stride`）のみで本物の 2D/3D CRM と厳密 ICA / 3D-TICA 放射伝達を実行し、残りのセルを GPU リング・リザーバ再生バッファ付き 2 ヘッド残差 MLP（`CRMSelfDistillNet` と `RadSelfDistillNet`）でオンライン推論する。事前学習済み重みを持たないため、惑星気候・古気候・急激な放射強制変化にも実行中に自律適応する。
 
 すべての代理推論カラムは融合 GPU カーネル（`crm_distill_closure_col`, `rad_distill_closure_col`）内で厳密な物理保存クロージャを通過する。気圧テーパ付き対流包絡関数 $s_{\mathrm{conv}}(\Pi)$ は対流圏全域（$p \ge 210\ \mathrm{hPa}$）で $1$ をとり、$90\ \mathrm{hPa}$ 圏界面コールドポイント（$\Pi \le 0.50$）以高で滑らかに $0$ へ減衰し、成層圏・中間圏の気温・水蒸気・運動量を完全に不変に保つ。対流領域（$s_{\mathrm{conv}} > 0$）では、水物質増分を局所 Clausius–Clapeyron 飽和混合比 $q_{\mathrm{sat}}(T_{\mathrm{env}}, p_{\mathrm{env}})$ で有界化して列総水量を機械精度で保存し、地表面顕熱フラックス $\mathrm{SHF}\,\Delta t$ を最下層境界層（$p \gtrsim 0.95\,p_s$）へ事前注入した上で、真気温空間 $T = \Pi\theta_m / (1 + (R_v/R_d) q_v)$ にて厳密顕熱エンタルピー保存クロージャを課す：
 

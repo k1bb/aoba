@@ -187,32 +187,32 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "en": "Number of independent MAML land/sea-ice surface tiles per host cell [-] for large-domain CRMs (e.g. RCE_large with crm_nx=64-128). 0 couples 1:1 with crm_ny*crm_nx (default); setting e.g. 8 tiles contiguous CRM blocks to keep land cost bounded while preserving patch heterogeneity.",
     },
     "enable_crm_self_distill": {
-        "ja": "オンライン自己蒸留・Active-Learning 2D/3D CRM 加速の有効化（既定 false）。一部の列のみ本物 CRM を連続実行し、残りを保存則制約付き密行列積 MLP＋周期 2D 空間ヘッド（地表面不均一性の空間配置・植生風・森林ロック対応）で推論しながら同時学習する。",
-        "en": "Enable online self-distilling / active-learning 2D/3D CRM acceleration (default false). Runs the genuine CRM on a rotating + high-uncertainty teacher subset while a conservation-constrained dense-GEMM MLP and periodic 2D spatial head (resolving surface patch clustering, vegetation breezes, and forest-locking) emulate the rest and learn online.",
+        "ja": "オンライン代理超パラメタリゼーション（Online Surrogate Superparameterization, OSSP）の 2D/3D CRM 代理加速の有効化（既定 false）。一部の教師列のみ本物 CRM を連続実行し、残りを厳密保存則クロージャ付き密行列積 MLP＋周期 2D 空間ヘッド（地表面不均一性の空間配置・植生風・森林ロック対応）でオンライン推論・同時学習する。",
+        "en": "Enable 2D/3D CRM emulation for Online Surrogate Superparameterization (OSSP; default false). Executes the genuine CRM on a rotating + high-uncertainty teacher subset while a conservation-constrained dense-GEMM MLP and periodic 2D spatial head (resolving surface patch clustering, vegetation breezes, and forest-locking) emulate the remaining columns and train online.",
     },
     "enable_rad_self_distill": {
-        "ja": "オンライン自己蒸留サブカラム ICA 放射伝達加速の有効化（既定 false）。教師列（CRM 自己蒸留と同期）のみ本物 CKD/RRTMGP 放射を解き、残りのサブカラムを厳密エネルギー保存制約付き学生 MLP で推論しつつ同時学習する（陸面各タイルのアルベド・射出率はそのまま保持）。",
-        "en": "Enable online self-distilling per-subcolumn ICA radiative transfer acceleration (default false). Runs genuine CKD/RRTMGP radiation on teacher columns (synced with CRM distillation) while a column-energy-conserving student MLP emulates the remaining subcolumns online while preserving exact per-tile surface albedo and emissivity.",
+        "ja": "OSSP サブカラム ICA 放射伝達代理モデルの有効化（既定 false）。教師列（CRM 教師と同期）のみ本物 CKD/RRTMGP 放射を解き、残りのサブカラムを厳密列エネルギー保存制約付き代理 MLP で推論しつつ同時学習する（陸面各タイルのアルベド・射出率はそのまま保持）。",
+        "en": "Enable per-subcolumn ICA radiative transfer emulation for Online Surrogate Superparameterization (OSSP; default false). Runs genuine CKD/RRTMGP radiation on teacher columns (synced with CRM teachers) while a column-energy-conserving surrogate MLP emulates the remaining subcolumns online while preserving exact per-tile surface albedo and emissivity.",
     },
     "crm_distill_stride": {
-        "ja": "自己蒸留 CRM の教師列ストライド [-]。毎ステップ全球の 1/stride の列（既定 13 ≒ 7.7%）のみ本物 2D CRM を実行する。大きいほど高速。",
-        "en": "Teacher sampling stride [-] for self-distilling CRM (1 in `stride` columns executes the genuine 2D CRM per step; default 13 ≈ 7.7%). Larger values increase speedup.",
+        "ja": "OSSP の教師列ストライド [-]。毎ステップ全球の 1/stride の列（既定 13 ≒ 7.7%）のみ本物 2D/3D CRM を実行する。大きいほど高速。",
+        "en": "Teacher sampling stride [-] for OSSP (1 in `stride` columns executes the genuine 2D/3D CRM per step; default 13 ≈ 7.7%). Larger values increase speedup.",
     },
     "crm_distill_warmup_steps": {
-        "ja": "自己蒸留 CRM の初期ウォームアップステップ数 [-]。この期間中は全列で本物 2D CRM を実行してリプレイバッファを充填し学生モデルを事前学習する（既定 24）。",
-        "en": "Initial warmup steps [-] running 100% genuine 2D CRM to populate the GPU replay buffer and pre-train the student before activating surrogate inference (default 24).",
+        "ja": "OSSP の初期ウォームアップステップ数 [-]。この期間中は本物 CRM でリプレイバッファを充填し代理モデルを初期学習する（既定 24）。",
+        "en": "Initial warmup steps [-] for OSSP to populate the GPU replay buffer from the genuine CRM and pre-train the surrogate before activating full surrogate inference (default 24).",
     },
     "crm_distill_dwell_steps": {
-        "ja": "自己蒸留 CRM 教師ローテーション班の連続滞在ステップ数 [-]（既定 12）。48 以上（例：240 ≒ 5日）にすると教師の 50% を全球層化永続アンカー列として固定し、RCE_large の対流自己組織化を長期連続発展させながら学習できる。",
-        "en": "Continuous teacher dwell steps [-] per rotating cohort (default 12). Values >= 48 (e.g., 240 ≈ 5 days) activate a 50% globally stratified persistent anchor cohort so RCEMIP-class convective self-aggregation matures uninterrupted.",
+        "ja": "OSSP 教師ローテーション班の連続滞在ステップ数 [-]（既定 12）。48 以上（例：240 ≒ 5日）にすると教師の 50% を全球層化永続アンカー列として固定し、RCE_large の対流自己組織化を長期連続発展させながら学習できる。",
+        "en": "Continuous teacher dwell steps [-] per rotating OSSP cohort (default 12). Values >= 48 (e.g., 240 ≈ 5 days) activate a 50% globally stratified persistent anchor cohort so RCEMIP-class convective self-aggregation matures uninterrupted.",
     },
     "crm_distill_hidden_dim": {
-        "ja": "自己蒸留 CRM 学生ネットワーク（純粋密行列積 Residual Column MLP）の隠れ層幅 [-]（既定 192）。増やすと表現力が上がり、減らすと推論が高速化する。",
-        "en": "Hidden layer width [-] of the conservation-constrained dense-GEMM residual column MLP student emulator (default 192). Larger increases capacity; smaller speeds up inference.",
+        "ja": "OSSP CRM 代理ネットワーク（純粋密行列積 Residual Column MLP）の隠れ層幅 [-]（既定 192）。増やすと表現力が上がり、減らすと推論が高速化する。",
+        "en": "Hidden layer width [-] of the conservation-constrained dense-GEMM residual column MLP OSSP CRM surrogate (default 192). Larger increases capacity; smaller speeds up inference.",
     },
     "crm_distill_replay_size": {
-        "ja": "自己蒸留 CRM の GPU 常駐リプレイバッファ容量（保持列数）[-]（既定 65536）。季節・緯度多様性を保持して破滅的忘却を防ぐ。",
-        "en": "Capacity (number of atmospheric columns) of the GPU-resident stratified replay buffer [-] preventing seasonal and latitudinal forgetting (default 65536).",
+        "ja": "OSSP の GPU 常駐リプレイバッファ容量（保持列数）[-]（既定 65536）。季節・緯度多様性を保持して破滅的忘却を防ぐ。",
+        "en": "Capacity (number of atmospheric columns) of the GPU-resident stratified OSSP replay buffer [-] preventing seasonal and latitudinal forgetting (default 65536).",
     },
     "enable_dust": {
         "ja": "地図不要の鉱物ダスト飛散・3D 輸送・放射・氷晶核 (INP) 結合の有効化。",
