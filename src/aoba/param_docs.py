@@ -182,6 +182,26 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "ja": "埋め込み CRM による超パラメタリゼーション (SP) の有効化。false にすると単独の全球雲解像モデルモードになる。",
         "en": "Enable embedded-CRM superparameterization (SP). False switches AOBA into standalone global CRM mode.",
     },
+    "enable_crm_self_distill": {
+        "ja": "オンライン自己蒸留・Active-Learning 2D CRM 加速の有効化（既定 false）。一部の列のみ本物 2D CRM を連続実行し、残りを保存則制約付き軽量 1D-ResNet で推論しながら同時学習する。",
+        "en": "Enable online self-distilling / active-learning 2D CRM acceleration (default false). Runs the genuine 2D CRM on a rotating + high-uncertainty subset of columns while a conservation-constrained 1D-ResNet emulates the rest and learns online.",
+    },
+    "crm_distill_stride": {
+        "ja": "自己蒸留 CRM の教師列ストライド [-]。毎ステップ全球の 1/stride の列（既定 13 ≒ 7.7%）のみ本物 2D CRM を実行する。大きいほど高速。",
+        "en": "Teacher sampling stride [-] for self-distilling CRM (1 in `stride` columns executes the genuine 2D CRM per step; default 13 ≈ 7.7%). Larger values increase speedup.",
+    },
+    "crm_distill_warmup_steps": {
+        "ja": "自己蒸留 CRM の初期ウォームアップステップ数 [-]。この期間中は全列で本物 2D CRM を実行してリプレイバッファを充填し学生モデルを事前学習する（既定 24）。",
+        "en": "Initial warmup steps [-] running 100% genuine 2D CRM to populate the GPU replay buffer and pre-train the student before activating surrogate inference (default 24).",
+    },
+    "crm_distill_hidden_dim": {
+        "ja": "自己蒸留 CRM 学生ネットワーク（純粋密行列積 Residual Column MLP）の隠れ層幅 [-]（既定 192）。増やすと表現力が上がり、減らすと推論が高速化する。",
+        "en": "Hidden layer width [-] of the conservation-constrained dense-GEMM residual column MLP student emulator (default 192). Larger increases capacity; smaller speeds up inference.",
+    },
+    "crm_distill_replay_size": {
+        "ja": "自己蒸留 CRM の GPU 常駐リプレイバッファ容量（保持列数）[-]（既定 65536）。季節・緯度多様性を保持して破滅的忘却を防ぐ。",
+        "en": "Capacity (number of atmospheric columns) of the GPU-resident stratified replay buffer [-] preventing seasonal and latitudinal forgetting (default 65536).",
+    },
     "enable_dust": {
         "ja": "地図不要の鉱物ダスト飛散・3D 輸送・放射・氷晶核 (INP) 結合の有効化。",
         "en": "Enable map-free wind-driven mineral dust emission, 3D FCT transport, radiative forcing, and INP coupling.",
