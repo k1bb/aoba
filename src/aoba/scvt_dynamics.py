@@ -36,6 +36,7 @@ from aoba.kernels import (
     dispatch_scvt_div_metal,
     dispatch_scvt_fast_acoustic_metal,
     dispatch_scvt_fct_advect_metal,
+    dispatch_scvt_rk3_prep_metal,
     dispatch_scvt_scalar_lap_metal,
     dispatch_scvt_trisk_rot_metal,
     dispatch_scvt_vec_lap_metal,
@@ -742,15 +743,28 @@ def step_scvt_rk3_hevi(
 
         n_ac = max(1, int(math.ceil(dtau / dt_ac_max)))
         dt_ac = dtau / float(n_ac)
-        (
-            pres_s, dp_dThm_s, m_edge, thm_e, rtot_e, fac_z0, fac_z1,
-            u_dot_gradz_s, tend_u_slow, rho_dw, rtot_w, thm_w, dl, diag, du,
-        ) = prep_fn(
-            m_s, Thm_s, u_s, w_s, dz_c, dz_w_int, dz_w_e, state.z_c,
-            q_load, dc_e, area_e, area_c, zw_slope_e, valid_ce,
-            mesh.edges_on_cell, c0, c1, rot_acc, visc_u, du_ext,
-            sponge_w, dt_ac, beta_hevi,
-        )
+        if can_use_crm_metal(m_s):
+            (
+                pres_s, dp_dThm_s, m_edge, thm_e, rtot_e, fac_z0, fac_z1,
+                u_dot_gradz_s, tend_u_slow, rho_dw, rtot_w, thm_w, dl, diag, du,
+            ) = dispatch_scvt_rk3_prep_metal(
+                mesh,
+                m_s=m_s, Thm_s=Thm_s, u_s=u_s, w_s=w_s,
+                dz_c=dz_c, dz_w_int=dz_w_int, dz_w_e=dz_w_e, z_c=state.z_c,
+                q_load=q_load, area_e=area_e, zw_slope_e=zw_slope_e,
+                rot_acc=rot_acc, visc_u=visc_u, du_ext=du_ext,
+                sponge_w=sponge_w, dt_ac=dt_ac, beta_hevi=beta_hevi,
+            )
+        else:
+            (
+                pres_s, dp_dThm_s, m_edge, thm_e, rtot_e, fac_z0, fac_z1,
+                u_dot_gradz_s, tend_u_slow, rho_dw, rtot_w, thm_w, dl, diag, du,
+            ) = prep_fn(
+                m_s, Thm_s, u_s, w_s, dz_c, dz_w_int, dz_w_e, state.z_c,
+                q_load, dc_e, area_e, area_c, zw_slope_e, valid_ce,
+                mesh.edges_on_cell, c0, c1, rot_acc, visc_u, du_ext,
+                sponge_w, dt_ac, beta_hevi,
+            )
 
         # --- Fast Horizontal Acoustic + Vertical Implicit HEVI Loop from U^0 over n_ac steps of dt_ac ---
         if stage_idx == 0:

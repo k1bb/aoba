@@ -9,6 +9,7 @@ from aoba.crm_self_distill import (
     SubgridSpatialHead,
     apply_exact_conservation_closure,
     apply_exact_rad_conservation_closure,
+    apply_subgrid_coldpool_outflow,
     apply_subgrid_surface_microclimate,
     compute_periodic_spatial_stats,
     compute_subgrid_structure_features,
@@ -154,7 +155,7 @@ def test_learned_spatial_placement_forest_locking_and_microclimate() -> None:
     p_tgt = forest / forest.sum(dim=(-2, -1), keepdim=True)
 
     for _ in range(80):
-        sc, sp = head(h_col, sub_maps)
+        sc, sp, dt_cp, dq_cp, ug_cp = head(h_col, sub_maps)
         loss = -(p_tgt.reshape(b, -1) * torch.log_softmax(sp.reshape(b, -1), dim=-1)).sum(dim=-1).mean()
         loss = loss - (p_tgt.reshape(b, -1) * torch.log_softmax(sc.reshape(b, -1), dim=-1)).sum(dim=-1).mean()
         opt.zero_grad()
@@ -162,7 +163,10 @@ def test_learned_spatial_placement_forest_locking_and_microclimate() -> None:
         opt.step()
 
     with torch.no_grad():
-        sc_eval, sp_eval = head(h_col, sub_maps)
+        sc_eval, sp_eval, dt_cp_eval, dq_cp_eval, ug_cp_eval = head(h_col, sub_maps)
+        assert float(dt_cp_eval.mean(dim=(-2, -1)).abs().max()) < 1.0e-5
+        assert float(dq_cp_eval.mean(dim=(-2, -1)).abs().max()) < 1.0e-7
+        assert bool((ug_cp_eval >= 0.0).all())
         nz = 4
         qv = torch.full((nz, b), 0.01)
         qc = torch.full((nz, b), 2.0e-4)
@@ -182,6 +186,17 @@ def test_learned_spatial_placement_forest_locking_and_microclimate() -> None:
         assert float((qc4.mean(dim=(-2, -1)) - qc).abs().max()) < 1.0e-7
         rain_on_forest_frac = float((rain3 * forest).sum() / rain3.sum())
         assert rain_on_forest_frac > 0.95, f"Expected >95% rain locked onto forest, got {rain_on_forest_frac:.3f}"
+
+        # Verify radial density-current outflow preserves exact cell-mean momentum and matches gust EKE
+        u_mean0 = torch.full((b,), 2.0)
+        v_mean0 = torch.full((b,), -1.5)
+        dthm_test = -3.0 * (forest - forest.mean(dim=(-2, -1), keepdim=True))
+        ug_test = 1.0 + 4.0 * forest
+        u0_cp, v0_cp = apply_subgrid_coldpool_outflow(u_mean0, v_mean0, dthm_test, ug_test, cids, step_count=12)
+        assert float((u0_cp.mean(dim=(-2, -1)) - u_mean0).abs().max()) < 1.0e-5
+        assert float((v0_cp.mean(dim=(-2, -1)) - v_mean0).abs().max()) < 1.0e-5
+        eke_out = ((u0_cp - u_mean0[:, None, None]) ** 2 + (v0_cp - v_mean0[:, None, None]) ** 2).mean(dim=(-2, -1))
+        assert bool((eke_out > 1.0).all()), "Cold-pool outflow must inject non-zero gust kinetic energy"
 
     # Verify zero-mean surface microclimate warms burned tiles and moistens forest tiles
     thm0 = torch.full((2, 1, 8), 300.0)
@@ -366,9 +381,13 @@ def test_rcelarge_decoupled_surface_tiles_and_persistent_anchor() -> None:
     t1, _ = select_teacher_indices(m.crm_distill)
     m.crm_distill.steps_seen = 10 + 64
     t2, _ = select_teacher_indices(m.crm_distill)
-    anchors = set(torch.nonzero(m.crm_distill.cohort_id == 0, as_tuple=False).squeeze(-1).tolist())
-    assert len(anchors.intersection(set(t1.tolist()))) >= 1
-    assert anchors.intersection(set(t1.tolist())) == anchors.intersection(set(t2.tolist()))
+    anchor_all = torch.nonzero(m.crm_distill.cohort_id == 0, as_tuple=False).squeeze(-1).tolist()
+    n_teach = max(1, (m.crm_distill.n_cells + m.crm_distill.stride - 1) // m.crm_distill.stride)
+    n_anchor = min(len(anchor_all), max(n_teach // 2, 1))
+    persistent_anchors = set(anchor_all[:n_anchor])
+    assert len(persistent_anchors) >= 1
+    assert persistent_anchors.issubset(set(t1.tolist()))
+    assert persistent_anchors.issubset(set(t2.tolist()))
     print(
         f"  [PASS] RCE_large (nx=64, sfc_tiles=8, dwell=64 persistent anchor) ({dev}): "
         f"Ts={d.global_mean_t_sfc_k:.2f}K OLR={d.global_mean_olr_wm2:.1f} ASR={d.global_mean_asr_wm2:.1f}"

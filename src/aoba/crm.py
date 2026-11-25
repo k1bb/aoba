@@ -43,6 +43,7 @@ from aoba.kernels import (
     can_use_crm_metal,
     dispatch_crm_fct_advect_metal,
     dispatch_crm_fct_pair_metal,
+    mean_2d,
     dispatch_crm_fct_quad_metal,
     dispatch_crm_sgs_metal,
     run_crm_rk3_hevi_metal,
@@ -174,7 +175,7 @@ def build_discrete_hydrostatic_rcemip_crm(
         gen.manual_seed(seed)
         # Zero-mean random boundary-layer thermal noise in lowest 4 levels (Wing et al., 2018)
         noise = (torch.rand((4, n_col, ny, nx), generator=gen, dtype=torch.float32) - 0.5) * 2.0 * pert_amplitude_k
-        noise = noise - noise.mean(dim=(-2, -1), keepdim=True)
+        noise = noise - mean_2d(noise, keepdim=True)
         theta_m[:4] = theta_m[:4] + noise.to(device=dev, dtype=dtype)
 
     zeros = torch.zeros(shape4, device=dev, dtype=dtype)
@@ -708,8 +709,8 @@ def step_crm_rk3_hevi(
     f_col_3d = crm.f_coriolis.view(1, -1, 1, 1) if use_3d_pert_cor else None
     if use_3d_pert_cor and can_use_crm_metal(rho0):
         # Metal fast path uses stage-frozen slow tendency; perturbation Coriolis has |f*dt_sub| < 0.008 with SGS damping
-        u_pert0 = u0 - u0.mean(dim=(-2, -1), keepdim=True)
-        v_pert0 = v0 - v0.mean(dim=(-2, -1), keepdim=True)
+        u_pert0 = u0 - mean_2d(u0, keepdim=True)
+        v_pert0 = v0 - mean_2d(v0, keepdim=True)
         du_sgs = du_sgs + f_col_3d * v_pert0
         dv_sgs = dv_sgs - f_col_3d * u_pert0
 
@@ -802,16 +803,16 @@ def step_crm_rk3_hevi(
         vadv_v = _upwind_vertical_advect(v_s, w_vy, dz_w_int)
 
         if use_3d_pert_cor and f_col_3d is not None:
-            v_c_pert = v_c - v_c.mean(dim=(-2, -1), keepdim=True)
-            u_c_pert = u_c - u_c.mean(dim=(-2, -1), keepdim=True)
+            v_c_pert = v_c - mean_2d(v_c, keepdim=True)
+            u_c_pert = u_c - mean_2d(u_c, keepdim=True)
             cor_u = f_col_3d * 0.5 * (v_c_pert + torch.roll(v_c_pert, -1, -1))
             cor_v = -f_col_3d * 0.5 * (u_c_pert + torch.roll(u_c_pert, -1, -2))
         else:
             cor_u = 0.0
             cor_v = 0.0
 
-        u_anom = u_s - u_s.mean(dim=(-2, -1), keepdim=True)
-        v_anom = v_s - v_s.mean(dim=(-2, -1), keepdim=True)
+        u_anom = u_s - mean_2d(u_s, keepdim=True)
+        v_anom = v_s - mean_2d(v_s, keepdim=True)
 
         tend_u_slow = adv_u + vadv_u + cor_u + du_sgs - sponge_c * u_anom
         tend_v_slow = adv_v + vadv_v + cor_v + dv_sgs - sponge_c * v_anom
@@ -922,11 +923,11 @@ def step_crm_physics_and_dynamics(
             crm.n_i = torch.zeros_like(crm.q_i)
 
     # Record initial horizontal-mean profiles before CRM physics + subgrid transport
-    thm_mean_0 = crm.theta_m.mean(dim=(-2, -1))
-    qn_mean_0 = crm.q_n.mean(dim=(-2, -1))
-    qp_mean_0 = crm.q_p.mean(dim=(-2, -1))
-    u_mean_0 = crm.u.mean(dim=(-2, -1))
-    v_mean_0 = crm.v.mean(dim=(-2, -1))
+    thm_mean_0 = mean_2d(crm.theta_m)
+    qn_mean_0 = mean_2d(crm.q_n)
+    qp_mean_0 = mean_2d(crm.q_p)
+    u_mean_0 = mean_2d(crm.u)
+    v_mean_0 = mean_2d(crm.v)
 
     # 1. Apply optional large-scale host forcing & radiative heating
     if dtheta_m_ls_dt is not None:
@@ -945,8 +946,8 @@ def step_crm_physics_and_dynamics(
     # Relax horizontal-mean CRM momentum toward host velocity if coupled in SP mode
     if u_host_target is not None and v_host_target is not None:
         alpha_m = min(dt_crm / max(tau_sp_mom, dt_crm), 1.0)
-        du_relax = alpha_m * (u_host_target.view(nz, n_col, 1, 1) - crm.u.mean(dim=(-2, -1), keepdim=True))
-        dv_relax = alpha_m * (v_host_target.view(nz, n_col, 1, 1) - crm.v.mean(dim=(-2, -1), keepdim=True))
+        du_relax = alpha_m * (u_host_target.view(nz, n_col, 1, 1) - mean_2d(crm.u, keepdim=True))
+        dv_relax = alpha_m * (v_host_target.view(nz, n_col, 1, 1) - mean_2d(crm.v, keepdim=True))
         crm.u = crm.u + du_relax
         crm.v = crm.v + dv_relax
 
@@ -1180,8 +1181,8 @@ def step_crm_physics_and_dynamics(
         )
         crm.q_n = crm.q_v + crm.q_c + crm.q_i
         crm.q_p = crm.q_r + crm.q_s + crm.q_g
-        rain_col = rain_sub.mean(dim=(-2, -1))
-        snow_col = snow_sub.mean(dim=(-2, -1))
+        rain_col = mean_2d(rain_sub)
+        snow_col = mean_2d(snow_sub)
     else:
         if use_2m_mp and crm.n_c is not None and crm.n_i is not None:
             w_center = 0.5 * (crm.w[:-1] + crm.w[1:])
@@ -1224,18 +1225,18 @@ def step_crm_physics_and_dynamics(
 
         rain_sub = mp.precip_rain.reshape(n_col, ny, nx)
         snow_sub = mp.precip_snow.reshape(n_col, ny, nx)
-        rain_col = rain_sub.mean(dim=(-2, -1))
-        snow_col = snow_sub.mean(dim=(-2, -1))
+        rain_col = mean_2d(rain_sub)
+        snow_col = mean_2d(snow_sub)
 
     # Diagnose net CRM physics/convective tendencies relative to pre-step + LS forcing
     thm_ls = dtheta_m_ls_dt if dtheta_m_ls_dt is not None else torch.zeros_like(thm_mean_0)
     qn_ls = dq_n_ls_dt if dq_n_ls_dt is not None else torch.zeros_like(qn_mean_0)
 
-    dthm_crm = (crm.theta_m.mean(dim=(-2, -1)) - thm_mean_0) / dt_crm - thm_ls
-    dqn_crm = (crm.q_n.mean(dim=(-2, -1)) - qn_mean_0) / dt_crm - qn_ls
-    dqp_crm = (crm.q_p.mean(dim=(-2, -1)) - qp_mean_0) / dt_crm
-    du_crm = (crm.u.mean(dim=(-2, -1)) - u_mean_0) / dt_crm
-    dv_crm = (crm.v.mean(dim=(-2, -1)) - v_mean_0) / dt_crm
+    dthm_crm = (mean_2d(crm.theta_m) - thm_mean_0) / dt_crm - thm_ls
+    dqn_crm = (mean_2d(crm.q_n) - qn_mean_0) / dt_crm - qn_ls
+    dqp_crm = (mean_2d(crm.q_p) - qp_mean_0) / dt_crm
+    du_crm = (mean_2d(crm.u) - u_mean_0) / dt_crm
+    dv_crm = (mean_2d(crm.v) - v_mean_0) / dt_crm
 
     return SPTendencies(
         dtheta_m_dt=dthm_crm,
@@ -1292,7 +1293,7 @@ def step_coupled_crm_rce(
         return t.view(n_col, 1, 1).expand(n_col, ny, nx).reshape(m_sub)
 
     def _mean_sub(t: torch.Tensor) -> torch.Tensor:
-        return t.reshape(n_col, ny, nx).mean(dim=(-2, -1))
+        return t.reshape(n_col, ny * nx).mean(dim=-1)
 
     # 1. Subcolumn thermodynamic & centered lowest-layer wind profiles [Nz, m_sub]
     rho_sub = crm.rho_d.reshape(nz, m_sub)

@@ -161,13 +161,13 @@ def compute_crm_lightning_and_lnox(
     f_cg_sub = 1.0 / (1.0 + z_ic_cg)
     flash_cg_sub = flash_tot_sub * f_cg_sub
 
-    flash_tot_cell = flash_tot_sub.mean(dim=(-2, -1))
-    flash_cg_cell = flash_cg_sub.mean(dim=(-2, -1))
+    flash_tot_cell = flash_tot_sub.reshape(flash_tot_sub.shape[0], -1).mean(dim=-1)
+    flash_cg_cell = flash_cg_sub.reshape(flash_cg_sub.shape[0], -1).mean(dim=-1)
 
     # 3. Schumann & Huntrieser (2007) natural LNOx production & mass-conserving N deposition
     #    50% deposited locally with the storm, 50% distributed globally as background atmospheric NOx
     lnox_local_sub = LNOX_KG_N_PER_FLASH * flash_tot_sub
-    lnox_cell = lnox_local_sub.mean(dim=(-2, -1))
+    lnox_cell = lnox_local_sub.reshape(lnox_local_sub.shape[0], -1).mean(dim=-1)
     area_w = area_cell.to(device=dev, dtype=dtype)
     area_sum = torch.clamp(area_w.sum(), min=1.0)
     lnox_global_mean = (lnox_cell * area_w).sum() / area_sum
@@ -175,7 +175,7 @@ def compute_crm_lightning_and_lnox(
     n_dep_lnox_sub = (
         LNOX_LOCAL_DEP_FRAC * lnox_local_sub + (1.0 - LNOX_LOCAL_DEP_FRAC) * lnox_global_mean
     )
-    n_dep_lnox_cell = n_dep_lnox_sub.mean(dim=(-2, -1))
+    n_dep_lnox_cell = n_dep_lnox_sub.reshape(n_dep_lnox_sub.shape[0], -1).mean(dim=-1)
 
     return LightningDiagnostics(
         flash_tot_sub=flash_tot_sub,

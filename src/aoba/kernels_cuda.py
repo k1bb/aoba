@@ -158,7 +158,11 @@ def _cuda_param_decl(p: KernelParam) -> str:
 def _transform_body_code(code: str) -> str:
     """Translate MSL expressions/qualifiers inside helpers and kernel bodies to CUDA C++17."""
     # Address-space qualifiers on local pointers/references and shared arrays
-    code = re.sub(r"\bthreadgroup_barrier\s*\(\s*mem_flags::mem_threadgroup\s*\)", "AOBA_SYNCTHREADS()", code)
+    code = re.sub(
+        r"\bthreadgroup_barrier\s*\(\s*mem_flags::(?:mem_threadgroup|mem_device)(?:\s*\|\s*mem_flags::(?:mem_threadgroup|mem_device))?\s*\)",
+        "AOBA_SYNCTHREADS()",
+        code,
+    )
     code = re.sub(r"\bthreadgroup\b", "AOBA_SHARED", code)
     code = re.sub(r"\bdevice\s+const\b", "const", code)
     code = re.sub(r"\bdevice\b\s+", "", code)

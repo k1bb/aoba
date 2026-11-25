@@ -694,7 +694,7 @@ def step_land_carbon_and_fire(
         assert maml_shape is not None
         nc_cg, ny_cg, nx_cg = maml_shape
         cg_3d = cg_raw.view(nc_cg, ny_cg, nx_cg)
-        cg_cell_mean = cg_3d.mean(dim=(-2, -1), keepdim=True).expand_as(cg_3d).reshape(-1)
+        cg_cell_mean = cg_3d.reshape(nc_cg, ny_cg * nx_cg).mean(dim=-1, keepdim=True).expand(nc_cg, ny_cg * nx_cg).reshape(-1)
         cg_rate = 0.50 * cg_raw + 0.50 * cg_cell_mean
     else:
         cg_rate = cg_raw

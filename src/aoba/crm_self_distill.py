@@ -53,6 +53,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from aoba import constants as C
+from aoba.kernels import (
+    can_use_elem_metal,
+    dispatch_crm_distill_closure_metal,
+    dispatch_crm_distill_extract_metal,
+    dispatch_rad_distill_closure_metal,
+    dispatch_rad_distill_extract_metal,
+    mean_2d,
+    sum_2d,
+)
 from aoba.thermodynamics import diagnose_pressure_temperature, qsat_mixed_val
 
 
@@ -92,8 +101,8 @@ def compute_periodic_spatial_stats(
 
     dx_m = max(float(dx), 1.0)
     dy_m = max(float(dx if dy is None else dy), 1.0)
-    anom = field_3d - field_3d.mean(dim=(-2, -1), keepdim=True)
-    var = (anom * anom).mean(dim=(-2, -1))
+    anom = field_3d - mean_2d(field_3d, keepdim=True)
+    var = mean_2d(anom * anom)
     std = torch.sqrt(torch.clamp(var, min=0.0))
     active = var > 1.0e-12
 
@@ -102,13 +111,15 @@ def compute_periodic_spatial_stats(
     n_axes = 0
     if nx > 1:
         ax_next = torch.roll(anom, shifts=-1, dims=-1)
-        cov_acc = cov_acc + (anom * ax_next).mean(dim=(-2, -1))
-        grad_acc = grad_acc + ((ax_next - anom) ** 2).mean(dim=(-2, -1)) / (dx_m * dx_m)
+        cov_acc = cov_acc + mean_2d(anom * ax_next)
+        diff_x = ax_next - anom
+        grad_acc = grad_acc + mean_2d(diff_x * diff_x) * (1.0 / (dx_m * dx_m))
         n_axes += 1
     if ny > 1:
         ay_next = torch.roll(anom, shifts=-1, dims=-2)
-        cov_acc = cov_acc + (anom * ay_next).mean(dim=(-2, -1))
-        grad_acc = grad_acc + ((ay_next - anom) ** 2).mean(dim=(-2, -1)) / (dy_m * dy_m)
+        cov_acc = cov_acc + mean_2d(anom * ay_next)
+        diff_y = ay_next - anom
+        grad_acc = grad_acc + mean_2d(diff_y * diff_y) * (1.0 / (dy_m * dy_m))
         n_axes += 1
 
     inv_axes = 1.0 / float(max(n_axes, 1))
@@ -152,15 +163,17 @@ def compute_subgrid_structure_features(
     """
     dxs = dx if dx_sfc is None else dx_sfc
     dys = dy if dy_sfc is None else dy_sfc
-    shf_std, shf_mi, shf_lp = compute_periodic_spatial_stats(shf_3d, dxs, dys)
-    lhf_std, lhf_mi, lhf_lp = compute_periodic_spatial_stats(lhf_3d, dxs, dys)
-    tr_std, tr_mi, tr_lp = compute_periodic_spatial_stats(t_rad_3d, dxs, dys)
-    alb_std, alb_mi, _ = compute_periodic_spatial_stats(alb_vis_3d, dxs, dys)
+    n_col = int(shf_3d.shape[0])
+    sfc_stack = torch.cat([shf_3d, lhf_3d, t_rad_3d, alb_vis_3d], dim=0)
+    s_std, s_mi, s_lp = compute_periodic_spatial_stats(sfc_stack, dxs, dys)
+    shf_std, lhf_std, tr_std, alb_std = s_std.split(n_col, dim=0)
+    shf_mi, lhf_mi, tr_mi, alb_mi = s_mi.split(n_col, dim=0)
+    shf_lp, lhf_lp, tr_lp, _ = s_lp.split(n_col, dim=0)
 
     # Spatial cross-correlation rho(SHF, LHF) in [-1, +1]
-    a_shf = shf_3d - shf_3d.mean(dim=(-2, -1), keepdim=True)
-    a_lhf = lhf_3d - lhf_3d.mean(dim=(-2, -1), keepdim=True)
-    cov_sl = (a_shf * a_lhf).mean(dim=(-2, -1))
+    a_shf = shf_3d - mean_2d(shf_3d, keepdim=True)
+    a_lhf = lhf_3d - mean_2d(lhf_3d, keepdim=True)
+    cov_sl = mean_2d(a_shf * a_lhf)
     denom_sl = shf_std * lhf_std
     rho_shf_lhf = torch.where(
         denom_sl > 1.0e-4,
@@ -171,7 +184,7 @@ def compute_subgrid_structure_features(
     # Column-mean moisture field [N, ny, nx] for RCEMIP convective self-aggregation clustering
     qn_col_3d = qn_4d.mean(dim=0)
     qn_std, qn_mi, qn_lp = compute_periodic_spatial_stats(qn_col_3d, dx, dy)
-    w_rms = torch.sqrt(torch.clamp((w_4d * w_4d).mean(dim=(0, 2, 3)), min=0.0))
+    w_rms = torch.sqrt(torch.clamp(mean_2d(w_4d * w_4d).mean(dim=0), min=0.0))
 
     return torch.stack([
         torch.clamp(shf_std * 0.01, 0.0, 5.0),
@@ -220,11 +233,28 @@ def extract_crm_distill_features(
     sub_org_w_rms: torch.Tensor | None = None,   # legacy fallback when subgrid_struct is omitted
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build flat dimensionless map-free input `[N, 14*nz + 23]` plus `(exner, temp)` `[nz, N]`."""
+    nz, n_col = rho_d.shape
+    if subgrid_struct is None:
+        struct_mat = torch.zeros((n_col, _N_STRUCT_IN), device=rho_d.device, dtype=rho_d.dtype)
+        if sub_org_qn_std is not None:
+            struct_mat[:, 12] = torch.log1p(torch.clamp(sub_org_qn_std, min=0.0) * 1.0e3)
+        if sub_org_w_rms is not None:
+            struct_mat[:, 15] = torch.clamp(sub_org_w_rms, 0.0, 10.0)
+    else:
+        struct_mat = subgrid_struct.to(device=rho_d.device, dtype=rho_d.dtype)
+
+    if can_use_elem_metal(rho_d):
+        return dispatch_crm_distill_extract_metal(
+            rho_d=rho_d, theta_m=theta_m, q_v=q_v, q_c=q_c, q_i=q_i, q_p=q_p,
+            u=u, v=v, dz_c=dz_c, dthm_ls=dthm_ls, dqn_ls=dqn_ls, q_rad=q_rad,
+            shf=shf, lhf=lhf, u_star=u_star, tau_x=tau_x, tau_y=tau_y,
+            is_ocean=is_ocean, f_cor=f_cor, struct_mat=struct_mat, dt=dt,
+        )
+
     pres, exner, temp = diagnose_pressure_temperature(rho_d, theta_m, q_v)
     qs = torch.clamp(qsat_mixed_val(temp, pres), min=1.0e-7, max=0.2)
     rh = torch.clamp(q_v / qs, min=0.0, max=2.0)
 
-    nz, n_col = rho_d.shape
     prof = torch.stack([
         (temp - 250.0) * 0.02,
         (torch.log(torch.clamp(pres, min=1.0)) - 10.0) * 0.4,
@@ -241,15 +271,6 @@ def extract_crm_distill_features(
         torch.clamp(q_rad * dt * 2.0, -10.0, 10.0),
         torch.log(torch.clamp(dz_c, min=10.0) * 2.0e-3),
     ], dim=0)  # [14, nz, N]
-
-    if subgrid_struct is None:
-        struct_mat = torch.zeros((n_col, _N_STRUCT_IN), device=rho_d.device, dtype=rho_d.dtype)
-        if sub_org_qn_std is not None:
-            struct_mat[:, 12] = torch.log1p(torch.clamp(sub_org_qn_std, min=0.0) * 1.0e3)
-        if sub_org_w_rms is not None:
-            struct_mat[:, 15] = torch.clamp(sub_org_w_rms, 0.0, 10.0)
-    else:
-        struct_mat = subgrid_struct.to(device=rho_d.device, dtype=rho_d.dtype)
 
     sfc_base = torch.stack([
         torch.clamp(shf * 5.0e-3, -5.0, 5.0),
@@ -295,6 +316,16 @@ def apply_exact_conservation_closure(
       3. `sum_k dm_k * (u_new - u_pre) == tau_x * dt`, `sum_k dm_k * (v_new - v_pre) == tau_y * dt`
       4. `q_v >= 0, q_c >= 0, q_i >= 0, q_p >= 0, P_rain >= 0, P_snow >= 0`
     """
+    if not raw_prof.requires_grad and not raw_scal.requires_grad and can_use_elem_metal(raw_prof):
+        return dispatch_crm_distill_closure_metal(
+            raw_prof=raw_prof, raw_scal=raw_scal,
+            rho_d=rho_d, dz_c=dz_c, exner=exner, temp_sfc=temp_sfc,
+            thm_post_ls=thm_post_ls, qn_post_ls=qn_post_ls,
+            qp_pre=qp_pre, qc_pre=qc_pre, qi_pre=qi_pre,
+            u_pre=u_pre, v_pre=v_pre, shf=shf, evap=evap,
+            tau_x=tau_x, tau_y=tau_y, dt=dt,
+        )
+
     # Convert [N, 8, nz] -> [nz, N] per field (contiguous for MPS backward kernels)
     rp = raw_prof.permute(1, 2, 0).contiguous()  # [8, nz, N]
     # Predict bounded temperature residual dT [K] -> d_theta_m = dT / exner so troposphere & stratosphere share O(1 K) scale
@@ -398,23 +429,32 @@ def extract_subgrid_spatial_maps(
     alb_vis_3d: torch.Tensor,   # [N, ny, nx] visible direct albedo [-]
     qn_4d: torch.Tensor,        # [nz, N, ny, nx] total non-precipitating water [kg kg^-1]
     w_4d: torch.Tensor,         # [nz+1, N, ny, nx] vertical velocity [m s^-1]
+    thm0_3d: torch.Tensor | None = None,  # [N, ny, nx] lowest-layer theta_m [K] (cold-pool memory)
+    qv0_3d: torch.Tensor | None = None,   # [N, ny, nx] lowest-layer q_v [kg kg^-1] (downdraft memory)
 ) -> torch.Tensor:
-    """Build `[N, 6, ny, nx]` dimensionless periodic spatial anomaly maps for `SubgridSpatialHead`.
+    """Build `[N, 8, ny, nx]` dimensionless periodic spatial anomaly maps for `SubgridSpatialHead`.
 
-    Provides the exact 2D/3D spatial arrangement of surface heat/moisture/temperature/albedo
-    patches alongside pre-step convective moisture & updraft memory so the periodic spatial
-    head can learn forest-locking RCE, forest-grassland vegetation breezes (including wind-
-    shifted upwind/downwind asymmetry), and convective self-aggregation directly from the
-    genuine 2D/3D CRM teacher.
+    Encodes surface heat/moisture/temperature/albedo patches alongside pre-step convective
+    moisture, vertical motion, and lowest-layer cold-pool `(theta_m', q_v')` anomalies so
+    the periodic spatial head captures forest-locking RCE, vegetation breezes, convective
+    self-aggregation, and cold-pool/downdraft surface coupling directly from the 3D CRM teacher.
     """
-    shf_a = torch.clamp((shf_3d - shf_3d.mean(dim=(-2, -1), keepdim=True)) * 0.01, -5.0, 5.0)
-    lhf_a = torch.clamp((lhf_3d - lhf_3d.mean(dim=(-2, -1), keepdim=True)) * 0.01, -5.0, 5.0)
-    tr_a = torch.clamp((t_rad_3d - t_rad_3d.mean(dim=(-2, -1), keepdim=True)) * 0.2, -5.0, 5.0)
-    alb_a = torch.clamp((alb_vis_3d - alb_vis_3d.mean(dim=(-2, -1), keepdim=True)) * 5.0, -5.0, 5.0)
+    shf_a = torch.clamp((shf_3d - mean_2d(shf_3d, keepdim=True)) * 0.01, -5.0, 5.0)
+    lhf_a = torch.clamp((lhf_3d - mean_2d(lhf_3d, keepdim=True)) * 0.01, -5.0, 5.0)
+    tr_a = torch.clamp((t_rad_3d - mean_2d(t_rad_3d, keepdim=True)) * 0.2, -5.0, 5.0)
+    alb_a = torch.clamp((alb_vis_3d - mean_2d(alb_vis_3d, keepdim=True)) * 5.0, -5.0, 5.0)
     qn_col = qn_4d.mean(dim=0)
-    qn_a = torch.clamp((qn_col - qn_col.mean(dim=(-2, -1), keepdim=True)) * 1.0e3, -5.0, 5.0)
+    qn_a = torch.clamp((qn_col - mean_2d(qn_col, keepdim=True)) * 1.0e3, -5.0, 5.0)
     w_col = torch.clamp(w_4d.mean(dim=0), -5.0, 5.0)
-    return torch.stack([shf_a, lhf_a, tr_a, alb_a, qn_a, w_col], dim=1).contiguous()
+    if thm0_3d is not None:
+        thm0_a = torch.clamp((thm0_3d - mean_2d(thm0_3d, keepdim=True)) * 0.5, -5.0, 5.0)
+    else:
+        thm0_a = torch.zeros_like(shf_a)
+    if qv0_3d is not None:
+        qv0_a = torch.clamp((qv0_3d - mean_2d(qv0_3d, keepdim=True)) * 500.0, -5.0, 5.0)
+    else:
+        qv0_a = torch.zeros_like(shf_a)
+    return torch.stack([shf_a, lhf_a, tr_a, alb_a, qn_a, w_col, thm0_a, qv0_a], dim=1).contiguous()
 
 
 def _periodic_pad2d(x: torch.Tensor, pad: int = 1) -> torch.Tensor:
@@ -531,29 +571,36 @@ def apply_subgrid_surface_microclimate(
     shf_3d: torch.Tensor,      # [N_s, ny, nx] subgrid sensible heat flux [W m^-2]
     evap_3d: torch.Tensor,     # [N_s, ny, nx] subgrid evaporation [kg m^-2 s^-1]
     dt: float,
+    *,
+    dthm_cp: torch.Tensor | None = None,  # [N_s, ny, nx] optional teacher-distilled cold-pool theta_m' [K]
+    dqv_cp: torch.Tensor | None = None,   # [N_s, ny, nx] optional teacher-distilled cold-pool q_v' [kg kg^-1]
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Inject exact zero-mean near-surface `(theta_m', q_v')` microclimate from tile `(SHF', evap')`.
+    """Inject exact zero-mean near-surface `(theta_m', q_v')` microclimate & cold-pool anomalies.
 
-    Ensures air immediately above warm/dry grassland or wildfire-burned tiles becomes warmer
-    and drier while air above cool transpiring forest tiles stays cooler and moister, with
-    zero perturbation to the cell-mean enthalpy or water vapor budget.
+    Combines surface-driven `(SHF', evap')` microclimate with optional teacher-distilled
+    convective cold-pool `(dthm_cp, dqv_cp)` anomalies while strictly preserving cell-mean
+    enthalpy and water vapor mass (`q_v >= 0`).
     """
     if int(shf_3d.shape[-2] * shf_3d.shape[-1]) <= 1:
         return crm_thm_0, crm_qv_0
     dm_0 = torch.clamp(rho_0 * dz_0, min=1.0).unsqueeze(-1).unsqueeze(-1)
     ex_0 = torch.clamp(exner_0, min=0.1).unsqueeze(-1).unsqueeze(-1)
-    shf_a = shf_3d - shf_3d.mean(dim=(-2, -1), keepdim=True)
-    evap_a = evap_3d - evap_3d.mean(dim=(-2, -1), keepdim=True)
+    shf_a = shf_3d - mean_2d(shf_3d, keepdim=True)
+    evap_a = evap_3d - mean_2d(evap_3d, keepdim=True)
 
     d_thm = torch.clamp((shf_a * dt) / (C.CP_D * dm_0 * ex_0), -3.0, 3.0)
-    d_thm = d_thm - d_thm.mean(dim=(-2, -1), keepdim=True)
+    if dthm_cp is not None:
+        d_thm = torch.clamp(d_thm + dthm_cp, -8.0, 8.0)
+    d_thm = d_thm - mean_2d(d_thm, keepdim=True)
     thm_out = crm_thm_0 + d_thm
 
-    qv_mean = crm_qv_0.mean(dim=(-2, -1), keepdim=True)
+    qv_mean = mean_2d(crm_qv_0, keepdim=True)
     d_qv = torch.clamp((evap_a * dt) / dm_0, -2.0e-3, 2.0e-3)
-    d_qv = d_qv - d_qv.mean(dim=(-2, -1), keepdim=True)
+    if dqv_cp is not None:
+        d_qv = torch.clamp(d_qv + dqv_cp, -6.0e-3, 6.0e-3)
+    d_qv = d_qv - mean_2d(d_qv, keepdim=True)
     qv_cand = torch.clamp(crm_qv_0 + d_qv, min=0.0)
-    qv_cand_mean = qv_cand.mean(dim=(-2, -1), keepdim=True)
+    qv_cand_mean = mean_2d(qv_cand, keepdim=True)
     qv_out = torch.where(
         qv_cand_mean > 1.0e-10,
         qv_cand * (qv_mean / torch.clamp(qv_cand_mean, min=1.0e-10)),
@@ -562,20 +609,71 @@ def apply_subgrid_surface_microclimate(
     return thm_out, qv_out
 
 
+def apply_subgrid_coldpool_outflow(
+    u_mean_0: torch.Tensor,    # [N_s] cell-mean lowest-layer zonal wind [m s^-1]
+    v_mean_0: torch.Tensor,    # [N_s] cell-mean lowest-layer meridional wind [m s^-1]
+    dthm_cp: torch.Tensor,     # [N_s, ny, nx] zero-mean cold-pool theta_m anomaly [K]
+    u_gust: torch.Tensor,      # [N_s, ny, nx] non-negative downdraft outflow gust speed [m s^-1]
+    cell_ids: torch.Tensor,    # [N_s] int64 cell indices for uniform-temperature fallback angle
+    step_count: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert `(dthm_cp, u_gust)` into exact zero-mean radial density-current outflow `(u_0, v_0)`.
+
+    Outflow accelerates away from cold-pool cores down the hydrostatic pressure gradient
+    (`+grad_h(dthm_cp)`), with exact zero cell-mean anomaly (`mean(u') == mean(v') == 0`)
+    and variance rescaling matching `mean(u_gust^2)` so surface fluxes, wind stress, and
+    dust uplift experience teacher-faithful gustiness with exact momentum conservation.
+    """
+    n_s, ny, nx = dthm_cp.shape
+    n_sub = max(int(ny * nx), 1)
+    if n_sub <= 1:
+        return u_mean_0.view(n_s, 1, 1), v_mean_0.view(n_s, 1, 1)
+
+    if nx > 1:
+        gx = 0.5 * (torch.roll(dthm_cp, shifts=-1, dims=-1) - torch.roll(dthm_cp, shifts=1, dims=-1))
+    else:
+        gx = torch.zeros_like(dthm_cp)
+    if ny > 1:
+        gy = 0.5 * (torch.roll(dthm_cp, shifts=-1, dims=-2) - torch.roll(dthm_cp, shifts=1, dims=-2))
+    else:
+        gy = torch.zeros_like(dthm_cp)
+
+    gnorm = torch.sqrt(gx * gx + gy * gy)
+    sub_idx = torch.arange(n_sub, device=dthm_cp.device, dtype=dthm_cp.dtype).view(1, ny, nx)
+    shift = ((cell_ids + (int(step_count) // 12)) % n_sub).to(dthm_cp.dtype).view(n_s, 1, 1)
+    ang = (2.0 * math.pi / float(n_sub)) * (sub_idx + shift)
+    ex = torch.where(gnorm > 1.0e-4, gx / torch.clamp(gnorm, min=1.0e-4), torch.cos(ang))
+    ey = torch.where(gnorm > 1.0e-4, gy / torch.clamp(gnorm, min=1.0e-4), torch.sin(ang))
+
+    u_raw = u_gust * ex
+    v_raw = u_gust * ey
+    u_p = u_raw - mean_2d(u_raw, keepdim=True)
+    v_p = v_raw - mean_2d(v_raw, keepdim=True)
+    eke_tgt = mean_2d(u_gust * u_gust, keepdim=True)
+    eke_cur = mean_2d(u_p * u_p + v_p * v_p, keepdim=True)
+    scale = torch.where(
+        eke_cur > 1.0e-8,
+        torch.clamp(torch.sqrt(eke_tgt / torch.clamp(eke_cur, min=1.0e-8)), max=2.0),
+        torch.zeros_like(eke_cur),
+    )
+    u_out = u_mean_0.view(n_s, 1, 1) + u_p * scale
+    v_out = v_mean_0.view(n_s, 1, 1) + v_p * scale
+    return u_out, v_out
+
+
 # ---------------------------------------------------------------------------
 # 2. Pure-GEMM Residual Column MLP + FiLM-Modulated Periodic 2D Spatial Head
 # ---------------------------------------------------------------------------
-_N_SPATIAL_IN = 6  # (shf', lhf', t_rad', alb', qn_col', w_col)
+_N_SPATIAL_IN = 8   # (shf', lhf', t_rad', alb', qn_col', w_col, thm0', qv0')
+_N_SPATIAL_TGT = 5  # (p_cld, p_prec, dthm_cp [K], dqv_cp [g kg^-1], u_gust [m s^-1])
 
 
 class SubgridSpatialHead(nn.Module):
-    """Size-invariant FiLM-modulated periodic 2D ConvNet predicting `(score_cld, score_prec)` on `(ny, nx)`.
+    """Size-invariant FiLM-modulated periodic 2D ConvNet predicting subgrid cloud, rain, and cold-pool maps.
 
-    Conditioned on the column MLP latent state `h_col` (encoding ambient wind vector `(u, v)`,
-    stratification, patch length scale `L_patch`, and Moran's `I`), this head works identically
-    on 2D (`1 x nx`) and 3D (`ny x nx`) periodic CRM grids to learn forest-locking RCE,
-    wind-shifted forest-grassland vegetation breezes, and convective cluster persistence directly
-    from the genuine CRM teacher.
+    Conditioned on the column MLP latent state `h_col`, this head predicts 5 periodic maps on
+    `(ny, nx)`: `(score_cld, score_prec, dthm_cp, dqv_cp, u_gust)` directly distilled from the
+    genuine 2D/3D CRM teacher.
     """
 
     def __init__(self, col_hidden_dim: int, c_hid: int = 16) -> None:
@@ -584,12 +682,22 @@ class SubgridSpatialHead(nn.Module):
         self.film = nn.Linear(int(col_hidden_dim), 2 * self.c_hid)
         self.conv1 = nn.Conv2d(_N_SPATIAL_IN, self.c_hid, kernel_size=3, padding=0)
         self.conv2 = nn.Conv2d(self.c_hid, self.c_hid, kernel_size=3, padding=0)
-        self.conv_out = nn.Conv2d(self.c_hid, 2, kernel_size=1, padding=0)
+        self.conv_out = nn.Conv2d(self.c_hid, _N_SPATIAL_TGT, kernel_size=1, padding=0)
         nn.init.normal_(self.conv_out.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.conv_out.bias)
 
-    def forward(self, h_col: torch.Tensor, sub_maps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return `(score_cld [B, ny, nx], score_prec [B, ny, nx])`."""
+    def forward(
+        self, h_col: torch.Tensor, sub_maps: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return `(score_cld, score_prec, dthm_cp [K], dqv_cp [kg kg^-1], u_gust [m s^-1])`."""
+        if int(sub_maps.shape[1]) < _N_SPATIAL_IN:
+            pad_c = _N_SPATIAL_IN - int(sub_maps.shape[1])
+            z_pad = torch.zeros(
+                (sub_maps.shape[0], pad_c, sub_maps.shape[2], sub_maps.shape[3]),
+                device=sub_maps.device,
+                dtype=sub_maps.dtype,
+            )
+            sub_maps = torch.cat([sub_maps, z_pad], dim=1)
         gb = self.film(h_col)
         gamma, beta = gb.chunk(2, dim=-1)
         gamma = gamma.unsqueeze(-1).unsqueeze(-1)
@@ -597,8 +705,15 @@ class SubgridSpatialHead(nn.Module):
         s = F.silu(self.conv1(_periodic_pad2d(sub_maps, 1)))
         s = F.silu(s * (1.0 + 0.25 * torch.tanh(gamma)) + 0.25 * beta)
         s = s + F.silu(self.conv2(_periodic_pad2d(s, 1)))
-        logits = self.conv_out(s)  # [B, 2, ny, nx]
-        return logits[:, 0], logits[:, 1]
+        logits = self.conv_out(s)  # [B, 5, ny, nx]
+        score_cld = logits[:, 0]
+        score_prec = logits[:, 1]
+        dthm_raw = 8.0 * torch.tanh(logits[:, 2] * 0.25)
+        dthm_cp = dthm_raw - mean_2d(dthm_raw, keepdim=True)
+        dqv_raw = 6.0e-3 * torch.tanh(logits[:, 3] * 0.25)
+        dqv_cp = dqv_raw - mean_2d(dqv_raw, keepdim=True)
+        u_gust = torch.clamp(F.softplus(logits[:, 4] - 2.0) * 2.0, min=0.0, max=15.0)
+        return score_cld, score_prec, dthm_cp, dqv_cp, u_gust
 
 
 class CRMSelfDistillNet(nn.Module):
@@ -674,14 +789,19 @@ def extract_spatial_targets(
     rain_3d: torch.Tensor,    # [B, ny, nx] post-CRM rain rate [kg m^-2 s^-1]
     snow_3d: torch.Tensor,    # [B, ny, nx] post-CRM snow rate [kg m^-2 s^-1]
     dm_col: torch.Tensor,     # [nz, B] dry air mass per layer [kg m^-2]
+    *,
+    thm0_3d: torch.Tensor | None = None,  # [B, ny, nx] post-CRM lowest-layer theta_m [K]
+    qv0_3d: torch.Tensor | None = None,   # [B, ny, nx] post-CRM lowest-layer q_v [kg kg^-1]
+    u0_3d: torch.Tensor | None = None,    # [B, ny, nx] post-CRM lowest-layer u [m s^-1]
+    v0_3d: torch.Tensor | None = None,    # [B, ny, nx] post-CRM lowest-layer v [m s^-1]
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract normalized `[B, 2, ny, nx]` teacher cloud/precip spatial probability maps and `[B, 2]` active masks."""
+    """Extract `[B, 5, ny, nx]` teacher cloud/precip probability + cold-pool maps and `[B, 3]` active masks."""
     b, ny, nx = rain_3d.shape
     n_sub = max(int(ny * nx), 1)
     unif = 1.0 / float(n_sub)
 
     cwp = ((qc_4d + qi_4d) * dm_col.unsqueeze(-1).unsqueeze(-1)).sum(dim=0)  # [B, ny, nx] kg m^-2
-    cwp_sum = cwp.sum(dim=(-2, -1), keepdim=True)
+    cwp_sum = sum_2d(cwp, keepdim=True)
     has_cld = (cwp_sum.squeeze(-1).squeeze(-1) > 1.0e-4).to(cwp.dtype)
     p_cld = torch.where(
         cwp_sum > 1.0e-4,
@@ -690,7 +810,7 @@ def extract_spatial_targets(
     )
 
     pr_tot = torch.clamp(rain_3d + snow_3d, min=0.0)
-    pr_sum = pr_tot.sum(dim=(-2, -1), keepdim=True)
+    pr_sum = sum_2d(pr_tot, keepdim=True)
     has_pr = (pr_sum.squeeze(-1).squeeze(-1) > 1.0e-7).to(pr_tot.dtype)
     p_pr = torch.where(
         pr_sum > 1.0e-7,
@@ -698,8 +818,21 @@ def extract_spatial_targets(
         torch.full_like(pr_tot, unif),
     )
 
-    tgt_maps = torch.stack([p_cld, p_pr], dim=1).contiguous()   # [B, 2, ny, nx]
-    has_map = torch.stack([has_cld, has_pr], dim=1).contiguous()  # [B, 2]
+    if thm0_3d is not None and qv0_3d is not None and u0_3d is not None and v0_3d is not None:
+        dthm_cp = torch.clamp(thm0_3d - mean_2d(thm0_3d, keepdim=True), -8.0, 8.0)
+        dqv_cp_gkg = torch.clamp((qv0_3d - mean_2d(qv0_3d, keepdim=True)) * 1000.0, -6.0, 6.0)
+        u_a = u0_3d - mean_2d(u0_3d, keepdim=True)
+        v_a = v0_3d - mean_2d(v0_3d, keepdim=True)
+        u_gust = torch.clamp(torch.sqrt(u_a * u_a + v_a * v_a + 1.0e-8), 0.0, 15.0)
+        has_cp = torch.ones_like(has_cld)
+    else:
+        dthm_cp = torch.zeros_like(p_cld)
+        dqv_cp_gkg = torch.zeros_like(p_cld)
+        u_gust = torch.zeros_like(p_cld)
+        has_cp = torch.zeros_like(has_cld)
+
+    tgt_maps = torch.stack([p_cld, p_pr, dthm_cp, dqv_cp_gkg, u_gust], dim=1).contiguous()   # [B, 5, ny, nx]
+    has_map = torch.stack([has_cld, has_pr, has_cp], dim=1).contiguous()                      # [B, 3]
     return tgt_maps, has_map
 
 
@@ -709,7 +842,8 @@ def _resize_spatial_for_buffer(t: torch.Tensor, ny_b: int, nx_b: int, *, is_prob
         return t
     out = F.adaptive_avg_pool2d(t.float(), (ny_b, nx_b))
     if is_prob:
-        out = out / torch.clamp(out.sum(dim=(-2, -1), keepdim=True), min=1.0e-8)
+        n_prob = min(2, int(out.shape[1]))
+        out[:, :n_prob] = out[:, :n_prob] / torch.clamp(sum_2d(out[:, :n_prob], keepdim=True), min=1.0e-8)
     return out
 
 
@@ -750,15 +884,15 @@ class GPUReplayBuffer:
         self.tgt_p = torch.zeros((self.capacity, 8, self.nz), device=device, dtype=torch.float32)
         # Teacher scalar targets: [precip_rain, precip_snow, f_prec_tgt] -> 3 scalars
         self.tgt_s = torch.zeros((self.capacity, 3), device=device, dtype=torch.float32)
-        # Optional 2D/3D spatial maps for SubgridSpatialHead (~8 MB for 65536 x 1 x 8)
+        # Optional 2D/3D spatial maps for SubgridSpatialHead (~16 MB for 65536 x 4 x 4)
         if self.has_spatial:
             self.sub_maps = torch.zeros(
                 (self.capacity, _N_SPATIAL_IN, self.ny_b, self.nx_b), device=device, dtype=torch.float16
             )
             self.tgt_maps = torch.zeros(
-                (self.capacity, 2, self.ny_b, self.nx_b), device=device, dtype=torch.float16
+                (self.capacity, _N_SPATIAL_TGT, self.ny_b, self.nx_b), device=device, dtype=torch.float16
             )
-            self.tgt_has_map = torch.zeros((self.capacity, 2), device=device, dtype=torch.float32)
+            self.tgt_has_map = torch.zeros((self.capacity, 3), device=device, dtype=torch.float32)
         else:
             self.sub_maps = None
             self.tgt_maps = None
@@ -809,9 +943,12 @@ class GPUReplayBuffer:
             sm_f16 = torch.clamp(
                 _resize_spatial_for_buffer(sub_maps, self.ny_b, self.nx_b, is_prob=False), -10.0, 10.0
             ).to(torch.float16)
-            tm_f16 = torch.clamp(
-                _resize_spatial_for_buffer(tgt_maps, self.ny_b, self.nx_b, is_prob=True), 0.0, 1.0
-            ).to(torch.float16)
+            tm_res = _resize_spatial_for_buffer(tgt_maps, self.ny_b, self.nx_b, is_prob=True)
+            tm_res = torch.cat([
+                torch.clamp(tm_res[:, :2], 0.0, 1.0),
+                torch.clamp(tm_res[:, 2:], -15.0, 15.0),
+            ], dim=1) if int(tm_res.shape[1]) > 2 else torch.clamp(tm_res, 0.0, 1.0)
+            tm_f16 = tm_res.to(torch.float16)
 
         # 1. Insert 75% into rolling recency ring [0, ring_cap)
         n_ring = max(1, (3 * b) // 4)
@@ -864,7 +1001,9 @@ class GPUReplayBuffer:
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor | None, torch.Tensor | None, torch.Tensor | None,
     ]:
-        n = min(int(batch_size), self.size)
+        # Always sample exact `batch_size` (with replacement when buffer is still filling)
+        # so tensor shapes stay static across warmup steps, preventing MPSGraph/CUDA recompilations.
+        n = max(int(batch_size), 1)
         if self.res_size > 0 and self.ring_size > 0:
             n_ring_s = n // 2
             n_res_s = n - n_ring_s
@@ -931,7 +1070,7 @@ def init_crm_self_distill_state(
     """Initialize online self-distilling 2D/3D CRM student network, optimizer, and GPU replay buffer."""
     st = max(int(stride), 2)
     net = CRMSelfDistillNet(nz=nz, hidden_dim=hidden_dim).to(device=device, dtype=torch.float32)
-    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1.0e-4)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1.0e-4, fused=(device.type == "cuda"))
     replay = GPUReplayBuffer(capacity=replay_size, nz=nz, device=device, ny=ny, nx=nx)
     # Quasi-uniform spatial cohort hash across all latitudes/longitudes (coprime Knuth multiplier)
     cell_ids = torch.arange(n_cells, device=device, dtype=torch.int64)
@@ -1030,12 +1169,33 @@ def select_teacher_indices(
     *,
     allow_sparse_warmup: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return `(teacher_idx, student_idx)` or `None` during dense warmup (100% genuine 2D/3D CRM)."""
-    return _select_hybrid_teacher_indices(
+    """Return `(teacher_idx, student_idx)` or `None` during dense warmup (100% genuine 2D/3D CRM).
+
+    Caches the selected `(teacher_idx, student_idx)` across OOD dwell windows (`min(dwell_steps, 12)`)
+    so active OOD teachers retain multi-hour 3D convective memory and `sync_sparse_crm_pool`
+    avoids per-step CPU–GPU synchronization.
+    """
+    in_warmup = state.steps_seen < state.warmup_steps
+    if in_warmup and not allow_sparse_warmup:
+        return None
+    if in_warmup:
+        dwell_w = max(state.warmup_steps // 4, 1)
+        bucket = ("w", state.steps_seen // dwell_w, allow_sparse_warmup)
+    else:
+        coh_bucket = (state.steps_seen - state.warmup_steps) // state.dwell_steps
+        ood_dwell = min(state.dwell_steps, 12)
+        ood_bucket = (state.steps_seen - state.warmup_steps) // max(ood_dwell, 1)
+        bucket = ("s", coh_bucket, ood_bucket, allow_sparse_warmup)
+    cached = getattr(state, "_sel_cache", None)
+    if cached is not None and cached[0] == bucket:
+        return cached[1]
+    res = _select_hybrid_teacher_indices(
         state.cohort_id, state.last_uncertainty,
         state.n_cells, state.stride, state.steps_seen, state.warmup_steps, state.dwell_steps,
         allow_sparse_warmup=allow_sparse_warmup,
     )
+    state._sel_cache = (bucket, res)  # type: ignore[attr-defined]
+    return res
 
 
 def _compute_distill_loss(
@@ -1087,10 +1247,14 @@ def _compute_distill_loss(
 def _compute_spatial_placement_loss(
     score_cld: torch.Tensor,   # [B, ny, nx]
     score_prec: torch.Tensor,  # [B, ny, nx]
-    tgt_maps: torch.Tensor,    # [B, 2, ny, nx] normalized probability targets
-    has_map: torch.Tensor,     # [B, 2] active masks (has_cld, has_prec)
+    tgt_maps: torch.Tensor,    # [B, 5, ny, nx] cloud/precip prob + (dthm_cp, dqv_cp_gkg, u_gust)
+    has_map: torch.Tensor,     # [B, 3] active masks (has_cld, has_prec, has_cp)
+    *,
+    dthm_cp: torch.Tensor | None = None,  # [B, ny, nx] [K]
+    dqv_cp: torch.Tensor | None = None,   # [B, ny, nx] [kg kg^-1]
+    u_gust: torch.Tensor | None = None,   # [B, ny, nx] [m s^-1]
 ) -> torch.Tensor:
-    """Cross-entropy spatial placement loss teaching where clouds & rain form on `(ny, nx)`."""
+    """Combined cross-entropy cloud/rain placement loss and Smooth-L1 cold-pool/downdraft loss."""
     b = int(score_cld.shape[0])
     sc_flat = score_cld.reshape(b, -1)
     sp_flat = score_prec.reshape(b, -1)
@@ -1104,7 +1268,21 @@ def _compute_spatial_placement_loss(
     m_pr = has_map[:, 1]
     loss_cld = (ce_cld * m_cld).sum() / torch.clamp(m_cld.sum(), min=1.0)
     loss_pr = (ce_pr * m_pr).sum() / torch.clamp(m_pr.sum(), min=1.0)
-    return 0.5 * (loss_cld + loss_pr)
+    loss = 0.5 * (loss_cld + loss_pr)
+
+    if (
+        dthm_cp is not None
+        and dqv_cp is not None
+        and u_gust is not None
+        and int(tgt_maps.shape[1]) >= 5
+    ):
+        m_cp = has_map[:, 2] if int(has_map.shape[1]) >= 3 else torch.ones_like(m_cld)
+        m_cp_sum = torch.clamp(m_cp.sum(), min=1.0)
+        l_t = (mean_2d(F.smooth_l1_loss(dthm_cp, tgt_maps[:, 2], reduction="none")) * m_cp).sum() / m_cp_sum
+        l_q = (mean_2d(F.smooth_l1_loss(dqv_cp * 1000.0, tgt_maps[:, 3], reduction="none")) * m_cp).sum() / m_cp_sum
+        l_u = (mean_2d(F.smooth_l1_loss(u_gust, tgt_maps[:, 4], reduction="none")) * m_cp).sum() / m_cp_sum
+        loss = loss + 0.5 * (l_t + l_q + 0.6 * l_u)
+    return loss
 
 
 def train_student_online(
@@ -1172,27 +1350,38 @@ def train_student_online(
         qp_b, qc_b, qi_b, u_b, v_b = cp_t[5], cp_t[6], cp_t[7], cp_t[8], cp_t[9]
         tsfc_b, shf_b, evap_b, tx_b, ty_b = csb[:, 0], csb[:, 1], csb[:, 2], csb[:, 3], csb[:, 4]
 
-        pred_a = apply_exact_conservation_closure(
-            pa_raw, sa_raw, rho_b, dz_b, ex_b, tsfc_b, thm_ls_b, qn_ls_b,
-            qp_b, qc_b, qi_b, u_b, v_b, shf_b, evap_b, tx_b, ty_b, dt,
+        # Single batched exact conservation closure for both ensemble heads [2*B]
+        p_both = torch.cat([pa_raw, pb_raw], dim=0)
+        s_both = torch.cat([sa_raw, sb_raw], dim=0)
+        pred_both = apply_exact_conservation_closure(
+            p_both, s_both,
+            rho_b.repeat(1, 2), dz_b.repeat(1, 2), ex_b.repeat(1, 2), tsfc_b.repeat(2),
+            thm_ls_b.repeat(1, 2), qn_ls_b.repeat(1, 2),
+            qp_b.repeat(1, 2), qc_b.repeat(1, 2), qi_b.repeat(1, 2),
+            u_b.repeat(1, 2), v_b.repeat(1, 2),
+            shf_b.repeat(2), evap_b.repeat(2), tx_b.repeat(2), ty_b.repeat(2), dt,
         )
-        pred_b = apply_exact_conservation_closure(
-            pb_raw, sb_raw, rho_b, dz_b, ex_b, tsfc_b, thm_ls_b, qn_ls_b,
-            qp_b, qc_b, qi_b, u_b, v_b, shf_b, evap_b, tx_b, ty_b, dt,
-        )
+        b_cur = int(xb.shape[0])
+        pred_a = {k: (v[:, :b_cur].contiguous() if v.ndim == 2 else v[:b_cur]) for k, v in pred_both.items()}
+        pred_b = {k: (v[:, b_cur:].contiguous() if v.ndim == 2 else v[b_cur:]) for k, v in pred_both.items()}
         loss, r_thm, r_qn = _compute_distill_loss(pred_a, pred_b, tpb, tsb, ex_b, dt)
 
         if use_sp and sm_fresh_b is not None and tm_fresh_b is not None and smr is not None and tmr is not None and hmr is not None:
             smb = torch.cat([sm_fresh_b[f_idx], smr], dim=0)
             tmb = torch.cat([tm_fresh_b[f_idx], tmr], dim=0)
             hmb = torch.cat([tgt_has_map_fresh[f_idx], hmr], dim=0)
-            sc_pred, sp_pred = state.net.spatial_head(h_lat, smb)
-            loss_sp = _compute_spatial_placement_loss(sc_pred, sp_pred, tmb, hmb)
+            sc_pred, sp_pred, dt_cp_pred, dq_cp_pred, ug_pred = state.net.spatial_head(h_lat, smb)
+            loss_sp = _compute_spatial_placement_loss(
+                sc_pred, sp_pred, tmb, hmb,
+                dthm_cp=dt_cp_pred, dqv_cp=dq_cp_pred, u_gust=ug_pred,
+            )
             loss = loss + 0.6 * loss_sp
 
         state.optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(state.net.parameters(), max_norm=2.0)
+        torch.nn.utils.clip_grad_norm_(
+            state.net.parameters(), max_norm=2.0, foreach=(x_fresh.device.type == "cuda"),
+        )
         state.optimizer.step()
         state.grad_updates += 1
         last_loss, last_rthm, last_rqn = loss, r_thm, r_qn
@@ -1247,9 +1436,15 @@ def predict_student_columns(
         ny_s, nx_s = int(sub_maps_stu.shape[-2]), int(sub_maps_stu.shape[-1])
         sc_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
         sp_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
+        dt_cp_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
+        dq_cp_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
+        ug_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
     else:
         sc_all = None
         sp_all = None
+        dt_cp_all = None
+        dq_cp_all = None
+        ug_all = None
 
     # Use FP16 autocast on MPS and BF16 on CUDA for peak Matrix/Tensor Core throughput!
     use_cuda_amp = (dev.type == "cuda")
@@ -1260,23 +1455,26 @@ def predict_student_columns(
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pa, sa, pb, sb, h_lat = state.net.forward_with_latent(x_stu[i0:i1])
                 if want_sp and sub_maps_stu is not None:
-                    sc_c, sp_c = state.net.spatial_head(h_lat, sub_maps_stu[i0:i1])
+                    sc_c, sp_c, dtc_c, dqc_c, ugc_c = state.net.spatial_head(h_lat, sub_maps_stu[i0:i1])
         elif use_mps_amp:
             with torch.amp.autocast("mps", dtype=torch.float16):
                 pa, sa, pb, sb, h_lat = state.net.forward_with_latent(x_stu[i0:i1])
                 if want_sp and sub_maps_stu is not None:
-                    sc_c, sp_c = state.net.spatial_head(h_lat, sub_maps_stu[i0:i1])
+                    sc_c, sp_c, dtc_c, dqc_c, ugc_c = state.net.spatial_head(h_lat, sub_maps_stu[i0:i1])
         else:
             pa, sa, pb, sb, h_lat = state.net.forward_with_latent(x_stu[i0:i1])
             if want_sp and sub_maps_stu is not None:
-                sc_c, sp_c = state.net.spatial_head(h_lat, sub_maps_stu[i0:i1])
+                sc_c, sp_c, dtc_c, dqc_c, ugc_c = state.net.spatial_head(h_lat, sub_maps_stu[i0:i1])
         pa_all[i0:i1] = pa.float()
         sa_all[i0:i1] = sa.float()
         pb_all[i0:i1] = pb.float()
         sb_all[i0:i1] = sb.float()
-        if want_sp and sc_all is not None and sp_all is not None:
+        if want_sp and sc_all is not None and sp_all is not None and dt_cp_all is not None and dq_cp_all is not None and ug_all is not None:
             sc_all[i0:i1] = sc_c.float()
             sp_all[i0:i1] = sp_c.float()
+            dt_cp_all[i0:i1] = dtc_c.float()
+            dq_cp_all[i0:i1] = dqc_c.float()
+            ug_all[i0:i1] = ugc_c.float()
 
     # Ensemble-mean raw prediction -> single exact conservation projection
     p_mean = 0.5 * (pa_all + pb_all)
@@ -1288,8 +1486,12 @@ def predict_student_columns(
     if sc_all is not None and sp_all is not None:
         out["score_cld"] = sc_all
         out["score_prec"] = sp_all
+        if dt_cp_all is not None and dq_cp_all is not None and ug_all is not None:
+            out["dthm_cp"] = dt_cp_all
+            out["dqv_cp"] = dq_cp_all
+            out["u_gust"] = ug_all
     # Epistemic disagreement score per column [N_s] for active OOD teacher routing
-    unc = (pa_all - pb_all).abs().mean(dim=(1, 2)) + (sa_all - sb_all).abs().mean(dim=1)
+    unc = (pa_all - pb_all).abs().reshape(n_s, -1).mean(dim=-1) + (sa_all - sb_all).abs().mean(dim=1)
     return out, unc
 
 
@@ -1366,6 +1568,19 @@ def extract_rad_distill_features(
     tau_aero_sw_c: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build flat dimensionless per-subcolumn ICA radiation features `[M, 9*nz + 13]` plus `(cp_layer, s_inc)`."""
+    co2_f = math.log(max(float(co2_ppmv), 1.0) / 284.317)
+    ch4_f = math.log(max(float(ch4_ppmv), 0.01) / 0.80825)
+    n2o_f = math.log(max(float(n2o_ppmv), 0.01) / 0.27302)
+    if can_use_elem_metal(pres_c):
+        return dispatch_rad_distill_extract_metal(
+            pres_c=pres_c, temp_c=temp_c, dz_c=dz_c, rho_d_c=rho_d_c,
+            qv_c=qv_c, qc_c=qc_c, qi_c=qi_c, t_sfc=t_sfc,
+            alb_vd=alb_vd, alb_vf=alb_vf, alb_nd=alb_nd, alb_nf=alb_nf,
+            emiss_sfc=emiss_sfc, mu0=mu0, s_toa=s_toa,
+            co2_f=co2_f, ch4_f=ch4_f, n2o_f=n2o_f,
+            o3_vmr_c=o3_vmr_c, q_dust_c=q_dust_c, tau_aero_sw_c=tau_aero_sw_c,
+        )
+
     nz, m_col = pres_c.shape
     dev = pres_c.device
     dtype = pres_c.dtype
@@ -1391,9 +1606,6 @@ def extract_rad_distill_features(
         aero_ch,
     ], dim=0)  # [9, nz, M]
 
-    co2_f = math.log(max(float(co2_ppmv), 1.0) / 284.317)
-    ch4_f = math.log(max(float(ch4_ppmv), 0.01) / 0.80825)
-    n2o_f = math.log(max(float(n2o_ppmv), 0.01) / 0.27302)
     day_mask = (mu0 > 1.0e-4).to(dtype)
 
     scal = torch.stack([
@@ -1439,6 +1651,13 @@ def apply_exact_rad_conservation_closure(
       4. Exact TOA-atmosphere-surface column radiative energy closure to float32 machine precision:
          `sum_k cp_layer_k * q_rad_k == (asr - olr) - (f_sw_sfc_net + f_lw_sfc_net)`.
     """
+    if not raw_qrad.requires_grad and not raw_scal.requires_grad and can_use_elem_metal(raw_qrad):
+        return dispatch_rad_distill_closure_metal(
+            raw_qrad=raw_qrad, raw_scal=raw_scal, cp_layer=cp_layer,
+            s_inc=s_inc, alb_vd=alb_vd, alb_vf=alb_vf, alb_nd=alb_nd,
+            alb_nf=alb_nf, emiss_sfc=emiss_sfc, t_sfc=t_sfc,
+        )
+
     # Bounded SW surface transmittance fractions
     s1d_f = torch.sigmoid(raw_scal[:, 0] - 1.5)
     s1f_f = torch.sigmoid(raw_scal[:, 1] - 2.0)
@@ -1600,7 +1819,9 @@ class GPURadReplayBuffer:
         self.total_seen += b
 
     def sample(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        n = min(int(batch_size), self.size)
+        # Always sample exact `batch_size` (with replacement when buffer is still filling)
+        # so tensor shapes stay static across warmup steps, preventing MPSGraph/CUDA recompilations.
+        n = max(int(batch_size), 1)
         if self.res_size > 0 and self.ring_size > 0:
             n_ring_s = n // 2
             n_res_s = n - n_ring_s
@@ -1656,7 +1877,7 @@ def init_rad_self_distill_state(
     """Initialize online ICA radiation student network, optimizer, and GPU replay buffer."""
     st = max(int(stride), 2)
     net = RadSelfDistillNet(nz=nz, hidden_dim=hidden_dim).to(device=device, dtype=torch.float32)
-    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1.0e-4)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1.0e-4, fused=(device.type == "cuda"))
     replay = GPURadReplayBuffer(capacity=replay_size, nz=nz, device=device)
     cell_ids = torch.arange(n_cells, device=device, dtype=torch.int64)
     cohort_id = ((cell_ids * 2654435761) % st).to(torch.int64)
@@ -1799,17 +2020,23 @@ def train_rad_student_online(
         tsb = torch.cat([tgt_s_fresh[f_idx], tsr], dim=0)
 
         qa_raw, sa_raw, qb_raw, sb_raw = state.net(xb)
-        pred_a = apply_exact_rad_conservation_closure(
-            qa_raw, sa_raw, cpb, csb[:, 0], csb[:, 1], csb[:, 2], csb[:, 3], csb[:, 4], csb[:, 5], csb[:, 6]
+        pred_both = apply_exact_rad_conservation_closure(
+            torch.cat([qa_raw, qb_raw], dim=0),
+            torch.cat([sa_raw, sb_raw], dim=0),
+            cpb.repeat(1, 2),
+            csb[:, 0].repeat(2), csb[:, 1].repeat(2), csb[:, 2].repeat(2),
+            csb[:, 3].repeat(2), csb[:, 4].repeat(2), csb[:, 5].repeat(2), csb[:, 6].repeat(2),
         )
-        pred_b = apply_exact_rad_conservation_closure(
-            qb_raw, sb_raw, cpb, csb[:, 0], csb[:, 1], csb[:, 2], csb[:, 3], csb[:, 4], csb[:, 5], csb[:, 6]
-        )
+        b_cur = int(xb.shape[0])
+        pred_a = {k: (v[:, :b_cur].contiguous() if v.ndim == 2 else v[:b_cur]) for k, v in pred_both.items()}
+        pred_b = {k: (v[:, b_cur:].contiguous() if v.ndim == 2 else v[b_cur:]) for k, v in pred_both.items()}
         loss, r_olr, r_asr = _compute_rad_distill_loss(pred_a, pred_b, tqb, tsb, cpb)
 
         state.optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(state.net.parameters(), max_norm=2.0)
+        torch.nn.utils.clip_grad_norm_(
+            state.net.parameters(), max_norm=2.0, foreach=(x_fresh.device.type == "cuda"),
+        )
         state.optimizer.step()
         state.grad_updates += 1
         last_loss, last_olr, last_asr = loss, r_olr, r_asr
@@ -1891,7 +2118,7 @@ def block_avg_2d(
     by = ny // ny_t
     bx = nx // nx_t
     lead = x.shape[:-2]
-    return x.reshape(*lead, ny_t, by, nx_t, bx).mean(dim=(-3, -1))
+    return x.reshape(*lead, ny_t, by, nx_t, bx).mean(dim=-1).mean(dim=-2)
 
 
 def block_expand_2d(
@@ -2003,12 +2230,24 @@ def sync_sparse_crm_pool(
     tiny zero-mean `+-0.10 K` lowest-2 km thermal perturbation to break block symmetry.
     """
     dev = pool.slot_cell_ids.device
+    # Zero-CPU-sync fast path when the exact cached `t_idx` tensor object has not rotated
+    if (
+        getattr(pool, "_sync_cache_ref", None) is t_idx
+        and getattr(pool, "_sync_cache_slots_ptr", None) == int(pool.slot_cell_ids.data_ptr())
+    ):
+        n_act = int(getattr(pool, "_sync_cache_n", min(int(t_idx.numel()), pool.n_pool)))
+        return pool.slot_cell_ids[:n_act], n_act
+
     req_list = [int(c) for c in t_idx.detach().cpu().tolist()]
     n_t = min(len(req_list), pool.n_pool)
     req_list = req_list[:n_t]
     req_set = set(req_list)
 
-    cur_list = [int(c) for c in pool.slot_cell_ids.detach().cpu().tolist()]
+    cur_cached = getattr(pool, "_cur_ids_cpu", None)
+    if cur_cached is not None and getattr(pool, "_cur_ids_ptr", None) == int(pool.slot_cell_ids.data_ptr()):
+        cur_list = list(cur_cached)
+    else:
+        cur_list = [int(c) for c in pool.slot_cell_ids.detach().cpu().tolist()]
     kept_set: set[int] = set()
     vacated_slots: list[int] = []
     for s in range(n_t):
@@ -2034,7 +2273,7 @@ def sync_sparse_crm_pool(
             return block_expand_2d(field[:, new_cells], ny_t, nx_t, ny_f, nx_f)
 
         rho_exp = _exp4(tile_crm.rho_d)
-        drho = (atmos_rho[:, new_cells] - rho_exp.mean(dim=(-2, -1))).unsqueeze(-1).unsqueeze(-1)
+        drho = (atmos_rho[:, new_cells] - mean_2d(rho_exp)).unsqueeze(-1).unsqueeze(-1)
         pool.crm.rho_d[:, new_slots] = torch.clamp(rho_exp + drho, min=1.0e-5)
         pool.crm.u[:, new_slots] = _exp4(tile_crm.u)
         pool.crm.v[:, new_slots] = _exp4(tile_crm.v)
@@ -2044,7 +2283,7 @@ def sync_sparse_crm_pool(
         k_pbl = min(nz, max(nz // 5, 4))
         gen = torch.Generator(device="cpu").manual_seed(104729 + int(step_seed) * 97 + len(entering_cells))
         noise = (torch.rand((k_pbl, len(entering_cells), ny_f, nx_f), generator=gen, dtype=torch.float32) * 2.0 - 1.0) * 0.10
-        noise = (noise - noise.mean(dim=(-2, -1), keepdim=True)).to(device=dev, dtype=thm_exp.dtype)
+        noise = (noise - mean_2d(noise, keepdim=True)).to(device=dev, dtype=thm_exp.dtype)
         thm_exp[:k_pbl] = thm_exp[:k_pbl] + noise
         pool.crm.theta_m[:, new_slots] = thm_exp
 
@@ -2076,6 +2315,11 @@ def sync_sparse_crm_pool(
         pool.slot_cell_ids = torch.tensor(cur_list, device=dev, dtype=torch.int64)
         pool.crm.f_coriolis = f_cell[torch.clamp(pool.slot_cell_ids, min=0)]
 
+    pool._cur_ids_cpu = cur_list  # type: ignore[attr-defined]
+    pool._cur_ids_ptr = int(pool.slot_cell_ids.data_ptr())  # type: ignore[attr-defined]
+    pool._sync_cache_ref = t_idx  # type: ignore[attr-defined]
+    pool._sync_cache_slots_ptr = int(pool.slot_cell_ids.data_ptr())  # type: ignore[attr-defined]
+    pool._sync_cache_n = n_t  # type: ignore[attr-defined]
     return pool.slot_cell_ids[:n_t], n_t
 
 
@@ -2089,7 +2333,7 @@ def compute_pool_org_invariants(
     """Compute the 4 full-3D atmospheric organization invariants `[n_t, 4]` for `subgrid_struct[:, 12:16]`."""
     qn_col_3d = qn_4d.mean(dim=0)
     qn_std, qn_mi, qn_lp = compute_periodic_spatial_stats(qn_col_3d, dx, dy)
-    w_rms = torch.sqrt(torch.clamp((w_4d * w_4d).mean(dim=(0, 2, 3)), min=0.0))
+    w_rms = torch.sqrt(torch.clamp(mean_2d(w_4d * w_4d).mean(dim=0), min=0.0))
     return torch.stack([
         torch.log1p(torch.clamp(qn_std, min=0.0) * 1.0e3),
         qn_mi,

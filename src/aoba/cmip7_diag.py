@@ -289,9 +289,9 @@ def sample_cmip7_fields(
     prw = (atmos.rho_d * atmos.q_v * atmos.dz_c).sum(dim=0)
     lwp_sub = (crm.rho_d * crm.q_c * dz_4).sum(dim=0)
     iwp_sub = (crm.rho_d * crm.q_i * dz_4).sum(dim=0)
-    clwvi = (lwp_sub + iwp_sub).mean(dim=(-2, -1))
-    clivi = iwp_sub.mean(dim=(-2, -1))
-    clt = (((lwp_sub + iwp_sub) > 1.0e-4).to(tas.dtype).mean(dim=(-2, -1))) * 100.0
+    clwvi = (lwp_sub + iwp_sub).reshape(nc, -1).mean(dim=-1)
+    clivi = iwp_sub.reshape(nc, -1).mean(dim=-1)
+    clt = (((lwp_sub + iwp_sub) > 1.0e-4).to(tas.dtype).reshape(nc, -1).mean(dim=-1)) * 100.0
 
     # Precipitation (total, convective from strong CRM updraft subcolumns, snowfall)
     rain = rc.get("rain", torch.zeros_like(tas))
@@ -300,7 +300,7 @@ def sample_cmip7_fields(
     if "rain_sub" in rc and "snow_sub" in rc:
         p_sub = (rc["rain_sub"] + rc["snow_sub"]).reshape(nc, ny, nx)
         w_max_sub = crm.w.max(dim=0).values
-        prc = (p_sub * (w_max_sub > 0.5).to(tas.dtype)).mean(dim=(-2, -1))
+        prc = (p_sub * (w_max_sub > 0.5).to(tas.dtype)).reshape(nc, -1).mean(dim=-1)
     else:
         prc = torch.zeros_like(pr)
 
@@ -398,7 +398,7 @@ def sample_cmip7_fields(
         wap_m = -atmos.rho_d * (1.0 + atmos.q_n + atmos.q_p) * C.GRAVITY * w_center
         qsat_3d = torch.clamp(qsat_mixed(temp_c, pres_c)[0], min=1.0e-9)
         hur_3d = torch.clamp(100.0 * atmos.q_v / qsat_3d, 0.0, 100.0)
-        cl_3d = (((crm.q_c + crm.q_i) > 1.0e-5).to(tas.dtype).mean(dim=(-2, -1))) * 100.0
+        cl_3d = (((crm.q_c + crm.q_i) > 1.0e-5).to(tas.dtype).reshape(atmos.q_c.shape[0], nc, -1).mean(dim=-1)) * 100.0
         for name, src in (
             ("ta", temp_c),
             ("ua", u_c),
