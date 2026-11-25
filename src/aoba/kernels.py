@@ -1264,10 +1264,11 @@ def dispatch_crm_sgs_metal(
     dz_w_int: torch.Tensor,
     gravity: float,
     c_s: float = 0.18,
+    nu_max: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     lib = _get_gpu_lib(rho_d.device)
     assert lib is not None
-    return run_crm_sgs_metal(lib, rho_d, u, v, w, theta_m, dx, dy, dz_c, dz_w_int, gravity, c_s)
+    return run_crm_sgs_metal(lib, rho_d, u, v, w, theta_m, dx, dy, dz_c, dz_w_int, gravity, c_s, nu_max=nu_max)
 
 
 def dispatch_crm_microphysics_metal(

@@ -707,7 +707,7 @@ def compute_smagorinsky_lilly_3d(
     lam = scotti_aspect_factor(aspect) * delta_filter
     cs_lam2_s = ((c_s * lam) ** 2) * strain_mag
 
-    ri = n2 / torch.clamp(strain_mag * strain_mag, min=1.0e-10)
+    ri = torch.clamp(n2 / torch.clamp(strain_mag * strain_mag, min=1.0e-10), min=-50.0)
     ri_unst = torch.clamp(ri, max=0.0)
     ri_stab = torch.clamp(ri, min=0.0, max=ri_c)
 

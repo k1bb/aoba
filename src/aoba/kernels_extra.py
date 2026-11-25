@@ -422,6 +422,7 @@ kernel void crm_sgs_eddy_uv(
     float dx = f_p.x;
     float dy = f_p.y;
     float gravity = f_p.z;
+    float nu_max = f_p.w;
     float inv_dx = 1.0f / dx;
     float inv_dy = 1.0f / dy;
 
@@ -510,7 +511,7 @@ kernel void crm_sgs_eddy_uv(
 
     float cs_lam2_s = cs_lam2_b[k * dz_cols + col_dz] * strain_mag;
 
-    float ri = n2 / max(strain_mag * strain_mag, 1.0e-10f);
+    float ri = max(n2 / max(strain_mag * strain_mag, 1.0e-10f), -50.0f);
     float pr_n = 0.70f;
     float ri_c = 0.25f;
     float g_coef = (1.0f - pr_n) / ri_c;
@@ -527,10 +528,16 @@ kernel void crm_sgs_eddy_uv(
         d_sgs  = (cs_lam2_s / pr_n) * stab_fac * (1.0f - g_coef * ri);
     }
 
+    float nu_bg = 0.004f * (dx * dy) / 10.0f;
+    if (nu_max > 0.0f) {
+        nu_sgs = min(nu_sgs, max(nu_max - nu_bg, 0.0f));
+        d_sgs  = min(d_sgs, nu_max);
+    }
+
     nu_sgs_out[gid] = nu_sgs;
     d_sgs_out[gid] = d_sgs;
 
-    float nu_eff = nu_sgs + 0.004f * (dx * dy) / 10.0f;
+    float nu_eff = nu_sgs + nu_bg;
     float lap_u = (u_xp1 - 2.0f * u0 + u_xm1) * (inv_dx * inv_dx) + u_lap_y;
     float lap_v = (v_xp1 - 2.0f * v0 + v_xm1) * (inv_dx * inv_dx) + v_lap_y;
 
@@ -3482,7 +3489,7 @@ kernel void crm_2d_sgs_simd(
         float s2 = 2.0f * (du_dx * du_dx + dw_dz * dw_dz) + dv_dx * dv_dx + du_dz * du_dz + dv_dz * dv_dz;
         float strain_mag = sqrt(max(s2, 1.0e-12f));
         float cs_lam2_s = cs_lam2_b[k * dz_cols + col_dz] * strain_mag;
-        float ri = n2 / max(strain_mag * strain_mag, 1.0e-10f);
+        float ri = max(n2 / max(strain_mag * strain_mag, 1.0e-10f), -50.0f);
 
         float pr_n = 0.70f;
         float ri_c = 0.25f;
@@ -3497,6 +3504,11 @@ kernel void crm_2d_sgs_simd(
             float stab_fac = sf * sf * sf * sf;
             nu_sgs = cs_lam2_s * stab_fac;
             d_sgs  = (cs_lam2_s / pr_n) * stab_fac * (1.0f - g_coef * ri);
+        }
+        float nu_max_2d = f_p.w;
+        if (nu_max_2d > 0.0f) {
+            nu_sgs = min(nu_sgs, max(nu_max_2d - nu_bg, 0.0f));
+            d_sgs  = min(d_sgs, nu_max_2d);
         }
 
         float nu_eff = nu_sgs + nu_bg;
@@ -4237,6 +4249,7 @@ def run_crm_sgs_metal(
     dz_w_int: torch.Tensor,
     gravity: float = C.GRAVITY,
     c_s: float = 0.18,
+    nu_max: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Execute 3D Smagorinsky-Lilly SGS tendencies in 2 fused Metal kernels."""
     nz, n_col, ny, nx = rho_d.shape
@@ -4273,7 +4286,7 @@ def run_crm_sgs_metal(
         ws["dz_ver"] = dz_ver
 
     u_p0 = [nz, n_col, ny, nx]
-    f_p = [float(dx), float(dy), float(gravity), float(c_s)]
+    f_p = [float(dx), float(dy), float(gravity), float(nu_max)]
 
     r_c = rho_d.contiguous()
     u_c = u.contiguous()

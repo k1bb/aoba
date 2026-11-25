@@ -380,13 +380,16 @@ def _compute_3d_sgs_tendencies(
     dy: float,
     dz_c: torch.Tensor,
     dz_w: torch.Tensor,
+    dt_sub: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute anisotropic 3D Smagorinsky-Lilly SGS momentum & heat tendencies (SCALE-RM Sec. 8.1.2)."""
-    nz = rho_d.shape[0]
+    nz, _, ny, _ = rho_d.shape
+    inv_h2 = (1.0 / (dx * dx)) + ((1.0 / (dy * dy)) if ny > 1 else 0.0)
+    nu_max = (0.12 / (max(dt_sub, 1.0) * inv_h2)) if dt_sub > 0.0 else 0.0
     if can_use_crm_metal(rho_d):
         dz_w_int = dz_w if dz_w.shape[0] == nz - 1 else dz_w[1:-1]
         return dispatch_crm_sgs_metal(
-            rho_d, u, v, w, theta_m, dx, dy, dz_c, dz_w_int, C.GRAVITY, 0.18
+            rho_d, u, v, w, theta_m, dx, dy, dz_c, dz_w_int, C.GRAVITY, 0.18, nu_max=nu_max
         )
     dz = dz_c.view(nz, -1, 1, 1)
     dz_int = dz_w.view(nz - 1, -1, 1, 1) if dz_w.shape[0] == nz - 1 else dz_w[1:-1].view(nz - 1, -1, 1, 1)
@@ -425,6 +428,10 @@ def _compute_3d_sgs_tendencies(
     n2[1:] += 0.5 * n2_int
 
     nu_sgs, d_sgs = compute_smagorinsky_lilly_3d(strain_mag, n2, dx, dy, dz)
+    nu_bg = 0.004 * (dx * dy) / 10.0  # background horizontal numerical filter
+    if nu_max > 0.0:
+        nu_sgs = torch.clamp(nu_sgs, max=max(nu_max - nu_bg, 0.0))
+        d_sgs = torch.clamp(d_sgs, max=nu_max)
 
     # Horizontal eddy flux divergences (vertical PBL turbulence is handled implicitly by MYNN 2.5)
     lap_u = (torch.roll(u, -1, -1) - 2.0 * u + torch.roll(u, 1, -1)) / (dx * dx) + (
@@ -449,8 +456,7 @@ def _compute_3d_sgs_tendencies(
     fth_y = -rho_y * d_y * (torch.roll(theta_m, -1, -2) - theta_m) / dy
     d_Thm_sgs = -(fth_x - torch.roll(fth_x, 1, -1)) / dx - (fth_y - torch.roll(fth_y, 1, -2)) / dy
 
-    # Add small 4th-order background horizontal numerical filter tau_div to control 2*dx grid noise
-    nu_bg = 0.004 * (dx * dy) / 10.0  # ~640 m^2 s^-1 at dx = 4 km
+    # Background + capped Smagorinsky-Lilly horizontal eddy viscosity
     du_sgs = (nu_sgs + nu_bg) * lap_u
     dv_sgs = (nu_sgs + nu_bg) * lap_v
     dw_sgs = torch.zeros_like(w)
@@ -1110,7 +1116,8 @@ def _step_crm_physics_and_dynamics_impl(
         # Wicker & Skamarock, 2002 stability limit is 1.25 in 2D -> 0.675 gives dt_sub = 60 s at dx = 4 km),
         # while step_crm_rk3_hevi sub-steps horizontal acoustic waves automatically.
         cfl_adv = 0.675 if is_2d_crm else 0.45
-        dt_cfl_max = min(60.0, cfl_adv * min(crm.dx, crm.dy) / 45.0)
+        u_ref_cfl = 45.0 if is_2d_crm else 60.0
+        dt_cfl_max = min(60.0, cfl_adv * min(crm.dx, crm.dy) / u_ref_cfl)
         n_sub = max(n_dyn_substeps, int(math.ceil(dt_crm / max(dt_cfl_max, 0.1))))
     dt_sub = dt_crm / float(max(n_sub, 1))
     dz_fct = dz_c_col if dz_c_col is not None else vgrid.dzeta_c
@@ -1159,7 +1166,8 @@ def _step_crm_physics_and_dynamics_impl(
                 if sgs_cached is None or (s_idx % sgs_stride == 0):
                     thm_sgs = crm.theta_m if s_idx == 0 else (Thm_cur / torch.clamp(crm.rho_d, min=1.0e-5))
                     sgs_cached = _compute_3d_sgs_tendencies(
-                        crm.rho_d, crm.u, crm.v, crm.w, thm_sgs, crm.dx, crm.dy, dz_c_sgs, dz_w_sgs
+                        crm.rho_d, crm.u, crm.v, crm.w, thm_sgs, crm.dx, crm.dy, dz_c_sgs, dz_w_sgs,
+                        dt_sub=dt_sub,
                     )
                 fx_mean, fy_mean, fz_mean = step_crm_rk3_hevi(
                     crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col,
@@ -1176,7 +1184,8 @@ def _step_crm_physics_and_dynamics_impl(
                     if sgs_cached is None or (cur_s % sgs_stride == 0):
                         thm_sgs = crm.theta_m if cur_s == 0 else (Thm_cur / torch.clamp(crm.rho_d, min=1.0e-5))
                         sgs_cached = _compute_3d_sgs_tendencies(
-                            crm.rho_d, crm.u, crm.v, crm.w, thm_sgs, crm.dx, crm.dy, dz_c_sgs, dz_w_sgs
+                            crm.rho_d, crm.u, crm.v, crm.w, thm_sgs, crm.dx, crm.dy, dz_c_sgs, dz_w_sgs,
+                            dt_sub=dt_sub,
                         )
                     fx, fy, fz = step_crm_rk3_hevi(
                         crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col,
