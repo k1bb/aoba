@@ -936,8 +936,9 @@ def _ogcm_gm_and_w_core(
     w_vel = torch.cat([z_c, w_up[1:], z_c], dim=0)
     eta_new = torch.clamp((eta_old + dt * w_up[0]) * is_ocn_f, -5.0, 5.0)
 
-    h0_old = torch.clamp(h_c_safe[0] + eta_old, min=10.0)
-    h0_new = torch.clamp(h_c_safe[0] + eta_new, min=10.0)
+    h0_min = 0.5 * h_c_safe[0]
+    h0_old = torch.maximum(h_c_safe[0] + eta_old, h0_min)
+    h0_new = torch.maximum(h_c_safe[0] + eta_new, h0_min)
     dh0_eff = h0_new - h0_old
 
     if enable_full_redi:
@@ -2032,8 +2033,9 @@ def _step_ogcm_voronoi_impl(
         z_c = torch.zeros_like(div_hu[0:1])
         w_vel = torch.cat([z_c, w_up[1:], z_c], dim=0)
         eta_new = torch.clamp((eta_old + dt * w_up[0]) * is_ocn_f, -5.0, 5.0)
-        h0_old = torch.clamp(h_c_safe[0] + eta_old, min=10.0)
-        h0_new = torch.clamp(h_c_safe[0] + eta_new, min=10.0)
+        h0_min = 0.5 * h_c_safe[0]
+        h0_old = torch.maximum(h_c_safe[0] + eta_old, h0_min)
+        h0_new = torch.maximum(h_c_safe[0] + eta_new, h0_min)
         dh0_eff = h0_new - h0_old
         if ENABLE_FULL_REDI:
             s2_cell = dispatch_scvt_weighted_edge_sum_metal(mesh, s2_edge_w, active_w_c)
@@ -2223,7 +2225,7 @@ def _step_ogcm_voronoi_impl(
             h_u_edge=h_u_edge,
             sx_int=sx_int,
             w_vel=w_vel,
-            h0_new=h0_new,
+            h0_new=h0_vdiff,
             dh0_eff=dh0_eff,
             a_t=a_t,
             b_t=b_t,
@@ -2290,12 +2292,9 @@ def diagnose_ocean_spinup_metrics(
 
     h_c64 = ogcm.h_c.detach().cpu().to(torch.float64)
     eta64 = ogcm.eta.detach().cpu().to(torch.float64)
-    h_eff = h_c64.clone()
-    h_eff[0] = torch.where(
-        wet0,
-        torch.clamp(h_c64[0] + eta64, min=10.0),
-        torch.zeros_like(area),
-    )
+    h_col64 = torch.clamp(h_c64.sum(dim=0), min=1.0)
+    zstar_fac = torch.where(wet0, torch.clamp(1.0 + eta64 / h_col64, min=0.5, max=1.5), torch.zeros_like(area))
+    h_eff = h_c64 * zstar_fac.unsqueeze(0)
     vol = h_eff * area.unsqueeze(0)  # [nzo, nc] [m^3]
     v_tot = float(vol.sum().item())
 
@@ -2445,8 +2444,9 @@ def compute_moc_and_oht_profiles(
     wet0 = ogcm.wet_c[0].detach().cpu()
     h_c64 = ogcm.h_c.detach().cpu().to(torch.float64)
     eta64 = ogcm.eta.detach().cpu().to(torch.float64)
-    h_eff = h_c64.clone()
-    h_eff[0] = torch.where(wet0, torch.clamp(h_c64[0] + eta64, min=10.0), torch.zeros_like(area))
+    h_col64 = torch.clamp(h_c64.sum(dim=0), min=1.0)
+    zstar_fac = torch.where(wet0, torch.clamp(1.0 + eta64 / h_col64, min=0.5, max=1.5), torch.zeros_like(area))
+    h_eff = h_c64 * zstar_fac.unsqueeze(0)
     t64 = ogcm.temp.detach().cpu().to(torch.float64) + ogcm.t_comp.detach().cpu().to(torch.float64)
 
     lat_deg = torch.rad2deg(mesh.lat_cell.detach().cpu().to(torch.float64))

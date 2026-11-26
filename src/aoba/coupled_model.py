@@ -2386,6 +2386,7 @@ def step_aoba_model(
                 m_ice_cell_before - m_ice_pre_sfc,
                 swe_ice_cell_before - swe_ice_pre_sfc,
                 t_ml_atm_ref=t_ml_pre_sfc,
+                h_ml_atm=sfc.h_ocean_ml,
                 dt=dt,
             )
 

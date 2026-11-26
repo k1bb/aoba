@@ -2509,8 +2509,8 @@ def main() -> None:
                 hc_lnd = _lmean(bio_now.h_canopy)
                 fevg_lnd = _lmean(torch.clamp(bio_now.f_evg, 0.0, 1.0)) if bio_now.f_evg is not None else float("nan")
                 fc4_lnd = _lmean(torch.clamp(bio_now.f_c4, 0.0, 1.0))
-                # Global terrestrial GPP [PgC/yr] from monthly mean gpp [umol CO2 m^-2 s^-1]
-                gpp_pgc_yr = m_gpp * 12.011e-9 * a_h_tot * (C.DAYS_PER_YEAR * C.SECONDS_PER_DAY) * 1.0e-12
+                # Global terrestrial GPP [PgC/yr] from land-only monthly mean gpp [umol CO2 m^-2 s^-1]
+                gpp_pgc_yr = m_gpp * 12.011e-9 * a_lnd_tot * (C.DAYS_PER_YEAR * C.SECONDS_PER_DAY) * 1.0e-12
                 lc_veg_pgc = float("nan")
                 lc_soil_pgc = float("nan")
                 if model.land_carbon is not None:

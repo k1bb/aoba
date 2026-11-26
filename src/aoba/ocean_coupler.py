@@ -233,37 +233,50 @@ def apply_atm_surface_increments_to_ocn_sfc(
     dswe_ice_atm: torch.Tensor,
     *,
     t_ml_atm_ref: torch.Tensor | None = None,
+    h_ml_atm: torch.Tensor | None = None,
     dt: float = 0.0,
     lambda_airsea_wm2k: float = 40.0,
 ) -> None:
-    """Apply atmospheric surface-layer tendencies onto fine `ocn_sfc` with exact freeze protection.
+    """Apply atmospheric surface-layer enthalpy tendencies onto fine `ocn_sfc` conservatively.
 
-    Preserves fine-scale SST gradients and sea-ice edges on `ocn_sfc` while transferring
-    the atmospheric heat and sea-ice mass exchange from `step_surface`. When `t_ml_atm_ref`
-    and `dt > 0` are provided, applies the exact exponential linearized bulk air-sea negative
-    thermal feedback `-lambda_as * (T_ocn - T_atm_ref)` (AOBA Formulation Eq. 9.8; Haney, 1971;
-    Barnier et al., 1995; Ma et al., 2016) so isolated fine coastal/inland-sea cells beneath
-    coarse land host cells cannot run away thermally while open-ocean parent-cell area means
-    remain heat-conserving.
+    Transfers the exact total water+ice surface enthalpy increment
+    `dE_atm = c_ml_atm * dT_ml_atm - L_f0 * dm_ice_atm` rather than `(dT, dm_ice)`
+    separately. Whenever a coarse atmosphere host cell straddles a fine-grid sea-ice edge
+    (`T_coarse > T_f` and `m_ice_coarse > 0`), internal coarse-cell basal melting cancels
+    identically in `dE_atm`, eliminating spurious open-ocean cooling and artificial ice
+    ratcheting across mismatched grid resolutions while preserving fine-scale SST fronts
+    and exact local enthalpy conservation `c_ml * dT - L_f0 * dm_ice == dE_tot`.
     """
-    dt_ocn = atm_to_ocn_intensive(coupler, dt_ml_atm)
-    dm_ocn = atm_to_ocn_intensive(coupler, dm_ice_atm)
-    dswe_ocn = atm_to_ocn_intensive(coupler, dswe_ice_atm)
     is_wet = coupler.ocn_wet_mask
+    h_ocn_safe = torch.clamp(ocn_sfc.h_ocean_ml, min=1.0)
+    c_ml_ocn = C.CP_SEAWATER * C.RHO_SEAWATER * h_ocn_safe
+    if h_ml_atm is not None:
+        c_ml_atm = C.CP_SEAWATER * C.RHO_SEAWATER * torch.clamp(h_ml_atm, min=1.0)
+        de_atm = c_ml_atm * dt_ml_atm - C.L_F0 * dm_ice_atm
+        de_ocn = atm_to_ocn_intensive(coupler, de_atm)
+    else:
+        dt_ocn = atm_to_ocn_intensive(coupler, dt_ml_atm)
+        dm_ocn = atm_to_ocn_intensive(coupler, dm_ice_atm)
+        de_ocn = c_ml_ocn * dt_ocn - C.L_F0 * dm_ocn
+    dswe_ocn = atm_to_ocn_intensive(coupler, dswe_ice_atm)
 
-    c_ml = C.CP_SEAWATER * C.RHO_SEAWATER * torch.clamp(ocn_sfc.h_ocean_ml, min=10.0)
-    t_next = ocn_sfc.t_ocean_ml + dt_ocn
+    de_tot = de_ocn
     if t_ml_atm_ref is not None and dt > 0.0 and lambda_airsea_wm2k > 0.0:
         t_ref_ocn = atm_to_ocn_intensive(coupler, t_ml_atm_ref)
-        r_fb = -torch.expm1(-(float(lambda_airsea_wm2k) * float(dt)) / c_ml)
-        t_next = t_next - r_fb * (ocn_sfc.t_ocean_ml - t_ref_ocn)
-    freeze_def = torch.where(is_wet, torch.clamp(C.T_FREEZE_OCEAN - t_next, min=0.0), torch.zeros_like(t_next))
-    ocn_sfc.t_ocean_ml = torch.where(is_wet, t_next + freeze_def, ocn_sfc.t_ocean_ml)
-    ocn_sfc.m_seaice = torch.where(
-        is_wet,
-        torch.clamp(ocn_sfc.m_seaice + dm_ocn + (c_ml * freeze_def) / C.L_F0, min=0.0),
-        ocn_sfc.m_seaice,
-    )
+        r_fb = -torch.expm1(-(float(lambda_airsea_wm2k) * float(dt)) / c_ml_ocn)
+        de_tot = de_tot - c_ml_ocn * r_fb * (ocn_sfc.t_ocean_ml - t_ref_ocn)
+
+    # Partition total enthalpy increment conservatively between fine-grid SST and sea ice
+    t_prov = ocn_sfc.t_ocean_ml + de_tot / c_ml_ocn
+    e_freeze = torch.where(is_wet, c_ml_ocn * torch.clamp(C.T_FREEZE_OCEAN - t_prov, min=0.0), torch.zeros_like(t_prov))
+    e_excess = torch.where(is_wet, c_ml_ocn * torch.clamp(t_prov - C.T_FREEZE_OCEAN, min=0.0), torch.zeros_like(t_prov))
+    m_freeze = e_freeze / C.L_F0
+    m_melt = torch.minimum(e_excess / C.L_F0, torch.clamp(ocn_sfc.m_seaice, min=0.0))
+    m_next = torch.clamp(ocn_sfc.m_seaice + m_freeze - m_melt, min=0.0)
+    t_next = t_prov + (C.L_F0 * (m_freeze - m_melt)) / c_ml_ocn
+
+    ocn_sfc.t_ocean_ml = torch.where(is_wet, t_next, ocn_sfc.t_ocean_ml)
+    ocn_sfc.m_seaice = torch.where(is_wet, m_next, ocn_sfc.m_seaice)
     ocn_sfc.swe_seaice = torch.where(
         is_wet,
         torch.clamp(ocn_sfc.swe_seaice + dswe_ocn, min=0.0),
