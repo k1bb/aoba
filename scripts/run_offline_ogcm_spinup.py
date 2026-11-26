@@ -202,33 +202,75 @@ def _step_offline_ocean_surface(
     return f_ice, evap_o, sw_abs_ocn, q_net_o, tr_ocn.u_star
 
 
-def inject_offline_ocean_into_restart(
-    base_restart_path: Path,
-    ogcm_state,
-    sfc_state,
-    out_restart_path: Path,
-) -> None:
-    """Inject equilibrated 3D OGCM & sea-ice state cleanly into a coupled Phase-1 `restart.pt`."""
-    ckpt = torch.load(base_restart_path, map_location="cpu", weights_only=False)
-    ckpt["ogcm"] = {
-        k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+def _serialize_ogcm(ogcm_state) -> dict[str, Any]:
+    """Serialize 3D OGCM state (including nested BGC & EVP-ITD dataclasses) matching `run_g5_30yr.py`."""
+    return {
+        k: (
+            {bk: bv.detach().cpu() if isinstance(bv, torch.Tensor) else bv for bk, bv in v.__dict__.items()}
+            if k in ("bgc", "seaice_evp") and v is not None
+            else (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+        )
         for k, v in ogcm_state.__dict__.items()
         if not k.startswith("_")
     }
-    is_ocn = (sfc_state.surf_type.detach().cpu() == SURF_OCEAN)
-    for k in ("t_ocean_ml", "t_ocean_ml_comp", "u_star_ocean", "m_seaice", "t_seaice", "swe_seaice"):
-        val = getattr(sfc_state, k, None)
-        if val is not None:
-            ckpt["sfc"][k] = val.detach().cpu()
+
+
+def _restore_ogcm(ogcm_target, ck_og: dict[str, Any], dev: torch.device) -> None:
+    """Restore 3D OGCM state (including nested BGC & EVP-ITD dicts) onto `dev`."""
+    for k, v in ck_og.items():
+        if k.startswith("_"):
+            continue
+        if k in ("bgc", "seaice_evp"):
+            sub_target = getattr(ogcm_target, k, None)
+            if v is not None and sub_target is not None:
+                sub_items = v.items() if isinstance(v, dict) else v.__dict__.items()
+                for bk, bv in sub_items:
+                    setattr(sub_target, bk, bv.to(device=dev) if isinstance(bv, torch.Tensor) else bv)
+            continue
+        setattr(ogcm_target, k, v.to(device=dev) if isinstance(v, torch.Tensor) else v)
+
+
+def inject_offline_ocean_into_restart(
+    base_restart_path: Path,
+    ogcm_state,
+    ocn_sfc_state,
+    out_restart_path: Path,
+    ocn_coupler=None,
+) -> None:
+    """Inject equilibrated 3D OGCM (+ BGC + EVP-ITD) & sea-ice state cleanly into a coupled `restart.pt`."""
+    ckpt = torch.load(base_restart_path, map_location="cpu", weights_only=False)
+    ckpt["ogcm"] = _serialize_ogcm(ogcm_state)
+
+    ocn_keys = ("t_ocean_ml", "t_ocean_ml_comp", "u_star_ocean", "m_seaice", "t_seaice", "swe_seaice")
+    if ocn_coupler is not None and ckpt.get("ocn_sfc") is not None:
+        # Independent fine-ocean grid: update `ocn_sfc` directly and project conservatively onto host `sfc`
+        for k in ocn_keys:
+            val = getattr(ocn_sfc_state, k, None)
+            if val is not None:
+                ckpt["ocn_sfc"][k] = val.detach().cpu()
+        is_ocn_host = (ckpt["sfc"]["surf_type"].detach().cpu() == SURF_OCEAN)
+        for k in ocn_keys:
+            val = getattr(ocn_sfc_state, k, None)
+            if val is not None and k in ckpt["sfc"]:
+                proj = ocn_coupler.remap_o2a(val).detach().cpu()
+                ckpt["sfc"][k] = torch.where(is_ocn_host, proj, ckpt["sfc"][k])
+        host_src = ckpt["sfc"]
+    else:
+        is_ocn_host = (ocn_sfc_state.surf_type.detach().cpu() == SURF_OCEAN)
+        for k in ocn_keys:
+            val = getattr(ocn_sfc_state, k, None)
+            if val is not None:
+                ckpt["sfc"][k] = val.detach().cpu()
+        host_src = ckpt["sfc"]
 
     # Synchronize subgrid ocean tiles (`sfc_sub`) identically to host cell ocean state
     if ckpt.get("sfc_sub") is not None:
-        nc = int(is_ocn.shape[0])
+        nc = int(is_ocn_host.shape[0])
         m_sub = int(ckpt["sfc_sub"]["t_ocean_ml"].shape[0])
         n_sub = m_sub // nc
-        is_ocn_sub = is_ocn.unsqueeze(1).expand(nc, n_sub).reshape(m_sub)
-        for k in ("t_ocean_ml", "t_ocean_ml_comp", "u_star_ocean", "m_seaice", "t_seaice", "swe_seaice"):
-            val = getattr(sfc_state, k, None)
+        is_ocn_sub = is_ocn_host.unsqueeze(1).expand(nc, n_sub).reshape(m_sub)
+        for k in ocn_keys:
+            val = host_src.get(k)
             if val is not None and k in ckpt["sfc_sub"]:
                 bcast = val.detach().cpu().unsqueeze(1).expand(nc, n_sub).reshape(m_sub)
                 ckpt["sfc_sub"][k] = torch.where(is_ocn_sub, bcast, ckpt["sfc_sub"][k])
@@ -278,6 +320,12 @@ def main() -> None:
     model = init_aoba_model(cfg, device=dev)
     assert model.ogcm is not None
 
+    ocn_mesh = model.ocn_mesh if model.ocn_mesh is not None else model.mesh
+    ocn_sfc = model.ocn_sfc if model.ocn_sfc is not None else model.sfc
+    ocn_coupler = model.ocn_coupler
+    has_fine_ocn = ocn_coupler is not None
+    ocn_keys = ("t_ocean_ml", "t_ocean_ml_comp", "u_star_ocean", "m_seaice", "t_seaice", "swe_seaice")
+
     # Restore ocean & surface state from Phase-1 restart (or resume Phase-2 checkpoint if present)
     off_ckpt_path = out_dir / "offline_ogcm_checkpoint.pt"
     start_year = 1
@@ -285,23 +333,42 @@ def main() -> None:
         print(f"Resuming Phase-2 offline ocean spin-up from {off_ckpt_path}...", flush=True)
         ock = torch.load(off_ckpt_path, map_location="cpu", weights_only=False)
         start_year = int(ock["year"]) + 1
-        for k, v in ock["ogcm"].items():
-            setattr(model.ogcm, k, v.to(device=dev) if isinstance(v, torch.Tensor) else v)
+        _restore_ogcm(model.ogcm, ock["ogcm"], dev)
         for k, v in ock["sfc"].items():
-            setattr(model.sfc, k, v.to(device=dev) if isinstance(v, torch.Tensor) else v)
+            if v is not None:
+                setattr(ocn_sfc, k, v.to(device=dev) if isinstance(v, torch.Tensor) else v)
     else:
-        for k, v in ckpt["ogcm"].items():
-            setattr(model.ogcm, k, v.to(device=dev) if isinstance(v, torch.Tensor) else v)
-        for k in ("t_ocean_ml", "t_ocean_ml_comp", "u_star_ocean", "m_seaice", "t_seaice", "swe_seaice"):
-            if k in ckpt["sfc"] and ckpt["sfc"][k] is not None:
-                setattr(model.sfc, k, ckpt["sfc"][k].to(device=dev))
+        _restore_ogcm(model.ogcm, ckpt["ogcm"], dev)
+        sfc_src = ckpt["ocn_sfc"] if (has_fine_ocn and ckpt.get("ocn_sfc") is not None) else ckpt["sfc"]
+        for k in ocn_keys:
+            if k in sfc_src and sfc_src[k] is not None:
+                setattr(ocn_sfc, k, sfc_src[k].to(device=dev))
 
-    clim = _load_self_forcing_climatology(coupled_dir, args.forcing_year_start, args.forcing_year_end, dev)
-    z_ref_rel = torch.clamp(model.atmos.z_c[0] - model.atmos.z_w[0], min=10.0)
-    a_earth_m2 = float(model.mesh.area_cell.detach().cpu().to(torch.float64).sum().item())
+    clim_atm = _load_self_forcing_climatology(coupled_dir, args.forcing_year_start, args.forcing_year_end, dev)
+    if has_fine_ocn:
+        assert ocn_coupler is not None
+        print(
+            f"Remapping 12-month self-forcing climatology from host (nc={model.mesh.n_cells}) "
+            f"-> fine ocean (nc={ocn_mesh.n_cells})...",
+            flush=True,
+        )
+        clim = {
+            k: torch.stack([ocn_coupler.remap_a2o(v[m]) for m in range(12)], dim=0)
+            for k, v in clim_atm.items()
+        }
+        z_ref_rel = ocn_coupler.remap_a2o(torch.clamp(model.atmos.z_c[0] - model.atmos.z_w[0], min=10.0))
+    else:
+        clim = clim_atm
+        z_ref_rel = torch.clamp(model.atmos.z_c[0] - model.atmos.z_w[0], min=10.0)
+
+    a_earth_m2 = float(ocn_mesh.area_cell.detach().cpu().to(torch.float64).sum().item())
     yr_sec = C.DAYS_PER_YEAR * C.SECONDS_PER_DAY
     steps_per_year = max(int(round(yr_sec / args.dt_ocn)), 12)
     dt_step = yr_sec / float(steps_per_year)
+
+    has_bgc = model.ogcm.bgc is not None
+    if has_bgc:
+        from aoba.ocean_bgc import diagnose_ocean_bgc_metrics
 
     csv_path = out_dir / "offline_spinup_monitor.csv"
     header = [
@@ -311,24 +378,36 @@ def main() -> None:
         "amoc_26n_sv", "amoc_max_sv", "acc_drake_sv", "seaice_nh_mkm2", "seaice_sh_mkm2",
         "deep_drift_k_per_century", "wall_s_per_yr",
     ]
+    if has_bgc:
+        header += ["ocean_npp_pgc_yr", "ocean_fgco2_pgc_yr", "ocean_o2_global_mmol_m3", "ocean_omz_vol_pct"]
+
     if start_year == 1 or not csv_path.exists():
-        m0 = diagnose_ocean_spinup_metrics(model.ogcm, model.sfc, model.mesh)
+        m0 = diagnose_ocean_spinup_metrics(model.ogcm, ocn_sfc, ocn_mesh)
+        row0 = [
+            0, f"{m0['t_ocn_global_k']:.5f}", f"{m0['t_ocn_0_300m_k']:.5f}",
+            f"{m0['t_ocn_300_1500m_k']:.5f}", f"{m0['t_ocn_deep_k']:.5f}",
+            f"{m0['sst_global_k']:.4f}", f"{m0['s_ocn_global_psu']:.5f}", f"{m0['sss_global_psu']:.4f}",
+            f"{m0['ohc_zj']:.4f}", "0.000", f"{m0['ocn_ke_jm2']:.2f}", f"{m0['ocn_eta_rms_m']:.4f}",
+            f"{m0['ocn_hbl_mean_m']:.2f}", f"{m0['ocn_hbl_max_m']:.1f}",
+            f"{m0['amoc_26n_sv']:.2f}", f"{m0['amoc_max_sv']:.2f}", f"{m0['acc_drake_sv']:.2f}",
+            f"{m0['seaice_nh_mkm2']:.3f}", f"{m0['seaice_sh_mkm2']:.3f}", "nan", "0.00",
+        ]
+        if has_bgc:
+            mb0 = diagnose_ocean_bgc_metrics(model.ogcm.bgc, model.ogcm, ocn_mesh)
+            row0 += [
+                f"{mb0.get('ocean_npp_pgc_yr', 0.0):.2f}",
+                f"{mb0.get('ocean_fgco2_pgc_yr', 0.0):.3f}",
+                f"{mb0.get('ocean_o2_global_mmol_m3', 0.0):.2f}",
+                f"{mb0.get('ocean_omz_vol_pct', 0.0):.3f}",
+            ]
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(header)
-            w.writerow([
-                0, f"{m0['t_ocn_global_k']:.5f}", f"{m0['t_ocn_0_300m_k']:.5f}",
-                f"{m0['t_ocn_300_1500m_k']:.5f}", f"{m0['t_ocn_deep_k']:.5f}",
-                f"{m0['sst_global_k']:.4f}", f"{m0['s_ocn_global_psu']:.5f}", f"{m0['sss_global_psu']:.4f}",
-                f"{m0['ohc_zj']:.4f}", "0.000", f"{m0['ocn_ke_jm2']:.2f}", f"{m0['ocn_eta_rms_m']:.4f}",
-                f"{m0['ocn_hbl_mean_m']:.2f}", f"{m0['ocn_hbl_max_m']:.1f}",
-                f"{m0['amoc_26n_sv']:.2f}", f"{m0['amoc_max_sv']:.2f}", f"{m0['acc_drake_sv']:.2f}",
-                f"{m0['seaice_nh_mkm2']:.3f}", f"{m0['seaice_sh_mkm2']:.3f}", "nan", "0.00",
-            ])
+            w.writerow(row0)
         prev_ohc_j = m0["ohc_j"]
         deep_hist = [m0["t_ocn_deep_k"]]
     else:
-        m_cur = diagnose_ocean_spinup_metrics(model.ogcm, model.sfc, model.mesh)
+        m_cur = diagnose_ocean_spinup_metrics(model.ogcm, ocn_sfc, ocn_mesh)
         prev_ohc_j = m_cur["ohc_j"]
         deep_hist = [m_cur["t_ocn_deep_k"]]
 
@@ -339,17 +418,18 @@ def main() -> None:
             t_sec_yr = frac_yr * yr_sec
             frc = _interp_periodic_month(clim, frac_yr)
             mu0, _, _ = compute_orbital_insolation(
-                t_sec_yr, model.mesh.lat_cell, model.mesh.lon_cell,
+                t_sec_yr, ocn_mesh.lat_cell, ocn_mesh.lon_cell,
                 cfg.solar_constant, cfg.obliquity_deg, cfg.eccentricity, cfg.perihelion_deg,
                 t_diurnal_sec=t_sec_yr, diurnal_cycle=False,
             )
             f_ice, evap_o, sw_abs_ocn, _, _ = _step_offline_ocean_surface(
-                model.sfc, model.mesh, frc, mu0, z_ref_rel, dt_step
+                ocn_sfc, ocn_mesh, frc, mu0, z_ref_rel, dt_step
             )
+            u10_o = torch.sqrt(frc["u_zonal_0"] ** 2 + frc["v_merid_0"] ** 2 + 1.0e-6)
             step_ogcm_voronoi(
                 ogcm=model.ogcm,
-                sfc=model.sfc,
-                mesh=model.mesh,
+                sfc=ocn_sfc,
+                mesh=ocn_mesh,
                 tau_x_sfc=frc["tau_x_sfc"],
                 tau_y_sfc=frc["tau_y_sfc"],
                 f_seaice=f_ice,
@@ -360,10 +440,18 @@ def main() -> None:
                 dt=dt_step,
                 enable_seaice_drift=bool(cfg.enable_seaice_drift),
                 sw_net_ocn=sw_abs_ocn,
+                u10_ocn=u10_o,
+                co2_ppmv=float(cfg.co2_ppmv),
+                enable_fct_zstar=bool(getattr(cfg, "enable_ogcm_fct_zstar", True)),
+                enable_scale_aware_gm=bool(getattr(cfg, "enable_ogcm_scale_aware_gm", True)),
+                enable_submeso=bool(getattr(cfg, "enable_ogcm_submeso", True)),
+                enable_tidal_mixing=bool(getattr(cfg, "enable_ogcm_tidal_mixing", True)),
+                enable_current_rel_wind=bool(getattr(cfg, "enable_current_rel_wind", True)),
+                enable_o2_omz=bool(getattr(cfg, "enable_ocean_o2_omz", False)),
             )
         synchronize_device(dev)
         wall_yr = time.perf_counter() - t0
-        m = diagnose_ocean_spinup_metrics(model.ogcm, model.sfc, model.mesh)
+        m = diagnose_ocean_spinup_metrics(model.ogcm, ocn_sfc, ocn_mesh)
         ohc_flux = (m["ohc_j"] - prev_ohc_j) / (yr_sec * a_earth_m2)
         prev_ohc_j = m["ohc_j"]
         deep_hist.append(m["t_ocn_deep_k"])
@@ -372,25 +460,40 @@ def main() -> None:
         else:
             deep_drift = float("nan")
 
+        row = [
+            yr, f"{m['t_ocn_global_k']:.5f}", f"{m['t_ocn_0_300m_k']:.5f}",
+            f"{m['t_ocn_300_1500m_k']:.5f}", f"{m['t_ocn_deep_k']:.5f}",
+            f"{m['sst_global_k']:.4f}", f"{m['s_ocn_global_psu']:.5f}", f"{m['sss_global_psu']:.4f}",
+            f"{m['ohc_zj']:.4f}", f"{ohc_flux:.3f}", f"{m['ocn_ke_jm2']:.2f}", f"{m['ocn_eta_rms_m']:.4f}",
+            f"{m['ocn_hbl_mean_m']:.2f}", f"{m['ocn_hbl_max_m']:.1f}",
+            f"{m['amoc_26n_sv']:.2f}", f"{m['amoc_max_sv']:.2f}", f"{m['acc_drake_sv']:.2f}",
+            f"{m['seaice_nh_mkm2']:.3f}", f"{m['seaice_sh_mkm2']:.3f}",
+            f"{deep_drift:.4f}" if math.isfinite(deep_drift) else "nan",
+            f"{wall_yr:.2f}",
+        ]
+        bgc_str = ""
+        if has_bgc:
+            mb = diagnose_ocean_bgc_metrics(model.ogcm.bgc, model.ogcm, ocn_mesh)
+            row += [
+                f"{mb.get('ocean_npp_pgc_yr', 0.0):.2f}",
+                f"{mb.get('ocean_fgco2_pgc_yr', 0.0):.3f}",
+                f"{mb.get('ocean_o2_global_mmol_m3', 0.0):.2f}",
+                f"{mb.get('ocean_omz_vol_pct', 0.0):.3f}",
+            ]
+            bgc_str = (
+                f" | NPP={mb.get('ocean_npp_pgc_yr', 0.0):.1f} PgC/y"
+                f" fgCO2={mb.get('ocean_fgco2_pgc_yr', 0.0):+.2f}"
+                f" O2={mb.get('ocean_o2_global_mmol_m3', 0.0):.1f}"
+            )
         with open(csv_path, "a", newline="") as f:
-            csv.writer(f).writerow([
-                yr, f"{m['t_ocn_global_k']:.5f}", f"{m['t_ocn_0_300m_k']:.5f}",
-                f"{m['t_ocn_300_1500m_k']:.5f}", f"{m['t_ocn_deep_k']:.5f}",
-                f"{m['sst_global_k']:.4f}", f"{m['s_ocn_global_psu']:.5f}", f"{m['sss_global_psu']:.4f}",
-                f"{m['ohc_zj']:.4f}", f"{ohc_flux:.3f}", f"{m['ocn_ke_jm2']:.2f}", f"{m['ocn_eta_rms_m']:.4f}",
-                f"{m['ocn_hbl_mean_m']:.2f}", f"{m['ocn_hbl_max_m']:.1f}",
-                f"{m['amoc_26n_sv']:.2f}", f"{m['amoc_max_sv']:.2f}", f"{m['acc_drake_sv']:.2f}",
-                f"{m['seaice_nh_mkm2']:.3f}", f"{m['seaice_sh_mkm2']:.3f}",
-                f"{deep_drift:.4f}" if math.isfinite(deep_drift) else "nan",
-                f"{wall_yr:.2f}",
-            ])
+            csv.writer(f).writerow(row)
 
         if yr == 1 or yr % 10 == 0 or yr == args.years:
             print(
                 f"[OFFLINE OGCM Y{yr:04d}/{args.years:04d}] dOHC={ohc_flux:+5.2f} W/m2 | "
                 f"Tocn(glob/up/mid/deep)={m['t_ocn_global_k']:.3f}/{m['t_ocn_0_300m_k']:.2f}/"
                 f"{m['t_ocn_300_1500m_k']:.2f}/{m['t_ocn_deep_k']:.3f} K | S={m['s_ocn_global_psu']:.4f} | "
-                f"AMOC={m['amoc_26n_sv']:.1f} Sv | ACC={m['acc_drake_sv']:.1f} Sv | "
+                f"AMOC={m['amoc_26n_sv']:.1f} Sv | ACC={m['acc_drake_sv']:.1f} Sv{bgc_str} | "
                 f"deep_drift={deep_drift:+.4f} K/100yr | {wall_yr:.1f} s/yr",
                 flush=True,
             )
@@ -400,8 +503,8 @@ def main() -> None:
             torch.save(
                 {
                     "year": yr,
-                    "ogcm": {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.ogcm.__dict__.items() if not k.startswith("_")},
-                    "sfc": {k: getattr(model.sfc, k).detach().cpu() for k in ("t_ocean_ml", "t_ocean_ml_comp", "u_star_ocean", "m_seaice", "t_seaice", "swe_seaice") if getattr(model.sfc, k, None) is not None},
+                    "ogcm": _serialize_ogcm(model.ogcm),
+                    "sfc": {k: getattr(ocn_sfc, k).detach().cpu() for k in ocn_keys if getattr(ocn_sfc, k, None) is not None},
                 },
                 tmp_ck,
             )
@@ -414,8 +517,9 @@ def main() -> None:
     inject_offline_ocean_into_restart(
         base_restart_path=base_restart,
         ogcm_state=model.ogcm,
-        sfc_state=model.sfc,
+        ocn_sfc_state=ocn_sfc,
         out_restart_path=out_dir / "restart_phase3_init.pt",
+        ocn_coupler=ocn_coupler,
     )
 
 
