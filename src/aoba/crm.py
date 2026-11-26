@@ -1138,19 +1138,20 @@ def _step_crm_physics_and_dynamics_impl(
     if ny == 1 and nx == 1:
         n_sub = max(n_dyn_substeps, 0)
     else:
-        # Split-explicit outer RK3-WS3 obeys the convective/jet CFL (60 m/s;
-        # Wicker & Skamarock, 2002 stability limit is 1.25 in 2D -> 0.675 gives dt_sub = 45 s at dx = 4 km),
-        # while step_crm_rk3_hevi sub-steps horizontal acoustic waves automatically.
-        cfl_adv = 0.675 if is_2d_crm else 0.45
-        u_ref_cfl = 60.0 if is_2d_crm else 75.0
-        dt_cfl_max = min(45.0 if is_2d_crm else 60.0, cfl_adv * min(crm.dx, crm.dy) / u_ref_cfl)
+        # Split-explicit outer RK3-WS3 & donor-cell FCT obey the half-span jet + convective CFL
+        # (u_ref = 80 m/s after Galilean shift covers >120 m/s winter polar-night jets over easterlies),
+        # yielding dt_sub <= 24 s at dx = 4 km in both 2D and 3D while step_crm_rk3_hevi sub-steps
+        # horizontal acoustic waves automatically.
+        cfl_adv = 0.50 if is_2d_crm else 0.45
+        u_ref_cfl = 80.0
+        dt_cfl_max = min(25.0 if is_2d_crm else 45.0, cfl_adv * min(crm.dx, crm.dy) / u_ref_cfl)
         n_sub = max(n_dyn_substeps, int(math.ceil(dt_crm / max(dt_cfl_max, 0.1))))
     dt_sub = dt_crm / float(max(n_sub, 1))
     dz_fct = dz_c_col if dz_c_col is not None else vgrid.dzeta_c
 
-    # Group acoustic substeps into advective super-steps (<= 45 s in 2D; 1 substep = 30 s in 3D
-    # so explicit horizontal donor-cell FCT obeys C_x + C_y <= 1 even in >100 m/s polar-night jets).
-    adv_group = max(1, min(n_sub, int(math.floor(45.0 / max(dt_sub, 1.0e-3))))) if is_2d_crm else 1
+    # Group acoustic substeps into advective super-steps (<= 25 s in 2D; 1 substep <= 22.5 s in 3D
+    # so explicit horizontal donor-cell FCT obeys C_x + C_y + C_z <= 1 even in >120 m/s polar-night jets).
+    adv_group = max(1, min(n_sub, int(math.floor(25.0 / max(dt_sub, 1.0e-3))))) if is_2d_crm else 1
     sgs_stride = max(1, int(math.floor(120.0 / max(dt_sub, 1.0e-3)))) if is_2d_crm else 1
     use_metal_crm = can_use_crm_metal(crm.rho_d)
     if n_sub > 0:
