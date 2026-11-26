@@ -48,6 +48,7 @@ from aoba.kernels_extra import (
     run_scvt_div_metal,
     run_scvt_fast_acoustic_metal,
     run_scvt_scalar_lap_metal,
+    run_scvt_storm_smag_metal,
     run_scvt_trisk_rot_metal,
     run_scvt_vec_lap_metal,
     run_scvt_vorticity_metal,
@@ -1411,6 +1412,26 @@ def dispatch_scvt_trisk_rot_metal(mesh: Any, zeta_v: torch.Tensor, u_edge: torch
     return run_scvt_trisk_rot_metal(lib, mesh, zeta_v, u_edge)
 
 
+def dispatch_scvt_storm_smag_metal(
+    mesh: Any,
+    rho_d: torch.Tensor,
+    dz_c: torch.Tensor,
+    q_n: torch.Tensor,
+    theta_m: torch.Tensor,
+    u_edge: torch.Tensor,
+    w: torch.Tensor,
+    dt: float,
+    cs_scalar: float,
+    cs_div: float,
+    k_cap: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(u_edge.device)
+    assert lib is not None
+    return run_scvt_storm_smag_metal(
+        lib, mesh, rho_d, dz_c, q_n, theta_m, u_edge, w, dt, cs_scalar, cs_div, k_cap,
+    )
+
+
 def dispatch_scvt_fct_advect_metal(
     mesh: Any,
     q_batch: torch.Tensor,
@@ -1629,7 +1650,7 @@ def dispatch_scvt_weighted_edge_sum_metal(
     if up is None:
         up = torch.tensor([nz, nc, ne], device=edge_field.device, dtype=torch.uint32)
         _WEIGHTED_EDGE_SUM_UP_CACHE[up_key] = up
-    lib.scvt_div_cell(mc["eoc"], weights_cell.contiguous(), edge_field.contiguous(), out, up, threads=nz * nc)
+    lib.scvt_div_cell(mc["eoc"], weights_cell.contiguous(), edge_field.contiguous(), out, up, threads=nc)
     return out
 
 

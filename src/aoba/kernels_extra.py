@@ -4107,21 +4107,29 @@ kernel void scvt_div_cell(
     device const float* flux_e     [[buffer(2)]],   // [nz, N_edges]
     device float* div_out          [[buffer(3)]],   // [nz, N_cells]
     device const uint* u_params    [[buffer(4)]],   // [nz, N_cells, N_edges]
-    uint gid [[thread_position_in_grid]])
+    uint c [[thread_position_in_grid]])
 {
     uint nz = u_params[0];
     uint n_cells = u_params[1];
     uint n_edges = u_params[2];
-    if (gid >= nz * n_cells) return;
-    uint k = gid / n_cells;
-    uint c = gid - k * n_cells;
+    if (c >= n_cells) return;
     uint c6 = c * 6u;
-    uint ebase = k * n_edges;
-    float acc = 0.0f;
-    for (uint d = 0u; d < 6u; ++d) {
-        acc += div_w[c6 + d] * flux_e[ebase + uint(eoc[c6 + d])];
+    uint e0 = uint(eoc[c6]);      float w0 = div_w[c6];
+    uint e1 = uint(eoc[c6 + 1u]); float w1 = div_w[c6 + 1u];
+    uint e2 = uint(eoc[c6 + 2u]); float w2 = div_w[c6 + 2u];
+    uint e3 = uint(eoc[c6 + 3u]); float w3 = div_w[c6 + 3u];
+    uint e4 = uint(eoc[c6 + 4u]); float w4 = div_w[c6 + 4u];
+    uint e5 = uint(eoc[c6 + 5u]); float w5 = div_w[c6 + 5u];
+    for (uint k = 0u; k < nz; ++k) {
+        uint eb = k * n_edges;
+        float acc = w0 * flux_e[eb + e0]
+                  + w1 * flux_e[eb + e1]
+                  + w2 * flux_e[eb + e2]
+                  + w3 * flux_e[eb + e3]
+                  + w4 * flux_e[eb + e4]
+                  + w5 * flux_e[eb + e5];
+        div_out[k * n_cells + c] = acc;
     }
-    div_out[gid] = acc;
 }
 
 kernel void scvt_vorticity_vert(
@@ -4130,19 +4138,20 @@ kernel void scvt_vorticity_vert(
     device const float* u_e        [[buffer(2)]],   // [nz, N_edges]
     device float* zeta_out         [[buffer(3)]],   // [nz, N_verts]
     device const uint* u_params    [[buffer(4)]],   // [nz, N_verts, N_edges]
-    uint gid [[thread_position_in_grid]])
+    uint v [[thread_position_in_grid]])
 {
     uint nz = u_params[0];
     uint n_verts = u_params[1];
     uint n_edges = u_params[2];
-    if (gid >= nz * n_verts) return;
-    uint k = gid / n_verts;
-    uint v = gid - k * n_verts;
+    if (v >= n_verts) return;
     uint v3 = v * 3u;
-    uint ebase = k * n_edges;
-    zeta_out[gid] = vort_w[v3]      * u_e[ebase + uint(eov[v3])]
-                  + vort_w[v3 + 1u] * u_e[ebase + uint(eov[v3 + 1u])]
-                  + vort_w[v3 + 2u] * u_e[ebase + uint(eov[v3 + 2u])];
+    uint e0 = uint(eov[v3]);      float w0 = vort_w[v3];
+    uint e1 = uint(eov[v3 + 1u]); float w1 = vort_w[v3 + 1u];
+    uint e2 = uint(eov[v3 + 2u]); float w2 = vort_w[v3 + 2u];
+    for (uint k = 0u; k < nz; ++k) {
+        uint eb = k * n_edges;
+        zeta_out[k * n_verts + v] = w0 * u_e[eb + e0] + w1 * u_e[eb + e1] + w2 * u_e[eb + e2];
+    }
 }
 
 kernel void scvt_vec_lap_edge(
@@ -4157,22 +4166,28 @@ kernel void scvt_vec_lap_edge(
     device float* lap_out          [[buffer(8)]],   // [nz, N_edges]
     device float* grad_div_out     [[buffer(9)]],   // [nz, N_edges]
     device const uint* u_params    [[buffer(10)]],  // [nz, N_cells, N_verts, N_edges]
-    uint gid [[thread_position_in_grid]])
+    uint e [[thread_position_in_grid]])
 {
     uint nz = u_params[0];
     uint n_cells = u_params[1];
     uint n_verts = u_params[2];
     uint n_edges = u_params[3];
-    if (gid >= nz * n_edges) return;
-    uint k = gid / n_edges;
-    uint e = gid - k * n_edges;
-
-    uint cbase = k * n_cells;
-    uint vbase = k * n_verts;
-    float gd = (div_c[cbase + uint(c1_arr[e])] - div_c[cbase + uint(c0_arr[e])]) * inv_dc[e];
-    float rc = -(zeta_v[vbase + uint(v1_arr[e])] - zeta_v[vbase + uint(v0_arr[e])]) * inv_dv[e];
-    grad_div_out[gid] = gd;
-    lap_out[gid] = gd + rc;
+    if (e >= n_edges) return;
+    uint c0e = uint(c0_arr[e]);
+    uint c1e = uint(c1_arr[e]);
+    uint v0e = uint(v0_arr[e]);
+    uint v1e = uint(v1_arr[e]);
+    float idc = inv_dc[e];
+    float idv = inv_dv[e];
+    for (uint k = 0u; k < nz; ++k) {
+        uint cbase = k * n_cells;
+        uint vbase = k * n_verts;
+        float gd = (div_c[cbase + c1e] - div_c[cbase + c0e]) * idc;
+        float rc = -(zeta_v[vbase + v1e] - zeta_v[vbase + v0e]) * idv;
+        uint oidx = k * n_edges + e;
+        grad_div_out[oidx] = gd;
+        lap_out[oidx] = gd + rc;
+    }
 }
 
 kernel void scvt_scalar_grad_edge(
@@ -4182,16 +4197,19 @@ kernel void scvt_scalar_grad_edge(
     device const float* phi_c      [[buffer(3)]],   // [nz, N_cells]
     device float* grad_out         [[buffer(4)]],   // [nz, N_edges]
     device const uint* u_params    [[buffer(5)]],   // [nz, N_cells, N_edges]
-    uint gid [[thread_position_in_grid]])
+    uint e [[thread_position_in_grid]])
 {
     uint nz = u_params[0];
     uint n_cells = u_params[1];
     uint n_edges = u_params[2];
-    if (gid >= nz * n_edges) return;
-    uint k = gid / n_edges;
-    uint e = gid - k * n_edges;
-    uint cbase = k * n_cells;
-    grad_out[gid] = (phi_c[cbase + uint(c1_arr[e])] - phi_c[cbase + uint(c0_arr[e])]) * inv_dc[e];
+    if (e >= n_edges) return;
+    uint c0e = uint(c0_arr[e]);
+    uint c1e = uint(c1_arr[e]);
+    float idc = inv_dc[e];
+    for (uint k = 0u; k < nz; ++k) {
+        uint cbase = k * n_cells;
+        grad_out[k * n_edges + e] = (phi_c[cbase + c1e] - phi_c[cbase + c0e]) * idc;
+    }
 }
 
 kernel void scvt_eta_edge(
@@ -4244,6 +4262,121 @@ kernel void scvt_trisk_rot_edge(
             acc += wt[j] * 0.5f * (eta_self + eta_e[idx]) * u_e[idx];
         }
         rot_out[ebase + e] = acc;
+    }
+}
+
+kernel void scvt_storm_smag_edge(
+    device const int* c0_arr       [[buffer(0)]],   // [N_edges]
+    device const int* c1_arr       [[buffer(1)]],   // [N_edges]
+    device const float* dc_arr     [[buffer(2)]],   // [N_edges]
+    device const float* inv_dc     [[buffer(3)]],   // [N_edges]
+    device const float* div_c      [[buffer(4)]],   // [nz, N_cells]
+    device const float* rho_d      [[buffer(5)]],   // [nz, N_cells]
+    device const float* dz_c       [[buffer(6)]],   // [nz, N_cells]
+    device const float* q_n        [[buffer(7)]],   // [nz, N_cells]
+    device const float* theta_m    [[buffer(8)]],   // [nz, N_cells]
+    device const float* w_in       [[buffer(9)]],   // [nz+1, N_cells]
+    device float* u_edge_io        [[buffer(10)]],  // [nz, N_edges] (in/out)
+    device float* flx_qn_out       [[buffer(11)]],  // [nz, N_edges]
+    device float* flx_th_out       [[buffer(12)]],  // [nz, N_edges]
+    device float* flx_w_out        [[buffer(13)]],  // [nz-1, N_edges]
+    constant ulong4& u_dim         [[buffer(14)]],  // [nz, N_cells, N_edges, 0]
+    constant float4& f_p           [[buffer(15)]],  // [dt, cs_scalar, cs_div, k_cap]
+    uint gid [[thread_position_in_grid]])
+{
+    uint nz = uint(u_dim.x);
+    uint nc = uint(u_dim.y);
+    uint ne = uint(u_dim.z);
+    if (gid >= nz * ne) return;
+
+    uint k = gid / ne;
+    uint e = gid - k * ne;
+    uint c0e = uint(c0_arr[e]);
+    uint c1e = uint(c1_arr[e]);
+    float dc = dc_arr[e];
+    float idc = inv_dc[e];
+    float dt = f_p.x;
+    float cs_sc2 = (f_p.y * dc) * (f_p.y * dc);
+    float cs_dv2 = (f_p.z * dc) * (f_p.z * dc);
+    float k_cap = f_p.w;
+
+    uint base_k = k * nc;
+    uint i0 = base_k + c0e;
+    uint i1 = base_k + c1e;
+    float d0 = div_c[i0];
+    float d1 = div_c[i1];
+    float conv_k = max(max(-d0, -d1), 0.0f);
+    float kh_sc_k = min(cs_sc2 * conv_k, k_cap);
+
+    if (conv_k > 0.0f) {
+        float kh_dv_k = min(cs_dv2 * conv_k, k_cap);
+        float m_e = 0.5f * (rho_d[i0] * dz_c[i0] + rho_d[i1] * dz_c[i1]);
+        float coef = -(dt * kh_sc_k) * m_e * idc;
+        flx_qn_out[gid] = coef * (q_n[i1] - q_n[i0]);
+        flx_th_out[gid] = coef * (theta_m[i1] - theta_m[i0]);
+        u_edge_io[gid] = u_edge_io[gid] + (dt * kh_dv_k) * ((d1 - d0) * idc);
+    } else {
+        flx_qn_out[gid] = 0.0f;
+        flx_th_out[gid] = 0.0f;
+    }
+
+    if (k + 1u < nz) {
+        uint base_p = (k + 1u) * nc;
+        float d0p = div_c[base_p + c0e];
+        float d1p = div_c[base_p + c1e];
+        float conv_p = max(max(-d0p, -d1p), 0.0f);
+        if (conv_k > 0.0f || conv_p > 0.0f) {
+            float kh_sc_p = min(cs_sc2 * conv_p, k_cap);
+            float kh_w = 0.5f * (kh_sc_k + kh_sc_p);
+            flx_w_out[gid] = -(dt * kh_w) * ((w_in[base_p + c1e] - w_in[base_p + c0e]) * idc);
+        } else {
+            flx_w_out[gid] = 0.0f;
+        }
+    }
+}
+
+kernel void scvt_storm_smag_cell(
+    device const int* eoc          [[buffer(0)]],   // [N_cells, 6]
+    device const float* div_w      [[buffer(1)]],   // [N_cells, 6]
+    device const float* rho_d      [[buffer(2)]],   // [nz, N_cells]
+    device const float* dz_c       [[buffer(3)]],   // [nz, N_cells]
+    device const float* flx_qn     [[buffer(4)]],   // [nz, N_edges]
+    device const float* flx_th     [[buffer(5)]],   // [nz, N_edges]
+    device const float* flx_w      [[buffer(6)]],   // [nz-1, N_edges]
+    device float* q_n_io           [[buffer(7)]],   // [nz, N_cells]
+    device float* theta_m_io       [[buffer(8)]],   // [nz, N_cells]
+    device float* w_io             [[buffer(9)]],   // [nz+1, N_cells]
+    constant ulong4& u_dim         [[buffer(10)]],  // [nz, N_cells, N_edges, 0]
+    uint c [[thread_position_in_grid]])
+{
+    uint nz = uint(u_dim.x);
+    uint nc = uint(u_dim.y);
+    uint ne = uint(u_dim.z);
+    if (c >= nc) return;
+
+    uint c6 = c * 6u;
+    uint e0 = uint(eoc[c6]);      float w0 = div_w[c6];
+    uint e1 = uint(eoc[c6 + 1u]); float w1 = div_w[c6 + 1u];
+    uint e2 = uint(eoc[c6 + 2u]); float w2 = div_w[c6 + 2u];
+    uint e3 = uint(eoc[c6 + 3u]); float w3 = div_w[c6 + 3u];
+    uint e4 = uint(eoc[c6 + 4u]); float w4 = div_w[c6 + 4u];
+    uint e5 = uint(eoc[c6 + 5u]); float w5 = div_w[c6 + 5u];
+
+    for (uint k = 0u; k < nz; ++k) {
+        uint eb = k * ne;
+        uint idx = k * nc + c;
+        float inv_m = 1.0f / max(rho_d[idx] * dz_c[idx], 1.0e-5f);
+        float dqn = w0 * flx_qn[eb + e0] + w1 * flx_qn[eb + e1] + w2 * flx_qn[eb + e2]
+                  + w3 * flx_qn[eb + e3] + w4 * flx_qn[eb + e4] + w5 * flx_qn[eb + e5];
+        float dth = w0 * flx_th[eb + e0] + w1 * flx_th[eb + e1] + w2 * flx_th[eb + e2]
+                  + w3 * flx_th[eb + e3] + w4 * flx_th[eb + e4] + w5 * flx_th[eb + e5];
+        q_n_io[idx] = max(q_n_io[idx] - dqn * inv_m, 0.0f);
+        theta_m_io[idx] = clamp(theta_m_io[idx] - dth * inv_m, 150.0f, 10000.0f);
+        if (k + 1u < nz) {
+            float dw = w0 * flx_w[eb + e0] + w1 * flx_w[eb + e1] + w2 * flx_w[eb + e2]
+                     + w3 * flx_w[eb + e3] + w4 * flx_w[eb + e4] + w5 * flx_w[eb + e5];
+            w_io[(k + 1u) * nc + c] -= dw;
+        }
     }
 }
 """
@@ -4711,10 +4844,13 @@ def run_scvt_fast_acoustic_metal(
     dz_c: torch.Tensor,
     dz_w_int: torch.Tensor,
     q_load: torch.Tensor,
-    dl: torch.Tensor,
-    diag: torch.Tensor,
-    du: torch.Tensor,
+    dl: torch.Tensor | None = None,
+    diag: torch.Tensor | None = None,
+    du: torch.Tensor | None = None,
     mesh: Any = None,
+    hevi_c_pre: torch.Tensor | None = None,
+    p_cell_pre: torch.Tensor | None = None,
+    k_slope_top_pre: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Execute global SCVT horizontal acoustic + vertical HEVI loop on Metal GPU."""
     nz, n_cells = m0.shape
@@ -4777,26 +4913,35 @@ def run_scvt_fast_acoustic_metal(
 
     u_p = [nz, n_cells, n_edges, accum_u]
     f_p = [float(dt_ac), float(beta_hevi), float(gravity), 0.0]
-    hevi_c = ws["hevi_c"]
-    p_cell = ws["p_cell"]
     ps_c = pres_s.contiguous()
     dp_c = dp_dThm_s.contiguous()
     tr_c = Thm_ref.contiguous()
     Thm0_c = Thm0.contiguous()
-    lib.scvt_hevi_factor_pack(
-        rho_dw.contiguous(), rtot_w.contiguous(), thm_w.contiguous(),
-        dl.contiguous(), diag.contiguous(), du.contiguous(),
-        ps_c, dp_c, tr_c, Thm0_c,
-        hevi_c, p_cell, [nz, n_cells, 0, 0], threads=n_cells,
-    )
-    zw_c = zw_slope_e.contiguous()
-    zw_ptr = zw_c.data_ptr()
-    if ws["k_slope_ptr"] != zw_ptr:
-        lib.scvt_slope_top_cell(
-            eoc_i32, esgn_c, zw_c, ws["k_slope_top"], [nz, n_cells, n_edges, 0], threads=n_cells,
+    if hevi_c_pre is not None and p_cell_pre is not None:
+        hevi_c = hevi_c_pre
+        p_cell = p_cell_pre
+    else:
+        hevi_c = ws["hevi_c"]
+        p_cell = ws["p_cell"]
+        assert rho_dw is not None and rtot_w is not None and thm_w is not None
+        assert dl is not None and diag is not None and du is not None
+        lib.scvt_hevi_factor_pack(
+            rho_dw.contiguous(), rtot_w.contiguous(), thm_w.contiguous(),
+            dl.contiguous(), diag.contiguous(), du.contiguous(),
+            ps_c, dp_c, tr_c, Thm0_c,
+            hevi_c, p_cell, [nz, n_cells, 0, 0], threads=n_cells,
         )
-        ws["k_slope_ptr"] = zw_ptr
-    k_slope_top = ws["k_slope_top"]
+    zw_c = zw_slope_e.contiguous()
+    if k_slope_top_pre is not None:
+        k_slope_top = k_slope_top_pre
+    else:
+        zw_ptr = zw_c.data_ptr()
+        if ws["k_slope_ptr"] != zw_ptr:
+            lib.scvt_slope_top_cell(
+                eoc_i32, esgn_c, zw_c, ws["k_slope_top"], [nz, n_cells, n_edges, 0], threads=n_cells,
+            )
+            ws["k_slope_ptr"] = zw_ptr
+        k_slope_top = ws["k_slope_top"]
 
     rt_e_c = rtot_e.contiguous()
     fz0_c = fac_z0.contiguous()
@@ -4985,7 +5130,7 @@ def run_scvt_div_metal(lib: Any, mesh: Any, flux_edge: torch.Tensor) -> torch.Te
     nc = mc["n_cells"]
     out = torch.empty((nz, nc), device=flux_edge.device, dtype=torch.float32)
     up = _scvt_u_param(mc, ("div", nz), [nz, nc, mc["n_edges"]], flux_edge.device)
-    lib.scvt_div_cell(mc["eoc"], mc["div_w"], flux_edge.contiguous(), out, up, threads=nz * nc)
+    lib.scvt_div_cell(mc["eoc"], mc["div_w"], flux_edge.contiguous(), out, up, threads=nc)
     return out
 
 
@@ -4995,7 +5140,7 @@ def run_scvt_vorticity_metal(lib: Any, mesh: Any, u_edge: torch.Tensor) -> torch
     nv = mc["n_verts"]
     out = torch.empty((nz, nv), device=u_edge.device, dtype=torch.float32)
     up = _scvt_u_param(mc, ("vor", nz), [nz, nv, mc["n_edges"]], u_edge.device)
-    lib.scvt_vorticity_vert(mc["eov"], mc["vort_w"], u_edge.contiguous(), out, up, threads=nz * nv)
+    lib.scvt_vorticity_vert(mc["eov"], mc["vort_w"], u_edge.contiguous(), out, up, threads=nv)
     return out
 
 
@@ -5010,7 +5155,7 @@ def run_scvt_vec_lap_metal(lib: Any, mesh: Any, u_edge: torch.Tensor) -> tuple[t
     up = _scvt_u_param(mc, ("vlap", nz), [nz, mc["n_cells"], mc["n_verts"], ne], u_edge.device)
     lib.scvt_vec_lap_edge(
         mc["c0"], mc["c1"], mc["v0"], mc["v1"], mc["inv_dc"], mc["inv_dv"],
-        div_c, zeta_v, lap, gd, up, threads=nz * ne,
+        div_c, zeta_v, lap, gd, up, threads=ne,
     )
     return lap, gd
 
@@ -5021,7 +5166,7 @@ def run_scvt_scalar_lap_metal(lib: Any, mesh: Any, phi_cell: torch.Tensor) -> to
     ne = mc["n_edges"]
     grad_e = torch.empty((nz, ne), device=phi_cell.device, dtype=torch.float32)
     up = _scvt_u_param(mc, ("sgrad", nz), [nz, mc["n_cells"], ne], phi_cell.device)
-    lib.scvt_scalar_grad_edge(mc["c0"], mc["c1"], mc["inv_dc"], phi_cell.contiguous(), grad_e, up, threads=nz * ne)
+    lib.scvt_scalar_grad_edge(mc["c0"], mc["c1"], mc["inv_dc"], phi_cell.contiguous(), grad_e, up, threads=ne)
     return run_scvt_div_metal(lib, mesh, grad_e)
 
 
@@ -5044,3 +5189,63 @@ def run_scvt_trisk_rot_metal(lib: Any, mesh: Any, zeta_v: torch.Tensor, u_edge: 
         mc["ep"], mc["w_trisk"], eta_e, u_edge.contiguous(), rot_out, up, threads=ne,
     )
     return rot_out
+
+
+def run_scvt_storm_smag_metal(
+    lib: Any,
+    mesh: Any,
+    rho_d: torch.Tensor,
+    dz_c: torch.Tensor,
+    q_n: torch.Tensor,
+    theta_m: torch.Tensor,
+    u_edge: torch.Tensor,
+    w: torch.Tensor,
+    dt: float,
+    cs_scalar: float,
+    cs_div: float,
+    k_cap: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused GPU convergence-only monotone Smagorinsky mixing (2 kernels + div, zero allocations)."""
+    mc = _get_scvt_mesh_cache(mesh)
+    nz, nc = rho_d.shape
+    ne = mc["n_edges"]
+    dev = rho_d.device
+    div_c = run_scvt_div_metal(lib, mesh, u_edge)
+
+    ws_key = ("smag_flx", nz, ne)
+    flx = mc.get(ws_key)
+    if flx is None or flx[0].device != dev:
+        flx = (
+            torch.empty((nz, ne), device=dev, dtype=torch.float32),
+            torch.empty((nz, ne), device=dev, dtype=torch.float32),
+            torch.empty((max(nz - 1, 1), ne), device=dev, dtype=torch.float32),
+        )
+        mc[ws_key] = flx
+    flx_qn, flx_th, flx_w = flx
+    dc_e = mc.get("dc_edge")
+    if dc_e is None or dc_e.device != dev:
+        dc_e = mesh.dc_edge.contiguous()
+        mc["dc_edge"] = dc_e
+
+    u_io = u_edge.contiguous().clone()
+    qn_io = q_n.contiguous().clone()
+    th_io = theta_m.contiguous().clone()
+    w_io = w.contiguous().clone()
+    r_c = rho_d.contiguous()
+    dz_cc = dz_c.contiguous()
+
+    u_dim = [nz, nc, ne, 0]
+    f_p = [float(dt), float(cs_scalar), float(cs_div), float(k_cap)]
+    lib.scvt_storm_smag_edge(
+        mc["c0"], mc["c1"], dc_e, mc["inv_dc"],
+        div_c, r_c, dz_cc, qn_io, th_io, w_io,
+        u_io, flx_qn, flx_th, flx_w,
+        u_dim, f_p, threads=nz * ne,
+    )
+    lib.scvt_storm_smag_cell(
+        mc["eoc"], mc["div_w"], r_c, dz_cc,
+        flx_qn, flx_th, flx_w,
+        qn_io, th_io, w_io,
+        u_dim, threads=nc,
+    )
+    return qn_io, th_io, u_io, w_io

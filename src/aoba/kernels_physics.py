@@ -2815,6 +2815,17 @@ kernel void ogcm_fct_edge(
     uint e = loc - k * ne;
 
     float we = wet_ef[loc];
+    bool full_redi = (f_p.y > 0.5f);
+    if (we < 0.5f) {
+        fl_h_out[gid] = 0.0f;
+        ah_e_out[gid] = 0.0f;
+        f_dif_out[gid] = 0.0f;
+        if (full_redi && k + 1u < nzo) {
+            s_dqdx_ew_out[b * ((nzo - 1u) * ne) + k * ne + e] = 0.0f;
+        }
+        return;
+    }
+
     uint c0 = uint(c0_arr[e]);
     uint c1 = uint(c1_arr[e]);
     uint q_b = b * (nzo * nc);
@@ -2831,7 +2842,6 @@ kernel void ogcm_fct_edge(
     float inv_dc_e = inv_dc[e];
     float dq_dx = ((q1 - q0) * inv_dc_e) * we;
     float kappa = f_p.x;
-    bool full_redi = (f_p.y > 0.5f);
 
     if (full_redi) {
         float sx_dqdz_lo = 0.0f;
@@ -2899,10 +2909,20 @@ kernel void ogcm_fct_cell_td(
     uint loc = gid - b * vol;
     uint k = loc / nc;
     uint c = loc - k * nc;
+    float wc = wet_cf[loc];
+    if (wc < 0.5f) {
+        qp_td_out[gid] = 0.0f;
+        if (k + 1u < nzo) {
+            uint vi = b * ((nzo - 1u) * nc) + k * nc + c;
+            fl_v_out[vi] = 0.0f;
+            av_int_out[vi] = 0.0f;
+        }
+        return;
+    }
+
     uint c6 = c * 6u;
     uint ebase = b * (nzo * ne) + k * ne;
 
-    float wc = wet_cf[loc];
     float div_fl_h = 0.0f;
     for (uint d = 0u; d < 6u; ++d) {
         div_fl_h = fma(div_w[c6 + d], fl_h[ebase + uint(eoc[c6 + d])], div_fl_h);
@@ -2967,6 +2987,13 @@ kernel void ogcm_fct_bounds_ratios(
     uint loc = gid - b * vol;
     uint k = loc / nc;
     uint c = loc - k * nc;
+    float wc = wet_cf[loc];
+    if (wc < 0.5f) {
+        r_plus_out[gid] = 1.0f;
+        r_minus_out[gid] = 1.0f;
+        return;
+    }
+
     uint c6 = c * 6u;
     uint qbase = b * vol + k * nc;
     uint ebase = b * (nzo * ne) + k * ne;
@@ -3021,7 +3048,6 @@ kernel void ogcm_fct_bounds_ratios(
         p_minus_v += max(av_a, 0.0f);
     }
 
-    float wc = wet_cf[loc];
     float p_plus  = dt * (p_plus_h  + p_plus_v)  * wc;
     float p_minus = dt * (p_minus_h + p_minus_v) * wc;
     float h_new_s = max(h_new_z[loc], 1.0f);
@@ -3073,11 +3099,20 @@ kernel void ogcm_fct_limit_kahan(
     uint loc = gid - b * vol;
     uint k = loc / nc;
     uint c = loc - k * nc;
+    float wc = wet_cf[loc];
+    if (wc < 0.5f) {
+        float q_old = q_in[gid];
+        float y = q_comp_in[gid];
+        float t = q_old + y;
+        q_out[gid] = t;
+        q_comp_out[gid] = (fabs(q_old) >= fabs(y)) ? ((q_old - t) + y) : ((y - t) + q_old);
+        return;
+    }
+
     uint c6 = c * 6u;
     uint qbase = b * vol + k * nc;
     uint ebase = b * (nzo * ne) + k * ne;
 
-    float wc = wet_cf[loc];
     float dt = f_p.x;
     float kappa = f_p.y;
     bool full_redi = (f_p.z > 0.5f);
@@ -3525,42 +3560,52 @@ kernel void scvt_rk3_prep_cell(
     device const float* area_c      [[buffer(3)]],   // [nc]
     device const float* m_s         [[buffer(4)]],   // [nz, nc]
     device const float* Thm_s       [[buffer(5)]],   // [nz, nc]
-    device const float* u_s         [[buffer(6)]],   // [nz, ne]
-    device const float* dz_c        [[buffer(7)]],   // [nz, nc]
-    device const float* dz_w_int    [[buffer(8)]],   // [nz-1, nc]
-    device const float* q_load      [[buffer(9)]],   // [nz, nc]
-    device const float* zw_slope_e  [[buffer(10)]],  // [nz-1, ne]
-    device const float* sponge_w    [[buffer(11)]],  // [nz-1]
-    device float* pres_s            [[buffer(12)]],  // [nz, nc]
-    device float* dp_dThm_s         [[buffer(13)]],  // [nz, nc]
-    device float* thm_s             [[buffer(14)]],  // [nz, nc]
-    device float* rtot_s            [[buffer(15)]],  // [nz, nc]
-    device float* ke_cell           [[buffer(16)]],  // [nz, nc]
-    device float* u_dot_gradz_s     [[buffer(17)]],  // [nz-1, nc]
-    device float* rho_dw            [[buffer(18)]],  // [nz-1, nc]
-    device float* rtot_w            [[buffer(19)]],  // [nz-1, nc]
-    device float* thm_w             [[buffer(20)]],  // [nz-1, nc]
-    device float* dl                [[buffer(21)]],  // [nz-1, nc]
-    device float* diag              [[buffer(22)]],  // [nz-1, nc]
-    device float* du                [[buffer(23)]],  // [nz-1, nc]
-    constant ulong4& u_dim          [[buffer(24)]],  // [nz, nc, ne, 0]
-    constant float4& f_p0           [[buffer(25)]],  // [p_ref, r_d, gamma_d, gravity]
-    constant float4& f_p1           [[buffer(26)]],  // [dt_ac, beta_hevi, 0, 0]
+    device const float* Thm0        [[buffer(6)]],   // [nz, nc]
+    device const float* u_s         [[buffer(7)]],   // [nz, ne]
+    device const float* dz_c        [[buffer(8)]],   // [nz, nc]
+    device const float* dz_w_int    [[buffer(9)]],   // [nz-1, nc]
+    device const float* q_load      [[buffer(10)]],  // [nz, nc]
+    device const float* zw_slope_e  [[buffer(11)]],  // [nz-1, ne]
+    device const float* sponge_w    [[buffer(12)]],  // [nz-1]
+    device const float* k_slope_top [[buffer(13)]],  // [nc]
+    device float* pres_s            [[buffer(14)]],  // [nz, nc]
+    device float* dp_dThm_s         [[buffer(15)]],  // [nz, nc]
+    device float* thm_s             [[buffer(16)]],  // [nz, nc]
+    device float* rtot_s            [[buffer(17)]],  // [nz, nc]
+    device float* ke_cell           [[buffer(18)]],  // [nz, nc]
+    device float* u_dot_gradz_s     [[buffer(19)]],  // [nz-1, nc]
+    device float* hevi_out          [[buffer(20)]],  // [6, nz-1, nc]: rho_dw, rtot_w, thm_w, dl, inv_piv, cp
+    device float* p_cell_out        [[buffer(21)]],  // [nz, nc]
+    constant ulong4& u_dim          [[buffer(22)]],  // [nz, nc, ne, same_thm0]
+    constant float4& f_p0           [[buffer(23)]],  // [p_ref, r_d, gamma_d, gravity]
+    constant float4& f_p1           [[buffer(24)]],  // [dt_ac, beta_hevi, 0, 0]
     uint c                          [[thread_position_in_grid]]
 ) {
     uint nz = uint(u_dim.x);
     uint nc = uint(u_dim.y);
     uint ne = uint(u_dim.z);
+    bool same_thm0 = (uint(u_dim.w) != 0u);
     if (c >= nc || nz < 2u) return;
 
     float p_ref = f_p0.x;
     float r_d = f_p0.y;
     float gamma = f_p0.z;
     float gravity = f_p0.w;
+    float inv_pref_rd = r_d / p_ref;
     float dt_ac = f_p1.x;
     float beta = f_p1.y;
     float bdt2 = (beta * dt_ac) * (beta * dt_ac);
     float inv_ac = 1.0f / area_c[c];
+    uint k_stop = uint(k_slope_top[c] + 0.5f);
+
+    uint n_int = nz - 1u;
+    uint int_stride = n_int * nc;
+    device float* o_rdw = hevi_out;
+    device float* o_rtw = hevi_out + int_stride;
+    device float* o_thw = hevi_out + 2u * int_stride;
+    device float* o_dl  = hevi_out + 3u * int_stride;
+    device float* o_inv = hevi_out + 4u * int_stride;
+    device float* o_cp  = hevi_out + 5u * int_stride;
 
     uint c6 = c * 6u;
     int e_idx[6];
@@ -3583,6 +3628,7 @@ kernel void scvt_rk3_prep_cell(
     float fac_g_prev = 0.0f;
     float c_up_prev = 0.0f;
     float q_odz_up_prev = 0.0f;
+    float inv_piv_prev = 1.0f;
 
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * nc + c;
@@ -3593,8 +3639,8 @@ kernel void scvt_rk3_prep_cell(
 
         float rho_v = m_v / dz_v;
         float thm_v = T_v / max(m_v, 1.0e-4f);
-        float arg = max((r_d * (T_v / dz_v)) / p_ref, 1.0e-7f);
-        float p_v = p_ref * pow(arg, gamma);
+        float arg = max((T_v / dz_v) * inv_pref_rd, 1.0e-7f);
+        float p_v = p_ref * exp2(gamma * log2(arg));
         float dp_v = gamma * p_v / max(T_v, 1.0e-3f);
         float rtot_v = rho_v * q_v;
         float q_odz = q_v / dz_v;
@@ -3603,16 +3649,18 @@ kernel void scvt_rk3_prep_cell(
         dp_dThm_s[idx] = dp_v;
         thm_s[idx] = thm_v;
         rtot_s[idx] = rtot_v;
+        p_cell_out[idx] = same_thm0 ? p_v : (p_v + dp_v * (Thm0[idx] - T_v));
 
         uint ke_base = k * ne;
         float ke_sum = 0.0f;
         float uz_sum = 0.0f;
-        uint m_base_e = (k > 0u) ? ((k - 1u) * ne) : 0u;
+        bool do_slope = (k > 0u && (k - 1u) < k_stop);
+        uint m_base_e = do_slope ? ((k - 1u) * ne) : 0u;
         for (uint s = 0u; s < 6u; ++s) {
             float w = ae_w[s];
             float u_cur = (w != 0.0f) ? u_s[ke_base + uint(e_idx[s])] : 0.0f;
             ke_sum = fma(w, u_cur * u_cur, ke_sum);
-            if (k > 0u && w != 0.0f) {
+            if (do_slope && w != 0.0f) {
                 float u_int = 0.5f * (u_edge_prev[s] + u_cur);
                 uz_sum = fma(w, u_int * zw_slope_e[m_base_e + uint(e_idx[s])], uz_sum);
             }
@@ -3628,9 +3676,9 @@ kernel void scvt_rk3_prep_cell(
             float rdw = 0.5f * (rho_prev + rho_v);
             float rtw = max(0.5f * (rtot_prev + rtot_v), 1.0e-5f);
             float thw = 0.5f * (thm_prev + thm_v);
-            rho_dw[midx] = rdw;
-            rtot_w[midx] = rtw;
-            thm_w[midx] = thw;
+            o_rdw[midx] = rdw;
+            o_rtw[midx] = rtw;
+            o_thw[midx] = thw;
 
             float dz_w = dz_w_int[midx];
             float fac_p = bdt2 * (rdw / (rtw * dz_w));
@@ -3638,15 +3686,24 @@ kernel void scvt_rk3_prep_cell(
             float c_dn = dp_prev;
             float c_up = dp_v;
 
-            diag[midx] = max(
+            float diag_m = max(
                 1.0f + dt_ac * sponge_w[m] + fac_p * thw * (c_up + c_dn) + fac_g * (q_odz - q_over_dz_prev),
                 0.5f
             );
             if (m == 0u) {
-                dl[midx] = 0.0f;
+                o_dl[midx] = 0.0f;
+                float inv0 = 1.0f / diag_m;
+                o_inv[midx] = inv0;
+                inv_piv_prev = inv0;
             } else {
-                dl[midx] = -fac_p * c_dn * thm_w_prev + fac_g * q_over_dz_prev;
-                du[(m - 1u) * nc + c] = -fac_p_prev * c_up_prev * thw - fac_g_prev * q_odz_up_prev;
+                float dl_m = -fac_p * c_dn * thm_w_prev + fac_g * q_over_dz_prev;
+                float du_prev = -fac_p_prev * c_up_prev * thw - fac_g_prev * q_odz_up_prev;
+                float cp_prev = du_prev * inv_piv_prev;
+                o_cp[(m - 1u) * nc + c] = cp_prev;
+                o_dl[midx] = dl_m;
+                float inv_m = 1.0f / (diag_m - dl_m * cp_prev);
+                o_inv[midx] = inv_m;
+                inv_piv_prev = inv_m;
             }
             thm_w_prev = thw;
             fac_p_prev = fac_p;
@@ -3660,7 +3717,7 @@ kernel void scvt_rk3_prep_cell(
         dp_prev = dp_v;
         q_over_dz_prev = q_odz;
     }
-    du[(nz - 2u) * nc + c] = 0.0f;
+    o_cp[(nz - 2u) * nc + c] = 0.0f;
 }
 
 kernel void scvt_rk3_prep_edge(
@@ -4417,128 +4474,129 @@ kernel void ogcm_pre_kpp_col(
     }
 }
 
-kernel void ogcm_gm_bolus_edge_col(
+kernel void ogcm_gm_slope_psi_edge(
     device const int* c0            [[buffer(0)]],   // [ne]
     device const int* c1            [[buffer(1)]],   // [ne]
     device const float* inv_dc      [[buffer(2)]],   // [ne]
     device const float* w_vor_edge  [[buffer(3)]],   // [ne]
-    device const float* u_star      [[buffer(4)]],   // [nzo, ne]
-    device const float* u_bt_mean   [[buffer(5)]],   // [ne]
-    device const float* u_star_baro [[buffer(6)]],   // [ne]
-    device const float* rho_anom    [[buffer(7)]],   // [nzo, nc]
-    device const float* dz_c_int    [[buffer(8)]],   // [nzo-1, nc]
-    device const float* wet_int_cf  [[buffer(9)]],   // [nzo-1, nc]
-    device const float* h_bl        [[buffer(10)]],  // [nc]
-    device const float* h_e         [[buffer(11)]],  // [nzo, ne]
-    device const float* h_e_safe    [[buffer(12)]],  // [nzo, ne]
-    device const float* z_int_m     [[buffer(13)]],  // [nzo-1]
-    device const float* wet_ef      [[buffer(14)]],  // [nzo, ne]
-    device const float* wet_int_ef  [[buffer(15)]],  // [nzo-1, ne]
-    device const float* gm_scale_e  [[buffer(16)]],  // [ne]
-    device const float* fk_coef_e   [[buffer(17)]],  // [ne]
-    device float* u_new_out         [[buffer(18)]],  // [nzo, ne]
-    device float* sx_int_out        [[buffer(19)]],  // [nzo-1, ne]
-    device float* h_u_edge_out      [[buffer(20)]],  // [nzo, ne]
-    device float* s2_edge_w_out     [[buffer(21)]],  // [nzo-1, ne]
-    constant ulong4& u_dim          [[buffer(22)]],  // [nzo, nc, ne, flags]
-    constant float4& f_p0           [[buffer(23)]],  // [kappa_gm, gm_slope_max, g_ov_rho, 0]
-    uint e                          [[thread_position_in_grid]]
+    device const float* rho_anom    [[buffer(4)]],   // [nzo, nc]
+    device const float* dz_c_int    [[buffer(5)]],   // [nzo-1, nc]
+    device const float* wet_int_cf  [[buffer(6)]],   // [nzo-1, nc]
+    device const float* h_bl        [[buffer(7)]],   // [nc]
+    device const float* h_e_safe    [[buffer(8)]],   // [nzo, ne]
+    device const float* z_int_m     [[buffer(9)]],   // [nzo-1]
+    device const float* wet_ef      [[buffer(10)]],  // [nzo, ne]
+    device const float* wet_int_ef  [[buffer(11)]],  // [nzo-1, ne]
+    device const float* gm_scale_e  [[buffer(12)]],  // [ne]
+    device const float* fk_coef_e   [[buffer(13)]],  // [ne]
+    device float* sx_int_out        [[buffer(14)]],  // [nzo-1, ne]
+    device float* psi_int_out       [[buffer(15)]],  // [nzo-1, ne]
+    device float* s2_edge_w_out     [[buffer(16)]],  // [nzo-1, ne] or [1]
+    constant ulong4& u_dim          [[buffer(17)]],  // [nzo, nc, ne, flags]
+    constant float4& f_p0           [[buffer(18)]],  // [kappa_gm, gm_slope_max, g_ov_rho, 0]
+    uint gid                        [[thread_position_in_grid]]
 ) {
     uint nzo = uint(u_dim.x);
     uint nc = uint(u_dim.y);
     uint ne = uint(u_dim.z);
     uint flags = uint(u_dim.w);
-    if (e >= ne || nzo == 0u) return;
+    if (nzo < 2u || gid >= (nzo - 1u) * ne) return;
 
     bool use_scale_gm = ((flags & 4u) != 0u);
     bool use_submeso  = ((flags & 2u) != 0u);
     bool use_redi     = ((flags & 1u) != 0u);
 
-    if (wet_ef[e] <= 0.0f) {
-        for (uint k = 0u; k < nzo; ++k) {
-            uint idx = k * ne + e;
-            u_new_out[idx] = 0.0f;
-            h_u_edge_out[idx] = 0.0f;
-            if (k + 1u < nzo) {
-                sx_int_out[idx] = 0.0f;
-                if (use_redi) s2_edge_w_out[idx] = 0.0f;
-            }
-        }
+    float wie = wet_int_ef[gid];
+    if (wie <= 0.0f) {
+        sx_int_out[gid] = 0.0f;
+        psi_int_out[gid] = 0.0f;
+        if (use_redi) s2_edge_w_out[gid] = 0.0f;
         return;
     }
 
+    uint k = gid / ne;
+    uint e = gid - k * ne;
     uint cell0 = uint(c0[e]);
     uint cell1 = uint(c1[e]);
     float idc = inv_dc[e];
-    float wvor = w_vor_edge[e];
-    float du_bt = u_bt_mean[e] - u_star_baro[e];
+
+    uint c0_k = k * nc + cell0;
+    uint c1_k = k * nc + cell1;
+    float rho_c0_k = rho_anom[c0_k];
+    float rho_c1_k = rho_anom[c1_k];
+    float rho_c0_n = rho_anom[c0_k + nc];
+    float rho_c1_n = rho_anom[c1_k + nc];
+
+    float drho_dx_cur  = ((rho_c1_k - rho_c0_k) * idc) * wet_ef[gid];
+    float drho_dx_next = ((rho_c1_n - rho_c0_n) * idc) * wet_ef[gid + ne];
+    float dz0 = ((rho_c0_n - rho_c0_k) / dz_c_int[c0_k]) * wet_int_cf[c0_k];
+    float dz1 = ((rho_c1_n - rho_c1_k) / dz_c_int[c1_k]) * wet_int_cf[c1_k];
+    float drho_dz_e = 0.5f * (dz0 + dz1);
+    float drho_dx_int = 0.5f * (drho_dx_cur + drho_dx_next);
+
     float hbl_e = max(0.5f * (h_bl[cell0] + h_bl[cell1]), 1.0f);
-    float inv_hbl_e = 1.0f / hbl_e;
-    float inv_hbl_fk = 1.0f / max(hbl_e, 10.0f);
-    float kgm = use_scale_gm ? (f_p0.x * gm_scale_e[e]) : f_p0.x;
+    float zk = z_int_m[k];
     float smax = f_p0.y;
-    float g_ov_rho = f_p0.z;
-    float fk_c = use_submeso ? (fk_coef_e[e] * hbl_e * hbl_e) : 0.0f;
+    float slope_raw = clamp(-drho_dx_int / max(drho_dz_e, 1.0e-5f), -smax, smax) * wie;
+    float sx = slope_raw * clamp(zk / hbl_e, 0.0f, 1.0f);
+    float kgm = use_scale_gm ? (f_p0.x * gm_scale_e[e]) : f_p0.x;
+    float psi_k = kgm * sx;
 
-    float rho0_c0 = rho_anom[cell0];
-    float rho0_c1 = rho_anom[cell1];
-    float drho_dx_cur = ((rho0_c1 - rho0_c0) * idc) * wet_ef[e];
-    float db_dx_ml = -g_ov_rho * drho_dx_cur;
-
-    float psi_prev = 0.0f;
-    float rho_c0_prev = rho0_c0;
-    float rho_c1_prev = rho0_c1;
-
-    for (uint k = 0u; k < nzo; ++k) {
-        uint idx = k * ne + e;
-        float wef = wet_ef[idx];
-        float u_n = clamp((u_star[idx] + du_bt) * wef, -4.0f, 4.0f);
-        u_new_out[idx] = u_n;
-
-        float psi_k = 0.0f;
-        if (k + 1u < nzo) {
-            uint nidx = (k + 1u) * ne + e;
-            float rho_c0_n = rho_anom[(k + 1u) * nc + cell0];
-            float rho_c1_n = rho_anom[(k + 1u) * nc + cell1];
-            float drho_dx_next = ((rho_c1_n - rho_c0_n) * idc) * wet_ef[nidx];
-
-            float wie = wet_int_ef[idx];
-            float sx = 0.0f;
-            if (wie > 0.0f) {
-                uint c0_m = k * nc + cell0;
-                uint c1_m = k * nc + cell1;
-                float dz0 = ((rho_c0_n - rho_c0_prev) / dz_c_int[c0_m]) * wet_int_cf[c0_m];
-                float dz1 = ((rho_c1_n - rho_c1_prev) / dz_c_int[c1_m]) * wet_int_cf[c1_m];
-                float drho_dz_e = 0.5f * (dz0 + dz1);
-                float drho_dx_int = 0.5f * (drho_dx_cur + drho_dx_next);
-                float slope_raw = clamp(-drho_dx_int / max(drho_dz_e, 1.0e-5f), -smax, smax) * wie;
-                sx = slope_raw * clamp(z_int_m[k] * inv_hbl_e, 0.0f, 1.0f);
-                psi_k = kgm * sx;
-                if (use_submeso) {
-                    float z_norm = z_int_m[k] * inv_hbl_fk;
-                    if (z_norm > 0.0f && z_norm < 1.0f) {
-                        float xi = 2.0f * z_norm - 1.0f;
-                        float xi2 = xi * xi;
-                        float mu_fk = (1.0f - xi2) * (1.0f + (5.0f / 21.0f) * xi2);
-                        psi_k += clamp(fk_c * db_dx_ml * mu_fk, -2.5f, 2.5f) * wie;
-                    }
-                }
-                float psi_cap = 0.15f * min(h_e_safe[idx], h_e_safe[nidx]);
-                psi_k = clamp(psi_k, -psi_cap, psi_cap) * wie;
-            }
-            sx_int_out[idx] = sx;
-            if (use_redi) s2_edge_w_out[idx] = (sx * sx) * wvor;
-
-            drho_dx_cur = drho_dx_next;
-            rho_c0_prev = rho_c0_n;
-            rho_c1_prev = rho_c1_n;
+    if (use_submeso) {
+        float inv_hbl_fk = 1.0f / max(hbl_e, 10.0f);
+        float z_norm = zk * inv_hbl_fk;
+        if (z_norm > 0.0f && z_norm < 1.0f) {
+            float drho0 = ((rho_anom[cell1] - rho_anom[cell0]) * idc) * wet_ef[e];
+            float db_dx_ml = -f_p0.z * drho0;
+            float fk_c = fk_coef_e[e] * hbl_e * hbl_e;
+            float xi = 2.0f * z_norm - 1.0f;
+            float xi2 = xi * xi;
+            float mu_fk = (1.0f - xi2) * (1.0f + (5.0f / 21.0f) * xi2);
+            psi_k += clamp(fk_c * db_dx_ml * mu_fk, -2.5f, 2.5f) * wie;
         }
-
-        float dpsi = psi_k - psi_prev;
-        float u_gm = (-dpsi / h_e_safe[idx]) * wef;
-        h_u_edge_out[idx] = h_e[idx] * ((u_n + u_gm) * wef);
-        psi_prev = psi_k;
     }
+    float psi_cap = 0.15f * min(h_e_safe[gid], h_e_safe[gid + ne]);
+    psi_k = clamp(psi_k, -psi_cap, psi_cap) * wie;
+
+    sx_int_out[gid] = sx;
+    psi_int_out[gid] = psi_k;
+    if (use_redi) s2_edge_w_out[gid] = (sx * sx) * w_vor_edge[e];
+}
+
+kernel void ogcm_gm_apply_edge(
+    device const float* u_star      [[buffer(0)]],   // [nzo, ne]
+    device const float* u_bt_mean   [[buffer(1)]],   // [ne]
+    device const float* u_star_baro [[buffer(2)]],   // [ne]
+    device const float* h_e         [[buffer(3)]],   // [nzo, ne]
+    device const float* h_e_safe    [[buffer(4)]],   // [nzo, ne]
+    device const float* wet_ef      [[buffer(5)]],   // [nzo, ne]
+    device const float* psi_int     [[buffer(6)]],   // [nzo-1, ne]
+    device float* u_new_out         [[buffer(7)]],   // [nzo, ne]
+    device float* h_u_edge_out      [[buffer(8)]],   // [nzo, ne]
+    constant ulong4& u_dim          [[buffer(9)]],   // [nzo, ne, 0, 0]
+    uint gid                        [[thread_position_in_grid]]
+) {
+    uint nzo = uint(u_dim.x);
+    uint ne = uint(u_dim.y);
+    if (gid >= nzo * ne) return;
+
+    float wef = wet_ef[gid];
+    if (wef <= 0.0f) {
+        u_new_out[gid] = 0.0f;
+        h_u_edge_out[gid] = 0.0f;
+        return;
+    }
+
+    uint k = gid / ne;
+    uint e = gid - k * ne;
+    float du_bt = u_bt_mean[e] - u_star_baro[e];
+    float u_n = clamp((u_star[gid] + du_bt) * wef, -4.0f, 4.0f);
+    float psi_k = (k + 1u < nzo) ? psi_int[gid] : 0.0f;
+    float psi_prev = (k > 0u) ? psi_int[gid - ne] : 0.0f;
+    float u_gm = (-(psi_k - psi_prev) / h_e_safe[gid]) * wef;
+
+    u_new_out[gid] = u_n;
+    h_u_edge_out[gid] = h_e[gid] * ((u_n + u_gm) * wef);
 }
 
 // =========================================================================
@@ -5417,12 +5475,17 @@ kernel void crm_distill_extract_col(
     constant float4& f_c0         [[buffer(18)]],  // [dt, p_ref, r_d, gamma_d]
     constant float4& f_c1         [[buffer(19)]],  // [kappa_d, rv_over_rd, eps_water, e_triple]
     constant float4& f_c2         [[buffer(20)]],  // [t_freeze, t_ice_all, t_liq_all, 0]
-    uint c                        [[thread_position_in_grid]])
+    uint grp                      [[threadgroup_position_in_grid]],
+    uint lane                     [[thread_position_in_threadgroup]])
 {
     uint nz = uint(u_pack.x);
     uint N = uint(u_pack.y);
     uint d_in = uint(u_pack.z);
-    if (c >= N) return;
+    uint c0 = grp * 32u;
+    if (c0 >= N) return;
+    uint n_valid = (c0 + 32u <= N) ? 32u : (N - c0);
+    uint c = c0 + lane;
+    bool active = (lane < n_valid);
 
     float dt = f_c0.x;
     float p_ref = f_c0.y;
@@ -5435,65 +5498,142 @@ kernel void crm_distill_extract_col(
     float t_frz = f_c2.x;
     float t_ice = f_c2.y;
     float t_liq = f_c2.z;
+    float gk = gamma_d * kappa_d;
+    float inv_pref_rd = r_d / p_ref;
+    float inv_t_span = 1.0f / (t_liq - t_ice);
 
-    uint x_base = c * d_in;
-    for (uint k = 0u; k < nz; ++k) {
-        uint idx = k * N + c;
-        float r = rho_d[idx];
-        float thm = theta_m[idx];
-        float qv = q_v[idx];
-        float arg = max(r_d * r * thm / p_ref, 1.0e-7f);
-        float pres = p_ref * pow(arg, gamma_d);
-        float ex = pow(max(pres / p_ref, 1.0e-7f), kappa_d);
-        float temp = ex * thm / (1.0f + rv_rd * qv);
-        exner_out[idx] = ex;
-        temp_out[idx] = temp;
+    // 5 x 32x33 bank-conflict-free shared-memory transpose slab (21.1 KB):
+    // 100% coalesced reads from [nz, N] and 100% coalesced writes to [N, d_in].
+    threadgroup float sm_t[5u * 32u * 33u];
+    const uint s_str = 32u * 33u;
 
-        float qc_p = max(q_c[idx], 0.0f);
-        float qi_p = max(q_i[idx], 0.0f);
-        float qn_tot = max(max(qv, 0.0f) + qc_p + qi_p, 0.0f);
-        float t_li = clamp(temp - (2489.449f * qc_p + 2820.911f * qi_p), 150.0f, 400.0f);
-        float th_l = t_li / max(ex, 0.05f);
+    for (uint k0 = 0u; k0 < nz; k0 += 32u) {
+        uint klen = (k0 + 32u <= nz) ? 32u : (nz - k0);
 
-        float omega = clamp((t_li - t_ice) / (t_liq - t_ice), 0.0f, 1.0f);
-        float tc = max(t_li, 160.0f) - t_frz;
-        float ti = max(t_li, 120.0f);
-        float ew = e_tr * exp(17.67f * tc / (tc + 243.50f));
-        float ei = e_tr * exp(21.8745584f * (ti - t_frz) / (ti - 7.66f));
-        float qsw = eps_w * ew / max(pres - ew, 0.05f * pres);
-        float qsi = eps_w * ei / max(pres - ei, 0.05f * pres);
-        float qs = clamp(omega * qsw + (1.0f - omega) * qsi, 1.0e-7f, 0.2f);
-        float rh = clamp(qn_tot / qs, 0.0f, 2.0f);
+        // Group A (5 thermo features: 0=t_li, 1=log_p, 2=th_l, 3=qn_tot, 7=rh)
+        if (active) {
+            for (uint dk = 0u; dk < klen; ++dk) {
+                uint idx = (k0 + dk) * N + c;
+                float r = rho_d[idx];
+                float thm = theta_m[idx];
+                float qv = q_v[idx];
+                float arg = max(r * thm * inv_pref_rd, 1.0e-7f);
+                float log2_arg = log2(arg);
+                float pres = p_ref * exp2(gamma_d * log2_arg);
+                float ex = exp2(gk * log2_arg);
+                float temp = ex * thm / (1.0f + rv_rd * qv);
+                exner_out[idx] = ex;
+                temp_out[idx] = temp;
 
-        x_out[x_base + 0u * nz + k]  = (t_li - 250.0f) * 0.02f;
-        x_out[x_base + 1u * nz + k]  = (log(max(pres, 1.0f)) - 10.0f) * 0.4f;
-        x_out[x_base + 2u * nz + k]  = (th_l - 320.0f) * 0.0125f;
-        x_out[x_base + 3u * nz + k]  = aoba_log1p(qn_tot * 1.0e3f);
-        x_out[x_base + 4u * nz + k]  = 0.0f;
-        x_out[x_base + 5u * nz + k]  = 0.0f;
-        x_out[x_base + 6u * nz + k]  = 0.0f;
-        x_out[x_base + 7u * nz + k]  = rh;
-        x_out[x_base + 8u * nz + k]  = clamp(u_in[idx] * (1.0f / 30.0f), -4.0f, 4.0f);
-        x_out[x_base + 9u * nz + k]  = clamp(v_in[idx] * (1.0f / 30.0f), -4.0f, 4.0f);
-        x_out[x_base + 10u * nz + k] = clamp(dthm_ls[idx] * dt, -10.0f, 10.0f);
-        x_out[x_base + 11u * nz + k] = clamp(dqn_ls[idx] * dt * 1.0e3f, -10.0f, 10.0f);
-        x_out[x_base + 12u * nz + k] = clamp(q_rad[idx] * dt * 2.0f, -10.0f, 10.0f);
-        x_out[x_base + 13u * nz + k] = log(max(dz_c[idx], 10.0f) * 2.0e-3f);
+                float qc_p = max(q_c[idx], 0.0f);
+                float qi_p = max(q_i[idx], 0.0f);
+                float qn_tot = max(max(qv, 0.0f) + qc_p + qi_p, 0.0f);
+                float t_li = clamp(temp - (2489.449f * qc_p + 2820.911f * qi_p), 150.0f, 400.0f);
+                float th_l = t_li / max(ex, 0.05f);
+
+                float omega = clamp((t_li - t_ice) * inv_t_span, 0.0f, 1.0f);
+                float tc = max(t_li, 160.0f) - t_frz;
+                float ti = max(t_li, 120.0f);
+                float ew = e_tr * exp(17.67f * tc / (tc + 243.50f));
+                float ei = e_tr * exp(21.8745584f * (ti - t_frz) / (ti - 7.66f));
+                float qsw = eps_w * ew / max(pres - ew, 0.05f * pres);
+                float qsi = eps_w * ei / max(pres - ei, 0.05f * pres);
+                float qs = clamp(omega * qsw + (1.0f - omega) * qsi, 1.0e-7f, 0.2f);
+                float rh = clamp(qn_tot / qs, 0.0f, 2.0f);
+
+                uint s_off = lane * 33u + dk;
+                sm_t[0u * s_str + s_off] = (t_li - 250.0f) * 0.02f;
+                sm_t[1u * s_str + s_off] = (log(max(pres, 1.0f)) - 10.0f) * 0.4f;
+                sm_t[2u * s_str + s_off] = (th_l - 320.0f) * 0.0125f;
+                sm_t[3u * s_str + s_off] = aoba_log1p(qn_tot * 1.0e3f);
+                sm_t[4u * s_str + s_off] = rh;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < klen) {
+            uint k_col = k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) {
+                uint xb = (c0 + r) * d_in + k_col;
+                uint rs = r * 33u + lane;
+                x_out[xb + 0u * nz] = sm_t[0u * s_str + rs];
+                x_out[xb + 1u * nz] = sm_t[1u * s_str + rs];
+                x_out[xb + 2u * nz] = sm_t[2u * s_str + rs];
+                x_out[xb + 3u * nz] = sm_t[3u * s_str + rs];
+                x_out[xb + 4u * nz] = 0.0f;
+                x_out[xb + 5u * nz] = 0.0f;
+                x_out[xb + 6u * nz] = 0.0f;
+                x_out[xb + 7u * nz] = sm_t[4u * s_str + rs];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Group B (5 kinematics/forcing features: 8=u, 9=v, 10=dthm_ls, 11=dqn_ls, 12=q_rad)
+        if (active) {
+            for (uint dk = 0u; dk < klen; ++dk) {
+                uint idx = (k0 + dk) * N + c;
+                uint s_off = lane * 33u + dk;
+                sm_t[0u * s_str + s_off] = clamp(u_in[idx] * (1.0f / 30.0f), -4.0f, 4.0f);
+                sm_t[1u * s_str + s_off] = clamp(v_in[idx] * (1.0f / 30.0f), -4.0f, 4.0f);
+                sm_t[2u * s_str + s_off] = clamp(dthm_ls[idx] * dt, -10.0f, 10.0f);
+                sm_t[3u * s_str + s_off] = clamp(dqn_ls[idx] * dt * 1.0e3f, -10.0f, 10.0f);
+                sm_t[4u * s_str + s_off] = clamp(q_rad[idx] * dt * 2.0f, -10.0f, 10.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < klen) {
+            uint k_col = k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) {
+                uint xb = (c0 + r) * d_in + k_col;
+                uint rs = r * 33u + lane;
+                x_out[xb + 8u * nz]  = sm_t[0u * s_str + rs];
+                x_out[xb + 9u * nz]  = sm_t[1u * s_str + rs];
+                x_out[xb + 10u * nz] = sm_t[2u * s_str + rs];
+                x_out[xb + 11u * nz] = sm_t[3u * s_str + rs];
+                x_out[xb + 12u * nz] = sm_t[4u * s_str + rs];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Group C (1 feature: 13=log(dz_c))
+        if (active) {
+            for (uint dk = 0u; dk < klen; ++dk) {
+                sm_t[lane * 33u + dk] = log(max(dz_c[(k0 + dk) * N + c], 10.0f) * 2.0e-3f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < klen) {
+            uint fcol = 13u * nz + k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) {
+                x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    uint s_off = x_base + 14u * nz;
-    x_out[s_off + 0u] = clamp(sfc_7[0u * N + c] * 5.0e-3f, -5.0f, 5.0f);
-    x_out[s_off + 1u] = clamp(sfc_7[1u * N + c] * 5.0e-3f, -5.0f, 5.0f);
-    x_out[s_off + 2u] = clamp(sfc_7[2u * N + c] * 2.0f, 0.0f, 5.0f);
-    x_out[s_off + 3u] = clamp(sfc_7[3u * N + c] * 5.0f, -5.0f, 5.0f);
-    x_out[s_off + 4u] = clamp(sfc_7[4u * N + c] * 5.0f, -5.0f, 5.0f);
-    x_out[s_off + 5u] = sfc_7[5u * N + c];
-    x_out[s_off + 6u] = clamp(fabs(sfc_7[6u * N + c]) * 1.0e4f, 0.0f, 5.0f);
-
-    uint st_src = c * 16u;
-    uint st_dst = s_off + 7u;
-    for (uint j = 0u; j < 16u; ++j) {
-        x_out[st_dst + j] = struct_m[st_src + j];
+    // Surface scalars (7) -> transposed via sm_t for coalesced writes
+    if (active) {
+        uint s_off = lane * 33u;
+        sm_t[s_off + 0u] = clamp(sfc_7[0u * N + c] * 5.0e-3f, -5.0f, 5.0f);
+        sm_t[s_off + 1u] = clamp(sfc_7[1u * N + c] * 5.0e-3f, -5.0f, 5.0f);
+        sm_t[s_off + 2u] = clamp(sfc_7[2u * N + c] * 2.0f, 0.0f, 5.0f);
+        sm_t[s_off + 3u] = clamp(sfc_7[3u * N + c] * 5.0f, -5.0f, 5.0f);
+        sm_t[s_off + 4u] = clamp(sfc_7[4u * N + c] * 5.0f, -5.0f, 5.0f);
+        sm_t[s_off + 5u] = sfc_7[5u * N + c];
+        sm_t[s_off + 6u] = clamp(fabs(sfc_7[6u * N + c]) * 1.0e4f, 0.0f, 5.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 7u) {
+        uint fcol = 14u * nz + lane;
+        for (uint r = 0u; r < n_valid; ++r) {
+            x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+        }
+    }
+    // Structural memory [N, 16]: copy coalesced across lanes 0..15 for each row r
+    if (lane < 16u) {
+        uint fcol = 14u * nz + 7u + lane;
+        for (uint r = 0u; r < n_valid; ++r) {
+            x_out[(c0 + r) * d_in + fcol] = struct_m[(c0 + r) * 16u + lane];
+        }
     }
 }
 
@@ -5551,16 +5691,20 @@ kernel void crm_distill_closure_col(
     float du_imp = 0.0f;
     float dv_imp = 0.0f;
 
-    float qsat_col[128];
-    float qnb_col[128];
-    float dm_c_col[128];
-    float sconv_col[128];
-    float qp_p_col[128];
+    // Low-register column buffers (7x[64] = 1.75 KB vs 19x[128] = 9.5 KB) with buffer reuse across passes
+    float qsat_col[64];
+    float qnb_col[64];
+    float dm_c_col[64];
+    float sconv_col[64];
+    float qp_p_col[64];
+    float rp0_s[64];
+    float rp1_s[64];
 
     float dm0 = max(rho_d[c] * dz_c[c], 1.0e-6f);
     float dq_evap0 = (evap * dt) / max(dm0, 1.0e-4f);
     float ex0 = max(exner[c], 0.10f);
     float inv_pbl_ex = 1.0f / (0.015f * ex0);
+    uint nz_c = min(nz, 64u);
 
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * N + c;
@@ -5574,7 +5718,7 @@ kernel void crm_distill_closure_col(
         dm_sum_m += dm * s_conv;
         dm_pbl_sum += dm * pbl_sh;
 
-        if (k < 128u) {
+        if (k < 64u) {
             dm_c_col[k] = dm;
             sconv_col[k] = s_conv;
         }
@@ -5592,7 +5736,8 @@ kernel void crm_distill_closure_col(
             float qv0 = max(qn0 - qc0 - qi0, 0.0f);
             float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
             float t_env = clamp(t_post_ls, 180.0f, 340.0f);
-            float p_env = p_ref * pow(ex_safe, 3.5f);
+            float ex2 = ex_safe * ex_safe;
+            float p_env = p_ref * ex2 * ex_safe * sqrt(ex_safe);
             float es_w = 611.2f * exp(clamp(17.67f * (t_env - t_frz) / max(t_env - 29.65f, 20.0f), -25.0f, 12.0f));
             float es_i = 611.2f * exp(clamp(21.875f * (t_env - t_frz) / max(t_env - 7.66f, 20.0f), -25.0f, 12.0f));
             float om_liq = clamp((t_env - 253.15f) / 20.0f, 0.0f, 1.0f);
@@ -5604,14 +5749,14 @@ kernel void crm_distill_closure_col(
             float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
             float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.0f);
             float qp_p = s_conv * min(qnb, 2.0e-3f) * (0.25f * (fp_sig * fp_sig));
-            if (k < 128u) {
+            if (k < 64u) {
                 qsat_col[k] = qsat_env;
                 qnb_col[k] = qnb;
                 qp_p_col[k] = qp_p;
             }
 
             denom_h += cp_d * dm * s_conv;
-        } else if (k < 128u) {
+        } else if (k < 64u) {
             qsat_col[k] = 1.0e-7f;
             qnb_col[k] = 0.0f;
             qp_p_col[k] = 0.0f;
@@ -5625,31 +5770,28 @@ kernel void crm_distill_closure_col(
     float p_frac = 0.25f * col_rh_gate * (pf_sig * pf_sig);
     float p_tot_mass = (w_avail_conv > 0.05f) ? max(p_frac * w_avail_conv, 0.0f) : 0.0f;
 
-    // Pass 1b (register-only): 2-pass [0.25, 0.50, 0.25] vertical binomial smoothing of rp[0], rp[1]
-    // to eliminate 2*dz sawtooth injection, followed by layer-gated convective & PBL redistribution.
-    float rp0_s[128];
-    float rp1_s[128];
-    float tmp_s[128];
-    uint nz_c = min(nz, 128u);
+    // Pass 1b (in-place, zero scratch array): 2-pass [0.25, 0.50, 0.25] vertical binomial smoothing of rp[0], rp[1]
     for (uint k = 0u; k < nz_c; ++k) {
-        rp0_s[k] = raw_prof[rp_base + 0u * nz + k] * sconv_col[k];
-        rp1_s[k] = raw_prof[rp_base + 1u * nz + k] * sconv_col[k];
+        float sc_k = sconv_col[k];
+        rp0_s[k] = (sc_k > 0.0f) ? (raw_prof[rp_base + 0u * nz + k] * sc_k) : 0.0f;
+        rp1_s[k] = (sc_k > 0.0f) ? (raw_prof[rp_base + 1u * nz + k] * sc_k) : 0.0f;
     }
     if (nz_c >= 3u) {
         for (int pass = 0; pass < 2; ++pass) {
-            tmp_s[0] = 0.75f * rp0_s[0] + 0.25f * rp0_s[1];
+            float prev0 = rp0_s[0];
+            rp0_s[0] = 0.75f * prev0 + 0.25f * rp0_s[1];
+            float prev1 = rp1_s[0];
+            rp1_s[0] = 0.75f * prev1 + 0.25f * rp1_s[1];
             for (uint k = 1u; k + 1u < nz_c; ++k) {
-                tmp_s[k] = 0.25f * rp0_s[k - 1u] + 0.50f * rp0_s[k] + 0.25f * rp0_s[k + 1u];
+                float cur0 = rp0_s[k];
+                rp0_s[k] = 0.25f * prev0 + 0.50f * cur0 + 0.25f * rp0_s[k + 1u];
+                prev0 = cur0;
+                float cur1 = rp1_s[k];
+                rp1_s[k] = 0.25f * prev1 + 0.50f * cur1 + 0.25f * rp1_s[k + 1u];
+                prev1 = cur1;
             }
-            tmp_s[nz_c - 1u] = 0.25f * rp0_s[nz_c - 2u] + 0.75f * rp0_s[nz_c - 1u];
-            for (uint k = 0u; k < nz_c; ++k) rp0_s[k] = tmp_s[k];
-
-            tmp_s[0] = 0.75f * rp1_s[0] + 0.25f * rp1_s[1];
-            for (uint k = 1u; k + 1u < nz_c; ++k) {
-                tmp_s[k] = 0.25f * rp1_s[k - 1u] + 0.50f * rp1_s[k] + 0.25f * rp1_s[k + 1u];
-            }
-            tmp_s[nz_c - 1u] = 0.25f * rp1_s[nz_c - 2u] + 0.75f * rp1_s[nz_c - 1u];
-            for (uint k = 0u; k < nz_c; ++k) rp1_s[k] = tmp_s[k];
+            rp0_s[nz_c - 1u] = 0.25f * prev0 + 0.75f * rp0_s[nz_c - 1u];
+            rp1_s[nz_c - 1u] = 0.25f * prev1 + 0.75f * rp1_s[nz_c - 1u];
         }
     }
 
@@ -5657,41 +5799,35 @@ kernel void crm_distill_closure_col(
     float dm_wbal_sum = 0.0f;
     float w_qp0_sum = 0.0f;
     float w_qp_prov_sum = 0.0f;
-    float wbal_col[128];
-    float dqnr_col[128];
-    for (uint k = 0u; k < nz; ++k) {
-        if (k < 128u && sconv_col[k] > 0.0f) {
+    for (uint k = 0u; k < nz_c; ++k) {
+        float sc_k = sconv_col[k];
+        if (sc_k > 0.0f) {
             float ex_k = exner[k * N + c];
             float pbl_g = clamp((ex_k - 0.90f) / 0.05f, 0.0f, 1.0f);
             float l_gate = max(col_rh_gate, pbl_g);
-            float d_temp_r = sconv_col[k] * l_gate * tanh(rp0_s[k] * 0.2f) * 0.15f;
+            float d_temp_r = sc_k * l_gate * tanh(rp0_s[k] * 0.2f) * 0.15f;
             dh_raw += cp_d * dm_c_col[k] * d_temp_r;
-            float du_r = sconv_col[k] * l_gate * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 4.0f;
-            float dv_r = sconv_col[k] * l_gate * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 4.0f;
+            float du_r = sc_k * l_gate * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 4.0f;
+            float dv_r = sc_k * l_gate * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 4.0f;
             du_imp += dm_c_col[k] * du_r;
             dv_imp += dm_c_col[k] * dv_r;
             float dq_lim = l_gate * min(0.015f * qnb_col[k], 1.0e-4f);
-            float dqn_r = sconv_col[k] * tanh(rp1_s[k] * 0.2f) * dq_lim;
-            float wb = dq_lim;
-            wbal_col[k] = wb;
-            dqnr_col[k] = dqn_r;
+            float dqn_r = sc_k * tanh(rp1_s[k] * 0.2f) * dq_lim;
+            rp1_s[k] = dqn_r;
             dm_dqn_sum += dm_c_col[k] * dqn_r;
-            dm_wbal_sum += dm_c_col[k] * wb;
+            dm_wbal_sum += dm_c_col[k] * dq_lim;
             w_qp0_sum += dm_c_col[k] * max(qp_pre[k * N + c], 0.0f);
             qp_p_col[k] *= col_rh_gate;
             w_qp_prov_sum += dm_c_col[k] * qp_p_col[k];
-        } else if (k < 128u) {
-            wbal_col[k] = 0.0f;
-            dqnr_col[k] = 0.0f;
+        } else {
+            rp1_s[k] = 0.0f;
         }
     }
     float dqn_corr = dm_dqn_sum / max(dm_wbal_sum, 1.0e-8f);
     float w_qn_tr_sum = 0.0f;
     float w_p_sum = 0.0f;
-    float qn_tr_col[128];
-    float wp_l_col[128];
-    for (uint k = 0u; k < nz; ++k) {
-        if (k < 128u && sconv_col[k] > 0.0f) {
+    for (uint k = 0u; k < nz_c; ++k) {
+        if (sconv_col[k] > 0.0f) {
             uint idx = k * N + c;
             float qn0_k = max(qn_post_ls[idx], 0.0f);
             float qc0_k = max(qc_pre[idx], 0.0f);
@@ -5702,18 +5838,20 @@ kernel void crm_distill_closure_col(
                 qc0_k *= sc;
                 qi0_k *= sc;
             }
-            float dqn_bal = dqnr_col[k] - dqn_corr * wbal_col[k];
+            float l_gate = max(col_rh_gate, clamp((exner[idx] - 0.90f) / 0.05f, 0.0f, 1.0f));
+            float wb = l_gate * min(0.015f * qnb_col[k], 1.0e-4f);
+            float dqn_bal = rp1_s[k] - dqn_corr * wb;
             float qn_tr = max(qnb_col[k] + dqn_bal, 0.0f);
             float rh_tr = clamp(qn_tr / max(qsat_col[k], 1.0e-7f), 0.0f, 2.0f);
             float rh_p = clamp((rh_tr - 0.60f) / 0.35f, 0.0f, 1.0f);
             float wp_l = qn_tr * (rh_p * rh_p + 0.01f) + 2.0f * qc0_k + 0.25f * qi0_k;
-            qn_tr_col[k] = qn_tr;
-            wp_l_col[k] = wp_l;
+            qnb_col[k] = qn_tr;
+            rp1_s[k] = wp_l;
             w_qn_tr_sum += dm_c_col[k] * qn_tr;
             w_p_sum += dm_c_col[k] * wp_l;
-        } else if (k < 128u) {
-            qn_tr_col[k] = 0.0f;
-            wp_l_col[k] = 0.0f;
+        } else {
+            qnb_col[k] = 0.0f;
+            rp1_s[k] = 0.0f;
         }
     }
     float qp_cap_col = w_qp0_sum + 0.15f * w_qn_tr_sum;
@@ -5722,17 +5860,15 @@ kernel void crm_distill_closure_col(
     float p_need_qn = max(p_tot_mass + (w_qp_conv_sum - w_qp0_sum), 0.0f);
     float inv_wp_sum = p_need_qn / max(w_p_sum, 1.0e-6f);
     float p_sink_mass = 0.0f;
-    float dqps_col[128];
-    for (uint k = 0u; k < nz; ++k) {
-        if (k < 128u && sconv_col[k] > 0.0f) {
-            float qn_tr = qn_tr_col[k];
-            float dq_psink = min(inv_wp_sum * wp_l_col[k], 0.9f * qn_tr);
-            float qn_p = max(qn_tr - dq_psink, 0.0f);
-            qn_tr_col[k] = qn_p;
-            dqps_col[k] = dq_psink;
+    for (uint k = 0u; k < nz_c; ++k) {
+        if (sconv_col[k] > 0.0f) {
+            float qn_tr = qnb_col[k];
+            float dq_psink = min(inv_wp_sum * rp1_s[k], 0.9f * qn_tr);
+            qnb_col[k] = max(qn_tr - dq_psink, 0.0f);
+            rp1_s[k] = dq_psink;
             p_sink_mass += dm_c_col[k] * dq_psink;
-        } else if (k < 128u) {
-            dqps_col[k] = 0.0f;
+        } else {
+            rp1_s[k] = 0.0f;
         }
     }
 
@@ -5740,14 +5876,12 @@ kernel void crm_distill_closure_col(
     float w_post_conv = 0.0f;
     float p_fall_mass = 0.0f;
     float d_m_qp = 0.0f;
-    float qfall_col[128];
 
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * N + c;
-        float dm = max(rho_d[idx] * dz_c[idx], 1.0e-6f);
+        float dm = (k < 64u) ? dm_c_col[k] : max(rho_d[idx] * dz_c[idx], 1.0e-6f);
         float ex = exner[idx];
-        float s_lin = clamp((ex - 0.50f) / 0.14f, 0.0f, 1.0f);
-        float s_conv = s_lin * s_lin;
+        float s_conv = (k < 64u) ? sconv_col[k] : 0.0f;
 
         float qn0 = max(qn_post_ls[idx], 0.0f);
         float qp0 = max(qp_pre[idx], 0.0f);
@@ -5767,12 +5901,12 @@ kernel void crm_distill_closure_col(
         float qi_n = qi0;
         float qv_n = qv0;
 
-        if (s_conv > 0.0f && k < 128u) {
+        if (s_conv > 0.0f && k < 64u) {
             float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
             float t_env = clamp(t_post_ls, 180.0f, 340.0f);
             float qsat_env = qsat_col[k];
 
-            qn_n = qn_tr_col[k];
+            qn_n = qnb_col[k];
             qp_n = qp_p_col[k] * qp_sc;
             w_post_conv += dm * (qn_n + qp_n);
 
@@ -5795,12 +5929,12 @@ kernel void crm_distill_closure_col(
             qi_n = qi_pf - qi_fall;
             qn_n = qv_n + qc_n + qi_n;
             p_fall_mass += dm * (qc_fall + qi_fall);
-            if (k < 128u) qfall_col[k] = qc_fall + qi_fall;
+            // Accumulate qf_k into rp1_s[k] (which already holds dqps_k)
+            rp1_s[k] += (qc_fall + qi_fall);
 
             d_m_qp += dm * (qp_n - qp0);
             out_prof[8u * plane + idx] = s_conv * rh_gate * aoba_sigmoid(raw_prof[rp_base + 7u * nz + k] - 2.0f);
         } else {
-            if (k < 128u) qfall_col[k] = 0.0f;
             out_prof[8u * plane + idx] = 0.0f;
         }
 
@@ -5824,21 +5958,14 @@ kernel void crm_distill_closure_col(
     float u_corr = (tau_x * dt - du_imp) / dm_sum_safe;
     float v_corr = (tau_y * dt - dv_imp) / dm_sum_safe;
 
-    // Pass 3: compute true-temperature profile, apply exact 2-pass red-black dry-convective
-    // adjustment within s_conv > 0, and write moist theta_m plus momentum-closed u, v
-    float t_col[128];
-    float t_pls[128];
-    float dm_col[128];
-    float ex_col[128];
-    float sc_col[128];
-    bool use_adj = (nz <= 128u);
+    // Pass 3: reuse qnb_col=t_col, qp_p_col=t_pls, qsat_col=ex_col (zero new stack arrays!)
+    bool use_adj = (nz <= 64u);
 
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * N + c;
         float ex = exner[idx];
         float ex_safe = max(ex, 0.05f);
-        float s_lin = clamp((ex - 0.50f) / 0.14f, 0.0f, 1.0f);
-        float s_conv = s_lin * s_lin;
+        float s_conv = (k < 64u) ? sconv_col[k] : 0.0f;
         float qn0 = max(qn_post_ls[idx], 0.0f);
         float qc0 = max(qc_pre[idx], 0.0f);
         float qi0 = max(qi_pre[idx], 0.0f);
@@ -5856,19 +5983,16 @@ kernel void crm_distill_closure_col(
             float pbl_sh = clamp(1.0f - (ex0 - ex) * inv_pbl_ex, 0.0f, 1.0f) * s_conv;
             float qc_n = out_prof[4u * plane + idx];
             float qi_n = out_prof[5u * plane + idx];
-            float qf_k = (k < 128u) ? qfall_col[k] : 0.0f;
-            float dqps_k = (k < 128u) ? dqps_col[k] : 0.0f;
-            float d_temp_lat = (l_v0 * ((qc_n + qi_n + qf_k) - (qc0 + qi0) + dqps_k) + l_f0 * (qi_n - qi0)) / cp_d;
-            float rp0_k = (k < 128u) ? rp0_s[k] : (raw_prof[rp_base + 0u * nz + k] * s_conv);
+            float qf_plus_dqps = (k < 64u) ? rp1_s[k] : 0.0f;
+            float d_temp_lat = (l_v0 * ((qc_n + qi_n) - (qc0 + qi0) + qf_plus_dqps) + l_f0 * (qi_n - qi0)) / cp_d;
+            float rp0_k = (k < 64u) ? rp0_s[k] : (raw_prof[rp_base + 0u * nz + k] * s_conv);
             float d_temp_r = s_conv * l_gate * tanh(rp0_k * 0.2f) * 0.15f;
             d_temp_cons = dT_shf_scale * pbl_sh + d_temp_lat + d_temp_r + h_corr * s_conv;
         }
         if (use_adj) {
-            t_pls[k] = t_post_ls;
-            t_col[k] = t_post_ls + d_temp_cons;
-            dm_col[k] = max(rho_d[idx] * dz_c[idx], 1.0e-6f);
-            ex_col[k] = ex_safe;
-            sc_col[k] = s_conv;
+            qp_p_col[k] = t_post_ls;
+            qnb_col[k] = t_post_ls + d_temp_cons;
+            qsat_col[k] = ex_safe;
         } else if (s_conv > 0.0f) {
             float qv_n = out_prof[3u * plane + idx];
             float d_thm_exact = (d_temp_cons * (1.0f + rv_rd * qv_n) + t_post_ls * rv_rd * (qv_n - qv0)) / ex_safe;
@@ -5890,23 +6014,23 @@ kernel void crm_distill_closure_col(
     if (use_adj) {
         for (uint start = 0u; start < 2u; ++start) {
             for (uint k = start; k + 1u < nz; k += 2u) {
-                if (sc_col[k] > 0.0f && sc_col[k + 1u] > 0.0f) {
-                    float th0 = t_col[k] / ex_col[k];
-                    float th1 = t_col[k + 1u] / ex_col[k + 1u];
+                if (sconv_col[k] > 0.0f && sconv_col[k + 1u] > 0.0f) {
+                    float th0 = qnb_col[k] / qsat_col[k];
+                    float th1 = qnb_col[k + 1u] / qsat_col[k + 1u];
                     if (th0 > th1) {
-                        float dm0_p = dm_col[k];
-                        float dm1_p = dm_col[k + 1u];
-                        float th_eq = (dm0_p * t_col[k] + dm1_p * t_col[k + 1u])
-                                      / max(dm0_p * ex_col[k] + dm1_p * ex_col[k + 1u], 1.0e-6f);
-                        t_col[k]      = th_eq * ex_col[k];
-                        t_col[k + 1u] = th_eq * ex_col[k + 1u];
+                        float dm0_p = dm_c_col[k];
+                        float dm1_p = dm_c_col[k + 1u];
+                        float th_eq = (dm0_p * qnb_col[k] + dm1_p * qnb_col[k + 1u])
+                                      / max(dm0_p * qsat_col[k] + dm1_p * qsat_col[k + 1u], 1.0e-6f);
+                        qnb_col[k]      = th_eq * qsat_col[k];
+                        qnb_col[k + 1u] = th_eq * qsat_col[k + 1u];
                     }
                 }
             }
         }
         for (uint k = 0u; k < nz; ++k) {
             uint idx = k * N + c;
-            if (sc_col[k] > 0.0f) {
+            if (sconv_col[k] > 0.0f) {
                 float qn0 = max(qn_post_ls[idx], 0.0f);
                 float qc0 = max(qc_pre[idx], 0.0f);
                 float qi0 = max(qi_pre[idx], 0.0f);
@@ -5918,8 +6042,9 @@ kernel void crm_distill_closure_col(
                 }
                 float qv0 = max(qn0 - qc0 - qi0, 0.0f);
                 float qv_n = out_prof[3u * plane + idx];
-                float d_temp_adj = t_col[k] - t_pls[k];
-                float d_thm_exact = (d_temp_adj * (1.0f + rv_rd * qv_n) + t_pls[k] * rv_rd * (qv_n - qv0)) / ex_col[k];
+                float t_p = qp_p_col[k];
+                float d_temp_adj = qnb_col[k] - t_p;
+                float d_thm_exact = (d_temp_adj * (1.0f + rv_rd * qv_n) + t_p * rv_rd * (qv_n - qv0)) / qsat_col[k];
                 out_prof[idx] = clamp(thm_post_ls[idx] + d_thm_exact, 150.0f, 10000.0f);
             } else {
                 out_prof[idx] = clamp(thm_post_ls[idx], 150.0f, 10000.0f);
@@ -5962,154 +6087,77 @@ kernel void rad_distill_extract_col(
     uint c = c0 + lane;
     bool active = (lane < n_valid);
 
-    threadgroup float sm_t[32u * 33u];
+    // 5 x 32x33 bank-conflict-free shared-memory transpose slab (21.1 KB):
+    // reads qv/qc/qi ONCE (no duplicate DRAM pass) and cuts 36 barriers -> 8 barriers.
+    threadgroup float sm_t[5u * 32u * 33u];
+    const uint s_str = 32u * 33u;
 
     float cp_d = f_p0.x;
     float cp_v = f_p0.y;
     float cwp_tot = 0.0f;
 
-    // Warp-tiled 32x32 shared-memory transpose: 100% coalesced reads [nz, M] AND 100% coalesced writes [M, d_in]
     for (uint k0 = 0u; k0 < nz; k0 += 32u) {
         uint klen = (k0 + 32u <= nz) ? 32u : (nz - k0);
 
-        // 0: temperature
-        if (active) {
-            for (uint dk = 0u; dk < klen; ++dk) {
-                sm_t[lane * 33u + dk] = (temp_c[(k0 + dk) * M + c] - 250.0f) * 0.02f;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane < klen) {
-            uint fcol = 0u * nz + k0 + lane;
-            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // 1: log(pressure)
-        if (active) {
-            for (uint dk = 0u; dk < klen; ++dk) {
-                sm_t[lane * 33u + dk] = (log(max(pres_c[(k0 + dk) * M + c], 1.0f)) - 10.0f) * 0.4f;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane < klen) {
-            uint fcol = 1u * nz + k0 + lane;
-            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // 2: qv
-        if (active) {
-            for (uint dk = 0u; dk < klen; ++dk) {
-                sm_t[lane * 33u + dk] = aoba_log1p(max(qv_c[(k0 + dk) * M + c], 0.0f) * 1.0e3f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane < klen) {
-            uint fcol = 2u * nz + k0 + lane;
-            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // 3: qc
-        if (active) {
-            for (uint dk = 0u; dk < klen; ++dk) {
-                sm_t[lane * 33u + dk] = aoba_log1p(max(qc_c[(k0 + dk) * M + c], 0.0f) * 1.0e4f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane < klen) {
-            uint fcol = 3u * nz + k0 + lane;
-            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // 4: qi
-        if (active) {
-            for (uint dk = 0u; dk < klen; ++dk) {
-                sm_t[lane * 33u + dk] = aoba_log1p(max(qi_c[(k0 + dk) * M + c], 0.0f) * 1.0e4f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane < klen) {
-            uint fcol = 4u * nz + k0 + lane;
-            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // 5: dm + cp_layer_out + cwp_tot accumulation
+        // Pass A: features 0..4 (T, log p, qv, qc, qi) + cp_layer_out + cwp_tot in ONE single read pass
         if (active) {
             for (uint dk = 0u; dk < klen; ++dk) {
                 uint idx = (k0 + dk) * M + c;
-                float dm = max(rho_d_c[idx] * dz_c[idx], 1.0e-6f);
                 float qv = max(qv_c[idx], 0.0f);
                 float qc = max(qc_c[idx], 0.0f);
                 float qi = max(qi_c[idx], 0.0f);
+                float dm = max(rho_d_c[idx] * dz_c[idx], 1.0e-6f);
                 cp_layer_out[idx] = (cp_d + cp_v * qv) * dm;
                 cwp_tot += (qc + qi) * dm;
-                sm_t[lane * 33u + dk] = aoba_log1p(dm * 1.0e-3f);
+
+                uint s_off = lane * 33u + dk;
+                sm_t[0u * s_str + s_off] = (temp_c[idx] - 250.0f) * 0.02f;
+                sm_t[1u * s_str + s_off] = (log(max(pres_c[idx], 1.0f)) - 10.0f) * 0.4f;
+                sm_t[2u * s_str + s_off] = aoba_log1p(qv * 1.0e3f);
+                sm_t[3u * s_str + s_off] = aoba_log1p(qc * 1.0e4f);
+                sm_t[4u * s_str + s_off] = aoba_log1p(qi * 1.0e4f);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane < klen) {
-            uint fcol = 5u * nz + k0 + lane;
-            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
+            uint k_col = k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) {
+                uint xb = (c0 + r) * d_in + k_col;
+                uint rs = r * 33u + lane;
+                x_out[xb + 0u * nz] = sm_t[0u * s_str + rs];
+                x_out[xb + 1u * nz] = sm_t[1u * s_str + rs];
+                x_out[xb + 2u * nz] = sm_t[2u * s_str + rs];
+                x_out[xb + 3u * nz] = sm_t[3u * s_str + rs];
+                x_out[xb + 4u * nz] = sm_t[4u * s_str + rs];
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // 6: o3
-        if (has_o3) {
-            if (active) {
-                for (uint dk = 0u; dk < klen; ++dk) {
-                    sm_t[lane * 33u + dk] = aoba_log1p(max(o3_c[(k0 + dk) * M + c], 0.0f) * 1.0e6f);
-                }
+        // Pass B: features 5..8 (dm, o3, dust, aerosol)
+        if (active) {
+            for (uint dk = 0u; dk < klen; ++dk) {
+                uint idx = (k0 + dk) * M + c;
+                uint s_off = lane * 33u + dk;
+                float dm = max(rho_d_c[idx] * dz_c[idx], 1.0e-6f);
+                sm_t[0u * s_str + s_off] = aoba_log1p(dm * 1.0e-3f);
+                if (has_o3)   sm_t[1u * s_str + s_off] = aoba_log1p(max(o3_c[idx], 0.0f) * 1.0e6f);
+                if (has_dust) sm_t[2u * s_str + s_off] = aoba_log1p(max(q_dust_c[idx], 0.0f) * 1.0e6f);
+                if (has_aero) sm_t[3u * s_str + s_off] = aoba_log1p(max(tau_aero_c[idx], 0.0f) * 10.0f);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lane < klen) {
-                uint fcol = 6u * nz + k0 + lane;
-                for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        } else if (lane < klen) {
-            uint fcol = 6u * nz + k0 + lane;
-            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = 0.0f;
         }
-
-        // 7: dust
-        if (has_dust) {
-            if (active) {
-                for (uint dk = 0u; dk < klen; ++dk) {
-                    sm_t[lane * 33u + dk] = aoba_log1p(max(q_dust_c[(k0 + dk) * M + c], 0.0f) * 1.0e6f);
-                }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < klen) {
+            uint k_col = k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) {
+                uint xb = (c0 + r) * d_in + k_col;
+                uint rs = r * 33u + lane;
+                x_out[xb + 5u * nz] = sm_t[0u * s_str + rs];
+                x_out[xb + 6u * nz] = has_o3   ? sm_t[1u * s_str + rs] : 0.0f;
+                x_out[xb + 7u * nz] = has_dust ? sm_t[2u * s_str + rs] : 0.0f;
+                x_out[xb + 8u * nz] = has_aero ? sm_t[3u * s_str + rs] : 0.0f;
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lane < klen) {
-                uint fcol = 7u * nz + k0 + lane;
-                for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        } else if (lane < klen) {
-            uint fcol = 7u * nz + k0 + lane;
-            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = 0.0f;
         }
-
-        // 8: aerosol optical depth
-        if (has_aero) {
-            if (active) {
-                for (uint dk = 0u; dk < klen; ++dk) {
-                    sm_t[lane * 33u + dk] = aoba_log1p(max(tau_aero_c[(k0 + dk) * M + c], 0.0f) * 10.0f);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lane < klen) {
-                uint fcol = 8u * nz + k0 + lane;
-                for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = sm_t[r * 33u + lane];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        } else if (lane < klen) {
-            uint fcol = 8u * nz + k0 + lane;
-            for (uint r = 0u; r < n_valid; ++r) x_out[(c0 + r) * d_in + fcol] = 0.0f;
-        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // 13 trailing surface & greenhouse-gas scalars (transposed via sm_t)
@@ -7140,11 +7188,13 @@ def run_ogcm_fct_zstar_metal(
             torch.empty((B, max(nzo - 1, 1), nc), device=dev, dtype=dtype),  # av_int
             torch.empty((B, nzo, nc), device=dev, dtype=dtype),       # r_plus
             torch.empty((B, nzo, nc), device=dev, dtype=dtype),       # r_minus
+            torch.empty((B, nzo, nc), device=dev, dtype=dtype),       # qp
         )
         _OGCM_FCT_WS_CACHE[key] = ws
-    fl_h, ah_e, f_dif, s_dqdx_ew, qp_td, fl_v, av_int, r_plus, r_minus = ws
+    fl_h, ah_e, f_dif, s_dqdx_ew, qp_td, fl_v, av_int, r_plus, r_minus, qp = ws
 
-    qp = ((q - q_ref) * wet_cf.unsqueeze(0)).contiguous()
+    torch.sub(q, q_ref, out=qp)
+    qp.mul_(wet_cf.unsqueeze(0))
     q_c = q.contiguous()
     qc_c = q_comp.contiguous()
     fnl_c = f_nl_q.contiguous()
@@ -7266,11 +7316,15 @@ def run_ocean_bgc_column_metal(
     )
 
 
+_SCVT_PREP_WS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+
 def run_scvt_rk3_prep_metal(
     lib: Any,
     mc: dict[str, Any],
     m_s: torch.Tensor,
     Thm_s: torch.Tensor,
+    Thm0: torch.Tensor,
     u_s: torch.Tensor,
     w_s: torch.Tensor,
     dz_c: torch.Tensor,
@@ -7288,45 +7342,78 @@ def run_scvt_rk3_prep_metal(
     beta_hevi: float,
     dtau_stage: float = 0.0,
 ) -> tuple[torch.Tensor, ...]:
-    """Fused GPU SCVT RK3 stage prep (`scvt_rk3_prep_cell` + `scvt_rk3_prep_edge`)."""
+    """Fused GPU SCVT RK3 stage prep + Thomas HEVI factorization (`scvt_rk3_prep_cell` + `scvt_rk3_prep_edge`)."""
     nz, nc = m_s.shape
     ne = int(u_s.shape[1])
     dev = m_s.device
     dtype = m_s.dtype
 
-    pres_s = torch.empty((nz, nc), device=dev, dtype=dtype)
-    dp_dThm_s = torch.empty((nz, nc), device=dev, dtype=dtype)
-    thm_s = torch.empty((nz, nc), device=dev, dtype=dtype)
-    rtot_s = torch.empty((nz, nc), device=dev, dtype=dtype)
-    ke_cell = torch.empty((nz, nc), device=dev, dtype=dtype)
-    u_dot_gradz_s = torch.empty((nz - 1, nc), device=dev, dtype=dtype)
-    rho_dw = torch.empty((nz - 1, nc), device=dev, dtype=dtype)
-    rtot_w = torch.empty((nz - 1, nc), device=dev, dtype=dtype)
-    thm_w = torch.empty((nz - 1, nc), device=dev, dtype=dtype)
-    dl = torch.empty((nz - 1, nc), device=dev, dtype=dtype)
-    diag = torch.empty((nz - 1, nc), device=dev, dtype=dtype)
-    du = torch.empty((nz - 1, nc), device=dev, dtype=dtype)
+    ws_key = (dev.type, dev.index or 0, nz, nc, ne, dtype)
+    ws = _SCVT_PREP_WS_CACHE.get(ws_key)
+    if ws is None:
+        if len(_SCVT_PREP_WS_CACHE) >= 4:
+            _SCVT_PREP_WS_CACHE.pop(next(iter(_SCVT_PREP_WS_CACHE)))
+        ws = {
+            "pres_s": torch.empty((nz, nc), device=dev, dtype=dtype),
+            "dp_dThm_s": torch.empty((nz, nc), device=dev, dtype=dtype),
+            "thm_s": torch.empty((nz, nc), device=dev, dtype=dtype),
+            "rtot_s": torch.empty((nz, nc), device=dev, dtype=dtype),
+            "ke_cell": torch.empty((nz, nc), device=dev, dtype=dtype),
+            "u_dot_gradz_s": torch.empty((nz - 1, nc), device=dev, dtype=dtype),
+            "hevi_c": torch.empty((6, nz - 1, nc), device=dev, dtype=dtype),
+            "p_cell": torch.empty((nz, nc), device=dev, dtype=dtype),
+            "k_slope_top": torch.empty((nc,), device=dev, dtype=torch.float32),
+            "k_slope_ptr": -1,
+            "m_edge": torch.empty((nz, ne), device=dev, dtype=dtype),
+            "thm_e": torch.empty((nz, ne), device=dev, dtype=dtype),
+            "rtot_e": torch.empty((nz, ne), device=dev, dtype=dtype),
+            "fac_z0": torch.empty((nz, ne), device=dev, dtype=dtype),
+            "fac_z1": torch.empty((nz, ne), device=dev, dtype=dtype),
+            "tend_u_slow": torch.empty((nz, ne), device=dev, dtype=dtype),
+        }
+        _SCVT_PREP_WS_CACHE[ws_key] = ws
 
-    u_dim = [nz, nc, ne, 0]
+    zw_c = zw_slope_e.contiguous()
+    zw_ptr = zw_c.data_ptr()
+    if ws["k_slope_ptr"] != zw_ptr:
+        lib.scvt_slope_top_cell(
+            mc["eoc"], mc["esgn"], zw_c, ws["k_slope_top"], [nz, nc, ne, 0], threads=nc,
+        )
+        ws["k_slope_ptr"] = zw_ptr
+    k_slope_top = ws["k_slope_top"]
+
+    pres_s = ws["pres_s"]
+    dp_dThm_s = ws["dp_dThm_s"]
+    thm_s = ws["thm_s"]
+    rtot_s = ws["rtot_s"]
+    ke_cell = ws["ke_cell"]
+    u_dot_gradz_s = ws["u_dot_gradz_s"]
+    hevi_c = ws["hevi_c"]
+    p_cell = ws["p_cell"]
+
+    Thm_s_c = Thm_s.contiguous()
+    Thm0_c = Thm0.contiguous()
+    same_thm0 = 1 if (Thm0_c.data_ptr() == Thm_s_c.data_ptr()) else 0
+    u_dim = [nz, nc, ne, same_thm0]
     lib.scvt_rk3_prep_cell(
         mc["eoc"], mc["esgn"], area_e.reshape(-1).contiguous(), mc["area_cell"],
-        m_s.contiguous(), Thm_s.contiguous(), u_s.contiguous(),
+        m_s.contiguous(), Thm_s_c, Thm0_c, u_s.contiguous(),
         dz_c.contiguous(), dz_w_int.contiguous(), q_load.contiguous(),
-        zw_slope_e.contiguous(), sponge_w.reshape(-1).contiguous(),
+        zw_c, sponge_w.reshape(-1).contiguous(), k_slope_top,
         pres_s, dp_dThm_s, thm_s, rtot_s, ke_cell,
-        u_dot_gradz_s, rho_dw, rtot_w, thm_w, dl, diag, du,
+        u_dot_gradz_s, hevi_c, p_cell,
         u_dim,
         [float(C.P_REF), float(C.R_D), float(C.GAMMA_D), float(C.GRAVITY)],
         [float(dt_ac), float(beta_hevi), 0.0, 0.0],
         threads=nc,
     )
 
-    m_edge = torch.empty((nz, ne), device=dev, dtype=dtype)
-    thm_e = torch.empty((nz, ne), device=dev, dtype=dtype)
-    rtot_e = torch.empty((nz, ne), device=dev, dtype=dtype)
-    fac_z0 = torch.empty((nz, ne), device=dev, dtype=dtype)
-    fac_z1 = torch.empty((nz, ne), device=dev, dtype=dtype)
-    tend_u_slow = torch.empty((nz, ne), device=dev, dtype=dtype)
+    m_edge = ws["m_edge"]
+    thm_e = ws["thm_e"]
+    rtot_e = ws["rtot_e"]
+    fac_z0 = ws["fac_z0"]
+    fac_z1 = ws["fac_z1"]
+    tend_u_slow = ws["tend_u_slow"]
 
     dtau_v = float(dtau_stage) if float(dtau_stage) > 0.0 else float(dt_ac)
     lib.scvt_rk3_prep_edge(
@@ -7340,7 +7427,7 @@ def run_scvt_rk3_prep_metal(
     )
     return (
         pres_s, dp_dThm_s, m_edge, thm_e, rtot_e, fac_z0, fac_z1,
-        u_dot_gradz_s, tend_u_slow, rho_dw, rtot_w, thm_w, dl, diag, du,
+        u_dot_gradz_s, tend_u_slow, hevi_c, p_cell, k_slope_top,
     )
 
 
@@ -7587,6 +7674,9 @@ def run_ogcm_pre_kpp_metal(
     return T_out, S_out, t_comp_out, s_comp_out, sfc_flux3[0], sfc_flux3[1], sfc_flux3[2], rho_anom, p_baroc
 
 
+_OGCM_GM_WS_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
+
+
 def run_ogcm_gm_bolus_edge_metal(
     lib: Any,
     mc: dict[str, Any],
@@ -7616,9 +7706,16 @@ def run_ogcm_gm_bolus_edge_metal(
     dev = u_star.device
     dtype = u_star.dtype
     u_new = torch.empty_like(u_star)
-    sx_int = torch.empty((nzo - 1, ne), device=dev, dtype=dtype)
+    sx_int = torch.empty((max(nzo - 1, 1), ne), device=dev, dtype=dtype)
     h_u_edge = torch.empty_like(u_star)
-    s2_edge_w = torch.empty((nzo - 1, ne), device=dev, dtype=dtype) if enable_full_redi else torch.empty(1, device=dev, dtype=dtype)
+    s2_edge_w = torch.empty((max(nzo - 1, 1), ne), device=dev, dtype=dtype) if enable_full_redi else torch.empty(1, device=dev, dtype=dtype)
+    psi_key = (dev.type, dev.index or 0, max(nzo - 1, 1), ne, dtype)
+    psi_int = _OGCM_GM_WS_CACHE.get(psi_key)
+    if psi_int is None:
+        if len(_OGCM_GM_WS_CACHE) >= 4:
+            _OGCM_GM_WS_CACHE.pop(next(iter(_OGCM_GM_WS_CACHE)))
+        psi_int = torch.empty((max(nzo - 1, 1), ne), device=dev, dtype=dtype)
+        _OGCM_GM_WS_CACHE[psi_key] = psi_int
     dummy1 = torch.zeros(1, device=dev, dtype=dtype)
     gm_s = gm_scale_e.contiguous() if (enable_scale_aware_gm and gm_scale_e is not None) else dummy1
     fk_c = fk_coef_e.contiguous() if (enable_submeso and fk_coef_e is not None) else dummy1
@@ -7626,17 +7723,25 @@ def run_ogcm_gm_bolus_edge_metal(
         (1 if (enable_submeso and fk_coef_e is not None) else 0) << 1
     ) | (1 if enable_full_redi else 0)
 
-    lib.ogcm_gm_bolus_edge_col(
-        mc["c0"], mc["c1"], mc["inv_dc"], w_vor_edge.contiguous(),
+    hes_c = h_e_safe.contiguous()
+    wef_c = wet_ef.contiguous()
+    if nzo >= 2:
+        lib.ogcm_gm_slope_psi_edge(
+            mc["c0"], mc["c1"], mc["inv_dc"], w_vor_edge.contiguous(),
+            rho_anom.contiguous(), dz_c_int.contiguous(), wet_int_cf.contiguous(),
+            h_bl.contiguous(), hes_c, z_int_m.reshape(-1).contiguous(),
+            wef_c, wet_int_ef.contiguous(), gm_s, fk_c,
+            sx_int, psi_int, s2_edge_w,
+            [nzo, nc, ne, flags],
+            [float(kappa_gm), float(gm_slope_max), float(C.GRAVITY / C.RHO_SEAWATER), 0.0],
+            threads=(nzo - 1) * ne,
+        )
+    lib.ogcm_gm_apply_edge(
         u_star.contiguous(), u_bt_mean.contiguous(), u_star_baro.contiguous(),
-        rho_anom.contiguous(), dz_c_int.contiguous(), wet_int_cf.contiguous(),
-        h_bl.contiguous(), h_e.contiguous(), h_e_safe.contiguous(),
-        z_int_m.reshape(-1).contiguous(), wet_ef.contiguous(), wet_int_ef.contiguous(),
-        gm_s, fk_c,
-        u_new, sx_int, h_u_edge, s2_edge_w,
-        [nzo, nc, ne, flags],
-        [float(kappa_gm), float(gm_slope_max), float(C.GRAVITY / C.RHO_SEAWATER), 0.0],
-        threads=ne,
+        h_e.contiguous(), hes_c, wef_c, psi_int,
+        u_new, h_u_edge,
+        [nzo, ne, 0, 0],
+        threads=nzo * ne,
     )
     return u_new, sx_int, h_u_edge, s2_edge_w
 
@@ -7857,6 +7962,7 @@ def run_crm_distill_extract_metal(
     x_out = torch.empty((n_col, d_in), device=dev, dtype=dtype)
     exner_out = torch.empty((nz, n_col), device=dev, dtype=dtype)
     temp_out = torch.empty((nz, n_col), device=dev, dtype=dtype)
+    n_grp = (n_col + 31) // 32
     lib.crm_distill_extract_col(
         rho_d.contiguous(), theta_m.contiguous(), q_v.contiguous(),
         q_c.contiguous(), q_i.contiguous(), q_p.contiguous(),
@@ -7868,7 +7974,8 @@ def run_crm_distill_extract_metal(
         [float(dt), float(C.P_REF), float(C.R_D), float(C.GAMMA_D)],
         [float(C.KAPPA_D), float(C.RV_OVER_RD), float(C.EPS_WATER), float(C.E_TRIPLE)],
         [float(C.T_FREEZE), float(C.T_ICE_ALL), float(C.T_LIQ_ALL), 0.0],
-        threads=n_col,
+        threads=(n_grp * 32,),
+        group_size=(32,),
     )
     return x_out, exner_out, temp_out
 

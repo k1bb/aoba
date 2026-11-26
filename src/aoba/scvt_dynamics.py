@@ -38,6 +38,7 @@ from aoba.kernels import (
     dispatch_scvt_fct_advect_metal,
     dispatch_scvt_rk3_prep_metal,
     dispatch_scvt_scalar_lap_metal,
+    dispatch_scvt_storm_smag_metal,
     dispatch_scvt_trisk_rot_metal,
     dispatch_scvt_vec_lap_metal,
     dispatch_scvt_vorticity_metal,
@@ -293,13 +294,19 @@ def apply_scvt_storm_smagorinsky(
     if dx_min is None:
         dx_min = float(mesh.dc_edge.min().item())
         setattr(mesh, "_dc_edge_min_m", dx_min)
+    k_cap = 0.12 * (dx_min ** 2) / max(dt, 1.0)
+    if _can_use_scvt_metal(state.u_edge):
+        state.q_n, state.theta_m, state.u_edge, state.w = dispatch_scvt_storm_smag_metal(
+            mesh, state.rho_d, state.dz_c, state.q_n, state.theta_m, state.u_edge, state.w,
+            dt, cs_scalar, cs_div, k_cap,
+        )
+        return
     c0 = mesh.cells_on_edge[:, 0]
     c1 = mesh.cells_on_edge[:, 1]
     dc_e = mesh.dc_edge.unsqueeze(0)
     div_c = compute_scvt_divergence(mesh, state.u_edge)
     conv_e = torch.clamp(torch.maximum(-div_c[:, c0], -div_c[:, c1]), min=0.0)
 
-    k_cap = 0.12 * (dx_min ** 2) / max(dt, 1.0)
     kh_sc = torch.clamp(((cs_scalar * dc_e) ** 2) * conv_e, max=k_cap)
     kh_dv = torch.clamp(((cs_div * dc_e) ** 2) * conv_e, max=k_cap)
 
@@ -887,13 +894,17 @@ def _step_scvt_rk3_hevi_impl(
 
         n_ac = max(1, int(math.ceil(dtau / dt_ac_max)))
         dt_ac = dtau / float(n_ac)
+        hevi_c_pre: torch.Tensor | None = None
+        p_cell_pre: torch.Tensor | None = None
+        k_slope_top_pre: torch.Tensor | None = None
+        rho_dw = rtot_w = thm_w = dl = diag = du = None
         if can_use_crm_metal(m_s):
             (
                 pres_s, dp_dThm_s, m_edge, thm_e, rtot_e, fac_z0, fac_z1,
-                u_dot_gradz_s, tend_u_slow, rho_dw, rtot_w, thm_w, dl, diag, du,
+                u_dot_gradz_s, tend_u_slow, hevi_c_pre, p_cell_pre, k_slope_top_pre,
             ) = dispatch_scvt_rk3_prep_metal(
                 mesh,
-                m_s=m_s, Thm_s=Thm_s, u_s=u_s, w_s=w_s,
+                m_s=m_s, Thm_s=Thm_s, Thm0=Thm0, u_s=u_s, w_s=w_s,
                 dz_c=dz_c, dz_w_int=dz_w_int, dz_w_e=dz_w_e, z_c=state.z_c,
                 q_load=q_load, area_e=area_e, zw_slope_e=zw_slope_e,
                 rot_acc=rot_acc, visc_u=visc_u, du_ext=du_ext,
@@ -913,7 +924,7 @@ def _step_scvt_rk3_hevi_impl(
 
         # --- Fast Horizontal Acoustic + Vertical Implicit HEVI Loop from U^0 over n_ac steps of dt_ac ---
         if stage_idx == 0:
-            udotz0 = u_dot_gradz_s
+            udotz0 = u_dot_gradz_s.clone() if can_use_crm_metal(m_s) else u_dot_gradz_s
 
         if not can_use_crm_metal(u0):
             m_s, Thm_s, u_s, w_s, uh_accum, om_accum = _scvt_fast_acoustic_hevi_cpu_gpu(
@@ -1003,6 +1014,9 @@ def _step_scvt_rk3_hevi_impl(
                 diag=diag,
                 du=du,
                 mesh=mesh,
+                hevi_c_pre=hevi_c_pre,
+                p_cell_pre=p_cell_pre,
+                k_slope_top_pre=k_slope_top_pre,
             )
         else:
             m_k = m0
