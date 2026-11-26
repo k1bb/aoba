@@ -236,6 +236,7 @@ def extract_crm_distill_features(
     subgrid_struct: torch.Tensor | None = None,  # [N, 16] 2D/3D surface heterogeneity & org invariants
     sub_org_qn_std: torch.Tensor | None = None,  # legacy fallback when subgrid_struct is omitted
     sub_org_w_rms: torch.Tensor | None = None,   # legacy fallback when subgrid_struct is omitted
+    conv_memory: torch.Tensor | None = None,     # [N, 4] train-test-invariant prognostic lifecycle memory
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build flat dimensionless map-free input `[N, 14*nz + 23]` plus `(exner, temp)` `[nz, N]`."""
     nz, n_col = rho_d.shape
@@ -248,12 +249,21 @@ def extract_crm_distill_features(
     else:
         struct_mat = subgrid_struct.to(device=rho_d.device, dtype=rho_d.dtype)
 
+    # Retain surface-tile heterogeneity invariants (cols 0..11) and fill cols 12..15 strictly with
+    # train-test-invariant prognostic convective lifecycle memory (or zero if absent), guaranteeing
+    # zero covariate shift between teacher and student columns across CPU, Metal, and CUDA.
+    struct_clean = struct_mat.clone()
+    if conv_memory is not None:
+        struct_clean[:, 12:16] = conv_memory.to(device=rho_d.device, dtype=rho_d.dtype)
+    else:
+        struct_clean[:, 12:16] = 0.0
+
     if can_use_elem_metal(rho_d):
         return dispatch_crm_distill_extract_metal(
             rho_d=rho_d, theta_m=theta_m, q_v=q_v, q_c=q_c, q_i=q_i, q_p=q_p,
             u=u, v=v, dz_c=dz_c, dthm_ls=dthm_ls, dqn_ls=dqn_ls, q_rad=q_rad,
             shf=shf, lhf=lhf, u_star=u_star, tau_x=tau_x, tau_y=tau_y,
-            is_ocean=is_ocean, f_cor=f_cor, struct_mat=struct_mat, dt=dt,
+            is_ocean=is_ocean, f_cor=f_cor, struct_mat=struct_clean.contiguous(), dt=dt,
         )
 
     pres, exner, temp = diagnose_pressure_temperature(rho_d, theta_m, q_v)
@@ -294,11 +304,6 @@ def extract_crm_distill_features(
         is_ocean.to(rho_d.dtype),
         torch.clamp(f_cor.abs() * 1.0e4, 0.0, 5.0),
     ], dim=1)  # [N, 7]
-
-    # Retain only surface-tile heterogeneity invariants (cols 0..11) shared identically by teachers
-    # and students; zero cols 12..15 (crm.w / crm.q_n stats) to eliminate train-test covariate shift.
-    struct_clean = struct_mat.clone()
-    struct_clean[:, 12:16] = 0.0
 
     # Flatten to [N, 14*nz + 23] for 100% dense BLAS GEMM / Tensor-Core execution
     prof_flat = prof.permute(2, 0, 1).reshape(n_col, _N_PROF_IN * nz)
@@ -1226,6 +1231,61 @@ class CRMSelfDistillState:
     ema_val_rmse_thm: float = 1.0
     ema_val_rmse_qn: float = 1.0e-3
     teacher_frac_last: float = 1.0
+    # Prognostic convective lifecycle memory updated identically across teacher & student columns
+    # via exact exponential integration (Mapes & Neale, 2011; Colin et al., 2019; AOBA Eq. 8.15b)
+    mem_prec_fast: torch.Tensor | None = None   # [n_cells] 1.5 h convective precipitation EMA [mm/d]
+    mem_prec_slow: torch.Tensor | None = None   # [n_cells] 4.0 h convective/cold-pool memory [mm/d]
+    mem_buoy_slow: torch.Tensor | None = None   # [n_cells] 3.0 h positive surface buoyancy EMA [m^2 s^-3]
+
+
+def _ensure_convective_memory(state: CRMSelfDistillState, ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dev, dt_t = ref.device, ref.dtype
+    if state.mem_prec_fast is None or state.mem_prec_fast.shape != (state.n_cells,):
+        state.mem_prec_fast = torch.zeros((state.n_cells,), device=dev, dtype=dt_t)
+    elif state.mem_prec_fast.device != dev:
+        state.mem_prec_fast = state.mem_prec_fast.to(device=dev, dtype=dt_t)
+    if state.mem_prec_slow is None or state.mem_prec_slow.shape != (state.n_cells,):
+        state.mem_prec_slow = torch.zeros((state.n_cells,), device=dev, dtype=dt_t)
+    elif state.mem_prec_slow.device != dev:
+        state.mem_prec_slow = state.mem_prec_slow.to(device=dev, dtype=dt_t)
+    if state.mem_buoy_slow is None or state.mem_buoy_slow.shape != (state.n_cells,):
+        state.mem_buoy_slow = torch.zeros((state.n_cells,), device=dev, dtype=dt_t)
+    elif state.mem_buoy_slow.device != dev:
+        state.mem_buoy_slow = state.mem_buoy_slow.to(device=dev, dtype=dt_t)
+    return state.mem_prec_fast, state.mem_prec_slow, state.mem_buoy_slow
+
+
+def get_convective_memory_features(
+    state: CRMSelfDistillState,
+    buoy_flux_cell: torch.Tensor,
+) -> torch.Tensor:
+    """Return `[n_cells, 4]` train-test-invariant convective lifecycle & diurnal-phase memory features."""
+    mp_f, mp_s, mb_s = _ensure_convective_memory(state, buoy_flux_cell)
+    b_pos = torch.clamp(buoy_flux_cell, min=0.0)
+    return torch.stack([
+        torch.log1p(torch.clamp(mp_f, min=0.0, max=500.0)),
+        torch.log1p(torch.clamp(mp_s, min=0.0, max=500.0)),
+        torch.clamp(mb_s * 200.0, 0.0, 5.0),
+        torch.clamp((b_pos - mb_s) * 200.0, -5.0, 5.0),
+    ], dim=1).contiguous()
+
+
+def update_convective_memory(
+    state: CRMSelfDistillState,
+    precip_mm_day_cell: torch.Tensor,
+    buoy_flux_cell: torch.Tensor,
+    dt: float,
+) -> None:
+    """Advance prognostic convective lifecycle memory via exact exponential integration (`-expm1(-dt/tau)`)."""
+    mp_f, mp_s, mb_s = _ensure_convective_memory(state, buoy_flux_cell)
+    p_cur = torch.clamp(precip_mm_day_cell, min=0.0, max=500.0)
+    b_pos = torch.clamp(buoy_flux_cell, min=0.0)
+    a_pf = -math.expm1(-max(float(dt), 0.0) / 5400.0)
+    a_ps = -math.expm1(-max(float(dt), 0.0) / 14400.0)
+    a_bs = -math.expm1(-max(float(dt), 0.0) / 10800.0)
+    mp_f.add_(a_pf * (p_cur - mp_f))
+    mp_s.add_(a_ps * (p_cur - mp_s))
+    mb_s.add_(a_bs * (b_pos - mb_s))
 
 
 def init_crm_self_distill_state(

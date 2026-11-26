@@ -1141,13 +1141,16 @@ h_{\mathrm{soil}} &= \exp\!\left(\frac{\psi_0 g}{R_v T_{s,0}}\right), \qquad r_{
 \end{aligned} \tag{7.34}
 $$
 
-Under-canopy aerodynamic resistance $r_{d,\mathrm{uc}}$ and leaf boundary-layer conductances $(g_{b,\mathrm{sun}}, g_{b,\mathrm{sh}})$ couple sunlit leaf ($T_{\mathrm{sun}}$), shaded leaf ($T_{\mathrm{sh}}$), and ground ($T_{\mathrm{gnd}}$) temperatures with canopy air $(T_{\mathrm{af}}, q_{\mathrm{af}})$ and stomatal conductance via a $3\times 3$ cofactor-Jacobian Newton solver (`LAND_EB_ITERATIONS = 3`):
+Under-canopy aerodynamic resistance $r_{d,\mathrm{uc}}$ and leaf boundary-layer conductances $(g_{b,\mathrm{sun}}, g_{b,\mathrm{sh}})$ couple sunlit leaf ($T_{\mathrm{sun}}$), shaded leaf ($T_{\mathrm{sh}}$), and ground ($T_{\mathrm{gnd}}$) temperatures with canopy air $(T_{\mathrm{af}}, q_{\mathrm{af}})$, stomatal conductance, and emergent canopy biomass plus canopy-airspace heat capacity $C_{\mathrm{can}}(L_{\mathrm{exp}}, h_{\mathrm{exp}})$ (Swenson et al., 2019; Bonan, 2019) via a $3\times 3$ cofactor-Jacobian implicit Newton solver (`LAND_EB_ITERATIONS = 3`):
 
 $$
-R_{n,i} - H_i(T_i, T_{\mathrm{af}}) - \lambda_i E_i(T_i, q_{\mathrm{af}}) - \delta_{i,2} G_0(T_{\mathrm{gnd}}, T_{s,0}) = 0, \qquad i \in \{\mathrm{sun}, \mathrm{sh}, \mathrm{gnd}\} \tag{7.35}
+\begin{aligned}
+C_{\mathrm{can}} &= 4200\,L_{\mathrm{exp}} + 5500\,h_{\mathrm{exp}}, \qquad c_i = \frac{f_i\,C_{\mathrm{can}}}{\Delta t} \quad (i \in \{\mathrm{sun}, \mathrm{sh}\}), \quad c_{\mathrm{gnd}} = 0, \\
+R_{n,i} &- H_i(T_i, T_{\mathrm{af}}) - \lambda_i E_i(T_i, q_{\mathrm{af}}) - c_i(T_i - T_i^n) - \delta_{i,2} G_0(T_{\mathrm{gnd}}, T_{s,0}) = 0, \qquad i \in \{\mathrm{sun}, \mathrm{sh}, \mathrm{gnd}\}
+\end{aligned} \tag{7.35}
 $$
 
-During snowmelt, $T_{\mathrm{gnd}}$ is clamped at $273.15\ \mathrm{K}$ with excess energy routed conservatively to melt; snowpack exceeding $S_{\max} = 1000\ \mathrm{kg\ m^{-2}}$ calves as glacial runoff while recording climatic surface mass balance $\mathrm{SMB}$.
+The canopy heat storage $S_{\mathrm{can}} = c_{\mathrm{sun}}(T_{\mathrm{sun}}^{n+1} - T_{\mathrm{sun}}^n) + c_{\mathrm{sh}}(T_{\mathrm{sh}}^{n+1} - T_{\mathrm{sh}}^n)$ is subtracted from the net surface energy residual when forming the soil heat flux $G_{\mathrm{soil}} = \mathrm{SW}_{\mathrm{abs}} + \mathrm{LW}_\downarrow - \mathrm{LW}_\uparrow - \mathrm{SHF} - \mathrm{LHF} - Q_{\mathrm{melt}} - S_{\mathrm{can}}$, ensuring exact land–canopy–soil energy conservation. During snowmelt, $T_{\mathrm{gnd}}$ is clamped at $273.15\ \mathrm{K}$ with excess energy routed conservatively to melt; snowpack exceeding $S_{\max} = 1000\ \mathrm{kg\ m^{-2}}$ calves as glacial runoff while recording climatic surface mass balance $\mathrm{SMB}$.
 
 **Dynamic Root Depth, 5-Layer Implicit Richards Hydrology & Enthalpy-Conserving Freeze–Thaw Conduction**: Across 5 universal-loam layers ($0.05, 0.15, 0.40, 0.80, 1.60\ \mathrm{m}$; $w_{\mathrm{sat}} = 0.43$, $\psi_s = -0.20\ \mathrm{m}$, $b = 5.39$, $K_{\mathrm{sat}} = 7.0\times 10^{-6}\ \mathrm{m\ s^{-1}}$), dynamic rooting depth $z_{\mathrm{root}}$, ice-impedance factor $f_{\mathrm{ice}}$ (Swenson et al., 2012; CLM5 Eq. 7.89), and saturated/frozen surface-runoff fraction $f_{\mathrm{sat}}$ are:
 
@@ -1504,7 +1507,17 @@ h_{\mathrm{corr}} &= \frac{\Delta H_{\mathrm{precip}} - c_{pd}\sum_k \Delta m_k 
 \end{aligned} \tag{8.15}
 $$
 
-For each radiation surrogate subcolumn, shortwave fluxes vanish identically on the night side ($\mu_0 \le 0$), longwave fluxes scale analytically with surface Planck emission $\sigma T_{\mathrm{sfc}}^4$, and the radiative heating profile satisfies exact column flux-divergence closure. Lowest-layer student subgrid anomalies $(\theta_{m,0}', q_{v,0}')$ and gust outflows $(u_0', v_0')$ are reconstructed directly around the cell mean from the periodic `SubgridSpatialHead` state prediction (`crm_student_tile_update_col`) with exact zero-mean conservation rather than accumulating onto previous-step anomalies. Online optimization combines boundary-layer-emphasized true-temperature, vertical lapse-rate, per-step tendency ($\Delta q_n, \Delta T$), and saturation-normalized moisture ($\Delta q_n / q_{\mathrm{sat}}$) Smooth-$L_1$ losses with a nullspace gauge-fixing penalty on uniform-projection temperature and momentum logits to prevent saturation drift along projection nullspaces:
+For each radiation surrogate subcolumn, shortwave fluxes vanish identically on the night side ($\mu_0 \le 0$), longwave fluxes scale analytically with surface Planck emission $\sigma T_{\mathrm{sfc}}^4$, and the radiative heating profile satisfies exact column flux-divergence closure. To represent multi-hour convective lifecycle hysteresis and diurnal buoyancy phase lag without teacher–student covariate shift (Mapes & Neale, 2011; Colin et al., 2019), three prognostic scalar memory states $(M_{P,\mathrm{fast}}, M_{P,\mathrm{slow}}, M_{B,\mathrm{slow}})$ advance identically across all teacher and student columns via exact exponential integration ($\alpha_\tau = -\operatorname{expm1}(-\Delta t/\tau)$ with $\tau_{P,\mathrm{fast}} = 1.5\ \mathrm{h}$, $\tau_{P,\mathrm{slow}} = 4.0\ \mathrm{h}$, $\tau_B = 3.0\ \mathrm{h}$) and supply four dimensionless memory inputs $\big(\ln(1 + M_{P,\mathrm{fast}}), \ln(1 + M_{P,\mathrm{slow}}), 200\,M_{B,\mathrm{slow}}, 200(B_{\mathrm{sfc}}^+ - M_{B,\mathrm{slow}})\big)$:
+
+$$
+\begin{aligned}
+M_{P,\mathrm{fast}}^{n+1} &= M_{P,\mathrm{fast}}^n + \alpha_{1.5\mathrm{h}}\big(P_{\mathrm{mm/d}} - M_{P,\mathrm{fast}}^n\big), \qquad
+M_{P,\mathrm{slow}}^{n+1} = M_{P,\mathrm{slow}}^n + \alpha_{4\mathrm{h}}\big(P_{\mathrm{mm/d}} - M_{P,\mathrm{slow}}^n\big), \\
+M_{B,\mathrm{slow}}^{n+1} &= M_{B,\mathrm{slow}}^n + \alpha_{3\mathrm{h}}\big(\max(B_{\mathrm{sfc}}, 0) - M_{B,\mathrm{slow}}^n\big)
+\end{aligned} \tag{8.15b}
+$$
+
+Lowest-layer student subgrid anomalies $(\theta_{m,0}', q_{v,0}')$ and gust outflows $(u_0', v_0')$ are reconstructed directly around the cell mean from the periodic `SubgridSpatialHead` state prediction (`crm_student_tile_update_col`) with exact zero-mean conservation rather than accumulating onto previous-step anomalies. Online optimization combines boundary-layer-emphasized true-temperature, vertical lapse-rate, per-step tendency ($\Delta q_n, \Delta T$), and saturation-normalized moisture ($\Delta q_n / q_{\mathrm{sat}}$) Smooth-$L_1$ losses with a nullspace gauge-fixing penalty on uniform-projection temperature and momentum logits to prevent saturation drift along projection nullspaces:
 
 $$
 \sum_{k=0}^{N_z-1} c_{p,\mathrm{moist},k}\,\Delta m_k\,Q_{\mathrm{rad},k} = (\mathrm{ASR} - \mathrm{OLR}) - (F_{\mathrm{SW,sfc}}^{\mathrm{net}} + F_{\mathrm{LW,sfc}}^{\mathrm{net}}) \tag{8.16}

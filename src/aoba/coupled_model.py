@@ -2645,17 +2645,20 @@ def step_aoba_model(
                 extract_crm_distill_features,
                 extract_spatial_targets,
                 extract_subgrid_spatial_maps,
+                get_convective_memory_features,
                 pack_teacher_context_and_targets,
                 predict_student_columns,
                 reconstruct_subgrid_heterogeneity,
                 select_teacher_indices,
                 train_student_online,
+                update_convective_memory,
             )
 
             q_rad_cell_pre = _sub_to_cell(q_rad_sub, nc, n_crm)
             shf_cell_pre = _sub_to_cell(sfc_diag_sub.shf, nc, n_sub)
             lhf_cell_pre = _sub_to_cell(sfc_diag_sub.lhf, nc, n_sub)
             evap_cell_pre = _sub_to_cell(sfc_diag_sub.evap, nc, n_sub)
+            buoy_cell_pre_sd = _sub_to_cell(sfc_diag_sub.buoy_flux, nc, n_sub)
             ustar_cell_pre = _sub_to_cell(sfc_diag_sub.u_star, nc, n_sub)
             tx_cell_pre = _sub_to_cell(sfc_diag_sub.tau_x, nc, n_sub)
             ty_cell_pre = _sub_to_cell(sfc_diag_sub.tau_y, nc, n_sub)
@@ -2701,12 +2704,14 @@ def step_aoba_model(
                     thm0_3d=_crm3d_to_tile3d(crm.theta_m[0]),
                     qv0_3d=_crm3d_to_tile3d(crm.q_v[0]),
                 )
+            conv_mem_sd = get_convective_memory_features(model.crm_distill, buoy_cell_pre_sd)
             x_all_sd, exner_all_sd, temp_all_sd = extract_crm_distill_features(
                 rho_pre_sd, thm_pre_sd, qv_pre_sd, qc_pre_sd, qi_pre_sd, qp_pre_sd,
                 u_host_new, v_host_new, atmos.dz_c, dthm_ls, dqn_ls, q_rad_cell_pre,
                 shf_cell_pre, lhf_cell_pre, ustar_cell_pre, tx_cell_pre, ty_cell_pre,
                 is_ocn_cell_pre, mesh.f_cell, dt,
                 subgrid_struct=subgrid_struct_sd,
+                conv_memory=conv_mem_sd,
             )
             thm_post_ls_sd = thm_pre_sd + dt * q_rad_cell_pre * (1.0 + C.RV_OVER_RD * qv_pre_sd) / torch.clamp(exner_all_sd, min=1.0e-3)
             sparse_warmup_crm = (ny > 1 and nx > 1 and m_crm > 100_000)
@@ -3421,6 +3426,13 @@ def step_aoba_model(
 
     rain_new = _sub_to_cell(rain_new_sub, nc, n_sub)
     snow_new = _sub_to_cell(snow_new_sub, nc, n_sub)
+    if bool(cfg.enable_superparam) and use_distill and model.crm_distill is not None:
+        update_convective_memory(
+            model.crm_distill,
+            (rain_new + snow_new) * C.SECONDS_PER_DAY,
+            buoy_cell_pre_sd,
+            dt,
+        )
 
     # 7b. Map-free CRM Non-Inductive Charging Lightning & Natural LNOx Deposition
     light_diag = None

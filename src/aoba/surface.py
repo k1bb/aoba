@@ -1135,6 +1135,10 @@ def _land_newton_jacobian_core(
     prev_dt_gnd: torch.Tensor,
     dt: float,
     apply_damping: bool,
+    t_sun_t0: torch.Tensor | None = None,
+    t_sh_t0: torch.Tensor | None = None,
+    c_sun_dt: torch.Tensor | None = None,
+    c_sh_dt: torch.Tensor | None = None,
 ):
     """Pure-tensor 3-source Newton Jacobian assembly & 3x3 solve (CUDA-compilable)."""
     e_pot_wet = rho_sfc * (
@@ -1235,20 +1239,24 @@ def _land_newton_jacobian_core(
     e_2 = torch.maximum(rho_sfc * gw_2 * (h_gnd * qsat_gnd - q_af), -rho_sfc * ga_land * qv_1)
 
     g0_down = g_cond_coeff * (t_gnd_cur - t_soil0)
-    b0 = sw_abs_sun + r_lw_0 - h_0 - l_vap_sun * e_0
-    b1 = sw_abs_sh + r_lw_1 - h_1 - l_vap_sh * e_1
+    c_s0 = c_sun_dt if c_sun_dt is not None else torch.zeros_like(t_sun_cur)
+    c_s1 = c_sh_dt if c_sh_dt is not None else torch.zeros_like(t_sh_cur)
+    ts0_ref = t_sun_t0 if t_sun_t0 is not None else t_sun_cur
+    ts1_ref = t_sh_t0 if t_sh_t0 is not None else t_sh_cur
+    b0 = sw_abs_sun + r_lw_0 - h_0 - l_vap_sun * e_0 - c_s0 * (t_sun_cur - ts0_ref)
+    b1 = sw_abs_sh + r_lw_1 - h_1 - l_vap_sh * e_1 - c_s1 * (t_sh_cur - ts1_ref)
     b2 = sw_abs_gnd + r_lw_2 - h_2 - l_vap_gnd * e_2 - g0_down
 
     k_lw_0 = 4.0 * dc_sun * sig
     k_lw_1 = 4.0 * dc_sh * sig
     lw_g_3 = 4.0 * eps_g * sig * t2_3
 
-    j00 = rho_cp * gh_0 * (1.0 - wh_0) + l_vap_sun * rho_sfc * gw_0 * dq_sun * (1.0 - ww_0) + k_lw_0 * lw_emit_c_coef * t0_3
+    j00 = rho_cp * gh_0 * (1.0 - wh_0) + l_vap_sun * rho_sfc * gw_0 * dq_sun * (1.0 - ww_0) + k_lw_0 * lw_emit_c_coef * t0_3 + c_s0
     j01 = -rho_cp * gh_0 * wh_1 - l_vap_sun * rho_sfc * gw_0 * ww_1 * dq_sh
     j02 = -rho_cp * gh_0 * wh_2 - l_vap_sun * rho_sfc * gw_0 * ww_2 * dhq_gnd_dT - dc_sun * lw_g_3
 
     j10 = -rho_cp * gh_1 * wh_0 - l_vap_sh * rho_sfc * gw_1 * ww_0 * dq_sun
-    j11 = rho_cp * gh_1 * (1.0 - wh_1) + l_vap_sh * rho_sfc * gw_1 * dq_sh * (1.0 - ww_1) + k_lw_1 * lw_emit_c_coef * t1_3
+    j11 = rho_cp * gh_1 * (1.0 - wh_1) + l_vap_sh * rho_sfc * gw_1 * dq_sh * (1.0 - ww_1) + k_lw_1 * lw_emit_c_coef * t1_3 + c_s1
     j12 = -rho_cp * gh_1 * wh_2 - l_vap_sh * rho_sfc * gw_1 * ww_2 * dhq_gnd_dT - dc_sh * lw_g_3
 
     dh2_dt2 = torch.where(has_veg, rho_cp * gh_2 * (1.0 - wh_2), rho_cp * ga_land)
@@ -1368,6 +1376,10 @@ def _land_post_newton_core(
     precip_rain: torch.Tensor,
     precip_snow: torch.Tensor,
     dt: float,
+    t_sun_t0: torch.Tensor | None = None,
+    t_sh_t0: torch.Tensor | None = None,
+    c_sun_dt: torch.Tensor | None = None,
+    c_sh_dt: torch.Tensor | None = None,
 ):
     """Pure-tensor post-Newton land fluxes, canopy water, and snowpack update (CUDA-compilable)."""
     eps_g = EMISSIVITY_LAND
@@ -1435,7 +1447,15 @@ def _land_post_newton_core(
     )
     lw_up_l = ((1.0 - f_veg_rad) ** 2) * (1.0 - eps_g) * lw_down + lw_emit_tot_l
     t_skin_final = torch.pow(torch.clamp(lw_emit_tot_l / (eps_g * sig), min=1.0e4), 0.25)
-    g_into_soil = sw_abs + lw_down - lw_up_l - shf_l - lhf_l - q_melt_avail
+    if c_sun_dt is not None and c_sh_dt is not None and t_sun_t0 is not None and t_sh_t0 is not None:
+        s_can = torch.where(
+            has_veg,
+            c_sun_dt * (t_sun_final - t_sun_t0) + c_sh_dt * (t_sh_final - t_sh_t0),
+            torch.zeros_like(t_sun_final),
+        )
+    else:
+        s_can = torch.zeros_like(t_sun_final)
+    g_into_soil = sw_abs + lw_down - lw_up_l - shf_l - lhf_l - q_melt_avail - s_can
 
     f_int = torch.clamp(ALPHA_INTERCEPT_LIQ * torch.tanh(lai_exp), 0.0, 1.0)
     wc_mid = w_canopy + dt * (f_int * precip_rain - e_inter - dew_leaf_neg)
@@ -2084,6 +2104,12 @@ def _step_surface_compacted_impl(
     t_gnd_cur = torch.where(has_veg_t, t_gnd_t0, t_can_t)
     t_sun_cur = t_sun_t0
     t_sh_cur = t_sh_t0
+    # Emergent biomass + canopy-airspace thermal inertia C_can(LAI, h_c) [J m^-2 K^-1]
+    # (AOBA Formulation Eq. 7.35; Swenson et al., 2019; Bonan, 2019)
+    c_can_tot_t = torch.where(has_veg_t, 4200.0 * lai_exp_t + 5500.0 * h_exp_t, torch.zeros_like(lai_exp_t))
+    inv_dt_s = 1.0 / max(float(dt), 1.0)
+    c_sun_dt_t = torch.where(has_sun_t, f_sun_area_t * c_can_tot_t * inv_dt_s, torch.zeros_like(c_can_tot_t))
+    c_sh_dt_t = torch.where(has_sh_t, f_sh_area_t * c_can_tot_t * inv_dt_s, torch.zeros_like(c_can_tot_t))
 
     n_eb_iter = max(int(LAND_EB_ITERATIONS), 1)
     prev_dt_sun = torch.zeros_like(t_sun_cur)
@@ -2105,6 +2131,7 @@ def _step_surface_compacted_impl(
             f_wet_t, w_can_t, rho_sfc_t, cp_air_t, f_veg_rad_t, f_sun_area_t,
             f_sh_area_t, lw_refl_c_t, lw_emit_c_coef_t, sw_abs_sun_t, sw_abs_sh_t,
             sw_abs_gnd_t, lwd_t, g_cond_coeff_t, flags_jac_f,
+            t_sun_t0, t_sh_t0, c_sun_dt_t, c_sh_dt_t,
         ], dim=0).contiguous()
         pb_out = torch.empty((13, n_terr_len), device=dev, dtype=dtype)
         jac_out = torch.empty((33, n_terr_len), device=dev, dtype=dtype)
@@ -2197,6 +2224,7 @@ def _step_surface_compacted_impl(
                 f_veg_rad_t, f_sun_area_t, f_sh_area_t, lw_refl_c_t, lw_emit_c_coef_t,
                 sw_abs_sun_t, sw_abs_sh_t, sw_abs_gnd_t, lwd_t, g_cond_coeff_t,
                 prev_dt_sun, prev_dt_sh, prev_dt_gnd, dt, (_eb_it > 0),
+                t_sun_t0, t_sh_t0, c_sun_dt_t, c_sh_dt_t,
             )
         prev_dt_sun, prev_dt_sh, prev_dt_gnd = dt0, dt1, dt2
         if _eb_it < n_eb_iter - 1:
@@ -2226,6 +2254,7 @@ def _step_surface_compacted_impl(
         f_veg_rad_t, f_sun_area_t, f_sh_area_t, lw_refl_c_t, sw_abs_t, lwd_t, lai_exp_t,
         wc_cap_t, w_can_t, w_avail_root_t, bio_t.s_root_cap, water_stress_t,
         swe_t, swe_max_t, snow_age_t, w_liq_t[0], t_soil0_t, pr_t, ps_t, dt,
+        t_sun_t0, t_sh_t0, c_sun_dt_t, c_sh_dt_t,
     )
 
     w_liq_hydro_t, sfc_runoff_t, sub_runoff_t = step_multilayer_soil_hydrology(
@@ -2484,9 +2513,15 @@ def step_surface(
 
     # Warm-start sunlit leaf, shaded leaf, and ground skin temperatures (backward-compatible with older restarts)
     t_gnd_cur = sfc.t_gnd_skin.clone() if sfc.t_gnd_skin is not None else t_soil0.clone()
-    t_sun_cur = sfc.t_leaf_sun.clone() if sfc.t_leaf_sun is not None else sfc.t_canopy.clone()
-    t_sh_cur = sfc.t_leaf_sh.clone() if sfc.t_leaf_sh is not None else sfc.t_canopy.clone()
+    t_sun_t0 = sfc.t_leaf_sun.clone() if sfc.t_leaf_sun is not None else sfc.t_canopy.clone()
+    t_sh_t0 = sfc.t_leaf_sh.clone() if sfc.t_leaf_sh is not None else sfc.t_canopy.clone()
+    t_sun_cur = t_sun_t0
+    t_sh_cur = t_sh_t0
     t_gnd_cur = torch.where(has_veg, t_gnd_cur, sfc.t_canopy)
+    c_can_tot = torch.where(has_veg, 4200.0 * lai_exp + 5500.0 * h_exp, torch.zeros_like(lai_exp))
+    inv_dt_s = 1.0 / max(float(dt), 1.0)
+    c_sun_dt = torch.where(has_sun, f_sun_area * c_can_tot * inv_dt_s, torch.zeros_like(c_can_tot))
+    c_sh_dt = torch.where(has_sh, f_sh_area * c_can_tot * inv_dt_s, torch.zeros_like(c_can_tot))
 
     # Coupled 3-source (sunlit leaf, shaded leaf, ground) + canopy-air + stomatal Newton iteration
     # (Dai et al., 2004, Sec. 2b-c; Bonan et al., 2018, Eqs. 8-13, 21-24; CLM5 Sec. 5.2-5.3)
@@ -2548,6 +2583,7 @@ def step_surface(
             f_veg_rad, f_sun_area, f_sh_area, lw_refl_c, lw_emit_c_coef,
             sw_abs_sun, sw_abs_sh, sw_abs_gnd, lw_down, g_cond_coeff,
             prev_dt_sun, prev_dt_sh, prev_dt_gnd, dt, (_eb_it > 0),
+            t_sun_t0, t_sh_t0, c_sun_dt, c_sh_dt,
         )
         prev_dt_sun, prev_dt_sh, prev_dt_gnd = dt0, dt1, dt2
 
@@ -2573,6 +2609,7 @@ def step_surface(
         wc_cap, sfc.w_canopy, w_avail_root, sfc.bio.s_root_cap, water_stress,
         sfc.swe_land, sfc.swe_max_season, sfc.snow_age, sfc.w_liq_soil[0],
         sfc.t_soil[0], precip_rain, precip_snow, dt,
+        t_sun_t0, t_sh_t0, c_sun_dt, c_sh_dt,
     )
 
     # Advance 5-layer implicit Richards soil hydrology with dynamic rooting depth z_root(S_R)

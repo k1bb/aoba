@@ -1141,13 +1141,16 @@ h_{\mathrm{soil}} &= \exp\!\left(\frac{\psi_0 g}{R_v T_{s,0}}\right), \qquad r_{
 \end{aligned} \tag{7.34}
 $$
 
-林冠下空力抵抗 $r_{d,\mathrm{uc}}$ および陽葉・陰葉境界層コンダクタンス $(g_{b,\mathrm{sun}}, g_{b,\mathrm{sh}})$ のもとで、陽葉温度 $T_{\mathrm{sun}}$・陰葉温度 $T_{\mathrm{sh}}$・地表面温度 $T_{\mathrm{gnd}}$ の 3 源エネルギー収支および林冠空気 $(T_{\mathrm{af}}, q_{\mathrm{af}})$・気孔コンダクタンスを $3\times 3$ 余因子ヤコビアン Newton 法（`LAND_EB_ITERATIONS = 3`）で連成解法する：
+林冠下空力抵抗 $r_{d,\mathrm{uc}}$ および陽葉・陰葉境界層コンダクタンス $(g_{b,\mathrm{sun}}, g_{b,\mathrm{sh}})$ のもとで、陽葉温度 $T_{\mathrm{sun}}$・陰葉温度 $T_{\mathrm{sh}}$・地表面温度 $T_{\mathrm{gnd}}$ の 3 源エネルギー収支および林冠空気 $(T_{\mathrm{af}}, q_{\mathrm{af}})$・気孔コンダクタンス・創発的な樹冠バイオマス＋樹冠内気層熱容量 $C_{\mathrm{can}}(L_{\mathrm{exp}}, h_{\mathrm{exp}})$（Swenson et al., 2019; Bonan, 2019）を $3\times 3$ 余因子ヤコビアン陰的 Newton 法（`LAND_EB_ITERATIONS = 3`）で連成解法する：
 
 $$
-R_{n,i} - H_i(T_i, T_{\mathrm{af}}) - \lambda_i E_i(T_i, q_{\mathrm{af}}) - \delta_{i,2} G_0(T_{\mathrm{gnd}}, T_{s,0}) = 0, \qquad i \in \{\mathrm{sun}, \mathrm{sh}, \mathrm{gnd}\} \tag{7.35}
+\begin{aligned}
+C_{\mathrm{can}} &= 4200\,L_{\mathrm{exp}} + 5500\,h_{\mathrm{exp}}, \qquad c_i = \frac{f_i\,C_{\mathrm{can}}}{\Delta t} \quad (i \in \{\mathrm{sun}, \mathrm{sh}\}), \quad c_{\mathrm{gnd}} = 0, \\
+R_{n,i} &- H_i(T_i, T_{\mathrm{af}}) - \lambda_i E_i(T_i, q_{\mathrm{af}}) - c_i(T_i - T_i^n) - \delta_{i,2} G_0(T_{\mathrm{gnd}}, T_{s,0}) = 0, \qquad i \in \{\mathrm{sun}, \mathrm{sh}, \mathrm{gnd}\}
+\end{aligned} \tag{7.35}
 $$
 
-積雪融解時は $T_{\mathrm{gnd}} \le 273.15\ \mathrm{K}$ にクランプして余剰熱を融雪潜熱へ振り分け、積雪水量が上限 $S_{\max} = 1000\ \mathrm{kg\ m^{-2}}$ を超えた分を氷河流出（calving）として分離するとともに気候的表面質量収支 $\mathrm{SMB}$ を記録する。
+樹冠貯熱項 $S_{\mathrm{can}} = c_{\mathrm{sun}}(T_{\mathrm{sun}}^{n+1} - T_{\mathrm{sun}}^n) + c_{\mathrm{sh}}(T_{\mathrm{sh}}^{n+1} - T_{\mathrm{sh}}^n)$ を正味地表面エネルギー残差から差し引いて地中熱フラックス $G_{\mathrm{soil}} = \mathrm{SW}_{\mathrm{abs}} + \mathrm{LW}_\downarrow - \mathrm{LW}_\uparrow - \mathrm{SHF} - \mathrm{LHF} - Q_{\mathrm{melt}} - S_{\mathrm{can}}$ を構成し、陸面–樹冠–土壌系の厳密エネルギー保存を保証する。積雪融解時は $T_{\mathrm{gnd}} \le 273.15\ \mathrm{K}$ にクランプして余剰熱を融雪潜熱へ振り分け、積雪水量が上限 $S_{\max} = 1000\ \mathrm{kg\ m^{-2}}$ を超えた分を氷河流出（calving）として分離するとともに気候的表面質量収支 $\mathrm{SMB}$ を記録する。
 
 **動的根系深さ・5 層陰的 Richards 土壌水文・エンタルピー保存凍土熱伝導**：鉛直 5 層（層厚 $0.05, 0.15, 0.40, 0.80, 1.60\ \mathrm{m}$, 総厚 $3.00\ \mathrm{m}$）の汎用ローム土壌（間隙率 $w_{\mathrm{sat}} = 0.43$, 飽和マトリックポテンシャル $\psi_s = -0.20\ \mathrm{m}$, Clapp–Hornberger 指数 $b = 5.39$, 飽和透水係数 $K_{\mathrm{sat}} = 7.0\times 10^{-6}\ \mathrm{m\ s^{-1}}$）において、最適根圏容量 $S_R$ から動的根系深さ $z_{\mathrm{root}}$、凍土透水阻害係数 $f_{\mathrm{ice}}$（Swenson et al., 2012; CLM5 Eq. 7.89）、および飽和/凍土不浸透地表流出率 $f_{\mathrm{sat}}$ を定める：
 
@@ -1504,7 +1507,17 @@ h_{\mathrm{corr}} &= \frac{\Delta H_{\mathrm{precip}} - c_{pd}\sum_k \Delta m_k 
 \end{aligned} \tag{8.15}
 $$
 
-放射代理モデルの各サブカラムは、夜側（$\mu_0 \le 0$）で短波フラックスが厳密に零となり、長波フラックスは地表 Planck 放射 $\sigma T_{\mathrm{sfc}}^4$ に解析的にスケールし、放射加熱率鉛直プロファイルは列フラックス発散保存則を厳密に満たす。学生セルの最下層サブグリッド偏差 $(\theta_{m,0}', q_{v,0}')$ および冷気プール突風 $(u_0', v_0')$ は、前ステップ偏差へ累積させることなく、周期 2D `SubgridSpatialHead` が予測する状態偏差からセル平均周りに厳密ゼロ平均保存で直接再構成する（`crm_student_tile_update_col`）。オンライン学習では、境界層重視の真気温・鉛直気温減率・1 ステップ変化量（$\Delta q_n, \Delta T$）・飽和比正規化水分（$\Delta q_n / q_{\mathrm{sat}}$）の Smooth-$L_1$ 損失に、一様射影零空間沿いの飽和ドリフトを抑止する温度・運動量ロジットのゲージ固定正則化を組み合わせる：
+放射代理モデルの各サブカラムは、夜側（$\mu_0 \le 0$）で短波フラックスが厳密に零となり、長波フラックスは地表 Planck 放射 $\sigma T_{\mathrm{sfc}}^4$ に解析的にスケールし、放射加熱率鉛直プロファイルは列フラックス発散保存則を厳密に満たす。教師・学生間の共変量シフトを生じさせずに数時間スケールの対流ライフサイクル履歴および日周期浮力位相遅れを表現するため（Mapes & Neale, 2011; Colin et al., 2019）、全教師・学生カラムで同一の厳密指数積分（$\alpha_\tau = -\operatorname{expm1}(-\Delta t/\tau)$、$\tau_{P,\mathrm{fast}} = 1.5\ \mathrm{h}$, $\tau_{P,\mathrm{slow}} = 4.0\ \mathrm{h}$, $\tau_B = 3.0\ \mathrm{h}$）により 3 つの予報スカラー記憶状態 $(M_{P,\mathrm{fast}}, M_{P,\mathrm{slow}}, M_{B,\mathrm{slow}})$ を更新し、4 つの無次元記憶特徴量 $\big(\ln(1 + M_{P,\mathrm{fast}}), \ln(1 + M_{P,\mathrm{slow}}), 200\,M_{B,\mathrm{slow}}, 200(B_{\mathrm{sfc}}^+ - M_{B,\mathrm{slow}})\big)$ を入力する：
+
+$$
+\begin{aligned}
+M_{P,\mathrm{fast}}^{n+1} &= M_{P,\mathrm{fast}}^n + \alpha_{1.5\mathrm{h}}\big(P_{\mathrm{mm/d}} - M_{P,\mathrm{fast}}^n\big), \qquad
+M_{P,\mathrm{slow}}^{n+1} = M_{P,\mathrm{slow}}^n + \alpha_{4\mathrm{h}}\big(P_{\mathrm{mm/d}} - M_{P,\mathrm{slow}}^n\big), \\
+M_{B,\mathrm{slow}}^{n+1} &= M_{B,\mathrm{slow}}^n + \alpha_{3\mathrm{h}}\big(\max(B_{\mathrm{sfc}}, 0) - M_{B,\mathrm{slow}}^n\big)
+\end{aligned} \tag{8.15b}
+$$
+
+学生セルの最下層サブグリッド偏差 $(\theta_{m,0}', q_{v,0}')$ および冷気プール突風 $(u_0', v_0')$ は、前ステップ偏差へ累積させることなく、周期 2D `SubgridSpatialHead` が予測する状態偏差からセル平均周りに厳密ゼロ平均保存で直接再構成する（`crm_student_tile_update_col`）。オンライン学習では、境界層重視の真気温・鉛直気温減率・1 ステップ変化量（$\Delta q_n, \Delta T$）・飽和比正規化水分（$\Delta q_n / q_{\mathrm{sat}}$）の Smooth-$L_1$ 損失に、一様射影零空間沿いの飽和ドリフトを抑止する温度・運動量ロジットのゲージ固定正則化を組み合わせる：
 
 $$
 \sum_{k=0}^{N_z-1} c_{p,\mathrm{moist},k}\,\Delta m_k\,Q_{\mathrm{rad},k} = (\mathrm{ASR} - \mathrm{OLR}) - (F_{\mathrm{SW,sfc}}^{\mathrm{net}} + F_{\mathrm{LW,sfc}}^{\mathrm{net}}) \tag{8.16}

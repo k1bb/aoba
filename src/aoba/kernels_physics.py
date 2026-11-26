@@ -5010,6 +5010,10 @@ kernel void surface_land_newton_jac_col(
     float lw_down        = jac_const[18u * N + i];
     float g_cond_coeff   = jac_const[19u * N + i];
     uint flags           = uint(jac_const[20u * N + i] + 0.5f);
+    float t_sun_t0       = jac_const[21u * N + i];
+    float t_sh_t0        = jac_const[22u * N + i];
+    float c_sun_dt       = jac_const[23u * N + i];
+    float c_sh_dt        = jac_const[24u * N + i];
     bool has_veg  = (flags & 1u) != 0u;
     bool has_sun  = (flags & 2u) != 0u;
     bool has_sh   = (flags & 4u) != 0u;
@@ -5097,20 +5101,20 @@ kernel void surface_land_newton_jac_col(
     float e_2 = max(rho_sfc * gw_2 * (h_gnd * qsat_gnd - q_af), -rho_sfc * ga_land * qv_1);
 
     float g0_down = g_cond_coeff * (t_gnd - t_soil0);
-    float b0 = sw_abs_sun + r_lw_0 - h_0 - l_vap_sun * e_0;
-    float b1 = sw_abs_sh  + r_lw_1 - h_1 - l_vap_sh  * e_1;
+    float b0 = sw_abs_sun + r_lw_0 - h_0 - l_vap_sun * e_0 - c_sun_dt * (t_sun - t_sun_t0);
+    float b1 = sw_abs_sh  + r_lw_1 - h_1 - l_vap_sh  * e_1 - c_sh_dt  * (t_sh  - t_sh_t0);
     float b2 = sw_abs_gnd + r_lw_2 - h_2 - l_vap_gnd * e_2 - g0_down;
 
     float k_lw_0 = 4.0f * dc_sun * sig;
     float k_lw_1 = 4.0f * dc_sh  * sig;
     float lw_g_3 = 4.0f * eps_g * sig * t2_3;
 
-    float j00 = rho_cp * gh_0 * (1.0f - wh_0) + l_vap_sun * rho_sfc * gw_0 * dq_sun * (1.0f - ww_0) + k_lw_0 * lw_emit_c_coef * t0_3;
+    float j00 = rho_cp * gh_0 * (1.0f - wh_0) + l_vap_sun * rho_sfc * gw_0 * dq_sun * (1.0f - ww_0) + k_lw_0 * lw_emit_c_coef * t0_3 + c_sun_dt;
     float j01 = -rho_cp * gh_0 * wh_1 - l_vap_sun * rho_sfc * gw_0 * ww_1 * dq_sh;
     float j02 = -rho_cp * gh_0 * wh_2 - l_vap_sun * rho_sfc * gw_0 * ww_2 * dhq_gnd_dT - dc_sun * lw_g_3;
 
     float j10 = -rho_cp * gh_1 * wh_0 - l_vap_sh * rho_sfc * gw_1 * ww_0 * dq_sun;
-    float j11 = rho_cp * gh_1 * (1.0f - wh_1) + l_vap_sh * rho_sfc * gw_1 * dq_sh * (1.0f - ww_1) + k_lw_1 * lw_emit_c_coef * t1_3;
+    float j11 = rho_cp * gh_1 * (1.0f - wh_1) + l_vap_sh * rho_sfc * gw_1 * dq_sh * (1.0f - ww_1) + k_lw_1 * lw_emit_c_coef * t1_3 + c_sh_dt;
     float j12 = -rho_cp * gh_1 * wh_2 - l_vap_sh * rho_sfc * gw_1 * ww_2 * dhq_gnd_dT - dc_sh * lw_g_3;
 
     float dh2_dt2 = has_veg ? (rho_cp * gh_2 * (1.0f - wh_2)) : (rho_cp * ga_land);
@@ -5474,11 +5478,8 @@ kernel void crm_distill_extract_col(
 
     uint st_src = c * 16u;
     uint st_dst = s_off + 7u;
-    for (uint j = 0u; j < 12u; ++j) {
+    for (uint j = 0u; j < 16u; ++j) {
         x_out[st_dst + j] = struct_m[st_src + j];
-    }
-    for (uint j = 12u; j < 16u; ++j) {
-        x_out[st_dst + j] = 0.0f;
     }
 }
 
