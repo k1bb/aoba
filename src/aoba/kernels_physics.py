@@ -7133,6 +7133,7 @@ kernel void crm_ens_mean_unc_transpose(
     threadgroup float* wm = sm_m + w * (32u * 33u);
 
     if (l < b_rows) sm_u[w * 32u + l] = 0.0f;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
     uint col_g = col_off + b_base + l;
     bool col_ok = (l < b_rows);
 

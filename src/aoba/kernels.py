@@ -1703,7 +1703,7 @@ def dispatch_scvt_weighted_edge_sum_metal(
     if up is None:
         up = torch.tensor([nz, nc, ne], device=edge_field.device, dtype=torch.uint32)
         _WEIGHTED_EDGE_SUM_UP_CACHE[up_key] = up
-    lib.scvt_div_cell(mc["eoc"], weights_cell.contiguous(), edge_field.contiguous(), out, up, threads=nc)
+    lib.scvt_div_cell(mc["eoc"], weights_cell.contiguous(), edge_field.contiguous(), out, up, threads=nz * nc)
     return out
 
 
