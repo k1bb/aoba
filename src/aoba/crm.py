@@ -693,6 +693,7 @@ def step_crm_rk3_hevi(
     update_theta_m: bool = True,
     thm_out: list[torch.Tensor] | None = None,
     clone_out: bool = True,
+    n_sub_grp: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Advance `(rho_d, u, v, w, theta_m)` over one Split-Explicit RK3-HEVI step `dt_dyn` [s].
 
@@ -757,6 +758,7 @@ def step_crm_rk3_hevi(
             dz_c, dz_w_int, sponge_c, sponge_w, None,
             q_n=crm.q_n, q_p=crm.q_p,
             clone_out=clone_out,
+            n_sub_grp=n_sub_grp,
         )
         crm.rho_d = rho_s
         crm.u = u_s
@@ -1218,8 +1220,18 @@ def _step_crm_physics_and_dynamics_impl(
         no_clone_pp = use_metal_crm
         while s_idx < n_sub:
             k_cnt = min(adv_group, n_sub - s_idx)
-            rho_start = crm.rho_d if (k_cnt == 1 and no_clone_pp) else crm.rho_d.clone()
-            if k_cnt == 1:
+            can_fuse_sub = (
+                k_cnt > 1
+                and no_clone_pp
+                and crm.rho_d.device.type == "mps"
+                and ny == 1
+                and 1 < nx <= 32
+                and nz <= 64
+                and (32 % nx == 0)
+                and ((s_idx // sgs_stride) == ((s_idx + k_cnt - 1) // sgs_stride))
+            )
+            rho_start = crm.rho_d if ((k_cnt == 1 or can_fuse_sub) and no_clone_pp) else crm.rho_d.clone()
+            if k_cnt == 1 or can_fuse_sub:
                 if sgs_cached is None or (s_idx % sgs_stride == 0):
                     thm_sgs = crm.theta_m if s_idx == 0 else (Thm_cur / torch.clamp(crm.rho_d, min=1.0e-5))
                     sgs_cached = _compute_3d_sgs_tendencies(
@@ -1230,6 +1242,7 @@ def _step_crm_physics_and_dynamics_impl(
                     crm, vgrid, dt_sub, z_c_col=z_c_col, dz_c_col=dz_c_col,
                     Thm_in=Thm_cur, sgs_in=sgs_cached, update_theta_m=False, thm_out=thm_box,
                     clone_out=not no_clone_pp,
+                    n_sub_grp=k_cnt if can_fuse_sub else 1,
                 )
                 Thm_cur = thm_box[0]
             else:

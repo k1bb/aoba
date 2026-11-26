@@ -1361,55 +1361,6 @@ kernel void crm_microphysics_2m_col(
 // 8. Global SCVT Fast Acoustic-HEVI Sub-Step Kernels
 // =========================================================================
 
-kernel void scvt_hevi_factor_pack(
-    device const float* rho_dw_in  [[buffer(0)]],   // [nz-1, N_cells]
-    device const float* rtot_w_in  [[buffer(1)]],   // [nz-1, N_cells]
-    device const float* thm_w_in   [[buffer(2)]],   // [nz-1, N_cells]
-    device const float* dl_in      [[buffer(3)]],   // [nz-1, N_cells]
-    device const float* diag_in    [[buffer(4)]],   // [nz-1, N_cells]
-    device const float* du_in      [[buffer(5)]],   // [nz-1, N_cells]
-    device const float* pres_s     [[buffer(6)]],   // [nz, N_cells]
-    device const float* dp_dThm_s  [[buffer(7)]],   // [nz, N_cells]
-    device const float* Thm_ref    [[buffer(8)]],   // [nz, N_cells]
-    device const float* Thm0       [[buffer(9)]],   // [nz, N_cells]
-    device float* hevi_out         [[buffer(10)]],  // [6, nz-1, N_cells]: rho_dw, rtot_w, thm_w, dl, inv_piv, cp
-    device float* p_cell_out       [[buffer(11)]],  // [nz, N_cells]
-    constant ulong4& u_p           [[buffer(12)]],  // [nz, N_cells, 0, 0]
-    uint c [[thread_position_in_grid]])
-{
-    uint nz = uint(u_p.x);
-    uint n_cells = uint(u_p.y);
-    if (c >= n_cells || nz < 2u) return;
-
-    uint n_int = nz - 1u;
-    uint int_stride = n_int * n_cells;
-    device float* o_rdw = hevi_out;
-    device float* o_rtw = hevi_out + int_stride;
-    device float* o_thw = hevi_out + 2u * int_stride;
-    device float* o_dl  = hevi_out + 3u * int_stride;
-    device float* o_inv = hevi_out + 4u * int_stride;
-    device float* o_cp  = hevi_out + 5u * int_stride;
-
-    float cp_prev = 0.0f;
-    for (uint m = 0u; m < n_int; ++m) {
-        uint midx = m * n_cells + c;
-        o_rdw[midx] = rho_dw_in[midx];
-        o_rtw[midx] = rtot_w_in[midx];
-        o_thw[midx] = thm_w_in[midx];
-        float dlm = dl_in[midx];
-        float diag_m = diag_in[midx];
-        o_dl[midx] = dlm;
-        float inv = (m == 0u) ? (1.0f / diag_m) : (1.0f / (diag_m - dlm * cp_prev));
-        float cpm = (m + 1u < n_int) ? (du_in[midx] * inv) : 0.0f;
-        o_inv[midx] = inv;
-        o_cp[midx] = cpm;
-        cp_prev = cpm;
-        p_cell_out[midx] = pres_s[midx] + dp_dThm_s[midx] * (Thm0[midx] - Thm_ref[midx]);
-    }
-    uint top_idx = n_int * n_cells + c;
-    p_cell_out[top_idx] = pres_s[top_idx] + dp_dThm_s[top_idx] * (Thm0[top_idx] - Thm_ref[top_idx]);
-}
-
 kernel void scvt_slope_top_cell(
     device const int* eoc          [[buffer(0)]],   // [N_cells, 6]
     device const float* esign      [[buffer(1)]],   // [N_cells, 6]
@@ -1448,21 +1399,16 @@ kernel void scvt_slope_top_cell(
 kernel void scvt_fast_edge(
     device const int* c0_arr       [[buffer(0)]],   // [N_edges]
     device const int* c1_arr       [[buffer(1)]],   // [N_edges]
-    device const float* dc_e       [[buffer(2)]],   // [N_edges]
-    device const float* rtot_e     [[buffer(3)]],   // [nz, N_edges]
-    device const float* fac_z0     [[buffer(4)]],   // [nz, N_edges]
-    device const float* fac_z1     [[buffer(5)]],   // [nz, N_edges]
-    device const float* m_edge     [[buffer(6)]],   // [nz, N_edges]
-    device const float* thm_e      [[buffer(7)]],   // [nz, N_edges]
-    device const float* tend_u_sl  [[buffer(8)]],   // [nz, N_edges]
-    device const float* sponge_c   [[buffer(9)]],   // [nz]
-    device const float* p_cell     [[buffer(10)]],  // [nz, N_cells]
-    device const float* u_c        [[buffer(11)]],  // [nz, N_edges]
-    device float* u_n              [[buffer(12)]],  // [nz, N_edges]
-    device float* uh_fTh           [[buffer(13)]],  // [nz, N_edges, 2] interleaved (uh, fTh)
-    device float* uh_accum         [[buffer(14)]],  // [nz, N_edges]
-    constant ulong4& u_p           [[buffer(15)]],  // [nz, N_cells, N_edges, accum]
-    constant float4& f_p           [[buffer(16)]],  // [dt_ac, beta_hevi, gravity, 0]
+    device const float4* edge_c4   [[buffer(2)]],   // [nz, N_edges]: (fz0/(rtot*dc), fz1/(rtot*dc), m_edge, thm_e)
+    device const float* tend_u_sl  [[buffer(3)]],   // [nz, N_edges]
+    device const float* sponge_c   [[buffer(4)]],   // [nz]
+    device const float* p_cell     [[buffer(5)]],   // [nz, N_cells]
+    device const float* u_c        [[buffer(6)]],   // [nz, N_edges]
+    device float* u_n              [[buffer(7)]],   // [nz, N_edges]
+    device float* uh_fTh           [[buffer(8)]],   // [nz, N_edges, 2] interleaved (uh, fTh)
+    device float* uh_accum         [[buffer(9)]],   // [nz, N_edges]
+    constant ulong4& u_p           [[buffer(10)]],  // [nz, N_cells, N_edges, accum]
+    constant float4& f_p           [[buffer(11)]],  // [dt_ac, beta_hevi, gravity, 0]
     uint gid [[thread_position_in_grid]])
 {
     uint nz = uint(u_p.x);
@@ -1478,17 +1424,18 @@ kernel void scvt_fast_edge(
     uint cbase = k * n_cells;
     float p0 = p_cell[cbase + c0];
     float p1 = p_cell[cbase + c1];
-    float pgf = -(p1 * fac_z1[gid] - p0 * fac_z0[gid]) / (rtot_e[gid] * dc_e[e]);
+    float4 ec = edge_c4[gid];
+    float pgf = -(p1 * ec.y - p0 * ec.x);
 
     float u0 = u_c[gid];
     float dt_ac = f_p.x;
     float un = (u0 + dt_ac * (tend_u_sl[gid] + pgf)) / (1.0f + dt_ac * sponge_c[k]);
-    float uh = m_edge[gid] * (1.10f * un - 0.10f * u0);
+    float uh = ec.z * (1.10f * un - 0.10f * u0);
 
     u_n[gid] = un;
     uint p2 = gid * 2u;
     uh_fTh[p2] = uh;
-    uh_fTh[p2 + 1u] = uh * thm_e[gid];
+    uh_fTh[p2 + 1u] = uh * ec.w;
     if (accum != 0u) {
         uh_accum[gid] += uh;
     }
@@ -1511,36 +1458,37 @@ kernel void scvt_fast_cell_hevi(
     device const float* dp_dThm_s  [[buffer(13)]],  // [nz, N_cells]
     device const float* Thm_ref    [[buffer(14)]],  // [nz, N_cells]
     device const float* tend_Thm   [[buffer(15)]],  // [nz, N_cells]
-    device const float* dz_c       [[buffer(16)]],  // [nz, N_cells]
-    device const float* dz_w_int   [[buffer(17)]],  // [nz-1, N_cells]
-    device const float* q_load     [[buffer(18)]],  // [nz, N_cells]
-    device const float* hevi_c     [[buffer(19)]],  // [6, nz-1, N_cells]: rho_dw, rtot_w, thm_w, dl, inv_piv, cp
-    device const float* sponge_w   [[buffer(20)]],  // [nz-1]
-    device const float* k_slope_top [[buffer(21)]], // [N_cells]
-    device float* m_n              [[buffer(22)]],  // [nz, N_cells]
-    device float* Thm_n            [[buffer(23)]],  // [nz, N_cells]
-    device float* w_n              [[buffer(24)]],  // [nz+1, N_cells]
-    device float* udotz_n          [[buffer(25)]],  // [nz-1, N_cells]
-    device float* om_accum         [[buffer(26)]],  // [nz+1, N_cells]
-    device float* p_cell_n         [[buffer(27)]],  // [nz, N_cells]
-    constant ulong4& u_p           [[buffer(28)]],  // [nz, N_cells, N_edges, accum]
-    constant float4& f_p           [[buffer(29)]],  // [dt_ac, beta_hevi, gravity, 0]
+    device const float* q_odz      [[buffer(16)]],  // [nz, N_cells]: q_load / dz_c
+    device const float* hevi_c     [[buffer(17)]],  // [7, nz-1, N_cells]: rdw, rdw/rtw, thw, dl, inv_piv, cp, 1/dz_w
+    device const float* sponge_w   [[buffer(18)]],  // [nz-1]
+    device const float* k_slope_top [[buffer(19)]], // [N_cells]
+    device float* m_n              [[buffer(20)]],  // [nz, N_cells]
+    device float* Thm_n            [[buffer(21)]],  // [nz, N_cells]
+    device float* w_n              [[buffer(22)]],  // [nz+1, N_cells]
+    device float* udotz_n          [[buffer(23)]],  // [nz-1, N_cells]
+    device float* om_accum         [[buffer(24)]],  // [nz+1, N_cells]
+    device float* p_cell_n         [[buffer(25)]],  // [nz, N_cells]
+    constant ulong4& u_p           [[buffer(26)]],  // [nz, N_cells, N_edges, (write_p<<1)|accum]
+    constant float4& f_p           [[buffer(27)]],  // [dt_ac, beta_hevi, gravity, 0]
     uint c [[thread_position_in_grid]])
 {
     uint nz = uint(u_p.x);
     uint n_cells = uint(u_p.y);
     uint n_edges = uint(u_p.z);
-    uint accum = uint(u_p.w);
+    uint flags = uint(u_p.w);
+    uint accum = flags & 1u;
+    bool write_p = ((flags >> 1u) != 0u);
     if (c >= n_cells) return;
 
     uint n_int = nz - 1u;
     uint int_stride = n_int * n_cells;
-    device const float* rho_dw  = hevi_c;
-    device const float* rtot_w  = hevi_c + int_stride;
-    device const float* thm_w   = hevi_c + 2u * int_stride;
-    device const float* dl      = hevi_c + 3u * int_stride;
-    device const float* inv_piv = hevi_c + 4u * int_stride;
-    device const float* cp      = hevi_c + 5u * int_stride;
+    device const float* h_rdw = hevi_c;
+    device const float* h_rr  = hevi_c + int_stride;
+    device const float* h_thw = hevi_c + 2u * int_stride;
+    device const float* h_dl  = hevi_c + 3u * int_stride;
+    device const float* h_inv = hevi_c + 4u * int_stride;
+    device const float* h_cp  = hevi_c + 5u * int_stride;
+    device const float* h_idw = hevi_c + 6u * int_stride;
 
     float dt_ac = f_p.x;
     float beta = f_p.y;
@@ -1573,7 +1521,6 @@ kernel void scvt_fast_cell_hevi(
     float uz_next_dn = 0.0f;
     float uz_old_dn = 0.0f;
     float rdw_dn = 0.0f;
-    float rtw_dn = 1.0f;
     float p_blend_prev = 0.0f;
     float rtot_blend_prev = 0.0f;
     float d_prev = 0.0f;
@@ -1588,7 +1535,6 @@ kernel void scvt_fast_cell_hevi(
         float uz_next_up = 0.0f;
         float uz_old_up = 0.0f;
         float rdw_up = 0.0f;
-        float rtw_up = 1.0f;
         if (k < n_int) {
             if (k < k_top) {
                 float uz_sum = 0.0f;
@@ -1606,8 +1552,7 @@ kernel void scvt_fast_cell_hevi(
             } else {
                 udotz_n[cidx] = 0.0f;
             }
-            rdw_up = rho_dw[cidx];
-            rtw_up = rtot_w[cidx];
+            rdw_up = h_rdw[cidx];
             om_up = rdw_up * (w_c[(k + 1u) * n_cells + c] - uz_old_up);
             if (k >= 1u && k + 2u < nz) {
                 float sgn = (om_up > 0.0f) ? 1.0f : ((om_up < 0.0f) ? -1.0f : 0.0f);
@@ -1636,24 +1581,19 @@ kernel void scvt_fast_cell_hevi(
         m_n[cidx] = md;
         Thm_n[cidx] = Td;
 
-        float ps = pres_s[cidx];
-        float dpT = dp_dThm_s[cidx];
-        float Tr = Thm_ref[cidx];
-        float pk = ps + dpT * (Thmk - Tr);
-        float pd = ps + dpT * (Td - Tr);
-        float p_blend_k = (1.0f - beta) * pk + beta * pd;
-        float rtot_blend_k = ((1.0f - beta) * mk + beta * md) * (q_load[cidx] / dz_c[cidx]);
+        float tr_k = Thm_ref[cidx];
+        float p_blend_k = fma(dp_dThm_s[cidx], (1.0f - beta) * (Thmk - tr_k) + beta * (Td - tr_k), pres_s[cidx]);
+        float rtot_blend_k = ((1.0f - beta) * mk + beta * md) * q_odz[cidx];
 
         if (k >= 1u) {
             uint m = k - 1u;
             uint midx = m * n_cells + c;
             float rtot_bw = 0.5f * (rtot_blend_prev + rtot_blend_k);
-            float nh_imbal = (p_blend_k - p_blend_prev) / dz_w_int[midx] + rtot_bw * gravity;
+            float nh_imbal = (p_blend_k - p_blend_prev) * h_idw[midx] + rtot_bw * gravity;
             float fz_phys_k = rdw_dn * w_c[cidx];
             float rhs = -rdw_dn * (uz_next_dn - uz_old_dn)
-                        + dt_ac * (-(rdw_dn / rtw_dn) * nh_imbal - sponge_w[m] * fz_phys_k);
-            float inv = inv_piv[midx];
-            d_prev = (m == 0u) ? (rhs * inv) : ((rhs - dl[midx] * d_prev) * inv);
+                        + dt_ac * (-h_rr[midx] * nh_imbal - sponge_w[m] * fz_phys_k);
+            d_prev = (m == 0u) ? (rhs * h_inv[midx]) : ((rhs - h_dl[midx] * d_prev) * h_inv[midx]);
             dp[m] = d_prev;
         }
 
@@ -1662,7 +1602,6 @@ kernel void scvt_fast_cell_hevi(
         uz_next_dn = uz_next_up;
         uz_old_dn = uz_old_up;
         rdw_dn = rdw_up;
-        rtw_dn = rtw_up;
         p_blend_prev = p_blend_k;
         rtot_blend_prev = rtot_blend_k;
 
@@ -1675,7 +1614,7 @@ kernel void scvt_fast_cell_hevi(
         }
     }
 
-    // Pass 2 (backward k = nz-1..0): fused Thomas back-substitution + w/m/Thm update
+    // Pass 2 (backward k = nz-1..0): fused Thomas back-substitution + w/m/Thm update (100% SoA coalesced)
     w_n[c] = 0.0f;
     w_n[nz * n_cells + c] = 0.0f;
     float dom_up = 0.0f;
@@ -1690,9 +1629,9 @@ kernel void scvt_fast_cell_hevi(
         if (k > 0u) {
             uint m = k - 1u;
             uint midx = m * n_cells + c;
-            dom_dn = dp[m] - cp[midx] * dom_up;
-            thw_dn = thm_w[midx];
-            float rdw = rho_dw[midx];
+            dom_dn = dp[m] - h_cp[midx] * dom_up;
+            thw_dn = h_thw[midx];
+            float rdw = h_rdw[midx];
             float uz_old = (m < k_top) ? udotz_c[midx] : 0.0f;
             float uz_nxt = (m < k_top) ? udotz_n[midx] : 0.0f;
             float om_old_m = rdw * (w_c[cidx] - uz_old);
@@ -1705,7 +1644,9 @@ kernel void scvt_fast_cell_hevi(
         m_n[cidx]   = max(m_n[cidx] - b_dt * (dom_up - dom_dn), 1.0e-3f);
         float T_fin = Thm_n[cidx] - b_dt * (thw_up * dom_up - thw_dn * dom_dn);
         Thm_n[cidx] = T_fin;
-        p_cell_n[cidx] = pres_s[cidx] + dp_dThm_s[cidx] * (T_fin - Thm_ref[cidx]);
+        if (write_p) {
+            p_cell_n[cidx] = fma(dp_dThm_s[cidx], T_fin - Thm_ref[cidx], pres_s[cidx]);
+        }
         dom_up = dom_dn;
         thw_up = thw_dn;
     }
@@ -3187,8 +3128,9 @@ kernel void crm_2d_fast_hevi_simd(
 }
 
 // Fused single-launch 3-stage 2D RK3-HEVI (`nz <= 64`, `nx <= 32`, `32 % nx == 0`, 26 buffers).
-// Executes all 3 WS-RK3 stages in ONE kernel launch with ONLY `d_star[64]` (256 B) private stack
-// (eliminating 8x[64] register spills!) while reusing L2-hot block-contiguous `stage_buf[tg_id, k, 0..3, lid]`.
+// Full-occupancy single-launch multi-substep 3-stage WS-RK3 + HEVI kernel:
+// Uses `d_star[64]` (256 B) only, direct 3-bank ping-pong (zero copy), 1-float4 Backward stage read,
+// and precomputed `inv_dz_c`/`inv_dz_w` (zero divisions inside the inner acoustic loop).
 kernel void crm_2d_rk3_stage_fused_simd(
     device const float* rho0       [[buffer(0)]],
     device const float* Thm0       [[buffer(1)]],
@@ -3200,22 +3142,27 @@ kernel void crm_2d_rk3_stage_fused_simd(
     device float* u_s              [[buffer(7)]],
     device float* v_s              [[buffer(8)]],
     device float* w_s              [[buffer(9)]],
-    device const float* q_n_in     [[buffer(10)]],
-    device const float* q_p_in     [[buffer(11)]],
-    device const float* du_sgs     [[buffer(12)]],
-    device const float* dv_sgs     [[buffer(13)]],
-    device const float* dw_sgs     [[buffer(14)]],
-    device const float* tend_Thm   [[buffer(15)]],
-    device const float* dz_c       [[buffer(16)]],
-    device const float* dz_w_int   [[buffer(17)]],
-    device const float* sponge_c   [[buffer(18)]],
-    device const float* sponge_w   [[buffer(19)]],
-    device float4* stage_buf       [[buffer(20)]],  // [n_tg, nz, 4, 64] block-contiguous
-    device float* fx_acc           [[buffer(21)]],
-    device float* fz_acc           [[buffer(22)]],
-    constant ulong4& u_p0          [[buffer(23)]],  // [nz, n_col, nx, (dz_cols<<18)|(n_ac0<<12)|(n_ac1<<6)|n_ac2]
-    constant float4& f_p0          [[buffer(24)]],  // [p_ref, r_d, gamma_d, dx]
-    constant float4& f_p1          [[buffer(25)]],  // [dt_dyn, beta_hevi, gravity, 0]
+    device float* rho_b2           [[buffer(10)]],
+    device float* Thm_b2           [[buffer(11)]],
+    device float* u_b2             [[buffer(12)]],
+    device float* v_b2             [[buffer(13)]],
+    device float* w_b2             [[buffer(14)]],
+    device const float* q_n_in     [[buffer(15)]],
+    device const float* q_p_in     [[buffer(16)]],
+    device const float* du_sgs     [[buffer(17)]],
+    device const float* dv_sgs     [[buffer(18)]],
+    device const float* dw_sgs     [[buffer(19)]],
+    device const float* tend_Thm   [[buffer(20)]],
+    device const float* inv_dz_c   [[buffer(21)]],
+    device const float* inv_dz_w   [[buffer(22)]],
+    device const float* sponge_c   [[buffer(23)]],
+    device const float* sponge_w   [[buffer(24)]],
+    device float4* stage_buf       [[buffer(25)]],  // [n_tg, nz, 4, 64] block-contiguous
+    device float* fx_acc           [[buffer(26)]],
+    device float* fz_acc           [[buffer(27)]],
+    constant ulong4& u_p0          [[buffer(28)]],  // [nz, n_col, nx, (dz_cols<<18)|(n_ac0<<12)|(n_ac1<<6)|n_ac2]
+    constant float4& f_p0          [[buffer(29)]],  // [p_ref, r_d, gamma_d, dx]
+    constant float4& f_p1          [[buffer(30)]],  // [dt_dyn, beta_hevi, gravity, n_sub_grp_f]
     uint gid                       [[thread_position_in_grid]],
     uint lid                       [[thread_position_in_threadgroup]],
     uint tg_id                     [[threadgroup_position_in_grid]],
@@ -3226,6 +3173,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
     uint nx = uint(u_p0.z);
     uint pk = uint(u_p0.w);
     uint dz_cols = pk >> 18u;
+    uint n_sub_grp = uint(f_p1.w + 0.5f);
 
     uint col = gid / nx;
     uint ix = gid - col * nx;
@@ -3251,351 +3199,381 @@ kernel void crm_2d_rk3_stage_fused_simd(
     float gravity = f_p1.z;
     float inv_nx  = 1.0f / float(nx);
     float inv_pref_rd = r_d / p_ref;
+    uint n_ac2 = pk & 0x3Fu;
+    float inv_nac_tot = 1.0f / float(n_ac2 * n_sub_grp);
 
     device float4* sb = stage_buf + (ulong(tg_id) * ulong(nz) * 256ul) + ulong(lid);
     float d_star[64];
 
-    for (uint stg = 0u; stg < 3u; ++stg) {
-        uint n_ac = (stg == 0u) ? ((pk >> 12u) & 0x3Fu) : ((stg == 1u) ? ((pk >> 6u) & 0x3Fu) : (pk & 0x3Fu));
-        float dtau_2d = (stg == 0u) ? (dt_dyn * (1.0f / 3.0f)) : ((stg == 1u) ? (0.5f * dt_dyn) : dt_dyn);
-        float n_ac_f  = float(n_ac);
-        float dt_ac   = dtau_2d / n_ac_f;
-        float inv_nac = 1.0f / n_ac_f;
-        float bdt2    = (beta * dt_ac) * (beta * dt_ac);
-        uint accum    = (stg == 2u) ? 1u : 0u;
+    for (uint sub = 0u; sub < n_sub_grp; ++sub) {
+        bool first_sub = (sub == 0u);
+        bool last_sub  = (sub + 1u == n_sub_grp);
+        // Bank routing:
+        // sub==0 & n_sub_grp==1: rho0 -> rho_s (final output in rho_s)
+        // sub==0 & n_sub_grp==2: rho0 -> rho_b2 (scratch bank 2)
+        // sub==1 & n_sub_grp==2: rho_b2 -> rho_s (final output in rho_s)
+        bool use_b2_as_base = ((sub & 1u) == 1u);
+        bool write_to_b2    = ((n_sub_grp - sub) & 1u) == 0u;
 
-        device const float* rho_in = (stg == 0u) ? rho0  : rho_s;
-        device const float* Thm_in = (stg == 0u) ? Thm0  : Thm_s;
-        device const float* u_in   = (stg == 0u) ? u0_in : u_s;
-        device const float* v_in   = (stg == 0u) ? v0_in : v_s;
-        device const float* w_in   = (stg == 0u) ? w0_in : w_s;
+        device const float* r_base = use_b2_as_base ? rho_b2 : (first_sub ? rho0  : rho_s);
+        device const float* T_base = use_b2_as_base ? Thm_b2 : (first_sub ? Thm0  : Thm_s);
+        device const float* u_base = use_b2_as_base ? u_b2   : (first_sub ? u0_in : u_s);
+        device const float* v_base = use_b2_as_base ? v_b2   : (first_sub ? v0_in : v_s);
+        device const float* w_base = use_b2_as_base ? w_b2   : (first_sub ? w0_in : w_s);
 
-        // ---- Pass 0: Stage preparation -> block-contiguous L2-hot stage_buf ----
-        float r_cur = rho_in[tid];
-        float T_cur = Thm_in[tid];
-        float q_cur = 1.0f + q_n_in[tid] + q_p_in[tid];
-        float u_cur = u_in[tid];
-        float v_cur = v_in[tid];
-        float thm_cur = T_cur / max(r_cur, 1.0e-5f);
-        float p_cur = p_ref * exp2(gamma_d * log2(max(T_cur * inv_pref_rd, 1.0e-7f)));
-        float dp_cur = gamma_d * p_cur / max(T_cur, 1.0e-3f);
-        float ap_cur = p_cur - dp_cur * T_cur;
-        float rtot_cur = r_cur * q_cur;
-        float inv_dz_cur = 1.0f / dz_c[col_dz];
+        device float* r_dst = write_to_b2 ? rho_b2 : rho_s;
+        device float* T_dst = write_to_b2 ? Thm_b2 : Thm_s;
+        device float* u_dst = write_to_b2 ? u_b2   : u_s;
+        device float* v_dst = write_to_b2 ? v_b2   : v_s;
+        device float* w_dst = write_to_b2 ? w_b2   : w_s;
 
-        float w_prev2 = 0.0f;
-        float w_below = w_in[tid];
-        float w_cur   = w_in[M + tid];
+        for (uint stg = 0u; stg < 3u; ++stg) {
+            uint n_ac = (stg == 0u) ? ((pk >> 12u) & 0x3Fu) : ((stg == 1u) ? ((pk >> 6u) & 0x3Fu) : n_ac2);
+            float dtau_2d = (stg == 0u) ? (dt_dyn * (1.0f / 3.0f)) : ((stg == 1u) ? (0.5f * dt_dyn) : dt_dyn);
+            float dt_ac   = dtau_2d / float(n_ac);
+            float bdt2    = (beta * dt_ac) * (beta * dt_ac);
+            uint accum    = (stg == 2u) ? 1u : 0u;
 
-        float r_prev = 0.0f, q_prev = 0.0f, u_prev = 0.0f, v_prev = 0.0f;
-        float thm_prev = 0.0f, rtot_prev = 0.0f, dp_prev = 0.0f, inv_dz_prev = 1.0f;
-        float w_ux_dn = 0.0f;
-        float thw_prev_m = 0.0f;
-        float c_prev = 0.0f;
-        float v_new_prev = 0.0f;
+            device const float* rho_in = (stg == 0u) ? r_base : r_dst;
+            device const float* Thm_in = (stg == 0u) ? T_base : T_dst;
+            device const float* u_in   = (stg == 0u) ? u_base : u_dst;
+            device const float* v_in   = (stg == 0u) ? v_base : v_dst;
+            device const float* w_in   = (stg == 0u) ? w_base : w_dst;
 
-        for (uint k = 0u; k < nz; ++k) {
-            uint idx = k * M + tid;
-            float r_next = 0.0f, T_next = 0.0f, q_next = 0.0f, u_next = 0.0f, v_next = 0.0f;
-            float thm_next = 0.0f, dp_next = 0.0f, ap_next = 0.0f, rtot_next = 0.0f, inv_dz_next = 1.0f;
-            if (k + 1u < nz) {
-                uint idx_n = (k + 1u) * M + tid;
-                r_next = rho_in[idx_n];
-                T_next = Thm_in[idx_n];
-                q_next = 1.0f + q_n_in[idx_n] + q_p_in[idx_n];
-                u_next = u_in[idx_n];
-                v_next = v_in[idx_n];
-                thm_next = T_next / max(r_next, 1.0e-5f);
-                float p_n = p_ref * exp2(gamma_d * log2(max(T_next * inv_pref_rd, 1.0e-7f)));
-                dp_next = gamma_d * p_n / max(T_next, 1.0e-3f);
-                ap_next = p_n - dp_next * T_next;
-                rtot_next = r_next * q_next;
-                inv_dz_next = 1.0f / dz_c[(k + 1u) * dz_cols + col_dz];
-            }
+            // ---- Pass 0: Stage preparation -> block-contiguous stage_buf ----
+            // Pack Backward-needed (rdw, thw, c_prev, inv_dz_l) into w1 so Backward reads ONLY 1 float4!
+            float r_cur = rho_in[tid];
+            float T_cur = Thm_in[tid];
+            float q_cur = 1.0f + q_n_in[tid] + q_p_in[tid];
+            float u_cur = u_in[tid];
+            float v_cur = v_in[tid];
+            float thm_cur = T_cur / max(r_cur, 1.0e-5f);
+            float p_cur = p_ref * exp2(gamma_d * log2(max(T_cur * inv_pref_rd, 1.0e-7f)));
+            float dp_cur = gamma_d * p_cur / max(T_cur, 1.0e-3f);
+            float ap_cur = p_cur - dp_cur * T_cur;
+            float rtot_cur = r_cur * q_cur;
+            float inv_dz_cur = inv_dz_c[col_dz];
 
-            float r_xp1 = simd_shuffle(r_cur, l_xp1);
-            float rtot_xp1 = simd_shuffle(rtot_cur, l_xp1);
-            float rho_x_v = 0.5f * (r_cur + r_xp1);
-            float rtot_xi = 1.0f / max(0.5f * (rtot_cur + rtot_xp1), 1.0e-5f);
+            float w_prev2 = 0.0f;
+            float w_below = w_in[tid];
+            float w_cur   = w_in[M + tid];
 
-            float th_xm1 = simd_shuffle(thm_cur, l_xm1);
-            float th_xp1 = simd_shuffle(thm_cur, l_xp1);
-            float th_xp2 = simd_shuffle(thm_cur, l_xp2);
-            float sgn_u = (u_cur > 0.0f) ? 1.0f : ((u_cur < 0.0f) ? -1.0f : 0.0f);
-            float thm_xe = (
-                (-th_xm1 + 7.0f * thm_cur + 7.0f * th_xp1 - th_xp2)
-                + 0.25f * sgn_u * (th_xp2 - 3.0f * th_xp1 + 3.0f * thm_cur - th_xm1)
-            ) * (1.0f / 12.0f);
-
-            float u_xm2 = simd_shuffle(u_cur, l_xm2);
-            float u_xm1 = simd_shuffle(u_cur, l_xm1);
-            float u_xp1 = simd_shuffle(u_cur, l_xp1);
-            float u_xp2 = simd_shuffle(u_cur, l_xp2);
-            float v_xm2 = simd_shuffle(v_cur, l_xm2);
-            float v_xm1 = simd_shuffle(v_cur, l_xm1);
-            float v_xp1 = simd_shuffle(v_cur, l_xp1);
-            float v_xp2 = simd_shuffle(v_cur, l_xp2);
-
-            float u_c_left  = 0.5f * (u_cur + u_xm1);
-            float u_c_right = 0.5f * (u_cur + u_xp1);
-            float adv_u = -(
-                u_c_right * (ws3_face(u_xm1, u_cur, u_xp1, u_xp2, u_c_right) - u_cur)
-                - u_c_left * (ws3_face(u_xm2, u_xm1, u_cur, u_xp1, u_c_left) - u_cur)
-            ) * inv_dx;
-            float adv_v = -(
-                u_cur * (ws3_face(v_xm1, v_cur, v_xp1, v_xp2, u_cur) - v_cur)
-                - u_xm1 * (ws3_face(v_xm2, v_xm1, v_cur, v_xp1, u_xm1) - v_cur)
-            ) * inv_dx;
-
-            float w_ux_up = 0.0f;
-            float vadv_u = 0.0f;
-            float vadv_v = 0.0f;
-            if (k + 1u < nz) {
-                float dzw_up = dz_w_int[k * dz_cols + col_dz];
-                float w_cur_xp1 = simd_shuffle(w_cur, l_xp1);
-                w_ux_up = 0.5f * (w_cur + w_cur_xp1);
-                if (w_ux_up < 0.0f) {
-                    float lim = max(1.0f, (-w_ux_up) * (dtau_2d / 0.45f) / dzw_up);
-                    vadv_u += (-w_ux_up / lim) * (u_next - u_cur) / dzw_up;
-                }
-                if (w_cur < 0.0f) {
-                    float lim = max(1.0f, (-w_cur) * (dtau_2d / 0.45f) / dzw_up);
-                    vadv_v += (-w_cur / lim) * (v_next - v_cur) / dzw_up;
-                }
-            }
-            if (k > 0u) {
-                float dzw_dn = dz_w_int[(k - 1u) * dz_cols + col_dz];
-                if (w_ux_dn > 0.0f) {
-                    float lim = max(1.0f, w_ux_dn * (dtau_2d / 0.45f) / dzw_dn);
-                    vadv_u += (-w_ux_dn / lim) * (u_cur - u_prev) / dzw_dn;
-                }
-                if (w_below > 0.0f) {
-                    float lim = max(1.0f, w_below * (dtau_2d / 0.45f) / dzw_dn);
-                    vadv_v += (-w_below / lim) * (v_cur - v_prev) / dzw_dn;
-                }
-            }
-
-            float sp = sponge_c[k];
-            float damp_u = 0.0f;
-            float damp_v = 0.0f;
-            if (sp > 0.0f) {
-                float usum = u_cur;
-                float vsum = v_cur;
-                for (uint s = 1u; s < nx; s <<= 1u) {
-                    usum += simd_shuffle_xor(usum, ushort(s));
-                    vsum += simd_shuffle_xor(vsum, ushort(s));
-                }
-                damp_u = sp * (u_cur - usum * inv_nx);
-                damp_v = sp * (v_cur - vsum * inv_nx);
-            }
-
-            float tu_sl = adv_u + vadv_u + du_sgs[idx] - damp_u;
-            float tv_sl = adv_v + vadv_v + dv_sgs[idx] - damp_v;
-            float v_new_k = v0_in[idx] + dtau_2d * tv_sl;
-            if (k > 0u && active) {
-                v_s[(k - 1u) * M + tid] = v_new_prev;
-            }
-            v_new_prev = v_new_k;
-
-            sb[k * 256u + 0u]  = float4(ap_cur, dp_cur, rho_x_v, rtot_xi);
-            sb[k * 256u + 64u] = float4(thm_xe, tu_sl, tend_Thm[idx], q_cur);
-
-            if (k >= 1u) {
-                uint m = k - 1u;
-                float u_w_right = 0.5f * (u_prev + u_cur);
-                float u_w_left  = simd_shuffle(u_w_right, l_xm1);
-
-                float w_int = w_below;
-                float w_xm2 = simd_shuffle(w_int, l_xm2);
-                float w_xm1 = simd_shuffle(w_int, l_xm1);
-                float w_xp1 = simd_shuffle(w_int, l_xp1);
-                float w_xp2 = simd_shuffle(w_int, l_xp2);
-                float adv_w_h = -(
-                    u_w_right * (ws3_face(w_xm1, w_int, w_xp1, w_xp2, u_w_right) - w_int)
-                    - u_w_left * (ws3_face(w_xm2, w_xm1, w_int, w_xp1, u_w_left) - w_int)
-                ) * inv_dx;
-
-                float dw_dz_dn = (w_int - w_prev2) * inv_dz_prev;
-                float dw_dz_up = (w_cur - w_int) * inv_dz_cur;
-                float w_pos_f = max(w_int, 0.0f);
-                float w_neg_f = min(w_int, 0.0f);
-                float lim_pf = max(1.0f, w_pos_f * (dtau_2d / 0.50f) * inv_dz_prev);
-                float lim_nf = max(1.0f, (-w_neg_f) * (dtau_2d / 0.50f) * inv_dz_cur);
-                float adv_w_v = -((w_pos_f / lim_pf) * dw_dz_dn + (w_neg_f / lim_nf) * dw_dz_up);
-                float tw_sl = adv_w_h + adv_w_v + dw_sgs[idx];
-
-                float rdw = 0.5f * (r_prev + r_cur);
-                float rtw = 0.5f * (rtot_prev + rtot_cur);
-                float thw = 0.5f * (thm_prev + thm_cur);
-                float inv_dz_wm = 1.0f / dz_w_int[m * dz_cols + col_dz];
-                float rdw_over_rtw = rdw / max(rtw, 1.0e-5f);
-
-                float fac_p = bdt2 * (rdw_over_rtw * inv_dz_wm);
-                float fac_g = bdt2 * (0.5f * gravity * rdw_over_rtw);
-                float c_dn = dp_prev * inv_dz_prev;
-                float c_up = dp_cur * inv_dz_cur;
-
-                float diag_m = max(
-                    1.0f + dt_ac * sponge_w[m] + fac_p * thw * (c_up + c_dn) + fac_g * (q_cur * inv_dz_cur - q_prev * inv_dz_prev),
-                    0.5f
-                );
-                float dl_m = (m > 0u) ? (-fac_p * c_dn * thw_prev_m + fac_g * (q_prev * inv_dz_prev)) : 0.0f;
-                float du_m = (m + 1u < nz - 1u)
-                    ? (-fac_p * c_up * (0.5f * (thm_cur + thm_next)) - fac_g * (q_cur * inv_dz_cur))
-                    : 0.0f;
-
-                float inv_den = 1.0f / max((m == 0u) ? diag_m : (diag_m - dl_m * c_prev), 1.0e-6f);
-                c_prev = (m + 1u < nz - 1u) ? (du_m * inv_den) : 0.0f;
-                thw_prev_m = thw;
-
-                sb[m * 256u + 128u] = float4(rdw, rdw_over_rtw, thw, rdw * tw_sl);
-                sb[m * 256u + 192u] = float4(dl_m, inv_den, c_prev, inv_dz_wm);
-            }
-
-            r_prev = r_cur; q_prev = q_cur; u_prev = u_cur; v_prev = v_cur;
-            thm_prev = thm_cur; rtot_prev = rtot_cur; dp_prev = dp_cur; inv_dz_prev = inv_dz_cur;
-            w_ux_dn = w_ux_up;
-
-            r_cur = r_next; T_cur = T_next; q_cur = q_next; u_cur = u_next; v_cur = v_next;
-            thm_cur = thm_next; dp_cur = dp_next; ap_cur = ap_next; rtot_cur = rtot_next; inv_dz_cur = inv_dz_next;
-            w_prev2 = w_below;
-            w_below = w_cur;
-            w_cur = (k + 2u <= nz) ? w_in[(k + 2u) * M + tid] : 0.0f;
-        }
-        if (active) {
-            v_s[(nz - 1u) * M + tid] = v_new_prev;
-        }
-
-        // ---- Pass 1..n_ac: Low-register acoustic-HEVI (`d_star[64]` only!) ----
-        for (uint ac = 0u; ac < n_ac; ++ac) {
-            bool first_ac = (ac == 0u);
-            bool last_ac  = (ac + 1u == n_ac);
-            float p_blend_prev = 0.0f;
-            float rtot_blend_prev = 0.0f;
-            float fz_old_below = 0.0f;
-            float thm_w_below = 0.0f;
-            float d_prev = 0.0f;
-            float4 w0_below = float4(0.0f);
+            float r_prev = 0.0f, q_prev = 0.0f, u_prev = 0.0f, v_prev = 0.0f;
+            float thm_prev = 0.0f, rtot_prev = 0.0f, dp_prev = 0.0f, inv_dz_prev = 1.0f;
+            float w_ux_dn = 0.0f;
+            float thw_prev_m = 0.0f;
+            float c_prev = 0.0f;
+            float v_new_prev = 0.0f;
 
             for (uint k = 0u; k < nz; ++k) {
                 uint idx = k * M + tid;
-                float4 c0 = sb[k * 256u + 0u];
-                float4 c1 = sb[k * 256u + 64u];
+                float r_next = 0.0f, T_next = 0.0f, q_next = 0.0f, u_next = 0.0f, v_next = 0.0f;
+                float thm_next = 0.0f, dp_next = 0.0f, ap_next = 0.0f, rtot_next = 0.0f, inv_dz_next = 1.0f;
+                if (k + 1u < nz) {
+                    uint idx_n = (k + 1u) * M + tid;
+                    r_next = rho_in[idx_n];
+                    T_next = Thm_in[idx_n];
+                    q_next = 1.0f + q_n_in[idx_n] + q_p_in[idx_n];
+                    u_next = u_in[idx_n];
+                    v_next = v_in[idx_n];
+                    thm_next = T_next / max(r_next, 1.0e-5f);
+                    float p_n = p_ref * exp2(gamma_d * log2(max(T_next * inv_pref_rd, 1.0e-7f)));
+                    dp_next = gamma_d * p_n / max(T_next, 1.0e-3f);
+                    ap_next = p_n - dp_next * T_next;
+                    rtot_next = r_next * q_next;
+                    inv_dz_next = inv_dz_c[(k + 1u) * dz_cols + col_dz];
+                }
 
-                float r_cur_a = first_ac ? rho0[idx]  : rho_s[idx];
-                float T_cur_a = first_ac ? Thm0[idx]  : Thm_s[idx];
-                float u_old   = first_ac ? u0_in[idx] : u_s[idx];
+                float r_xp1 = simd_shuffle(r_cur, l_xp1);
+                float rtot_xp1 = simd_shuffle(rtot_cur, l_xp1);
+                float rho_x_v = 0.5f * (r_cur + r_xp1);
+                float rtot_xi = 1.0f / max(0.5f * (rtot_cur + rtot_xp1), 1.0e-5f);
 
-                float ap = c0.x;
-                float dp = c0.y;
-                float p_k0 = fma(dp, T_cur_a, ap);
-                float p_k1 = simd_shuffle(p_k0, l_xp1);
+                float th_xm1 = simd_shuffle(thm_cur, l_xm1);
+                float th_xp1 = simd_shuffle(thm_cur, l_xp1);
+                float th_xp2 = simd_shuffle(thm_cur, l_xp2);
+                float sgn_u = (u_cur > 0.0f) ? 1.0f : ((u_cur < 0.0f) ? -1.0f : 0.0f);
+                float thm_xe = (
+                    (-th_xm1 + 7.0f * thm_cur + 7.0f * th_xp1 - th_xp2)
+                    + 0.25f * sgn_u * (th_xp2 - 3.0f * th_xp1 + 3.0f * thm_cur - th_xm1)
+                ) * (1.0f / 12.0f);
 
-                float pgf_u = -(p_k1 - p_k0) * inv_dx * c0.w;
-                float u_n = u_old + dt_ac * (c1.y + pgf_u);
-                float fx_k = c0.z * (1.10f * u_n - 0.10f * u_old);
-                float fx_thm_k = fx_k * c1.x;
+                float u_xm2 = simd_shuffle(u_cur, l_xm2);
+                float u_xm1 = simd_shuffle(u_cur, l_xm1);
+                float u_xp1 = simd_shuffle(u_cur, l_xp1);
+                float u_xp2 = simd_shuffle(u_cur, l_xp2);
+                float v_xm2 = simd_shuffle(v_cur, l_xm2);
+                float v_xm1 = simd_shuffle(v_cur, l_xm1);
+                float v_xp1 = simd_shuffle(v_cur, l_xp1);
+                float v_xp2 = simd_shuffle(v_cur, l_xp2);
 
-                float fx_m = simd_shuffle(fx_k, l_xm1);
-                float fx_thm_m = simd_shuffle(fx_thm_k, l_xm1);
+                float u_c_left  = 0.5f * (u_cur + u_xm1);
+                float u_c_right = 0.5f * (u_cur + u_xp1);
+                float adv_u = -(
+                    u_c_right * (ws3_face(u_xm1, u_cur, u_xp1, u_xp2, u_c_right) - u_cur)
+                    - u_c_left * (ws3_face(u_xm2, u_xm1, u_cur, u_xp1, u_c_left) - u_cur)
+                ) * inv_dx;
+                float adv_v = -(
+                    u_cur * (ws3_face(v_xm1, v_cur, v_xp1, v_xp2, u_cur) - v_cur)
+                    - u_xm1 * (ws3_face(v_xm2, v_xm1, v_cur, v_xp1, u_xm1) - v_cur)
+                ) * inv_dx;
 
-                if (active) {
-                    u_s[idx] = u_n;
-                    if (accum != 0u) {
-                        float fx_sum = first_ac ? fx_k : (fx_acc[idx] + fx_k);
-                        fx_acc[idx] = last_ac ? (fx_sum * inv_nac) : fx_sum;
+                float w_ux_up = 0.0f;
+                float vadv_u = 0.0f;
+                float vadv_v = 0.0f;
+                if (k + 1u < nz) {
+                    float idzw_up = inv_dz_w[k * dz_cols + col_dz];
+                    float w_cur_xp1 = simd_shuffle(w_cur, l_xp1);
+                    w_ux_up = 0.5f * (w_cur + w_cur_xp1);
+                    if (w_ux_up < 0.0f) {
+                        float lim = max(1.0f, (-w_ux_up) * (dtau_2d / 0.45f) * idzw_up);
+                        vadv_u += (-w_ux_up / lim) * (u_next - u_cur) * idzw_up;
+                    }
+                    if (w_cur < 0.0f) {
+                        float lim = max(1.0f, (-w_cur) * (dtau_2d / 0.45f) * idzw_up);
+                        vadv_v += (-w_cur / lim) * (v_next - v_cur) * idzw_up;
+                    }
+                }
+                if (k > 0u) {
+                    float idzw_dn = inv_dz_w[(k - 1u) * dz_cols + col_dz];
+                    if (w_ux_dn > 0.0f) {
+                        float lim = max(1.0f, w_ux_dn * (dtau_2d / 0.45f) * idzw_dn);
+                        vadv_u += (-w_ux_dn / lim) * (u_cur - u_prev) * idzw_dn;
+                    }
+                    if (w_below > 0.0f) {
+                        float lim = max(1.0f, w_below * (dtau_2d / 0.45f) * idzw_dn);
+                        vadv_v += (-w_below / lim) * (v_cur - v_prev) * idzw_dn;
                     }
                 }
 
-                float div_h_rho = (fx_k - fx_m) * inv_dx;
-                float div_h_Thm = (fx_thm_k - fx_thm_m) * inv_dx;
-
-                float4 w0_ab = float4(0.0f);
-                float fz_old_above = 0.0f;
-                float thm_w_above = 0.0f;
-                if (k + 1u < nz) {
-                    w0_ab = sb[k * 256u + 128u];
-                    float w_ab = first_ac ? w0_in[(k + 1u) * M + tid] : w_s[(k + 1u) * M + tid];
-                    fz_old_above = w0_ab.x * w_ab;
-                    thm_w_above = w0_ab.z;
+                float sp = sponge_c[k];
+                float damp_u = 0.0f;
+                float damp_v = 0.0f;
+                if (sp > 0.0f) {
+                    float usum = u_cur;
+                    float vsum = v_cur;
+                    for (uint s = 1u; s < nx; s <<= 1u) {
+                        usum += simd_shuffle_xor(usum, ushort(s));
+                        vsum += simd_shuffle_xor(vsum, ushort(s));
+                    }
+                    damp_u = sp * (u_cur - usum * inv_nx);
+                    damp_v = sp * (v_cur - vsum * inv_nx);
                 }
 
-                float inv_dz_k = 1.0f / dz_c[k * dz_cols + col_dz];
-                float r_dag = r_cur_a - dt_ac * (div_h_rho + (fz_old_above - fz_old_below) * inv_dz_k);
-                float T_dag = T_cur_a + dt_ac * (
-                    -div_h_Thm
-                    - (thm_w_above * fz_old_above - thm_w_below * fz_old_below) * inv_dz_k
-                    + c1.z
-                );
-                if (active) {
-                    rho_s[idx] = r_dag;
-                    Thm_s[idx] = T_dag;
+                float tu_sl = adv_u + vadv_u + du_sgs[idx] - damp_u;
+                float tv_sl = adv_v + vadv_v + dv_sgs[idx] - damp_v;
+                float v_new_k = v_base[idx] + dtau_2d * tv_sl;
+                if (k > 0u && active) {
+                    v_dst[(k - 1u) * M + tid] = v_new_prev;
                 }
+                v_new_prev = v_new_k;
 
-                float p_blend = fma(dp, (1.0f - beta) * T_cur_a + beta * T_dag, ap);
-                float rtot_blend = ((1.0f - beta) * r_cur_a + beta * r_dag) * c1.w;
+                sb[k * 256u + 0u]  = float4(ap_cur, dp_cur, rho_x_v, rtot_xi);
+                sb[k * 256u + 64u] = float4(thm_xe, tu_sl, tend_Thm[idx], q_cur);
 
                 if (k >= 1u) {
-                    uint um = k - 1u;
-                    float4 w1_m = sb[um * 256u + 192u];
-                    float nh_imb = (p_blend - p_blend_prev) * w1_m.w + 0.5f * (rtot_blend + rtot_blend_prev) * gravity;
-                    float rhs_m = dt_ac * (w0_below.w - w0_below.y * nh_imb - sponge_w[um] * fz_old_below);
-                    float inv_den = w1_m.y;
-                    d_prev = (um == 0u) ? (rhs_m * inv_den) : ((rhs_m - w1_m.x * d_prev) * inv_den);
-                    d_star[um] = d_prev;
+                    uint m = k - 1u;
+                    float u_w_right = 0.5f * (u_prev + u_cur);
+                    float u_w_left  = simd_shuffle(u_w_right, l_xm1);
+
+                    float w_int = w_below;
+                    float w_xm2 = simd_shuffle(w_int, l_xm2);
+                    float w_xm1 = simd_shuffle(w_int, l_xm1);
+                    float w_xp1 = simd_shuffle(w_int, l_xp1);
+                    float w_xp2 = simd_shuffle(w_int, l_xp2);
+                    float adv_w_h = -(
+                        u_w_right * (ws3_face(w_xm1, w_int, w_xp1, w_xp2, u_w_right) - w_int)
+                        - u_w_left * (ws3_face(w_xm2, w_xm1, w_int, w_xp1, u_w_left) - w_int)
+                    ) * inv_dx;
+
+                    float dw_dz_dn = (w_int - w_prev2) * inv_dz_prev;
+                    float dw_dz_up = (w_cur - w_int) * inv_dz_cur;
+                    float w_pos_f = max(w_int, 0.0f);
+                    float w_neg_f = min(w_int, 0.0f);
+                    float lim_pf = max(1.0f, w_pos_f * (dtau_2d / 0.50f) * inv_dz_prev);
+                    float lim_nf = max(1.0f, (-w_neg_f) * (dtau_2d / 0.50f) * inv_dz_cur);
+                    float adv_w_v = -((w_pos_f / lim_pf) * dw_dz_dn + (w_neg_f / lim_nf) * dw_dz_up);
+                    float tw_sl = adv_w_h + adv_w_v + dw_sgs[idx];
+
+                    float rdw = 0.5f * (r_prev + r_cur);
+                    float rtw = 0.5f * (rtot_prev + rtot_cur);
+                    float thw = 0.5f * (thm_prev + thm_cur);
+                    float inv_dz_wm = inv_dz_w[m * dz_cols + col_dz];
+                    float rdw_over_rtw = rdw / max(rtw, 1.0e-5f);
+
+                    float fac_p = bdt2 * (rdw_over_rtw * inv_dz_wm);
+                    float fac_g = bdt2 * (0.5f * gravity * rdw_over_rtw);
+                    float c_dn = dp_prev * inv_dz_prev;
+                    float c_up = dp_cur * inv_dz_cur;
+
+                    float diag_m = max(
+                        1.0f + dt_ac * sponge_w[m] + fac_p * thw * (c_up + c_dn) + fac_g * (q_cur * inv_dz_cur - q_prev * inv_dz_prev),
+                        0.5f
+                    );
+                    float dl_m = (m > 0u) ? (-fac_p * c_dn * thw_prev_m + fac_g * (q_prev * inv_dz_prev)) : 0.0f;
+                    float du_m = (m + 1u < nz - 1u)
+                        ? (-fac_p * c_up * (0.5f * (thm_cur + thm_next)) - fac_g * (q_cur * inv_dz_cur))
+                        : 0.0f;
+
+                    float inv_den = 1.0f / max((m == 0u) ? diag_m : (diag_m - dl_m * c_prev), 1.0e-6f);
+                    c_prev = (m + 1u < nz - 1u) ? (du_m * inv_den) : 0.0f;
+                    thw_prev_m = thw;
+
+                    // w0 (Forward-only): (rdw_over_rtw, rdw*tw_sl, dl_m, inv_den)
+                    // w1 (Backward + Forward-w): (rdw, thw, c_prev, inv_dz_wm) -> Backward reads ONLY w1!
+                    sb[m * 256u + 128u] = float4(rdw_over_rtw, rdw * tw_sl, dl_m, inv_den);
+                    sb[m * 256u + 192u] = float4(rdw, thw, c_prev, inv_dz_wm);
                 }
 
-                p_blend_prev = p_blend;
-                rtot_blend_prev = rtot_blend;
-                fz_old_below = fz_old_above;
-                thm_w_below = thm_w_above;
-                w0_below = w0_ab;
-            }
+                r_prev = r_cur; q_prev = q_cur; u_prev = u_cur; v_prev = v_cur;
+                thm_prev = thm_cur; rtot_prev = rtot_cur; dp_prev = dp_cur; inv_dz_prev = inv_dz_cur;
+                w_ux_dn = w_ux_up;
 
-            float dfz_above = 0.0f;
-            float thm_w_above = 0.0f;
-            for (int m = int(nz) - 2; m >= 0; --m) {
-                uint um = uint(m);
-                uint k_layer = um + 1u;
-                uint w_idx = k_layer * M + tid;
-                float4 w0_m = sb[um * 256u + 128u];
-                float4 w1_m = sb[um * 256u + 192u];
-                float dfz_cur = (m == int(nz) - 2) ? d_star[um] : (d_star[um] - w1_m.z * dfz_above);
-                float rdw_m = w0_m.x;
-                float w_old_m = first_ac ? w0_in[w_idx] : w_s[w_idx];
-                float fz_old_m = rdw_m * w_old_m;
-                float fz_new_m = fz_old_m + dfz_cur;
-                float w_new = fz_new_m / max(rdw_m, 1.0e-5f);
-
-                float thm_w_m = w0_m.z;
-                float inv_dz_l = 1.0f / dz_c[k_layer * dz_cols + col_dz];
-                if (active) {
-                    w_s[w_idx] = w_new;
-                    rho_s[w_idx] = max(rho_s[w_idx] - beta * dt_ac * (dfz_above - dfz_cur) * inv_dz_l, 1.0e-5f);
-                    Thm_s[w_idx] = Thm_s[w_idx] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) * inv_dz_l;
-                    if (accum != 0u) {
-                        float fz_inc = fz_old_m + beta * dfz_cur;
-                        float fz_sum = first_ac ? fz_inc : (fz_acc[w_idx] + fz_inc);
-                        fz_acc[w_idx] = last_ac ? (fz_sum * inv_nac) : fz_sum;
-                    }
-                }
-                dfz_above = dfz_cur;
-                thm_w_above = thm_w_m;
+                r_cur = r_next; T_cur = T_next; q_cur = q_next; u_cur = u_next; v_cur = v_next;
+                thm_cur = thm_next; dp_cur = dp_next; ap_cur = ap_next; rtot_cur = rtot_next; inv_dz_cur = inv_dz_next;
+                w_prev2 = w_below;
+                w_below = w_cur;
+                w_cur = (k + 2u <= nz) ? w_in[(k + 2u) * M + tid] : 0.0f;
             }
             if (active) {
-                float inv_dz_0 = 1.0f / dz_c[col_dz];
-                w_s[tid] = 0.0f;
-                w_s[nz * M + tid] = 0.0f;
-                rho_s[tid] = max(rho_s[tid] - beta * dt_ac * dfz_above * inv_dz_0, 1.0e-5f);
-                Thm_s[tid] = Thm_s[tid] - beta * dt_ac * (thm_w_above * dfz_above) * inv_dz_0;
-                if (accum != 0u && last_ac) {
-                    fz_acc[tid] = 0.0f;
-                    fz_acc[nz * M + tid] = 0.0f;
+                v_dst[(nz - 1u) * M + tid] = v_new_prev;
+            }
+
+            // ---- Pass 1..n_ac: Low-register acoustic-HEVI (`d_star[64]` only, 1-float4 Backward!) ----
+            for (uint ac = 0u; ac < n_ac; ++ac) {
+                bool first_ac = (ac == 0u);
+                bool last_ac  = (ac + 1u == n_ac);
+                bool first_acc = first_sub && first_ac;
+                bool last_acc  = last_sub && last_ac;
+
+                float p_blend_prev = 0.0f;
+                float rtot_blend_prev = 0.0f;
+                float fz_old_below = 0.0f;
+                float thm_w_below = 0.0f;
+                float inv_dz_w_below = 0.0f;
+                float d_prev = 0.0f;
+
+                for (uint k = 0u; k < nz; ++k) {
+                    uint idx = k * M + tid;
+                    float4 c0 = sb[k * 256u + 0u];
+                    float4 c1 = sb[k * 256u + 64u];
+
+                    float r_cur_a = first_ac ? r_base[idx] : r_dst[idx];
+                    float T_cur_a = first_ac ? T_base[idx] : T_dst[idx];
+                    float u_old   = first_ac ? u_base[idx] : u_dst[idx];
+
+                    float ap = c0.x;
+                    float dp = c0.y;
+                    float p_k0 = fma(dp, T_cur_a, ap);
+                    float p_k1 = simd_shuffle(p_k0, l_xp1);
+
+                    float pgf_u = -(p_k1 - p_k0) * inv_dx * c0.w;
+                    float u_n = u_old + dt_ac * (c1.y + pgf_u);
+                    float fx_k = c0.z * (1.10f * u_n - 0.10f * u_old);
+                    float fx_thm_k = fx_k * c1.x;
+
+                    float fx_m = simd_shuffle(fx_k, l_xm1);
+                    float fx_thm_m = simd_shuffle(fx_thm_k, l_xm1);
+
+                    if (active) {
+                        u_dst[idx] = u_n;
+                        if (accum != 0u) {
+                            float fx_sum = first_acc ? fx_k : (fx_acc[idx] + fx_k);
+                            fx_acc[idx] = last_acc ? (fx_sum * inv_nac_tot) : fx_sum;
+                        }
+                    }
+
+                    float div_h_rho = (fx_k - fx_m) * inv_dx;
+                    float div_h_Thm = (fx_thm_k - fx_thm_m) * inv_dx;
+
+                    float fz_old_above = 0.0f;
+                    float thm_w_above = 0.0f;
+                    float inv_dz_w_ab = 0.0f;
+                    if (k + 1u < nz) {
+                        float4 w1_ab = sb[k * 256u + 192u];
+                        float w_ab = first_ac ? w_base[(k + 1u) * M + tid] : w_dst[(k + 1u) * M + tid];
+                        fz_old_above = w1_ab.x * w_ab;
+                        thm_w_above = w1_ab.y;
+                        inv_dz_w_ab = w1_ab.w;
+                    }
+
+                    float inv_dz_k = inv_dz_c[k * dz_cols + col_dz];
+                    float r_dag = r_cur_a - dt_ac * (div_h_rho + (fz_old_above - fz_old_below) * inv_dz_k);
+                    float T_dag = T_cur_a + dt_ac * (
+                        -div_h_Thm
+                        - (thm_w_above * fz_old_above - thm_w_below * fz_old_below) * inv_dz_k
+                        + c1.z
+                    );
+                    if (active) {
+                        r_dst[idx] = r_dag;
+                        T_dst[idx] = T_dag;
+                    }
+
+                    float p_blend = fma(dp, (1.0f - beta) * T_cur_a + beta * T_dag, ap);
+                    float rtot_blend = ((1.0f - beta) * r_cur_a + beta * r_dag) * c1.w;
+
+                    if (k >= 1u) {
+                        uint um = k - 1u;
+                        float4 w0_m = sb[um * 256u + 128u];
+                        float nh_imb = (p_blend - p_blend_prev) * inv_dz_w_below + 0.5f * (rtot_blend + rtot_blend_prev) * gravity;
+                        float rhs_m = dt_ac * (w0_m.y - w0_m.x * nh_imb - sponge_w[um] * fz_old_below);
+                        float inv_den = w0_m.w;
+                        d_prev = (um == 0u) ? (rhs_m * inv_den) : ((rhs_m - w0_m.z * d_prev) * inv_den);
+                        d_star[um] = d_prev;
+                    }
+
+                    p_blend_prev = p_blend;
+                    rtot_blend_prev = rtot_blend;
+                    fz_old_below = fz_old_above;
+                    thm_w_below = thm_w_above;
+                    inv_dz_w_below = inv_dz_w_ab;
+                }
+
+                float dfz_above = 0.0f;
+                float thm_w_above = 0.0f;
+                for (int m = int(nz) - 2; m >= 0; --m) {
+                    uint um = uint(m);
+                    uint k_layer = um + 1u;
+                    uint w_idx = k_layer * M + tid;
+                    // Single float4 read (`w1`: rdw, thw, c_prev, inv_dz_wm) -> 50% less Backward stage_buf traffic!
+                    float4 w1_m = sb[um * 256u + 192u];
+                    float dfz_cur = (m == int(nz) - 2) ? d_star[um] : (d_star[um] - w1_m.z * dfz_above);
+                    float rdw_m = w1_m.x;
+                    float w_old_m = first_ac ? w_base[w_idx] : w_dst[w_idx];
+                    float fz_old_m = rdw_m * w_old_m;
+                    float fz_new_m = fz_old_m + dfz_cur;
+                    float w_new = fz_new_m / max(rdw_m, 1.0e-5f);
+
+                    float thm_w_m = w1_m.y;
+                    float inv_dz_l = inv_dz_c[k_layer * dz_cols + col_dz];
+                    if (active) {
+                        w_dst[w_idx] = w_new;
+                        r_dst[w_idx] = max(r_dst[w_idx] - beta * dt_ac * (dfz_above - dfz_cur) * inv_dz_l, 1.0e-5f);
+                        T_dst[w_idx] = T_dst[w_idx] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) * inv_dz_l;
+                        if (accum != 0u) {
+                            float fz_inc = fz_old_m + beta * dfz_cur;
+                            float fz_sum = first_acc ? fz_inc : (fz_acc[w_idx] + fz_inc);
+                            fz_acc[w_idx] = last_acc ? (fz_sum * inv_nac_tot) : fz_sum;
+                        }
+                    }
+                    dfz_above = dfz_cur;
+                    thm_w_above = thm_w_m;
+                }
+                if (active) {
+                    float inv_dz_0 = inv_dz_c[col_dz];
+                    w_dst[tid] = 0.0f;
+                    w_dst[nz * M + tid] = 0.0f;
+                    r_dst[tid] = max(r_dst[tid] - beta * dt_ac * dfz_above * inv_dz_0, 1.0e-5f);
+                    T_dst[tid] = T_dst[tid] - beta * dt_ac * (thm_w_above * dfz_above) * inv_dz_0;
+                    if (accum != 0u && last_acc) {
+                        fz_acc[tid] = 0.0f;
+                        fz_acc[nz * M + tid] = 0.0f;
+                    }
                 }
             }
-        }
-        if (stg < 2u) {
-            threadgroup_barrier(mem_flags::mem_device);
+            if (stg < 2u || !last_sub) {
+                threadgroup_barrier(mem_flags::mem_device);
+            }
         }
     }
 }
@@ -4817,42 +4795,23 @@ def run_scvt_fast_acoustic_metal(
     u0: torch.Tensor,
     w0: torch.Tensor,
     udotz0: torch.Tensor,
+    edge_c4: torch.Tensor,
     pres_s: torch.Tensor,
     dp_dThm_s: torch.Tensor,
-    Thm_ref: torch.Tensor,
-    fac_z0: torch.Tensor,
-    fac_z1: torch.Tensor,
-    rtot_e: torch.Tensor,
-    dc_e: torch.Tensor,
+    q_odz: torch.Tensor,
+    hevi_c: torch.Tensor,
+    p_cell_init: torch.Tensor,
+    k_slope_top: torch.Tensor,
     tend_u_slow: torch.Tensor,
     tend_Thm_slow: torch.Tensor,
     sponge_c: torch.Tensor,
     sponge_w: torch.Tensor,
     area_e: torch.Tensor,
     zw_slope_e: torch.Tensor,
-    dv_edge: torch.Tensor,
-    area_cell: torch.Tensor,
-    edges_on_cell: torch.Tensor,
-    edge_sign_on_cell: torch.Tensor,
-    c0: torch.Tensor,
-    c1: torch.Tensor,
-    m_edge: torch.Tensor,
-    thm_e: torch.Tensor,
-    rho_dw: torch.Tensor,
-    rtot_w: torch.Tensor,
-    thm_w: torch.Tensor,
-    dz_c: torch.Tensor,
-    dz_w_int: torch.Tensor,
-    q_load: torch.Tensor,
-    dl: torch.Tensor | None = None,
-    diag: torch.Tensor | None = None,
-    du: torch.Tensor | None = None,
-    mesh: Any = None,
-    hevi_c_pre: torch.Tensor | None = None,
-    p_cell_pre: torch.Tensor | None = None,
-    k_slope_top_pre: torch.Tensor | None = None,
+    Thm_ref: torch.Tensor,
+    mesh: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Execute global SCVT horizontal acoustic + vertical HEVI loop on Metal GPU."""
+    """Execute global SCVT horizontal acoustic + vertical HEVI loop on GPU (float4 edge + SoA cell)."""
     nz, n_cells = m0.shape
     n_edges = u0.shape[1]
     dev = m0.device
@@ -4877,10 +4836,6 @@ def run_scvt_fast_acoustic_metal(
             "udz_a": torch.empty_like(udotz0),
             "udz_b": torch.empty_like(udotz0),
             "udz_c": torch.empty_like(udotz0),
-            "hevi_c": torch.empty((6, nz - 1, n_cells), device=dev, dtype=m0.dtype),
-            "p_cell": torch.empty((nz, n_cells), device=dev, dtype=m0.dtype),
-            "k_slope_top": torch.empty((n_cells,), device=dev, dtype=torch.float32),
-            "k_slope_ptr": -1,
             "uh_fTh": torch.empty((nz, n_edges, 2), device=dev, dtype=u0.dtype),
             "uh_acc": torch.zeros_like(u0),
             "om_acc": torch.zeros_like(w0),
@@ -4891,70 +4846,28 @@ def run_scvt_fast_acoustic_metal(
         ws["uh_acc"].zero_()
         ws["om_acc"].zero_()
 
-    if mesh is not None:
-        mc = _get_scvt_mesh_cache(mesh)
-        c0_i32 = mc["c0"]
-        c1_i32 = mc["c1"]
-        eoc_i32 = mc["eoc"]
-        esgn_c = mc["esgn"]
-        area_c_c = mc["area_cell"]
-        dv_c = mc["dv_edge"]
-    else:
-        c0_i32 = c0.to(torch.int32).contiguous()
-        c1_i32 = c1.to(torch.int32).contiguous()
-        eoc_i32 = edges_on_cell.to(torch.int32).contiguous()
-        esgn_c = edge_sign_on_cell.contiguous()
-        area_c_c = area_cell.contiguous()
-        dv_c = dv_edge.contiguous()
+    mc = _get_scvt_mesh_cache(mesh)
+    c0_i32 = mc["c0"]
+    c1_i32 = mc["c1"]
+    eoc_i32 = mc["eoc"]
+    esgn_c = mc["esgn"]
+    area_c_c = mc["area_cell"]
+    dv_c = mc["dv_edge"]
     ae_c = area_e.view(-1).contiguous()
-    dce_c = dc_e.view(-1).contiguous()
     spc_c = sponge_c.view(-1).contiguous()
     spw_c = sponge_w.view(-1).contiguous()
-
-    u_p = [nz, n_cells, n_edges, accum_u]
-    f_p = [float(dt_ac), float(beta_hevi), float(gravity), 0.0]
-    ps_c = pres_s.contiguous()
-    dp_c = dp_dThm_s.contiguous()
-    tr_c = Thm_ref.contiguous()
-    Thm0_c = Thm0.contiguous()
-    if hevi_c_pre is not None and p_cell_pre is not None:
-        hevi_c = hevi_c_pre
-        p_cell = p_cell_pre
-    else:
-        hevi_c = ws["hevi_c"]
-        p_cell = ws["p_cell"]
-        assert rho_dw is not None and rtot_w is not None and thm_w is not None
-        assert dl is not None and diag is not None and du is not None
-        lib.scvt_hevi_factor_pack(
-            rho_dw.contiguous(), rtot_w.contiguous(), thm_w.contiguous(),
-            dl.contiguous(), diag.contiguous(), du.contiguous(),
-            ps_c, dp_c, tr_c, Thm0_c,
-            hevi_c, p_cell, [nz, n_cells, 0, 0], threads=n_cells,
-        )
     zw_c = zw_slope_e.contiguous()
-    if k_slope_top_pre is not None:
-        k_slope_top = k_slope_top_pre
-    else:
-        zw_ptr = zw_c.data_ptr()
-        if ws["k_slope_ptr"] != zw_ptr:
-            lib.scvt_slope_top_cell(
-                eoc_i32, esgn_c, zw_c, ws["k_slope_top"], [nz, n_cells, n_edges, 0], threads=n_cells,
-            )
-            ws["k_slope_ptr"] = zw_ptr
-        k_slope_top = ws["k_slope_top"]
-
-    rt_e_c = rtot_e.contiguous()
-    fz0_c = fac_z0.contiguous()
-    fz1_c = fac_z1.contiguous()
-    me_c = m_edge.contiguous()
-    the_c = thm_e.contiguous()
     tu_c = tend_u_slow.contiguous()
     tth_c = tend_Thm_slow.contiguous()
-    dzc_c = dz_c.contiguous()
-    dzw_c = dz_w_int.contiguous()
-    ql_c = q_load.contiguous()
+    ps_c = pres_s.contiguous()
+    dp_c = dp_dThm_s.contiguous()
+    qodz_c = q_odz.contiguous()
+
+    f_p = [float(dt_ac), float(beta_hevi), float(gravity), 0.0]
+    u_p_edge = [nz, n_cells, n_edges, accum_u]
 
     # Select 2 scratch banks disjoint from Thm_ref (zero pre-loop copy_ and zero stage-0/1 clone!)
+    tr_c = Thm_ref.contiguous()
     tr_ptr = tr_c.data_ptr()
     bank_a = (ws["m_a"], ws["Thm_a"], ws["u_a"], ws["w_a"], ws["udz_a"])
     bank_b = (ws["m_b"], ws["Thm_b"], ws["u_b"], ws["w_b"], ws["udz_b"])
@@ -4966,27 +4879,29 @@ def run_scvt_fast_acoustic_metal(
     else:
         pp0, pp1 = bank_a, bank_b
 
-    cur = (m0.contiguous(), Thm0_c, u0.contiguous(), w0.contiguous(), udotz0.contiguous())
+    cur = (m0.contiguous(), Thm0.contiguous(), u0.contiguous(), w0.contiguous(), udotz0.contiguous())
     nxt = pp0
     alt = pp1
     uh_fTh = ws["uh_fTh"]
+    p_cell = p_cell_init
 
     for ac_i in range(n_ac):
         mc_s, Tc, uc, wc, uzc = cur
         mn_s, Tn, un, wn, uzn = nxt
+        write_p = 1 if (ac_i + 1 < n_ac) else 0
         lib.scvt_fast_edge(
-            c0_i32, c1_i32, dce_c, rt_e_c, fz0_c, fz1_c,
-            me_c, the_c, tu_c, spc_c,
+            c0_i32, c1_i32, edge_c4, tu_c, spc_c,
             p_cell, uc,
             un, uh_fTh, ws["uh_acc"],
-            u_p, f_p, threads=nz * n_edges,
+            u_p_edge, f_p, threads=nz * n_edges,
         )
         lib.scvt_fast_cell_hevi(
             eoc_i32, esgn_c, area_c_c, dv_c, ae_c, zw_c, un, uh_fTh,
-            mc_s, Tc, wc, uzc, ps_c, dp_c, tr_c,
-            tth_c, dzc_c, dzw_c, ql_c,
-            hevi_c, spw_c, k_slope_top, mn_s, Tn, wn, uzn, ws["om_acc"], p_cell,
-            u_p, f_p, threads=n_cells,
+            mc_s, Tc, wc, uzc,
+            ps_c, dp_c, tr_c, tth_c, qodz_c,
+            hevi_c, spw_c, k_slope_top,
+            mn_s, Tn, wn, uzn, ws["om_acc"], p_cell,
+            [nz, n_cells, n_edges, (write_p << 1) | accum_u], f_p, threads=n_cells,
         )
         if ac_i == 0:
             cur, nxt = nxt, alt

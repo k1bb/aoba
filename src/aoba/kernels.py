@@ -1706,6 +1706,7 @@ def run_crm_rk3_hevi_metal(
     q_n: torch.Tensor | None = None,
     q_p: torch.Tensor | None = None,
     clone_out: bool = True,
+    n_sub_grp: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Execute the full 3-stage Split-Explicit Wicker-Skamarock RK3-HEVI step on GPU (Metal or CUDA)."""
     lib = _get_gpu_lib(rho0.device)
@@ -1816,11 +1817,17 @@ def run_crm_rk3_hevi_metal(
         c_tg = 64 // nx
         n_tg = (n_col + c_tg - 1) // c_tg
         grid_64 = (n_tg * 64,)
-        # Ping-pong output buffer so rho0_c..w0_c never alias rho_out..w_out across substeps
-        if rho0_c.data_ptr() == rho_a.data_ptr():
+        # Ping-pong 3 banks so rho0_c..w0_c, scratch bank2, and rho_out..w_out never alias
+        ptr0 = rho0_c.data_ptr()
+        if ptr0 == rho_a.data_ptr():
             rho_out, Thm_out, u_out, v_out, w_out = rho_b, Thm_b, u_b, v_b, w_b
+            rho_b2, Thm_b2, u_b2, v_b2, w_b2 = rho_c_ws, Thm_c_ws, u_c_ws, v_c_ws, w_c_ws
+        elif ptr0 == rho_b.data_ptr():
+            rho_out, Thm_out, u_out, v_out, w_out = rho_a, Thm_a, u_a, v_a, w_a
+            rho_b2, Thm_b2, u_b2, v_b2, w_b2 = rho_c_ws, Thm_c_ws, u_c_ws, v_c_ws, w_c_ws
         else:
             rho_out, Thm_out, u_out, v_out, w_out = rho_a, Thm_a, u_a, v_a, w_a
+            rho_b2, Thm_b2, u_b2, v_b2, w_b2 = rho_b, Thm_b, u_b, v_b, w_b
 
         qn_c = q_n.contiguous() if q_n is not None else (q_load - 1.0).contiguous()
         qp_c = q_p.contiguous() if q_p is not None else ws.setdefault("fy_zero", torch.zeros_like(rho0_c))
@@ -1835,20 +1842,27 @@ def run_crm_rk3_hevi_metal(
         n_ac1 = max(1, int(_math.ceil(rk_taus[1] / max(dt_ac_max, 0.1))))
         n_ac2 = max(1, int(_math.ceil(rk_taus[2] / max(dt_ac_max, 0.1))))
         if dev.type == "mps" and n_ac0 <= 63 and n_ac1 <= 63 and n_ac2 <= 63:
-            # Single-launch low-register (`d_star[64]` only) 3-stage WS-RK3 + HEVI kernel
-            # reusing block-contiguous L2-hot stage slab across all 3 stages.
+            # Full-occupancy single-launch multi-substep 3-stage WS-RK3 + HEVI kernel
+            # with direct 3-bank ping-pong, 1-float4 Backward read, and cached inv_dz_c/inv_dz_w.
             if "stage_buf_bc" not in ws:
                 ws["stage_buf_bc"] = torch.empty((n_tg, nz, 4, 64, 4), device=dev, dtype=torch.float32)
             stage_buf = ws["stage_buf_bc"]
-            u_fused = [nz, n_col, nx, (int(dz_cols) << 18) | (n_ac0 << 12) | (n_ac1 << 6) | n_ac2]
-            f_fused1 = [float(dt_dyn), float(beta_hevi), float(gravity), 0.0]
+            dz_ptr = dzc_c.data_ptr()
+            if ws.get("inv_dz_ptr") != dz_ptr or ws.get("inv_dz_ver") != getattr(dzc_c, "_version", 0):
+                ws["inv_dz_c"] = (1.0 / dzc_c).contiguous()
+                ws["inv_dz_w"] = (1.0 / dzw_c).contiguous()
+                ws["inv_dz_ptr"] = dz_ptr
+                ws["inv_dz_ver"] = getattr(dzc_c, "_version", 0)
+            u_fused0 = [nz, n_col, nx, (int(dz_cols) << 18) | (n_ac0 << 12) | (n_ac1 << 6) | n_ac2]
+            f_fused1 = [float(dt_dyn), float(beta_hevi), float(gravity), float(max(int(n_sub_grp), 1))]
             lib.crm_2d_rk3_stage_fused_simd(
                 rho0_c, Thm0_c, u0_c, v0_c, w0_c,
                 rho_out, Thm_out, u_out, v_out, w_out,
+                rho_b2, Thm_b2, u_b2, v_b2, w_b2,
                 qn_c, qp_c, du_s_c, dv_s_c, dw_s_c, tTh_c,
-                dzc_c, dzw_c, spc_c, spw_c,
+                ws["inv_dz_c"], ws["inv_dz_w"], spc_c, spw_c,
                 stage_buf, fx_acc, fz_acc,
-                u_fused, f_prep0, f_fused1,
+                u_fused0, f_prep0, f_fused1,
                 threads=grid_64, group_size=(64,),
             )
             return rho_out, Thm_out, u_out, v_out, w_out, fx_acc, ws["fy_zero"], fz_acc

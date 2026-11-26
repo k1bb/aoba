@@ -3570,15 +3570,16 @@ kernel void scvt_rk3_prep_cell(
     device const float* k_slope_top [[buffer(13)]],  // [nc]
     device float* pres_s            [[buffer(14)]],  // [nz, nc]
     device float* dp_dThm_s         [[buffer(15)]],  // [nz, nc]
-    device float* thm_s             [[buffer(16)]],  // [nz, nc]
-    device float* rtot_s            [[buffer(17)]],  // [nz, nc]
-    device float* ke_cell           [[buffer(18)]],  // [nz, nc]
-    device float* u_dot_gradz_s     [[buffer(19)]],  // [nz-1, nc]
-    device float* hevi_out          [[buffer(20)]],  // [6, nz-1, nc]: rho_dw, rtot_w, thm_w, dl, inv_piv, cp
-    device float* p_cell_out        [[buffer(21)]],  // [nz, nc]
-    constant ulong4& u_dim          [[buffer(22)]],  // [nz, nc, ne, same_thm0]
-    constant float4& f_p0           [[buffer(23)]],  // [p_ref, r_d, gamma_d, gravity]
-    constant float4& f_p1           [[buffer(24)]],  // [dt_ac, beta_hevi, 0, 0]
+    device float* q_odz_out         [[buffer(16)]],  // [nz, nc]
+    device float* thm_s             [[buffer(17)]],  // [nz, nc]
+    device float* rtot_s            [[buffer(18)]],  // [nz, nc]
+    device float* ke_cell           [[buffer(19)]],  // [nz, nc]
+    device float* u_dot_gradz_s     [[buffer(20)]],  // [nz-1, nc]
+    device float* hevi_out          [[buffer(21)]],  // [7, nz-1, nc]: rdw, rdw/rtw, thw, dl, inv_piv, cp, 1/dz_w
+    device float* p_cell_out        [[buffer(22)]],  // [nz, nc]
+    constant ulong4& u_dim          [[buffer(23)]],  // [nz, nc, ne, same_thm0]
+    constant float4& f_p0           [[buffer(24)]],  // [p_ref, r_d, gamma_d, gravity]
+    constant float4& f_p1           [[buffer(25)]],  // [dt_ac, beta_hevi, 0, 0]
     uint c                          [[thread_position_in_grid]]
 ) {
     uint nz = uint(u_dim.x);
@@ -3601,11 +3602,12 @@ kernel void scvt_rk3_prep_cell(
     uint n_int = nz - 1u;
     uint int_stride = n_int * nc;
     device float* o_rdw = hevi_out;
-    device float* o_rtw = hevi_out + int_stride;
+    device float* o_rr  = hevi_out + int_stride;
     device float* o_thw = hevi_out + 2u * int_stride;
     device float* o_dl  = hevi_out + 3u * int_stride;
     device float* o_inv = hevi_out + 4u * int_stride;
     device float* o_cp  = hevi_out + 5u * int_stride;
+    device float* o_idw = hevi_out + 6u * int_stride;
 
     uint c6 = c * 6u;
     int e_idx[6];
@@ -3647,9 +3649,10 @@ kernel void scvt_rk3_prep_cell(
 
         pres_s[idx] = p_v;
         dp_dThm_s[idx] = dp_v;
+        q_odz_out[idx] = q_odz;
         thm_s[idx] = thm_v;
         rtot_s[idx] = rtot_v;
-        p_cell_out[idx] = same_thm0 ? p_v : (p_v + dp_v * (Thm0[idx] - T_v));
+        p_cell_out[idx] = same_thm0 ? p_v : fma(dp_v, Thm0[idx] - T_v, p_v);
 
         uint ke_base = k * ne;
         float ke_sum = 0.0f;
@@ -3676,13 +3679,15 @@ kernel void scvt_rk3_prep_cell(
             float rdw = 0.5f * (rho_prev + rho_v);
             float rtw = max(0.5f * (rtot_prev + rtot_v), 1.0e-5f);
             float thw = 0.5f * (thm_prev + thm_v);
+            float inv_dz_w = 1.0f / dz_w_int[midx];
+            float rdw_ov_rtw = rdw / rtw;
             o_rdw[midx] = rdw;
-            o_rtw[midx] = rtw;
+            o_rr[midx]  = rdw_ov_rtw;
             o_thw[midx] = thw;
+            o_idw[midx] = inv_dz_w;
 
-            float dz_w = dz_w_int[midx];
-            float fac_p = bdt2 * (rdw / (rtw * dz_w));
-            float fac_g = bdt2 * (0.5f * gravity * (rdw / rtw));
+            float fac_p = bdt2 * (rdw_ov_rtw * inv_dz_w);
+            float fac_g = bdt2 * (0.5f * gravity * rdw_ov_rtw);
             float c_dn = dp_prev;
             float c_up = dp_v;
 
@@ -3737,14 +3742,10 @@ kernel void scvt_rk3_prep_edge(
     device const float* rot_acc     [[buffer(13)]],  // [nz, ne]
     device const float* visc_u      [[buffer(14)]],  // [nz, ne]
     device const float* du_ext      [[buffer(15)]],  // [nz, ne]
-    device float* m_edge            [[buffer(16)]],  // [nz, ne]
-    device float* thm_e             [[buffer(17)]],  // [nz, ne]
-    device float* rtot_e            [[buffer(18)]],  // [nz, ne]
-    device float* fac_z0            [[buffer(19)]],  // [nz, ne]
-    device float* fac_z1            [[buffer(20)]],  // [nz, ne]
-    device float* tend_u_slow       [[buffer(21)]],  // [nz, ne]
-    constant ulong4& u_dim          [[buffer(22)]],  // [nz, nc, ne, 0]
-    constant float4& f_par          [[buffer(23)]],  // [gravity, dtau_stage, 0, 0]
+    device float4* edge_c4          [[buffer(16)]],  // [nz, ne]: (fz0/(rtot*dc), fz1/(rtot*dc), m_edge, thm_e)
+    device float* tend_u_slow       [[buffer(17)]],  // [nz, ne]
+    constant ulong4& u_dim          [[buffer(18)]],  // [nz, nc, ne, 0]
+    constant float4& f_par          [[buffer(19)]],  // [gravity, dtau_stage, 0, 0]
     uint gid                        [[thread_position_in_grid]]
 ) {
     uint nz = uint(u_dim.x);
@@ -3757,8 +3758,10 @@ kernel void scvt_rk3_prep_edge(
 
     uint k = gid / ne;
     uint e = gid - k * ne;
-    uint i0 = k * nc + uint(c0[e]);
-    uint i1 = k * nc + uint(c1[e]);
+    uint cell0 = uint(c0[e]);
+    uint cell1 = uint(c1[e]);
+    uint i0 = k * nc + cell0;
+    uint i1 = k * nc + cell1;
 
     float u_v = u_s[gid];
     float sgn_u = (u_v > 0.0f) ? 1.0f : ((u_v < 0.0f) ? -1.0f : 0.0f);
@@ -3770,18 +3773,18 @@ kernel void scvt_rk3_prep_edge(
     float p0 = max(pres_s[i0], 0.1f);
     float p1 = max(pres_s[i1], 0.1f);
     float dz10 = z_c[i1] - z_c[i0];
+    float idc = inv_dc[e];
 
-    m_edge[gid] = 0.5f * (m_s[i0] + m_s[i1]);
-    thm_e[gid] = 0.5f * (th0 + th1) - 0.15f * sgn_u * (th1 - th0);
-    rtot_e[gid] = max(0.5f * (rt0 + rt1), 1.0e-5f);
-    fac_z0[gid] = exp(-0.5f * (rt0 * gravity / p0) * dz10);
-    fac_z1[gid] = exp(0.5f * (rt1 * gravity / p1) * dz10);
+    float m_edge_v = 0.5f * (m_s[i0] + m_s[i1]);
+    float thm_e_v = 0.5f * (th0 + th1) - 0.15f * sgn_u * (th1 - th0);
+    float inv_rtot_dc = idc / max(0.5f * (rt0 + rt1), 1.0e-5f);
+    float fz0_sc = exp(-0.5f * (rt0 * gravity / p0) * dz10) * inv_rtot_dc;
+    float fz1_sc = exp( 0.5f * (rt1 * gravity / p1) * dz10) * inv_rtot_dc;
+    edge_c4[gid] = float4(fz0_sc, fz1_sc, m_edge_v, thm_e_v);
 
-    float grad_ke = (ke_cell[i1] - ke_cell[i0]) * inv_dc[e];
+    float grad_ke = (ke_cell[i1] - ke_cell[i0]) * idc;
 
     float vadv = 0.0f;
-    uint cell0 = uint(c0[e]);
-    uint cell1 = uint(c1[e]);
     if (k + 1u < nz) {
         uint midx0 = k * nc + cell0;
         uint midx1 = k * nc + cell1;
@@ -7342,7 +7345,7 @@ def run_scvt_rk3_prep_metal(
     beta_hevi: float,
     dtau_stage: float = 0.0,
 ) -> tuple[torch.Tensor, ...]:
-    """Fused GPU SCVT RK3 stage prep + Thomas HEVI factorization (`scvt_rk3_prep_cell` + `scvt_rk3_prep_edge`)."""
+    """Fused GPU SCVT RK3 stage prep (`scvt_rk3_prep_cell` SoA + `scvt_rk3_prep_edge` float4)."""
     nz, nc = m_s.shape
     ne = int(u_s.shape[1])
     dev = m_s.device
@@ -7356,19 +7359,16 @@ def run_scvt_rk3_prep_metal(
         ws = {
             "pres_s": torch.empty((nz, nc), device=dev, dtype=dtype),
             "dp_dThm_s": torch.empty((nz, nc), device=dev, dtype=dtype),
+            "q_odz": torch.empty((nz, nc), device=dev, dtype=dtype),
             "thm_s": torch.empty((nz, nc), device=dev, dtype=dtype),
             "rtot_s": torch.empty((nz, nc), device=dev, dtype=dtype),
             "ke_cell": torch.empty((nz, nc), device=dev, dtype=dtype),
             "u_dot_gradz_s": torch.empty((nz - 1, nc), device=dev, dtype=dtype),
-            "hevi_c": torch.empty((6, nz - 1, nc), device=dev, dtype=dtype),
+            "hevi_c": torch.empty((7, nz - 1, nc), device=dev, dtype=dtype),
             "p_cell": torch.empty((nz, nc), device=dev, dtype=dtype),
             "k_slope_top": torch.empty((nc,), device=dev, dtype=torch.float32),
             "k_slope_ptr": -1,
-            "m_edge": torch.empty((nz, ne), device=dev, dtype=dtype),
-            "thm_e": torch.empty((nz, ne), device=dev, dtype=dtype),
-            "rtot_e": torch.empty((nz, ne), device=dev, dtype=dtype),
-            "fac_z0": torch.empty((nz, ne), device=dev, dtype=dtype),
-            "fac_z1": torch.empty((nz, ne), device=dev, dtype=dtype),
+            "edge_c4": torch.empty((nz, ne, 4), device=dev, dtype=dtype),
             "tend_u_slow": torch.empty((nz, ne), device=dev, dtype=dtype),
         }
         _SCVT_PREP_WS_CACHE[ws_key] = ws
@@ -7384,6 +7384,7 @@ def run_scvt_rk3_prep_metal(
 
     pres_s = ws["pres_s"]
     dp_dThm_s = ws["dp_dThm_s"]
+    q_odz = ws["q_odz"]
     thm_s = ws["thm_s"]
     rtot_s = ws["rtot_s"]
     ke_cell = ws["ke_cell"]
@@ -7400,19 +7401,15 @@ def run_scvt_rk3_prep_metal(
         m_s.contiguous(), Thm_s_c, Thm0_c, u_s.contiguous(),
         dz_c.contiguous(), dz_w_int.contiguous(), q_load.contiguous(),
         zw_c, sponge_w.reshape(-1).contiguous(), k_slope_top,
-        pres_s, dp_dThm_s, thm_s, rtot_s, ke_cell,
-        u_dot_gradz_s, hevi_c, p_cell,
+        pres_s, dp_dThm_s, q_odz, thm_s, rtot_s, ke_cell, u_dot_gradz_s,
+        hevi_c, p_cell,
         u_dim,
         [float(C.P_REF), float(C.R_D), float(C.GAMMA_D), float(C.GRAVITY)],
         [float(dt_ac), float(beta_hevi), 0.0, 0.0],
         threads=nc,
     )
 
-    m_edge = ws["m_edge"]
-    thm_e = ws["thm_e"]
-    rtot_e = ws["rtot_e"]
-    fac_z0 = ws["fac_z0"]
-    fac_z1 = ws["fac_z1"]
+    edge_c4 = ws["edge_c4"]
     tend_u_slow = ws["tend_u_slow"]
 
     dtau_v = float(dtau_stage) if float(dtau_stage) > 0.0 else float(dt_ac)
@@ -7421,13 +7418,12 @@ def run_scvt_rk3_prep_metal(
         m_s.contiguous(), thm_s, rtot_s, pres_s, z_c.contiguous(), ke_cell,
         u_s.contiguous(), w_s.contiguous(), u_dot_gradz_s, dz_w_e.contiguous(),
         rot_acc.contiguous(), visc_u.contiguous(), du_ext.contiguous(),
-        m_edge, thm_e, rtot_e, fac_z0, fac_z1, tend_u_slow,
+        edge_c4, tend_u_slow,
         u_dim, [float(C.GRAVITY), dtau_v, 0.0, 0.0],
         threads=nz * ne,
     )
     return (
-        pres_s, dp_dThm_s, m_edge, thm_e, rtot_e, fac_z0, fac_z1,
-        u_dot_gradz_s, tend_u_slow, hevi_c, p_cell, k_slope_top,
+        edge_c4, pres_s, dp_dThm_s, q_odz, hevi_c, p_cell, k_slope_top, u_dot_gradz_s, tend_u_slow,
     )
 
 

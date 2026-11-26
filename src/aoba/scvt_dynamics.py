@@ -894,14 +894,13 @@ def _step_scvt_rk3_hevi_impl(
 
         n_ac = max(1, int(math.ceil(dtau / dt_ac_max)))
         dt_ac = dtau / float(n_ac)
-        hevi_c_pre: torch.Tensor | None = None
-        p_cell_pre: torch.Tensor | None = None
-        k_slope_top_pre: torch.Tensor | None = None
+        edge_c4 = q_odz = hevi_c_pre = p_cell_pre = k_slope_top_pre = None
+        pres_s = dp_dThm_s = m_edge = thm_e = rtot_e = fac_z0 = fac_z1 = None
         rho_dw = rtot_w = thm_w = dl = diag = du = None
         if can_use_crm_metal(m_s):
             (
-                pres_s, dp_dThm_s, m_edge, thm_e, rtot_e, fac_z0, fac_z1,
-                u_dot_gradz_s, tend_u_slow, hevi_c_pre, p_cell_pre, k_slope_top_pre,
+                edge_c4, pres_s, dp_dThm_s, q_odz, hevi_c_pre, p_cell_pre, k_slope_top_pre,
+                u_dot_gradz_s, tend_u_slow,
             ) = dispatch_scvt_rk3_prep_metal(
                 mesh,
                 m_s=m_s, Thm_s=Thm_s, Thm0=Thm0, u_s=u_s, w_s=w_s,
@@ -983,40 +982,21 @@ def _step_scvt_rk3_hevi_impl(
                 u0=u0,
                 w0=w0,
                 udotz0=udotz0,
+                edge_c4=edge_c4,
                 pres_s=pres_s,
                 dp_dThm_s=dp_dThm_s,
-                Thm_ref=Thm_s,
-                fac_z0=fac_z0,
-                fac_z1=fac_z1,
-                rtot_e=rtot_e,
-                dc_e=dc_e,
+                q_odz=q_odz,
+                hevi_c=hevi_c_pre,
+                p_cell_init=p_cell_pre,
+                k_slope_top=k_slope_top_pre,
                 tend_u_slow=tend_u_slow,
                 tend_Thm_slow=tend_Thm_slow,
                 sponge_c=sponge_c,
                 sponge_w=sponge_w,
                 area_e=area_e,
                 zw_slope_e=zw_slope_e,
-                dv_edge=mesh.dv_edge,
-                area_cell=mesh.area_cell,
-                edges_on_cell=mesh.edges_on_cell,
-                edge_sign_on_cell=mesh.edge_sign_on_cell,
-                c0=c0,
-                c1=c1,
-                m_edge=m_edge,
-                thm_e=thm_e,
-                rho_dw=rho_dw,
-                rtot_w=rtot_w,
-                thm_w=thm_w,
-                dz_c=dz_c,
-                dz_w_int=dz_w_int,
-                q_load=q_load,
-                dl=dl,
-                diag=diag,
-                du=du,
+                Thm_ref=Thm_s,
                 mesh=mesh,
-                hevi_c_pre=hevi_c_pre,
-                p_cell_pre=p_cell_pre,
-                k_slope_top_pre=k_slope_top_pre,
             )
         else:
             m_k = m0
