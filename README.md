@@ -19,7 +19,7 @@
 - **Emergence from Minimal Geographic Constraints**: Aside from surface topography/bathymetry (`Earth2014`) and optional climatological ozone, AOBA uses no spatially mapped boundary lookup tables; climate zones, terrestrial ecosystems, wildfires, mineral dust, marine ecosystems, cloud regimes, ocean circulation, and gravity-wave spectra emerge from universal equations and global parameters.
 - **Unified Multi-Scale Framework & Identical Host–Child Dynamics**: Both superparameterized multi-decadal climate runs (`enable_superparam = true`) and direct cloud-resolving simulations (`enable_superparam = false`) execute within one codebase. The global host (parent) and embedded CRM (child) solve the exact same flux-form compressible nonhydrostatic Euler equations on orthogonal Arakawa C-grids with Charney–Phillips vertical staggering, RK3-HEVI integration, Zalesak FCT transport, and shared physics.
 - **Automatic Resolution-Aware Scaling & Hardware Portability (Laptop to HPC)**: Resolution-dependent physical and numerical operators (subgrid LWC-variance microphysics, biharmonic hyperviscosity, divergence damping, Hallberg scale-aware GM90, Smagorinsky mixing, CFL substeps) scale automatically from active mesh geometry. Automatic accelerator dispatch (`cuda` → `mps` → `cpu`), **101 single-source fused Metal/CUDA kernels**, and automatic CUDA Graphs enable high throughput across Apple Silicon laptops, cloud GPUs, and supercomputing clusters (such as JAMSTEC ES4 A100s).
-- **Open, Readable, Bilingual Scientific Software & Interactive Workbench**: Written in clean, type-annotated, literature-cited Python with zero gated datasets, a single centralized 322-parameter TOML registry, synchronized English/Japanese textbook documentation, and the interactive `AOBA Studio` Web GUI.
+- **Open, Readable, Bilingual Scientific Software & Interactive Workbench**: Written in clean, type-annotated, literature-cited Python with zero gated datasets, a single centralized 323-parameter TOML registry, synchronized English/Japanese textbook documentation, and the interactive `AOBA Studio` Web GUI.
 
 ## Core Design Principles
 
@@ -35,7 +35,7 @@
 
 3. **Selectable Radiation (`four_band` / `ckd` / `ckd_hd` / `rrtmgp` + 3D-TICA) & Cloud Microphysics (`one_moment` / `two_moment` / `six_class_2m`)**:
    - **Radiative Transfer**: Four unified schemes under `rad_scheme`: analytical 4-band (`four_band`), 16-band 50 $g$-point Correlated-$k$ (`ckd`), 111 $g$-point high-detail CKD (`ckd_hd`), and official 240 $g$-point HITRAN / MT\_CKD 4.1 **RRTMGP** (`rrtmgp`, 128 LW + 112 SW; Pincus et al., 2019), with optional 3D Tilted Independent Column Approximation (`enable_rad_3d_tica`; Várnai & Davies, 1999) and interactive aerosol/dust/cloud/$\mathrm{O}_3$ radiative coupling.
-   - **Cloud Microphysics & Lightning**: Three selectable schemes under `microphysics_scheme` — 1-moment mixed-phase (`one_moment`; Khairoutdinov & Randall, 2003), 2-moment cloud liquid/ice (`two_moment`), and full 6-class 2-moment (`six_class_2m`: vapor, cloud liquid/ice, rain, snow, graupel; Morrison et al., 2005; Seifert & Beheng, 2006) — with map-free natural sea-salt/sulfate/dust CCN & INP activation and non-inductive subcolumn lightning & $\mathrm{LNO}_x$ (`src/aoba/lightning.py`; McCaul et al., 2009).
+   - **Cloud Microphysics & Selectable Lightning**: Three selectable schemes under `microphysics_scheme` — 1-moment mixed-phase (`one_moment`; Khairoutdinov & Randall, 2003), 2-moment cloud liquid/ice (`two_moment`), and full 6-class 2-moment (`six_class_2m`: vapor, cloud liquid/ice, rain, snow, graupel; Morrison et al., 2005; Seifert & Beheng, 2006) — with map-free natural sea-salt/sulfate/dust CCN & INP activation and selectable non-inductive lightning & $\mathrm{LNO}_x$ (`lightning_scheme = "diagnostic"` in `src/aoba/lightning.py` or SCALE-LT-class `"explicit_bulk"` 5-species charge/Poisson/discharge in `src/aoba/lightning_explicit.py`; McCaul et al., 2009; Takahashi, 1978; Sato et al., 2019).
 
 4. **PFT-Free Two-Leaf $\mathrm{C}_3/\mathrm{C}_4$ EEO Biosphere, MAML Subgrid Land/Lakes, C/N Permafrost, Wildfire, & River Routing**:
    - **Autonomous EEO Vegetation & Thermal Acclimation (`src/aoba/biosphere.py`)**: Non-rectangular-hyperbola optimality photosynthesis ($V_{c\max 25}, J_{\max 25}, V_{p\max 25}, R_{25}$), three-pillar thermal acclimation ($T_{\mathrm{growth}}, T_{\mathrm{home}}$), closed-form sunlit/shaded two-leaf partitioning, discrete-crown clumping and optimal leaf orientation, climate-adapted soil-moisture optimality $\tau(D_{\max})$, drought-bridging root-zone capacity $S_R$, autonomous evergreen/deciduous habit $f_{\mathrm{evg}}$ with winter frost damage, Lambert-$W_0$ prognostic LAI, and vascular canopy height $h_c$ coupled to analytical Roughness Sublayer (RSL) similarity (de Pury & Farquhar, 1997; Prentice et al., 2014; Smith et al., 2019; Scott & Smith, 2022; Wang et al., 2023; Schneider et al., 2025; Zhou et al., 2025).
@@ -50,9 +50,9 @@
    - **Prognostic 3D Ozone & Natural Aerosols**: Four ozone modes (`rcemip`, `latitude_seasonal`, `climatology`, `prognostic` 3D Chapman + $\mathrm{HO}_x/\mathrm{NO}_x/\mathrm{ClO}_x$/PSC photochemistry + Brewer–Dobson transport; `src/aoba/ozone_chemistry.py`), 4-species natural aerosols (sea salt, FlexPFT-coupled DMS/$\mathrm{SO}_4$, wildfire BC/OC, BVOC-SOA; `src/aoba/aerosols.py`), map-free mineral dust (`src/aoba/dust.py`), snow BC/dust darkening, and stable water isotopes ($\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$; `src/aoba/water_isotopes.py`).
    - **Optional Emission-Driven, Paleoclimate, & Exoplanet Switches**: Selectable $\mathrm{CO}_2$ modes (`constant` / `scenario` / `csv` / `prognostic` 3D transport), prognostic $\mathrm{CH}_4/\mathrm{N}_2\mathrm{O}$ (`src/aoba/trace_gas_cycle.py`), volcanic/solar forcing (`src/aoba/volcanic_solar.py`), silicate weathering & Milankovitch orbital evolution (`src/aoba/planetary_geochem.py`), accelerated Glen-law SIA dynamic ice sheets (`src/aoba/icesheet.py`), and exoplanet presets (`earth`, `proxima_b`, `trappist_1e`, `mars_early`; `src/aoba/planetary_presets.py`).
 
-7. **101 Single-Source Fused Metal / CUDA Kernels, Universal Grid Remapping, & Centralized 322-Parameter `AOBA Studio`**:
+7. **101 Single-Source Fused Metal / CUDA Kernels, Universal Grid Remapping, & Centralized 323-Parameter `AOBA Studio`**:
    - **Single-Source GPU Backend**: All **101 fused GPU kernels** across `kernels.py`, `kernels_extra.py`, `kernels_physics.py`, and `kernels_esm.py` execute natively on Apple Silicon (`mps` Metal shaders) and NVIDIA GPUs (`cuda` via deterministic Metal→CUDA C++17 transpilation in `src/aoba/kernels_cuda.py`), with automatic CUDA Graph capture/replay (`src/aoba/runtime.py`) and zero mid-step CPU–GPU synchronizations.
-   - **Centralized Registry, Presets, & Diagnostics**: All **322 global parameters across 14 sections** live in [`config/aoba_default.toml`](config/aoba_default.toml) with 100% bilingual documentation (`src/aoba/param_docs.py`), **11 ready-to-run presets** in `config/presets/`, universal cross-grid restart remapping (`AG4 → AG6`, arbitrary `nz`/`ocean_glevel`), 30-class Köppen–Geiger diagnostics (`src/aoba/koppen.py`), CMIP7 Data Request v1.2 output (`src/aoba/cmip7_diag.py`), and the bilingual `AOBA Studio` Web workbench (`scripts/aoba_config_gui.py`).
+   - **Centralized Registry, Presets, & Diagnostics**: All **323 global parameters across 14 sections** live in [`config/aoba_default.toml`](config/aoba_default.toml) with 100% bilingual documentation (`src/aoba/param_docs.py`), **11 ready-to-run presets** in `config/presets/`, universal cross-grid restart remapping (`AG4 → AG6`, arbitrary `nz`/`ocean_glevel`), 30-class Köppen–Geiger diagnostics (`src/aoba/koppen.py`), CMIP7 Data Request v1.2 output (`src/aoba/cmip7_diag.py`), and the bilingual `AOBA Studio` Web workbench (`scripts/aoba_config_gui.py`).
 
 8. **Single-Precision (`float32`) Design Rationale & Numerical Safeguards**:
    - **Why `float32`?**: Consumer/laptop GPUs (Apple Silicon `mps`, lacking native `float64`) and mainstream cloud GPUs severely restrict FP64 throughput; native `float32` doubles effective memory bandwidth across PDE solvers.
@@ -65,7 +65,7 @@ aoba/
 ├── README.md                 # Project overview (English)
 ├── README_ja.md              # Project overview (Japanese)
 ├── config/
-│   ├── aoba_default.toml     # Centralized 322-parameter TOML registry (14 sections)
+│   ├── aoba_default.toml     # Centralized 323-parameter TOML registry (14 sections)
 │   └── presets/              # 11 ready-to-run experiment presets (Mac to ES4/A100 Flagship)
 ├── docs/
 │   ├── architecture.md       # System architecture & literature traceability (EN/JA)
@@ -75,7 +75,7 @@ aoba/
 │   └── assets/               # Icon & 7 schematic SVG diagrams
 ├── data/                     # Local Earth2014 topography/bathymetry & validation caches
 ├── src/
-│   └── aoba/                 # PyTorch + 101 single-source Metal/CUDA modules (55 files)
+│   └── aoba/                 # PyTorch + 101 single-source Metal/CUDA modules (56 files)
 ├── tests/                    # 27 unit, conservation, kernel & OSSP test suites (CPU/MPS/CUDA)
 ├── scripts/                  # Coupled runners, offline OGCM accelerator, GUI & plotting tools
 ├── notebooks/                # Colab A100/H100 auto-resume notebook

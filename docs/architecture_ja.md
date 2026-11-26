@@ -43,9 +43,9 @@ AOBA は以下の 2 つの地球システム科学上の基本問題を検証し
 - **主要文献**: Toon et al. (1989); Lacis & Hansen (1974); Slingo (1989); Ebert & Curry (1992); Hu & Stamnes (1993); Cahalan et al. (1994); Chou et al. (1999); Várnai & Davies (1999); Sekiguchi & Nakajima (2008); Pincus et al. (2019); Mlawer et al. (2023).
 - **統一選択スキーム**: 単一の 2 ストリーム三重対角インタフェース上で 4 スキームを切替可能です：① `"four_band"`（高速解析 4 バンド）、② `"ckd"`（16 バンド 50 g点 Correlated-$k$）、③ `"ckd_hd"`（111 g点高精細 CKD ＋ Chou 長波雲散乱 ＋ 5 種エアロゾル）、④ `"rrtmgp"`（公式 240 g点 HITRAN / MT\_CKD 4.1：LW 128 + SW 112）。`enable_rad_3d_tica = true` により雲側面入射・遮蔽を表現する 3D 傾斜独立コラム近似（3D-TICA）を有効化できます。
 
-### 4.2 雲微物理と発雷（`microphysics_scheme`, `src/aoba/microphysics*.py`, `src/aoba/lightning.py`）
-- **主要文献**: Khairoutdinov & Randall (2003); Khairoutdinov & Kogan (2000); Morrison et al. (2005); Seifert & Beheng (2006); Morrison & Gettelman (2008); DeMott et al. (2010); Boutle et al. (2014); McCaul et al. (2009); Price & Rind (1993); Schumann & Huntrieser (2007).
-- **選択スキーム**: `"one_moment"`（2 変数診断混相）、`"two_moment"`（雲水・雲氷数濃度 $n_c, n_i$ 予報、海塩/硫酸塩/ダスト CCN・INP 活性化、解像度依存 KK00 LWC 分散スケーリング）、および `"six_class_2m"`（水蒸気・雲水・雲氷・雨・雪・霰の完全 6 クラス 2 モーメント）。サブコラム氷–霰衝突帯電から IC/CG 発雷率および質量保存型 $\mathrm{LNO}_x$ 生成を診断し、オゾン化学および陸域・海洋窒素循環へ結合します。
+### 4.2 雲微物理と選択制発雷（`microphysics_scheme`, `lightning_scheme`, `src/aoba/microphysics*.py`, `src/aoba/lightning*.py`）
+- **主要文献**: Khairoutdinov & Randall (2003); Khairoutdinov & Kogan (2000); Morrison et al. (2005); Seifert & Beheng (2006); Morrison & Gettelman (2008); DeMott et al. (2010); Boutle et al. (2014); McCaul et al. (2009); Price & Rind (1993); Schumann & Huntrieser (2007); Takahashi (1978); Chiu (1978); Dwyer (2003); Fierro et al. (2013); Sato et al. (2019).
+- **選択スキーム**: `"one_moment"`（2 変数診断混相）、`"two_moment"`（雲水・雲氷数濃度 $n_c, n_i$ 予報、海塩/硫酸塩/ダスト CCN・INP 活性化、解像度依存 KK00 LWC 分散スケーリング）、および `"six_class_2m"`（水蒸気・雲水・雲氷・雨・雪・霰の完全 6 クラス 2 モーメント）。発雷（`lightning_scheme`）は高速な `"diagnostic"` 非誘導帯電診断（`src/aoba/lightning.py`）と、任意の SCALE-LT 相当 `"explicit_bulk"` 5 種水物質電荷予報＋FFT・Thomas 厳密ポアソン電場＋絶縁破壊 IC/CG 放電スキーム（`src/aoba/lightning_explicit.py`）を選択でき、質量保存型 $\mathrm{LNO}_x$ 生成をオゾン化学および陸域・海洋窒素循環へ結合します。
 
 ---
 
@@ -83,7 +83,7 @@ AOBA は以下の 2 つの地球システム科学上の基本問題を検証し
 
 ---
 
-## 8. 322 パラメータ一元管理・101 カーネル Metal/CUDA バックエンド・標準診断
+## 8. 323 パラメータ一元管理・101 カーネル Metal/CUDA バックエンド・標準診断
 
-- **統合 TOML と `AOBA Studio`（`src/aoba/params.py`, `src/aoba/param_docs.py`, `scripts/aoba_config_gui.py`）**: 全 14 セクション・**322 パラメータ**を [`config/aoba_default.toml`](../config/aoba_default.toml) に一元化し（日英 100% 物理解説）、**11 本の実験プリセット**（`config/presets/`）、任意解像度・層数間リスタート再補間（`AG4 → AG6` 等）、30 クラス Köppen–Geiger 分類（`src/aoba/koppen.py`）、および CMIP7 Data Request v1.2 準拠 Zarr v3 出力（`src/aoba/cmip7_diag.py`, `src/aoba/io_zarr.py`）を提供します。
+- **統合 TOML と `AOBA Studio`（`src/aoba/params.py`, `src/aoba/param_docs.py`, `scripts/aoba_config_gui.py`）**: 全 14 セクション・**323 パラメータ**を [`config/aoba_default.toml`](../config/aoba_default.toml) に一元化し（日英 100% 物理解説）、**11 本の実験プリセット**（`config/presets/`）、任意解像度・層数間リスタート再補間（`AG4 → AG6` 等）、30 クラス Köppen–Geiger 分類（`src/aoba/koppen.py`）、および CMIP7 Data Request v1.2 準拠 Zarr v3 出力（`src/aoba/cmip7_diag.py`, `src/aoba/io_zarr.py`）を提供します。
 - **101 カーネル単一ソース Metal/CUDA ＋ CUDA Graphs バックエンド（`src/aoba/kernels*.py`, `src/aoba/kernels_cuda.py`, `src/aoba/runtime.py`）**: SCVT RK3-HEVI 力学、2D/3D CRM、FCT 移流、1M/2M/6 クラス微物理、RRTMGP/CKD-HD/CKD/4 バンド放射、3D 予報オゾン、MYNN PBL、圧縮陸面/生態系 Newton–Raphson、MAML/湖沼/C-N/火災/発雷、ダスト/エアロゾル/水同位体、5 カテゴリー EVP-ITD 海氷、3D $z^*$ OGCM/KPP/GM/Redi/FlexPFT BGC、OGW/NGWD、および OSSP 特徴抽出・厳密保存クロージャ・空間ヘッド・アンサンブル計算を網羅する **全 101 個の融合 GPU カーネル**を Metal Shading Language で単一記述し、NVIDIA GPU 上では決定論的に CUDA C++17 へ自動トランスパイル・キャッシュするとともに、CUDA Graphs 自動キャプチャ/リプレイによりホスト CPU オーバーヘッドを排除します。

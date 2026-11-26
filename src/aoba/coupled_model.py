@@ -107,6 +107,7 @@ class AOBAConfig:
     enable_land_carbon: bool = True          # Map-free terrestrial carbon cycle, permafrost soil C, & SPITFIRE wildfire
     enable_land_nitrogen: bool = True        # Stocker & Prentice (2024) CN-model & FUN/Houlton BNF nitrogen cycle
     enable_lightning: bool = True            # Map-free CRM non-inductive charging lightning & LNOx deposition
+    lightning_scheme: str = "diagnostic"     # "diagnostic" (McCaul 2009 proxy) or "explicit_bulk" (SCALE-LT 5-species charge + Poisson + breakdown)
     enable_fire_veg_feedback: bool = True    # MAML burnt-patch crown-fire reset of EEO LAI & canopy height
     enable_seaice_evp_itd: bool = True       # MPAS-Seaice Voronoi EVP rheology + 5-category ITD
     enable_ogcm_fct_zstar: bool = True       # FESOM2-style 3D Zalesak FCT advection + exact z* coordinate
@@ -271,6 +272,7 @@ class AOBAState:
     last_sfc_diag_sub: SurfaceFluxDiagnostics | None = None  # Zero-copy ref for optional CMIP7 diagnostics
     last_s_toa: torch.Tensor | None = None                   # Zero-copy ref for TOA incident SW (`rsdt`)
     last_lightning: object | None = None                     # Latest CRM LightningDiagnostics (CG strikes + LNOx)
+    explicit_lightning: object | None = None                 # Optional ExplicitLightningState when lightning_scheme == "explicit_bulk"
     crm_distill: object | None = None                        # Optional online self-distilling 2D/3D CRM controller
     rad_distill: object | None = None                        # Optional online per-subcolumn ICA radiation controller
     sparse_crm_pool: object | None = None                    # Teacher-only full-3D CRM pool (when n_sub < n_crm in 3D)
@@ -3607,21 +3609,66 @@ def step_aoba_model(
     # 7b. Map-free CRM Non-Inductive Charging Lightning & Natural LNOx Deposition
     light_diag = None
     if bool(cfg.enable_lightning) and bool(cfg.enable_superparam):
-        from aoba.lightning import compute_crm_lightning_and_lnox
+        _lscheme = str(getattr(cfg, "lightning_scheme", "diagnostic")).strip().lower()
+        if _lscheme == "explicit_bulk":
+            from aoba.lightning_explicit import (
+                init_explicit_lightning_state,
+                step_explicit_bulk_lightning_and_lnox,
+            )
 
-        light_diag = compute_crm_lightning_and_lnox(
-            rho_d=crm.rho_d,
-            theta_m=crm.theta_m,
-            q_v=crm.q_v,
-            q_i=crm.q_i,
-            q_p=crm.q_p,
-            w_stag=crm.w,
-            z_c=atmos.z_c,
-            dz_c=atmos.dz_c,
-            area_cell=mesh.area_cell,
-            q_g_prog=getattr(crm, "q_g", None),
-            q_s_prog=getattr(crm, "q_s", None),
-        )
+            _nz_l, _nc_l, _ny_l, _nx_l = crm.rho_d.shape
+            if (
+                model.explicit_lightning is None
+                or tuple(model.explicit_lightning.q_chg.shape) != (5, _nz_l, _nc_l, _ny_l, _nx_l)
+            ):
+                model.explicit_lightning = init_explicit_lightning_state(
+                    nz=_nz_l,
+                    n_cells=_nc_l,
+                    ny=_ny_l,
+                    nx=_nx_l,
+                    device=crm.rho_d.device,
+                    dtype=crm.rho_d.dtype,
+                )
+            light_diag = step_explicit_bulk_lightning_and_lnox(
+                state=model.explicit_lightning,
+                rho_d=crm.rho_d,
+                theta_m=crm.theta_m,
+                q_v=crm.q_v,
+                q_c=crm.q_c,
+                q_i=crm.q_i,
+                q_p=crm.q_p,
+                w_stag=crm.w,
+                z_c=atmos.z_c,
+                dz_c=atmos.dz_c,
+                area_cell=mesh.area_cell,
+                dx=float(cfg.crm_dx),
+                dt=float(dt),
+                dy=float(cfg.crm_dx),
+                u_stag=getattr(crm, "u", None),
+                v_stag=getattr(crm, "v", None),
+                q_r_prog=getattr(crm, "q_r", None),
+                q_s_prog=getattr(crm, "q_s", None),
+                q_g_prog=getattr(crm, "q_g", None),
+                n_i_prog=getattr(crm, "n_i", None),
+                n_s_prog=getattr(crm, "n_s", None),
+                n_g_prog=getattr(crm, "n_g", None),
+            )
+        else:
+            from aoba.lightning import compute_crm_lightning_and_lnox
+
+            light_diag = compute_crm_lightning_and_lnox(
+                rho_d=crm.rho_d,
+                theta_m=crm.theta_m,
+                q_v=crm.q_v,
+                q_i=crm.q_i,
+                q_p=crm.q_p,
+                w_stag=crm.w,
+                z_c=atmos.z_c,
+                dz_c=atmos.dz_c,
+                area_cell=mesh.area_cell,
+                q_g_prog=getattr(crm, "q_g", None),
+                q_s_prog=getattr(crm, "q_s", None),
+            )
         model.last_lightning = light_diag
     f_dust_dep_cell = None
     if cfg.enable_dust:

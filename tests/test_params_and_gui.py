@@ -48,7 +48,7 @@ def test_toml_roundtrip_and_module_sync() -> None:
     defaults = default_config_dict()
     loaded = load_aoba_toml(toml_p)
     assert len(defaults) == 14
-    assert sum(len(v) for v in defaults.values()) == 322
+    assert sum(len(v) for v in defaults.values()) == 323
     assert set(loaded.keys()) == set(defaults.keys())
     for sec in defaults:
         assert set(loaded[sec].keys()) == set(defaults[sec].keys()), f"Key mismatch in [{sec}]"
@@ -129,7 +129,7 @@ def test_gui_server_endpoints() -> None:
             assert len(m_resp["verts_on_cell_b64"]) > 0 and len(m_resp["surf_type_b64"]) > 0
 
         state = json.loads(urllib.request.urlopen(f"{base}/api/state").read().decode("utf-8"))
-        assert state["param_count"] == 322
+        assert state["param_count"] == 323
         assert "grid" in state["config"]
 
         co2_cat = json.loads(urllib.request.urlopen(f"{base}/api/co2_catalog").read().decode("utf-8"))
@@ -525,7 +525,7 @@ def test_textbook_docs_param_coverage_and_studio_math() -> None:
         st = json.loads(urllib.request.urlopen(f"{base}/api/state").read().decode("utf-8"))
         assert set(st["param_docs"].keys()) == all_keys
         html = urllib.request.urlopen(f"{base}/").read().decode("utf-8")
-        for opt in ("ckd_hd", "rrtmgp", "six_class_2m", "prognostic", "trappist1e", "snowball_earth"):
+        for opt in ("ckd_hd", "rrtmgp", "six_class_2m", "explicit_bulk", "prognostic", "trappist1e", "snowball_earth"):
             assert f'value="{opt}"' in html, f"Missing Studio dropdown option: {opt}"
         svg_resp = urllib.request.urlopen(f"{base}/docs/assets/{svg_files[0].name}").read().decode("utf-8")
         assert "<svg" in svg_resp

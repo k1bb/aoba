@@ -2180,6 +2180,11 @@ function buildFieldRow(sec, key, skipKeys = []) {
       <option value="two_moment" ${cur==="two_moment"?"selected":""}>two_moment (標準2モーメント KK00 Nc/Ni・CCN/INP)</option>
       <option value="six_class_2m" ${cur==="six_class_2m"?"selected":""}>six_class_2m (6種2モーメント Morrison 雨・雪・霰)</option>
     </select>`;
+  } else if (key === "lightning_scheme") {
+    ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
+      <option value="diagnostic" ${cur==="diagnostic"?"selected":""}>diagnostic (高速 CRM 霰フラックス＋寒冷雲厚診断 McCaul 2009)</option>
+      <option value="explicit_bulk" ${cur==="explicit_bulk"?"selected":""}>explicit_bulk (SCALE-LT 相当 5種電荷予報・Takahashi帯電・2D/3Dポアソン放電)</option>
+    </select>`;
   } else if (key === "o3_mode") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">
       <option value="rcemip" ${cur==="rcemip"?"selected":""}>rcemip (Wing 2018 1D一様)</option>

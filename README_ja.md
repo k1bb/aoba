@@ -19,7 +19,7 @@
 - **最小限の地理的境界条件からの自律創発**: 地表面標高・海底地形（`Earth2014`）および任意のオゾン気候値を除き、空間マップ型境界データを一切使用せず、気候帯・陸域生態系・森林火災・ダスト・海洋生態系・雲・海洋循環・重力波スペクトルを普遍方程式とグローバルパラメータのみから創発させる。
 - **統一マルチスケール基盤と親・子モデルの完全同一力学**: 低解像度 SP 長期気候積分（`enable_superparam = true`）と高解像度直接雲解像計算（`enable_superparam = false`）を単一コードで実行でき、全球ホスト（親）と埋め込み CRM（子）の双方に同一のフラックス保存型完全圧縮性非静力学オイラー方程式・直交 Arakawa C-grid・Charney–Phillips 鉛直配置・RK3-HEVI・Zalesak FCT を採用する。
 - **自動解像度スケーリングとラップトップ〜スパコン貫通 GPU ポータビリティ**: 格子間隔・時間刻み依存の物理・数値パラメータ（サブグリッド LWC 分散微物理、重調和粘性、発散減衰、Hallberg スケール適応 GM90、Smagorinsky 混合、CFL サブステップ）を稼働メッシュから自動算出する。アクセラレータ自動検知（`cuda` → `mps` → `cpu`）、**全 101 個の単一ソース融合 Metal/CUDA カーネル**、および自動 CUDA Graphs により、Apple Silicon ノート PC からクラウド GPU・地球シミュレータ（ES4 A100）まで同一コードで高速実行する。
-- **オープン・可読・日英バイリンガル研究基盤**: 現代的で型注釈・文献引用付きの Python 実装、単一の 322 パラメータ TOML レジストリ、日英同期の教科書型ドキュメント、および対話型 Web ワークベンチ `AOBA Studio` を提供する。
+- **オープン・可読・日英バイリンガル研究基盤**: 現代的で型注釈・文献引用付きの Python 実装、単一の 323 パラメータ TOML レジストリ、日英同期の教科書型ドキュメント、および対話型 Web ワークベンチ `AOBA Studio` を提供する。
 
 ## 主要アーキテクチャと機能
 
@@ -35,7 +35,7 @@
 
 3. **選択式放射伝達（`four_band` / `ckd` / `ckd_hd` / `rrtmgp` ＋ 3D-TICA）と雲微物理（`one_moment` / `two_moment` / `six_class_2m`）**:
    - **放射伝達**: `rad_scheme` により解析 4 バンド（`four_band`）、16 バンド 50 g点 Correlated-$k$（`ckd`）、111 g点高精細 CKD（`ckd_hd`）、および公式 240 g点 HITRAN / MT\_CKD 4.1 **RRTMGP**（`rrtmgp`, LW 128 + SW 112；Pincus et al., 2019）を切替でき、3D 傾斜独立コラム近似（`enable_rad_3d_tica`；Várnai & Davies, 1999）およびエアロゾル・ダスト・雲・オゾン放射結合に対応します。
-   - **雲微物理と発雷**: `microphysics_scheme` により 1 モーメント混相（`one_moment`；Khairoutdinov & Randall, 2003）、2 モーメント雲水/雲氷（`two_moment`）、および 6 クラス 2 モーメント（`six_class_2m`：水蒸気・雲水・雲氷・雨・雪・霰；Morrison et al., 2005; Seifert & Beheng, 2006）を選択でき、自然海塩・硫酸塩・ダスト由来の CCN/INP 活性化およびサブコラム非誘導帯電発雷・$\mathrm{LNO}_x$ 生成（`src/aoba/lightning.py`；McCaul et al., 2009）を備えます。
+   - **雲微物理と選択制発雷**: `microphysics_scheme` により 1 モーメント混相（`one_moment`；Khairoutdinov & Randall, 2003）、2 モーメント雲水/雲氷（`two_moment`）、および 6 クラス 2 モーメント（`six_class_2m`：水蒸気・雲水・雲氷・雨・雪・霰；Morrison et al., 2005; Seifert & Beheng, 2006）を選択でき、自然海塩・硫酸塩・ダスト由来の CCN/INP 活性化および選択制非誘導帯電発雷・$\mathrm{LNO}_x$ 生成（`lightning_scheme = "diagnostic"` `src/aoba/lightning.py` または SCALE-LT 相当 `"explicit_bulk"` 5 種電荷・ポアソン電場・放電 `src/aoba/lightning_explicit.py`；McCaul et al., 2009; Takahashi, 1978; Sato et al., 2019）を備えます。
 
 4. **PFT フリー Two-Leaf $\mathrm{C}_3/\mathrm{C}_4$ EEO 生態系、MAML サブグリッド地形・湖沼、陸域 C/N 凍土、火災、河川ルーティング**:
    - **自律 EEO 植生と熱順化（`src/aoba/biosphere.py`）**: 非直角双曲線最適性光合成（$V_{c\max 25}, J_{\max 25}, V_{p\max 25}, R_{25}$）、3 本柱熱順化（$T_{\mathrm{growth}}, T_{\mathrm{home}}$）、陽葉・陰葉閉形式配分、離散樹冠クランピングと最適葉傾斜角、気候適応土壌水分応答 $\tau(D_{\max})$、最適根圏貯水容量 $S_R$、冬季凍害を含む自律常緑/落葉比率 $f_{\mathrm{evg}}$、Lambert-$W_0$ 予報 LAI、および管束水力樹冠高 $h_c$ と解析的粗度サブレイヤ（RSL）を統合します（de Pury & Farquhar, 1997; Prentice et al., 2014; Smith et al., 2019; Scott & Smith, 2022; Wang et al., 2023; Schneider et al., 2025; Zhou et al., 2025）。
@@ -50,9 +50,9 @@
    - **予報 3D オゾン・自然エアロゾル・水同位体**: 4 種のオゾンモード（`rcemip`, `latitude_seasonal`, `climatology`, `prognostic` 3D Chapman ＋ $\mathrm{HO}_x/\mathrm{NO}_x/\mathrm{ClO}_x$/PSC 光化学＋Brewer–Dobson 輸送；`src/aoba/ozone_chemistry.py`）、4 種の自然エアロゾル（海塩・FlexPFT 結合 DMS/$\mathrm{SO}_4$・火災 BC/OC・BVOC-SOA；`src/aoba/aerosols.py`）、マップ不要の鉱物ダスト（`src/aoba/dust.py`）、積雪 BC/ダスト暗色化、および安定水同位体（$\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$；`src/aoba/water_isotopes.py`）を搭載します。
    - **任意の排出量駆動・古気候・系外惑星オプション**: 選択式 $\mathrm{CO}_2$ モード（`constant` / `scenario` / `csv` / `prognostic` 3D 輸送）、予報 $\mathrm{CH}_4/\mathrm{N}_2\mathrm{O}$（`src/aoba/trace_gas_cycle.py`）、火山・太陽強制（`src/aoba/volcanic_solar.py`）、珪酸塩風化とミランコビッチ軌道変動（`src/aoba/planetary_geochem.py`）、加速 Glen 流動則 SIA 動的氷床（`src/aoba/icesheet.py`）、および惑星プリセット（`earth`, `proxima_b`, `trappist_1e`, `mars_early`；`src/aoba/planetary_presets.py`）を備えます。
 
-7. **101 個の単一ソース融合 Metal/CUDA カーネル、汎用異格子リスタート再補間、322 パラメータ一元管理 `AOBA Studio`**:
+7. **101 個の単一ソース融合 Metal/CUDA カーネル、汎用異格子リスタート再補間、323 パラメータ一元管理 `AOBA Studio`**:
    - **単一ソース GPU バックエンド**: `kernels.py`・`kernels_extra.py`・`kernels_physics.py`・`kernels_esm.py` に記述された **全 101 個の融合 GPU カーネル**が、Apple Silicon（`mps` Metal シェーダー）および NVIDIA GPU（`src/aoba/kernels_cuda.py` による決定論的 Metal→CUDA C++17 自動トランスパイル）の双方でネイティブ動作し、自動 CUDA Graphs キャプチャ/リプレイ（`src/aoba/runtime.py`）によりステップ途中の CPU–GPU 同期ゼロを実現しています。
-   - **設定管理・プリセット・標準診断**: 全 14 セクション・**322 パラメータ**を [`config/aoba_default.toml`](config/aoba_default.toml) に一元化し（日英 100% 物理解説 `src/aoba/param_docs.py`）、**11 本の即実行プリセット**（`config/presets/`）、任意解像度・層数間（例：`AG4 → AG6`）の汎用リスタート再補間、30 クラス Köppen–Geiger 気候帯診断（`src/aoba/koppen.py`）、CMIP7 Data Request v1.2 出力（`src/aoba/cmip7_diag.py`）、および対話型 Web ワークベンチ `AOBA Studio`（`scripts/aoba_config_gui.py`）を提供します。
+   - **設定管理・プリセット・標準診断**: 全 14 セクション・**323 パラメータ**を [`config/aoba_default.toml`](config/aoba_default.toml) に一元化し（日英 100% 物理解説 `src/aoba/param_docs.py`）、**11 本の即実行プリセット**（`config/presets/`）、任意解像度・層数間（例：`AG4 → AG6`）の汎用リスタート再補間、30 クラス Köppen–Geiger 気候帯診断（`src/aoba/koppen.py`）、CMIP7 Data Request v1.2 出力（`src/aoba/cmip7_diag.py`）、および対話型 Web ワークベンチ `AOBA Studio`（`scripts/aoba_config_gui.py`）を提供します。
 
 8. **単精度（`float32`）ネイティブ設計と長期保存性・数値安定性対策**:
    - **なぜ単精度ベースか**: Apple Silicon（`mps` はネイティブ `float64` 非対応）や汎用 NVIDIA GPU では倍精度演算が強く制限されます。メモリ帯域律速の流体・物理ソルバを `float32` ネイティブ化することで実効メモリ帯域を 2 倍に高め、ラップトップからクラウド GPU まで高速に実行できます。
@@ -65,7 +65,7 @@ aoba/
 ├── README.md                 # プロジェクト概要（英語）
 ├── README_ja.md              # プロジェクト概要（日本語）
 ├── config/
-│   ├── aoba_default.toml     # 322 パラメータ一元管理 TOML（14 セクション）
+│   ├── aoba_default.toml     # 323 パラメータ一元管理 TOML（14 セクション）
 │   └── presets/              # 11 本の用途別プリセット（Mac 探索〜ES4/A100 本番）
 ├── docs/
 │   ├── architecture.md       # 支配構成・根拠文献トレーサビリティ仕様書（EN/JA）
@@ -75,7 +75,7 @@ aoba/
 │   └── assets/               # アイコン ＆ 概念図 SVG 7 点
 ├── data/                     # Earth2014 地形・検証データ（ローカル専用）
 ├── src/
-│   └── aoba/                 # PyTorch + 101 融合 Metal/CUDA パッケージ（全 55 モジュール）
+│   └── aoba/                 # PyTorch + 101 融合 Metal/CUDA パッケージ（全 56 モジュール）
 ├── tests/                    # 単体・保存則・カーネル・OSSP 検証スイート（全 27 本）
 ├── scripts/                  # 結合実行・オフライン OGCM 加速・GUI・可視化ツール
 ├── notebooks/                # Colab A100/H100 自動再開ノートブック

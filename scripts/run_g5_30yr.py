@@ -350,6 +350,11 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
             if getattr(model, "lakes", None) is not None
             else None
         ),
+        "explicit_lightning": (
+            {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.explicit_lightning.__dict__.items()}
+            if getattr(model, "explicit_lightning", None) is not None
+            else None
+        ),
         "crm_distill": (
             {
                 "net_state": {k: v.detach().cpu() for k, v in model.crm_distill.net.state_dict().items()},
@@ -1066,6 +1071,15 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             model.lakes.h_ml = torch.minimum(model.lakes.h_ml, torch.clamp(model.lakes.h_cap, min=1.0))
         model.lakes.v_lake_m3 = torch.minimum(torch.clamp(model.lakes.v_lake_m3, min=0.0), model.lakes.v_cap_m3)
         update_lake_hypsometry(model.lakes, model.mesh.area_cell)
+
+    # 7b. Explicit bulk lightning charge state (exact copy on matching CRM shape; neutral reset on grid remap)
+    if ckpt.get("explicit_lightning") is not None and getattr(model, "explicit_lightning", None) is not None:
+        ck_lt = ckpt["explicit_lightning"]
+        q_old = ck_lt.get("q_chg")
+        if isinstance(q_old, torch.Tensor) and tuple(q_old.shape) == tuple(model.explicit_lightning.q_chg.shape):
+            for k, v in ck_lt.items():
+                if hasattr(model.explicit_lightning, k):
+                    setattr(model.explicit_lightning, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
 
     # 8. Land carbon & nitrogen pools (supports both cell-level and subgrid pools)
     if ckpt.get("land_carbon") is not None and model.land_carbon is not None:

@@ -270,6 +270,10 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "ja": "埋め込み CRM 上昇流・氷／霰粒子に基づく発雷頻度および雷起源 NOₓ (LNOx) 放出を有効化。",
         "en": "Enable CRM convective updraft/ice-graupel lightning flash rate and lightning NOₓ (LNOx) production.",
     },
+    "lightning_scheme": {
+        "ja": "発雷物理スキームの選択（diagnostic: 高速 CRM 霰フラックス＋寒冷雲厚診断 McCaul 2009 / Price & Rind 1993；explicit_bulk: SCALE-LT 相当の 5 水物質電荷密度予報・Takahashi 1978 温度–LWC 極性反転非誘導帯電・2D/3D FFT＋Thomas ポアソン電場解法・Fierro 2013 絶縁破壊放電・IC/CG 分離）。",
+        "en": "Lightning physics scheme selector (diagnostic: fast McCaul 2009 graupel-flux + Price & Rind 1993 cold-cloud-depth proxy; explicit_bulk: SCALE-LT-class 5-species prognostic hydrometeor charge density, Takahashi 1978 temperature–LWC polarity-reversal riming electrification, exact 2D/3D FFT+Thomas Poisson electric potential, Fierro 2013 dielectric breakdown discharge, and explicit IC/CG separation).",
+    },
     "enable_fire_veg_feedback": {
         "ja": "SPITFIRE 機構に基づく MAML パッチ山火事（発雷着火・乾燥度・植生燃焼・煙エアロゾル・CO₂ 放出）を有効化。",
         "en": "Enable SPITFIRE wildfire ignition/spread on MAML land patches with vegetation mortality and smoke/CO₂ emissions.",

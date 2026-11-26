@@ -13,7 +13,7 @@
 9. [海洋循環 (`ocean_mode`)・独立高解像海洋・波浪・EVP–ITD 海氷・FlexPFT 海洋 BGC](#9-海洋循環-ocean_mode独立高解像海洋波浪evpitd-海氷flexpft-海洋-bgc)
 10. [大気化学 (`o3_mode`)・自然/火山エアロゾル・炭素/微量気体循環 (`co2_mode`)・水安定同位体](#10-大気化学-o3_mode自然火山エアロゾル炭素微量気体循環-co2_mode水安定同位体)
 11. [動的氷床モデル・ミランコビッチ軌道進化・汎用惑星プリセット](#11-動的氷床モデルミランコビッチ軌道進化汎用惑星プリセット)
-12. [一元 322 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio](#12-一元-322-パラメータ-toml-レジストリ診断köppengeiger--cmip7zarr-v3aoba-studio)
+12. [一元 323 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio](#12-一元-323-パラメータ-toml-レジストリ診断köppengeiger--cmip7zarr-v3aoba-studio)
 
 ---
 
@@ -682,7 +682,16 @@ $$
 q_{x,k}^{n+1} = \frac{m_k q_{x,k}^n + \Delta t\,F_{x,k+1}}{m_k + \Delta t\,\rho_{d,k} v_{x,k}}, \qquad F_{x,k} = \rho_{d,k} v_{x,k} q_{x,k}^{n+1}, \qquad x\in\{r, s, g\} \tag{5.15}
 $$
 
-### 5.6 CRM 非誘導帯電落雷および $\mathrm{LNO}_x$ 窒素沈着 (`src/aoba/lightning.py`)
+### 5.6 選択制 CRM 非誘導帯電落雷および $\mathrm{LNO}_x$ スキーム (`lightning_scheme`)
+
+いずれの発雷スキームも地理ルックアップ表を一切用いず、埋め込み CRM が陽的に解像する水物質場・鉛直流場から駆動され、同一形式の `LightningDiagnostics`（サブコラム全発雷率・対地雷率および質量保存型 $\mathrm{LNO}_x$ 沈着フラックス）を SPITFIRE 火災、予報オゾン化学、および陸域・海洋窒素循環へ供給する。
+
+| `lightning_scheme` | 予報電荷変数 | 物理範囲と放電表現 | 計算コストと推奨用途 |
+| :--- | :--- | :--- | :--- |
+| `"diagnostic"` *(既定)* | なし（診断型） | McCaul et al. (2009) 混相霰–上昇流フラックスおよび IWP 指標と Price & Rind (1993) 冷雲厚 IC/CG 比。 | 追加コスト極小。数十年スケールの 2D 超パラメータ化気候計算に推奨。 |
+| `"explicit_bulk"` | 5 種水物質電荷密度 $\rho_{q,s}\ (s\in\{c,r,i,s,g\})$ | SCALE-LT 相当の陽的バルク帯電：Takahashi (1978) / Sato et al. (2019) の $T$–LWC 極性反転雲粒捕捉帯電、保存的 3D 移流・重力沈降、FFT ＋ Thomas 厳密ポアソン電場求解、および Dwyer (2003) / Fierro et al. (2013) 絶縁破壊 IC/CG 放電。 | 中程度の CRM 追加コスト（5 種電荷配列＋親ステップ当たり 1 回の非反復 FFT–Thomas 求解）。3D CRM 深対流・雷雲電荷構造研究向け。 |
+
+#### 5.6.1 診断型非誘導帯電スキーム (`lightning_scheme = "diagnostic"`, `src/aoba/lightning.py`)
 
 CRM が陽的に解像する上昇流 $w_+ = \max(\bar{w}_k, 0)$ と霰混合比 $q_g$ から、氷晶–霰衝突の電荷分離が最も活発な $-15^\circ\mathrm{C}$ 混合相帯ガウス重み $W_T(T)$ を用いて、McCaul et al. (2009) と Saunders et al. (1991) の非誘導帯電指標 $(G_{\max}, G_{\mathrm{chg}})$ および全発雷頻度 $\mathcal{F}_{\mathrm{tot}}$（全球校正係数 $c_{\mathrm{cal}} = 3.6$）を算出する：
 
@@ -708,6 +717,53 @@ $$
 Z &= \operatorname{clamp}\!\big(0.021 H^4 - 0.648 H^3 + 7.493 H^2 - 36.54 H + 63.09,\ 1,\ 19\big), \\
 f_{\mathrm{CG}} &= \frac{1}{1 + Z}, \qquad D_{\mathrm{N,LNOx}} = 0.50\,S_{\mathrm{N,loc}} + 0.50\,\overline{S}_{\mathrm{N,glob}}
 \end{aligned} \tag{5.18}
+$$
+
+#### 5.6.2 陽的バルク帯電・放電スキーム (`lightning_scheme = "explicit_bulk"`, `src/aoba/lightning_explicit.py`)
+
+`explicit_bulk` モードでは、2D/3D CRM 格子上で 5 種の凝結水物質 $s \in \{c, r, i, s_{\mathrm{nw}}, g\}$ の体積電荷密度 $\rho_{q,s}\ [\mathrm{C\ m^{-3}}]$ を陽的に予報する。霰と雲氷・雪の反発衝突に伴う 1 衝突当たりの霰側移動電荷量 $\delta q_{\mathrm{coll}}(T, \mathrm{LWC})$ は、$-40^\circ\mathrm{C} < T_C < 0^\circ\mathrm{C}$ の過冷却混合相領域でのみ活性となる平滑な Takahashi (1978) / Sato et al. (2019) 極性反転則で与える（$\delta q_{\max} = 2.5\times 10^{-14}\ \mathrm{C}$、雲水量 $\mathrm{LWC} = 10^3\rho_d q_c\ [\mathrm{g\ m^{-3}}]$）：
+
+$$
+\begin{aligned}
+T_{\mathrm{rev}}(\mathrm{LWC}) &= -10.0 - 10.0\,\tanh\!\big(0.65(\mathrm{LWC} - 0.55)\big), \\
+\delta q_{\mathrm{coll}} &= \delta q_{\max}\,\tanh\!\left(\frac{T_C - T_{\mathrm{rev}}}{4.0}\right)\frac{\mathrm{LWC}}{\mathrm{LWC} + 0.15}\,\sigma\!\left(\frac{T_C + 40}{3.0}\right)\sigma\!\left(-\frac{T_C}{1.5}\right)\,\mathbf{1}_{T_C < 0}
+\end{aligned} \tag{5.19}
+$$
+
+ここで $\sigma(x) = (1 + e^{-x})^{-1}$ はロジスティックゲート関数である。重力捕捉衝突頻度 $R_{gi}, R_{gs}$（反発割合 $\alpha_{\mathrm{reb}} = 0.90$）により厳密ゼロ和の電荷分離（$\Delta\rho_{q,g} = -(\Delta\rho_{q,i} + \Delta\rho_{q,s})$）を行ったのち、全 5 種の電荷密度に対し保存的周期水平ドナーセル移流、終端落下速度 $v_{t,s}$ を含む無条件安定な陰的鉛直移流・沈降、$0^\circ\mathrm{C}$ 以上での霰・雪から雨への融解電荷移行、および晴天イオン導電緩和（$\tau_{\mathrm{ion}} = 600\ \mathrm{s}$; Chiu, 1978）を積分する：
+
+$$
+\begin{aligned}
+R_{gx} &= \alpha_{\mathrm{reb}}\,\frac{\pi}{4}(D_g + D_x)^2\,|v_{t,g} - v_{t,x}|\,N_g N_x, \qquad x\in\{i, s\}, \\
+\frac{\partial \rho_{q,s}}{\partial t} &= -\nabla_h\cdot(\mathbf{u}_h \rho_{q,s}) - \frac{\partial}{\partial z}\big[(w - v_{t,s})\rho_{q,s}\big] + S_{\mathrm{ni},s} + S_{\mathrm{melt},s} - \frac{\rho_{q,s}}{\tau_{\mathrm{rel},s}}
+\end{aligned} \tag{5.20}
+$$
+
+総空間電荷密度 $\rho_q = \sum_s \rho_{q,s}$ から、水平周期・上下端接地 Dirichlet 境界条件 $\Phi_e(0) = \Phi_e(z_{\mathrm{top}}) = 0$ の 2D/3D ポアソン方程式を解き電位 $\Phi_e$ と 3 次元電場 $\mathbf{E} = -\nabla \Phi_e$ を求める。水平 $(x, y)$ のバッチ 2D 実数 FFT と離散水平固有値 $\lambda_{m,n}$ ごとの鉛直伸縮格子三重対角 Thomas 法を組み合わせることで反復ゼロの厳密解を 1 ステップで得る：
+
+$$
+\begin{aligned}
+\nabla^2 \Phi_e &= -\frac{\rho_q}{\varepsilon_0}, \qquad \mathbf{E} = -\nabla \Phi_e, \\
+\lambda_{m,n} &= \frac{4}{\Delta x^2}\sin^2\!\left(\frac{\pi m}{N_x}\right) + \frac{4}{\Delta y^2}\sin^2\!\left(\frac{\pi n}{N_y}\right)
+\end{aligned} \tag{5.21}
+$$
+
+CRM コラム内の最大電場強度 $|\mathbf{E}|$ が空気密度スケーリングされた絶縁破壊閾値 $E_{\mathrm{crit}} = E_{\mathrm{crit},0}(\rho_d/\rho_0)$（$E_{\mathrm{crit},0} = 120\ \mathrm{kV\ m^{-1}}$; Dwyer, 2003; Sato et al., 2019）を超過すると、$|\mathbf{E}| \ge 0.30\,E_{\mathrm{crit}}$ を満たす放電路（Fierro et al., 2013）内で局所電荷の割合 $f_{\mathrm{neut}} = \min(0.30\min(\max(|\mathbf{E}|/E_{\mathrm{crit}}), 3), 0.80)$ を中和する。純粋な雲内放電（IC）では放電路体積平均の電荷不均衡を $|\rho_{q,s}|$ 比例で差し引き、総空間電荷保存を厳密に保つ：
+
+$$
+\begin{aligned}
+E_{\mathrm{crit}} &= E_{\mathrm{crit},0}\,\max\!\left(\frac{\rho_d}{\rho_0},\ 0.05\right), \\
+\Delta\rho_{q,s}^{\mathrm{neut}} &= -f_{\mathrm{neut}}\,\rho_{q,s} - \mathbf{1}_{\mathrm{IC}}\,\frac{|\rho_{q,s}|}{\sum_{s'}|\rho_{q,s'}|}\,\overline{\Delta\rho_q^{\mathrm{raw}}}_{\mathrm{chan}}
+\end{aligned} \tag{5.22}
+$$
+
+放電路が対地高度 $3.5\ \mathrm{km}$ 以下に達するか地表鉛直電場が $|E_z(z_0)| \ge 0.25\,E_{\mathrm{crit}}(z_0)$ を満たす放電を対地雷（CG）と分類する。サブコラム全発雷頻度密度 $\mathcal{F}_{\mathrm{tot}}$ は中和された双極子電荷量（$Q_{\mathrm{flash}} = 15\ \mathrm{C\ flash^{-1}}$; Rakov & Uman, 2003）から診断し、診断型と同一の Schumann & Huntrieser (2007) 質量保存型 $\mathrm{LNO}_x$ 窒素沈着フラックスへ接続する：
+
+$$
+\begin{aligned}
+\mathcal{F}_{\mathrm{tot}} &= \frac{1}{2\,Q_{\mathrm{flash}}\,\Delta t}\int_0^{z_{\mathrm{top}}} \left|\sum_s \Delta\rho_{q,s}^{\mathrm{neut}}\right|\,dz\ [\mathrm{flashes\ m^{-2}\ s^{-1}}], \\
+D_{\mathrm{N,LNOx}} &= 0.50\,Y_{\mathrm{N}}\mathcal{F}_{\mathrm{tot}} + 0.50\,\overline{Y_{\mathrm{N}}\mathcal{F}_{\mathrm{tot}}}_{\mathrm{glob}}
+\end{aligned} \tag{5.23}
 $$
 
 ---
@@ -1983,16 +2039,16 @@ $$
 
 ---
 
-## 12. 一元 322 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio
+## 12. 一元 323 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio
 
 ### 12.1 単一 TOML 設定管理・融合 GPU カーネル・ネイティブ Zarr v3 出力
 
-全 14 セクション・322 パラメータが [`config/aoba_default.toml`](../config/aoba_default.toml)（`src/aoba/params.py`）に集約され、全 321 ユニークキーの日英物理解説が [`src/aoba/param_docs.py`](../src/aoba/param_docs.py) で、11 本の即実行プリセットが `config/presets/` で管理されている。ハードウェア可搬 `float32` 実行（`src/aoba/runtime.py` による `cuda` $\to$ `mps` $\to$ `cpu` 自動切替）では、全 101 本の単一ソース融合 Metal カーネル（`kernels.py`, `kernels_physics.py`, `kernels_extra.py`, `kernels_esm.py`）を `kernels_cuda.py` でネイティブ CUDA C++17 へ自動変換し、自動 CUDA Graph 記録・再生と合わせて鉛直三重対角解法・沈降・放射・微物理・CRM サブサイクル・EVP 海氷・順圧海洋サブサイクルおよび OSSP ML 特徴抽出・保存クロージャ・空間ヘッドをステップ途中 CPU–GPU 同期ゼロで実行する。モデルコアの全履歴出力（`src/aoba/io_zarr.py`）は CF-1.11 / UGRID-1.0 準拠の Zarr v3（`mesh.zarr`, `monthly.zarr`, `snapshots.zarr`, 選択時 `cmip7_monthly.zarr` / `cmip7_fx.zarr`）、日別全球診断 `daily_global.csv` および原子的チェックポイント `restart.pt` / `restart_mid.pt`（水平・鉛直解像度間の汎用球面・静水圧再補間対応）を使用する。
+全 14 セクション・323 パラメータが [`config/aoba_default.toml`](../config/aoba_default.toml)（`src/aoba/params.py`）に集約され、全 322 ユニークキーの日英物理解説が [`src/aoba/param_docs.py`](../src/aoba/param_docs.py) で、11 本の即実行プリセットが `config/presets/` で管理されている。ハードウェア可搬 `float32` 実行（`src/aoba/runtime.py` による `cuda` $\to$ `mps` $\to$ `cpu` 自動切替）では、全 101 本の単一ソース融合 Metal カーネル（`kernels.py`, `kernels_physics.py`, `kernels_extra.py`, `kernels_esm.py`）を `kernels_cuda.py` でネイティブ CUDA C++17 へ自動変換し、自動 CUDA Graph 記録・再生と合わせて鉛直三重対角解法・沈降・放射・微物理・CRM サブサイクル・EVP 海氷・順圧海洋サブサイクルおよび OSSP ML 特徴抽出・保存クロージャ・空間ヘッドをステップ途中 CPU–GPU 同期ゼロで実行する。モデルコアの全履歴出力（`src/aoba/io_zarr.py`）は CF-1.11 / UGRID-1.0 準拠の Zarr v3（`mesh.zarr`, `monthly.zarr`, `snapshots.zarr`, 選択時 `cmip7_monthly.zarr` / `cmip7_fx.zarr`）、日別全球診断 `daily_global.csv` および原子的チェックポイント `restart.pt` / `restart_mid.pt`（水平・鉛直解像度間の汎用球面・静水圧再補間対応）を使用する。
 
 | TOML セクション | 項目数 | 管轄領域 |
 | :--- | ---: | :--- |
 | `[grid]` | 16 | SCVT `glevel`、鉛直層 `nz`/`z_top`、CRM `(nx, ny, dx)`、時間刻み、チャンク設定 |
-| `[forcing]` | 98 | 全選択制スキーム（`rad_scheme`, `microphysics_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`）、OSSP 自己蒸留・シャドウ診断、軌道・暦法、ESM スイッチ |
+| `[forcing]` | 99 | 全選択制スキーム（`rad_scheme`, `microphysics_scheme`, `lightning_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`）、OSSP 自己蒸留・シャドウ診断、軌道・暦法、ESM スイッチ |
 | `[icesheet]` | 5 | 動的 SIA 氷床有効化、EMA 時定数、加速倍率、アイソスタシー時定数 |
 | `[output]` | 23 | Zarr v3 出力間隔・分割方式、CSV、月末リスタート、CMIP7 出力 |
 | `[constants]` | 26 | 惑星半径・重力・気体定数・潜熱・海水/海氷基礎定数 |
@@ -2013,4 +2069,4 @@ $$
 
 ### 12.3 AOBA Studio ワークベンチ (`scripts/aoba_config_gui.py`)
 
-ローカル Web アプリケーション（`python scripts/aoba_config_gui.py --port 8765`）により、全 322 パラメータの日英解説・列挙型ドロップダウン編集・実験プリセット適用、同期回転 3 地球儀（`T₂`, `Precip`, 10 種 ESM 診断場）と観測基準範囲（ERA5, CERES EBAF, GPCP, MODIS, NSIDC）対比、および KaTeX 数式組版（オフライン時は内蔵再帰下降レンダラへ自動フォールバック）＋SVG 概念図付き内蔵ドキュメントビューアを提供する。
+ローカル Web アプリケーション（`python scripts/aoba_config_gui.py --port 8765`）により、全 323 パラメータの日英解説・列挙型ドロップダウン編集・実験プリセット適用、同期回転 3 地球儀（`T₂`, `Precip`, 10 種 ESM 診断場）と観測基準範囲（ERA5, CERES EBAF, GPCP, MODIS, NSIDC）対比、および KaTeX 数式組版（オフライン時は内蔵再帰下降レンダラへ自動フォールバック）＋SVG 概念図付き内蔵ドキュメントビューアを提供する。
