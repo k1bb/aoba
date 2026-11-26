@@ -230,8 +230,10 @@ AOBA_DEVICE uint clamp(uint x, uint lo, uint hi) { return x < lo ? lo : (x > hi 
 AOBA_DEVICE float fabs(float x) { return fabsf(x); }
 AOBA_DEVICE float floor(float x) { return floorf(x); }
 AOBA_DEVICE float exp(float x) { return expf(x); }
+AOBA_DEVICE float exp2(float x) { return exp2f(x); }
 AOBA_DEVICE float expm1(float x) { return expm1f(x); }
 AOBA_DEVICE float log(float x) { return logf(x); }
+AOBA_DEVICE float log2(float x) { return log2f(x); }
 AOBA_DEVICE float log1p(float x) { return log1pf(x); }
 AOBA_DEVICE float pow(float a, float b) { return powf(a, b); }
 AOBA_DEVICE float sqrt(float x) { return sqrtf(x); }
@@ -773,7 +775,9 @@ AOBA_DEVICE int clamp(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi
 AOBA_DEVICE uint clamp(uint x, uint lo, uint hi) { return x < lo ? lo : (x > hi ? hi : x); }
 AOBA_DEVICE float fabs(float x) { return std::fabs(x); }
 AOBA_DEVICE float exp(float x) { return std::exp(x); }
+AOBA_DEVICE float exp2(float x) { return std::exp2(x); }
 AOBA_DEVICE float log(float x) { return std::log(x); }
+AOBA_DEVICE float log2(float x) { return std::log2(x); }
 AOBA_DEVICE float pow(float a, float b) { return std::pow(a, b); }
 AOBA_DEVICE float sqrt(float x) { return std::sqrt(x); }
 AOBA_DEVICE float rsqrt(float x) { return 1.0f / std::sqrt(x); }

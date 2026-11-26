@@ -59,6 +59,8 @@ class OceanAtmosCoupler:
     atm_wet_area_sum: torch.Tensor       # [N_atm] float32 sum of fine wet ocean area inside host cell
     has_wet_children: torch.Tensor       # [N_atm] bool (atm_wet_area_sum > 0)
     coastal_ocn_nearest: torch.Tensor    # [N_atm] int64 nearest wet fine ocean cell for coastal runoff routing
+    has_orphan_all: bool = True          # Static flag: any coarse cell lacks wet children (avoids per-step sync)
+    has_orphan_ocn: bool = True          # Static flag: any coarse ocean cell lacks wet children
 
 
 def _nearest_spherical_indices(
@@ -130,6 +132,9 @@ def build_ocean_atmos_coupler(
     else:
         ocn_to_atm_ocn = ocn_to_atm
 
+    has_orphan_all = bool((~has_wet_children).any().item())
+    has_orphan_ocn = bool((atm_ocn & (~has_wet_children)).any().item())
+
     return OceanAtmosCoupler(
         n_atm=n_atm,
         n_ocn=n_ocn,
@@ -146,6 +151,8 @@ def build_ocean_atmos_coupler(
         atm_wet_area_sum=atm_wet_area_sum,
         has_wet_children=has_wet_children,
         coastal_ocn_nearest=atm_to_ocn_nearest_wet,
+        has_orphan_all=has_orphan_all,
+        has_orphan_ocn=has_orphan_ocn,
     )
 
 
@@ -181,8 +188,9 @@ def atm_to_ocn_conservative_flux(
 
     # Map via parent cell; for coarse cells with no wet children (coastal mismatch), deposit to nearest wet cell
     raw_ocn = flux_atm[coupler.ocn_to_atm_idx] * coupler.ocn_wet_mask.to(flux_atm.dtype)
-    orphan_mask = src_mask & (~coupler.has_wet_children)
-    if bool(orphan_mask.any()):
+    has_orphan = coupler.has_orphan_ocn if ocean_only_source else coupler.has_orphan_all
+    if has_orphan:
+        orphan_mask = src_mask & (~coupler.has_wet_children)
         orphan_mass = torch.where(orphan_mask, flux_atm * coupler.atm_area, torch.zeros_like(flux_atm))
         extra_mass = torch.zeros(coupler.n_ocn, device=flux_atm.device, dtype=flux_atm.dtype)
         extra_mass.scatter_add_(0, coupler.coastal_ocn_nearest, orphan_mass)

@@ -567,7 +567,7 @@ def test_land_energy_balance_newton_iterations(device: str) -> None:
     finally:
         surface_mod.LAND_EB_ITERATIONS = default_iters
     err = {k: float((out[k].shf - out[40].shf).abs().mean().item()) for k in (1, 3, 10)}
-    assert err[3] < 0.1 * err[1]  # Three passes remove >90% of the single-pass error
+    assert err[3] < 0.12 * err[1]  # Three passes remove >88% of single-pass error (with Eq. 7.35 canopy inertia)
     assert err[10] < err[3] and err[10] < 1.0  # W m^-2 mean error vs the 40-pass fixed point
 
 
@@ -685,9 +685,13 @@ def test_three_source_leaf_energy_balance_rsl_and_pmodel_coupling(device: str) -
     assert float(sfc.t_leaf_sun[0].item()) > float(sfc.t_leaf_sh[0].item()) + 0.5
     assert float(sfc.t_leaf_sun[1].item()) > float(sfc.t_leaf_sh[1].item()) + 1.0
     # 2. Stomatal closure under drought heats sunlit leaves higher and raises sensible heat vs well-watered forest
-    assert float(sfc.t_leaf_sun[1].item()) > float(sfc.t_leaf_sun[0].item()) + 0.5
+    # (With Eq. 7.35 20 m forest thermal inertia C_can = 127 kJ m^-2 K^-1, 12-min warming is ~0.4 K and exceeds 0.5 K by step 2.)
+    assert float(sfc.t_leaf_sun[1].item()) > float(sfc.t_leaf_sun[0].item()) + 0.35
     assert float(diag.lhf[0].item()) > float(diag.lhf[1].item()) + 40.0
     assert float(diag.shf[1].item()) > float(diag.shf[0].item()) + 20.0
+    diag2 = step_surface(sfc, **kw)
+    assert float(sfc.t_leaf_sun[1].item()) > float(sfc.t_leaf_sun[0].item()) + 0.5
+    assert float(diag2.shf[1].item()) > float(diag2.shf[0].item()) + 40.0
 
     # 3. Leaf-surface (c_s, D_s) P-model coupling converges cleanly to standard P-model as g_bw -> infinity
     t_l = torch.tensor([300.0, 300.0], device=dev)

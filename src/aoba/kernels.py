@@ -1810,28 +1810,26 @@ def run_crm_rk3_hevi_metal(
         import math as _math
         rk_taus = (dt_dyn / 3.0, 0.5 * dt_dyn, dt_dyn)
 
-        if dev.type == "mps":
-            # Apple Silicon unified L1/SLC favors single-launch fused stage_prep + fast_hevi
-            # with block-contiguous L2-hot stage slab (`1.28x` faster on MPS).
+        n_ac0 = max(1, int(_math.ceil(rk_taus[0] / max(dt_ac_max, 0.1))))
+        n_ac1 = max(1, int(_math.ceil(rk_taus[1] / max(dt_ac_max, 0.1))))
+        n_ac2 = max(1, int(_math.ceil(rk_taus[2] / max(dt_ac_max, 0.1))))
+        if dev.type == "mps" and n_ac0 <= 63 and n_ac1 <= 63 and n_ac2 <= 63:
+            # Single-launch low-register (`d_star[64]` only) 3-stage WS-RK3 + HEVI kernel
+            # reusing block-contiguous L2-hot stage slab across all 3 stages.
             if "stage_buf_bc" not in ws:
                 ws["stage_buf_bc"] = torch.empty((n_tg, nz, 4, 64, 4), device=dev, dtype=torch.float32)
             stage_buf = ws["stage_buf_bc"]
-            for stage_idx, dtau in enumerate(rk_taus):
-                n_ac = max(1, int(_math.ceil(dtau / max(dt_ac_max, 0.1))))
-                dt_ac = dtau / float(n_ac)
-                first_i = 1 if stage_idx == 0 else 0
-                accum_i = 1 if stage_idx == 2 else 0
-                u_fused = [nz, n_col, nx, (int(dz_cols) << 16) | (int(n_ac) << 2) | (first_i << 1) | accum_i]
-                f_fused1 = [float(dt_ac), float(beta_hevi), float(gravity), float(dtau)]
-                lib.crm_2d_rk3_stage_fused_simd(
-                    rho0_c, Thm0_c, u0_c, v0_c, w0_c,
-                    rho_out, Thm_out, u_out, v_out, w_out,
-                    qn_c, qp_c, du_s_c, dv_s_c, dw_s_c, tTh_c,
-                    dzc_c, dzw_c, spc_c, spw_c,
-                    stage_buf, fx_acc, fz_acc,
-                    u_fused, f_prep0, f_fused1,
-                    threads=grid_64, group_size=(64,),
-                )
+            u_fused = [nz, n_col, nx, (int(dz_cols) << 18) | (n_ac0 << 12) | (n_ac1 << 6) | n_ac2]
+            f_fused1 = [float(dt_dyn), float(beta_hevi), float(gravity), 0.0]
+            lib.crm_2d_rk3_stage_fused_simd(
+                rho0_c, Thm0_c, u0_c, v0_c, w0_c,
+                rho_out, Thm_out, u_out, v_out, w_out,
+                qn_c, qp_c, du_s_c, dv_s_c, dw_s_c, tTh_c,
+                dzc_c, dzw_c, spc_c, spw_c,
+                stage_buf, fx_acc, fz_acc,
+                u_fused, f_prep0, f_fused1,
+                threads=grid_64, group_size=(64,),
+            )
             return rho_out, Thm_out, u_out, v_out, w_out, fx_acc, ws["fy_zero"], fz_acc
 
         # NVIDIA CUDA (A100/H100) achieves higher SM occupancy with the low-register 2-kernel
