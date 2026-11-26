@@ -639,10 +639,13 @@ N_{\mathrm{INP}} &= (1 - f_{\mathrm{hom}})N_{\mathrm{het}} + 2\times 10^5\,f_{\m
 \end{aligned} \tag{5.10}
 $$
 
-暖雲自動変換は雲解像格子スケール（既定 `crm_dx = 4 km` 基準）のサブグリッド雲水量分散補正を含む Khairoutdinov & Kogan (2000) 則（$C_{\mathrm{KK00}} = 42000$）へ切り替え、予報数濃度から算出した雲粒・氷晶有効半径 $(r_{e,l}, r_{e,i})$（分散係数 $\kappa_{\mathrm{disp}} = 0.72$, 雲氷密度 $\rho_{i,\mathrm{cld}} = 500\ \mathrm{kg\ m^{-3}}$）を放射スキーム（式 4.11）および粒径依存雲氷終端落下速度 $V_{TI,\mathrm{eff}}$ へ渡す：
+暖雲自動変換は、50 m LES（$1350$）から雲解像格子（$\Delta x = 4\ \mathrm{km}$ で $42000$）まで水平格子間隔 $\Delta x$ に応じてサブグリッド雲水量分散補正を自動スケーリングする Khairoutdinov & Kogan (2000) 則 $C_{\mathrm{KK00}}(\Delta x)$（Morrison & Gettelman, 2008; Boutle et al., 2014）を採用し、予報数濃度から算出した雲粒・氷晶有効半径 $(r_{e,l}, r_{e,i})$（分散係数 $\kappa_{\mathrm{disp}} = 0.72$, 雲氷密度 $\rho_{i,\mathrm{cld}} = 500\ \mathrm{kg\ m^{-3}}$）を放射スキーム（式 4.11）および粒径依存雲氷終端落下速度 $V_{TI,\mathrm{eff}}$ へ渡す：
 
 $$
-\left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{auto,KK00}} = 42000\,q_c^{2.47}\,N_{c,\mathrm{cm^{-3}}}^{-1.79} \tag{5.11}
+\begin{aligned}
+C_{\mathrm{KK00}}(\Delta x) &= \operatorname{clamp}\!\left(1350\left(\frac{\max(\Delta x,\,50)}{50}\right)^{0.7845},\ 1350,\ 1.2\times 10^5\right), \\
+\left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{auto,KK00}} &= C_{\mathrm{KK00}}(\Delta x)\,q_c^{2.47}\,N_{c,\mathrm{cm^{-3}}}^{-1.79}
+\end{aligned} \tag{5.11}
 $$
 
 $$
@@ -659,8 +662,9 @@ $$
 
 $$
 \begin{aligned}
-k_{\mathrm{auto}} &= 1350\,q_c^{1.47}\,N_c^{-1.79}, \qquad k_{\mathrm{accr}} = 67\,q_r^{1.15}\,q_c^{0.15}, \\
-k_{\mathrm{rime}} &= 3.5\,q_s^{0.80} + 5.0\,q_g^{0.80}, \qquad k_{s\to g} = 250\,q_c, \\
+C_{\mathrm{KK00,6c}}(\Delta x) &= \operatorname{clamp}\!\left(1350\left(\frac{\max(\Delta x,\,50)}{50}\right)^{0.5254},\ 1350,\ 6\times 10^4\right), \\
+k_{\mathrm{auto}} &= C_{\mathrm{KK00,6c}}(\Delta x)\,q_c^{1.47}\,N_c^{-1.79}, \qquad k_{\mathrm{accr}} = 67\,q_r^{1.15}\,q_c^{0.15}, \\
+k_{\mathrm{rime}} &= 0.6\,q_s^{0.80} + 1.2\,q_g^{0.80}, \qquad k_{s\to g} = 250\,q_c, \\
 k_{\mathrm{frz}} &= 0.015\,\exp\!\big(0.25(268.15 - T)\big)
 \end{aligned} \tag{5.13}
 $$
@@ -1570,10 +1574,14 @@ K_{v,\mathrm{tot}}(z) &= K_{v,\mathrm{bg}}(z) + \min\!\left(\frac{0.0667\,E_{\ma
 \end{aligned} \tag{9.5}
 $$
 
-4. **3D 傾圧 WS-RK3 運動量＋順圧自由表面分離解法（Ringler et al., 2013; Shchepetkin & McWilliams, 2005）**：3D 傾圧運動量方程式を TRiSK 渦度コリオリ・スケール適応 Munk 粘性・半陰的レイリー＋海底二次摩擦（$C_{d,\mathrm{bot}} = 2.5\times 10^{-3}$）付き 3 段 WS-RK3 と陰的鉛直粘性 Thomas ソルバで進めたのち、鉛直平均傾向 $F_{\mathrm{baro}}$ で強制される 2D 順圧自由表面モード $(u_{\mathrm{bt}}, \eta)$ を最大 64 サブサイクル（融合 Metal/CUDA カーネル）で積分する。サブサイクル内では定常地衡流を一切減衰させずにボックスカー共鳴のみを除去する高速変動減衰（アンカー流速偏差 $u_{\mathrm{bt}} - u_{\mathrm{bt}}^{\mathrm{bar}}$ にのみ作用）を適用し、時間平均順圧流速 $\bar{u}_{\mathrm{bt}}$ で 3D 流速の順圧成分を置換する：
+4. **3D 傾圧 WS-RK3 運動量＋順圧自由表面分離解法（Ringler et al., 2010, 2013; Griffies & Hallberg, 2000; Shchepetkin & McWilliams, 2005）**：3D 傾圧運動量方程式をベクトル不変形式で定式化し、エネルギー保存 TRiSK 渦度フラックス $-(\zeta + f)\hat{\mathbf{k}}\times\mathbf{u}_o$、Voronoi 運動エネルギー Bernoulli 勾配 $-\nabla K$、湿潤マスク対称 4 階重調和超粘性 $-\nu_4\nabla^4\mathbf{u}_o$ と弱い残留 2 階 Munk 粘性 $A_h\nabla^2\mathbf{u}_o$（$\delta_{M4} = 0.65\,\Delta c_{\min}$、$\delta_{M2} = 0.25\,\Delta c_{\min}$、任意の格子解像度で陽的安定性を保証する CFL 上限付き）、半陰的レイリー＋海底二次摩擦（$C_{d,\mathrm{bot}} = 2.5\times 10^{-3}$）付き 3 段 WS-RK3 と陰的鉛直粘性 Thomas ソルバで進める。続いて鉛直平均傾向 $F_{\mathrm{baro}}$ で強制される 2D 順圧自由表面モード $(u_{\mathrm{bt}}, \eta)$ を最大 192 サブサイクル（融合 Metal/CUDA カーネル）で積分する。サブサイクル内では定常地衡流を一切減衰させずにボックスカー共鳴のみを除去する高速変動減衰（アンカー流速偏差 $u_{\mathrm{bt}} - u_{\mathrm{bt}}^{\mathrm{bar}}$ にのみ作用）を適用し、時間平均順圧流速 $\bar{u}_{\mathrm{bt}}$ で 3D 流速の順圧成分を置換する：
 
 $$
-\frac{\partial \mathbf{u}_o}{\partial t} + (\mathbf{u}_o\cdot\nabla)\mathbf{u}_o + f\hat{\mathbf{k}}\times\mathbf{u}_o = -g\nabla\eta - \frac{1}{\rho_0}\nabla p_{\mathrm{hyd}} + \frac{\partial}{\partial z}\left(A_v\frac{\partial \mathbf{u}_o}{\partial z}\right) + A_h\nabla^2\mathbf{u}_o - r_{\mathrm{drag}}\mathbf{u}_o \tag{9.6}
+\begin{aligned}
+\frac{\partial \mathbf{u}_o}{\partial t} + (\zeta + f)\hat{\mathbf{k}}\times\mathbf{u}_o &= -g\nabla\eta - \nabla\!\left(\frac{p_{\mathrm{hyd}}}{\rho_0} + K\right) + \frac{\partial}{\partial z}\left(A_v\frac{\partial \mathbf{u}_o}{\partial z}\right) + A_h\nabla^2\mathbf{u}_o - \nu_4\nabla^4\mathbf{u}_o - r_{\mathrm{drag}}\mathbf{u}_o, \\
+K_{k,i} &= \frac{1}{4 A_i}\sum_{e\in\mathcal{E}(i)} d_{c,e} d_{v,e}\,u_{k,e}^2, \\
+\nu_4 &= \min\!\left(\beta\,\delta_{M4}^5,\ 10^{-3}\frac{\Delta c_{\min}^4}{\Delta t}\right), \qquad A_h = \min\!\left(\beta\,\delta_{M2}^3,\ 0.04\frac{\Delta c_{\min}^2}{\Delta t}\right)
+\end{aligned} \tag{9.6}
 $$
 
 5. **解像度適応 GM90・Fox-Kemper サブメソ再成層・FCT-$z^*$ 移流・回転 Redi 拡散・増分陰的鉛直拡散**：中立面勾配 $S_x$（$|S_x| \le 10^{-2}$、境界層内線形テーパ）に対し、Hallberg (2013) のロスビー変形半径 $L_d$ 適応 GM90 流れ関数 $\Psi_{\mathrm{GM}}$（$\kappa_{\mathrm{GM}} = 800\ \mathrm{m^2\ s^{-1}}$）と Fox-Kemper et al. (2008, Eq. 5; 2011) の混合層サブメソ渦流れ関数 $\Psi_{\mathrm{MLE}}$ の和からボーラス速度 $u_{\mathrm{GM},k}$ を得る。トレーサ輸送は $z^*$ 座標（層厚 $h^*_k$・相対鉛直流 $w^*_{k+1/2}$; Adcroft & Campin, 2004; Danilov et al., 2017）上の偏差形式 Zalesak FCT 移流および完全回転 Redi 等密度面拡散（$\kappa_{\mathrm{Redi}} = 1000\ \mathrm{m^2\ s^{-1}}$、対角鉛直項 $K_{v,\mathrm{Redi}} \propto S_x^2$ は陰解法へ組込）で積分し、鉛直拡散は float32 桁落ちドリフトを完全排除する増分形式＋厳密テレスコーピングフラックス再構成＋Neumaier/Kahan 加算で解く：

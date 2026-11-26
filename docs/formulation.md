@@ -639,10 +639,13 @@ N_{\mathrm{INP}} &= (1 - f_{\mathrm{hom}})N_{\mathrm{het}} + 2\times 10^5\,f_{\m
 \end{aligned} \tag{5.10}
 $$
 
-Warm-rain autoconversion adopts Khairoutdinov & Kogan (2000) with cloud-resolving subgrid LWC variance enhancement (calibrated at default `crm_dx = 4 km`, $C_{\mathrm{KK00}} = 42000$), while prognostic effective radii $(r_{e,l}, r_{e,i})$ ($\kappa_{\mathrm{disp}} = 0.72$, $\rho_{i,\mathrm{cld}} = 500\ \mathrm{kg\ m^{-3}}$) couple into radiation (Eq. 4.11) and size-aware cloud-ice sedimentation velocity $V_{TI,\mathrm{eff}}$:
+Warm-rain autoconversion adopts scale-aware Khairoutdinov & Kogan (2000) with resolution-dependent subgrid LWC variance enhancement $C_{\mathrm{KK00}}(\Delta x)$ bridging 50 m LES ($1350$) to cloud-resolving grids (Morrison & Gettelman, 2008; Boutle et al., 2014; $42000$ at $\Delta x = 4\ \mathrm{km}$), while prognostic effective radii $(r_{e,l}, r_{e,i})$ ($\kappa_{\mathrm{disp}} = 0.72$, $\rho_{i,\mathrm{cld}} = 500\ \mathrm{kg\ m^{-3}}$) couple into radiation (Eq. 4.11) and size-aware cloud-ice sedimentation velocity $V_{TI,\mathrm{eff}}$:
 
 $$
-\left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{auto,KK00}} = 42000\,q_c^{2.47}\,N_{c,\mathrm{cm^{-3}}}^{-1.79} \tag{5.11}
+\begin{aligned}
+C_{\mathrm{KK00}}(\Delta x) &= \operatorname{clamp}\!\left(1350\left(\frac{\max(\Delta x,\,50)}{50}\right)^{0.7845},\ 1350,\ 1.2\times 10^5\right), \\
+\left(\frac{\partial q_p}{\partial t}\right)_{\mathrm{auto,KK00}} &= C_{\mathrm{KK00}}(\Delta x)\,q_c^{2.47}\,N_{c,\mathrm{cm^{-3}}}^{-1.79}
+\end{aligned} \tag{5.11}
 $$
 
 $$
@@ -659,8 +662,9 @@ Independently prognoses all 6 classes (11 variables) including rain $(q_r, n_r)$
 
 $$
 \begin{aligned}
-k_{\mathrm{auto}} &= 1350\,q_c^{1.47}\,N_c^{-1.79}, \qquad k_{\mathrm{accr}} = 67\,q_r^{1.15}\,q_c^{0.15}, \\
-k_{\mathrm{rime}} &= 3.5\,q_s^{0.80} + 5.0\,q_g^{0.80}, \qquad k_{s\to g} = 250\,q_c, \\
+C_{\mathrm{KK00,6c}}(\Delta x) &= \operatorname{clamp}\!\left(1350\left(\frac{\max(\Delta x,\,50)}{50}\right)^{0.5254},\ 1350,\ 6\times 10^4\right), \\
+k_{\mathrm{auto}} &= C_{\mathrm{KK00,6c}}(\Delta x)\,q_c^{1.47}\,N_c^{-1.79}, \qquad k_{\mathrm{accr}} = 67\,q_r^{1.15}\,q_c^{0.15}, \\
+k_{\mathrm{rime}} &= 0.6\,q_s^{0.80} + 1.2\,q_g^{0.80}, \qquad k_{s\to g} = 250\,q_c, \\
 k_{\mathrm{frz}} &= 0.015\,\exp\!\big(0.25(268.15 - T)\big)
 \end{aligned} \tag{5.13}
 $$
@@ -1570,10 +1574,14 @@ K_{v,\mathrm{tot}}(z) &= K_{v,\mathrm{bg}}(z) + \min\!\left(\frac{0.0667\,E_{\ma
 \end{aligned} \tag{9.5}
 $$
 
-4. **3D Baroclinic WS-RK3 Momentum + Split-Explicit Barotropic Free Surface (Ringler et al., 2013; Shchepetkin & McWilliams, 2005)**: 3D baroclinic momentum advances via 3-stage WS-RK3 with TRiSK vorticity Coriolis, scale-adaptive Munk viscosity, semi-implicit Rayleigh and quadratic bottom drag ($C_{d,\mathrm{bot}} = 2.5\times 10^{-3}$), and implicit vertical viscosity (Thomas tridiagonal). The 2D barotropic free-surface mode $(u_{\mathrm{bt}}, \eta)$ forced by depth-averaged tendency $F_{\mathrm{baro}}$ is integrated over up to 64 sub-cycles (fused Metal/CUDA kernel) with zero-steady-drag fast-fluctuation damping acting exclusively on departures from the sub-cycle anchor velocity $(u_{\mathrm{bt}} - u_{\mathrm{bt}}^{\mathrm{bar}})$ to eliminate boxcar resonance without damping geostrophic currents, after which time-averaged $\bar{u}_{\mathrm{bt}}$ replaces the depth-mean component of the 3D velocity:
+4. **3D Baroclinic WS-RK3 Momentum + Split-Explicit Barotropic Free Surface (Ringler et al., 2010, 2013; Griffies & Hallberg, 2000; Shchepetkin & McWilliams, 2005)**: 3D baroclinic momentum advances in vector-invariant form via 3-stage WS-RK3 with energy-conserving TRiSK vorticity flux $-(\zeta + f)\hat{\mathbf{k}}\times\mathbf{u}_o$, Voronoi kinetic-energy Bernoulli gradient $-\nabla K$, wet-masked scale-selective 4th-order biharmonic hyperviscosity $-\nu_4\nabla^4\mathbf{u}_o$ paired with a weak residual Laplacian Munk floor $A_h\nabla^2\mathbf{u}_o$ ($\delta_{M4} = 0.65\,\Delta c_{\min}$, $\delta_{M2} = 0.25\,\Delta c_{\min}$, CFL-capped for stability across arbitrary mesh resolutions), semi-implicit Rayleigh and quadratic bottom drag ($C_{d,\mathrm{bot}} = 2.5\times 10^{-3}$), and implicit vertical viscosity (Thomas tridiagonal). The 2D barotropic free-surface mode $(u_{\mathrm{bt}}, \eta)$ forced by depth-averaged tendency $F_{\mathrm{baro}}$ is integrated over up to 192 sub-cycles (fused Metal/CUDA kernel) with zero-steady-drag fast-fluctuation damping acting exclusively on departures from the sub-cycle anchor velocity $(u_{\mathrm{bt}} - u_{\mathrm{bt}}^{\mathrm{bar}})$ to eliminate boxcar resonance without damping geostrophic currents, after which time-averaged $\bar{u}_{\mathrm{bt}}$ replaces the depth-mean component of the 3D velocity:
 
 $$
-\frac{\partial \mathbf{u}_o}{\partial t} + (\mathbf{u}_o\cdot\nabla)\mathbf{u}_o + f\hat{\mathbf{k}}\times\mathbf{u}_o = -g\nabla\eta - \frac{1}{\rho_0}\nabla p_{\mathrm{hyd}} + \frac{\partial}{\partial z}\left(A_v\frac{\partial \mathbf{u}_o}{\partial z}\right) + A_h\nabla^2\mathbf{u}_o - r_{\mathrm{drag}}\mathbf{u}_o \tag{9.6}
+\begin{aligned}
+\frac{\partial \mathbf{u}_o}{\partial t} + (\zeta + f)\hat{\mathbf{k}}\times\mathbf{u}_o &= -g\nabla\eta - \nabla\!\left(\frac{p_{\mathrm{hyd}}}{\rho_0} + K\right) + \frac{\partial}{\partial z}\left(A_v\frac{\partial \mathbf{u}_o}{\partial z}\right) + A_h\nabla^2\mathbf{u}_o - \nu_4\nabla^4\mathbf{u}_o - r_{\mathrm{drag}}\mathbf{u}_o, \\
+K_{k,i} &= \frac{1}{4 A_i}\sum_{e\in\mathcal{E}(i)} d_{c,e} d_{v,e}\,u_{k,e}^2, \\
+\nu_4 &= \min\!\left(\beta\,\delta_{M4}^5,\ 10^{-3}\frac{\Delta c_{\min}^4}{\Delta t}\right), \qquad A_h = \min\!\left(\beta\,\delta_{M2}^3,\ 0.04\frac{\Delta c_{\min}^2}{\Delta t}\right)
+\end{aligned} \tag{9.6}
 $$
 
 5. **Resolution-Aware GM90, Fox-Kemper Submesoscale Restratification, FCT-$z^*$ Advection, Rotated Redi Diffusion & Increment Implicit Vertical Diffusion**: From neutral slopes $S_x$ ($|S_x| \le 10^{-2}$, tapered linearly across the boundary layer), Hallberg (2013) Rossby-radius-aware GM90 streamfunction $\Psi_{\mathrm{GM}}$ ($\kappa_{\mathrm{GM}} = 800\ \mathrm{m^2\ s^{-1}}$) and Fox-Kemper et al. (2008, Eq. 5; 2011) mixed-layer eddy streamfunction $\Psi_{\mathrm{MLE}}$ yield bolus velocity $u_{\mathrm{GM},k}$. Tracers advance in $z^*$ coordinates ($h^*_k, w^*_{k+1/2}$; Adcroft & Campin, 2004; Danilov et al., 2017) with anomaly-form Zalesak FCT advection, full rotated Redi diffusion ($\kappa_{\mathrm{Redi}} = 1000\ \mathrm{m^2\ s^{-1}}$, diagonal $K_{v,\mathrm{Redi}} \propto S_x^2$ folded into the implicit solve), and increment-form implicit vertical diffusion with telescoping flux reconstruction and Neumaier/Kahan summation:

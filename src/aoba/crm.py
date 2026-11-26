@@ -1389,6 +1389,7 @@ def _step_crm_physics_and_dynamics_impl(
             is_ocean_sub=is_ocean_sub,
             u_sfc_sub=u_sfc_sub,
             q_dust_sub=q_dust_sub,
+            dx_m=float(crm.dx),
         )
         crm.q_n = crm.q_v + crm.q_c + crm.q_i
         crm.q_p = crm.q_r + crm.q_s + crm.q_g
@@ -1412,6 +1413,7 @@ def _step_crm_physics_and_dynamics_impl(
                 is_ocean=is_ocean_sub.reshape(m_sub) if is_ocean_sub is not None else None,
                 u_sfc=u_sfc_sub.reshape(m_sub) if u_sfc_sub is not None else None,
                 q_dust=q_dust_sub.reshape(nz, m_sub) if q_dust_sub is not None else None,
+                dx_m=float(crm.dx),
             )
             if mp.n_c is not None:
                 crm.n_c = mp.n_c.reshape(nz, n_col, ny, nx)

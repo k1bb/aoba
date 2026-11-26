@@ -530,6 +530,7 @@ def _get_ogcm_static_cache(ogcm: OceanOGCMState, mesh: SCVTMesh, is_ocean: torch
     w_vor_edge = 0.5 * mesh.dc_edge * mesh.dv_edge
     active_eoc = (mesh.edge_sign_on_cell != 0.0).to(dtype)
     inv_area_c = 1.0 / mesh.area_cell
+    active_w_c = (active_eoc * inv_area_c.unsqueeze(-1)).contiguous()
     div_w = (mesh.edge_sign_on_cell.to(dtype) * mesh.dv_edge[mesh.edges_on_cell].to(dtype)) * inv_area_c.unsqueeze(-1)
     vort_w = (
         mesh.edge_sign_on_vert.to(dtype) * mesh.dc_edge[mesh.edges_on_vert].to(dtype)
@@ -566,6 +567,7 @@ def _get_ogcm_static_cache(ogcm: OceanOGCMState, mesh: SCVTMesh, is_ocean: torch
         "w_vor_edge": w_vor_edge,
         "active_eoc": active_eoc,
         "inv_area_c": inv_area_c,
+        "active_w_c": active_w_c,
         "div_w": div_w,
         "vort_w": vort_w,
         "h_max": h_max,
@@ -1834,24 +1836,50 @@ def _step_ogcm_voronoi_impl(
         av_diag = torch.clamp(av_diag * l_scale, max=KPP_KV_MAX)
     ogcm.h_bl = h_bl
 
-    # 4. 3D Baroclinic Momentum Step (WS-RK3 TRiSK Coriolis + Baroclinic PGF + Munk Viscosity + Semi-Implicit Drag)
+    # 4. 3D Baroclinic Momentum Step (WS-RK3 TRiSK Coriolis + Baroclinic PGF + Bernoulli -grad K
+    #    + Scale-Aware Biharmonic Hyperviscosity + Residual Munk Floor + Semi-Implicit Drag;
+    #    AOBA Formulation Eq. (9.6); Ringler et al., 2010, 2013; Griffies & Hallberg, 2000).
     dc_min = getattr(mesh, "_dc_edge_min_m", None)
     if dc_min is None:
         dc_min = float(mesh.dc_edge.min().item())
         setattr(mesh, "_dc_edge_min_m", dc_min)
-    delta_munk = 0.75 * dc_min
-    a_h = min(BETA_MUNK_OGCM * (delta_munk ** 3), 0.06 * (dc_min ** 2) / max(dt, 1.0))
+    delta_m4 = 0.65 * dc_min
+    nu_4 = min(BETA_MUNK_OGCM * (delta_m4 ** 5), 0.0010 * (dc_min ** 4) / max(dt, 1.0))
+    delta_m2 = 0.25 * dc_min
+    a_h = min(BETA_MUNK_OGCM * (delta_m2 ** 3), 0.04 * (dc_min ** 2) / max(dt, 1.0))
 
-    lap_u, _ = compute_vector_laplacian_edge(mesh, u)
+    # Symmetric wet-masked biharmonic operator D = wet * del^2 * wet guarantees strict energy
+    # dissipation <u, -nu_4 * D^2 u> = -nu_4 ||D u||^2 <= 0 at all interior and coastal wet edges.
+    lap2_u, _ = compute_vector_laplacian_edge(mesh, u)
+    lap2_u_wet = lap2_u * wet_ef
+    lap4_u, _ = compute_vector_laplacian_edge(mesh, lap2_u_wet)
+    visc_h_edge = (a_h * lap2_u_wet - nu_4 * lap4_u) * wet_ef
+
+    # Voronoi cell kinetic energy K_i = (1 / 2 A_i) sum_{e in i} (0.5 * dc_e * dv_e) * u_e^2
+    # (Ringler et al., 2010, Eq. 16) folded into the Bernoulli head p_bern = p_baroc + rho_0 * K
+    # so -(1/rho_0) grad(p_bern) yields exact -(1/rho_0) grad(p_baroc) - grad(K).
     use_gpu_ogcm = get_active_gpu_backend(dev) in ("mps", "cuda")
+    w_vor_edge = cache["w_vor_edge"]
+    active_w_c = cache["active_w_c"]
+    w_vor_u2 = w_vor_edge.unsqueeze(0) * (u * u)
+    if use_gpu_ogcm and u.dtype == torch.float32:
+        ke_c = 0.5 * dispatch_scvt_weighted_edge_sum_metal(mesh, w_vor_u2, active_w_c) * wet_cf
+    else:
+        ke_c = (
+            0.5
+            * (w_vor_u2[:, mesh.edges_on_cell] * cache["active_eoc"].unsqueeze(0)).sum(dim=-1)
+            * cache["inv_area_c"].unsqueeze(0)
+            * wet_cf
+        )
+    p_bern = (p_baroc + C.RHO_SEAWATER * ke_c) * wet_cf
 
     if use_gpu_ogcm:
         # Fused GPU baroclinic RK3 + TRiSK Coriolis + register-assembled momentum Thomas solve
         # eliminates ~6.3 GB TRiSK gathers and ~1.5 GB momentum/tridiagonal DRAM traffic on G7.
         f_fixed = dispatch_ogcm_baroclinic_f_fixed_metal(
             mesh,
-            p_baroc=p_baroc, lap_u=lap_u, tau_n_e=tau_n_e,
-            h_e0_safe=h_e_safe[0], wet_ef=wet_ef, a_h=a_h,
+            p_baroc=p_bern, lap_u=visc_h_edge, tau_n_e=tau_n_e,
+            h_e0_safe=h_e_safe[0], wet_ef=wet_ef, a_h=1.0,
         )
         is_bot_f = cache.get("is_bot_ef")
         if is_bot_f is None:
@@ -1885,10 +1913,10 @@ def _step_ogcm_voronoi_impl(
     else:
         bc_rk3_fn = maybe_cuda_compile(_ogcm_baroclinic_rk3_core, device=dev)
         u_star, a_m, b_m, d_m = bc_rk3_fn(
-            u, lap_u, p_baroc, av_diag, tau_n_e,
+            u, visc_h_edge, p_bern, av_diag, tau_n_e,
             mesh.f_vert, mesh.edges_on_vert, cache["vort_w"],
             v0_e, v1_e, ep_idx, w_trisk, c0, c1, inv_dc_edge,
-            cache["is_bot_e"], h_e_safe, cache["dz_int_e"], wet_ef, wet_int_ef, a_h, dt,
+            cache["is_bot_e"], h_e_safe, cache["dz_int_e"], wet_ef, wet_int_ef, 1.0, dt,
         )
         u_star_raw = solve_tridiagonal_batched(a_m, b_m, d_m, u_star)
 

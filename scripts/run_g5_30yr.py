@@ -1403,53 +1403,90 @@ def _write_live_preview_atomic(
     h_ice = model.icesheet.h_ice if model.icesheet is not None else torch.zeros_like(t2_k)
     sst_c_host = (model.sfc.t_ocean_ml - 273.15)
     seaice_host = torch.clamp(torch.sqrt(torch.clamp(model.sfc.m_seaice, min=0.0) / 500.0), 0.0, 1.0)
-    # Surface wind speed [m s^-1] on host cells as fallback when OGCM is disabled
-    u0_e = model.atmos.u_edge[0]
-    eoc = mesh.edges_on_cell
-    valid_e = (mesh.edge_sign_on_cell != 0.0).to(u0_e.dtype)
-    ke0_c = 0.5 * ((mesh.area_edge * (u0_e * u0_e))[eoc] * valid_e).sum(dim=-1) / torch.clamp(mesh.area_cell, min=1.0)
-    u10_ms = torch.sqrt(torch.clamp(2.0 * ke0_c, min=0.0))
+    swe_land = torch.clamp(model.sfc.swe_land, min=0.0)
 
-    date_str = model.calendar.date_at(model.sim_time_sec).iso_datetime[:16]
+    # Column LWP & IWP [g m^-2] for Himawari True-Color RGB cloud reflectance
+    dz_c4 = model.atmos.dz_c.unsqueeze(-1).unsqueeze(-1)
+    lwp_gm2 = (model.crm.rho_d * torch.clamp(model.crm.q_c, min=0.0) * dz_c4).sum(dim=0).mean(dim=(-2, -1)) * 1.0e3
+    iwp_gm2 = (model.crm.rho_d * torch.clamp(model.crm.q_i, min=0.0) * dz_c4).sum(dim=0).mean(dim=(-2, -1)) * 1.0e3
+
+    # Lowest-layer wind vector (u10_u, u10_v) & speed [m s^-1] + significant wave height H_s [m]
+    u10_u_t, u10_v_t = reconstruct_cell_winds(mesh, model.atmos.u_edge[0:1])
+    u10_u = u10_u_t[0]
+    u10_v = u10_v_t[0]
+    u10_ms = torch.sqrt(torch.clamp(u10_u * u10_u + u10_v * u10_v, min=0.0))
+    if getattr(model, "ocean_waves", None) is not None and getattr(model.ocean_waves, "hs", None) is not None:
+        hs_raw = model.ocean_waves.hs
+        if hs_raw.shape[0] == mesh.n_cells:
+            wave_hs_m = torch.clamp(hs_raw, min=0.0, max=15.0)
+        else:
+            wave_hs_m = torch.clamp(0.0246 * u10_ms * u10_ms, min=0.0, max=12.0) * (mesh.surf_type == SURF_OCEAN).to(u10_ms.dtype)
+    else:
+        wave_hs_m = torch.clamp(0.0246 * u10_ms * u10_ms, min=0.0, max=12.0) * (mesh.surf_type == SURF_OCEAN).to(u10_ms.dtype)
+
+    # Exact solar declination & subsolar longitude for Himawari solar incidence angle
+    cal_dt = model.calendar.date_at(model.sim_time_sec)
+    obliq_rad = math.radians(float(model.cfg.obliquity_deg))
+    doy_now = float(cal_dt.doy)
+    yr_days = max(float(cal_dt.days_in_year), 1.0)
+    orb_ang = 2.0 * math.pi * ((doy_now - 80.0) / yr_days)
+    solar_decl_deg = math.degrees(math.asin(max(-1.0, min(1.0, math.sin(obliq_rad) * math.sin(orb_ang)))))
+    frac_day = ((model.sim_time_sec / C.SECONDS_PER_DAY) % 1.0 + 1.0) % 1.0
+    subsolar_lon_deg = ((180.0 - 360.0 * frac_day + 180.0) % 360.0) - 180.0
+
+    date_str = cal_dt.iso_datetime[:16]
     coords_np = getattr(mesh, "_live_preview_coords", None)
-    if coords_np is None:
+    if coords_np is None or len(coords_np) < 4:
         coords_np = (
             np.rad2deg(mesh.lat_cell.detach().cpu().numpy()).astype(np.float32),
             np.rad2deg(mesh.lon_cell.detach().cpu().numpy()).astype(np.float32),
             mesh.surf_type.detach().cpu().numpy().astype(np.int8),
+            mesh.z_topo.detach().cpu().numpy().astype(np.float32),
         )
         mesh._live_preview_coords = coords_np
-    lat_deg_np, lon_deg_np, surf_type_np = coords_np
+    lat_deg_np, lon_deg_np, surf_type_np, z_topo_np = coords_np
 
     extra_arrays: dict[str, Any] = {
         "sst_c": sst_c_host.detach().cpu().numpy().astype(np.float32),
         "seaice_frac": seaice_host.detach().cpu().numpy().astype(np.float32),
         "u10_ms": u10_ms.detach().cpu().numpy().astype(np.float32),
+        "u10_u": u10_u.detach().cpu().numpy().astype(np.float32),
+        "u10_v": u10_v.detach().cpu().numpy().astype(np.float32),
+        "lwp_gm2": lwp_gm2.detach().cpu().numpy().astype(np.float32),
+        "iwp_gm2": iwp_gm2.detach().cpu().numpy().astype(np.float32),
+        "swe_land": swe_land.detach().cpu().numpy().astype(np.float32),
+        "z_topo": z_topo_np,
+        "wave_hs_m": wave_hs_m.detach().cpu().numpy().astype(np.float32),
+        "solar_decl_deg": np.float32(solar_decl_deg),
+        "subsolar_lon_deg": np.float32(subsolar_lon_deg),
     }
     if model.ogcm is not None:
         omesh = model.ocn_mesh if model.ocn_mesh is not None else mesh
         ocn_coords = getattr(omesh, "_live_preview_ocn_coords", None)
-        if ocn_coords is None:
+        if ocn_coords is None or len(ocn_coords) < 4:
             ocn_coords = (
                 np.rad2deg(omesh.lat_cell.detach().cpu().numpy()).astype(np.float32),
                 np.rad2deg(omesh.lon_cell.detach().cpu().numpy()).astype(np.float32),
                 model.ogcm.wet_c[0].detach().cpu().numpy().astype(np.uint8),
+                model.ogcm.h_col.detach().cpu().numpy().astype(np.float32),
             )
             omesh._live_preview_ocn_coords = ocn_coords
-        olat_np, olon_np, owet_np = ocn_coords
+        olat_np, olon_np, owet_np, odepth_np = ocn_coords
         osst_c = (model.ogcm.temp[0] - 273.15).detach().cpu().numpy().astype(np.float32)
-        ou0 = model.ogcm.u_edge[0]
-        oeoc = omesh.edges_on_cell
-        ov_e = (omesh.edge_sign_on_cell != 0.0).to(ou0.dtype)
-        oke0 = 0.5 * ((omesh.area_edge * (ou0 * ou0))[oeoc] * ov_e).sum(dim=-1) / torch.clamp(omesh.area_cell, min=1.0)
-        ospd = torch.sqrt(torch.clamp(2.0 * oke0, min=0.0)).detach().cpu().numpy().astype(np.float32)
+        ou_c_t, ov_c_t = reconstruct_cell_winds(omesh, model.ogcm.u_edge[0:1])
+        ou_c = ou_c_t[0]
+        ov_c = ov_c_t[0]
+        ospd = torch.sqrt(torch.clamp(ou_c * ou_c + ov_c * ov_c, min=0.0)).detach().cpu().numpy().astype(np.float32)
         osfc = model.ocn_sfc if model.ocn_sfc is not None else model.sfc
         oice = torch.clamp(torch.sqrt(torch.clamp(osfc.m_seaice, min=0.0) / 500.0), 0.0, 1.0).detach().cpu().numpy().astype(np.float32)
         extra_arrays["ocn_lat_deg"] = olat_np
         extra_arrays["ocn_lon_deg"] = olon_np
         extra_arrays["ocn_wet"] = owet_np
+        extra_arrays["ocn_depth_m"] = odepth_np
         extra_arrays["ocn_sst_c"] = osst_c
         extra_arrays["ocn_speed_ms"] = ospd
+        extra_arrays["ocn_u_ms"] = ou_c.detach().cpu().numpy().astype(np.float32)
+        extra_arrays["ocn_v_ms"] = ov_c.detach().cpu().numpy().astype(np.float32)
         extra_arrays["ocn_seaice_frac"] = oice
 
     tmp_path = out_path.with_name(f".{out_path.name}.tmp.npz")

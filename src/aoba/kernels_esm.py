@@ -1463,7 +1463,7 @@ kernel void microphysics_6class_col(
     constant float4& f_p0        [[buffer(21)]], // [dt, R_D, CV_D, P_REF]
     constant float4& f_p1        [[buffer(22)]], // [RV_OVER_RD, T_FREEZE, L_F0, L_V0]
     constant float4& f_p2        [[buffer(23)]], // [CP_D, EPS_WATER, CCN_OCN, CCN_LND]
-    constant float4& f_p3        [[buffer(24)]], // [CCN_DUST_SC, INP_DUST_ENH, 0, 0]
+    constant float4& f_p3        [[buffer(24)]], // [CCN_DUST_SC, INP_DUST_ENH, KK00_AUTO, 0]
     uint col                     [[thread_position_in_grid]]
 ) {
     uint nz = uint(u_dim.x);
@@ -1495,6 +1495,7 @@ kernel void microphysics_6class_col(
     float CCN_LND = f_p2.w;
     float CCN_DUST = f_p3.x;
     float INP_DUST = f_p3.y;
+    float KK00_AUTO = (f_p3.z > 0.0f) ? f_p3.z : 13500.0f;
 
     float is_ocn = has_ocn ? is_ocn_s[col] : 0.7f;
     float ccn_col_base = is_ocn * CCN_OCN + (1.0f - is_ocn) * CCN_LND;
@@ -1560,10 +1561,10 @@ kernel void microphysics_6class_col(
         float ns_cur = max(n_s[idx], 0.0f);
         float ng_cur = max(n_g[idx], 0.0f);
 
-        // 2. Warm-rain KK00 autoconversion & accretion
+        // 2. Warm-rain KK00 autoconversion & accretion (AOBA Formulation Eq. 5.13)
         if (qc > 1.0e-6f) {
             float nc_cm3 = clamp(nc_cur * rd * 1.0e-6f, 10.0f, 800.0f);
-            float k_auto = 1350.0f * pow(max(qc, 1.0e-9f), 1.47f) * pow(nc_cm3, -1.79f);
+            float k_auto = KK00_AUTO * pow(max(qc, 1.0e-9f), 1.47f) * pow(nc_cm3, -1.79f);
             float k_accr = 67.0f * pow(qr, 1.15f) * pow(max(qc, 1.0e-9f), 0.15f);
             float dq_c2r = (-esm_expm1(-min((k_auto + k_accr) * dt, 10.0f))) * qc;
             qc -= dq_c2r;
@@ -2847,6 +2848,7 @@ def run_microphysics_6class_metal(
     ccn_land_cm3: float = 160.0,
     ccn_dust_scale_cm3: float = 20.0,
     inp_dust_enhance: float = 2.0,
+    kk00_auto_coef: float = 13500.0,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor,
@@ -2913,7 +2915,7 @@ def run_microphysics_6class_metal(
         [float(dt), float(C.R_D), float(C.CV_D), float(C.P_REF)],
         [float(C.RV_OVER_RD), float(C.T_FREEZE), float(C.L_F0), float(C.L_V0)],
         [float(C.CP_D), float(C.EPS_WATER), float(ccn_ocean_cm3), float(ccn_land_cm3)],
-        [float(ccn_dust_scale_cm3), float(inp_dust_enhance), 0.0, 0.0],
+        [float(ccn_dust_scale_cm3), float(inp_dust_enhance), float(kk00_auto_coef), 0.0],
         threads=M,
     )
     sh4 = (nz, nc, ny, nx)

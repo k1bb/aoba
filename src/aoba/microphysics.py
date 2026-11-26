@@ -484,7 +484,22 @@ CCN_OCEAN_BASE_CM3: float = 30.0     # Clean pre-industrial marine CCN baseline 
 CCN_LAND_BASE_CM3: float = 95.0      # Clean pre-industrial continental biogenic CCN [cm^-3] (Andreae, 2009)
 CCN_DUST_SCALE_CM3: float = 120.0    # Additional CCN per 10 ug m^-3 mineral dust [cm^-3]
 INP_DUST_ENHANCE: float = 4.0        # DeMott et al. (2010) dust immersion INP enhancement factor [-]
-KK00_AUTO_COEF: float = 42000.0      # Khairoutdinov & Kogan (2000) x 4 km subgrid LWC variance enhancement (MG08 / CERES)
+KK00_AUTO_COEF_LES: float = 1350.0   # Khairoutdinov & Kogan (2000, Eq. 29) 50 m LES warm-rain autoconversion
+KK00_AUTO_COEF: float = 42000.0      # Reference 4 km CRM subgrid LWC-variance-enhanced KK00 (MG08 / Boutle et al., 2014)
+KK00_DX_LES_M: float = 50.0          # Reference LES grid spacing [m]
+KK00_SCALE_EXP: float = 0.784486     # Scale-aware power-law exponent bridging 50 m LES (1350) -> 4 km CRM (42000)
+
+
+def compute_kk00_auto_coef(dx_m: float = 4000.0) -> float:
+    """Scale-aware KK00 warm-rain autoconversion coefficient as a function of grid spacing `dx_m` [m].
+
+    Smoothly bridges Khairoutdinov & Kogan (2000, Eq. 29) at 50 m LES (`1350`) to subgrid LWC-variance-enhanced
+    cloud-resolving grids (Morrison & Gettelman, 2008; Boutle et al., 2014; `42000` at 4 km).
+    AOBA Formulation Eqs. (5.11) & (5.13).
+    """
+    dx_eff = max(float(dx_m), KK00_DX_LES_M)
+    c_raw = KK00_AUTO_COEF_LES * ((dx_eff / KK00_DX_LES_M) ** KK00_SCALE_EXP)
+    return min(max(c_raw, KK00_AUTO_COEF_LES), 120000.0)
 LIQ_DISP_KAPPA: float = 0.72         # Martin et al. (1994) droplet spectral dispersion kappa = (r_v/r_e)^3 [-]
 RHO_CLOUD_ICE: float = 500.0         # Effective cloud-ice crystal bulk density [kg m^-3] (Wyser, 1998)
 RE_LIQ_MIN_UM: float = 4.0           # Lower bound on prognostic liquid effective radius [um]
@@ -595,10 +610,10 @@ def compute_natural_ccn_inp(
     return n_act_m3, n_inp_m3
 
 
-def _get_mp2m_metal_consts() -> list[float]:
+def _get_mp2m_metal_consts(kk00_auto_coef: float = KK00_AUTO_COEF) -> list[float]:
     return _MP_METAL_CONSTS + [
         CCN_OCEAN_BASE_CM3, CCN_LAND_BASE_CM3, CCN_DUST_SCALE_CM3, INP_DUST_ENHANCE,
-        KK00_AUTO_COEF, RHO_CLOUD_ICE, RE_ICE_MIN_UM, RE_ICE_MAX_UM, INP_MIN_HET_M3,
+        float(kk00_auto_coef), RHO_CLOUD_ICE, RE_ICE_MIN_UM, RE_ICE_MAX_UM, INP_MIN_HET_M3,
     ]
 
 
@@ -616,22 +631,24 @@ def step_microphysics_two_moment(
     is_ocean: torch.Tensor | None = None,
     u_sfc: torch.Tensor | None = None,
     q_dust: torch.Tensor | None = None,
+    dx_m: float = 4000.0,
 ) -> MicrophysicsResult:
     """Advance 2-moment mixed-phase cloud microphysics `(q_n, q_p, n_c, n_i)` by `dt` [s].
 
-    Combines exact mass-conserving saturation adjustment, Khairoutdinov & Kogan (2000, Eq. 29)
-    2-moment warm-rain autoconversion `dq_r/dt = 1350 * q_c^2.47 * N_c,cm^-3^(-1.79)`,
+    Combines exact mass-conserving saturation adjustment, scale-aware Khairoutdinov & Kogan
+    (2000, Eq. 29) 2-moment warm-rain autoconversion `dq_r/dt = C_KK00(dx) * q_c^2.47 * N_c,cm^-3^(-1.79)`,
     Morrison et al. (2005) droplet/ice number activation, scavenging, & sedimentation, and
     KR03 accretion, evaporation/sublimation, and implicit donor-cell precipitation fallout.
     """
     eps_small = 1.0e-15
+    kk00_coef = compute_kk00_auto_coef(dx_m)
     if can_use_crm_metal(rho_d) and (rho_d.ndim in (2, 4)):
         thm_new, qn_f, qp_s, t_new, qv_new, qc_new, qi_new, nc_f, ni_f, r_rate, s_rate = (
             dispatch_crm_microphysics_2m_metal(
                 rho_d=rho_d, theta_m_c=theta_m_c, q_n=q_n, q_p=q_p, q_v_prev=q_v_prev,
                 n_c_in=n_c_in, n_i_in=n_i_in, dz_c=dz_c, dt=dt,
                 w_eff=w_eff, is_ocean=is_ocean, u_sfc=u_sfc, q_dust=q_dust,
-                mp_consts=_get_mp2m_metal_consts(),
+                mp_consts=_get_mp2m_metal_consts(kk00_coef),
             )
         )
         return MicrophysicsResult(
@@ -666,10 +683,10 @@ def step_microphysics_two_moment(
     # Cap physical droplet/ice number to realistic mean-radius bounds
     nc_cm3 = torch.clamp(rho_safe * nc_act * 1.0e-6, min=10.0, max=600.0)
 
-    # 3. Khairoutdinov & Kogan (2000, Eq. 29) 2-moment autoconversion + KR03 ice aggregation
+    # 3. Scale-aware Khairoutdinov & Kogan (2000, Eq. 29) 2-moment autoconversion + KR03 ice aggregation
     dq_auto = torch.where(
         q_c > 1.0e-6,
-        KK00_AUTO_COEF * torch.pow(torch.clamp(q_c, min=1.0e-9), 2.47) * torch.pow(nc_cm3, -1.79),
+        kk00_coef * torch.pow(torch.clamp(q_c, min=1.0e-9), 2.47) * torch.pow(nc_cm3, -1.79),
         torch.zeros_like(q_c),
     )
     ice_temp_fac = torch.exp(0.025 * (temp - C.T_TRIPLE))

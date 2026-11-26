@@ -189,6 +189,18 @@ class CPUGlobePreviewEngine:
         ocn_lon_deg: np.ndarray | None = None,
         ocn_wet: np.ndarray | None = None,
         ocn_is_wind: bool = False,
+        lwp_gm2: np.ndarray | None = None,
+        iwp_gm2: np.ndarray | None = None,
+        swe_land: np.ndarray | None = None,
+        z_topo: np.ndarray | None = None,
+        wave_hs_m: np.ndarray | None = None,
+        u10_u: np.ndarray | None = None,
+        u10_v: np.ndarray | None = None,
+        ocn_u_ms: np.ndarray | None = None,
+        ocn_v_ms: np.ndarray | None = None,
+        ocn_depth_m: np.ndarray | None = None,
+        solar_decl_deg: float | None = None,
+        subsolar_lon_deg: float | None = None,
     ) -> dict[str, Any]:
         """Regrid irregular SCVT cell arrays onto `[180, 360]` on CPU and encode compact Uint8 rasters for 6 globes."""
         t0 = time.perf_counter()
@@ -248,6 +260,53 @@ class CPUGlobePreviewEngine:
         ocn_coast[(odx | ody)] = 1
 
         spd_max = 25.0 if ocn_is_wind else 1.2
+        extra_b64: dict[str, Any] = {}
+        if lwp_gm2 is not None and lwp_gm2.shape[0] == lat_deg.shape[0]:
+            lwp_g = (lwp_gm2[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            extra_b64["lwp_b64"] = self._quantize_u8(lwp_g, 0.0, 400.0)
+        if iwp_gm2 is not None and iwp_gm2.shape[0] == lat_deg.shape[0]:
+            iwp_g = (iwp_gm2[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            extra_b64["iwp_b64"] = self._quantize_u8(iwp_g, 0.0, 200.0)
+        if swe_land is not None and swe_land.shape[0] == lat_deg.shape[0]:
+            swe_g = (swe_land[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            extra_b64["swe_b64"] = self._quantize_u8(swe_g, 0.0, 150.0)
+        if z_topo is not None and z_topo.shape[0] == lat_deg.shape[0]:
+            zt_g = (z_topo[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            extra_b64["ztopo_b64"] = self._quantize_u8(zt_g, 0.0, 5000.0)
+        if wave_hs_m is not None and wave_hs_m.shape[0] == lat_deg.shape[0]:
+            wv_g = (wave_hs_m[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            extra_b64["wave_b64"] = self._quantize_u8(wv_g, 0.0, 10.0)
+        if u10_u is not None and u10_v is not None and u10_u.shape[0] == lat_deg.shape[0]:
+            wu_g = (u10_u[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            wv_g = (u10_v[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            wspd_g = np.hypot(wu_g, wv_g)
+            extra_b64["wind_u_b64"] = self._quantize_u8(wu_g, -25.0, 25.0)
+            extra_b64["wind_v_b64"] = self._quantize_u8(wv_g, -25.0, 25.0)
+            extra_b64["wind_spd_b64"] = self._quantize_u8(wspd_g, 0.0, 25.0)
+        if ocn_u_ms is not None and ocn_v_ms is not None:
+            if ocn_lat_deg is not None and ocn_u_ms.shape[0] == ocn_lat_deg.shape[0]:
+                ou_g = (ocn_u_ms[o_idxs] * o_w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+                ov_g = (ocn_v_ms[o_idxs] * o_w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            elif ocn_u_ms.shape[0] == lat_deg.shape[0]:
+                ou_g = (ocn_u_ms[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+                ov_g = (ocn_v_ms[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            else:
+                ou_g = ov_g = None
+            if ou_g is not None and ov_g is not None:
+                extra_b64["ocn_u_b64"] = self._quantize_u8(ou_g, -1.2, 1.2)
+                extra_b64["ocn_v_b64"] = self._quantize_u8(ov_g, -1.2, 1.2)
+        if ocn_depth_m is not None:
+            if ocn_lat_deg is not None and ocn_depth_m.shape[0] == ocn_lat_deg.shape[0]:
+                dp_g = (ocn_depth_m[o_idxs] * o_w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+                extra_b64["depth_b64"] = self._quantize_u8(dp_g, 0.0, 4000.0)
+            elif ocn_depth_m.shape[0] == lat_deg.shape[0]:
+                dp_g = (ocn_depth_m[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+                extra_b64["depth_b64"] = self._quantize_u8(dp_g, 0.0, 4000.0)
+        if solar_decl_deg is not None:
+            extra_b64["solar_decl_deg"] = round(float(solar_decl_deg), 3)
+        if subsolar_lon_deg is not None:
+            extra_b64["subsolar_lon_deg"] = round(float(subsolar_lon_deg), 3)
+
         cpu_ms = (time.perf_counter() - t0) * 1000.0
         lo3, hi3 = float(esm_range[0]), float(esm_range[1])
         return {
@@ -274,6 +333,7 @@ class CPUGlobePreviewEngine:
             "ocn_wet_b64": base64.b64encode(owet_grid.tobytes()).decode("ascii"),
             "ocn_coast_b64": base64.b64encode(ocn_coast.tobytes()).decode("ascii"),
             "cpu_regrid_ms": round(cpu_ms, 2),
+            **extra_b64,
         }
 
 
@@ -697,16 +757,28 @@ class RunManager:
                         lai = np.asarray(zf["lai"], dtype=np.float32)
                         surf_type = np.asarray(zf["surf_type"], dtype=np.int8)
                         has_ocn_mesh = "ocn_lat_deg" in zf and "ocn_sst_c" in zf
+                        lwp_gm2 = np.asarray(zf["lwp_gm2"], dtype=np.float32) if "lwp_gm2" in zf else None
+                        iwp_gm2 = np.asarray(zf["iwp_gm2"], dtype=np.float32) if "iwp_gm2" in zf else None
+                        swe_land = np.asarray(zf["swe_land"], dtype=np.float32) if "swe_land" in zf else None
+                        z_topo = np.asarray(zf["z_topo"], dtype=np.float32) if "z_topo" in zf else None
+                        wave_hs_m = np.asarray(zf["wave_hs_m"], dtype=np.float32) if "wave_hs_m" in zf else None
+                        u10_u = np.asarray(zf["u10_u"], dtype=np.float32) if "u10_u" in zf else None
+                        u10_v = np.asarray(zf["u10_v"], dtype=np.float32) if "u10_v" in zf else None
+                        solar_decl_deg = float(zf["solar_decl_deg"]) if "solar_decl_deg" in zf else None
+                        subsolar_lon_deg = float(zf["subsolar_lon_deg"]) if "subsolar_lon_deg" in zf else None
                         if has_ocn_mesh:
                             ocn_lat_deg = np.asarray(zf["ocn_lat_deg"], dtype=np.float32)
                             ocn_lon_deg = np.asarray(zf["ocn_lon_deg"], dtype=np.float32)
                             ocn_wet = np.asarray(zf["ocn_wet"], dtype=np.uint8) if "ocn_wet" in zf else None
+                            ocn_depth_m = np.asarray(zf["ocn_depth_m"], dtype=np.float32) if "ocn_depth_m" in zf else None
                             sst_c = np.asarray(zf["ocn_sst_c"], dtype=np.float32)
                             ocn_spd = np.asarray(zf["ocn_speed_ms"], dtype=np.float32) if "ocn_speed_ms" in zf else np.zeros_like(sst_c)
+                            ocn_u_ms = np.asarray(zf["ocn_u_ms"], dtype=np.float32) if "ocn_u_ms" in zf else None
+                            ocn_v_ms = np.asarray(zf["ocn_v_ms"], dtype=np.float32) if "ocn_v_ms" in zf else None
                             seaice = np.asarray(zf["ocn_seaice_frac"], dtype=np.float32) if "ocn_seaice_frac" in zf else np.zeros_like(sst_c)
                             ocn_is_wind = False
                         else:
-                            ocn_lat_deg = ocn_lon_deg = ocn_wet = None
+                            ocn_lat_deg = ocn_lon_deg = ocn_wet = ocn_depth_m = ocn_u_ms = ocn_v_ms = None
                             sst_c = np.asarray(zf["sst_c"], dtype=np.float32) if "sst_c" in zf else t2_c
                             seaice = np.asarray(zf["seaice_frac"], dtype=np.float32) if "seaice_frac" in zf else np.zeros_like(t2_c)
                             ocn_spd = np.asarray(zf["u10_ms"], dtype=np.float32) if "u10_ms" in zf else np.zeros_like(t2_c)
@@ -725,11 +797,17 @@ class RunManager:
                             calendar_type=str(fc.get("calendar_type", "gregorian")),
                         )
                         date_str = cal.date_at(sim_days * 86400.0).iso_date
+                    if solar_decl_deg is None:
+                        solar_decl_deg = math.degrees(math.asin(max(-1.0, min(1.0, math.sin(math.radians(23.44)) * math.sin(2.0 * math.pi * (day_yr / 365.2425))))))
                     raster = self.engine.regrid_fields(
                         lat_deg, lon_deg, t2_c, precip, lai, surf_type,
                         olr=olr, sst_c=sst_c, seaice_frac=seaice, ocn_speed_ms=ocn_spd,
                         ocn_lat_deg=ocn_lat_deg, ocn_lon_deg=ocn_lon_deg, ocn_wet=ocn_wet,
                         ocn_is_wind=ocn_is_wind,
+                        lwp_gm2=lwp_gm2, iwp_gm2=iwp_gm2, swe_land=swe_land, z_topo=z_topo,
+                        wave_hs_m=wave_hs_m, u10_u=u10_u, u10_v=u10_v,
+                        ocn_u_ms=ocn_u_ms, ocn_v_ms=ocn_v_ms, ocn_depth_m=ocn_depth_m,
+                        solar_decl_deg=solar_decl_deg, subsolar_lon_deg=subsolar_lon_deg,
                     )
                     meta = {
                         "source": "live_preview.npz",
@@ -1246,14 +1324,65 @@ _HTML_PAGE = r"""<!DOCTYPE html>
 
       <div class="kpi-strip">
         <div class="kpi"><div class="k-title" data-i18n="mkpi_proc">稼働プロセス</div><div class="k-val" id="mon-proc">-</div></div>
-        <div class="kpi"><div class="k-title" data-i18n="mkpi_time">表示データ時刻</div><div class="k-val" id="mon-time">-</div></div>
+        <div class="kpi"><div class="k-title" data-i18n="mkpi_time">表示データ時刻</div><div class="k-val" id="mon-time" style="white-space:nowrap;">-</div></div>
         <div class="kpi"><div class="k-title" data-i18n="mkpi_src">データソース</div><div class="k-val" id="mon-src" style="font-size:12px;">-</div></div>
         <div class="kpi"><div class="k-title" data-i18n="mkpi_cpu">CPU 投影処理時間</div><div class="k-val" id="mon-cpums">-</div></div>
         <div class="kpi"><div class="k-title" data-i18n="mkpi_latest">最新全球 T<sub>s</sub> / OLR / LAI</div><div class="k-val" id="mon-latest" style="font-size:12.5px;">-</div></div>
       </div>
     </div>
 
-    <!-- 6 ROTATING ORTHOGRAPHIC GLOBES (3x2: Atmosphere + Native Fine Ocean + Biosphere) -->
+    <!-- HIMAWARI-8/9 TRUE-COLOR RGB SATELLITE EMULATOR -->
+    <div class="card" style="margin-bottom:14px;">
+      <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px;">
+        <div>
+          <h2 style="margin:0;">🛰️ ひまわり True-Color RGB エミュレータ</h2>
+          <p class="sub" style="margin:2px 0 0;">太陽入射角・レイリー散乱・トワイライト・波高サングリント＆白波・植生・積雪/海氷・LWP/IWP 雲の物理合成地球儀（クリックで全画面観賞）。</p>
+        </div>
+        <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
+          <button onclick="openHimawariTheater()" style="font-size:12px; padding:5px 12px; background:linear-gradient(135deg,#0284c7,#2563eb); color:#fff; border:none;">⛶ 全画面観賞</button>
+        </div>
+      </div>
+      <div style="display:flex; flex-wrap:wrap; gap:18px; align-items:center; justify-content:center;">
+        <div id="hero-globe-wrap" title="クリックで全画面観賞 / ドラッグで回転" style="position:relative; width:380px; height:380px; flex-shrink:0;">
+          <canvas id="globeHimawari" class="globe-canvas" width="380" height="380" style="width:380px; height:380px; max-width:380px; cursor:grab;"></canvas>
+        </div>
+        <div style="flex:1; min-width:260px; max-width:460px; display:flex; flex-direction:column; gap:10px; font-size:12.5px;">
+          <div style="display:flex; flex-wrap:wrap; gap:12px;">
+            <label class="switch"><input type="checkbox" id="hima-solar" checked onchange="markHeroDirty()" /> <span>☀️ 太陽入射角 (昼夜・トワイライト)</span></label>
+            <label class="switch"><input type="checkbox" id="hima-night-ir" checked onchange="markHeroDirty()" /> <span>🌙 夜間 GeoColor 赤外雲</span></label>
+            <label class="switch"><input type="checkbox" id="hima-glint" checked onchange="markHeroDirty()" /> <span>✨ 海洋サングリント＆白波</span></label>
+          </div>
+          <div style="display:grid; grid-template-columns:130px 1fr 48px; gap:8px; align-items:center; color:var(--muted);">
+            <span>太陽経度オフセット</span>
+            <input type="range" id="hima-sun-offset" min="-180" max="180" value="0" oninput="document.getElementById('hima-sun-off-val').textContent=(this.value>=0?'+':'')+this.value+'°'; markHeroDirty();" />
+            <span id="hima-sun-off-val" style="text-align:right; color:var(--fg);">+0°</span>
+          </div>
+          <div id="hima-sun-info" style="font-size:11.5px; color:#94a3b8; background:rgba(15,23,42,0.55); padding:8px 10px; border-radius:8px; border:1px solid var(--border);">
+            太陽直下点: 計算待機中...（ドラッグ回転は下の6地球儀と完全同期します）
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- FULLSCREEN THEATER MODAL FOR HIMAWARI RGB -->
+    <div id="hima-theater" style="display:none; position:fixed; inset:0; z-index:9999; background:radial-gradient(ellipse at center, #060d1c 0%, #02040a 72%, #000 100%); flex-direction:column; align-items:center; justify-content:center; user-select:none;">
+      <div style="position:absolute; top:14px; left:20px; right:20px; display:flex; justify-content:space-between; align-items:center; pointer-events:none;">
+        <div style="pointer-events:auto; background:rgba(7,12,24,0.72); border:1px solid rgba(56,189,248,0.3); padding:7px 14px; border-radius:10px; backdrop-filter:blur(8px);">
+          <div style="font-size:14px; font-weight:700; color:#e0f2fe;">🛰️ AOBA Himawari True-Color Theater</div>
+          <div id="theater-meta" style="font-size:11.5px; color:#94a3b8;">ドラッグで地球を回転 / Esc で終了</div>
+        </div>
+        <div style="pointer-events:auto; display:flex; gap:8px;">
+          <button onclick="toggleBrowserFullscreen()" style="background:rgba(15,23,42,0.82); color:#bae6fd; border:1px solid rgba(56,189,248,0.4); padding:6px 12px; font-size:12px;">🖥️ OS全画面切替</button>
+          <button onclick="closeHimawariTheater()" style="background:rgba(127,29,29,0.85); color:#fecaca; border:1px solid rgba(248,113,113,0.5); padding:6px 14px; font-size:12px;">✕ 閉じる (Esc)</button>
+        </div>
+      </div>
+      <div id="theater-stage" style="position:relative; width:min(84vh,84vw); height:min(84vh,84vw);">
+        <canvas id="globeTheater" width="760" height="760" style="width:100%; height:100%; cursor:grab; background:transparent; border:none; border-radius:50%;"></canvas>
+      </div>
+      <div style="position:absolute; bottom:16px; display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:center; background:rgba(7,12,24,0.78); border:1px solid rgba(56,189,248,0.3); padding:8px 16px; border-radius:12px; backdrop-filter:blur(8px); font-size:12px; color:#cbd5e1;">
+        <label style="display:flex; align-items:center; gap:5px;">太陽オフセット <input type="range" min="-180" max="180" value="0" style="width:140px;" oninput="document.getElementById('hima-sun-offset').value=this.value; document.getElementById('hima-sun-off-val').textContent=(this.value>=0?'+':'')+this.value+'°'; markHeroDirty();" /></label>
+      </div>
+    </div>
     <div class="card">
       <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px;">
         <div>
@@ -1307,9 +1436,23 @@ _HTML_PAGE = r"""<!DOCTYPE html>
           <div class="cbar-labels"><span>-2°C</span><span>+6°C</span><span>+15°C</span><span>+24°C</span><span>+32°C</span></div>
         </div>
         <div class="globe-card">
-          <h3 id="g-ocn-title" data-i18n="g_ocn_title">表層海流速 |u<sub>ocn</sub>| [m s⁻¹]</h3>
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:2px;">
+            <h3 id="g-ocn-title" data-i18n="g_ocn_title" style="margin:0;">表層海流速 |u<sub>ocn</sub>|</h3>
+            <div style="display:flex; align-items:center; gap:5px;">
+              <select id="ocn-panel-mode" onchange="onOcnPanelModeChange()" style="font-size:11px; padding:2px 5px; width:auto;">
+                <option value="ocean" selected>🌊 海流</option>
+                <option value="wind">💨 10m風</option>
+              </select>
+              <label style="display:flex; align-items:center; gap:3px; font-size:11px; color:var(--muted); cursor:pointer;" title="earth.nullschool.net 風アニメーション流線を重畳">
+                <input type="checkbox" id="ocn-stream-mini" checked onchange="resetStreamParticles()" /> 🌀流線
+              </label>
+            </div>
+          </div>
           <div id="g-ocn-sub" class="g-sub" data-i18n="g_ocn_sub">黒潮・メキシコ湾流・南極周極流・渦構造</div>
-          <canvas id="globeOCN" class="globe-canvas" width="300" height="300"></canvas>
+          <div style="position:relative; width:100%; max-width:310px; aspect-ratio:1/1; margin:0 auto;">
+            <canvas id="globeOCN" class="globe-canvas" width="300" height="300" style="width:100%; height:100%; max-width:none;"></canvas>
+            <canvas id="globeOCNStream" width="300" height="300" style="position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; background:transparent; border:none;"></canvas>
+          </div>
           <div class="cbar" style="background:linear-gradient(90deg, #040d1c, #0c2d5c, #0284c7, #22d3ee, #fde047, #f97316);"></div>
           <div id="g-ocn-cbar-labels" class="cbar-labels"><span>0.0</span><span>0.3</span><span>0.6</span><span>0.9</span><span>1.2+ m/s</span></div>
         </div>
@@ -2522,9 +2665,7 @@ async function fetchMonitorOnce() {
     }
     document.getElementById("mon-src").textContent = meta.source || "-";
     document.getElementById("mon-time").textContent =
-      meta.sim_days !== undefined
-        ? (meta.date_str ? `${meta.date_str} (Day ${meta.sim_days})` : `Day ${meta.sim_days}`)
-        : "-";
+      meta.date_str ? String(meta.date_str) : (meta.sim_days !== undefined ? `Day ${meta.sim_days}` : "-");
     const syncLbl = document.getElementById("lbl-sync-day");
     if (syncLbl) {
       syncLbl.textContent = MON.wallSPerDay > 0 ? `昼半球同期 (${MON.wallSPerDay.toFixed(1)}s/日)` : "昼半球同期";
@@ -2544,33 +2685,71 @@ async function fetchMonitorOnce() {
 
     if (data.raster) {
       MON.raster = data.raster;
-      MON.rawT2 = b64ToUint8(data.raster.t2_b64);
-      MON.rawIR = data.raster.ir_b64 ? b64ToUint8(data.raster.ir_b64) : null;
-      MON.rawOLR = b64ToUint8(data.raster.precip_b64 || data.raster.olr_b64);
-      MON.rawSST = data.raster.sst_b64 ? b64ToUint8(data.raster.sst_b64) : null;
-      MON.rawSeaIce = data.raster.seaice_b64 ? b64ToUint8(data.raster.seaice_b64) : null;
-      MON.rawOcnSpd = data.raster.ocn_spd_b64 ? b64ToUint8(data.raster.ocn_spd_b64) : null;
-      MON.rawOcnWet = data.raster.ocn_wet_b64 ? b64ToUint8(data.raster.ocn_wet_b64) : null;
-      MON.rawOcnCoast = data.raster.ocn_coast_b64 ? b64ToUint8(data.raster.ocn_coast_b64) : null;
-      MON.rawLAI = b64ToUint8(data.raster.lai_b64);
-      MON.rawSurf = b64ToUint8(data.raster.surf_b64);
-      MON.rawCoast = b64ToUint8(data.raster.coast_b64);
+      const newSimDays = (meta.sim_days !== undefined && meta.sim_days !== null) ? Number(meta.sim_days) : null;
+      const frameKey = `${meta.source || ""}|${newSimDays}|${MON.esmField}`;
+      const isNewFrame = (frameKey !== MON.lastFrameKey);
+      if (isNewFrame) {
+        MON.lastFrameKey = frameKey;
+        const t2 = b64ToUint8(data.raster.t2_b64);
+        const ir = data.raster.ir_b64 ? b64ToUint8(data.raster.ir_b64) : null;
+        const olr = b64ToUint8(data.raster.precip_b64 || data.raster.olr_b64);
+        const sst = data.raster.sst_b64 ? b64ToUint8(data.raster.sst_b64) : null;
+        const seaIce = data.raster.seaice_b64 ? b64ToUint8(data.raster.seaice_b64) : null;
+        const ocnSpd = data.raster.ocn_spd_b64 ? b64ToUint8(data.raster.ocn_spd_b64) : null;
+        const lai = b64ToUint8(data.raster.lai_b64);
+        const lwp = data.raster.lwp_b64 ? b64ToUint8(data.raster.lwp_b64) : null;
+        const iwp = data.raster.iwp_b64 ? b64ToUint8(data.raster.iwp_b64) : null;
+        const swe = data.raster.swe_b64 ? b64ToUint8(data.raster.swe_b64) : null;
+        const wave = data.raster.wave_b64 ? b64ToUint8(data.raster.wave_b64) : null;
+        const windSpd = data.raster.wind_spd_b64 ? b64ToUint8(data.raster.wind_spd_b64) : null;
+        const subLon = (data.raster.subsolar_lon_deg !== undefined)
+          ? Number(data.raster.subsolar_lon_deg)
+          : (newSimDays !== null ? wrapLonDeg(180.0 - 360.0 * (((newSimDays % 1.0) + 1.0) % 1.0)) : 140.0);
+        const declDeg = (data.raster.solar_decl_deg !== undefined) ? Number(data.raster.solar_decl_deg) : 0.0;
+
+        MON.rawOcnWet = data.raster.ocn_wet_b64 ? b64ToUint8(data.raster.ocn_wet_b64) : null;
+        MON.rawOcnCoast = data.raster.ocn_coast_b64 ? b64ToUint8(data.raster.ocn_coast_b64) : null;
+        MON.rawSurf = b64ToUint8(data.raster.surf_b64);
+        MON.rawCoast = b64ToUint8(data.raster.coast_b64);
+        MON.rawZTopo = data.raster.ztopo_b64 ? b64ToUint8(data.raster.ztopo_b64) : null;
+        MON.rawDepth = data.raster.depth_b64 ? b64ToUint8(data.raster.depth_b64) : null;
+        MON.rawWindU = data.raster.wind_u_b64 ? b64ToUint8(data.raster.wind_u_b64) : null;
+        MON.rawWindV = data.raster.wind_v_b64 ? b64ToUint8(data.raster.wind_v_b64) : null;
+        MON.rawOcnU = data.raster.ocn_u_b64 ? b64ToUint8(data.raster.ocn_u_b64) : null;
+        MON.rawOcnV = data.raster.ocn_v_b64 ? b64ToUint8(data.raster.ocn_v_b64) : null;
+        MON.rawSST = sst;
+        MON.rawSeaIce = seaIce;
+        MON.rawLAI = lai;
+        MON.rawSWE = swe;
+        MON.rawWave = wave;
+        MON.solarDeclDeg = declDeg;
+
+        const nowMs = performance.now();
+        const canInterp = MON.currFrame && MON.currFrame.t2 && MON.currFrame.t2.length === t2.length &&
+          meta.source === "live_preview.npz" && newSimDays !== null && MON.currFrame.simDays !== null &&
+          (newSimDays > MON.currFrame.simDays) && (newSimDays - MON.currFrame.simDays) < 0.25;
+        MON.prevFrame = canInterp ? MON.currFrame : null;
+        MON.currFrame = { t2, ir, olr, ocnSpd, lwp, iwp, windSpd, subLon, declDeg, simDays: newSimDays };
+        MON.frameArriveMs = nowMs;
+        if (canInterp && MON.wallSPerDay > 0) {
+          const dtModelDays = newSimDays - MON.prevFrame.simDays;
+          const expectMs = dtModelDays * MON.wallSPerDay * 1000.0;
+          MON.frameIntervalMs = Math.max(350.0, Math.min(3500.0, expectMs));
+        } else {
+          MON.frameIntervalMs = 850.0;
+        }
+        if (!MON.prevFrame) {
+          MON.rawT2 = t2; MON.rawIR = ir; MON.rawOLR = olr;
+          MON.rawOcnSpd = ocnSpd; MON.rawLWP = lwp; MON.rawIWP = iwp; MON.rawWindSpd = windSpd;
+          GLOBE_VIEW.subsolarLon = subLon;
+        }
+        markHeroDirty();
+      }
       const sstSub = document.getElementById("g-sst-sub");
       if (sstSub && data.raster.ocn_res_lbl) {
         sstSub.textContent = (LANG === "ja" ? "黒潮・湾流・海氷（白） — " : "Western boundary currents & sea ice — ") + data.raster.ocn_res_lbl;
       }
-      const ocnT = document.getElementById("g-ocn-title");
-      const ocnS = document.getElementById("g-ocn-sub");
-      const ocnL = document.getElementById("g-ocn-cbar-labels");
-      if (data.raster.ocn_is_wind) {
-        if (ocnT) ocnT.innerHTML = LANG === "ja" ? "地表風速 |u<sub>10</sub>| [m s⁻¹]" : "Surface Wind |u<sub>10</sub>| [m s⁻¹]";
-        if (ocnS) ocnS.textContent = LANG === "ja" ? "貿易風・偏西風・低気圧の強風帯" : "Trades, westerlies & storm wind bands";
-        if (ocnL) ocnL.innerHTML = "<span>0</span><span>6</span><span>12</span><span>18</span><span>25+ m/s</span>";
-      } else {
-        if (ocnT) ocnT.innerHTML = LANG === "ja" ? "表層海流速 |u<sub>ocn</sub>| [m s⁻¹]" : "Ocean Current |u<sub>ocn</sub>| [m s⁻¹]";
-        if (ocnS) ocnS.textContent = (LANG === "ja" ? "黒潮・湾流・ACC・中規模渦 — " : "Kuroshio, Gulf Stream, ACC & eddies — ") + (data.raster.ocn_res_lbl || "");
-        if (ocnL) ocnL.innerHTML = "<span>0.0</span><span>0.3</span><span>0.6</span><span>0.9</span><span>1.2+ m/s</span>";
-      }
+      onOcnPanelModeChange(false);
       const tEl = document.getElementById("g-esm-title");
       const sEl = document.getElementById("g-esm-sub");
       const cEl = document.getElementById("g-esm-cbar");
@@ -2619,10 +2798,10 @@ const LUT_OCN = makeColorLUT([[0,[4,13,28]],[0.14,[12,45,92]],[0.34,[2,132,199]]
 const LUT_LAI = makeColorLUT([[0,[146,112,74]],[0.20,[163,163,50]],[0.45,[77,158,56]],[0.72,[21,128,61]],[1,[6,78,59]]]);
 const LUT_ESM = makeColorLUT([[0,[30,27,75]],[0.20,[29,78,216]],[0.42,[14,165,233]],[0.65,[52,211,153]],[0.84,[250,204,21]],[1,[249,115,22]]]);
 
-function buildOrthographicCache(lat0Deg) {
-  const size = 300, cx = 150, cy = 150, R = 132;
+function buildOrthographicCache(lat0Deg, size = 300, R = 132) {
+  const cx = size * 0.5, cy = size * 0.5;
   const lat0 = (lat0Deg * Math.PI) / 180, sinL0 = Math.sin(lat0), cosL0 = Math.cos(lat0);
-  const pixIdx = [], latRow = [], dlonDeg = [], shade = [], latVal = [];
+  const pixIdx = [], latRow = [], dlonDeg = [], shade = [], latVal = [], zArr = [];
   for (let py = 0; py < size; py++) {
     const Y = (cy - py) / R;
     for (let px = 0; px < size; px++) {
@@ -2639,16 +2818,462 @@ function buildOrthographicCache(lat0Deg) {
       dlonDeg.push(dlon);
       shade.push(li);
       latVal.push(lat);
+      zArr.push(Z);
     }
   }
-  return { size, R, cx, cy, count: pixIdx.length, pixIdx: new Int32Array(pixIdx), latRow: new Uint16Array(latRow), dlonDeg: new Float32Array(dlonDeg), shade: new Float32Array(shade), latVal: new Float32Array(latVal) };
+  return { size, R, cx, cy, count: pixIdx.length, pixIdx: new Int32Array(pixIdx), latRow: new Uint16Array(latRow), dlonDeg: new Float32Array(dlonDeg), shade: new Float32Array(shade), latVal: new Float32Array(latVal), zVal: new Float32Array(zArr) };
 }
 
 function getOrthoGeo() {
   if (GLOBE_VIEW.geoCache && Math.abs(GLOBE_VIEW.geoCacheLat - GLOBE_VIEW.lat0) < 0.05) return GLOBE_VIEW.geoCache;
   GLOBE_VIEW.geoCacheLat = GLOBE_VIEW.lat0;
-  GLOBE_VIEW.geoCache = buildOrthographicCache(GLOBE_VIEW.lat0);
+  GLOBE_VIEW.geoCache = buildOrthographicCache(GLOBE_VIEW.lat0, 300, 132);
   return GLOBE_VIEW.geoCache;
+}
+
+function getHeroGeo() {
+  if (GLOBE_VIEW.heroGeoCache && Math.abs(GLOBE_VIEW.heroGeoCacheLat - GLOBE_VIEW.lat0) < 0.05) return GLOBE_VIEW.heroGeoCache;
+  GLOBE_VIEW.heroGeoCacheLat = GLOBE_VIEW.lat0;
+  GLOBE_VIEW.heroGeoCache = buildOrthographicCache(GLOBE_VIEW.lat0, 380, 168);
+  return GLOBE_VIEW.heroGeoCache;
+}
+
+function getTheaterGeo() {
+  if (GLOBE_VIEW.theaterGeoCache && Math.abs(GLOBE_VIEW.theaterGeoCacheLat - GLOBE_VIEW.lat0) < 0.05) return GLOBE_VIEW.theaterGeoCache;
+  GLOBE_VIEW.theaterGeoCacheLat = GLOBE_VIEW.lat0;
+  GLOBE_VIEW.theaterGeoCache = buildOrthographicCache(GLOBE_VIEW.lat0, 760, 344);
+  return GLOBE_VIEW.theaterGeoCache;
+}
+
+let _theaterOpen = false;
+function openHimawariTheater() {
+  const el = document.getElementById("hima-theater");
+  if (!el) return;
+  el.style.display = "flex";
+  _theaterOpen = true;
+  markHeroDirty();
+  resetStreamParticles();
+  const ts = document.getElementById("globeTheaterStream");
+  if (ts) ts.getContext("2d").clearRect(0, 0, ts.width, ts.height);
+}
+function closeHimawariTheater() {
+  const el = document.getElementById("hima-theater");
+  if (el) el.style.display = "none";
+  _theaterOpen = false;
+  if (document.fullscreenElement) {
+    document.exitFullscreen().catch(() => {});
+  }
+}
+function toggleBrowserFullscreen() {
+  const el = document.getElementById("hima-theater");
+  if (!el) return;
+  if (!document.fullscreenElement) {
+    el.requestFullscreen?.().catch(() => {});
+  } else {
+    document.exitFullscreen?.().catch(() => {});
+  }
+}
+window.addEventListener("keydown", e => {
+  if (e.key === "Escape" && _theaterOpen) closeHimawariTheater();
+});
+
+let _heroDirty = true;
+function markHeroDirty() { _heroDirty = true; }
+
+function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
+  const canvas = document.getElementById(targetCanvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const W = geo.size;
+  if (!MON.raster) {
+    ctx.clearRect(0, 0, W, W);
+    const g = ctx.createRadialGradient(geo.cx, geo.cy, geo.R*0.2, geo.cx, geo.cy, geo.R);
+    g.addColorStop(0, "#12325c"); g.addColorStop(1, "#050b18");
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(geo.cx, geo.cy, geo.R, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = "#bae6fd"; ctx.font = "13px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("ライブ出力待機中 (Himawari RGB / Streamlines)", geo.cx, geo.cy + 4);
+    ctx.textAlign = "left";
+    return;
+  }
+  if (!canvas._offCv) {
+    canvas._offCv = document.createElement("canvas");
+    canvas._offCv.width = W; canvas._offCv.height = W;
+    canvas._imgData = canvas._offCv.getContext("2d").createImageData(W, W);
+  }
+  const offCtx = canvas._offCv.getContext("2d");
+  const img = canvas._imgData, buf = img.data;
+  buf.fill(0);
+
+  const baseMode = document.getElementById("hero-base-mode")?.value || "himawari";
+  const useSolar = document.getElementById("hima-solar")?.checked ?? true;
+  const useNightIR = document.getElementById("hima-night-ir")?.checked ?? true;
+  const useGlint = document.getElementById("hima-glint")?.checked ?? true;
+  const sunOffsetDeg = Number(document.getElementById("hima-sun-offset")?.value || 0);
+  const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
+
+  const lon0 = GLOBE_VIEW.lon0;
+  const lat0Rad = GLOBE_VIEW.lat0 * Math.PI / 180;
+  const lon0Rad = lon0 * Math.PI / 180;
+  const vx = Math.cos(lat0Rad) * Math.cos(lon0Rad);
+  const vy = Math.cos(lat0Rad) * Math.sin(lon0Rad);
+  const vz = Math.sin(lat0Rad);
+
+  const declDeg = Number(MON.solarDeclDeg || 0.0);
+  const subLonDeg = wrapLonDeg((GLOBE_VIEW.subsolarLon !== null ? GLOBE_VIEW.subsolarLon : 140.0) + sunOffsetDeg);
+  const declRad = declDeg * Math.PI / 180;
+  const subLonRad = subLonDeg * Math.PI / 180;
+  const sx = Math.cos(declRad) * Math.cos(subLonRad);
+  const sy = Math.cos(declRad) * Math.sin(subLonRad);
+  const sz = Math.sin(declRad);
+
+  // Half-vector h = normalize(s + v) for physical Cox-Munk ocean sunglint
+  let hx = sx + vx, hy = sy + vy, hz = sz + vz;
+  const hNorm = Math.hypot(hx, hy, hz) || 1.0;
+  hx /= hNorm; hy /= hNorm; hz /= hNorm;
+
+  const sunInfo = document.getElementById("hima-sun-info");
+  if (sunInfo) {
+    const hasVec = (MON.rawWindU && MON.rawWindV) || (MON.rawOcnU && MON.rawOcnV);
+    sunInfo.textContent = `太陽直下点: lat ${declDeg>=0?"+":""}${declDeg.toFixed(1)}°, lon ${subLonDeg>=0?"+":""}${subLonDeg.toFixed(1)}° | ` +
+      (hasVec ? "物理雲(LWP/IWP)・波高・風/海流ベクトル ライブ連動中" : "旧プレビュー互換モード（次ステップからLWP/風/海流ベクトルを自動反映）");
+  }
+
+  const rH = MON.raster.height || 360, rW = MON.raster.width || 720;
+  const rowScale = rH / 360.0, lonScale = rW / 360.0;
+  const surf = MON.rawSurf, coast = MON.rawCoast, laiU8 = MON.rawLAI;
+  const seaIce = MON.rawSeaIce, ocnWet = MON.rawOcnWet;
+  const lwpU8 = MON.rawLWP, iwpU8 = MON.rawIWP, irU8 = MON.rawIR;
+  const sweU8 = MON.rawSWE, ztU8 = MON.rawZTopo, depthU8 = MON.rawDepth, waveU8 = MON.rawWave;
+  const deg2rad = Math.PI / 180.0;
+
+  for (let p = 0; p < geo.count; p++) {
+    const row = Math.max(0, Math.min(rH - 1, Math.floor(geo.latRow[p] * rowScale)));
+    const lon = wrapLonDeg(lon0 + geo.dlonDeg[p]);
+    const col = Math.max(0, Math.min(rW - 1, Math.floor((lon + 180) * lonScale)));
+    const gIdx = row * rW + col;
+    const Z = geo.zVal[p];
+    const st = surf[gIdx];
+    const isWet = ocnWet ? (ocnWet[gIdx] === 1) : (st === 0);
+
+    if (baseMode === "dark") {
+      // earth.nullschool.net dark sphere base for high-contrast streamlines
+      const sh = geo.shade[p];
+      let r, g, b;
+      if (isWet) {
+        r = 7 * sh; g = 14 * sh; b = 28 * sh;
+        if (seaIce && seaIce[gIdx] > 40) {
+          const fi = Math.min(1, (seaIce[gIdx] - 40) / 160);
+          r = r*(1-fi) + 46*sh*fi; g = g*(1-fi) + 64*sh*fi; b = b*(1-fi) + 86*sh*fi;
+        }
+      } else if (st === 2) {
+        r = 42 * sh; g = 52 * sh; b = 66 * sh;
+      } else {
+        r = 24 * sh; g = 30 * sh; b = 40 * sh;
+      }
+      if (coast[gIdx] === 1) { r += 48; g += 62; b += 78; }
+      if (drawGrid && (Math.abs(geo.latVal[p] % 30) < 0.7 || Math.abs((lon + 360) % 30) < 0.7)) {
+        r += 16; g += 24; b += 34;
+      }
+      const o = geo.pixIdx[p];
+      buf[o] = Math.min(255, r); buf[o+1] = Math.min(255, g); buf[o+2] = Math.min(255, b); buf[o+3] = 255;
+      continue;
+    }
+
+    // --- HIMAWARI-8/9 TRUE-COLOR RGB PHYSICAL SYNTHESIS ---
+    const latRad = geo.latVal[p] * deg2rad;
+    const lonRad = lon * deg2rad;
+    const cosLat = Math.cos(latRad);
+    const nx = cosLat * Math.cos(lonRad);
+    const ny = cosLat * Math.sin(lonRad);
+    const nz = Math.sin(latRad);
+    const mu0 = useSolar ? (nx * sx + ny * sy + nz * sz) : 0.78;
+
+    // 1. Surface spectral albedo (R, G, B in 0..1)
+    let sr, sg, sb;
+    let glintAdd = 0.0;
+    if (isWet) {
+      // Bathymetry-aware deep navy -> turquoise continental shelf
+      const depthM = depthU8 ? (depthU8[gIdx] / 255.0) * 4000.0 : 2500.0;
+      const shallow = Math.exp(-depthM / 220.0);
+      sr = 0.025 + 0.055 * shallow;
+      sg = 0.085 + 0.240 * shallow;
+      sb = 0.210 + 0.260 * shallow;
+
+      // Significant wave height H_s -> ocean whitecap foam + Cox-Munk sunglint
+      const hs = waveU8 ? (waveU8[gIdx] / 255.0) * 10.0 : 1.5;
+      const foam = useGlint ? Math.min(0.28, Math.max(0.0, (hs - 2.0) * 0.032)) : 0.0;
+      sr = sr * (1 - foam) + 0.88 * foam;
+      sg = sg * (1 - foam) + 0.92 * foam;
+      sb = sb * (1 - foam) + 0.96 * foam;
+
+      // Sea ice overlay
+      const fIce = (seaIce && seaIce[gIdx] > 30) ? Math.min(1.0, (seaIce[gIdx] - 30) / 145.0) : 0.0;
+      if (fIce > 0.0) {
+        sr = sr * (1 - fIce) + 0.88 * fIce;
+        sg = sg * (1 - fIce) + 0.93 * fIce;
+        sb = sb * (1 - fIce) + 0.97 * fIce;
+      } else if (useGlint && mu0 > 0.02) {
+        const nh = Math.max(0.0, nx * hx + ny * hy + nz * hz);
+        const sig2 = 0.008 + 0.024 * Math.min(hs / 3.5, 2.5);
+        const gVal = Math.exp(-(1.0 - nh * nh) / (2.0 * sig2)) * (0.045 / Math.sqrt(sig2));
+        glintAdd = Math.min(0.85, gVal * Math.pow(Math.max(mu0, 0.0), 0.6));
+      }
+    } else if (st === 2) {
+      // Continental ice sheets (Antarctica / Greenland)
+      sr = 0.90; sg = 0.94; sb = 0.98;
+    } else {
+      // Land true color from LAI + elevation + snow cover
+      const lai = laiU8 ? (laiU8[gIdx] / 255.0) * 7.0 : 1.5;
+      const vf = Math.min(1.0, Math.pow(lai / 5.0, 0.72));
+      const elev = ztU8 ? (ztU8[gIdx] / 255.0) * 5000.0 : 400.0;
+      const rock = Math.min(0.7, Math.max(0.0, (elev - 2200.0) / 2800.0));
+      // Desert ochre -> grassland olive -> rainforest emerald
+      sr = 0.64 * (1 - vf) + 0.09 * vf;
+      sg = 0.54 * (1 - vf) + 0.29 * vf;
+      sb = 0.36 * (1 - vf) + 0.12 * vf;
+      sr = sr * (1 - rock) + 0.44 * rock;
+      sg = sg * (1 - rock) + 0.42 * rock;
+      sb = sb * (1 - rock) + 0.39 * rock;
+      const swe = sweU8 ? (sweU8[gIdx] / 255.0) * 150.0 : 0.0;
+      const fSnow = Math.min(1.0, swe / 35.0);
+      if (fSnow > 0.0) {
+        sr = sr * (1 - fSnow) + 0.91 * fSnow;
+        sg = sg * (1 - fSnow) + 0.94 * fSnow;
+        sb = sb * (1 - fSnow) + 0.97 * fSnow;
+      }
+    }
+
+    // 2. Cloud reflectance from LWP & IWP (two-stream reflectance tau/(tau+7.5)) or OLR fallback
+    let alphaCld = 0.0, cirrusFrac = 0.0;
+    if (lwpU8 && iwpU8) {
+      const lwp = (lwpU8[gIdx] / 255.0) * 400.0;
+      const iwp = (iwpU8[gIdx] / 255.0) * 200.0;
+      const tauL = 0.085 * lwp;
+      const tauI = 0.032 * iwp;
+      const tau = tauL + tauI;
+      alphaCld = Math.min(0.96, tau / (tau + 6.5));
+      cirrusFrac = tau > 0.05 ? (tauI / tau) : 0.0;
+    } else if (irU8) {
+      const olrV = 110.0 + (irU8[gIdx] / 255.0) * 210.0;
+      alphaCld = Math.min(0.92, Math.max(0.0, (255.0 - olrV) / 115.0));
+      cirrusFrac = 0.35;
+    }
+    const cldR = 0.97 - 0.04 * cirrusFrac;
+    const cldG = 0.97 - 0.01 * cirrusFrac;
+    const cldB = 0.99;
+
+    // Combine surface (+ glint attenuated by clouds) and clouds
+    const oneMinusC = 1.0 - alphaCld;
+    let cr = sr * oneMinusC + cldR * alphaCld + glintAdd * oneMinusC * oneMinusC;
+    let cg = sg * oneMinusC + cldG * alphaCld + glintAdd * 0.95 * oneMinusC * oneMinusC;
+    let cb = sb * oneMinusC + cldB * alphaCld + glintAdd * 0.85 * oneMinusC * oneMinusC;
+
+    // 3. Solar incidence angle illumination, Rayleigh limb scattering, twilight & night GeoColor IR
+    const limb = Math.pow(1.0 - Z, 2.4);
+    let r, g, b;
+    if (mu0 > 0.0) {
+      const illum = Math.pow(mu0, 0.68);
+      // Subtle Rayleigh blue airglow on day side + limb
+      const rayl = (0.04 + 0.16 * limb) * Math.pow(mu0, 0.35);
+      // Warm twilight glow near terminator (0 < mu0 < 0.18)
+      const tw = Math.exp(-Math.pow((mu0 - 0.03) / 0.09, 2)) * 0.22;
+      r = (cr * illum + rayl * 0.32 + tw * 0.95) * 255.0;
+      g = (cg * illum + rayl * 0.56 + tw * 0.42) * 255.0;
+      b = (cb * illum + rayl * 1.00 + tw * 0.12) * 255.0;
+    } else {
+      // Night hemisphere + twilight scatter (-0.11 < mu0 <= 0)
+      const tw = Math.exp(-Math.pow((mu0 - 0.01) / 0.065, 2)) * 0.18;
+      let nr = 0.018 + (isWet ? 0.0 : 0.016) + tw * 0.85;
+      let ng = 0.026 + (isWet ? 0.005 : 0.016) + tw * 0.35;
+      let nb = 0.055 + (isWet ? 0.018 : 0.014) + tw * 0.18 + limb * 0.04;
+      if (useNightIR && irU8) {
+        const olrV = 110.0 + (irU8[gIdx] / 255.0) * 210.0;
+        const irCld = Math.min(1.0, Math.max(0.0, (250.0 - olrV) / 120.0));
+        nr += irCld * 0.24;
+        ng += irCld * 0.31;
+        nb += irCld * 0.44;
+      }
+      r = nr * 255.0; g = ng * 255.0; b = nb * 255.0;
+    }
+
+    if (drawGrid && (Math.abs(geo.latVal[p] % 30) < 0.65 || Math.abs((lon + 360) % 30) < 0.65)) {
+      r = r * 0.88 + 24; g = g * 0.88 + 38; b = b * 0.88 + 54;
+    }
+    const o = geo.pixIdx[p];
+    buf[o] = Math.max(0, Math.min(255, r));
+    buf[o+1] = Math.max(0, Math.min(255, g));
+    buf[o+2] = Math.max(0, Math.min(255, b));
+    buf[o+3] = 255;
+  }
+  offCtx.putImageData(img, 0, 0);
+  ctx.clearRect(0, 0, W, W);
+  const halo = ctx.createRadialGradient(geo.cx, geo.cy, geo.R*0.92, geo.cx, geo.cy, geo.R*1.09);
+  halo.addColorStop(0, "rgba(96,165,250,0.42)");
+  halo.addColorStop(0.55, "rgba(56,189,248,0.16)");
+  halo.addColorStop(1, "rgba(56,189,248,0)");
+  ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(geo.cx, geo.cy, geo.R*1.09, 0, Math.PI*2); ctx.fill();
+  ctx.drawImage(canvas._offCv, 0, 0);
+}
+
+/* --- EARTH.NULLSCHOOL.NET ANIMATED PARTICLE STREAMLINES ON ORTHOGRAPHIC 3D GLOBE --- */
+const STREAM_STATE = { hero: [], mini: [], lastLon: null, lastLat: null };
+
+function _spawnParticle(isOcean) {
+  // Uniform on sphere (cos-weighted latitude)
+  for (let tries = 0; tries < 12; tries++) {
+    const u = Math.random() * 2 - 1;
+    const lat = Math.asin(Math.max(-0.985, Math.min(0.985, u))) * (180 / Math.PI);
+    const lon = Math.random() * 360 - 180;
+    if (isOcean && MON.raster && (MON.rawOcnWet || MON.rawSurf)) {
+      const rH = MON.raster.height || 360, rW = MON.raster.width || 720;
+      const row = Math.max(0, Math.min(rH - 1, Math.floor((90 - lat) * (rH / 180))));
+      const col = Math.max(0, Math.min(rW - 1, Math.floor((lon + 180) * (rW / 360))));
+      const gi = row * rW + col;
+      const wet = MON.rawOcnWet ? (MON.rawOcnWet[gi] === 1) : (MON.rawSurf[gi] === 0);
+      if (!wet) continue;
+    }
+    return { lat, lon, age: Math.floor(Math.random() * 65), maxAge: 55 + Math.floor(Math.random() * 55) };
+  }
+  return { lat: (Math.random() - 0.5) * 140, lon: Math.random() * 360 - 180, age: 0, maxAge: 65 };
+}
+
+function onOcnPanelModeChange(doReset = true) {
+  if (doReset) {
+    _lastRenderKey = "";
+    resetStreamParticles();
+  }
+  const mode = document.getElementById("ocn-panel-mode")?.value || "ocean";
+  const ocnT = document.getElementById("g-ocn-title");
+  const ocnS = document.getElementById("g-ocn-sub");
+  const ocnL = document.getElementById("g-ocn-cbar-labels");
+  const showWind = (mode === "wind") || (MON.raster && MON.raster.ocn_is_wind);
+  if (showWind) {
+    if (ocnT) ocnT.innerHTML = LANG === "ja" ? "地表10m風速 |u<sub>10</sub>|" : "Surface Wind |u<sub>10</sub>|";
+    if (ocnS) ocnS.textContent = LANG === "ja" ? "貿易風・偏西風・低気圧の風速＋流線" : "Trades, westerlies & storm streamlines";
+    if (ocnL) ocnL.innerHTML = "<span>0</span><span>6</span><span>12</span><span>18</span><span>25+ m/s</span>";
+  } else {
+    if (ocnT) ocnT.innerHTML = LANG === "ja" ? "表層海流速 |u<sub>ocn</sub>|" : "Ocean Current |u<sub>ocn</sub>|";
+    if (ocnS) ocnS.textContent = (LANG === "ja" ? "黒潮・湾流・ACC・中規模渦 — " : "Kuroshio, Gulf Stream, ACC — ") + ((MON.raster && MON.raster.ocn_res_lbl) || "");
+    if (ocnL) ocnL.innerHTML = "<span>0.0</span><span>0.3</span><span>0.6</span><span>0.9</span><span>1.2+ m/s</span>";
+  }
+}
+
+function resetStreamParticles() {
+  const ocnMode = document.getElementById("ocn-panel-mode")?.value || "ocean";
+  const isOcnM = (ocnMode === "ocean") && !(MON.raster && MON.raster.ocn_is_wind);
+  STREAM_STATE.mini = [];
+  for (let i = 0; i < 1800; i++) STREAM_STATE.mini.push(_spawnParticle(isOcnM));
+  const c = document.getElementById("globeOCNStream");
+  if (c) c.getContext("2d").clearRect(0, 0, c.width, c.height);
+}
+
+function _sampleVec(lat, lon, uArr, vArr, vMax) {
+  const rH = MON.raster.height || 360, rW = MON.raster.width || 720;
+  const fy = Math.max(0, Math.min(rH - 1.001, (90.0 - lat) * (rH / 180.0)));
+  const fx = ((((lon + 180.0) % 360.0) + 360.0) % 360.0) * (rW / 360.0);
+  const y0 = Math.floor(fy), y1 = Math.min(rH - 1, y0 + 1), wy = fy - y0;
+  const x0 = Math.floor(fx) % rW, x1 = (x0 + 1) % rW, wx = fx - Math.floor(fx);
+  const i00 = y0 * rW + x0, i10 = y0 * rW + x1, i01 = y1 * rW + x0, i11 = y1 * rW + x1;
+  const u8 = (uArr[i00]*(1-wx) + uArr[i10]*wx)*(1-wy) + (uArr[i01]*(1-wx) + uArr[i11]*wx)*wy;
+  const v8 = (vArr[i00]*(1-wx) + vArr[i10]*wx)*(1-wy) + (vArr[i01]*(1-wx) + vArr[i11]*wx)*wy;
+  return [(u8 / 255.0 * 2.0 - 1.0) * vMax, (v8 / 255.0 * 2.0 - 1.0) * vMax];
+}
+
+function _streamColor(normSpd) {
+  const t = Math.max(0, Math.min(1, normSpd));
+  if (t < 0.25) return `rgba(56,189,248,${0.48 + t})`;
+  if (t < 0.50) return `rgba(52,211,153,${0.72 + 0.3*(t-0.25)})`;
+  if (t < 0.78) return `rgba(253,224,71,0.92)`;
+  return `rgba(244,114,182,0.98)`;
+}
+
+function _stepStreamCanvas(canvasId, particles, uArr, vArr, vMax, isOcean, size, R, dt) {
+  const cv = document.getElementById(canvasId);
+  if (!cv || !MON.raster) return;
+  const ctx = cv.getContext("2d");
+  if (!uArr || !vArr) { ctx.clearRect(0, 0, size, size); return; }
+
+  // Fade previous frame smoothly for comet-tail trails
+  ctx.save();
+  ctx.globalCompositeOperation = "destination-in";
+  ctx.fillStyle = "rgba(0,0,0,0.88)";
+  ctx.fillRect(0, 0, size, size);
+  ctx.restore();
+
+  const cx = size * 0.5, cy = size * 0.5;
+  const lat0 = GLOBE_VIEW.lat0 * Math.PI / 180;
+  const lon0 = GLOBE_VIEW.lon0 * Math.PI / 180;
+  const sinL0 = Math.sin(lat0), cosL0 = Math.cos(lat0);
+  const deg2rad = Math.PI / 180;
+  const spdMul = Number(document.getElementById("stream-speed")?.value || 1.1);
+  // Scale physical velocity to pleasant degrees/sec on globe
+  const advScale = (isOcean ? 18.0 : 1.05) * spdMul * Math.min(dt, 0.05);
+  const rH = MON.raster.height || 360, rW = MON.raster.width || 720;
+
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, R - 1, 0, Math.PI * 2); ctx.clip();
+  ctx.lineWidth = size > 340 ? 1.45 : 1.2;
+  ctx.lineCap = "round";
+
+  // Bucket strokes into 4 speed colors for ultra-fast batched Canvas rendering!
+  const paths = [[], [], [], []];
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    p.age++;
+    if (p.age > p.maxAge || Math.abs(p.lat) > 84.5) {
+      particles[i] = _spawnParticle(isOcean);
+      continue;
+    }
+    const [u, v] = _sampleVec(p.lat, p.lon, uArr, vArr, vMax);
+    const spd = Math.hypot(u, v);
+    if (spd < (isOcean ? 0.008 : 0.25)) {
+      p.age += 6;
+      continue;
+    }
+    const lat1 = p.lat, lon1 = p.lon;
+    const cosL = Math.max(0.18, Math.cos(lat1 * deg2rad));
+    const lat2 = Math.max(-85, Math.min(85, lat1 + v * advScale));
+    const lon2 = wrapLonDeg(lon1 + (u * advScale) / cosL);
+    if (isOcean && (MON.rawOcnWet || MON.rawSurf)) {
+      const row = Math.max(0, Math.min(rH - 1, Math.floor((90 - lat2) * (rH / 180))));
+      const col = Math.max(0, Math.min(rW - 1, Math.floor((lon2 + 180) * (rW / 360))));
+      const gi = row * rW + col;
+      const wet = MON.rawOcnWet ? (MON.rawOcnWet[gi] === 1) : (MON.rawSurf[gi] === 0);
+      if (!wet) { particles[i] = _spawnParticle(true); continue; }
+    }
+    p.lat = lat2; p.lon = lon2;
+
+    // Project start and end onto orthographic hemisphere
+    const phi1 = lat1 * deg2rad, dl1 = lon1 * deg2rad - lon0;
+    const z1 = sinL0 * Math.sin(phi1) + cosL0 * Math.cos(phi1) * Math.cos(dl1);
+    if (z1 <= 0.02) continue;
+    const phi2 = lat2 * deg2rad, dl2 = lon2 * deg2rad - lon0;
+    const z2 = sinL0 * Math.sin(phi2) + cosL0 * Math.cos(phi2) * Math.cos(dl2);
+    if (z2 <= 0.02) continue;
+
+    const x1 = cx + R * Math.cos(phi1) * Math.sin(dl1);
+    const y1 = cy - R * (cosL0 * Math.sin(phi1) - sinL0 * Math.cos(phi1) * Math.cos(dl1));
+    const x2 = cx + R * Math.cos(phi2) * Math.sin(dl2);
+    const y2 = cy - R * (cosL0 * Math.sin(phi2) - sinL0 * Math.cos(phi2) * Math.cos(dl2));
+    if (Math.hypot(x2 - x1, y2 - y1) > 22) continue;
+
+    const normS = spd / (isOcean ? 0.55 : 18.0);
+    const b = normS < 0.25 ? 0 : (normS < 0.55 ? 1 : (normS < 0.85 ? 2 : 3));
+    paths[b].push(x1, y1, x2, y2);
+  }
+  const cols = ["rgba(56,189,248,0.62)", "rgba(52,211,153,0.82)", "rgba(253,224,71,0.92)", "rgba(244,114,182,0.98)"];
+  for (let b = 0; b < 4; b++) {
+    const arr = paths[b];
+    if (!arr.length) continue;
+    ctx.beginPath();
+    ctx.strokeStyle = cols[b];
+    for (let k = 0; k < arr.length; k += 4) {
+      ctx.moveTo(arr[k], arr[k+1]);
+      ctx.lineTo(arr[k+2], arr[k+3]);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function wrapLonDeg(lon) {
@@ -2720,12 +3345,14 @@ function renderOneGlobe(canvasId, kind, geo) {
   buf.fill(0);
   const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
   const lon0 = GLOBE_VIEW.lon0;
-  const isOcnGlobe = (kind === "sst") || (kind === "ocn" && !MON.raster.ocn_is_wind);
+  const ocnPanelMode = document.getElementById("ocn-panel-mode")?.value || "ocean";
+  const showWindOnOcn = (kind === "ocn") && (ocnPanelMode === "wind" || MON.raster.ocn_is_wind);
+  const isOcnGlobe = (kind === "sst") || (kind === "ocn" && !showWindOnOcn);
   const srcVals = kind === "t2" ? MON.rawT2
     : (kind === "ir" ? (MON.rawIR || MON.rawOLR)
     : (kind === "olr" ? MON.rawOLR
     : (kind === "sst" ? (MON.rawSST || MON.rawT2)
-    : (kind === "ocn" ? (MON.rawOcnSpd || MON.rawOLR)
+    : (kind === "ocn" ? (showWindOnOcn ? (MON.rawWindSpd || MON.rawOcnSpd || MON.rawOLR) : (MON.rawOcnSpd || MON.rawOLR))
     : MON.rawLAI))));
   const isLaiMode = (MON.esmField || "lai") === "lai";
   const landOnly3 = MON.raster.esm_land_only !== false;
@@ -2800,7 +3427,26 @@ function renderOneGlobe(canvasId, kind, geo) {
 }
 
 let _lastAnimTs = 0;
+let _lastInterpTs = 0;
 let _lastRenderKey = "";
+const _INTERP_BUFS = {};
+function _blendU8(key, prevA, currA, a) {
+  if (!currA) return null;
+  if (!prevA || prevA.length !== currA.length || a >= 0.995) return currA;
+  if (a <= 0.005) return prevA;
+  let dst = _INTERP_BUFS[key];
+  if (!dst || dst.length !== currA.length) {
+    dst = new Uint8Array(currA.length);
+    _INTERP_BUFS[key] = dst;
+  }
+  const n = currA.length;
+  for (let i = 0; i < n; i++) {
+    const pv = prevA[i];
+    dst[i] = (pv + a * (currA[i] - pv) + 0.5) | 0;
+  }
+  return dst;
+}
+
 function animateGlobes(ts) {
   requestAnimationFrame(animateGlobes);
   const monPane = document.getElementById("tab-monitor");
@@ -2808,25 +3454,85 @@ function animateGlobes(ts) {
   const dt = Math.min((ts - (_lastAnimTs || ts)) / 1000.0, 0.1);
   _lastAnimTs = ts;
 
+  // Model-time-synchronized 30 fps frame interpolation between prevFrame -> currFrame (0% model overhead!)
   const syncDay = document.getElementById("globe-sync-day")?.checked ?? true;
+  if (MON.prevFrame && MON.currFrame && (ts - _lastInterpTs) >= 32.0) {
+    const a = Math.max(0.0, Math.min(1.0, (ts - MON.frameArriveMs) / Math.max(MON.frameIntervalMs || 850.0, 200.0)));
+    if (a < 1.0 || MON._lastAlpha < 1.0) {
+      _lastInterpTs = ts;
+      MON._lastAlpha = a;
+      const pf = MON.prevFrame, cf = MON.currFrame;
+      MON.rawT2 = _blendU8("t2", pf.t2, cf.t2, a);
+      MON.rawIR = _blendU8("ir", pf.ir, cf.ir, a);
+      MON.rawOLR = _blendU8("olr", pf.olr, cf.olr, a);
+      MON.rawOcnSpd = _blendU8("ocn", pf.ocnSpd, cf.ocnSpd, a);
+      MON.rawLWP = _blendU8("lwp", pf.lwp, cf.lwp, a);
+      MON.rawIWP = _blendU8("iwp", pf.iwp, cf.iwp, a);
+      MON.rawWindSpd = _blendU8("wspd", pf.windSpd, cf.windSpd, a);
+      // Shortest circular arc interpolation for sun longitude
+      let dLon = cf.subLon - pf.subLon;
+      if (dLon > 180.0) dLon -= 360.0;
+      if (dLon < -180.0) dLon += 360.0;
+      GLOBE_VIEW.subsolarLon = wrapLonDeg(pf.subLon + a * dLon);
+      if (!GLOBE_VIEW.manualOverride && syncDay && !GLOBE_VIEW.dragging) {
+        GLOBE_VIEW.lon0 = GLOBE_VIEW.subsolarLon;
+      }
+      _heroDirty = true;
+    }
+  }
   if (!syncDay && (document.getElementById("globe-spin")?.checked ?? true) && !GLOBE_VIEW.dragging) {
     const spd = Number(document.getElementById("globe-speed")?.value ?? 12);
     GLOBE_VIEW.lon0 = wrapLonDeg(GLOBE_VIEW.lon0 + spd * dt);
   }
   const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
   const rKey = `${GLOBE_VIEW.lat0.toFixed(3)}|${GLOBE_VIEW.lon0.toFixed(3)}|${MON.raster?.sim_days ?? "idle"}|${MON.raster?.step ?? ""}|${MON.esmField ?? "lai"}|${drawGrid}|${LANG}`;
-  if (rKey === _lastRenderKey) return;
-  _lastRenderKey = rKey;
+  const viewMoved = (STREAM_STATE.lastLon !== null) && (Math.abs(GLOBE_VIEW.lon0 - STREAM_STATE.lastLon) > 0.15 || Math.abs(GLOBE_VIEW.lat0 - STREAM_STATE.lastLat) > 0.15);
+  if (viewMoved) {
+    ["globeStreamOverlay", "globeOCNStream", "globeTheaterStream"].forEach(id => {
+      const c = document.getElementById(id);
+      if (c) c.getContext("2d").clearRect(0, 0, c.width, c.height);
+    });
+  }
+  STREAM_STATE.lastLon = GLOBE_VIEW.lon0;
+  STREAM_STATE.lastLat = GLOBE_VIEW.lat0;
 
-  const geo = getOrthoGeo();
-  renderOneGlobe("globeT2", "t2", geo);
-  renderOneGlobe("globeIR", "ir", geo);
-  renderOneGlobe("globeOLR", "olr", geo);
-  renderOneGlobe("globeSST", "sst", geo);
-  renderOneGlobe("globeOCN", "ocn", geo);
-  renderOneGlobe("globeLAI", "lai", geo);
-  document.getElementById("view-angles").textContent =
-    `Center: lat ${GLOBE_VIEW.lat0>=0?"+":""}${GLOBE_VIEW.lat0.toFixed(1)}°, lon ${GLOBE_VIEW.lon0>=0?"+":""}${GLOBE_VIEW.lon0.toFixed(1)}°`;
+  if (rKey !== _lastRenderKey || _heroDirty) {
+    _lastRenderKey = rKey;
+    _heroDirty = false;
+    if (_theaterOpen) {
+      renderHimawariGlobe(getTheaterGeo(), "globeTheater");
+      const tm = document.getElementById("theater-meta");
+      const tTxt = document.getElementById("mon-time")?.textContent || "";
+      if (tm) tm.textContent = `${tTxt} | Center: lat ${GLOBE_VIEW.lat0>=0?"+":""}${GLOBE_VIEW.lat0.toFixed(1)}°, lon ${GLOBE_VIEW.lon0>=0?"+":""}${GLOBE_VIEW.lon0.toFixed(1)}° | ドラッグ回転 / Esc 終了`;
+    } else {
+      const geo = getOrthoGeo();
+      renderHimawariGlobe(getHeroGeo(), "globeHimawari");
+      renderOneGlobe("globeT2", "t2", geo);
+      renderOneGlobe("globeIR", "ir", geo);
+      renderOneGlobe("globeOLR", "olr", geo);
+      renderOneGlobe("globeSST", "sst", geo);
+      renderOneGlobe("globeOCN", "ocn", geo);
+      renderOneGlobe("globeLAI", "lai", geo);
+    }
+    document.getElementById("view-angles").textContent =
+      `Center: lat ${GLOBE_VIEW.lat0>=0?"+":""}${GLOBE_VIEW.lat0.toFixed(1)}°, lon ${GLOBE_VIEW.lon0>=0?"+":""}${GLOBE_VIEW.lon0.toFixed(1)}°`;
+  }
+
+  // Smooth 60 FPS Nullschool particle streamline advection on Globe #5 (Ocean Current / 10m Wind)
+  if (MON.raster && !_theaterOpen) {
+    const miniOn = document.getElementById("ocn-stream-mini")?.checked ?? true;
+    const ocnMode = document.getElementById("ocn-panel-mode")?.value || "ocean";
+    const isOcnM = (ocnMode === "ocean") && !MON.raster.ocn_is_wind && !!(MON.rawOcnU && MON.rawOcnV);
+    const uArr = isOcnM ? MON.rawOcnU : MON.rawWindU;
+    const vArr = isOcnM ? MON.rawOcnV : MON.rawWindV;
+    if (miniOn && uArr && vArr) {
+      if (STREAM_STATE.mini.length === 0) resetStreamParticles();
+      _stepStreamCanvas("globeOCNStream", STREAM_STATE.mini, uArr, vArr, isOcnM ? 1.2 : 25.0, isOcnM, 300, 132, dt);
+    } else {
+      const c = document.getElementById("globeOCNStream");
+      if (c) c.getContext("2d").clearRect(0, 0, c.width, c.height);
+    }
+  }
 }
 
 function resetGlobeView() {
@@ -2836,10 +3542,16 @@ function resetGlobeView() {
 }
 
 function bindGlobeInteractions() {
-  ["globeT2", "globeIR", "globeOLR", "globeSST", "globeOCN", "globeLAI"].forEach(id => {
+  ["globeHimawari", "globeTheater", "globeT2", "globeIR", "globeOLR", "globeSST", "globeOCN", "globeLAI"].forEach(id => {
     const cv = document.getElementById(id);
     if (!cv) return;
-    cv.addEventListener("mousedown", e => { GLOBE_VIEW.dragging = true; GLOBE_VIEW.manualOverride = true; GLOBE_VIEW.lastX = e.clientX; GLOBE_VIEW.lastY = e.clientY; });
+    let downX = 0, downY = 0;
+    cv.addEventListener("mousedown", e => { downX = e.clientX; downY = e.clientY; GLOBE_VIEW.dragging = true; GLOBE_VIEW.manualOverride = true; GLOBE_VIEW.lastX = e.clientX; GLOBE_VIEW.lastY = e.clientY; });
+    if (id === "globeHimawari") {
+      cv.addEventListener("click", e => {
+        if (Math.hypot(e.clientX - downX, e.clientY - downY) < 6) openHimawariTheater();
+      });
+    }
     cv.addEventListener("mousemove", e => {
       if (GLOBE_VIEW.dragging) {
         const dx = e.clientX - GLOBE_VIEW.lastX, dy = e.clientY - GLOBE_VIEW.lastY;
@@ -3364,11 +4076,15 @@ function drawTimeSeries(csv) {
   ctx.fillText(`Day ${days[li].toFixed(0)}`, W - 82, H - 8);
 }
 
-setInterval(() => {
+let _pollBusy = false;
+setInterval(async () => {
   const auto = document.getElementById("auto-poll")?.checked;
   const active = document.getElementById("tab-monitor")?.classList.contains("active");
-  if (auto && active) fetchMonitorOnce();
-}, 2000);
+  if (auto && active && !_pollBusy) {
+    _pollBusy = true;
+    try { await fetchMonitorOnce(); } finally { _pollBusy = false; }
+  }
+}, 450);
 
 /* --- HEADER OTHELLO VORONOI 'A' ICON ANIMATION --- */
 let OTHELLO_CELLS = null;

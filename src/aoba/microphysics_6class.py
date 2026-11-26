@@ -37,6 +37,8 @@ from aoba.microphysics import (
     CCN_LAND_BASE_CM3,
     CCN_OCEAN_BASE_CM3,
     INP_DUST_ENHANCE,
+    KK00_AUTO_COEF_LES,
+    KK00_DX_LES_M,
 )
 from aoba.thermodynamics import diagnose_pressure_temperature
 
@@ -45,6 +47,21 @@ RHO_WATER: float = 1000.0
 RHO_SNOW: float = 100.0
 RHO_GRAUPEL: float = 400.0
 Q_EPS: float = 1.0e-12
+# Scale-aware Boutle et al. (2014) / Morrison & Gettelman (2008) subgrid LWC-variance enhancement
+# for 6-class continuous exponential autoconversion: bridges 50 m LES (1350) -> 4 km CRM (13500).
+KK00_6C_SCALE_EXP: float = 0.525365
+
+
+def compute_kk00_auto_coef_6c(dx_m: float = 4000.0) -> float:
+    """Resolution-aware KK00 autoconversion prefactor for 6-class 2-moment microphysics.
+
+    Scales smoothly from raw Khairoutdinov & Kogan (2000, Eq. 29) at 50 m LES (`1350`) to
+    Boutle et al. (2014) subgrid LWC-variance-enhanced cloud-resolving spacing (`13500` at 4 km).
+    AOBA Formulation Eq. (5.13).
+    """
+    dx_eff = max(float(dx_m), KK00_DX_LES_M)
+    c_raw = KK00_AUTO_COEF_LES * ((dx_eff / KK00_DX_LES_M) ** KK00_6C_SCALE_EXP)
+    return min(max(c_raw, KK00_AUTO_COEF_LES), 60000.0)
 
 
 def init_six_class_hydrometeors(crm) -> None:
@@ -115,6 +132,7 @@ def step_microphysics_six_class_2m(
     u_sfc_sub: torch.Tensor | None = None,
     q_dust_sub: torch.Tensor | None = None,
     ccn_aero_sub: torch.Tensor | None = None,
+    dx_m: float = 4000.0,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor,
@@ -125,6 +143,7 @@ def step_microphysics_six_class_2m(
 
     Returns `(theta_m, q_v, q_c, q_i, q_r, q_s, q_g, n_c, n_i, n_r, n_s, n_g, precip_rain, precip_snow)`.
     """
+    kk00_coef = compute_kk00_auto_coef_6c(dx_m)
     if can_use_crm_metal(rho_d) and rho_d.numel() > 0:
         return dispatch_microphysics_6class_metal(
             rho_d=rho_d,
@@ -150,6 +169,7 @@ def step_microphysics_six_class_2m(
             ccn_land_cm3=CCN_LAND_BASE_CM3,
             ccn_dust_scale_cm3=CCN_DUST_SCALE_CM3,
             inp_dust_enhance=INP_DUST_ENHANCE,
+            kk00_auto_coef=kk00_coef,
         )
 
     nz, nc, ny, nx = rho_d.shape
@@ -195,9 +215,9 @@ def step_microphysics_six_class_2m(
     ns_cur = torch.clamp(n_s, min=0.0)
     ng_cur = torch.clamp(n_g, min=0.0)
 
-    # 2. Warm-rain KK00 autoconversion & accretion (q_c -> q_r)
+    # 2. Scale-aware warm-rain KK00 autoconversion & accretion (q_c -> q_r; AOBA Formulation Eq. 5.13)
     nc_cm3 = torch.clamp(nc_cur * rho_d * 1.0e-6, min=10.0, max=800.0)
-    k_auto = 1350.0 * torch.pow(torch.clamp(qc, min=1.0e-9), 1.47) * torch.pow(nc_cm3, -1.79)
+    k_auto = kk00_coef * torch.pow(torch.clamp(qc, min=1.0e-9), 1.47) * torch.pow(nc_cm3, -1.79)
     k_accr = 67.0 * torch.pow(torch.clamp(qr, min=0.0), 1.15) * torch.pow(torch.clamp(qc, min=1.0e-9), 0.15)
     f_c2r = -torch.expm1(-torch.clamp((k_auto + k_accr) * dt, max=10.0))
     dq_c2r = torch.where(qc > 1.0e-6, f_c2r * qc, torch.zeros_like(qc))
