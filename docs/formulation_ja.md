@@ -1363,14 +1363,17 @@ $$
 \end{aligned} \tag{8.5}
 $$
 
-3 段 Wicker–Skamarock RK3（$\Delta\tau \in \{\Delta t_{\mathrm{dyn}}/3, \Delta t_{\mathrm{dyn}}/2, \Delta t_{\mathrm{dyn}}\}$）の各段で、非線形 TRiSK コリオリ・渦度項 $\sum_{e'} w_{e,e'}\frac{\eta_e+\eta_{e'}}{2}u_{e'}$、運動エネルギー勾配 $-\nabla K$、鉛直運動量移流および散逸項からなる低速傾向を凍結し、高速音波サブステップ（最大時間刻み $\Delta t_{\mathrm{ac,max}} = \min(\max(0.16 d_{\min}/350, 1), 300)\ \mathrm{s}$, 鉛直陰的重み $\beta_{\mathrm{HEVI}} = 0.60$）を積分する。山岳上の水平気圧傾度力には Klemp (2011) の静水圧指数係数 $(f_{z0}, f_{z1})$ を適用し、水平質量フラックスには前向きオフセンタリング $U_h^{(k)}$ を用いる。鉛直音波は線形化状態方程式を用いて反変鉛直フラックス増分 $\delta\Omega_k$ に関する $(N_z - 1)$ 層三重対角 Helmholtz 方程式へ帰着させ、厳密質量・温位保存更新を行う：
+3 段 Wicker–Skamarock RK3（$\Delta\tau \in \{\Delta t_{\mathrm{dyn}}/3, \Delta t_{\mathrm{dyn}}/2, \Delta t_{\mathrm{dyn}}\}$）の各段で、非線形 TRiSK コリオリ・渦度項 $\sum_{e'} w_{e,e'}\frac{\eta_e+\eta_{e'}}{2}u_{e'}$、運動エネルギー勾配 $-\nabla K$、鉛直運動量移流および散逸項からなる低速傾向を凍結し、高速音波サブステップ（最大時間刻み $\Delta t_{\mathrm{ac,max}} = \min(\max(0.16 d_{\min}/350, 1), 300)\ \mathrm{s}$, 鉛直陰的重み $\beta_{\mathrm{HEVI}} = 0.60$）を積分する。山岳上の水平気圧傾度力には Klemp (2011) の静水圧指数係数 $(f_{z0}, f_{z1})$ を適用し、水平質量フラックスには前向きオフセンタリング $U_h^{(k)}$ を用いる。さらに内部境界面 $k + \tfrac{1}{2}$ の陽的鉛直 $\theta_m$ 移流には保存型 MPAS-A 3 次上風バイアス流束再構成（$\beta_v = 0.25$; Skamarock & Gassmann, 2011, Eq. 5; Skamarock et al., 2012, Eq. 20）を適用し、静的な鉛直数値拡散を加えずに格子スケール $2\Delta z$ 鉛直計算モードを減衰させる：
 
 $$
 \begin{aligned}
 f_{z0} &= \exp\!\left(-\frac{\rho_{\mathrm{tot},c_0} g}{2 p_{c_0}}\Delta z_{10}\right), \qquad f_{z1} = \exp\!\left(+\frac{\rho_{\mathrm{tot},c_1} g}{2 p_{c_1}}\Delta z_{10}\right), \\
-U_h^{(k)} &= \bar{m}_e\big(1.10\,u^{(k+1)} - 0.10\,u^{(k)}\big), \qquad p^{(k)} = p_s + \frac{\gamma_d p_s}{\Theta_{m,s}}\big(\Theta_m^{(k)} - \Theta_{m,s}\big)
+U_h^{(k)} &= \bar{m}_e\big(1.10\,u^{(k+1)} - 0.10\,u^{(k)}\big), \qquad p^{(k)} = p_s + \frac{\gamma_d p_s}{\Theta_{m,s}}\big(\Theta_m^{(k)} - \Theta_{m,s}\big), \\
+\theta_{m,k+1/2}^{\mathrm{up}} &= \frac{7(\theta_{m,k} + \theta_{m,k+1}) - (\theta_{m,k-1} + \theta_{m,k+2})}{12} - \frac{\beta_v\,\operatorname{sgn}(\Omega_{k+1/2})}{12}\Big[3(\theta_{m,k+1} - \theta_{m,k}) - (\theta_{m,k+2} - \theta_{m,k-1})\Big]
 \end{aligned} \tag{8.6}
 $$
+
+鉛直音波は線形化状態方程式を用いて反変鉛直フラックス増分 $\delta\Omega_k$ に関する $(N_z - 1)$ 層三重対角 Helmholtz 方程式へ帰着させ、厳密質量・温位保存更新を行う：
 
 $$
 \begin{aligned}
@@ -1461,25 +1464,28 @@ $$
 
 `enable_crm_self_distill = true` および `enable_rad_self_distill = true` のとき、AOBA はオンライン代理超パラメタリゼーション（OSSP）を有効化し、空間層化ローテーションと高エピステミック不確実性（OOD）選択によって抽出した教師親セル（`1 / crm_distill_stride`）のみで本物の 2D/3D CRM と厳密 ICA / 3D-TICA 放射伝達を実行し、残りのセルを GPU リング・リザーバ再生バッファ付き 2 ヘッド残差 MLP（`CRMSelfDistillNet` と `RadSelfDistillNet`）でオンライン推論する。事前学習済み重みを持たないため、惑星気候・古気候・急激な放射強制変化にも実行中に自律適応する。
 
-すべての代理推論カラムには演算子分割ベースラインを適用する。まず硬い 1 次元鉛直境界層拡散および地表面フラックス注入 $(\mathrm{SHF}, E, \tau_x, \tau_y)$ を全親格子列に対して融合 MYNN レベル 2.5 三重対角ソルバ（第 6 節）の純保存混合モード（`do_sat_adj = false`：格子平均飽和調節を行わずサブグリッド雲水・雲氷 $q_c, q_i$ を保存拡散）で解析的に進め、その残差である 3 次元対流輸送と雲微物理のみを融合 GPU カーネル（`crm_distill_closure_col`, `rad_distill_closure_col`）内の厳密物理保存クロージャ付き代理モデルで推論する。気圧テーパ付き対流包絡関数 $s_{\mathrm{conv}}(\Pi)$ は対流圏全域（$p \ge 210\ \mathrm{hPa}$）で $1$ をとり、$90\ \mathrm{hPa}$ 圏界面コールドポイント（$\Pi \le 0.50$）以高で滑らかに $0$ へ減衰し、成層圏・中間圏の気温・水蒸気・運動量を完全に不変に保つ。対流領域（$s_{\mathrm{conv}} > 0$）では、水物質増分を局所 Clausius–Clapeyron 飽和混合比 $q_{\mathrm{sat}}(T_{\mathrm{env}}, p_{\mathrm{env}})$ で有界化して列総水量を機械精度で保存し、真気温空間 $T = \Pi\theta_m / (1 + (R_v/R_d) q_v)$ で厳密顕熱エンタルピー保存クロージャを課したのち、2 パス赤黒法によるエンタルピー厳密保存型の乾燥対流調節で静的超断熱不安定対（$\theta_k > \theta_{k+1}$）を除去してから $\theta_m^{n+1}$ を再構成する：
+すべての代理推論カラムには演算子分割ベースラインを適用する。まず硬い 1 次元鉛直境界層拡散および地表面フラックス注入 $(\mathrm{SHF}, E, \tau_x, \tau_y)$ を全親格子列に対して融合 MYNN レベル 2.5 三重対角ソルバ（第 6 節）の純保存混合モード（`do_sat_adj = false`：親格子 FCT 移流で $q_n, q_p, q_c, q_i$ を同時輸送し $q_v + q_c + q_i = q_n$ を厳密同期したうえで、格子平均飽和調節を行わずにサブグリッド雲水・雲氷 $q_c, q_i$ を保存拡散）で解析的に進める。自己回帰的な凝結物フィードバックと教師・学生間の共変量シフトを排除するため、代理ネットワークの入力には保存湿潤熱力学プロファイル $(T_{li}, \theta_l, q_n, q_n / q_{\mathrm{sat}}(T_{li}))$・大規模強制・教師学生共通の地表面タイル不均一性不変量のみを用いる。融合 GPU カーネル（`crm_distill_closure_col`, `rad_distill_closure_col`）では、気圧テーパ付き対流包絡関数 $s_{\mathrm{conv}}(\Pi)$ が対流圏全域（$p \ge 210\ \mathrm{hPa}$）で $1$ をとり $90\ \mathrm{hPa}$ 圏界面コールドポイント（$\Pi \le 0.50$）以高で滑らかに $0$ へ減衰するとともに、列湿潤活性ゲート $g_{\mathrm{col}}$ が乾燥晴天列（$\max_k \mathrm{RH}_k \le 0.72$）で零となる。生の対流温度・水分ロジットには 2 パス鉛直二項フィルタ $[0.25, 0.50, 0.25]$（$2\Delta z$ 鉛直モードの伝達率零）を適用したうえで物理的有界残差（$|\Delta T_{\mathrm{raw}}| \le 0.15\ \mathrm{K}$, $|\Delta q_{n,\mathrm{raw}}| \le \Delta q_{\lim}$）を生成する。水分再配分では重み $w_{\mathrm{bal},k} = \Delta q_{\lim,k}(10^3 q_{n,\mathrm{base},k})$ による厳密ゼロ和射影を行って下層残差の上層低温域への漏洩を防ぎ、高相対湿度雲層（$\mathrm{RH} > 0.60$）から優先的に降水シンクを抽出し、滑らかな混相氷比率 $f_{\mathrm{ice}} = (1 - \omega_{\mathrm{liq}})\sigma(r_4)$（$T \le 253.15\ \mathrm{K}$ では $f_{\mathrm{ice}} = 1$）で相分配したのち、過剰雲水（$q_c > 5\times 10^{-4}\ \mathrm{kg\ kg^{-1}}$）および過剰雲氷（$q_i > \min(q_{\mathrm{sat}}, 10^{-4}\ \mathrm{kg\ kg^{-1}})$）を保存的に降水へ落下させる：
 
 $$
 \begin{aligned}
-s_{\mathrm{conv}}(\Pi) &= \left[\operatorname{clamp}\!\left(\frac{\Pi - 0.50}{0.14},\ 0,\ 1\right)\right]^2, \qquad |\Delta q_{n,\mathrm{raw}}| \le s_{\mathrm{conv}}\min\!\big(1.5\,q_{\mathrm{sat}} + 0.5\,q_{n,\mathrm{base}},\ 5\times 10^{-3}\big), \\
+s_{\mathrm{conv}}(\Pi) &= \left[\operatorname{clamp}\!\left(\frac{\Pi - 0.50}{0.14},\ 0,\ 1\right)\right]^2, \qquad g_{\mathrm{col}} = \operatorname{clamp}\!\left(\frac{\max_{k\in\mathrm{conv}}(q_{n,k}/q_{\mathrm{sat},k}) - 0.72}{0.25},\ 0,\ 1\right), \\
+\Delta q_{\lim,k} &= g_{\mathrm{col}}\min\!\big(0.015\,q_{n,\mathrm{base},k},\ 1.0\times 10^{-4}\big), \qquad \Delta q_{n,\mathrm{bal},k} = \Delta q_{n,\mathrm{raw},k} - \frac{\sum_j \Delta m_j \Delta q_{n,\mathrm{raw},j}}{\sum_j \Delta m_j w_{\mathrm{bal},j}}\,w_{\mathrm{bal},k}, \\
 \phi_{\mathrm{pbl}}(\Pi) &= \operatorname{clamp}\!\left(1 - \frac{\Pi_0 - \Pi}{0.015\,\Pi_0},\ 0,\ 1\right) s_{\mathrm{conv}}, \qquad \Delta T_{\mathrm{shf},k} = \frac{\mathrm{SHF}\,\Delta t}{c_{pd}\sum_j \Delta m_j\,\phi_{\mathrm{pbl},j}}\,\phi_{\mathrm{pbl},k}
 \end{aligned} \tag{8.14}
 $$
 
+顕熱エンタルピーは真気温空間 $T = \Pi\theta_m / (1 + (R_v/R_d) q_v)$ で閉じ、雲相変化および降水シンクの凝結潜熱 $\Delta T_{\mathrm{lat},k}$ を凝結が生じた雲層内へその場で付与したうえで、残余の降水・降雪融解収支のみを $h_{\mathrm{corr}}$ で厳密保存閉鎖し、2 パス赤黒法によるエンタルピー厳密保存型の乾燥対流調節で静的超断熱不安定対（$\theta_k > \theta_{k+1}$）を除去してから $\theta_m^{n+1}$ を再構成する：
+
 $$
 \begin{aligned}
-\Delta T_{\mathrm{lat},k} &= \frac{L_{v0}\big[(q_{c,k}^{n+1} + q_{i,k}^{n+1}) - (q_{c,k}^0 + q_{i,k}^0)\big] + L_{f0}\big(q_{i,k}^{n+1} - q_{i,k}^0\big)}{c_{pd}}, \\
-\Delta H_{\mathrm{precip}} &= L_{v0}\big(P_{\mathrm{tot}}\Delta t + \Delta M_p\big) + L_{f0} P_{\mathrm{snow}}\Delta t, \\
+\Delta T_{\mathrm{lat},k} &= \frac{L_{v0}\big[(q_{c,k}^{\mathrm{pf}} + q_{i,k}^{\mathrm{pf}}) - (q_{c,k}^0 + q_{i,k}^0) + \Delta q_{\mathrm{psink},k}\big] + L_{f0}\big(q_{i,k}^{n+1} - q_{i,k}^0\big)}{c_{pd}}, \\
+\Delta H_{\mathrm{precip}} &= L_{v0}\big(P_{\mathrm{tot,orig}}\Delta t - M_{\mathrm{psink}} + \Delta M_p\big) + L_{f0} P_{\mathrm{snow}}\Delta t, \\
 h_{\mathrm{corr}} &= \frac{\Delta H_{\mathrm{precip}} - c_{pd}\sum_k \Delta m_k \Delta T_{\mathrm{raw},k}}{c_{pd}\sum_k \Delta m_k s_{\mathrm{conv},k}}, \qquad \Delta T_{\mathrm{cons},k} = \Delta T_{\mathrm{shf},k} + \Delta T_{\mathrm{lat},k} + \Delta T_{\mathrm{raw},k} + h_{\mathrm{corr}}\,s_{\mathrm{conv},k}, \\
 \theta_{m,k}^{n+1} &= \theta_{m,k}^{\mathrm{post,ls}} + \frac{\Delta T_{\mathrm{cons},k}\!\left(1 + \frac{R_v}{R_d} q_{v,k}^{n+1}\right) + T_k^{\mathrm{post,ls}}\frac{R_v}{R_d}\!\left(q_{v,k}^{n+1} - q_{v,k}^0\right)}{\max(\Pi_k,\ 0.05)}
 \end{aligned} \tag{8.15}
 $$
 
-放射代理モデルの各サブカラムは、夜側（$\mu_0 \le 0$）で短波フラックスが厳密に零となり、長波フラックスは地表 Planck 放射 $\sigma T_{\mathrm{sfc}}^4$ に解析的にスケールし、放射加熱率鉛直プロファイルは列フラックス発散保存則を厳密に満たす。オンライン学習では、境界層重視の真気温および鉛直気温減率 Smooth-$L_1$ 損失に、射影零空間沿いの飽和ドリフトを完全に抑止する列平均ロジットのゲージ固定正則化を組み合わせる：
+放射代理モデルの各サブカラムは、夜側（$\mu_0 \le 0$）で短波フラックスが厳密に零となり、長波フラックスは地表 Planck 放射 $\sigma T_{\mathrm{sfc}}^4$ に解析的にスケールし、放射加熱率鉛直プロファイルは列フラックス発散保存則を厳密に満たす。オンライン学習では、境界層重視の真気温・鉛直気温減率・1 ステップ変化量（$\Delta q_n, \Delta T$）・飽和比正規化水分（$\Delta q_n / q_{\mathrm{sat}}$）の Smooth-$L_1$ 損失に、一様射影零空間沿いの飽和ドリフトを抑止する温度・運動量ロジットのゲージ固定正則化を組み合わせる：
 
 $$
 \sum_{k=0}^{N_z-1} c_{p,\mathrm{moist},k}\,\Delta m_k\,Q_{\mathrm{rad},k} = (\mathrm{ASR} - \mathrm{OLR}) - (F_{\mathrm{SW,sfc}}^{\mathrm{net}} + F_{\mathrm{LW,sfc}}^{\mathrm{net}}) \tag{8.16}

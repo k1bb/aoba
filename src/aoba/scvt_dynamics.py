@@ -507,8 +507,19 @@ def _scvt_fast_acoustic_hevi_cpu_gpu(
         om_old[1:-1] = rho_dw * (w_k[1:-1] - udotz_k)
 
         m_dag = m_k - dt_ac * (div_h_m + (om_old[1:] - om_old[:-1]))
+        # Flux-form MPAS-A 3rd-order upwind-biased vertical theta_m advection (Skamarock & Gassmann, 2011,
+        # Eq. 5; Skamarock et al., 2012, Eq. 20; beta_v = 0.25) damps Lorenz 2*dz modes without static diffusion.
+        th_k = Thm_k / torch.clamp(m_k, min=1.0e-4)
+        thw_adv = 0.5 * (th_k[:-1] + th_k[1:])
+        if int(th_k.shape[0]) >= 4:
+            om_mid = om_old[2:-2]
+            sgn_om = torch.where(om_mid > 0.0, 1.0, torch.where(om_mid < 0.0, -1.0, 0.0))
+            th_c4 = (7.0 * (th_k[1:-2] + th_k[2:-1]) - (th_k[:-3] + th_k[3:])) * (1.0 / 12.0)
+            th_d3 = (3.0 * (th_k[2:-1] - th_k[1:-2]) - (th_k[3:] - th_k[:-3])) * (1.0 / 12.0)
+            thw_adv = thw_adv.clone()
+            thw_adv[1:-1] = th_c4 - 0.25 * sgn_om * th_d3
         fTh_z_old = torch.zeros_like(w_k)
-        fTh_z_old[1:-1] = thm_w * om_old[1:-1]
+        fTh_z_old[1:-1] = thw_adv * om_old[1:-1]
         Thm_dag = Thm_k + dt_ac * (-div_h_Thm - (fTh_z_old[1:] - fTh_z_old[:-1]) + tend_Thm_slow)
 
         p_dag = pres_s + dp_dThm_s * (Thm_dag - Thm_s)
@@ -955,8 +966,17 @@ def _step_scvt_rk3_hevi_impl(
                 om_old[1:-1] = rho_dw * (w_k[1:-1] - udotz_k)
 
                 m_dag = m_k - dt_ac * (div_h_m + (om_old[1:] - om_old[:-1]))
+                th_k = Thm_k / torch.clamp(m_k, min=1.0e-4)
+                thw_adv = 0.5 * (th_k[:-1] + th_k[1:])
+                if int(th_k.shape[0]) >= 4:
+                    om_mid = om_old[2:-2]
+                    sgn_om = torch.where(om_mid > 0.0, 1.0, torch.where(om_mid < 0.0, -1.0, 0.0))
+                    th_c4 = (7.0 * (th_k[1:-2] + th_k[2:-1]) - (th_k[:-3] + th_k[3:])) * (1.0 / 12.0)
+                    th_d3 = (3.0 * (th_k[2:-1] - th_k[1:-2]) - (th_k[3:] - th_k[:-3])) * (1.0 / 12.0)
+                    thw_adv = thw_adv.clone()
+                    thw_adv[1:-1] = th_c4 - 0.25 * sgn_om * th_d3
                 fTh_z_old = torch.zeros_like(w_k)
-                fTh_z_old[1:-1] = thm_w * om_old[1:-1]
+                fTh_z_old[1:-1] = thw_adv * om_old[1:-1]
                 Thm_dag = Thm_k + dt_ac * (-div_h_Thm - (fTh_z_old[1:] - fTh_z_old[:-1]) + tend_Thm_slow)
 
                 p_dag = pres_s + dp_dThm_s * (Thm_dag - Thm_s)

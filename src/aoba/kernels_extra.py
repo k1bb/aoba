@@ -1483,9 +1483,16 @@ kernel void scvt_fast_cell_hevi(
     float p_blend[64];
     float rtot_blend[64];
     float om_old[64];
+    float th_loc[64];
+    float thw_adv[64];
     float udotz_next[64];
     float cp[64];
     float dp[64];
+
+    for (uint k = 0u; k < nz; ++k) {
+        uint cidx = k * n_cells + c;
+        th_loc[k] = Thm_c[cidx] / max(m_c[cidx], 1.0e-4f);
+    }
 
     for (uint m = 0u; m < nz - 1u; ++m) {
         uint midx = m * n_cells + c;
@@ -1501,7 +1508,16 @@ kernel void scvt_fast_cell_hevi(
         }
         udotz_next[m] = uz_sum;
         udotz_n[midx] = uz_sum;
-        om_old[m] = rho_dw[midx] * (w_c[(m + 1u) * n_cells + c] - udotz_c[midx]);
+        float om_v = rho_dw[midx] * (w_c[(m + 1u) * n_cells + c] - udotz_c[midx]);
+        om_old[m] = om_v;
+        if (m >= 1u && m + 2u < nz) {
+            float sgn = (om_v > 0.0f) ? 1.0f : ((om_v < 0.0f) ? -1.0f : 0.0f);
+            float th_c4 = (7.0f * (th_loc[m] + th_loc[m + 1u]) - (th_loc[m - 1u] + th_loc[m + 2u])) * (1.0f / 12.0f);
+            float th_d3 = (3.0f * (th_loc[m + 1u] - th_loc[m]) - (th_loc[m + 2u] - th_loc[m - 1u])) * (1.0f / 12.0f);
+            thw_adv[m] = th_c4 - 0.25f * sgn * th_d3;
+        } else {
+            thw_adv[m] = 0.5f * (th_loc[m] + th_loc[m + 1u]);
+        }
     }
 
     for (uint k = 0u; k < nz; ++k) {
@@ -1518,8 +1534,8 @@ kernel void scvt_fast_cell_hevi(
         }
         float om_dn = (k > 0u) ? om_old[k - 1u] : 0.0f;
         float om_up = (k + 1u < nz) ? om_old[k] : 0.0f;
-        float thw_dn = (k > 0u) ? thm_w[(k - 1u) * n_cells + c] : 0.0f;
-        float thw_up = (k + 1u < nz) ? thm_w[k * n_cells + c] : 0.0f;
+        float thw_dn = (k > 0u) ? thw_adv[k - 1u] : 0.0f;
+        float thw_up = (k + 1u < nz) ? thw_adv[k] : 0.0f;
 
         float mk = m_c[cidx];
         float Thmk = Thm_c[cidx];
@@ -1964,21 +1980,34 @@ kernel void crm_mynn_col(
         }
     } else {
         float th_new_a[64], qv_new_a[64], qc_new_a[64];
+        float qv_sync[64], qc_sync[64], qi_sync[64];
         for (uint k = 0u; k < nz; ++k) {
+            float qn_p = max(qn_a[k], 0.0f);
+            float qc_p = max(qc_a[k], 0.0f);
+            float qi_p = max(qi_a[k], 0.0f);
+            float qci_p = qc_p + qi_p;
+            if (qci_p > qn_p) {
+                float sc = qn_p / max(qci_p, 1.0e-12f);
+                qc_p *= sc;
+                qi_p *= sc;
+            }
+            qc_sync[k] = qc_p;
+            qi_sync[k] = qi_p;
+            qv_sync[k] = max(qn_p - qc_p - qi_p, 0.0f);
             diag_t[k] = 1.0f - dl_t[k] - du_t[k];
             rhs_t[k] = th_a[k];
         }
         rhs_t[0] += dt * (shf_sfc / (cp_eff0 * exn_a[0])) / mass_c[0];
         mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, th_new_a);
 
-        for (uint k = 0u; k < nz; ++k) rhs_t[k] = qv_a[k];
+        for (uint k = 0u; k < nz; ++k) rhs_t[k] = qv_sync[k];
         rhs_t[0] += dt * evap_sfc / mass_c[0];
         mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, qv_new_a);
 
-        for (uint k = 0u; k < nz; ++k) rhs_t[k] = qc_a[k];
+        for (uint k = 0u; k < nz; ++k) rhs_t[k] = qc_sync[k];
         mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, qc_new_a);
 
-        for (uint k = 0u; k < nz; ++k) rhs_t[k] = qi_a[k];
+        for (uint k = 0u; k < nz; ++k) rhs_t[k] = qi_sync[k];
         mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, sol_a);
 
         for (uint k = 0u; k < nz; ++k) {

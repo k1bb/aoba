@@ -663,12 +663,21 @@ def step_mynn_level25(
         temp_new, qv_new, qc_new, qi_new = saturation_adjustment(t_li_new, pres, q_n_new)
         theta_m_new = (temp_new / exner) * (1.0 + C.RV_OVER_RD * qv_new)
     else:
-        # Pure conservative turbulent mixing without grid-mean phase conversion (preserves subgrid clouds)
+        # Pure conservative turbulent mixing without grid-mean phase conversion (preserves subgrid clouds).
+        # Enforce exact q_v + q_c + q_i == q_n partition before diffusing so total water is strictly conserved.
         zero_sfc = torch.zeros_like(evap_sfc)
+        qn_pos = torch.clamp(q_n, min=0.0)
+        qc_in = torch.clamp(q_c, min=0.0)
+        qi_in = torch.clamp(q_i, min=0.0)
+        qci_in = qc_in + qi_in
+        sc_in = torch.where(qci_in > qn_pos, qn_pos / torch.clamp(qci_in, min=1.0e-12), torch.ones_like(qci_in))
+        qc_in = qc_in * sc_in
+        qi_in = qi_in * sc_in
+        qv_in = torch.clamp(qn_pos - qc_in - qi_in, min=0.0)
         theta_new = _diffuse_implicit(theta, k_h_int, thl_flux_sfc)
-        qv_new = torch.clamp(_diffuse_implicit(q_v, k_h_int, evap_sfc), min=0.0)
-        qc_new = torch.clamp(_diffuse_implicit(q_c, k_h_int, zero_sfc), min=0.0)
-        qi_new = torch.clamp(_diffuse_implicit(q_i, k_h_int, zero_sfc), min=0.0)
+        qv_new = torch.clamp(_diffuse_implicit(qv_in, k_h_int, evap_sfc), min=0.0)
+        qc_new = torch.clamp(_diffuse_implicit(qc_in, k_h_int, zero_sfc), min=0.0)
+        qi_new = torch.clamp(_diffuse_implicit(qi_in, k_h_int, zero_sfc), min=0.0)
         q_n_new = qv_new + qc_new + qi_new
         theta_m_new = theta_new * (1.0 + C.RV_OVER_RD * qv_new)
 

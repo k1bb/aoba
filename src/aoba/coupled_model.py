@@ -2485,7 +2485,7 @@ def step_aoba_model(
     m_new_host = atmos.rho_d * atmos.dz_c
     uh_mean = uh_acc * inv_nh
     om_mean = om_acc * inv_nh
-    adv_list = [atmos.q_n, atmos.q_p]
+    adv_list = [atmos.q_n, atmos.q_p, atmos.q_c, atmos.q_i]
     has_dust_adv = bool(cfg.enable_dust and atmos.q_dust is not None)
     if has_dust_adv:
         adv_list.append(atmos.q_dust)
@@ -2512,7 +2512,14 @@ def step_aoba_model(
     )
     atmos.q_n = q_adv[0]
     atmos.q_p = q_adv[1]
-    idx_q = 2
+    qc_adv = torch.clamp(q_adv[2], min=0.0)
+    qi_adv = torch.clamp(q_adv[3], min=0.0)
+    qci_adv = qc_adv + qi_adv
+    sc_adv = torch.where(qci_adv > atmos.q_n, atmos.q_n / torch.clamp(qci_adv, min=1.0e-12), torch.ones_like(qci_adv))
+    atmos.q_c = qc_adv * sc_adv
+    atmos.q_i = qi_adv * sc_adv
+    atmos.q_v = torch.clamp(atmos.q_n - atmos.q_c - atmos.q_i, min=0.0)
+    idx_q = 4
     if has_dust_adv:
         atmos.q_dust = q_adv[idx_q]
         idx_q += 1
@@ -2656,6 +2663,7 @@ def step_aoba_model(
             qv_pre_sd = atmos.q_v.clone()
             qc_pre_sd = atmos.q_c.clone()
             qi_pre_sd = atmos.q_i.clone()
+            qke_pre_sd = mean_2d(crm.qke).clone()
             dx_sfc_eff = float(cfg.crm_dx) * float(bx_full)
             dy_sfc_eff = float(cfg.crm_dx) * float(by_full)
             subgrid_struct_sd = compute_subgrid_structure_features(
@@ -2937,7 +2945,7 @@ def step_aoba_model(
                 if sub_maps_all_sd is not None
                 else (None, None)
             )
-            n_cgrad = 4 if ((has_pool or sparse_warmup_crm) and model.crm_distill.steps_seen < model.crm_distill.warmup_steps) else 1
+            n_cgrad = 4 if ((has_pool or sparse_warmup_crm) and model.crm_distill.steps_seen < model.crm_distill.warmup_steps) else 2
             train_student_online(
                 model.crm_distill, x_all_sd[t_idx], ctx_p_t, ctx_s_t, tgt_p_t, tgt_s_t, dt,
                 n_grad_steps=n_cgrad,
@@ -3327,7 +3335,7 @@ def step_aoba_model(
             # Warmup phase: 100% genuine CRM ran above; collect stratified teacher pairs and pre-train student
             rain_cell_w = _sub_to_cell(rain_new_sub, nc, n_sub)
             snow_cell_w = _sub_to_cell(snow_new_sub, nc, n_sub)
-            n_samp = min(nc, 2048)
+            n_samp = min(nc, 512)
             if n_samp < nc:
                 w_idx = torch.randperm(nc, device=atmos.rho_d.device)[:n_samp]
             else:
@@ -3338,11 +3346,42 @@ def step_aoba_model(
             f_prec_w = mean_2d(
                 ((rain_new_sub.reshape(nc, ny_t, nx_t)[w_idx] + snow_new_sub.reshape(nc, ny_t, nx_t)[w_idx]) > 1.0e-7).to(atmos.q_n.dtype)
             )
+            # Advance exact same operator-split host 1D MYNN baseline (do_sat_adj=False) on warmup samples
+            # so warmup replay targets are 100% consistent with post-warmup student inference (zero double-mixing).
+            buoy_cell_w = _sub_to_cell(sfc_diag_sub.buoy_flux, nc, n_sub)[w_idx]
+            (
+                u_mynn_w, v_mynn_w, thm_mynn_w, qn_mynn_w, _,
+                _, _, qv_mynn_w, qc_mynn_w, qi_mynn_w,
+            ) = step_mynn_level25(
+                rho_d=rho_pre_sd[:, w_idx],
+                u=u_host_new[:, w_idx],
+                v=v_host_new[:, w_idx],
+                theta_m_c=thm_post_ls_sd[:, w_idx],
+                q_n=qn_pre_sd[:, w_idx],
+                q_v=qv_pre_sd[:, w_idx],
+                q_c=qc_pre_sd[:, w_idx],
+                q_i=qi_pre_sd[:, w_idx],
+                qke=qke_pre_sd[:, w_idx],
+                z_c=atmos.z_c[:, w_idx],
+                z_w=atmos.z_w[:, w_idx],
+                dz_c=atmos.dz_c[:, w_idx],
+                u_star=ustar_cell_pre[w_idx],
+                sfc_buoy_flux=buoy_cell_w,
+                tau_x_sfc=tx_cell_pre[w_idx],
+                tau_y_sfc=ty_cell_pre[w_idx],
+                shf_sfc=shf_cell_pre[w_idx],
+                evap_sfc=evap_cell_pre[w_idx],
+                dt=dt,
+                return_hydrometeors=True,
+                do_sat_adj=False,
+            )
+            _, exner_mynn_w, temp_mynn_w = diagnose_pressure_temperature(rho_pre_sd[:, w_idx], thm_mynn_w, qv_mynn_w)
+            zero_sfc_w = torch.zeros_like(shf_cell_pre[w_idx])
             ctx_p_w, ctx_s_w, tgt_p_w, tgt_s_w = pack_teacher_context_and_targets(
-                rho_pre_sd[:, w_idx], atmos.dz_c[:, w_idx], exner_all_sd[:, w_idx], temp_all_sd[0, w_idx],
-                thm_post_ls_sd[:, w_idx], qn_pre_sd[:, w_idx], qp_pre_sd[:, w_idx],
-                qc_pre_sd[:, w_idx], qi_pre_sd[:, w_idx], u_host_new[:, w_idx], v_host_new[:, w_idx],
-                shf_cell_pre[w_idx], evap_cell_pre[w_idx], tx_cell_pre[w_idx], ty_cell_pre[w_idx],
+                rho_pre_sd[:, w_idx], atmos.dz_c[:, w_idx], exner_mynn_w, temp_mynn_w[0],
+                thm_mynn_w, qn_mynn_w, qp_pre_sd[:, w_idx],
+                qc_mynn_w, qi_mynn_w, u_mynn_w, v_mynn_w,
+                zero_sfc_w, zero_sfc_w, zero_sfc_w, zero_sfc_w,
                 atmos.theta_m[:, w_idx], atmos.q_n[:, w_idx], atmos.q_p[:, w_idx],
                 atmos.q_c[:, w_idx], atmos.q_i[:, w_idx], u_post_w, v_post_w,
                 rain_cell_w[w_idx], snow_cell_w[w_idx], f_cld_w, f_prec_w,
