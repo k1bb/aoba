@@ -1397,7 +1397,16 @@ $$
 
 埋め込み CRM（二重周期 2D/3D Arakawa C-grid / Charney–Phillips、水平格子間隔 $\Delta x = \Delta y$ は `[grid] crm_dx` で任意設定・既定 $4\ \mathrm{km}$）は親格子と同一の RK3–HEVI 圧縮性 Euler 方程式を解く。水平運動量移流には 3 次 Wicker–Skamarock 上風バイアス流束差分法を、$\theta_m$ には 4 次中心＋$0.25$ 上風散逸を、全スカラー移流には 3D Zalesak FCT（水平・鉛直 4 次高次流束）を用いる。水平サブグリッド乱流には第 6.4 節の 3D Smagorinsky–Lilly SGS（背景数値粘性 $\nu_{\mathrm{bg}} = 0.004\,\Delta x\Delta y/10$ を含む）を、鉛直乱流には第 6.3 節の MYNN 2.5 を適用する。
 
-高速水平平均風による水平移流 CFL 制約を緩和するため、サブサイクル前に各親カラムで厳密なガリレイ並進速度 $U_{\mathrm{shift}} = \frac{1}{2}(\max u + \min u)$（3D 時は $V_{\mathrm{shift}}$ も）を差し引き、積分後に復元する。また次元整合コリオリ項（1D/2D では無効、3D のみ水平摂動風 $(u', v')$ に作用）および水平摂動のみに作用するレイリースポンジ層を備える。単独周期 3D CRM 放射対流平衡実験ドライバ `step_coupled_crm_rce`（Wing et al., 2018; 既定 $S_0 = 551.58\ \mathrm{W\ m^{-2}}, \mathrm{CO}_2 = 400\ \mathrm{ppmv}$）も同一コード内に実装されている。
+高速水平平均風による水平移流 CFL 制約を緩和するため、サブサイクル前に各親カラムで厳密なガリレイ並進速度 $U_{\mathrm{shift}} = \frac{1}{2}(\max u + \min u)$（3D 時は $V_{\mathrm{shift}}$ も）を差し引き、積分後に復元する。また次元整合コリオリ項（1D/2D では無効、3D のみ水平摂動風 $(u', v')$ に作用）および水平摂動のみに作用するレイリースポンジ層を備える。対流グレーゾーン（$N_x > 1$ または $N_y > 1$）において地表面浮力フラックス $B_{\mathrm{sfc}} > 0$ の不安定境界層が形成される際、最下層 3 層（鉛直重み $w_z = (1.0, 0.65, 0.35)$）に厳密質量重み付き水平平均ゼロ（$\overline{\rho_d\,\delta\theta'_m} = 0$）の自己消滅型 Deardorff (1970) 熱揺らぎを付与する：
+
+$$
+\begin{aligned}
+w_* &= \big(\max(B_{\mathrm{sfc}}, 0)\,z_{\mathrm{ref}}\big)^{1/3}, \qquad \theta_* = \frac{\max(B_{\mathrm{sfc}}, 0)\,\theta_0 / g}{\max(w_*, 0.10)}, \\
+f_{\mathrm{gz}} &= \operatorname{clamp}\!\left(\frac{\Delta x_{\mathrm{CRM}}}{4000\ \mathrm{m}},\ 0,\ 1\right), \qquad \sigma_{\theta} = \max\!\Big(\min(0.8\,f_{\mathrm{gz}}\,\theta_*,\ 0.25\ \mathrm{K}) - \operatorname{std}_{x,y}(\theta_{m,0}),\ 0\Big)
+\end{aligned} \tag{8.7b}
+$$
+
+ここで $z_{\mathrm{ref}} = 1000\ \mathrm{m}$、$\theta_0 = 300\ \mathrm{K}$ である。夜間安定境界層（$B_{\mathrm{sfc}} \le 0$）、高解像度 LES 極限（$\Delta x_{\mathrm{CRM}} \to 0$）、および既に分解された CRM 熱対流分散が目標値に達したカラムでは $\sigma_\theta = 0$ となり自動的に停止する。単独周期 3D CRM 放射対流平衡実験ドライバ `step_coupled_crm_rce`（Wing et al., 2018; 既定 $S_0 = 551.58\ \mathrm{W\ m^{-2}}, \mathrm{CO}_2 = 400\ \mathrm{ppmv}$）も同一コード内に実装されている。
 
 ### 8.4 サブグリッド山岳ブロッキングおよび山岳重力波抵抗 (`src/aoba/orography.py`)
 

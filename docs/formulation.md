@@ -1397,7 +1397,16 @@ Using the third-stage time-averaged mass fluxes $(\bar{U}_h, \bar{\Omega})$, all
 
 The embedded CRM (doubly periodic 2D/3D Arakawa C-grid / Charney–Phillips, configurable horizontal spacing $\Delta x = \Delta y$ via `[grid] crm_dx`, default $4\ \mathrm{km}$) integrates the same RK3–HEVI compressible Euler equations as the host. Horizontal momentum advection uses the third-order Wicker–Skamarock upwind-biased flux difference, $\theta_m$ uses fourth-order centered plus $0.25$ upwind dissipation, and all scalar tracers use 3D Zalesak FCT (fourth-order horizontal and vertical high-order fluxes). Horizontal subgrid turbulence uses the 3D Smagorinsky–Lilly SGS scheme of Section 6.4 (including background numerical viscosity $\nu_{\mathrm{bg}} = 0.004\,\Delta x\Delta y/10$), and vertical turbulence uses the MYNN 2.5 scheme of Section 6.3.
 
-To relax the horizontal advective CFL constraint under strong mean winds, an exact Galilean shift $U_{\mathrm{shift}} = \frac{1}{2}(\max u + \min u)$ (plus $V_{\mathrm{shift}}$ in 3D) is subtracted per host column prior to sub-cycling and restored afterward. Dimensionally consistent Coriolis forcing (disabled in 1D/2D; acting on horizontal perturbation winds $(u', v')$ in 3D) and a perturbation-only Rayleigh sponge layer are included. A standalone periodic 3D CRM radiative–convective equilibrium driver (`step_coupled_crm_rce`; Wing et al., 2018; default $S_0 = 551.58\ \mathrm{W\ m^{-2}}$, $\mathrm{CO}_2 = 400\ \mathrm{ppmv}$) shares the same core.
+To relax the horizontal advective CFL constraint under strong mean winds, an exact Galilean shift $U_{\mathrm{shift}} = \frac{1}{2}(\max u + \min u)$ (plus $V_{\mathrm{shift}}$ in 3D) is subtracted per host column prior to sub-cycling and restored afterward. Dimensionally consistent Coriolis forcing (disabled in 1D/2D; acting on horizontal perturbation winds $(u', v')$ in 3D) and a perturbation-only Rayleigh sponge layer are included. In the convective gray zone ($N_x > 1$ or $N_y > 1$), whenever surface buoyancy flux $B_{\mathrm{sfc}} > 0$ produces unresolved subgrid boundary-layer thermals, self-extinguishing Deardorff (1970) thermal perturbations are seeded in the lowest three levels ($w_z = (1.0, 0.65, 0.35)$) with exact mass-weighted zero horizontal mean ($\overline{\rho_d\,\delta\theta'_m} = 0$):
+
+$$
+\begin{aligned}
+w_* &= \big(\max(B_{\mathrm{sfc}}, 0)\,z_{\mathrm{ref}}\big)^{1/3}, \qquad \theta_* = \frac{\max(B_{\mathrm{sfc}}, 0)\,\theta_0 / g}{\max(w_*, 0.10)}, \\
+f_{\mathrm{gz}} &= \operatorname{clamp}\!\left(\frac{\Delta x_{\mathrm{CRM}}}{4000\ \mathrm{m}},\ 0,\ 1\right), \qquad \sigma_{\theta} = \max\!\Big(\min(0.8\,f_{\mathrm{gz}}\,\theta_*,\ 0.25\ \mathrm{K}) - \operatorname{std}_{x,y}(\theta_{m,0}),\ 0\Big)
+\end{aligned} \tag{8.7b}
+$$
+
+where $z_{\mathrm{ref}} = 1000\ \mathrm{m}$ and $\theta_0 = 300\ \mathrm{K}$. Seeding vanishes identically in stable nocturnal boundary layers ($B_{\mathrm{sfc}} \le 0$), at fine LES spacing ($\Delta x_{\mathrm{CRM}} \to 0$), and once resolved CRM thermal variance reaches the Deardorff target. A standalone periodic 3D CRM radiative–convective equilibrium driver (`step_coupled_crm_rce`; Wing et al., 2018; default $S_0 = 551.58\ \mathrm{W\ m^{-2}}$, $\mathrm{CO}_2 = 400\ \mathrm{ppmv}$) shares the same core.
 
 ### 8.4 Subgrid Orographic Blocking & Mountain Gravity-Wave Drag (`src/aoba/orography.py`)
 

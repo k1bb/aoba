@@ -957,6 +957,36 @@ def step_crm_physics_and_dynamics(
         if crm.n_i is None:
             crm.n_i = torch.zeros_like(crm.q_i)
 
+    # Self-extinguishing Deardorff (1970) buoyancy-driven subgrid PBL thermal seeding
+    # (AOBA Formulation Eq. 8.7b; Deardorff, 1970; Wyngaard & Coté, 1974):
+    # Supplies only the gray-zone deficit below target thermal variance when surface buoyancy
+    # flux B_sfc > 0 (strictly zero at night / stable PBL and automatically vanishing at LES
+    # spacing dx -> 50 m or once resolved CRM thermals exceed target_std), with exact
+    # mass-weighted zero-mean perturbation conserving column enthalpy.
+    if (nx > 1 or ny > 1) and sfc_fluxes is not None:
+        b_sfc = sfc_fluxes.buoy_flux
+        if b_sfc.ndim == 1 and int(b_sfc.numel()) == n_col:
+            b_pos = torch.clamp(b_sfc, min=0.0).view(1, n_col, 1, 1)
+        else:
+            b_pos = torch.clamp(b_sfc.reshape(n_col, ny, nx), min=0.0).mean(dim=(-2, -1), keepdim=True).unsqueeze(0)
+        dx_eff = max(float(crm.dx), float(crm.dy) if ny > 1 else float(crm.dx))
+        f_gz = min(max(dx_eff / 4000.0, 0.0), 1.0)
+        if f_gz > 0.0:
+            w_star = torch.pow(b_pos * 1000.0, 1.0 / 3.0)
+            th_star = (b_pos * (300.0 / C.GRAVITY)) / torch.clamp(w_star, min=0.10)
+            target_std = torch.clamp(0.8 * f_gz * th_star, max=0.25)
+            cur_std = crm.theta_m[0:1].std(dim=(-2, -1), keepdim=True, unbiased=False)
+            sigma_th = torch.clamp(target_std - cur_std, min=0.0)
+            k_pbl = min(3, nz)
+            w_z_vals = (1.0, 0.65, 0.35)[:k_pbl]
+            w_z = torch.tensor(w_z_vals, device=crm.theta_m.device, dtype=crm.theta_m.dtype).view(k_pbl, 1, 1, 1)
+            eta = torch.randn((k_pbl, n_col, ny, nx), device=crm.theta_m.device, dtype=crm.theta_m.dtype)
+            rho_p = crm.rho_d[:k_pbl]
+            rho_eta_mean = (rho_p * eta).mean(dim=(-2, -1), keepdim=True) / torch.clamp(
+                rho_p.mean(dim=(-2, -1), keepdim=True), min=1.0e-5
+            )
+            crm.theta_m[:k_pbl].add_((sigma_th * w_z) * (eta - rho_eta_mean))
+
     if can_use_cuda_graph(crm.rho_d.device) and can_use_crm_metal(crm.rho_d):
         _opt_crm_names = ("f_coriolis", "n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g")
         _core_crm_names = ("rho_d", "u", "v", "w", "theta_m", "q_n", "q_p", "q_v", "q_c", "q_i", "qke")
