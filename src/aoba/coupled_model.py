@@ -2170,6 +2170,7 @@ def step_aoba_model(
 
     # Optional MAML subgrid orographic microclimate downscaling (lapse rate + terrain aspect)
     temp_sfc_in = temp_sub_0
+    pres_1_in = pres_sub_0
     pres_sfc_in = pres_sfc_sub
     sw1_dir_in = sw1_dir_sub
     sw2_dir_in = sw2_dir_sub
@@ -2182,6 +2183,9 @@ def step_aoba_model(
             temp_sfc_in, pres_sfc_in, sw1_dir_in = downscale_maml_microclimate(
                 model.maml_land, temp_sub_0, pres_sfc_sub, sw1_dir_sub
             )
+            # Scale lowest-layer mid-level pressure by the exact same barometric ratio so
+            # Exner ratio (pres_sfc / pres_1)^kappa stays hydrostatically consistent on steep slopes.
+            pres_1_in = pres_sub_0 * (pres_sfc_in / torch.clamp(pres_sfc_sub, min=100.0))
             sw2_dir_in = torch.clamp(sw2_dir_sub * model.maml_land.slope_sw_fac, min=0.0)
 
     # 4. Subgrid MAML Land/Snow/Soil/Two-Leaf Biosphere & Ocean/Sea-Ice Balance + Host Voronoi Ekman Ocean
@@ -2191,7 +2195,7 @@ def step_aoba_model(
         v_1=v_sub_0 - v_ocn_sub,
         temp_1=temp_sfc_in,
         qv_1=qv_sub_0,
-        pres_1=pres_sub_0,
+        pres_1=pres_1_in,
         pres_sfc=pres_sfc_in,
         z_ref_rel=z_ref_rel_sub,
         sw1_dir_down=sw1_dir_in,
