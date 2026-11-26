@@ -58,6 +58,7 @@ from aoba.kernels_physics import (
     run_crm_distill_closure_metal,
     run_crm_distill_extract_metal,
     run_crm_student_tile_update_metal,
+    run_diagnose_p_T_metal,
     run_dust_column_metal,
     run_natural_aerosol_4sp_metal,
     run_ngwd_propagate_metal,
@@ -71,6 +72,8 @@ from aoba.kernels_physics import (
     run_ogcm_mom_vdiff_metal,
     run_ogcm_pre_kpp_metal,
     run_ogcm_tracer_vdiff_freeze_metal,
+    run_ogcm_trisk_coriolis_wet_metal,
+    run_ogcm_vec_lap_wet_metal,
     run_oro_gwd_metal,
     run_rad_ckd_metal,
     run_rad_distill_closure_metal,
@@ -1547,6 +1550,28 @@ def dispatch_ogcm_baroclinic_rk3_update_metal(**kwargs: Any) -> torch.Tensor:
     lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_ogcm_baroclinic_rk3_update_metal(lib, **kwargs)
+
+
+def dispatch_ogcm_vec_lap_wet_metal(mesh: Any, **kwargs: Any) -> torch.Tensor:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    mc = _get_scvt_mesh_cache(mesh)
+    return run_ogcm_vec_lap_wet_metal(lib, mc, **kwargs)
+
+
+def dispatch_ogcm_trisk_coriolis_wet_metal(mesh: Any, **kwargs: Any) -> torch.Tensor:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    mc = _get_scvt_mesh_cache(mesh)
+    return run_ogcm_trisk_coriolis_wet_metal(lib, mc, **kwargs)
+
+
+def dispatch_diagnose_p_T_metal(
+    rho_d: torch.Tensor, theta_m: torch.Tensor, q_v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(rho_d.device)
+    assert lib is not None
+    return run_diagnose_p_T_metal(lib, rho_d, theta_m, q_v)
 
 
 def dispatch_ogcm_mom_vdiff_metal(mesh: Any, **kwargs: Any) -> torch.Tensor:

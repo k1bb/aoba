@@ -1713,7 +1713,7 @@ kernel void crm_mynn_col(
     device float* qv_out           [[buffer(20)]],
     device float* qc_out           [[buffer(21)]],
     device float* qi_out           [[buffer(22)]],
-    constant ulong4& u_dim         [[buffer(23)]],  // [nz, M, dz_cols, 0]
+    constant ulong4& u_dim         [[buffer(23)]],  // [nz, M, dz_cols, no_sat_adj]
     constant float& dt             [[buffer(24)]],
     device const float* mp         [[buffer(25)]],  // [static constants...]
     uint m [[thread_position_in_grid]])
@@ -1721,8 +1721,9 @@ kernel void crm_mynn_col(
     uint nz = uint(u_dim.x);
     uint M = uint(u_dim.y);
     uint dz_cols = uint(u_dim.z);
-    if (m >= M) return;
+    if (m >= M || nz < 2u || nz > 64u) return;
     uint col_dz = (dz_cols > 1u) ? m : 0u;
+    uint n_int = nz - 1u;
 
     float p_ref    = mp[0];
     float r_d      = mp[1];
@@ -1765,13 +1766,49 @@ kernel void crm_mynn_col(
     float shf_sfc      = sfc6[4u * M + m];
     float evap_sfc     = sfc6[5u * M + m];
 
-    float rd_a[64], u_a[64], v_a[64], qn_a[64], q2_a[64], qv_a[64], qc_a[64], qi_a[64];
-    float pres_a[64], exn_a[64], temp_a[64], th_a[64], thl_a[64], zc_a[64], dzc_a[64], qvel_a[64];
-
+    float gk = gamma_d * kappa_d;
+    float inv_pref_rd = r_d / p_ref;
+    float q2_floor = 2.0f * tke_min;
+    float q_min_vel = sqrt(q2_floor);
     float zw0 = z_w[col_dz];
-    float q_min_vel = sqrt(2.0f * tke_min);
+
+    // Pass 1 (zero local arrays, early break at 4 km): turbulent length scale l_t_col
     float num_lt = 0.0f;
     float den_lt = 0.0f;
+    for (uint k = 0u; k < nz; ++k) {
+        uint dz_idx = k * dz_cols + col_dz;
+        float zrel = z_c[dz_idx] - zw0;
+        if (zrel > 4000.0f) break;
+        float qvel = sqrt(max(qke_in[k * M + m], q2_floor));
+        float q_exc = max(qvel - q_min_vel, 0.0f);
+        float dzc = dz_c[dz_idx];
+        num_lt += q_exc * zrel * dzc;
+        den_lt += q_exc * dzc;
+    }
+
+    float l_t_col = clamp(0.23f * num_lt / max(den_lt, 1.0e-4f), 20.0f, 500.0f);
+    float us_safe = max(u_star, 0.02f);
+    float b_sfc_nz = (fabs(sfc_buoy) < 1.0e-9f) ? 1.0e-9f : sfc_buoy;
+    float l_mo = -(us_safe * us_safe * us_safe) / (kappa_vk * b_sfc_nz);
+    float q_conv = (sfc_buoy > 0.0f) ? exp2((1.0f / 3.0f) * log2(sfc_buoy * l_t_col)) : 0.0f;
+    float af_ratio = (A1 * F1) / (A2 * F2);
+    float inv_af_ratio = 1.0f / af_ratio;
+    float inv_sqrt2 = 0.70710678f;
+    float inv_sqrt2pi = 0.39894228f;
+    float sqrt_b2_h = sqrt(B2 * 0.5f);
+
+    // Compact 8x[64] stack (2,048 B vs 36x[64] = 9,216 B): eliminates register spills!
+    float km_a[64], kh_a[64], prod_c[64], l_c[64];
+    float cp_a[64], invp_a[64], dp0_a[64], dp1_a[64];
+
+    // Pass 2 (streaming 2-scalar sliding window): diagnose Km, Kh, l_c, prod_c
+    float u_p = 0.0f, v_p = 0.0f, qn_p = 0.0f, qci_p = 0.0f;
+    float pres_p = 0.0f, temp_p = 0.0f, th_p = 0.0f, thl_p = 0.0f, zc_p = 0.0f, qvel_p = 0.0f;
+    float exn0 = 1.0f;
+    float zc0 = zw0 + 1.0f;
+    float qv0 = 0.0f;
+    prod_c[0] = 0.0f;
+
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * M + m;
         uint dz_idx = k * dz_cols + col_dz;
@@ -1781,288 +1818,392 @@ kernel void crm_mynn_col(
         float qv = max(qv_in[idx], 0.0f);
         float qc = qc_in[idx];
         float qi = qi_in[idx];
-        float q2 = max(qke_in[idx], 2.0f * tke_min);
-        float qvel = sqrt(q2);
-
-        float arg = max(r_d * rd * thm / p_ref, 1.0e-8f);
-        float exner = pow(arg, gamma_d * kappa_d);
+        float qvel = sqrt(max(qke_in[idx], q2_floor));
+        float arg = max(rd * thm * inv_pref_rd, 1.0e-8f);
+        float exner = exp2(gk * log2(arg));
         float pres = p_ref * arg * exner;
-        float temp = exner * (thm / (1.0f + rv_ov_rd * qv));
-        float theta = temp / exner;
+        float theta = thm / (1.0f + rv_ov_rd * qv);
+        float temp = exner * theta;
         float theta_l = theta - (lv0 * qc + ls0 * qi) / (cp_d * exner);
-
+        float u_c = u_in[idx];
+        float v_c = v_in[idx];
         float zc = z_c[dz_idx];
-        float dzc = dz_c[dz_idx];
-        float zrel = zc - zw0;
-        if (zrel <= 4000.0f) {
-            float q_exc = max(qvel - q_min_vel, 0.0f);
-            num_lt += q_exc * zrel * dzc;
-            den_lt += q_exc * dzc;
-        }
+        float qci = qc + qi;
 
-        rd_a[k] = rd;
-        u_a[k] = u_in[idx];
-        v_a[k] = v_in[idx];
-        qn_a[k] = qn;
-        q2_a[k] = q2;
-        qv_a[k] = qv;
-        qc_a[k] = qc;
-        qi_a[k] = qi;
-        pres_a[k] = pres;
-        exn_a[k] = exner;
-        temp_a[k] = temp;
-        th_a[k] = theta;
-        thl_a[k] = theta_l;
-        zc_a[k] = zc;
-        dzc_a[k] = dzc;
-        qvel_a[k] = qvel;
-    }
-
-    float l_t_col = clamp(0.23f * num_lt / max(den_lt, 1.0e-4f), 20.0f, 500.0f);
-    float us_safe = max(u_star, 0.02f);
-    float b_sfc_nz = (fabs(sfc_buoy) < 1.0e-9f) ? 1.0e-9f : sfc_buoy;
-    float l_mo = -(us_safe * us_safe * us_safe) / (kappa_vk * b_sfc_nz);
-    float q_conv = pow(max(sfc_buoy, 0.0f) * l_t_col, 1.0f / 3.0f);
-    float af_ratio = (A1 * F1) / (A2 * F2);
-    float inv_sqrt2 = 0.70710678f;
-    float inv_sqrt2pi = 0.39894228f;
-    float sqrt_b2_h = sqrt(B2 * 0.5f);
-
-    float km_a[64], kh_a[64], dzint_a[64], rho_int_a[64];
-    float prod_c[64], l_c[64];
-    for (uint k = 0u; k < nz; ++k) prod_c[k] = 0.0f;
-
-    uint n_int = nz - 1u;
-    for (uint k = 0u; k < n_int; ++k) {
-        float dz_int = max(zc_a[k + 1u] - zc_a[k], 1.0f);
-        float z_int = z_w[(k + 1u) * dz_cols + col_dz] - zw0;
-        dzint_a[k] = dz_int;
-
-        float du_dz = (u_a[k + 1u] - u_a[k]) / dz_int;
-        float dv_dz = (v_a[k + 1u] - v_a[k]) / dz_int;
-        float dthl_dz = (thl_a[k + 1u] - thl_a[k]) / dz_int;
-        float dqn_dz = (qn_a[k + 1u] - qn_a[k]) / dz_int;
-        float shear2 = du_dz * du_dz + dv_dz * dv_dz + 1.0e-10f;
-
-        float q_int = 0.5f * (qvel_a[k + 1u] + qvel_a[k]);
-        float q2_int = q_int * q_int;
-        float temp_int = 0.5f * (temp_a[k + 1u] + temp_a[k]);
-        float pres_int = 0.5f * (pres_a[k + 1u] + pres_a[k]);
-        float theta_int = 0.5f * (th_a[k + 1u] + th_a[k]);
-        float qn_int = 0.5f * (qn_a[k + 1u] + qn_a[k]);
-        float qc_int = 0.5f * (qc_a[k + 1u] + qc_a[k]) + 0.5f * (qi_a[k + 1u] + qi_a[k]);
-
-        float qsl, dqsl;
-        mp_qsat_mix(temp_int, pres_int, e_tr, t_frz, t_ice, t_liq, eps_w, qsl, dqsl);
-        float a_cond = 1.0f / (1.0f + (lv0 / cp_d) * dqsl);
-        float b_cond = (temp_int / theta_int) * dqsl;
-        float c_cond = (1.0f + zvir * qn_int - (1.0f + zvir) * qc_int) * (theta_int * lv0 / (temp_int * cp_d)) - (1.0f + zvir) * theta_int;
-
-        float r_grid = (qc_int > 1.0e-6f) ? 1.0f : 0.0f;
-        float beta_th0 = 1.0f + zvir * qn_int - (1.0f + zvir) * qc_int - 0.5f * r_grid * a_cond * b_cond * c_cond;
-        float beta_q0 = zvir * theta_int + 0.5f * r_grid * a_cond * c_cond;
-        float n2_init = (gravity / theta_int) * (beta_th0 * dthl_dz + beta_q0 * dqn_dz);
-
-        float zeta = clamp(z_int / l_mo, -10.0f, 5.0f);
-        float l_surf;
-        if (zeta < 0.0f) {
-            l_surf = kappa_vk * z_int * pow(max(1.0f - 100.0f * zeta, 1.0f), 0.20f);
-        } else if (zeta < 1.0f) {
-            l_surf = kappa_vk * z_int / (1.0f + 2.7f * zeta);
+        if (k == 0u) {
+            exn0 = exner;
+            zc0 = zc;
+            qv0 = qv;
         } else {
-            l_surf = kappa_vk * z_int / 3.7f;
+            uint i = k - 1u;
+            float dz_int = max(zc - zc_p, 1.0f);
+            float inv_dz_int = 1.0f / dz_int;
+            float z_int = z_w[k * dz_cols + col_dz] - zw0;
+
+            float du_dz = (u_c - u_p) * inv_dz_int;
+            float dv_dz = (v_c - v_p) * inv_dz_int;
+            float dthl_dz = (theta_l - thl_p) * inv_dz_int;
+            float dqn_dz = (qn - qn_p) * inv_dz_int;
+            float shear2 = du_dz * du_dz + dv_dz * dv_dz + 1.0e-10f;
+
+            float q_int = 0.5f * (qvel + qvel_p);
+            float q2_int = q_int * q_int;
+            float temp_int = 0.5f * (temp + temp_p);
+            float pres_int = 0.5f * (pres + pres_p);
+            float theta_int = 0.5f * (theta + th_p);
+            float qn_int = 0.5f * (qn + qn_p);
+            float qc_int = 0.5f * (qci + qci_p);
+
+            float qsl, dqsl;
+            mp_qsat_mix(temp_int, pres_int, e_tr, t_frz, t_ice, t_liq, eps_w, qsl, dqsl);
+            float a_cond = 1.0f / (1.0f + (lv0 / cp_d) * dqsl);
+            float b_cond = (temp_int / theta_int) * dqsl;
+            float c_cond = (1.0f + zvir * qn_int - (1.0f + zvir) * qc_int) * (theta_int * lv0 / (temp_int * cp_d)) - (1.0f + zvir) * theta_int;
+
+            float r_grid = (qc_int > 1.0e-6f) ? 1.0f : 0.0f;
+            float beta_th0 = 1.0f + zvir * qn_int - (1.0f + zvir) * qc_int - 0.5f * r_grid * a_cond * b_cond * c_cond;
+            float beta_q0 = zvir * theta_int + 0.5f * r_grid * a_cond * c_cond;
+            float n2_init = (gravity / theta_int) * (beta_th0 * dthl_dz + beta_q0 * dqn_dz);
+
+            float zeta = clamp(z_int / l_mo, -10.0f, 5.0f);
+            float l_surf;
+            if (zeta < 0.0f) {
+                l_surf = kappa_vk * z_int * exp2(0.20f * log2(max(1.0f - 100.0f * zeta, 1.0f)));
+            } else if (zeta < 1.0f) {
+                l_surf = kappa_vk * z_int / (1.0f + 2.7f * zeta);
+            } else {
+                l_surf = kappa_vk * z_int / 3.7f;
+            }
+
+            float inv_lb = 0.0f;
+            if (n2_init > 1.0e-8f) {
+                float n_bv = sqrt(n2_init);
+                float lb_base = q_int / n_bv;
+                float lb = (zeta < 0.0f) ? ((1.0f + 5.0f * sqrt(q_conv / max(l_t_col * n_bv, 1.0e-6f))) * lb_base) : lb_base;
+                inv_lb = 1.0f / max(lb, 1.0f);
+            }
+
+            float l_cap = 30.0f + 270.0f * exp(-max((z_int - 3000.0f) / 1500.0f, 0.0f));
+            float l_master = clamp(1.0f / (1.0f / max(l_surf, 0.5f) + 1.0f / l_t_col + inv_lb), 0.5f, l_cap);
+            if (i == 0u) l_c[0] = l_master;
+            else         l_c[i] = 0.5f * (l_c[i] + l_master);
+            l_c[k] = l_master;
+
+            float dq_li = dqn_dz - b_cond * dthl_dz;
+            float sigma_s = max(0.5f * a_cond * l_master * sqrt_b2_h * fabs(dq_li), 1.0e-7f);
+            float q1 = clamp(a_cond * (qn_int - qsl) / (2.0f * sigma_s), -6.0f, 6.0f);
+            float r_sub = 0.5f * (1.0f + mynn_erff(q1 * inv_sqrt2));
+            float gauss_q1 = inv_sqrt2pi * exp(-0.5f * q1 * q1);
+            float ql_sub = 2.0f * sigma_s * (r_sub * q1 + gauss_q1);
+            float r_tilde = clamp(r_sub - (ql_sub / (2.0f * sigma_s)) * gauss_q1, 0.0f, 1.0f);
+
+            float beta_th = 1.0f + zvir * qn_int - (1.0f + zvir) * ql_sub - r_tilde * a_cond * b_cond * c_cond;
+            float beta_q = zvir * theta_int + r_tilde * a_cond * c_cond;
+            float n2 = (gravity / theta_int) * (beta_th * dthl_dz + beta_q * dqn_dz);
+
+            float ri = clamp(n2 / shear2, -10.0f, 5.0f);
+            float disc = max(ri * ri + 2.0f * af_ratio * (RF1 - 2.0f * RF2) * ri + (af_ratio * RF1) * (af_ratio * RF1), 0.0f);
+            float rf = min(0.5f * inv_af_ratio * (ri + af_ratio * RF1 - sqrt(disc)), RFC - 1.0e-4f);
+            float sh2 = max(3.0f * A2 * (GAM1 + GAM2) * (RFC - rf) / (1.0f - rf), 0.0f);
+            float sm2 = max(af_ratio * ((RF1 - rf) / max(RF2 - rf, 1.0e-5f)) * sh2, 0.0f);
+            float q2_lev2 = max(B1 * (l_master * l_master) * sm2 * (1.0f - rf) * shear2, 0.0f);
+
+            float alpha_c = (q2_lev2 > q2_int) ? (q_int / sqrt(max(q2_lev2, 1.0e-8f))) : 1.0f;
+            float ac2 = alpha_c * alpha_c;
+            float l2_ov_q2 = (l_master * l_master) / q2_int;
+            float g_m = min(l2_ov_q2 * shear2, 1.0e4f);
+            float g_h = clamp(-l2_ov_q2 * n2, -4.0f, 0.028f);
+
+            float phi1 = 1.0f - 3.0f * ac2 * A2 * B2 * (1.0f - C3) * g_h;
+            float phi2 = 1.0f - 9.0f * ac2 * A1 * A2 * (1.0f - C2) * g_h;
+            float phi3 = phi1 + 9.0f * ac2 * (A2 * A2) * (1.0f - C2) * (1.0f - C5) * g_h;
+            float phi4 = phi1 - 12.0f * ac2 * A1 * A2 * (1.0f - C2) * g_h;
+            float phi5 = 6.0f * ac2 * (A1 * A1) * g_m;
+            float denom25 = max(phi2 * phi4 + phi5 * phi3, 1.0e-5f);
+
+            float s_m = clamp(alpha_c * A1 * (phi3 - 3.0f * C1 * phi4) / denom25, 0.0f, 2.5f);
+            float s_h = clamp(alpha_c * A2 * (phi2 + 3.0f * C1 * phi5) / denom25, 0.0f, 3.0f);
+
+            float km = clamp(l_master * q_int * s_m, 0.0f, 500.0f);
+            float kh = clamp(l_master * q_int * s_h, 0.0f, 500.0f);
+            km_a[i] = km;
+            kh_a[i] = kh;
+            km_out[i * M + m] = km;
+            kh_out[i * M + m] = kh;
+
+            float prod_i = 2.0f * (km * shear2 - kh * n2);
+            prod_c[i] += 0.5f * prod_i;
+            prod_c[k] = 0.5f * prod_i;
         }
-
-        float inv_lb = 0.0f;
-        if (n2_init > 1.0e-8f) {
-            float n_bv = sqrt(n2_init);
-            float lb_base = q_int / n_bv;
-            float lb = (zeta < 0.0f) ? ((1.0f + 5.0f * sqrt(q_conv / max(l_t_col * n_bv, 1.0e-6f))) * lb_base) : lb_base;
-            inv_lb = 1.0f / max(lb, 1.0f);
-        }
-
-        float l_cap = 30.0f + 270.0f * exp(-max((z_int - 3000.0f) / 1500.0f, 0.0f));
-        float l_master = clamp(1.0f / (1.0f / max(l_surf, 0.5f) + 1.0f / l_t_col + inv_lb), 0.5f, l_cap);
-        if (k == 0u) l_c[0] = l_master;
-        if (k > 0u)  l_c[k] = 0.5f * (l_c[k] + l_master);
-        if (k + 1u < n_int) l_c[k + 1u] = l_master;
-        else l_c[nz - 1u] = l_master;
-
-        float dq_li = dqn_dz - b_cond * dthl_dz;
-        float sigma_s = max(0.5f * a_cond * l_master * sqrt_b2_h * fabs(dq_li), 1.0e-7f);
-        float q1 = clamp(a_cond * (qn_int - qsl) / (2.0f * sigma_s), -6.0f, 6.0f);
-        float r_sub = 0.5f * (1.0f + mynn_erff(q1 * inv_sqrt2));
-        float gauss_q1 = inv_sqrt2pi * exp(-0.5f * q1 * q1);
-        float ql_sub = 2.0f * sigma_s * (r_sub * q1 + gauss_q1);
-        float r_tilde = clamp(r_sub - (ql_sub / (2.0f * sigma_s)) * gauss_q1, 0.0f, 1.0f);
-
-        float beta_th = 1.0f + zvir * qn_int - (1.0f + zvir) * ql_sub - r_tilde * a_cond * b_cond * c_cond;
-        float beta_q = zvir * theta_int + r_tilde * a_cond * c_cond;
-        float n2 = (gravity / theta_int) * (beta_th * dthl_dz + beta_q * dqn_dz);
-
-        float ri = clamp(n2 / shear2, -10.0f, 5.0f);
-        float disc = max(ri * ri + 2.0f * af_ratio * (RF1 - 2.0f * RF2) * ri + (af_ratio * RF1) * (af_ratio * RF1), 0.0f);
-        float rf = min(0.5f * (1.0f / af_ratio) * (ri + af_ratio * RF1 - sqrt(disc)), RFC - 1.0e-4f);
-        float sh2 = max(3.0f * A2 * (GAM1 + GAM2) * (RFC - rf) / (1.0f - rf), 0.0f);
-        float sm2 = max(af_ratio * ((RF1 - rf) / max(RF2 - rf, 1.0e-5f)) * sh2, 0.0f);
-        float q2_lev2 = max(B1 * (l_master * l_master) * sm2 * (1.0f - rf) * shear2, 0.0f);
-
-        float alpha_c = (q2_lev2 > q2_int) ? (q_int / sqrt(max(q2_lev2, 1.0e-8f))) : 1.0f;
-        float ac2 = alpha_c * alpha_c;
-        float g_m = min((l_master * l_master / q2_int) * shear2, 1.0e4f);
-        float g_h = clamp(-(l_master * l_master / q2_int) * n2, -4.0f, 0.028f);
-
-        float phi1 = 1.0f - 3.0f * ac2 * A2 * B2 * (1.0f - C3) * g_h;
-        float phi2 = 1.0f - 9.0f * ac2 * A1 * A2 * (1.0f - C2) * g_h;
-        float phi3 = phi1 + 9.0f * ac2 * (A2 * A2) * (1.0f - C2) * (1.0f - C5) * g_h;
-        float phi4 = phi1 - 12.0f * ac2 * A1 * A2 * (1.0f - C2) * g_h;
-        float phi5 = 6.0f * ac2 * (A1 * A1) * g_m;
-        float denom25 = max(phi2 * phi4 + phi5 * phi3, 1.0e-5f);
-
-        float s_m = clamp(alpha_c * A1 * (phi3 - 3.0f * C1 * phi4) / denom25, 0.0f, 2.5f);
-        float s_h = clamp(alpha_c * A2 * (phi2 + 3.0f * C1 * phi5) / denom25, 0.0f, 3.0f);
-
-        float km = clamp(l_master * q_int * s_m, 0.0f, 500.0f);
-        float kh = clamp(l_master * q_int * s_h, 0.0f, 500.0f);
-        km_a[k] = km;
-        kh_a[k] = kh;
-        km_out[k * M + m] = km;
-        kh_out[k * M + m] = kh;
-        rho_int_a[k] = 0.5f * (rd_a[k + 1u] + rd_a[k]);
-
-        float prod_i = 2.0f * (km * shear2 - kh * n2);
-        prod_c[k] += 0.5f * prod_i;
-        prod_c[k + 1u] += 0.5f * prod_i;
+        u_p = u_c; v_p = v_c; qn_p = qn; qci_p = qci;
+        pres_p = pres; temp_p = temp; th_p = theta; thl_p = theta_l; zc_p = zc; qvel_p = qvel;
     }
 
-    float zrel0 = max(zc_a[0] - zw0, 1.0f);
+    float zrel0 = max(zc0 - zw0, 1.0f);
     prod_c[0] += 2.0f * max((u_star * u_star * u_star) / (kappa_vk * zrel0) + sfc_buoy, 0.0f);
 
-    float mass_c[64], dl_t[64], du_t[64], diag_t[64], rhs_t[64], sol_a[64];
-    for (uint k = 0u; k < nz; ++k) {
-        mass_c[k] = rd_a[k] * dzc_a[k];
-        dl_t[k] = 0.0f;
-        du_t[k] = 0.0f;
-    }
-
-    for (uint k = 0u; k < n_int; ++k) {
-        float fct = dt * 3.0f * rho_int_a[k] * km_a[k] / dzint_a[k];
-        dl_t[k + 1u] = -fct / mass_c[k + 1u];
-        du_t[k]      = -fct / mass_c[k];
-    }
-    for (uint k = 0u; k < nz; ++k) {
-        float prod_pos = max(prod_c[k], 0.0f);
-        float buoy_sink = max(-prod_c[k], 0.0f) / q2_a[k];
-        float q_eq = pow(max(0.5f * B1 * l_c[k] * prod_pos, 0.0f), 1.0f / 3.0f);
-        float q_diss = max(qvel_a[k], q_eq);
-        diag_t[k] = 1.0f - dl_t[k] - du_t[k] + dt * (2.0f * q_diss / (B1 * l_c[k]) + buoy_sink);
-        rhs_t[k] = q2_a[k] + dt * prod_pos;
-    }
-    mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, sol_a);
-    for (uint k = 0u; k < nz; ++k) qke_out[k * M + m] = clamp(sol_a[k], 2.0f * tke_min, 100.0f);
-
-    for (uint k = 0u; k < n_int; ++k) {
-        float fcm = dt * rho_int_a[k] * km_a[k] / dzint_a[k];
-        dl_t[k + 1u] = -fcm / mass_c[k + 1u];
-        du_t[k]      = -fcm / mass_c[k];
-    }
-    float lim0 = 0.5f * mass_c[0] / max(dt, 1.0f);
-    for (int comp = 0; comp < 2; ++comp) {
-        float tau_sfc = (comp == 0) ? tau_x_sfc : tau_y_sfc;
-        float v0 = (comp == 0) ? u_a[0] : v_a[0];
-        bool opp = (tau_sfc * v0) < 0.0f;
-        float r_drag = opp ? (fabs(tau_sfc) / max(fabs(v0), 0.10f)) : 0.0f;
-        float exp_rem = opp ? (tau_sfc + r_drag * v0) : clamp(tau_sfc, -lim0, lim0);
-        for (uint k = 0u; k < nz; ++k) {
-            diag_t[k] = 1.0f - dl_t[k] - du_t[k];
-            rhs_t[k] = (comp == 0) ? u_a[k] : v_a[k];
-        }
-        diag_t[0] += dt * r_drag / mass_c[0];
-        rhs_t[0]  += dt * exp_rem / mass_c[0];
-        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, sol_a);
-        for (uint k = 0u; k < nz; ++k) {
-            if (comp == 0) u_out[k * M + m] = sol_a[k];
-            else           v_out[k * M + m] = sol_a[k];
-        }
-    }
-
-    for (uint k = 0u; k < n_int; ++k) {
-        float fch = dt * rho_int_a[k] * kh_a[k] / dzint_a[k];
-        dl_t[k + 1u] = -fch / mass_c[k + 1u];
-        du_t[k]      = -fch / mass_c[k];
-    }
-    bool no_sat_adj = (u_dim.w != 0u);
-    float cp_eff0 = cp_d + cp_v * qv_a[0];
-    if (!no_sat_adj) {
-        for (uint k = 0u; k < nz; ++k) {
-            diag_t[k] = 1.0f - dl_t[k] - du_t[k];
-            rhs_t[k] = thl_a[k];
-        }
-        rhs_t[0] += dt * (shf_sfc / (cp_eff0 * exn_a[0])) / mass_c[0];
-        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, sol_a);
-
-        float thl_new_a[64];
-        for (uint k = 0u; k < nz; ++k) {
-            thl_new_a[k] = sol_a[k];
-            rhs_t[k] = qn_a[k];
-        }
-        rhs_t[0] += dt * evap_sfc / mass_c[0];
-        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, sol_a);
-
+    // Pass 3: streaming QKE tridiagonal solve (0 matrix arrays!)
+    {
+        float rd_cur = rho_d[m];
+        float zc_cur = z_c[col_dz];
+        float fc_dn = 0.0f;
+        float cp_prev = 0.0f;
+        float dp_prev = 0.0f;
         for (uint k = 0u; k < nz; ++k) {
             uint idx = k * M + m;
-            float qn_new = max(sol_a[k], 0.0f);
-            float t_li_new = thl_new_a[k] * exn_a[k];
+            float inv_mass = 1.0f / (rd_cur * dz_c[k * dz_cols + col_dz]);
+            float rd_nxt = 0.0f;
+            float zc_nxt = zc_cur;
+            float fc_up = 0.0f;
+            if (k < n_int) {
+                rd_nxt = rho_d[(k + 1u) * M + m];
+                zc_nxt = z_c[(k + 1u) * dz_cols + col_dz];
+                fc_up = dt * 3.0f * (0.5f * (rd_cur + rd_nxt)) * km_a[k] / max(zc_nxt - zc_cur, 1.0f);
+            }
+            float dl_k = -fc_dn * inv_mass;
+            float du_k = -fc_up * inv_mass;
+            float q2_k = max(qke_in[idx], q2_floor);
+            float qvel_k = sqrt(q2_k);
+            float pr_k = prod_c[k];
+            float prod_pos = max(pr_k, 0.0f);
+            float buoy_sink = max(-pr_k, 0.0f) / q2_k;
+            float q_eq_arg = 0.5f * B1 * l_c[k] * prod_pos;
+            float q_eq = (q_eq_arg > 0.0f) ? exp2((1.0f / 3.0f) * log2(q_eq_arg)) : 0.0f;
+            float q_diss = max(qvel_k, q_eq);
+            float diag_k = 1.0f - dl_k - du_k + dt * (2.0f * q_diss / (B1 * l_c[k]) + buoy_sink);
+            float rhs_k = q2_k + dt * prod_pos;
+            float inv_p = 1.0f / max((k == 0u) ? diag_k : (diag_k - dl_k * cp_prev), 1.0e-12f);
+            cp_prev = du_k * inv_p;
+            dp_prev = ((k == 0u) ? rhs_k : (rhs_k - dl_k * dp_prev)) * inv_p;
+            cp_a[k] = cp_prev;
+            dp0_a[k] = dp_prev;
+            fc_dn = fc_up;
+            rd_cur = rd_nxt;
+            zc_cur = zc_nxt;
+        }
+        float x_up = dp0_a[n_int];
+        qke_out[n_int * M + m] = clamp(x_up, q2_floor, 100.0f);
+        for (int ki = int(n_int) - 1; ki >= 0; --ki) {
+            uint k = uint(ki);
+            x_up = dp0_a[k] - cp_a[k] * x_up;
+            qke_out[k * M + m] = clamp(x_up, q2_floor, 100.0f);
+        }
+    }
+
+    // Pass 4: fused u & v streaming tridiagonal solve (reads rho_d, z_c, dz_c, km_a ONCE!)
+    {
+        float rd_cur = rho_d[m];
+        float zc_cur = z_c[col_dz];
+        float mass0 = rd_cur * dz_c[col_dz];
+        float lim0 = 0.5f * mass0 / max(dt, 1.0f);
+        float u0 = u_in[m];
+        float v0 = v_in[m];
+        bool opp_u = (tau_x_sfc * u0) < 0.0f;
+        float r_u = opp_u ? (fabs(tau_x_sfc) / max(fabs(u0), 0.10f)) : 0.0f;
+        float rem_u = opp_u ? (tau_x_sfc + r_u * u0) : clamp(tau_x_sfc, -lim0, lim0);
+        bool opp_v = (tau_y_sfc * v0) < 0.0f;
+        float r_v = opp_v ? (fabs(tau_y_sfc) / max(fabs(v0), 0.10f)) : 0.0f;
+        float rem_v = opp_v ? (tau_y_sfc + r_v * v0) : clamp(tau_y_sfc, -lim0, lim0);
+
+        float fc_dn = 0.0f;
+        float cpu = 0.0f, cpv = 0.0f, dpu = 0.0f, dpv = 0.0f;
+        for (uint k = 0u; k < nz; ++k) {
+            uint idx = k * M + m;
+            float inv_mass = 1.0f / (rd_cur * dz_c[k * dz_cols + col_dz]);
+            float rd_nxt = 0.0f;
+            float zc_nxt = zc_cur;
+            float fc_up = 0.0f;
+            if (k < n_int) {
+                rd_nxt = rho_d[(k + 1u) * M + m];
+                zc_nxt = z_c[(k + 1u) * dz_cols + col_dz];
+                fc_up = dt * (0.5f * (rd_cur + rd_nxt)) * km_a[k] / max(zc_nxt - zc_cur, 1.0f);
+            }
+            float dl_k = -fc_dn * inv_mass;
+            float du_k = -fc_up * inv_mass;
+            float diag_base = 1.0f - dl_k - du_k;
+            float diag_u = diag_base + ((k == 0u) ? (dt * r_u * inv_mass) : 0.0f);
+            float diag_v = diag_base + ((k == 0u) ? (dt * r_v * inv_mass) : 0.0f);
+            float rhs_u = u_in[idx] + ((k == 0u) ? (dt * rem_u * inv_mass) : 0.0f);
+            float rhs_v = v_in[idx] + ((k == 0u) ? (dt * rem_v * inv_mass) : 0.0f);
+
+            float ip_u = 1.0f / max((k == 0u) ? diag_u : (diag_u - dl_k * cpu), 1.0e-12f);
+            cpu = du_k * ip_u;
+            dpu = ((k == 0u) ? rhs_u : (rhs_u - dl_k * dpu)) * ip_u;
+            cp_a[k] = cpu;
+            dp0_a[k] = dpu;
+
+            float ip_v = 1.0f / max((k == 0u) ? diag_v : (diag_v - dl_k * cpv), 1.0e-12f);
+            cpv = du_k * ip_v;
+            dpv = ((k == 0u) ? rhs_v : (rhs_v - dl_k * dpv)) * ip_v;
+            invp_a[k] = cpv;
+            dp1_a[k] = dpv;
+
+            fc_dn = fc_up;
+            rd_cur = rd_nxt;
+            zc_cur = zc_nxt;
+        }
+        float xu = dp0_a[n_int];
+        float xv = dp1_a[n_int];
+        u_out[n_int * M + m] = xu;
+        v_out[n_int * M + m] = xv;
+        for (int ki = int(n_int) - 1; ki >= 0; --ki) {
+            uint k = uint(ki);
+            xu = dp0_a[k] - cp_a[k] * xu;
+            xv = dp1_a[k] - invp_a[k] * xv;
+            u_out[k * M + m] = xu;
+            v_out[k * M + m] = xv;
+        }
+    }
+
+    // Pass 5: single-factorization fused scalar (theta / q) streaming tridiagonal solve
+    // Reuses dead `prod_c` & `l_c` as dp2/dp3 (or exn/pres) -> 0 extra stack arrays!
+    bool no_sat_adj = (u_dim.w != 0u);
+    float cp_eff0 = cp_d + cp_v * qv0;
+    float shf_num = dt * (shf_sfc / (cp_eff0 * exn0));
+    float evap_num = dt * evap_sfc;
+
+    float rd_cur = rho_d[m];
+    float zc_cur = z_c[col_dz];
+    float fc_dn = 0.0f;
+    float cp_prev = 0.0f;
+
+    if (!no_sat_adj) {
+        float d_thl = 0.0f, d_qn = 0.0f;
+        for (uint k = 0u; k < nz; ++k) {
+            uint idx = k * M + m;
+            float inv_mass = 1.0f / (rd_cur * dz_c[k * dz_cols + col_dz]);
+            float rd_nxt = 0.0f;
+            float zc_nxt = zc_cur;
+            float fc_up = 0.0f;
+            if (k < n_int) {
+                rd_nxt = rho_d[(k + 1u) * M + m];
+                zc_nxt = z_c[(k + 1u) * dz_cols + col_dz];
+                fc_up = dt * (0.5f * (rd_cur + rd_nxt)) * kh_a[k] / max(zc_nxt - zc_cur, 1.0f);
+            }
+            float dl_k = -fc_dn * inv_mass;
+            float du_k = -fc_up * inv_mass;
+            float diag_k = 1.0f - dl_k - du_k;
+            float inv_p = 1.0f / max((k == 0u) ? diag_k : (diag_k - dl_k * cp_prev), 1.0e-12f);
+            cp_prev = du_k * inv_p;
+            cp_a[k] = cp_prev;
+
+            float thm = thm_in[idx];
+            float qv = max(qv_in[idx], 0.0f);
+            float qc = qc_in[idx];
+            float qi = qi_in[idx];
+            float arg = max(rd_cur * thm * inv_pref_rd, 1.0e-8f);
+            float exner = exp2(gk * log2(arg));
+            float pres = p_ref * arg * exner;
+            float theta = thm / (1.0f + rv_ov_rd * qv);
+            float thl = theta - (lv0 * qc + ls0 * qi) / (cp_d * exner);
+            prod_c[k] = exner;
+            l_c[k] = pres;
+
+            float rhs_thl = thl + ((k == 0u) ? (shf_num * inv_mass) : 0.0f);
+            float rhs_qn  = qn_in[idx] + ((k == 0u) ? (evap_num * inv_mass) : 0.0f);
+            d_thl = ((k == 0u) ? rhs_thl : (rhs_thl - dl_k * d_thl)) * inv_p;
+            d_qn  = ((k == 0u) ? rhs_qn  : (rhs_qn  - dl_k * d_qn))  * inv_p;
+            dp0_a[k] = d_thl;
+            dp1_a[k] = d_qn;
+
+            fc_dn = fc_up;
+            rd_cur = rd_nxt;
+            zc_cur = zc_nxt;
+        }
+        float x_thl = 0.0f, x_qn = 0.0f;
+        for (int ki = int(n_int); ki >= 0; --ki) {
+            uint k = uint(ki);
+            uint idx = k * M + m;
+            if (k == n_int) {
+                x_thl = dp0_a[k];
+                x_qn  = dp1_a[k];
+            } else {
+                float cpk = cp_a[k];
+                x_thl = dp0_a[k] - cpk * x_thl;
+                x_qn  = dp1_a[k] - cpk * x_qn;
+            }
+            float exn_k = prod_c[k];
+            float qn_new = max(x_qn, 0.0f);
             float t_new, qv_new, qc_new, qi_new, qsat_u;
-            mp_sat_adj(t_li_new, pres_a[k], qn_new, e_tr, t_frz, t_ice, t_liq, eps_w, lv0, ls0, cp_d, t_new, qv_new, qc_new, qi_new, qsat_u);
+            mp_sat_adj(x_thl * exn_k, l_c[k], qn_new, e_tr, t_frz, t_ice, t_liq, eps_w, lv0, ls0, cp_d, t_new, qv_new, qc_new, qi_new, qsat_u);
             qn_out[idx]  = qn_new;
             qv_out[idx]  = qv_new;
             qc_out[idx]  = qc_new;
             qi_out[idx]  = qi_new;
-            thm_out[idx] = (t_new / exn_a[k]) * (1.0f + rv_ov_rd * qv_new);
+            thm_out[idx] = (t_new / exn_k) * (1.0f + rv_ov_rd * qv_new);
         }
     } else {
-        float th_new_a[64], qv_new_a[64], qc_new_a[64];
-        float qv_sync[64], qc_sync[64], qi_sync[64];
-        for (uint k = 0u; k < nz; ++k) {
-            float qn_p = max(qn_a[k], 0.0f);
-            float qc_p = max(qc_a[k], 0.0f);
-            float qi_p = max(qi_a[k], 0.0f);
-            float qci_p = qc_p + qi_p;
-            if (qci_p > qn_p) {
-                float sc = qn_p / max(qci_p, 1.0e-12f);
-                qc_p *= sc;
-                qi_p *= sc;
-            }
-            qc_sync[k] = qc_p;
-            qi_sync[k] = qi_p;
-            qv_sync[k] = max(qn_p - qc_p - qi_p, 0.0f);
-            diag_t[k] = 1.0f - dl_t[k] - du_t[k];
-            rhs_t[k] = th_a[k];
-        }
-        rhs_t[0] += dt * (shf_sfc / (cp_eff0 * exn_a[0])) / mass_c[0];
-        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, th_new_a);
-
-        for (uint k = 0u; k < nz; ++k) rhs_t[k] = qv_sync[k];
-        rhs_t[0] += dt * evap_sfc / mass_c[0];
-        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, qv_new_a);
-
-        for (uint k = 0u; k < nz; ++k) rhs_t[k] = qc_sync[k];
-        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, qc_new_a);
-
-        for (uint k = 0u; k < nz; ++k) rhs_t[k] = qi_sync[k];
-        mynn_thomas_solve(nz, dl_t, diag_t, du_t, rhs_t, sol_a);
-
+        float d_th = 0.0f, d_qv = 0.0f, d_qc = 0.0f, d_qi = 0.0f;
         for (uint k = 0u; k < nz; ++k) {
             uint idx = k * M + m;
-            float qv_new = max(qv_new_a[k], 0.0f);
-            float qc_new = max(qc_new_a[k], 0.0f);
-            float qi_new = max(sol_a[k], 0.0f);
+            float inv_mass = 1.0f / (rd_cur * dz_c[k * dz_cols + col_dz]);
+            float rd_nxt = 0.0f;
+            float zc_nxt = zc_cur;
+            float fc_up = 0.0f;
+            if (k < n_int) {
+                rd_nxt = rho_d[(k + 1u) * M + m];
+                zc_nxt = z_c[(k + 1u) * dz_cols + col_dz];
+                fc_up = dt * (0.5f * (rd_cur + rd_nxt)) * kh_a[k] / max(zc_nxt - zc_cur, 1.0f);
+            }
+            float dl_k = -fc_dn * inv_mass;
+            float du_k = -fc_up * inv_mass;
+            float diag_k = 1.0f - dl_k - du_k;
+            float inv_p = 1.0f / max((k == 0u) ? diag_k : (diag_k - dl_k * cp_prev), 1.0e-12f);
+            cp_prev = du_k * inv_p;
+            cp_a[k] = cp_prev;
+
+            float qv_raw = max(qv_in[idx], 0.0f);
+            float th_k = thm_in[idx] / (1.0f + rv_ov_rd * qv_raw);
+            float qn_k = max(qn_in[idx], 0.0f);
+            float qc_k = max(qc_in[idx], 0.0f);
+            float qi_k = max(qi_in[idx], 0.0f);
+            float qci_k = qc_k + qi_k;
+            if (qci_k > qn_k) {
+                float sc = qn_k / max(qci_k, 1.0e-12f);
+                qc_k *= sc;
+                qi_k *= sc;
+            }
+            float qv_k = max(qn_k - qc_k - qi_k, 0.0f);
+
+            float rhs_th = th_k + ((k == 0u) ? (shf_num * inv_mass) : 0.0f);
+            float rhs_qv = qv_k + ((k == 0u) ? (evap_num * inv_mass) : 0.0f);
+            d_th = ((k == 0u) ? rhs_th : (rhs_th - dl_k * d_th)) * inv_p;
+            d_qv = ((k == 0u) ? rhs_qv : (rhs_qv - dl_k * d_qv)) * inv_p;
+            d_qc = ((k == 0u) ? qc_k   : (qc_k   - dl_k * d_qc)) * inv_p;
+            d_qi = ((k == 0u) ? qi_k   : (qi_k   - dl_k * d_qi)) * inv_p;
+            dp0_a[k]  = d_th;
+            dp1_a[k]  = d_qv;
+            prod_c[k] = d_qc;
+            l_c[k]    = d_qi;
+
+            fc_dn = fc_up;
+            rd_cur = rd_nxt;
+            zc_cur = zc_nxt;
+        }
+        float x_th = 0.0f, x_qv = 0.0f, x_qc = 0.0f, x_qi = 0.0f;
+        for (int ki = int(n_int); ki >= 0; --ki) {
+            uint k = uint(ki);
+            uint idx = k * M + m;
+            if (k == n_int) {
+                x_th = dp0_a[k];
+                x_qv = dp1_a[k];
+                x_qc = prod_c[k];
+                x_qi = l_c[k];
+            } else {
+                float cpk = cp_a[k];
+                x_th = dp0_a[k]  - cpk * x_th;
+                x_qv = dp1_a[k]  - cpk * x_qv;
+                x_qc = prod_c[k] - cpk * x_qc;
+                x_qi = l_c[k]    - cpk * x_qi;
+            }
+            float qv_new = max(x_qv, 0.0f);
+            float qc_new = max(x_qc, 0.0f);
+            float qi_new = max(x_qi, 0.0f);
             qv_out[idx]  = qv_new;
             qc_out[idx]  = qc_new;
             qi_out[idx]  = qi_new;
             qn_out[idx]  = qv_new + qc_new + qi_new;
-            thm_out[idx] = th_new_a[k] * (1.0f + rv_ov_rd * qv_new);
+            thm_out[idx] = x_th * (1.0f + rv_ov_rd * qv_new);
         }
     }
 }

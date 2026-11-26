@@ -118,6 +118,17 @@ def diagnose_pressure_temperature(
         Pi = (p / p_0)^(R_d / c_pd)
         T = Pi * theta = Pi * theta_m / (1 + (R_v / R_d) * q_v)
     """
+    if (
+        rho_d.device.type in ("mps", "cuda")
+        and rho_d.dtype == torch.float32
+        and rho_d.shape == theta_m.shape == q_v.shape
+        and rho_d.numel() >= 4096
+        and not torch.is_grad_enabled()
+    ):
+        from aoba.kernels import can_use_elem_metal, dispatch_diagnose_p_T_metal
+
+        if can_use_elem_metal(rho_d):
+            return dispatch_diagnose_p_T_metal(rho_d, theta_m, q_v)
     arg = torch.clamp(C.R_D * rho_d * theta_m / C.P_REF, min=1.0e-8)
     exner = torch.pow(arg, C.R_D / C.CV_D)
     pres = C.P_REF * arg * exner

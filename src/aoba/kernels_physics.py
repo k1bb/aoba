@@ -2738,16 +2738,25 @@ kernel void ogcm_bt_vel_edge(
     device const int* c1            [[buffer(7)]],  // [ne]
     device float* u_out             [[buffer(8)]],  // [ne]
     device float* flux_out          [[buffer(9)]],  // [ne]
-    constant ulong& ne_u            [[buffer(10)]],
-    constant float4& f_dt           [[buffer(11)]],  // [rk_dt, 1 / (1 + rk_dt * r_bt_pert), 0, 0]
+    device float* u_acc             [[buffer(10)]], // [ne]
+    constant ulong4& u_dim          [[buffer(11)]], // [ne, accum_u, 0, 0]
+    constant float4& f_dt           [[buffer(12)]], // [rk_dt, 1 / (1 + rk_dt * r_bt_pert), 0, 0]
     uint e                          [[thread_position_in_grid]])
 {
-    if (e >= uint(ne_u)) return;
+    if (e >= uint(u_dim.x)) return;
     float m = ocn_e0f[e];
+    if (m < 0.5f) {
+        u_out[e] = 0.0f;
+        flux_out[e] = 0.0f;
+        return;
+    }
     float pgf = g_inv_dc[e] * (eta_bt[uint(c1[e])] - eta_bt[uint(c0[e])]);
-    float u_st = clamp(((u0_bt[e] + f_dt.x * (pgf + f_baro[e])) * f_dt.y) * m, -2.5f, 2.5f);
+    float u_st = clamp((u0_bt[e] + f_dt.x * (pgf + f_baro[e])) * f_dt.y, -2.5f, 2.5f);
     u_out[e] = u_st;
     flux_out[e] = h_col_e[e] * u_st;
+    if (u_dim.y != 0u) {
+        u_acc[e] += u_st;
+    }
 }
 
 kernel void ogcm_bt_eta_cell(
@@ -3829,13 +3838,14 @@ kernel void ogcm_baroclinic_f_fixed(
     device const int* c1            [[buffer(1)]],   // [ne]
     device const float* inv_dc      [[buffer(2)]],   // [ne]
     device const float* p_baroc     [[buffer(3)]],   // [nzo, nc]
-    device const float* lap_u       [[buffer(4)]],   // [nzo, ne]
-    device const float* tau_n_e     [[buffer(5)]],   // [ne]
-    device const float* h_e0_safe   [[buffer(6)]],   // [ne]
-    device const float* wet_ef      [[buffer(7)]],   // [nzo, ne]
-    device float* f_fixed           [[buffer(8)]],   // [nzo, ne]
-    constant ulong4& u_dim          [[buffer(9)]],   // [nzo, nc, ne, 0]
-    constant float4& f_p            [[buffer(10)]],  // [inv_rho_sw, a_h, 0, 0]
+    device const float* lap2_u      [[buffer(4)]],   // [nzo, ne]
+    device const float* lap4_u      [[buffer(5)]],   // [nzo, ne]
+    device const float* tau_n_e     [[buffer(6)]],   // [ne]
+    device const float* h_e0_safe   [[buffer(7)]],   // [ne]
+    device const float* wet_ef      [[buffer(8)]],   // [nzo, ne]
+    device float* f_fixed           [[buffer(9)]],   // [nzo, ne]
+    constant ulong4& u_dim          [[buffer(10)]],  // [nzo, nc, ne, 0]
+    constant float4& f_p            [[buffer(11)]],  // [inv_rho_sw, a_h, nu_4, 0]
     uint gid                        [[thread_position_in_grid]]
 ) {
     uint nzo = uint(u_dim.x);
@@ -3850,9 +3860,9 @@ kernel void ogcm_baroclinic_f_fixed(
     uint k = gid / ne;
     uint e = gid - k * ne;
     float inv_rho = f_p.x;
-    float a_h = f_p.y;
     float pgf = -inv_rho * (p_baroc[k * nc + uint(c1[e])] - p_baroc[k * nc + uint(c0[e])]) * inv_dc[e];
-    float ff = (pgf + a_h * lap_u[gid]) * w;
+    float visc = f_p.y * lap2_u[gid] - f_p.z * lap4_u[gid];
+    float ff = (pgf + visc) * w;
     if (k == 0u) {
         ff += (tau_n_e[e] * inv_rho / h_e0_safe[e]) * w;
     }
@@ -4634,11 +4644,14 @@ kernel void crm_student_tile_update_col(
     device float* crm_u             [[buffer(24)]],  // [nz, nc, n_sub] (in/out)
     device float* crm_v             [[buffer(25)]],  // [nz, nc, n_sub] (in/out)
     device float* rain_3d           [[buffer(26)]],  // [nc, n_sub] (out)
+    // Full-SIMD warp-packed variant (`group_size = 32`, `c_per_tg = 32 / n_sub`) for power-of-2 `n_sub <= 32`
+    // eliminates 75% idle SIMD lanes at `n_sub = 8` and replaces all 128 vertical barriers with `simd_shuffle_xor`!
     device float* snow_3d           [[buffer(27)]],  // [nc, n_sub] (out)
     constant ulong4& u_pack         [[buffer(28)]],  // [nz, nc, (ny<<16)|nx, (step_shift<<3)|(has_cp<<2)|(has_sp<<1)|has_sc]
     constant float4& f_p            [[buffer(29)]],  // [dt, cp_d, damp_anom, 0]
-    uint c                          [[threadgroup_position_in_grid]],
-    uint s                          [[thread_position_in_threadgroup]])
+    uint tg_id                      [[threadgroup_position_in_grid]],
+    uint lid                        [[thread_position_in_threadgroup]],
+    uint simd_lane                  [[thread_index_in_simdgroup]])
 {
     uint nz = uint(u_pack.x);
     uint nc = uint(u_pack.y);
@@ -4650,7 +4663,16 @@ kernel void crm_student_tile_update_col(
     uint has_sp = (flags >> 1u) & 1u;
     uint has_cp = (flags >> 2u) & 1u;
     uint step_shift = flags >> 3u;
-    if (c >= nc || s >= n_sub || n_sub <= 1u || n_sub > 64u) return;
+    if (n_sub <= 1u || n_sub > 64u) return;
+
+    bool use_simd_pack = (n_sub <= 32u) && ((32u % n_sub) == 0u);
+    uint c_per_tg = use_simd_pack ? (32u / n_sub) : 1u;
+    uint loc_c = use_simd_pack ? (lid / n_sub) : 0u;
+    uint s = use_simd_pack ? (lid - loc_c * n_sub) : lid;
+    uint c = tg_id * c_per_tg + loc_c;
+    if (!use_simd_pack && (c >= nc || s >= n_sub)) return;
+    bool active = (c < nc);
+    uint c_s = active ? c : 0u;
 
     threadgroup float sm_a[64];
     threadgroup float sm_b[64];
@@ -4660,84 +4682,123 @@ kernel void crm_student_tile_update_col(
 
     float fn_sub = float(n_sub);
     float inv_nsub = 1.0f / fn_sub;
-    uint shift = (c + step_shift) % n_sub;
-    uint base_c = c * n_sub;
+    uint shift = (c_s + step_shift) % n_sub;
+    uint base_c = c_s * n_sub;
     float rfb_s = float((s + shift) % n_sub);
     float tb_s = (1.0f - rfb_s * inv_nsub) * 1.0e-4f;
+    uint lane_base = simd_lane - s;
 
-    // Parallel cloud rank across all n_sub tiles in shared memory (O(n_sub) per thread)
+    // Parallel cloud rank across all n_sub tiles (warp-shuffle for pow2 <= 32, shared mem otherwise)
     float rank_cld_s = rfb_s;
     if (has_sc != 0u) {
         float ks = score_cld[base_c + s] + tb_s;
-        sm_a[s] = ks;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float r = 0.0f;
-        for (uint j = 0u; j < n_sub; ++j) {
-            float kj = sm_a[j];
-            if (kj > ks || (kj == ks && j < s)) r += 1.0f;
+        if (use_simd_pack) {
+            float r = 0.0f;
+            for (uint j = 0u; j < n_sub; ++j) {
+                float kj = simd_shuffle(ks, ushort(lane_base + j));
+                if (kj > ks || (kj == ks && j < s)) r += 1.0f;
+            }
+            rank_cld_s = r;
+        } else {
+            sm_a[s] = ks;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float r = 0.0f;
+            for (uint j = 0u; j < n_sub; ++j) {
+                float kj = sm_a[j];
+                if (kj > ks || (kj == ks && j < s)) r += 1.0f;
+            }
+            rank_cld_s = r;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        rank_cld_s = r;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // Parallel precipitation subcolumn multipliers -> rain_3d, snow_3d (coalesced)
-    float rain_c = stu_1d[c];
-    float snow_c = stu_1d[nc + c];
-    float f_p_eff = clamp(stu_1d[2u * nc + c], inv_nsub, 1.0f);
+    float rain_c = stu_1d[c_s];
+    float snow_c = stu_1d[nc + c_s];
+    float f_p_eff = clamp(stu_1d[2u * nc + c_s], inv_nsub, 1.0f);
     float fp_n = f_p_eff * fn_sub;
     float rank_prec_s = rank_cld_s;
     if (has_sp != 0u) {
         float ks = score_prec[base_c + s] + tb_s;
-        sm_a[s] = ks;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float rp = 0.0f;
-        for (uint j = 0u; j < n_sub; ++j) {
-            float kj = sm_a[j];
-            if (kj > ks || (kj == ks && j < s)) rp += 1.0f;
+        if (use_simd_pack) {
+            float rp = 0.0f;
+            for (uint j = 0u; j < n_sub; ++j) {
+                float kj = simd_shuffle(ks, ushort(lane_base + j));
+                if (kj > ks || (kj == ks && j < s)) rp += 1.0f;
+            }
+            rank_prec_s = rp;
+        } else {
+            sm_a[s] = ks;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float rp = 0.0f;
+            for (uint j = 0u; j < n_sub; ++j) {
+                float kj = sm_a[j];
+                if (kj > ks || (kj == ks && j < s)) rp += 1.0f;
+            }
+            rank_prec_s = rp;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        rank_prec_s = rp;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float wp_s = clamp(fp_n - rank_prec_s, 0.0f, 1.0f);
-    sm_a[s] = wp_s;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (s == 0u) {
-        float sw = 0.0f;
-        for (uint j = 0u; j < n_sub; ++j) sw += sm_a[j];
-        sm_red[0] = 1.0f / max(sw * inv_nsub, 1.0e-6f);
+    float inv_wp_mean;
+    if (use_simd_pack) {
+        float sw = wp_s;
+        for (uint off = 1u; off < n_sub; off <<= 1u) sw += simd_shuffle_xor(sw, ushort(off));
+        inv_wp_mean = 1.0f / max(sw * inv_nsub, 1.0e-6f);
+    } else {
+        sm_a[s] = wp_s;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s == 0u) {
+            float sw = 0.0f;
+            for (uint j = 0u; j < n_sub; ++j) sw += sm_a[j];
+            sm_red[0] = 1.0f / max(sw * inv_nsub, 1.0e-6f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        inv_wp_mean = sm_red[0];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float m_p_s = wp_s * sm_red[0];
-    rain_3d[base_c + s] = rain_c * m_p_s;
-    snow_3d[base_c + s] = snow_c * m_p_s;
+    float m_p_s = wp_s * inv_wp_mean;
+    if (active) {
+        rain_3d[base_c + s] = rain_c * m_p_s;
+        snow_3d[base_c + s] = snow_c * m_p_s;
+    }
 
-    // Surface microclimate + cold-pool (k == 0) precomputation in shared memory
+    // Surface microclimate + cold-pool (k == 0) precomputation
     float dt = f_p.x;
     float cp_d = f_p.y;
     float damp = f_p.z;
-    float dm_0 = max(stu_1d[3u * nc + c] * stu_1d[4u * nc + c], 1.0f);
-    float ex_0 = max(stu_1d[5u * nc + c], 0.1f);
+    float dm_0 = max(stu_1d[3u * nc + c_s] * stu_1d[4u * nc + c_s], 1.0f);
+    float ex_0 = max(stu_1d[5u * nc + c_s], 0.1f);
     float inv_cp_dm_ex = dt / (cp_d * dm_0 * ex_0);
     float inv_dm = dt / dm_0;
 
     float shf_s = shf_tile[base_c + s];
     float evap_s = evap_tile[base_c + s];
-    sm_a[s] = shf_s;
-    sm_b[s] = evap_s;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (s == 0u) {
-        float s_shf = 0.0f;
-        float s_evap = 0.0f;
-        for (uint j = 0u; j < n_sub; ++j) {
-            s_shf += sm_a[j];
-            s_evap += sm_b[j];
+    float shf_mean, evap_mean;
+    if (use_simd_pack) {
+        float s_shf = shf_s, s_evap = evap_s;
+        for (uint off = 1u; off < n_sub; off <<= 1u) {
+            s_shf  += simd_shuffle_xor(s_shf, ushort(off));
+            s_evap += simd_shuffle_xor(s_evap, ushort(off));
         }
-        sm_red[0] = s_shf * inv_nsub;
-        sm_red[1] = s_evap * inv_nsub;
+        shf_mean = s_shf * inv_nsub;
+        evap_mean = s_evap * inv_nsub;
+    } else {
+        sm_a[s] = shf_s;
+        sm_b[s] = evap_s;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s == 0u) {
+            float s_shf = 0.0f, s_evap = 0.0f;
+            for (uint j = 0u; j < n_sub; ++j) {
+                s_shf += sm_a[j];
+                s_evap += sm_b[j];
+            }
+            sm_red[0] = s_shf * inv_nsub;
+            sm_red[1] = s_evap * inv_nsub;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        shf_mean = sm_red[0];
+        evap_mean = sm_red[1];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float shf_mean = sm_red[0];
-    float evap_mean = sm_red[1];
 
     float dt_v_s;
     float dq_v_s;
@@ -4750,56 +4811,95 @@ kernel void crm_student_tile_update_col(
         dt_v_s = clamp((shf_s - shf_mean) * inv_cp_dm_ex, -3.0f, 3.0f);
         dq_v_s = clamp((evap_s - evap_mean) * inv_dm, -2.0e-3f, 2.0e-3f);
     }
-    sm_a[s] = dt_v_s;
-    sm_b[s] = dq_v_s;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (s == 0u) {
-        float s_dt = 0.0f;
-        float s_dq = 0.0f;
-        for (uint j = 0u; j < n_sub; ++j) {
-            s_dt += sm_a[j];
-            s_dq += sm_b[j];
+    float dt_v_mean, dq_v_mean;
+    if (use_simd_pack) {
+        float s_dt = dt_v_s, s_dq = dq_v_s;
+        for (uint off = 1u; off < n_sub; off <<= 1u) {
+            s_dt += simd_shuffle_xor(s_dt, ushort(off));
+            s_dq += simd_shuffle_xor(s_dq, ushort(off));
         }
-        sm_red[0] = s_dt * inv_nsub;
-        sm_red[1] = s_dq * inv_nsub;
+        dt_v_mean = s_dt * inv_nsub;
+        dq_v_mean = s_dq * inv_nsub;
+    } else {
+        sm_a[s] = dt_v_s;
+        sm_b[s] = dq_v_s;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s == 0u) {
+            float s_dt = 0.0f, s_dq = 0.0f;
+            for (uint j = 0u; j < n_sub; ++j) {
+                s_dt += sm_a[j];
+                s_dq += sm_b[j];
+            }
+            sm_red[0] = s_dt * inv_nsub;
+            sm_red[1] = s_dq * inv_nsub;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dt_v_mean = sm_red[0];
+        dq_v_mean = sm_red[1];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float dthm_anom_s = dt_v_s - sm_red[0];
-    float dqv_anom_s = dq_v_s - sm_red[1];
+    float dthm_anom_s = dt_v_s - dt_v_mean;
+    float dqv_anom_s = dq_v_s - dq_v_mean;
 
-    float qv_0_c = stu_qv[c];
+    float qv_0_c = stu_qv[c_s];
     float qv_cand_s = max(qv_0_c + dqv_anom_s, 0.0f);
-    sm_a[s] = qv_cand_s;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (s == 0u) {
-        float s_qvc = 0.0f;
-        for (uint j = 0u; j < n_sub; ++j) s_qvc += sm_a[j];
+    float qv_scale_0;
+    if (use_simd_pack) {
+        float s_qvc = qv_cand_s;
+        for (uint off = 1u; off < n_sub; off <<= 1u) s_qvc += simd_shuffle_xor(s_qvc, ushort(off));
         float qcm = s_qvc * inv_nsub;
-        sm_red[0] = (qcm > 1.0e-10f) ? (qv_0_c / max(qcm, 1.0e-10f)) : -1.0f;
+        qv_scale_0 = (qcm > 1.0e-10f) ? (qv_0_c / max(qcm, 1.0e-10f)) : -1.0f;
+    } else {
+        sm_a[s] = qv_cand_s;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s == 0u) {
+            float s_qvc = 0.0f;
+            for (uint j = 0u; j < n_sub; ++j) s_qvc += sm_a[j];
+            float qcm = s_qvc * inv_nsub;
+            sm_red[0] = (qcm > 1.0e-10f) ? (qv_0_c / max(qcm, 1.0e-10f)) : -1.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        qv_scale_0 = sm_red[0];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float qv_scale_0 = sm_red[0];
     float qv_0_mc_s = (qv_scale_0 >= 0.0f) ? (qv_cand_s * qv_scale_0) : qv_0_c;
 
-    // Cold-pool radial density-current outflow at k == 0 (single shared-mem neighbor stencil)
+    // Cold-pool radial density-current outflow at k == 0
     float u_cp_anom_s = 0.0f;
     float v_cp_anom_s = 0.0f;
     if (has_cp != 0u) {
-        sm_d[s] = dthm_cp_s;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         uint iy = s / nx_t;
         uint ix = s - iy * nx_t;
         float gx = 0.0f;
         float gy = 0.0f;
-        if (nx_t > 1u) {
-            uint ixp = (ix + 1u < nx_t) ? (ix + 1u) : 0u;
-            uint ixm = (ix > 0u) ? (ix - 1u) : (nx_t - 1u);
-            gx = 0.5f * (sm_d[iy * nx_t + ixp] - sm_d[iy * nx_t + ixm]);
-        }
-        if (ny_t > 1u) {
-            uint iyp = (iy + 1u < ny_t) ? (iy + 1u) : 0u;
-            uint iym = (iy > 0u) ? (iy - 1u) : (ny_t - 1u);
-            gy = 0.5f * (sm_d[iyp * nx_t + ix] - sm_d[iym * nx_t + ix]);
+        if (use_simd_pack) {
+            if (nx_t > 1u) {
+                uint ixp = (ix + 1u < nx_t) ? (ix + 1u) : 0u;
+                uint ixm = (ix > 0u) ? (ix - 1u) : (nx_t - 1u);
+                gx = 0.5f * (
+                    simd_shuffle(dthm_cp_s, ushort(lane_base + iy * nx_t + ixp))
+                    - simd_shuffle(dthm_cp_s, ushort(lane_base + iy * nx_t + ixm))
+                );
+            }
+            if (ny_t > 1u) {
+                uint iyp = (iy + 1u < ny_t) ? (iy + 1u) : 0u;
+                uint iym = (iy > 0u) ? (iy - 1u) : (ny_t - 1u);
+                gy = 0.5f * (
+                    simd_shuffle(dthm_cp_s, ushort(lane_base + iyp * nx_t + ix))
+                    - simd_shuffle(dthm_cp_s, ushort(lane_base + iym * nx_t + ix))
+                );
+            }
+        } else {
+            sm_d[s] = dthm_cp_s;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (nx_t > 1u) {
+                uint ixp = (ix + 1u < nx_t) ? (ix + 1u) : 0u;
+                uint ixm = (ix > 0u) ? (ix - 1u) : (nx_t - 1u);
+                gx = 0.5f * (sm_d[iy * nx_t + ixp] - sm_d[iy * nx_t + ixm]);
+            }
+            if (ny_t > 1u) {
+                uint iyp = (iy + 1u < ny_t) ? (iy + 1u) : 0u;
+                uint iym = (iy > 0u) ? (iy - 1u) : (ny_t - 1u);
+                gy = 0.5f * (sm_d[iyp * nx_t + ix] - sm_d[iym * nx_t + ix]);
+            }
         }
         float gn = sqrt(gx * gx + gy * gy);
         float ang = (6.28318530718f * inv_nsub) * float(s + shift);
@@ -4808,41 +4908,62 @@ kernel void crm_student_tile_update_col(
         float ug = u_gust[base_c + s];
         float ur_s = ug * ex;
         float vr_s = ug * ey;
-        sm_a[s] = ur_s;
-        sm_b[s] = vr_s;
-        sm_c[s] = ug * ug;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (s == 0u) {
-            float s_ur = 0.0f, s_vr = 0.0f, s_ug2 = 0.0f;
-            for (uint j = 0u; j < n_sub; ++j) {
-                s_ur += sm_a[j];
-                s_vr += sm_b[j];
-                s_ug2 += sm_c[j];
+        float ur_mean, vr_mean, eke_tgt, eke_scale;
+        if (use_simd_pack) {
+            float s_ur = ur_s, s_vr = vr_s, s_ug2 = ug * ug;
+            for (uint off = 1u; off < n_sub; off <<= 1u) {
+                s_ur  += simd_shuffle_xor(s_ur, ushort(off));
+                s_vr  += simd_shuffle_xor(s_vr, ushort(off));
+                s_ug2 += simd_shuffle_xor(s_ug2, ushort(off));
             }
-            sm_red[0] = s_ur * inv_nsub;
-            sm_red[1] = s_vr * inv_nsub;
-            sm_red[2] = s_ug2 * inv_nsub;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float up_s = ur_s - sm_red[0];
-        float vp_s = vr_s - sm_red[1];
-        float eke_tgt = sm_red[2];
-        sm_a[s] = up_s * up_s + vp_s * vp_s;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (s == 0u) {
-            float s_eke = 0.0f;
-            for (uint j = 0u; j < n_sub; ++j) s_eke += sm_a[j];
+            ur_mean = s_ur * inv_nsub;
+            vr_mean = s_vr * inv_nsub;
+            eke_tgt = s_ug2 * inv_nsub;
+            float up_s = ur_s - ur_mean;
+            float vp_s = vr_s - vr_mean;
+            float s_eke = up_s * up_s + vp_s * vp_s;
+            for (uint off = 1u; off < n_sub; off <<= 1u) s_eke += simd_shuffle_xor(s_eke, ushort(off));
             float eke_cur = s_eke * inv_nsub;
-            sm_red[3] = (eke_cur > 1.0e-8f) ? min(sqrt(eke_tgt / max(eke_cur, 1.0e-8f)), 2.0f) : 0.0f;
+            eke_scale = (eke_cur > 1.0e-8f) ? min(sqrt(eke_tgt / max(eke_cur, 1.0e-8f)), 2.0f) : 0.0f;
+            u_cp_anom_s = up_s * eke_scale;
+            v_cp_anom_s = vp_s * eke_scale;
+        } else {
+            sm_a[s] = ur_s;
+            sm_b[s] = vr_s;
+            sm_c[s] = ug * ug;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (s == 0u) {
+                float s_ur = 0.0f, s_vr = 0.0f, s_ug2 = 0.0f;
+                for (uint j = 0u; j < n_sub; ++j) {
+                    s_ur += sm_a[j];
+                    s_vr += sm_b[j];
+                    s_ug2 += sm_c[j];
+                }
+                sm_red[0] = s_ur * inv_nsub;
+                sm_red[1] = s_vr * inv_nsub;
+                sm_red[2] = s_ug2 * inv_nsub;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float up_s = ur_s - sm_red[0];
+            float vp_s = vr_s - sm_red[1];
+            float eke_tgt_l = sm_red[2];
+            sm_a[s] = up_s * up_s + vp_s * vp_s;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (s == 0u) {
+                float s_eke = 0.0f;
+                for (uint j = 0u; j < n_sub; ++j) s_eke += sm_a[j];
+                float eke_cur = s_eke * inv_nsub;
+                sm_red[3] = (eke_cur > 1.0e-8f) ? min(sqrt(eke_tgt_l / max(eke_cur, 1.0e-8f)), 2.0f) : 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            u_cp_anom_s = up_s * sm_red[3];
+            v_cp_anom_s = vp_s * sm_red[3];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        u_cp_anom_s = up_s * sm_red[3];
-        v_cp_anom_s = vp_s * sm_red[3];
     }
 
-    // Vertical column update (k = 0..nz-1): 100% coalesced across tile index s
+    // Vertical column update (k = 0..nz-1): 100% coalesced + ZERO barriers for pow2 n_sub <= 32!
     for (uint k = 0u; k < nz; ++k) {
-        uint kc = k * nc + c;
+        uint kc = k * nc + c_s;
         uint idx = kc * n_sub + s;
         float rho_c = atmos_rho[kc];
         float thm_c = stu_thm[kc];
@@ -4859,34 +4980,53 @@ kernel void crm_student_tile_update_col(
         float u_old   = crm_u[idx];
         float v_old   = crm_v[idx];
         float wc_s    = clamp(fc_n - rank_cld_s, 0.0f, 1.0f);
-        sm_a[s] = thm_old;
-        sm_b[s] = u_old;
-        sm_c[s] = v_old;
-        sm_d[s] = wc_s;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (s == 0u) {
-            float s_thm = 0.0f, s_u = 0.0f, s_v = 0.0f, s_wc = 0.0f;
-            for (uint j = 0u; j < n_sub; ++j) {
-                s_thm += sm_a[j];
-                s_u   += sm_b[j];
-                s_v   += sm_c[j];
-                s_wc  += sm_d[j];
+        float m_thm, m_u, m_v, inv_wc;
+        if (use_simd_pack) {
+            float s_thm = thm_old, s_u = u_old, s_v = v_old, s_wc = wc_s;
+            for (uint off = 1u; off < n_sub; off <<= 1u) {
+                s_thm += simd_shuffle_xor(s_thm, ushort(off));
+                s_u   += simd_shuffle_xor(s_u, ushort(off));
+                s_v   += simd_shuffle_xor(s_v, ushort(off));
+                s_wc  += simd_shuffle_xor(s_wc, ushort(off));
             }
-            sm_red[0] = s_thm * inv_nsub;
-            sm_red[1] = s_u * inv_nsub;
-            sm_red[2] = s_v * inv_nsub;
-            sm_red[3] = 1.0f / max(s_wc * inv_nsub, 1.0e-6f);
+            m_thm = s_thm * inv_nsub;
+            m_u   = s_u * inv_nsub;
+            m_v   = s_v * inv_nsub;
+            inv_wc = 1.0f / max(s_wc * inv_nsub, 1.0e-6f);
+        } else {
+            sm_a[s] = thm_old;
+            sm_b[s] = u_old;
+            sm_c[s] = v_old;
+            sm_d[s] = wc_s;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (s == 0u) {
+                float s_thm = 0.0f, s_u = 0.0f, s_v = 0.0f, s_wc = 0.0f;
+                for (uint j = 0u; j < n_sub; ++j) {
+                    s_thm += sm_a[j];
+                    s_u   += sm_b[j];
+                    s_v   += sm_c[j];
+                    s_wc  += sm_d[j];
+                }
+                sm_red[0] = s_thm * inv_nsub;
+                sm_red[1] = s_u * inv_nsub;
+                sm_red[2] = s_v * inv_nsub;
+                sm_red[3] = 1.0f / max(s_wc * inv_nsub, 1.0e-6f);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            m_thm = sm_red[0];
+            m_u   = sm_red[1];
+            m_v   = sm_red[2];
+            inv_wc = sm_red[3];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float m_c = wc_s * sm_red[3];
+        float m_c = wc_s * inv_wc;
         float qc_s = qc_c * m_c;
         float qi_s = qi_c * m_c;
         float qp_s = qp_c * m_c;
-        float thm_s = thm_c + damp * (thm_old - sm_red[0]);
+        float thm_s = thm_c + damp * (thm_old - m_thm);
         float qv_s = qv_c;
-        float u_s = u_c + damp * (u_old - sm_red[1]);
-        float v_s = v_c + damp * (v_old - sm_red[2]);
+        float u_s = u_c + damp * (u_old - m_u);
+        float v_s = v_c + damp * (v_old - m_v);
         if (k == 0u) {
             thm_s = thm_c + dthm_anom_s;
             qv_s = qv_0_mc_s;
@@ -4895,15 +5035,17 @@ kernel void crm_student_tile_update_col(
                 v_s = v_c + v_cp_anom_s;
             }
         }
-        crm_rho[idx] = rho_c;
-        crm_thm[idx] = thm_s;
-        crm_qv[idx]  = qv_s;
-        crm_qc[idx]  = qc_s;
-        crm_qi[idx]  = qi_s;
-        crm_qp[idx]  = qp_s;
-        crm_qn[idx]  = qv_s + qc_s + qi_s;
-        crm_u[idx]   = u_s;
-        crm_v[idx]   = v_s;
+        if (active) {
+            crm_rho[idx] = rho_c;
+            crm_thm[idx] = thm_s;
+            crm_qv[idx]  = qv_s;
+            crm_qc[idx]  = qc_s;
+            crm_qi[idx]  = qi_s;
+            crm_qp[idx]  = qp_s;
+            crm_qn[idx]  = qv_s + qc_s + qi_s;
+            crm_u[idx]   = u_s;
+            crm_v[idx]   = v_s;
+        }
     }
 }
 
@@ -6269,6 +6411,183 @@ kernel void rad_distill_closure_col(
         q_rad_out[k * M + c] += corr;
     }
 }
+
+// =========================================================================
+// 26. Fused Thermodynamics (p, Pi, T) + OGCM Wet-Skip Coalesced Mesh Ops
+// =========================================================================
+
+kernel void elem_diagnose_p_T(
+    device const float* rho_d       [[buffer(0)]],
+    device const float* theta_m     [[buffer(1)]],
+    device const float* q_v         [[buffer(2)]],
+    device float* pres_out          [[buffer(3)]],
+    device float* exner_out         [[buffer(4)]],
+    device float* temp_out          [[buffer(5)]],
+    constant ulong& n_tot           [[buffer(6)]],
+    constant float4& f_p            [[buffer(7)]],   // [r_d/p_ref, r_d/cv_d, p_ref, rv_over_rd]
+    uint gid                        [[thread_position_in_grid]])
+{
+    if (gid >= uint(n_tot)) return;
+    float thm = theta_m[gid];
+    float arg = max(f_p.x * rho_d[gid] * thm, 1.0e-8f);
+    float exn = exp2(f_p.y * log2(arg));
+    pres_out[gid] = f_p.z * arg * exn;
+    exner_out[gid] = exn;
+    temp_out[gid] = exn * (thm / (1.0f + f_p.w * max(q_v[gid], 0.0f)));
+}
+
+kernel void ogcm_div_cell_wet(
+    device const int* eoc           [[buffer(0)]],   // [nc, 6]
+    device const float* div_w       [[buffer(1)]],   // [nc, 6]
+    device const float* flux_e      [[buffer(2)]],   // [nzo, ne]
+    device const float* wet_cf      [[buffer(3)]],   // [nzo, nc]
+    device float* div_out           [[buffer(4)]],   // [nzo, nc]
+    constant ulong4& u_dim          [[buffer(5)]],   // [nzo, nc, ne, 0]
+    uint gid                        [[thread_position_in_grid]])
+{
+    uint nzo = uint(u_dim.x);
+    uint nc = uint(u_dim.y);
+    uint ne = uint(u_dim.z);
+    if (gid >= nzo * nc) return;
+    float wc = wet_cf[gid];
+    if (wc < 0.5f) {
+        div_out[gid] = 0.0f;
+        return;
+    }
+    uint k = gid / nc;
+    uint c = gid - k * nc;
+    uint c6 = c * 6u;
+    uint eb = k * ne;
+    float acc = 0.0f;
+    for (uint s = 0u; s < 6u; ++s) {
+        float w = div_w[c6 + s];
+        if (w != 0.0f) {
+            acc = fma(w, flux_e[eb + uint(eoc[c6 + s])], acc);
+        }
+    }
+    div_out[gid] = acc;
+}
+
+kernel void ogcm_vorticity_vert_wet(
+    device const int* eov           [[buffer(0)]],   // [nv, 3]
+    device const float* vort_w      [[buffer(1)]],   // [nv, 3]
+    device const float* u_e         [[buffer(2)]],   // [nzo, ne]
+    device const float* wet_vf      [[buffer(3)]],   // [nzo, nv]
+    device float* zeta_out          [[buffer(4)]],   // [nzo, nv]
+    constant ulong4& u_dim          [[buffer(5)]],   // [nzo, nv, ne, 0]
+    uint gid                        [[thread_position_in_grid]])
+{
+    uint nzo = uint(u_dim.x);
+    uint nv = uint(u_dim.y);
+    uint ne = uint(u_dim.z);
+    if (gid >= nzo * nv) return;
+    if (wet_vf[gid] < 0.5f) {
+        zeta_out[gid] = 0.0f;
+        return;
+    }
+    uint k = gid / nv;
+    uint v = gid - k * nv;
+    uint v3 = v * 3u;
+    uint eb = k * ne;
+    float acc = vort_w[v3] * u_e[eb + uint(eov[v3])];
+    acc = fma(vort_w[v3 + 1u], u_e[eb + uint(eov[v3 + 1u])], acc);
+    acc = fma(vort_w[v3 + 2u], u_e[eb + uint(eov[v3 + 2u])], acc);
+    zeta_out[gid] = acc;
+}
+
+kernel void ogcm_vec_lap_edge_wet(
+    device const int* c0            [[buffer(0)]],   // [ne]
+    device const int* c1            [[buffer(1)]],   // [ne]
+    device const int* v0            [[buffer(2)]],   // [ne]
+    device const int* v1            [[buffer(3)]],   // [ne]
+    device const float* inv_dc      [[buffer(4)]],   // [ne]
+    device const float* inv_dv      [[buffer(5)]],   // [ne]
+    device const float* div_c       [[buffer(6)]],   // [nzo, nc]
+    device const float* zeta_v      [[buffer(7)]],   // [nzo, nv]
+    device const float* wet_ef      [[buffer(8)]],   // [nzo, ne]
+    device float* lap_out           [[buffer(9)]],   // [nzo, ne]
+    constant ulong4& u_dim          [[buffer(10)]],  // [nzo, nc, nv, ne]
+    uint gid                        [[thread_position_in_grid]])
+{
+    uint nzo = uint(u_dim.x);
+    uint nc = uint(u_dim.y);
+    uint nv = uint(u_dim.z);
+    uint ne = uint(u_dim.w);
+    if (gid >= nzo * ne) return;
+    if (wet_ef[gid] < 0.5f) {
+        lap_out[gid] = 0.0f;
+        return;
+    }
+    uint k = gid / ne;
+    uint e = gid - k * ne;
+    uint cb = k * nc;
+    uint vb = k * nv;
+    float gd = (div_c[cb + uint(c1[e])] - div_c[cb + uint(c0[e])]) * inv_dc[e];
+    float cz = (zeta_v[vb + uint(v1[e])] - zeta_v[vb + uint(v0[e])]) * inv_dv[e];
+    lap_out[gid] = gd - cz;
+}
+
+kernel void ogcm_eta_edge_wet(
+    device const int* v0            [[buffer(0)]],   // [ne]
+    device const int* v1            [[buffer(1)]],   // [ne]
+    device const float* zeta_v      [[buffer(2)]],   // [nzo, nv]
+    device const float* f_vert      [[buffer(3)]],   // [nv]
+    device const float* wet_ef      [[buffer(4)]],   // [nzo, ne]
+    device float* eta_e             [[buffer(5)]],   // [nzo, ne]
+    constant ulong4& u_dim          [[buffer(6)]],   // [nzo, nv, ne, 0]
+    uint gid                        [[thread_position_in_grid]])
+{
+    uint nzo = uint(u_dim.x);
+    uint nv = uint(u_dim.y);
+    uint ne = uint(u_dim.z);
+    if (gid >= nzo * ne) return;
+    if (wet_ef[gid] < 0.5f) {
+        eta_e[gid] = 0.0f;
+        return;
+    }
+    uint k = gid / ne;
+    uint e = gid - k * ne;
+    uint i0 = uint(v0[e]);
+    uint i1 = uint(v1[e]);
+    uint vb = k * nv;
+    eta_e[gid] = 0.5f * ((zeta_v[vb + i0] + f_vert[i0]) + (zeta_v[vb + i1] + f_vert[i1]));
+}
+
+kernel void ogcm_trisk_rot_edge_wet(
+    device const int* ep            [[buffer(0)]],   // [ne, 10]
+    device const float* w_trisk     [[buffer(1)]],   // [ne, 10]
+    device const float* eta_e       [[buffer(2)]],   // [nzo, ne]
+    device const float* u_e         [[buffer(3)]],   // [nzo, ne]
+    device const float* wet_ef      [[buffer(4)]],   // [nzo, ne]
+    device float* rot_out           [[buffer(5)]],   // [nzo, ne]
+    constant ulong4& u_dim          [[buffer(6)]],   // [nzo, nv, ne, 0]
+    uint gid                        [[thread_position_in_grid]])
+{
+    uint nzo = uint(u_dim.x);
+    uint ne = uint(u_dim.z);
+    if (gid >= nzo * ne) return;
+    if (wet_ef[gid] < 0.5f) {
+        rot_out[gid] = 0.0f;
+        return;
+    }
+    uint k = gid / ne;
+    uint e = gid - k * ne;
+    uint e10 = e * 10u;
+    uint eb = k * ne;
+    float ee = eta_e[gid];
+    float acc = 0.0f;
+    for (uint s = 0u; s < 10u; ++s) {
+        float w = w_trisk[e10 + s];
+        if (w != 0.0f) {
+            uint ei = eb + uint(ep[e10 + s]);
+            float ue = u_e[ei];
+            if (ue != 0.0f) {
+                acc = fma(w * (0.5f * (ee + eta_e[ei])), ue, acc);
+            }
+        }
+    }
+    rot_out[gid] = acc;
+}
 """
 
 
@@ -7099,11 +7418,10 @@ def run_ogcm_barotropic_rk3_metal(
             torch.empty(nc, dtype=eta_init.dtype, device=dev),
         )
         _BT_WS_CACHE[key] = ws
-    u_bt, u_st, flux_bt, eta_bt, eta_st = ws
-
-    u_bt.copy_(u_bt_init)
-    eta_bt.copy_(eta_init)
-    u_bt_acc = torch.zeros_like(u_bt)
+    u_bt_a, u_bt_b, flux_bt, eta_a, eta_b = ws
+    u_bt_a.copy_(u_bt_init)
+    eta_a.copy_(eta_init)
+    u_bt_acc = torch.zeros_like(u_bt_a)
 
     f_b = f_baro.contiguous()
     g_i = g_inv_dc.contiguous()
@@ -7112,6 +7430,8 @@ def run_ogcm_barotropic_rk3_metal(
     io = is_ocn_f.contiguous()
     dw = div_w.contiguous()
     u_cell_dim = [nc, max_eoc, 0, 0]
+    u_vel_noacc = [ne, 0, 0, 0]
+    u_vel_acc = [ne, 1, 0, 0]
 
     dt_total = max(float(n_bt) * float(dt_bt), 1.0)
     r_bt_pert = 1.0 / dt_total
@@ -7122,21 +7442,22 @@ def run_ogcm_barotropic_rk3_metal(
     p_dt2 = [dt2, 1.0 / (1.0 + dt2 * r_bt_pert), 0.0, 0.0]
     p_dt3 = [dt3, 1.0 / (1.0 + dt3 * r_bt_pert), 0.0, 0.0]
 
+    u_cur, u_nxt = u_bt_a, u_bt_b
+    eta_cur, eta_nxt = eta_a, eta_b
     for _ in range(n_bt):
-        # Stage 1: (u_bt, eta_bt) -> (u_st, eta_st)
-        lib.ogcm_bt_vel_edge(u_bt, eta_bt, f_b, g_i, hc_e, oe, c0_i32, c1_i32, u_st, flux_bt, ne, p_dt1, threads=ne)
-        lib.ogcm_bt_eta_cell(eta_bt, flux_bt, io, eoc_i32, dw, eta_st, u_cell_dim, dt1, threads=nc)
-        # Stage 2: (u_bt, eta_st) -> (u_st, eta_st)
-        lib.ogcm_bt_vel_edge(u_bt, eta_st, f_b, g_i, hc_e, oe, c0_i32, c1_i32, u_st, flux_bt, ne, p_dt2, threads=ne)
-        lib.ogcm_bt_eta_cell(eta_bt, flux_bt, io, eoc_i32, dw, eta_st, u_cell_dim, dt2, threads=nc)
-        # Stage 3: (u_bt, eta_st) -> (u_st, eta_st), then commit to (u_bt, eta_bt)
-        lib.ogcm_bt_vel_edge(u_bt, eta_st, f_b, g_i, hc_e, oe, c0_i32, c1_i32, u_st, flux_bt, ne, p_dt3, threads=ne)
-        lib.ogcm_bt_eta_cell(eta_bt, flux_bt, io, eoc_i32, dw, eta_st, u_cell_dim, dt3, threads=nc)
-        u_bt.copy_(u_st)
-        eta_bt.copy_(eta_st)
-        u_bt_acc.add_(u_bt)
+        # Stage 1: (u_cur, eta_cur) -> (u_nxt, eta_nxt)
+        lib.ogcm_bt_vel_edge(u_cur, eta_cur, f_b, g_i, hc_e, oe, c0_i32, c1_i32, u_nxt, flux_bt, u_bt_acc, u_vel_noacc, p_dt1, threads=ne)
+        lib.ogcm_bt_eta_cell(eta_cur, flux_bt, io, eoc_i32, dw, eta_nxt, u_cell_dim, dt1, threads=nc)
+        # Stage 2: (u_cur, eta_nxt) -> (u_nxt, eta_nxt)
+        lib.ogcm_bt_vel_edge(u_cur, eta_nxt, f_b, g_i, hc_e, oe, c0_i32, c1_i32, u_nxt, flux_bt, u_bt_acc, u_vel_noacc, p_dt2, threads=ne)
+        lib.ogcm_bt_eta_cell(eta_cur, flux_bt, io, eoc_i32, dw, eta_nxt, u_cell_dim, dt2, threads=nc)
+        # Stage 3: (u_cur, eta_nxt) -> (u_nxt, eta_nxt) + fused u_bt_acc += u_nxt, then ping-pong (zero copy_!)
+        lib.ogcm_bt_vel_edge(u_cur, eta_nxt, f_b, g_i, hc_e, oe, c0_i32, c1_i32, u_nxt, flux_bt, u_bt_acc, u_vel_acc, p_dt3, threads=ne)
+        lib.ogcm_bt_eta_cell(eta_cur, flux_bt, io, eoc_i32, dw, eta_nxt, u_cell_dim, dt3, threads=nc)
+        u_cur, u_nxt = u_nxt, u_cur
+        eta_cur, eta_nxt = eta_nxt, eta_cur
 
-    return u_bt.clone(), u_bt_acc * (1.0 / float(n_bt))
+    return u_cur.clone(), u_bt_acc * (1.0 / float(n_bt))
 
 
 _OGCM_FCT_WS_CACHE: dict[tuple, tuple[torch.Tensor, ...]] = {}
@@ -7431,22 +7752,25 @@ def run_ogcm_baroclinic_f_fixed_metal(
     lib: Any,
     mc: dict[str, Any],
     p_baroc: torch.Tensor,
-    lap_u: torch.Tensor,
+    lap2_u: torch.Tensor,
+    lap4_u: torch.Tensor,
     tau_n_e: torch.Tensor,
     h_e0_safe: torch.Tensor,
     wet_ef: torch.Tensor,
     a_h: float,
+    nu_4: float = 0.0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    nzo, ne = lap_u.shape
+    nzo, ne = lap2_u.shape
     nc = int(p_baroc.shape[1])
-    f_fixed = torch.empty_like(lap_u)
+    f_fixed = out if out is not None else torch.empty_like(lap2_u)
     lib.ogcm_baroclinic_f_fixed(
         mc["c0"], mc["c1"], mc["inv_dc"],
-        p_baroc.contiguous(), lap_u.contiguous(),
+        p_baroc.contiguous(), lap2_u.contiguous(), lap4_u.contiguous(),
         tau_n_e.contiguous(), h_e0_safe.contiguous(), wet_ef.contiguous(),
         f_fixed,
         [nzo, nc, ne, 0],
-        [float(1.0 / C.RHO_SEAWATER), float(a_h), 0.0, 0.0],
+        [float(1.0 / C.RHO_SEAWATER), float(a_h), float(nu_4), 0.0],
         threads=nzo * ne,
     )
     return f_fixed
@@ -7462,8 +7786,9 @@ def run_ogcm_baroclinic_rk3_update_metal(
     wet_ef: torch.Tensor,
     rk_dt: float,
     r_rayleigh: float,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    u_out = torch.empty_like(u0)
+    u_out = out if out is not None else torch.empty_like(u0)
     n_tot = int(u0.numel())
     lib.ogcm_baroclinic_rk3_update(
         u0.contiguous(), u_s.contiguous(), cor_3d.contiguous(), f_fixed.contiguous(),
@@ -7472,6 +7797,83 @@ def run_ogcm_baroclinic_rk3_update_metal(
         threads=n_tot,
     )
     return u_out
+
+
+def run_ogcm_vec_lap_wet_metal(
+    lib: Any,
+    mc: dict[str, Any],
+    u_edge: torch.Tensor,
+    wet_cf: torch.Tensor,
+    wet_vf: torch.Tensor,
+    wet_ef: torch.Tensor,
+    div_buf: torch.Tensor | None = None,
+    zeta_buf: torch.Tensor | None = None,
+    lap_out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Coalesced wet-skipping 3D OGCM vector Laplacian `wet_ef * (grad(div u) - curl(zeta))`."""
+    nzo, ne = u_edge.shape
+    nc = int(mc["n_cells"])
+    nv = int(mc["n_verts"])
+    dev = u_edge.device
+    div_c = div_buf if div_buf is not None else torch.empty((nzo, nc), device=dev, dtype=torch.float32)
+    zeta_v = zeta_buf if zeta_buf is not None else torch.empty((nzo, nv), device=dev, dtype=torch.float32)
+    lap = lap_out if lap_out is not None else torch.empty((nzo, ne), device=dev, dtype=torch.float32)
+    u_c = u_edge.contiguous()
+    lib.ogcm_div_cell_wet(mc["eoc"], mc["div_w"], u_c, wet_cf.contiguous(), div_c, [nzo, nc, ne, 0], threads=nzo * nc)
+    lib.ogcm_vorticity_vert_wet(mc["eov"], mc["vort_w"], u_c, wet_vf.contiguous(), zeta_v, [nzo, nv, ne, 0], threads=nzo * nv)
+    lib.ogcm_vec_lap_edge_wet(
+        mc["c0"], mc["c1"], mc["v0"], mc["v1"], mc["inv_dc"], mc["inv_dv"],
+        div_c, zeta_v, wet_ef.contiguous(), lap, [nzo, nc, nv, ne], threads=nzo * ne,
+    )
+    return lap
+
+
+def run_ogcm_trisk_coriolis_wet_metal(
+    lib: Any,
+    mc: dict[str, Any],
+    u_edge: torch.Tensor,
+    wet_vf: torch.Tensor,
+    wet_ef: torch.Tensor,
+    zeta_buf: torch.Tensor | None = None,
+    eta_buf: torch.Tensor | None = None,
+    rot_out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Coalesced wet-skipping 3D OGCM vorticity + eta_e + TRiSK Coriolis."""
+    nzo, ne = u_edge.shape
+    nv = int(mc["n_verts"])
+    dev = u_edge.device
+    zeta_v = zeta_buf if zeta_buf is not None else torch.empty((nzo, nv), device=dev, dtype=torch.float32)
+    eta_e = eta_buf if eta_buf is not None else torch.empty((nzo, ne), device=dev, dtype=torch.float32)
+    rot = rot_out if rot_out is not None else torch.empty((nzo, ne), device=dev, dtype=torch.float32)
+    u_c = u_edge.contiguous()
+    we_c = wet_ef.contiguous()
+    lib.ogcm_vorticity_vert_wet(mc["eov"], mc["vort_w"], u_c, wet_vf.contiguous(), zeta_v, [nzo, nv, ne, 0], threads=nzo * nv)
+    lib.ogcm_eta_edge_wet(mc["v0"], mc["v1"], zeta_v, mc["f_vert"], we_c, eta_e, [nzo, nv, ne, 0], threads=nzo * ne)
+    lib.ogcm_trisk_rot_edge_wet(mc["ep"], mc["w_trisk"], eta_e, u_c, we_c, rot, [nzo, nv, ne, 0], threads=nzo * ne)
+    return rot
+
+
+def run_diagnose_p_T_metal(
+    lib: Any,
+    rho_d: torch.Tensor,
+    theta_m: torch.Tensor,
+    q_v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused GPU thermodynamic diagnosis `(p, Pi, T)` from `(rho_d, theta_m, q_v)`."""
+    r_c = rho_d.contiguous()
+    t_c = theta_m.contiguous()
+    q_c = q_v.contiguous()
+    pres = torch.empty_like(r_c)
+    exner = torch.empty_like(r_c)
+    temp = torch.empty_like(r_c)
+    n_tot = int(r_c.numel())
+    lib.elem_diagnose_p_T(
+        r_c, t_c, q_c, pres, exner, temp,
+        n_tot,
+        [float(C.R_D / C.P_REF), float(C.R_D / C.CV_D), float(C.P_REF), float(C.RV_OVER_RD)],
+        threads=n_tot,
+    )
+    return pres, exner, temp
 
 
 def run_ogcm_mom_vdiff_metal(
@@ -7798,6 +8200,15 @@ def run_crm_student_tile_update_metal(
     ug_buf = u_gust.reshape(nc, n_sub).contiguous() if has_cp else dummy1
     step_shift = int(step_count) // 12
     flags = (step_shift << 3) | (has_cp << 2) | (has_sp << 1) | has_sc
+    use_simd_pack = (n_sub <= 32) and ((32 % n_sub) == 0)
+    if use_simd_pack:
+        c_per_tg = 32 // n_sub
+        n_tg = (nc + c_per_tg - 1) // c_per_tg
+        thr = (n_tg * 32,)
+        grp = (32,)
+    else:
+        thr = (nc * n_sub,)
+        grp = (n_sub,)
     lib.crm_student_tile_update_col(
         atmos_rho.contiguous(), stu_thm.contiguous(), stu_qv.contiguous(),
         stu_qc.contiguous(), stu_qi.contiguous(), stu_qp.contiguous(),
@@ -7810,8 +8221,8 @@ def run_crm_student_tile_update_metal(
         rain_3d, snow_3d,
         [nz, nc, (int(ny_t) << 16) | int(nx_t), flags],
         [float(dt), float(C.CP_D), 0.85, 0.0],
-        threads=(nc * n_sub,),
-        group_size=(n_sub,),
+        threads=thr,
+        group_size=grp,
     )
 
 
