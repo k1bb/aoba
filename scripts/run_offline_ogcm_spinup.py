@@ -248,11 +248,13 @@ def inject_offline_ocean_into_restart(
             val = getattr(ocn_sfc_state, k, None)
             if val is not None:
                 ckpt["ocn_sfc"][k] = val.detach().cpu()
+        from aoba.ocean_coupler import ocn_to_atm_mean
+
         is_ocn_host = (ckpt["sfc"]["surf_type"].detach().cpu() == SURF_OCEAN)
         for k in ocn_keys:
             val = getattr(ocn_sfc_state, k, None)
             if val is not None and k in ckpt["sfc"]:
-                proj = ocn_coupler.remap_o2a(val).detach().cpu()
+                proj = ocn_to_atm_mean(ocn_coupler, val).detach().cpu()
                 ckpt["sfc"][k] = torch.where(is_ocn_host, proj, ckpt["sfc"][k])
         host_src = ckpt["sfc"]
     else:
@@ -347,16 +349,35 @@ def main() -> None:
     clim_atm = _load_self_forcing_climatology(coupled_dir, args.forcing_year_start, args.forcing_year_end, dev)
     if has_fine_ocn:
         assert ocn_coupler is not None
+        from aoba.ocean_coupler import atm_to_ocn_conservative_flux, atm_to_ocn_intensive
+
         print(
             f"Remapping 12-month self-forcing climatology from host (nc={model.mesh.n_cells}) "
             f"-> fine ocean (nc={ocn_mesh.n_cells})...",
             flush=True,
         )
-        clim = {
-            k: torch.stack([ocn_coupler.remap_a2o(v[m]) for m in range(12)], dim=0)
-            for k, v in clim_atm.items()
-        }
-        z_ref_rel = ocn_coupler.remap_a2o(torch.clamp(model.atmos.z_c[0] - model.atmos.z_w[0], min=10.0))
+        clim = {}
+        for k, v in clim_atm.items():
+            if k in ("runoff_total", "runoff_glacier"):
+                clim[k] = torch.stack(
+                    [atm_to_ocn_conservative_flux(ocn_coupler, v[m], ocean_only_source=False) for m in range(12)],
+                    dim=0,
+                )
+            elif k in ("precip_rain", "precip_snow"):
+                clim[k] = torch.stack(
+                    [atm_to_ocn_intensive(ocn_coupler, v[m], ocean_only_source=False) for m in range(12)],
+                    dim=0,
+                )
+            else:
+                clim[k] = torch.stack(
+                    [atm_to_ocn_intensive(ocn_coupler, v[m], ocean_only_source=True) for m in range(12)],
+                    dim=0,
+                )
+        z_ref_rel = atm_to_ocn_intensive(
+            ocn_coupler,
+            torch.clamp(model.atmos.z_c[0] - model.atmos.z_w[0], min=10.0),
+            ocean_only_source=False,
+        )
     else:
         clim = clim_atm
         z_ref_rel = torch.clamp(model.atmos.z_c[0] - model.atmos.z_w[0], min=10.0)

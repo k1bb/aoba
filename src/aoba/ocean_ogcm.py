@@ -1850,6 +1850,11 @@ def _step_ogcm_voronoi_impl(
     nu_4 = min(BETA_MUNK_OGCM * (delta_m4 ** 5), 0.0010 * (dc_min ** 4) / max(dt, 1.0))
     delta_m2 = 0.25 * dc_min
     a_h = min(BETA_MUNK_OGCM * (delta_m2 ** 3), 0.04 * (dc_min ** 2) / max(dt, 1.0))
+    # Scale-aware divergence damping `a_div * grad(div u)` (Skamarock & Klemp, 1992; Gassmann, 2013;
+    # Ringler et al., 2013): strictly negative-semidefinite (-a_div ||div u||^2 <= 0) and invisible to
+    # non-divergent geostrophic/rotational eddies, suppressing the C-grid Hollingsworth-Bernoulli
+    # divergent monopole instability in unstratified abyssal layers at eddy-permitting resolutions.
+    a_div = 0.030 * (dc_min ** 2) / max(dt, 1.0)
 
     # Symmetric wet-masked biharmonic operator D = wet * del^2 * wet guarantees strict energy
     # dissipation <u, -nu_4 * D^2 u> = -nu_4 ||D u||^2 <= 0 at all interior and coastal wet edges.
@@ -1866,6 +1871,7 @@ def _step_ogcm_voronoi_impl(
         if ws_bc is None:
             nv = int(mesh.n_verts)
             ws_bc = {
+                "div_u": torch.zeros((nzo, nc), device=dev, dtype=dtype),
                 "div": torch.zeros((nzo, nc), device=dev, dtype=dtype),
                 "zeta": torch.zeros((nzo, nv), device=dev, dtype=dtype),
                 "eta": torch.zeros((nzo, ne), device=dev, dtype=dtype),
@@ -1879,7 +1885,7 @@ def _step_ogcm_voronoi_impl(
             cache["ws_bc"] = ws_bc
         lap2_u_wet = dispatch_ogcm_vec_lap_wet_metal(
             mesh, u_edge=u, wet_cf=wet_cf, wet_vf=wet_vf, wet_ef=wet_ef,
-            div_buf=ws_bc["div"], zeta_buf=ws_bc["zeta"], lap_out=ws_bc["lap2"],
+            div_buf=ws_bc["div_u"], zeta_buf=ws_bc["zeta"], lap_out=ws_bc["lap2"],
         )
         lap4_u = dispatch_ogcm_vec_lap_wet_metal(
             mesh, u_edge=lap2_u_wet, wet_cf=wet_cf, wet_vf=wet_vf, wet_ef=wet_ef,
@@ -1887,7 +1893,8 @@ def _step_ogcm_voronoi_impl(
         )
         w_vor_u2 = w_vor_edge.unsqueeze(0) * (u * u)
         ke_c = 0.5 * dispatch_scvt_weighted_edge_sum_metal(mesh, w_vor_u2, active_w_c) * wet_cf
-        p_bern = (p_baroc + C.RHO_SEAWATER * ke_c) * wet_cf
+        # Fold `+a_div * grad(div u)` directly into Bernoulli potential `-inv_rho * grad(p_bern)`
+        p_bern = (p_baroc + C.RHO_SEAWATER * (ke_c - a_div * ws_bc["div_u"])) * wet_cf
 
         # Fused GPU baroclinic RK3 + wet-skipping TRiSK Coriolis + register-assembled momentum Thomas solve
         f_fixed = dispatch_ogcm_baroclinic_f_fixed_metal(
@@ -1929,10 +1936,10 @@ def _step_ogcm_voronoi_impl(
             b_m = 1.0 - a_m - d_m
             u_star_raw = solve_tridiagonal_batched(a_m, b_m, d_m, u_star)
     else:
-        lap2_u, _ = compute_vector_laplacian_edge(mesh, u)
+        lap2_u, grad_div_u = compute_vector_laplacian_edge(mesh, u)
         lap2_u_wet = lap2_u * wet_ef
         lap4_u, _ = compute_vector_laplacian_edge(mesh, lap2_u_wet)
-        visc_h_edge = (a_h * lap2_u_wet - nu_4 * lap4_u) * wet_ef
+        visc_h_edge = (a_h * lap2_u_wet + a_div * grad_div_u - nu_4 * lap4_u) * wet_ef
         w_vor_u2 = w_vor_edge.unsqueeze(0) * (u * u)
         ke_c = (
             0.5
