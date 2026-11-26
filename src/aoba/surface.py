@@ -1533,18 +1533,33 @@ def _ocean_seaice_post_core(
     mu0: torch.Tensor,
     dt: float,
 ):
-    """Pure-tensor open-water, sea-ice skin, and Kahan mixed-layer update (CUDA-compilable)."""
-    shf_ow = rho_sfc * cp_air * ga_h_o * (t_ocean_ml - t_air_sfc)
-    evap_ow = rho_sfc * ga_q_o * (qsat_ow - qv_1)
-    lhf_ow = C.L_V0 * evap_ow
-    t_ml_4 = (t_ocean_ml * t_ocean_ml) ** 2
-    lw_up_ow = EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * t_ml_4 + (1.0 - EMISSIVITY_OCEAN) * lw_down
+    """Pure-tensor open-water, sea-ice skin, and Kahan mixed-layer update (CUDA-compilable).
+
+    Uses exact energy-conserving semi-implicit open-water ocean-atmosphere flux coupling
+    (AOBA Formulation Eq. 9.1b; Polcher et al., 1998; Best et al., 2004) so thin surface
+    layers (e.g. h_ml = 2 m) remain unconditionally free of 2*dt explicit oscillations.
+    """
+    dshf_dT = rho_sfc * cp_air * ga_h_o
+    shf_ow0 = dshf_dT * (t_ocean_ml - t_air_sfc)
+    evap_ow0 = rho_sfc * ga_q_o * (qsat_ow - qv_1)
+    lhf_ow0 = C.L_V0 * evap_ow0
+    t_ml_2 = t_ocean_ml * t_ocean_ml
+    t_ml_3 = t_ml_2 * t_ocean_ml
+    t_ml_4 = t_ml_2 * t_ml_2
+    lw_emit_ow0 = EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * t_ml_4
+    lw_up_ow0 = lw_emit_ow0 + (1.0 - EMISSIVITY_OCEAN) * lw_down
     alb_ocn_dir = compute_ocean_albedo_briegleb(mu0)[0]
     sw_abs_ow = (
         (sw1_dir_down + sw2_dir_down) * (1.0 - alb_ocn_dir)
         + (sw1_dif_down + sw2_dif_down) * 0.94
     )
-    g_down_ow = sw_abs_ow + lw_down - lw_up_ow - shf_ow - lhf_ow - C.L_F0 * precip_snow
+    g_down_ow0 = sw_abs_ow + lw_down - lw_up_ow0 - shf_ow0 - lhf_ow0 - C.L_F0 * precip_snow
+    # Bolton (1980, Eq. 10) liquid saturation slope & open-water flux sensitivity [W m^-2 K^-1]
+    d_to = torch.clamp(t_ocean_ml, min=250.0) - 29.65
+    dqow_dT = qsat_ow * (17.67 * 243.50) / (d_to * d_to)
+    devap_dT = rho_sfc * ga_q_o * dqow_dT
+    dlw_dT = 4.0 * EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * t_ml_3
+    lambda_ow = dshf_dT + C.L_V0 * devap_dT + dlw_dT
 
     h_ice_eff = torch.clamp(m_seaice / (C.RHO_SEAICE * torch.clamp(f_ice, min=0.05)), min=0.05)
     h_sn_ice = swe_seaice / RHO_SNOWPACK
@@ -1587,7 +1602,10 @@ def _ocean_seaice_post_core(
     q_rem_melt = torch.clamp(q_top_melt * dt - C.L_F0 * sn_si_melt, min=0.0)
 
     cw_ml = C.RHO_SEAWATER * C.CP_SEAWATER * h_ocean_ml
-    dt_ml_flux = (dt / cw_ml) * ((1.0 - f_ice) * g_down_ow - f_ice * g_oi_up)
+    # AOBA Formulation Eq. (9.1b): semi-implicit open-water mixed-layer flux coupling
+    dt_ml_flux = (dt * ((1.0 - f_ice) * g_down_ow0 - f_ice * g_oi_up)) / (
+        cw_ml + dt * (1.0 - f_ice) * lambda_ow
+    )
     t_ml_prov, comp1 = _kahan_add(t_ocean_ml, dt_ml_flux, t_ocean_ml_comp)
 
     e_freeze = cw_ml * torch.clamp(C.T_FREEZE_OCEAN - t_ml_prov, min=0.0)
@@ -1599,11 +1617,17 @@ def _ocean_seaice_post_core(
     t_ml_next, comp2 = _kahan_add(t_ml_prov, dt_ml_lat, comp1)
     comp_final = torch.where((e_freeze > 0.0) | (m_melt > 0.0), torch.zeros_like(comp2), comp2)
 
+    # Update open-water fluxes consistently with dt_ml_flux for exact atmosphere-ocean energy conservation
+    shf_ow = shf_ow0 + dshf_dT * dt_ml_flux
+    evap_ow = evap_ow0 + devap_dT * dt_ml_flux
+    lhf_ow = C.L_V0 * evap_ow
+    lw_emit_ow = torch.clamp(lw_emit_ow0 + dlw_dT * dt_ml_flux, min=0.0)
+
     shf_o = (1.0 - f_ice) * shf_ow + f_ice * shf_si
     evap_o = (1.0 - f_ice) * evap_ow + f_ice * subl_si
     lhf_o = (1.0 - f_ice) * lhf_ow + f_ice * lhf_si
-    lw_emit_o = EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * (
-        (1.0 - f_ice) * t_ml_4 + f_ice * ((t_si_new * t_si_new) ** 2)
+    lw_emit_o = (1.0 - f_ice) * lw_emit_ow + f_ice * (
+        EMISSIVITY_OCEAN * C.STEFAN_BOLTZMANN * ((t_si_new * t_si_new) ** 2)
     )
     return t_ml_next, comp_final, m_si_next, t_si_new, swe_si_next, shf_o, evap_o, lhf_o, lw_emit_o
 

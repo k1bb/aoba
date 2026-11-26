@@ -5280,18 +5280,26 @@ kernel void surface_ocean_seaice_post_col(
     float mu      = clamp(mu0_in[i], 0.01f, 1.0f);
 
     float rho_cp_ga = rho_sfc * cp_air * ga_h;
-    float shf_ow = rho_cp_ga * (t_ml - t_air);
-    float evap_ow = rho_sfc * ga_q * (qsat_ow - qv_1);
-    float lhf_ow = l_v0 * evap_ow;
+    float shf_ow0 = rho_cp_ga * (t_ml - t_air);
+    float evap_ow0 = rho_sfc * ga_q * (qsat_ow - qv_1);
+    float lhf_ow0 = l_v0 * evap_ow0;
     float t_ml_2 = t_ml * t_ml;
+    float t_ml_3 = t_ml_2 * t_ml;
     float t_ml_4 = t_ml_2 * t_ml_2;
-    float lw_up_ow = emiss_ocn * sig * t_ml_4 + (1.0f - emiss_ocn) * lw_dn;
+    float lw_emit_ow0 = emiss_ocn * sig * t_ml_4;
+    float lw_up_ow0 = lw_emit_ow0 + (1.0f - emiss_ocn) * lw_dn;
     float alb_ocn_dir = clamp(
         0.026f / (pow(mu, 1.7f) + 0.065f) + 0.15f * (mu - 0.1f) * (mu - 0.5f) * (mu - 1.0f),
         0.02f, 0.40f
     );
     float sw_abs_ow = (sw1_d + sw2_d) * (1.0f - alb_ocn_dir) + (sw1_f + sw2_f) * 0.94f;
-    float g_down_ow = sw_abs_ow + lw_dn - lw_up_ow - shf_ow - lhf_ow - l_f0 * p_sn;
+    float g_down_ow0 = sw_abs_ow + lw_dn - lw_up_ow0 - shf_ow0 - lhf_ow0 - l_f0 * p_sn;
+    // AOBA Formulation Eq. (9.1b): Bolton (1980, Eq. 10) open-water flux sensitivity [W m^-2 K^-1]
+    float d_to = max(t_ml, 250.0f) - 29.65f;
+    float dqow_dT = qsat_ow * 4302.645f / (d_to * d_to);
+    float devap_dT = rho_sfc * ga_q * dqow_dT;
+    float dlw_dT = 4.0f * emiss_ocn * sig * t_ml_3;
+    float lambda_ow = rho_cp_ga + l_v0 * devap_dT + dlw_dT;
 
     float h_ice_eff = max(m_si / (rho_si * max(f_ice, 0.05f)), 0.05f);
     float h_sn_ice = swe_si / rho_snow;
@@ -5329,7 +5337,8 @@ kernel void surface_ocean_seaice_post_col(
     float q_rem_melt = max(q_top_melt * dt - l_f0 * sn_si_melt, 0.0f);
 
     float cw_ml = rho_sw * cp_sw * h_ml;
-    float dt_ml_flux = (dt / cw_ml) * ((1.0f - f_ice) * g_down_ow - f_ice * g_oi_up);
+    float dt_ml_flux = (dt * ((1.0f - f_ice) * g_down_ow0 - f_ice * g_oi_up))
+        / (cw_ml + dt * (1.0f - f_ice) * lambda_ow);
     // Neumaier compensated summation #1
     float y1 = dt_ml_flux + comp0;
     float t_ml_prov = t_ml + y1;
@@ -5347,11 +5356,16 @@ kernel void surface_ocean_seaice_post_col(
     float comp2 = (fabs(t_ml_prov) >= fabs(y2)) ? ((t_ml_prov - t_ml_next) + y2) : ((y2 - t_ml_next) + t_ml_prov);
     float comp_final = (e_freeze > 0.0f || m_melt > 0.0f) ? 0.0f : comp2;
 
+    float shf_ow = shf_ow0 + rho_cp_ga * dt_ml_flux;
+    float evap_ow = evap_ow0 + devap_dT * dt_ml_flux;
+    float lhf_ow = l_v0 * evap_ow;
+    float lw_emit_ow = max(lw_emit_ow0 + dlw_dT * dt_ml_flux, 0.0f);
+
     float shf_o = (1.0f - f_ice) * shf_ow + f_ice * shf_si;
     float evap_o = (1.0f - f_ice) * evap_ow + f_ice * subl_si;
     float lhf_o = (1.0f - f_ice) * lhf_ow + f_ice * lhf_si;
     float t_si_2 = t_si_new * t_si_new;
-    float lw_emit_o = emiss_ocn * sig * ((1.0f - f_ice) * t_ml_4 + f_ice * (t_si_2 * t_si_2));
+    float lw_emit_o = (1.0f - f_ice) * lw_emit_ow + f_ice * (emiss_ocn * sig * (t_si_2 * t_si_2));
 
     ocn_out[i]          = t_ml_next;
     ocn_out[N + i]      = comp_final;

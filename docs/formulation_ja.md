@@ -1550,7 +1550,18 @@ G_{oi} &= \left[\frac{h_i}{2 k_{\mathrm{ice}}} + \frac{h_{\mathrm{sn}}}{k_{\math
 \end{aligned} \tag{9.1}
 $$
 
-海面降雪は開水面で融解潜熱冷却 $-L_{f0} P_{\mathrm{snow}}$ を与え、海氷上では積雪として蓄積する。海氷表面温度 $T_i \le 273.15\ \mathrm{K}$ は陰的熱収支で解き、混合層水温 $T_{\mathrm{ml}}$ は Neumaier/Kahan 補償加算で更新しつつ $T_{\mathrm{ml}} < T_{f,\mathrm{ocn}}$ の過冷却エネルギーを厳密に海氷生成へ変換する。
+海面降雪は開水面で融解潜熱冷却 $-L_{f0} P_{\mathrm{snow}}$ を与え、海氷上では積雪として蓄積する。海氷表面温度 $T_i \le 273.15\ \mathrm{K}$ は陰的熱収支で解く。開水面では、上向き乱流・長波フラックスの温度応答係数 $\lambda_{\mathrm{ow}} = \partial(H_{\mathrm{ow}} + \mathrm{LHF}_{\mathrm{ow}} + \mathrm{LW}_{\uparrow,\mathrm{ow}})/\partial T_{\mathrm{ml}}$ を介して混合層熱容量 $C_w = \rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml}}$ と半陰的に結合し（Polcher et al., 1998; Best et al., 2004）、最表層が薄い構成（$h_{\mathrm{ml}} \le 2\ \mathrm{m}$）でも陽的結合特有の $2\Delta t$ 振動を防ぎつつ大気–海洋間のエネルギー保存を厳密に保つ：
+
+$$
+\begin{aligned}
+\lambda_{\mathrm{ow}} &= \rho_s c_p g_{a,h} + L_{v0}\,\rho_s g_{a,q}\frac{\partial q_{\mathrm{sat}}}{\partial T} + 4\,\varepsilon_o \sigma T_{\mathrm{ml}}^3, \\
+\Delta T_{\mathrm{ml}} &= \frac{\Delta t\,\big[(1 - f_i)\,G_{\mathrm{ow}}^0 - f_i\,G_{oi}\big]}{C_w + \Delta t\,(1 - f_i)\,\lambda_{\mathrm{ow}}}, \\
+H_{\mathrm{ow}} &= H_{\mathrm{ow}}^0 + \rho_s c_p g_{a,h}\,\Delta T_{\mathrm{ml}}, \qquad E_{\mathrm{ow}} = E_{\mathrm{ow}}^0 + \rho_s g_{a,q}\frac{\partial q_{\mathrm{sat}}}{\partial T}\,\Delta T_{\mathrm{ml}}, \\
+\mathrm{LW}_{\mathrm{emit,ow}} &= \varepsilon_o \sigma T_{\mathrm{ml}}^4 + 4\,\varepsilon_o \sigma T_{\mathrm{ml}}^3\,\Delta T_{\mathrm{ml}}
+\end{aligned} \tag{9.1b}
+$$
+
+ここで $G_{\mathrm{ow}}^0 = \mathrm{SW}_{\mathrm{abs,ow}} + \mathrm{LW}_\downarrow - \mathrm{LW}_{\uparrow,\mathrm{ow}}^0 - H_{\mathrm{ow}}^0 - L_{v0} E_{\mathrm{ow}}^0 - L_{f0} P_{\mathrm{snow}}$ は現時刻の正味下向き開水面フラックス、$\partial q_{\mathrm{sat}}/\partial T = q_{\mathrm{sat}}(T_{\mathrm{ml}})\,4302.645 / (T_{\mathrm{ml}} - 29.65)^2$ は Bolton (1980, Eq. 10) の飽和比湿勾配である。混合層水温 $T_{\mathrm{ml}}$ は $\Delta T_{\mathrm{ml}}$ の Neumaier/Kahan 補償加算で更新し、$T_{\mathrm{ml}} < T_{f,\mathrm{ocn}}$ の過冷却エネルギーを厳密に海氷生成へ変換する。
 
 ### 9.3 選択肢 1：`ocean_mode = "ekman_sw"`（1.5 層エクマン＋浅水波海洋、`src/aoba/ocean_ekman.py`）
 

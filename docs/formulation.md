@@ -1550,7 +1550,18 @@ G_{oi} &= \left[\frac{h_i}{2 k_{\mathrm{ice}}} + \frac{h_{\mathrm{sn}}}{k_{\math
 \end{aligned} \tag{9.1}
 $$
 
-Snowfall onto open water imparts latent melt cooling $-L_{f0} P_{\mathrm{snow}}$, whereas snowfall onto ice accumulates as snowpack. Sea-ice skin temperature $T_i \le 273.15\ \mathrm{K}$ solves an implicit surface energy balance, and mixed-layer temperature $T_{\mathrm{ml}}$ updates via Neumaier/Kahan summation, converting any supercooling below $T_{f,\mathrm{ocn}}$ conservatively into sea-ice formation.
+Snowfall onto open water imparts latent melt cooling $-L_{f0} P_{\mathrm{snow}}$, whereas snowfall onto ice accumulates as snowpack. Sea-ice skin temperature $T_i \le 273.15\ \mathrm{K}$ solves an implicit surface energy balance. Over open water, upward turbulent and longwave fluxes are coupled semi-implicitly to the mixed-layer heat capacity $C_w = \rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml}}$ via the surface flux sensitivity $\lambda_{\mathrm{ow}} = \partial(H_{\mathrm{ow}} + \mathrm{LHF}_{\mathrm{ow}} + \mathrm{LW}_{\uparrow,\mathrm{ow}})/\partial T_{\mathrm{ml}}$ (Polcher et al., 1998; Best et al., 2004), eliminating explicit $2\Delta t$ oscillations even for thin top ocean layers ($h_{\mathrm{ml}} \le 2\ \mathrm{m}$) while preserving atmosphere–ocean energy conservation identically:
+
+$$
+\begin{aligned}
+\lambda_{\mathrm{ow}} &= \rho_s c_p g_{a,h} + L_{v0}\,\rho_s g_{a,q}\frac{\partial q_{\mathrm{sat}}}{\partial T} + 4\,\varepsilon_o \sigma T_{\mathrm{ml}}^3, \\
+\Delta T_{\mathrm{ml}} &= \frac{\Delta t\,\big[(1 - f_i)\,G_{\mathrm{ow}}^0 - f_i\,G_{oi}\big]}{C_w + \Delta t\,(1 - f_i)\,\lambda_{\mathrm{ow}}}, \\
+H_{\mathrm{ow}} &= H_{\mathrm{ow}}^0 + \rho_s c_p g_{a,h}\,\Delta T_{\mathrm{ml}}, \qquad E_{\mathrm{ow}} = E_{\mathrm{ow}}^0 + \rho_s g_{a,q}\frac{\partial q_{\mathrm{sat}}}{\partial T}\,\Delta T_{\mathrm{ml}}, \\
+\mathrm{LW}_{\mathrm{emit,ow}} &= \varepsilon_o \sigma T_{\mathrm{ml}}^4 + 4\,\varepsilon_o \sigma T_{\mathrm{ml}}^3\,\Delta T_{\mathrm{ml}}
+\end{aligned} \tag{9.1b}
+$$
+
+where $G_{\mathrm{ow}}^0 = \mathrm{SW}_{\mathrm{abs,ow}} + \mathrm{LW}_\downarrow - \mathrm{LW}_{\uparrow,\mathrm{ow}}^0 - H_{\mathrm{ow}}^0 - L_{v0} E_{\mathrm{ow}}^0 - L_{f0} P_{\mathrm{snow}}$ is the level-$n$ net downward open-water flux, $\partial q_{\mathrm{sat}}/\partial T = q_{\mathrm{sat}}(T_{\mathrm{ml}})\,4302.645 / (T_{\mathrm{ml}} - 29.65)^2$ follows Bolton (1980, Eq. 10), and $T_{\mathrm{ml}}$ updates via Neumaier/Kahan summation of $\Delta T_{\mathrm{ml}}$, converting any supercooling below $T_{f,\mathrm{ocn}}$ conservatively into sea-ice formation.
 
 ### 9.3 Option 1: `ocean_mode = "ekman_sw"` (1.5-Layer Ekman + Shallow-Water Ocean, `src/aoba/ocean_ekman.py`)
 
