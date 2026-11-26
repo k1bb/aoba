@@ -2276,6 +2276,8 @@ def step_aoba_model(
                 t1_cell_before - t_ml_pre_sfc,
                 m_ice_cell_before - m_ice_pre_sfc,
                 swe_ice_cell_before - swe_ice_pre_sfc,
+                t_ml_atm_ref=t_ml_pre_sfc,
+                dt=dt,
             )
 
         ocn_stride = max(int(getattr(cfg, "ocean_stride", 1)), 1)

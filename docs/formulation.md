@@ -1590,11 +1590,12 @@ When EVP is disabled, a fallback free-drift plus plastic-ridging sea-ice transpo
 
 ### 9.5 Independent Fine Ocean Grid Coupling (`ocean_glevel > glevel`) & Current-Relative Wind (`src/aoba/ocean_coupler.py`)
 
-For each fine ocean cell $j$ mapped to parent atmospheric cell $p(j) = \arg\max_i(\mathbf{x}_{\mathrm{ocn},j}\cdot\mathbf{x}_{\mathrm{atm},i})$, ocean-to-atmosphere fields use exact wet-area-weighted averaging, atmosphere-to-ocean intensive fluxes are directly gathered, and extensive runoff/river fluxes apply global-integral conservation scaling. Surface increments $(\Delta T_{\mathrm{ml}}, \Delta m_{\mathrm{ice}}, \Delta\mathrm{SWE}_{\mathrm{ice}})$ are applied incrementally to preserve fine-scale SST gradients. When running 3D CRM or standalone GCRM with `enable_current_rel_wind = true`, air–sea fluxes use the current-relative wind $\mathbf{U}_{\mathrm{rel}}$ (Renault et al., 2016):
+For each fine ocean cell $j$ mapped to parent atmospheric cell $p(j) = \arg\max_i(\mathbf{x}_{\mathrm{ocn},j}\cdot\mathbf{x}_{\mathrm{atm},i})$, ocean-to-atmosphere fields use exact wet-area-weighted averaging, atmosphere-to-ocean intensive fluxes are directly gathered, and extensive runoff/river fluxes apply global-integral conservation scaling. Surface increments $(\Delta T_{\mathrm{ml}}, \Delta m_{\mathrm{ice}}, \Delta\mathrm{SWE}_{\mathrm{ice}})$ are applied incrementally to preserve fine-scale SST gradients, accompanied by an exact exponential linearized bulk air–sea thermal feedback ($\lambda_{\mathrm{as}} = 40\ \mathrm{W\ m^{-2}\ K^{-1}}$; Haney, 1971; Barnier et al., 1995; Ma et al., 2016) relative to the inherited parent marine temperature $T_{\mathrm{atm},q(j)}$ so isolated shallow coastal bays beneath coarse land cells cannot overheat while open-ocean parent-cell means remain heat-conserving. When running 3D CRM or standalone GCRM with `enable_current_rel_wind = true`, air–sea fluxes use the current-relative wind $\mathbf{U}_{\mathrm{rel}}$ (Renault et al., 2016):
 
 $$
 \begin{aligned}
 \bar{\psi}_{\mathrm{atm},i} &= \frac{\sum_{j:\,p(j)=i} A_{\mathrm{ocn},j}\,w_{\mathrm{wet},j}\,\psi_{\mathrm{ocn},j}}{\sum_{j:\,p(j)=i} A_{\mathrm{ocn},j}\,w_{\mathrm{wet},j}}, \\
+T_{\mathrm{ocn},j}^{n+1} &= T_{\mathrm{ocn},j}^n + \Delta T_{\mathrm{ml},q(j)} - \left[1 - \exp\!\left(-\frac{\lambda_{\mathrm{as}}\,\Delta t}{\rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml},j}}\right)\right]\big(T_{\mathrm{ocn},j}^n - T_{\mathrm{atm},q(j)}^n\big), \\
 \mathbf{U}_{\mathrm{rel}} &= \mathbf{u}_a(z_1) - \mathbf{u}_o(z=0)
 \end{aligned} \tag{9.8}
 $$

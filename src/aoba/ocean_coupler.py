@@ -223,20 +223,33 @@ def apply_atm_surface_increments_to_ocn_sfc(
     dt_ml_atm: torch.Tensor,
     dm_ice_atm: torch.Tensor,
     dswe_ice_atm: torch.Tensor,
+    *,
+    t_ml_atm_ref: torch.Tensor | None = None,
+    dt: float = 0.0,
+    lambda_airsea_wm2k: float = 40.0,
 ) -> None:
     """Apply atmospheric surface-layer tendencies onto fine `ocn_sfc` with exact freeze protection.
 
     Preserves fine-scale SST gradients and sea-ice edges on `ocn_sfc` while transferring
-    the atmospheric heat and sea-ice mass exchange from `step_surface`.
+    the atmospheric heat and sea-ice mass exchange from `step_surface`. When `t_ml_atm_ref`
+    and `dt > 0` are provided, applies the exact exponential linearized bulk air-sea negative
+    thermal feedback `-lambda_as * (T_ocn - T_atm_ref)` (AOBA Formulation Eq. 9.8; Haney, 1971;
+    Barnier et al., 1995; Ma et al., 2016) so isolated fine coastal/inland-sea cells beneath
+    coarse land host cells cannot run away thermally while open-ocean parent-cell area means
+    remain heat-conserving.
     """
     dt_ocn = atm_to_ocn_intensive(coupler, dt_ml_atm)
     dm_ocn = atm_to_ocn_intensive(coupler, dm_ice_atm)
     dswe_ocn = atm_to_ocn_intensive(coupler, dswe_ice_atm)
     is_wet = coupler.ocn_wet_mask
 
+    c_ml = C.CP_SEAWATER * C.RHO_SEAWATER * torch.clamp(ocn_sfc.h_ocean_ml, min=10.0)
     t_next = ocn_sfc.t_ocean_ml + dt_ocn
+    if t_ml_atm_ref is not None and dt > 0.0 and lambda_airsea_wm2k > 0.0:
+        t_ref_ocn = atm_to_ocn_intensive(coupler, t_ml_atm_ref)
+        r_fb = -torch.expm1(-(float(lambda_airsea_wm2k) * float(dt)) / c_ml)
+        t_next = t_next - r_fb * (ocn_sfc.t_ocean_ml - t_ref_ocn)
     freeze_def = torch.where(is_wet, torch.clamp(C.T_FREEZE_OCEAN - t_next, min=0.0), torch.zeros_like(t_next))
-    c_ml = C.CP_SEAWATER * C.RHO_SEAWATER * ocn_sfc.h_ocean_ml
     ocn_sfc.t_ocean_ml = torch.where(is_wet, t_next + freeze_def, ocn_sfc.t_ocean_ml)
     ocn_sfc.m_seaice = torch.where(
         is_wet,

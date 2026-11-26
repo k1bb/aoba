@@ -1590,11 +1590,12 @@ EVP 無効時のフォールバックとして自由漂流＋塑性リジング�
 
 ### 9.5 独立高解像度海洋グリッド結合 (`ocean_glevel > glevel`) と海流相対風速 (`src/aoba/ocean_coupler.py`)
 
-細密海洋セル $j$ を包含する親大気セル $p(j) = \arg\max_i(\mathbf{x}_{\mathrm{ocn},j}\cdot\mathbf{x}_{\mathrm{atm},i})$ に対し、海洋 $\to$ 大気は厳密湿潤面積加重平均、大気 $\to$ 海洋の示強量は直接参照、流出・河川などの示量フラックスは全球総量保存スケーリングでマッピングする。大気からの表層増分 $(\Delta T_{\mathrm{ml}}, \Delta m_{\mathrm{ice}}, \Delta\mathrm{SWE}_{\mathrm{ice}})$ は細密 SST 勾配を保ったまま増分結合される。また 3D CRM または単独全球 CRM かつ `enable_current_rel_wind = true` 時、海面フラックスは海流相対風速 $\mathbf{U}_{\mathrm{rel}}$（Renault et al., 2016）を用いる：
+細密海洋セル $j$ を包含する親大気セル $p(j) = \arg\max_i(\mathbf{x}_{\mathrm{ocn},j}\cdot\mathbf{x}_{\mathrm{atm},i})$ に対し、海洋 $\to$ 大気は厳密湿潤面積加重平均、大気 $\to$ 海洋の示強量は直接参照、流出・河川などの示量フラックスは全球総量保存スケーリングでマッピングする。大気からの表層増分 $(\Delta T_{\mathrm{ml}}, \Delta m_{\mathrm{ice}}, \Delta\mathrm{SWE}_{\mathrm{ice}})$ は細密 SST 勾配を保ったまま増分結合されるとともに、参照した親海洋セル温度 $T_{\mathrm{atm},q(j)}$ に対する厳密指数積分の線形化バルク海気熱負フィードバック（$\lambda_{\mathrm{as}} = 40\ \mathrm{W\ m^{-2}\ K^{-1}}$; Haney, 1971; Barnier et al., 1995; Ma et al., 2016）を適用することで、外洋親セル平均の熱保存を保ちながら粗い陸セル直下の孤立浅海・内海の過熱暴走を防止する。また 3D CRM または単独全球 CRM かつ `enable_current_rel_wind = true` 時、海面フラックスは海流相対風速 $\mathbf{U}_{\mathrm{rel}}$（Renault et al., 2016）を用いる：
 
 $$
 \begin{aligned}
 \bar{\psi}_{\mathrm{atm},i} &= \frac{\sum_{j:\,p(j)=i} A_{\mathrm{ocn},j}\,w_{\mathrm{wet},j}\,\psi_{\mathrm{ocn},j}}{\sum_{j:\,p(j)=i} A_{\mathrm{ocn},j}\,w_{\mathrm{wet},j}}, \\
+T_{\mathrm{ocn},j}^{n+1} &= T_{\mathrm{ocn},j}^n + \Delta T_{\mathrm{ml},q(j)} - \left[1 - \exp\!\left(-\frac{\lambda_{\mathrm{as}}\,\Delta t}{\rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml},j}}\right)\right]\big(T_{\mathrm{ocn},j}^n - T_{\mathrm{atm},q(j)}^n\big), \\
 \mathbf{U}_{\mathrm{rel}} &= \mathbf{u}_a(z_1) - \mathbf{u}_o(z=0)
 \end{aligned} \tag{9.8}
 $$
