@@ -7057,18 +7057,23 @@ kernel void crm_ens_mean_unc_transpose(
     uint b_rows = (b_base < B_c) ? min(32u, B_c - b_base) : 0u;
     if (b_rows == 0u) return;
 
-    threadgroup float sm_m[32 * 33];
-    threadgroup float sm_d[32 * 33];
+    // 4-warp TG (`group_size = 128`): each warp owns 2 of the 8 profile features -> 4x parallelism!
+    uint w = lid >> 5u;
+    uint l = lid & 31u;
+    threadgroup float sm_m[4 * 32 * 33];
+    threadgroup float sm_u[4 * 32];
+    threadgroup float* wm = sm_m + w * (32u * 33u);
 
-    float u_prof_sum = 0.0f;
-    uint col_g = col_off + b_base + lid;
-    bool col_ok = (lid < b_rows);
+    if (l < b_rows) sm_u[w * 32u + l] = 0.0f;
+    uint col_g = col_off + b_base + l;
+    bool col_ok = (l < b_rows);
 
-    for (uint f = 0u; f < 8u; ++f) {
+    for (uint fi = 0u; fi < 2u; ++fi) {
+        uint f = w + fi * 4u;
         for (uint k0 = 0u; k0 < nz; k0 += 32u) {
             uint k_len = min(32u, nz - k0);
-            uint k_r = k0 + lid;
-            bool k_ok = (lid < k_len);
+            uint k_r = k0 + l;
+            bool k_ok = (l < k_len);
             for (uint r = 0u; r < b_rows; ++r) {
                 float mv = 0.0f;
                 float dv = 0.0f;
@@ -7079,22 +7084,25 @@ kernel void crm_ens_mean_unc_transpose(
                     mv = 0.5f * (a + b);
                     dv = fabs(a - b);
                 }
-                sm_m[r * 33u + lid] = mv;
-                sm_d[r * 33u + lid] = dv;
+                wm[r * 33u + l] = mv;
+                // Warp-wide sum of |a - b| across k_r in 5 register shuffles (0 extra TG mem!)
+                for (uint off = 1u; off < 32u; off <<= 1u) dv += simd_shuffle_xor(dv, ushort(off));
+                if (l == 0u) sm_u[w * 32u + r] += dv;
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             if (col_ok) {
                 for (uint j = 0u; j < k_len; ++j) {
-                    p_mean_soa[(f * nz + k0 + j) * N_tot + col_g] = sm_m[lid * 33u + j];
-                    u_prof_sum += sm_d[lid * 33u + j];
+                    p_mean_soa[(f * nz + k0 + j) * N_tot + col_g] = wm[l * 33u + j];
                 }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
 
-    if (col_ok) {
-        uint src_s = (b_base + lid) * 3u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (w == 0u && col_ok) {
+        float u_prof_sum = sm_u[l] + sm_u[32u + l] + sm_u[64u + l] + sm_u[96u + l];
+        uint src_s = (b_base + l) * 3u;
         uint dst_s = col_g * 3u;
         float u_scal = 0.0f;
         for (uint j = 0u; j < 3u; ++j) {
@@ -8503,7 +8511,7 @@ def run_crm_ens_mean_unc_transpose_metal(
         pb.float().contiguous(), sb.float().contiguous(),
         p_mean_soa, s_mean, unc_out,
         [B_c, nz, N_tot, int(col_off)],
-        threads=(n_tg * 32,), group_size=(32,),
+        threads=(n_tg * 128,), group_size=(128,),
     )
 
 
