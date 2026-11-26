@@ -355,6 +355,17 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
             if getattr(model, "explicit_lightning", None) is not None
             else None
         ),
+        "lightning_distill": (
+            {
+                "net_state": {k: v.detach().cpu() for k, v in model.lightning_distill.net.state_dict().items()},
+                "steps_seen": int(model.lightning_distill.steps_seen),
+                "grad_updates": int(model.lightning_distill.grad_updates),
+                "ema_loss": float(model.lightning_distill.ema_loss),
+                "ema_val_corr": float(model.lightning_distill.ema_val_corr),
+            }
+            if getattr(model, "lightning_distill", None) is not None
+            else None
+        ),
         "crm_distill": (
             {
                 "net_state": {k: v.detach().cpu() for k, v in model.crm_distill.net.state_dict().items()},
@@ -1072,7 +1083,7 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         model.lakes.v_lake_m3 = torch.minimum(torch.clamp(model.lakes.v_lake_m3, min=0.0), model.lakes.v_cap_m3)
         update_lake_hypsometry(model.lakes, model.mesh.area_cell)
 
-    # 7b. Explicit bulk lightning charge state (exact copy on matching CRM shape; neutral reset on grid remap)
+    # 7b. Explicit bulk lightning charge state & optional OSSP lightning distillation head
     if ckpt.get("explicit_lightning") is not None and getattr(model, "explicit_lightning", None) is not None:
         ck_lt = ckpt["explicit_lightning"]
         q_old = ck_lt.get("q_chg")
@@ -1080,6 +1091,20 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             for k, v in ck_lt.items():
                 if hasattr(model.explicit_lightning, k):
                     setattr(model.explicit_lightning, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
+    if ckpt.get("lightning_distill") is not None and bool(getattr(model.cfg, "enable_lightning", False)) and bool(getattr(model.cfg, "enable_crm_self_distill", False)):
+        from aoba.lightning_explicit import init_lightning_self_distill_state
+
+        ck_ld = ckpt["lightning_distill"]
+        if getattr(model, "lightning_distill", None) is None:
+            model.lightning_distill = init_lightning_self_distill_state(device=device)
+        if isinstance(ck_ld.get("net_state"), dict):
+            model.lightning_distill.net.load_state_dict(
+                {k: v.to(device=device) for k, v in ck_ld["net_state"].items()}, strict=False
+            )
+        model.lightning_distill.steps_seen = int(ck_ld.get("steps_seen", 0))
+        model.lightning_distill.grad_updates = int(ck_ld.get("grad_updates", 0))
+        model.lightning_distill.ema_loss = float(ck_ld.get("ema_loss", 0.0))
+        model.lightning_distill.ema_val_corr = float(ck_ld.get("ema_val_corr", 0.0))
 
     # 8. Land carbon & nitrogen pools (supports both cell-level and subgrid pools)
     if ckpt.get("land_carbon") is not None and model.land_carbon is not None:

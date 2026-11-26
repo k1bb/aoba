@@ -273,6 +273,7 @@ class AOBAState:
     last_s_toa: torch.Tensor | None = None                   # Zero-copy ref for TOA incident SW (`rsdt`)
     last_lightning: object | None = None                     # Latest CRM LightningDiagnostics (CG strikes + LNOx)
     explicit_lightning: object | None = None                 # Optional ExplicitLightningState when lightning_scheme == "explicit_bulk"
+    lightning_distill: object | None = None                  # Optional OSSP Hurdle lightning self-distillation state
     crm_distill: object | None = None                        # Optional online self-distilling 2D/3D CRM controller
     rad_distill: object | None = None                        # Optional online per-subcolumn ICA radiation controller
     sparse_crm_pool: object | None = None                    # Teacher-only full-3D CRM pool (when n_sub < n_crm in 3D)
@@ -2837,6 +2838,9 @@ def step_aoba_model(
             else:
                 distill_sel = select_teacher_indices(model.crm_distill, allow_sparse_warmup=sparse_warmup_crm)
 
+        lt_teacher_crm = None
+        lt_t_idx = None
+        lt_s_idx = None
         if distill_sel is not None and model.crm_distill is not None:
             t_idx, s_idx = distill_sel
             rain_3d = rain_new_sub.reshape(nc, ny_t, nx_t)
@@ -3356,6 +3360,9 @@ def step_aoba_model(
 
             model.crm_distill.teacher_frac_last = float(t_idx.numel()) / float(max(nc, 1))
             model.crm_distill.steps_seen += 1
+            lt_teacher_crm = sub_crm_t
+            lt_t_idx = t_idx
+            lt_s_idx = s_idx
         elif chunk >= nc and n_sub == n_crm:
             drho_mean = (atmos.rho_d - mean_2d(crm.rho_d)).unsqueeze(-1).unsqueeze(-1)
             crm.rho_d = torch.clamp(crm.rho_d + drho_mean, min=1.0e-5)
@@ -3610,7 +3617,48 @@ def step_aoba_model(
     light_diag = None
     if bool(cfg.enable_lightning) and bool(cfg.enable_superparam):
         _lscheme = str(getattr(cfg, "lightning_scheme", "diagnostic")).strip().lower()
-        if _lscheme == "explicit_bulk":
+        if (
+            lt_teacher_crm is not None
+            and lt_t_idx is not None
+            and lt_s_idx is not None
+            and int(lt_s_idx.numel()) > 0
+        ):
+            # OSSP active: execute genuine 2 km CRM lightning (`explicit_bulk` or `diagnostic`)
+            # strictly on active teacher cells and self-distill onto student cells via Hurdle MLP.
+            from aoba.lightning_explicit import (
+                init_lightning_self_distill_state,
+                step_ossp_distilled_lightning,
+            )
+
+            if model.lightning_distill is None:
+                model.lightning_distill = init_lightning_self_distill_state(device=atmos.rho_d.device)
+            _, _, _ny_out_l, _nx_out_l = crm.rho_d.shape
+            light_diag, model.explicit_lightning = step_ossp_distilled_lightning(
+                lightning_scheme=_lscheme,
+                explicit_state=model.explicit_lightning,
+                distill_state=model.lightning_distill,
+                teacher_crm=lt_teacher_crm,
+                t_idx=lt_t_idx,
+                s_idx=lt_s_idx,
+                rho_host=atmos.rho_d,
+                theta_m_host=atmos.theta_m,
+                q_v_host=atmos.q_v,
+                q_c_host=atmos.q_c,
+                q_i_host=atmos.q_i,
+                q_p_host=atmos.q_p,
+                z_c_host=atmos.z_c,
+                dz_c_host=atmos.dz_c,
+                area_cell=mesh.area_cell,
+                rain_3d=rain_new_sub.reshape(nc, ny_t, nx_t),
+                snow_3d=snow_new_sub.reshape(nc, ny_t, nx_t),
+                buoy_sfc=buoy_cell_pre_sd,
+                ny_out=_ny_out_l,
+                nx_out=_nx_out_l,
+                dx_crm=float(cfg.crm_dx),
+                dt=float(dt),
+                has_pool=has_pool,
+            )
+        elif _lscheme == "explicit_bulk":
             from aoba.lightning_explicit import (
                 init_explicit_lightning_state,
                 step_explicit_bulk_lightning_and_lnox,

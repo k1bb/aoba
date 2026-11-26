@@ -44,6 +44,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from aoba import constants as C
 from aoba.kernels import solve_tridiagonal_batched
@@ -657,4 +659,461 @@ def step_explicit_bulk_lightning_and_lnox(
         flash_cg_cell=flash_cg_cell,
         n_dep_lnox_sub=n_dep_lnox_sub,
         n_dep_lnox_cell=n_dep_lnox_cell,
+    )
+
+
+# =========================================================================
+# Online Self-Distilling Superparameterization (OSSP) Lightning Head
+# Runs full-resolution 2 km CRM lightning (`explicit_bulk` or `diagnostic`)
+# strictly on active OSSP teacher columns and distills a universal,
+# map-free two-part Hurdle MLP onto student columns at negligible cost.
+# =========================================================================
+
+LIGHTNING_DISTILL_N_FEAT: int = 14
+LIGHTNING_FLASH_LOG_SCALE: float = 1.0e-11  # Scale [flashes m^-2 s^-1] for log1p compression
+
+
+class LightningSelfDistillNet(nn.Module):
+    """Compact map-free Hurdle MLP mapping 14 atmospheric-column features to lightning statistics.
+
+    Outputs 4 unconstrained logits per column:
+      0: `logit_p`      -> P(flash_tot > 0 | x) via sigmoid (trained on unbiased all-sky buffer)
+      1: `raw_log_rate` -> E[log1p(flash_tot / F_SCALE) | flash_tot > 0, x] via softplus (active-storm buffer)
+      2: `logit_fcg`    -> E[f_cg | flash_tot > 0, x] via sigmoid (active-storm buffer)
+      3: `logit_ccd`    -> cold-cloud depth / 15 km via sigmoid (all-sky buffer)
+    """
+
+    def __init__(self, n_feat: int = LIGHTNING_DISTILL_N_FEAT, hidden_dim: int = 64) -> None:
+        super().__init__()
+        self.fc_in = nn.Linear(n_feat, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc_mid = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, 4)
+        # Initialize strike probability slightly negative so untrained warmup never hallucinates storms
+        nn.init.zeros_(self.fc_out.weight)
+        with torch.no_grad():
+            self.fc_out.bias.copy_(torch.tensor([-3.5, 0.5, -1.2, -1.0]))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.silu(self.ln1(self.fc_in(x)))
+        h = h + F.silu(self.ln2(self.fc_mid(h)))
+        return self.fc_out(h)
+
+
+@dataclass
+class LightningSelfDistillState:
+    """State for teacher-CRM lightning online self-distillation (all-sky + active-storm Hurdle buffers)."""
+
+    net: LightningSelfDistillNet
+    opt: torch.optim.Optimizer
+    # Unbiased all-sky GPU ring buffer (for calibrated strike probability P(flash > 0 | x) & ccd)
+    all_x: torch.Tensor        # [cap_all, 14]
+    all_hit: torch.Tensor      # [cap_all] float in {0, 1}
+    all_ccd: torch.Tensor      # [cap_all] normalized cold-cloud depth in [0, 1]
+    all_valid: torch.Tensor    # [cap_all] float maturity mask in {0, 1}
+    # Active-storm GPU ring buffer (fixed-shape top-k storms; zero CPU-GPU sync!)
+    act_x: torch.Tensor        # [cap_act, 14]
+    act_y: torch.Tensor        # [cap_act] log1p(flash_tot / F_SCALE)
+    act_fcg: torch.Tensor      # [cap_act] f_cg in [0, 1]
+    act_valid: torch.Tensor    # [cap_act] float active-storm mask in {0, 1}
+    all_ptr: int = 0
+    all_size: int = 0
+    act_ptr: int = 0
+    act_size: int = 0
+    # Teacher slot tracking for clean neutral charge reset on cell rotation
+    slot_cell_ids: torch.Tensor | None = None    # [n_t] int64
+    slot_dwell_age: torch.Tensor | None = None   # [n_t] int32
+    # Online running diagnostics (CPU scalars, updated without mid-step GPU sync)
+    steps_seen: int = 0
+    grad_updates: int = 0
+    ema_loss: float = 0.0
+    ema_val_corr: float = 0.0
+    ema_teacher_flash_mean: float = 0.0
+
+
+def init_lightning_self_distill_state(
+    device: torch.device | str = "cpu",
+    *,
+    hidden_dim: int = 64,
+    cap_all: int = 8192,
+    cap_act: int = 4096,
+    lr: float = 2.0e-3,
+) -> LightningSelfDistillState:
+    """Allocate Hurdle lightning self-distillation MLP, AdamW optimizer, and stratified GPU buffers."""
+    dev = torch.device(device)
+    net = LightningSelfDistillNet(n_feat=LIGHTNING_DISTILL_N_FEAT, hidden_dim=hidden_dim).to(dev)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1.0e-4)
+    return LightningSelfDistillState(
+        net=net,
+        opt=opt,
+        all_x=torch.zeros((cap_all, LIGHTNING_DISTILL_N_FEAT), device=dev, dtype=torch.float32),
+        all_hit=torch.zeros((cap_all,), device=dev, dtype=torch.float32),
+        all_ccd=torch.zeros((cap_all,), device=dev, dtype=torch.float32),
+        all_valid=torch.zeros((cap_all,), device=dev, dtype=torch.float32),
+        act_x=torch.zeros((cap_act, LIGHTNING_DISTILL_N_FEAT), device=dev, dtype=torch.float32),
+        act_y=torch.zeros((cap_act,), device=dev, dtype=torch.float32),
+        act_fcg=torch.zeros((cap_act,), device=dev, dtype=torch.float32),
+        act_valid=torch.zeros((cap_act,), device=dev, dtype=torch.float32),
+    )
+
+
+def extract_lightning_distill_features(
+    rho_d: torch.Tensor,          # [nz, nc]
+    theta_m: torch.Tensor,        # [nz, nc]
+    q_v: torch.Tensor,            # [nz, nc]
+    q_c: torch.Tensor,            # [nz, nc]
+    q_i: torch.Tensor,            # [nz, nc]
+    q_p: torch.Tensor,            # [nz, nc]
+    z_c: torch.Tensor,            # [nz, nc]
+    dz_c: torch.Tensor,           # [nz, nc]
+    rain_3d: torch.Tensor,        # [nc, ny_t, nx_t] [kg m^-2 s^-1]
+    snow_3d: torch.Tensor,        # [nc, ny_t, nx_t] [kg m^-2 s^-1]
+    buoy_sfc: torch.Tensor,       # [nc] [m^2 s^-3]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build 14 universal map-free physical column features `[nc, 14]` and convective gate `[nc]`."""
+    nz, nc = rho_d.shape
+    _, _, temp = diagnose_pressure_temperature(rho_d, theta_m, q_v)
+    dm = torch.clamp(rho_d * dz_c, min=0.0)
+    qv_pos = torch.clamp(q_v, min=0.0)
+    qc_pos = torch.clamp(q_c, min=0.0)
+    qi_pos = torch.clamp(q_i, min=0.0)
+    qp_pos = torch.clamp(q_p, min=0.0)
+
+    # Precipitation statistics in mm/day (cell mean & subgrid convective localization std)
+    rain_mm = torch.clamp(rain_3d.reshape(nc, -1).mean(dim=-1) * C.SECONDS_PER_DAY, min=0.0)
+    snow_mm = torch.clamp(snow_3d.reshape(nc, -1).mean(dim=-1) * C.SECONDS_PER_DAY, min=0.0)
+    prec_sub_mm = torch.clamp((rain_3d + snow_3d).reshape(nc, -1) * C.SECONDS_PER_DAY, min=0.0)
+    prec_std_mm = prec_sub_mm.std(dim=-1, unbiased=False) if prec_sub_mm.shape[-1] > 1 else torch.zeros_like(rain_mm)
+
+    # Column & mixed-phase (-40 C < T < 0 C) hydrometeor paths [kg m^-2]
+    cwp = (dm * qc_pos).sum(dim=0)
+    iwp = (dm * (qi_pos + qp_pos)).sum(dim=0)
+    in_mix = ((temp < C.T_FREEZE) & (temp > C.T_FREEZE - 40.0)).to(rho_d.dtype)
+    mix_iwp = (dm * (qi_pos + qp_pos) * in_mix).sum(dim=0)
+    mix_lwc = (dm * qc_pos * in_mix).sum(dim=0)
+
+    # Thermodynamic instability proxy (boundary-layer theta_e minus mid-tropospheric theta)
+    t_sfc = temp[0]
+    qv_low = qv_pos[0]
+    th_e_low = theta_m[0] + (C.L_V0 / C.CP_D) * qv_low
+    k_mid = min(max(nz // 3, 1), nz - 1)
+    k_hi = min(max((2 * nz) // 3, k_mid + 1), nz - 1)
+    th_mid = theta_m[k_mid:k_hi].mean(dim=0)
+    cape_proxy = torch.clamp((th_e_low - th_mid) / 30.0, 0.0, 4.0)
+
+    # Freezing level and ice cloud-top heights AGL [km]
+    z_agl_km = torch.clamp((z_c - z_c[0:1] + 0.5 * dz_c[0:1]) * 1.0e-3, min=0.0)
+    z_frz_km = torch.where(temp >= C.T_FREEZE, z_agl_km, torch.zeros_like(z_agl_km)).amax(dim=0)
+    has_ice = (qi_pos + qp_pos) >= 1.0e-5
+    z_ctop_km = torch.where(has_ice, z_agl_km, torch.zeros_like(z_agl_km)).amax(dim=0)
+    ccd_proxy_km = torch.clamp(z_ctop_km - z_frz_km, 0.0, 16.0)
+
+    feats = torch.stack(
+        [
+            torch.log1p(rain_mm),
+            torch.log1p(snow_mm),
+            torch.log1p(cwp * 10.0),
+            torch.log1p(iwp * 10.0),
+            torch.log1p(mix_iwp * 10.0),
+            torch.log1p(mix_lwc * 10.0),
+            torch.clamp((t_sfc - C.T_FREEZE) / 30.0, -3.0, 3.0),
+            cape_proxy,
+            torch.clamp(qv_low / 0.02, 0.0, 3.0),
+            torch.clamp(z_frz_km / 6.0, 0.0, 3.0),
+            torch.clamp(z_ctop_km / 16.0, 0.0, 2.0),
+            torch.clamp(ccd_proxy_km / 12.0, 0.0, 2.0),
+            torch.clamp(buoy_sfc / 0.05, -2.0, 4.0),
+            torch.log1p(prec_std_mm),
+        ],
+        dim=-1,
+    )
+    feats = torch.nan_to_num(feats, nan=0.0, posinf=5.0, neginf=-5.0)
+    conv_gate = ((mix_iwp > 1.0e-4) | ((rain_mm + snow_mm) > 0.25)).to(rho_d.dtype)
+    return feats, conv_gate
+
+
+def _ring_push(buf: torch.Tensor, ptr: int, size: int, vals: torch.Tensor) -> tuple[int, int]:
+    """Append `[n, ...]` tensor into circular GPU buffer without CPU-GPU synchronization."""
+    n = int(vals.shape[0])
+    cap = int(buf.shape[0])
+    if n <= 0 or cap <= 0:
+        return ptr, size
+    if n >= cap:
+        buf.copy_(vals[-cap:])
+        return 0, cap
+    end = ptr + n
+    if end <= cap:
+        buf[ptr:end].copy_(vals)
+        new_ptr = end % cap
+    else:
+        first = cap - ptr
+        buf[ptr:].copy_(vals[:first])
+        buf[: n - first].copy_(vals[first:])
+        new_ptr = n - first
+    return new_ptr, min(size + n, cap)
+
+
+def step_ossp_distilled_lightning(
+    *,
+    lightning_scheme: str,
+    explicit_state: ExplicitLightningState | None,
+    distill_state: LightningSelfDistillState,
+    teacher_crm: object,
+    t_idx: torch.Tensor,          # [n_t] int64
+    s_idx: torch.Tensor,          # [n_s] int64
+    rho_host: torch.Tensor,       # [nz, nc]
+    theta_m_host: torch.Tensor,   # [nz, nc]
+    q_v_host: torch.Tensor,       # [nz, nc]
+    q_c_host: torch.Tensor,       # [nz, nc]
+    q_i_host: torch.Tensor,       # [nz, nc]
+    q_p_host: torch.Tensor,       # [nz, nc]
+    z_c_host: torch.Tensor,       # [nz, nc]
+    dz_c_host: torch.Tensor,      # [nz, nc]
+    area_cell: torch.Tensor,      # [nc]
+    rain_3d: torch.Tensor,        # [nc, ny_t, nx_t]
+    snow_3d: torch.Tensor,        # [nc, ny_t, nx_t]
+    buoy_sfc: torch.Tensor,       # [nc]
+    ny_out: int,
+    nx_out: int,
+    dx_crm: float,
+    dt: float,
+    has_pool: bool,
+) -> tuple[LightningDiagnostics, ExplicitLightningState | None]:
+    """Run genuine full-res 2 km CRM lightning on OSSP teacher cells & distill onto student cells.
+
+    Supports both `lightning_scheme = "explicit_bulk"` (SCALE-LT 5-species charge + FFT-Thomas
+    Poisson + breakdown on teacher pool only, ~16-40 MB VRAM) and `lightning_scheme = "diagnostic"`.
+    """
+    from aoba.lightning import compute_crm_lightning_and_lnox
+
+    dev = rho_host.device
+    dtype = rho_host.dtype
+    nz, nc = rho_host.shape
+    n_t = int(t_idx.numel())
+    _, _, ny_full, nx_full = teacher_crm.rho_d.shape
+
+    # 1. Track teacher slot continuity; reset explicit charge to neutral strictly on newly rotated cells
+    if distill_state.slot_cell_ids is None or int(distill_state.slot_cell_ids.numel()) != n_t:
+        distill_state.slot_cell_ids = t_idx.detach().clone()
+        distill_state.slot_dwell_age = torch.ones((n_t,), device=dev, dtype=torch.int32)
+        swapped = torch.ones((n_t,), device=dev, dtype=torch.bool)
+    else:
+        same_slot = distill_state.slot_cell_ids == t_idx
+        swapped = ~same_slot
+        distill_state.slot_cell_ids = t_idx.detach().clone()
+        distill_state.slot_dwell_age = torch.where(
+            same_slot,
+            distill_state.slot_dwell_age + 1,
+            torch.ones_like(distill_state.slot_dwell_age),
+        )
+
+    # 2. Execute 100% genuine 2 km CRM lightning strictly on active teacher columns (`[nz, n_t, ny_full, nx_full]`)
+    use_explicit = str(lightning_scheme).strip().lower() == "explicit_bulk"
+    if use_explicit:
+        if explicit_state is None or tuple(explicit_state.q_chg.shape) != (5, nz, n_t, ny_full, nx_full):
+            explicit_state = init_explicit_lightning_state(
+                nz=nz, n_cells=n_t, ny=ny_full, nx=nx_full, device=dev, dtype=dtype,
+            )
+        else:
+            # Zero-sync unconditional slot mask: swapped teacher cells reset to neutral; dwelling cells keep charge
+            keep_mask = (~swapped).to(dtype).view(1, 1, n_t, 1, 1)
+            explicit_state.q_chg.mul_(keep_mask)
+
+        diag_t = step_explicit_bulk_lightning_and_lnox(
+            state=explicit_state,
+            rho_d=teacher_crm.rho_d,
+            theta_m=teacher_crm.theta_m,
+            q_v=teacher_crm.q_v,
+            q_c=teacher_crm.q_c,
+            q_i=teacher_crm.q_i,
+            q_p=teacher_crm.q_p,
+            w_stag=teacher_crm.w,
+            z_c=z_c_host[:, t_idx],
+            dz_c=dz_c_host[:, t_idx],
+            area_cell=area_cell[t_idx],
+            dx=float(dx_crm),
+            dt=float(dt),
+            dy=float(dx_crm),
+            u_stag=getattr(teacher_crm, "u", None),
+            v_stag=getattr(teacher_crm, "v", None),
+            q_r_prog=getattr(teacher_crm, "q_r", None),
+            q_s_prog=getattr(teacher_crm, "q_s", None),
+            q_g_prog=getattr(teacher_crm, "q_g", None),
+            n_i_prog=getattr(teacher_crm, "n_i", None),
+            n_s_prog=getattr(teacher_crm, "n_s", None),
+            n_g_prog=getattr(teacher_crm, "n_g", None),
+        )
+    else:
+        diag_t = compute_crm_lightning_and_lnox(
+            rho_d=teacher_crm.rho_d,
+            theta_m=teacher_crm.theta_m,
+            q_v=teacher_crm.q_v,
+            q_i=teacher_crm.q_i,
+            q_p=teacher_crm.q_p,
+            w_stag=teacher_crm.w,
+            z_c=z_c_host[:, t_idx],
+            dz_c=dz_c_host[:, t_idx],
+            area_cell=area_cell[t_idx],
+            q_g_prog=getattr(teacher_crm, "q_g", None),
+            q_s_prog=getattr(teacher_crm, "q_s", None),
+        )
+
+    # 3. Extract 14 universal physical column features across all host cells
+    feats_all, conv_gate = extract_lightning_distill_features(
+        rho_host, theta_m_host, q_v_host, q_c_host, q_i_host, q_p_host,
+        z_c_host, dz_c_host, rain_3d, snow_3d, buoy_sfc,
+    )
+
+    # 4. Zero-sync fixed-shape push of teacher samples into all-sky & top-k active-storm Hurdle buffers
+    min_dwell = 2 if use_explicit else 1
+    mature_f = (distill_state.slot_dwell_age >= min_dwell).to(torch.float32)
+    x_t = feats_all[t_idx].detach()
+    fl_t = diag_t.flash_tot_cell.detach()
+    cg_t = diag_t.flash_cg_cell.detach()
+    ccd_t = diag_t.cold_cloud_km_sub.reshape(n_t, -1).mean(dim=-1).detach()
+    hit_t = (fl_t > 1.0e-14).to(torch.float32)
+    ccd_norm_t = torch.clamp(ccd_t / 15.0, 0.0, 1.0)
+
+    ptr_all0 = distill_state.all_ptr
+    sz_all0 = distill_state.all_size
+    distill_state.all_ptr, distill_state.all_size = _ring_push(distill_state.all_x, ptr_all0, sz_all0, x_t)
+    _ring_push(distill_state.all_hit, ptr_all0, sz_all0, hit_t)
+    _ring_push(distill_state.all_ccd, ptr_all0, sz_all0, ccd_norm_t)
+    _ring_push(distill_state.all_valid, ptr_all0, sz_all0, mature_f)
+
+    # Fixed-shape top-k storm extraction (zero `.item()` / `nonzero()` CPU-GPU sync!)
+    k_top = min(16, n_t)
+    top_fl, top_idx = torch.topk(fl_t * mature_f, k=k_top, dim=0)
+    top_valid = (top_fl > 1.0e-14).to(torch.float32)
+    top_x = x_t[top_idx]
+    top_y = torch.log1p(torch.clamp(top_fl, min=0.0) / LIGHTNING_FLASH_LOG_SCALE)
+    top_fcg = torch.clamp(cg_t[top_idx] / torch.clamp(top_fl, min=1.0e-18), 0.0, 1.0)
+
+    ptr_act0 = distill_state.act_ptr
+    sz_act0 = distill_state.act_size
+    distill_state.act_ptr, distill_state.act_size = _ring_push(distill_state.act_x, ptr_act0, sz_act0, top_x)
+    _ring_push(distill_state.act_y, ptr_act0, sz_act0, top_y)
+    _ring_push(distill_state.act_fcg, ptr_act0, sz_act0, top_fcg)
+    _ring_push(distill_state.act_valid, ptr_act0, sz_act0, top_valid)
+
+    # 5. Online Hurdle MLP training (2 fast masked mini-batch AdamW updates; zero CPU-GPU sync!)
+    if distill_state.all_size >= 32:
+        with torch.enable_grad():
+            distill_state.net.train()
+            b_all = min(256, distill_state.all_size)
+            b_act = min(128, distill_state.act_size)
+            for _ in range(2):
+                idx_a = torch.randint(0, distill_state.all_size, (b_all,), device=dev)
+                pred_a = distill_state.net(distill_state.all_x[idx_a])
+                w_m = distill_state.all_valid[idx_a]
+                w_m_sum = torch.clamp(w_m.sum(), min=1.0)
+                loss_hit = (
+                    F.binary_cross_entropy_with_logits(pred_a[:, 0], distill_state.all_hit[idx_a], reduction="none") * w_m
+                ).sum() / w_m_sum
+                loss_ccd = (
+                    ((torch.sigmoid(pred_a[:, 3]) - distill_state.all_ccd[idx_a]) ** 2) * w_m
+                ).sum() / w_m_sum
+                loss = loss_hit + 0.25 * loss_ccd
+
+                if b_act >= 4:
+                    idx_p = torch.randint(0, distill_state.act_size, (b_act,), device=dev)
+                    pred_p = distill_state.net(distill_state.act_x[idx_p])
+                    w_p = distill_state.act_valid[idx_p]
+                    w_p_sum = torch.clamp(w_p.sum(), min=1.0)
+                    has_p = (w_p.sum() > 0.5).to(torch.float32)
+                    loss_rate = (
+                        F.smooth_l1_loss(F.softplus(pred_p[:, 1]), distill_state.act_y[idx_p], reduction="none") * w_p
+                    ).sum() / w_p_sum
+                    loss_fcg = (
+                        F.binary_cross_entropy_with_logits(pred_p[:, 2], distill_state.act_fcg[idx_p], reduction="none") * w_p
+                    ).sum() / w_p_sum
+                    loss = loss + has_p * (loss_rate + 0.35 * loss_fcg)
+
+                distill_state.opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(distill_state.net.parameters(), 2.0)
+                distill_state.opt.step()
+                distill_state.grad_updates += 1
+
+    # 6. Predict student cells via Hurdle MLP (with physical zero-cloud gate & subgrid precip weighting)
+    flash_tot_sub = torch.zeros((nc, ny_out, nx_out), device=dev, dtype=dtype)
+    flash_cg_sub = torch.zeros((nc, ny_out, nx_out), device=dev, dtype=dtype)
+    f_cg_sub = torch.zeros((nc, ny_out, nx_out), device=dev, dtype=dtype)
+    ccd_km_sub = torch.zeros((nc, ny_out, nx_out), device=dev, dtype=dtype)
+
+    if int(s_idx.numel()) > 0:
+        with torch.no_grad():
+            distill_state.net.eval()
+            out_s = distill_state.net(feats_all[s_idx])
+            p_strike = torch.sigmoid(out_s[:, 0])
+            log_rate = torch.clamp(F.softplus(out_s[:, 1]), max=11.0)
+            f_cg_s = torch.sigmoid(out_s[:, 2])
+            ccd_s = 15.0 * torch.sigmoid(out_s[:, 3])
+            gate_s = conv_gate[s_idx]
+            if distill_state.grad_updates >= 10:
+                has_seen_storm = (distill_state.act_valid[: distill_state.act_size].sum() > 0.5).to(dtype)
+                flash_cell_s = has_seen_storm * gate_s * p_strike * (LIGHTNING_FLASH_LOG_SCALE * torch.expm1(log_rate))
+            else:
+                flash_cell_s = torch.zeros_like(gate_s)
+            cg_cell_s = flash_cell_s * f_cg_s
+
+            # Map cell-mean student lightning onto (ny_out, nx_out) preserving exact cell mean
+            prec_s = torch.clamp(rain_3d[s_idx] + snow_3d[s_idx], min=0.0)
+            if prec_s.shape[-2] != ny_out or prec_s.shape[-1] != nx_out:
+                prec_s = F.interpolate(
+                    prec_s.unsqueeze(1), size=(ny_out, nx_out), mode="nearest"
+                ).squeeze(1)
+            prec_mean = prec_s.mean(dim=(-2, -1), keepdim=True)
+            rel_w = torch.where(
+                prec_mean > 1.0e-10,
+                0.5 + 0.5 * (prec_s / torch.clamp(prec_mean, min=1.0e-10)),
+                torch.ones_like(prec_s),
+            )
+            rel_w = rel_w / torch.clamp(rel_w.mean(dim=(-2, -1), keepdim=True), min=1.0e-6)
+
+            flash_tot_sub[s_idx] = flash_cell_s.view(-1, 1, 1) * rel_w
+            flash_cg_sub[s_idx] = cg_cell_s.view(-1, 1, 1) * rel_w
+            f_cg_sub[s_idx] = f_cg_s.view(-1, 1, 1).expand(-1, ny_out, nx_out)
+            ccd_km_sub[s_idx] = ccd_s.view(-1, 1, 1).expand(-1, ny_out, nx_out)
+
+    # 7. Insert exact 2 km teacher CRM fields onto t_idx (downsampling to tile grid when has_pool=True)
+    def _map_teacher_3d(arr: torch.Tensor) -> torch.Tensor:
+        if arr.shape[-2] == ny_out and arr.shape[-1] == nx_out:
+            return arr
+        return F.adaptive_avg_pool2d(arr.unsqueeze(1), (ny_out, nx_out)).squeeze(1)
+
+    flash_tot_sub[t_idx] = _map_teacher_3d(diag_t.flash_tot_sub)
+    flash_cg_sub[t_idx] = _map_teacher_3d(diag_t.flash_cg_sub)
+    f_cg_sub[t_idx] = _map_teacher_3d(diag_t.f_cg_sub)
+    ccd_km_sub[t_idx] = _map_teacher_3d(diag_t.cold_cloud_km_sub)
+
+    distill_state.steps_seen += 1
+
+    # 8. Exact global mass-conserving Schumann & Huntrieser (2007) LNOx deposition
+    flash_tot_cell = flash_tot_sub.reshape(nc, -1).mean(dim=-1)
+    flash_cg_cell = flash_cg_sub.reshape(nc, -1).mean(dim=-1)
+    lnox_local_sub = LNOX_KG_N_PER_FLASH * flash_tot_sub
+    lnox_cell = lnox_local_sub.reshape(nc, -1).mean(dim=-1)
+    area_w = area_cell.to(device=dev, dtype=dtype)
+    area_sum = torch.clamp(area_w.sum(), min=1.0)
+    lnox_global_mean = (lnox_cell * area_w).sum() / area_sum
+
+    n_dep_lnox_sub = (
+        LNOX_LOCAL_DEP_FRAC * lnox_local_sub + (1.0 - LNOX_LOCAL_DEP_FRAC) * lnox_global_mean
+    )
+    n_dep_lnox_cell = n_dep_lnox_sub.reshape(nc, -1).mean(dim=-1)
+
+    return (
+        LightningDiagnostics(
+            flash_tot_sub=flash_tot_sub,
+            flash_cg_sub=flash_cg_sub,
+            f_cg_sub=f_cg_sub,
+            cold_cloud_km_sub=ccd_km_sub,
+            flash_tot_cell=flash_tot_cell,
+            flash_cg_cell=flash_cg_cell,
+            n_dep_lnox_sub=n_dep_lnox_sub,
+            n_dep_lnox_cell=n_dep_lnox_cell,
+        ),
+        explicit_state,
     )

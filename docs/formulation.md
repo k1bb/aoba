@@ -766,6 +766,8 @@ D_{\mathrm{N,LNOx}} &= 0.50\,Y_{\mathrm{N}}\mathcal{F}_{\mathrm{tot}} + 0.50\,\o
 \end{aligned} \tag{5.23}
 $$
 
+When Online Self-Distilling Superparameterization (`enable_crm_self_distill = true`) is active, full-resolution 2 km CRM lightning (`explicit_bulk` or `diagnostic`) executes strictly on the active teacher subset (`1 / stride` host cells, resetting newly rotated teacher slots to neutral charge while evolving dwelling slots continuously across `crm_distill_dwell_steps`), and a compact map-free two-part Hurdle MLP (`LightningSelfDistillNet`, taking 14 universal column thermodynamic, mixed-phase hydrometeor, CAPE-proxy, surface buoyancy, and precipitation features with a zero-cloud gate) distills strike probability $P(\mathcal{F}_{\mathrm{tot}} > 0 \mid \mathbf{x})$, conditional intensity $\mathbb{E}[\ln(1 + \mathcal{F}_{\mathrm{tot}}/\mathcal{F}_0) \mid \text{strike}, \mathbf{x}]$, and CG fraction $f_{\mathrm{CG}}$ online onto all student columns.
+
 ---
 
 ## 6. Boundary-Layer Turbulence, Roughness Sublayer (RSL), MYNN 2.5 & 3D Smagorinsky–Lilly SGS

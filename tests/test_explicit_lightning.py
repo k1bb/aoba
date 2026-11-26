@@ -251,6 +251,120 @@ def test_cpu_vs_gpu_parity() -> None:
     )
 
 
+def test_ossp_distilled_explicit_lightning(dev: torch.device) -> None:
+    """Verify OSSP teacher-CRM explicit_bulk lightning + Hurdle online self-distillation & coupled run."""
+    from aoba.crm import CRMState
+    from aoba.lightning_explicit import init_lightning_self_distill_state, step_ossp_distilled_lightning
+
+    nz, nc, ny_full, nx_full = 24, 24, 1, 8
+    n_t = 8
+    dx = 2000.0
+    dz_val = 600.0
+    dz_c = torch.full((nz, nc), dz_val, device=dev)
+    z_c = ((torch.arange(nz, device=dev, dtype=torch.float32) + 0.5) * dz_val).view(nz, 1).expand(nz, nc).contiguous()
+    area_cell = torch.full((nc,), 1.0e10, device=dev)
+
+    temp_1d = torch.clamp(300.0 - 6.5e-3 * z_c[:, 0], min=200.0)
+    pres_1d = 101325.0 * torch.pow(temp_1d / 300.0, 9.81 / (287.04 * 6.5e-3))
+    rho_1d = pres_1d / (287.04 * temp_1d)
+    exner_1d = torch.pow(pres_1d / 100000.0, 287.04 / 1004.64)
+    thm_1d = temp_1d / exner_1d
+
+    # Half of cells (even indices) are active deep convective storms; odd indices are dry clear sky
+    is_storm = (torch.arange(nc, device=dev) % 2 == 0).to(torch.float32)
+    z_km = z_c[:, 0] * 1.0e-3
+    rho_h = rho_1d.view(nz, 1).expand(nz, nc).contiguous()
+    thm_h = thm_1d.view(nz, 1).expand(nz, nc).contiguous()
+    qv_h = (8.0e-3 * torch.exp(-z_km / 3.0)).view(nz, 1) * (0.2 + 0.8 * is_storm.view(1, nc))
+    qc_h = (2.0e-3 * torch.exp(-((z_km - 6.5) / 1.8) ** 2)).view(nz, 1) * is_storm.view(1, nc)
+    qi_h = (1.0e-3 * torch.exp(-((z_km - 9.5) / 2.2) ** 2)).view(nz, 1) * is_storm.view(1, nc)
+    qg_h = (4.5e-3 * torch.exp(-((z_km - 7.5) / 2.5) ** 2)).view(nz, 1) * is_storm.view(1, nc)
+    qs_h = (2.0e-3 * torch.exp(-((z_km - 8.5) / 2.2) ** 2)).view(nz, 1) * is_storm.view(1, nc)
+    qr_h = (2.0e-3 * torch.exp(-((z_km - 2.5) / 1.5) ** 2)).view(nz, 1) * is_storm.view(1, nc)
+    qp_h = qr_h + qs_h + qg_h
+
+    rain_3d = (3.0e-4 * is_storm).view(nc, 1, 1).expand(nc, 1, 4).contiguous()
+    snow_3d = torch.zeros_like(rain_3d)
+    buoy_sfc = 0.04 * is_storm
+
+    t_idx = torch.arange(0, n_t, device=dev, dtype=torch.int64)
+    s_idx = torch.arange(n_t, nc, device=dev, dtype=torch.int64)
+
+    core_x = torch.zeros((1, 1, 1, nx_full), device=dev)
+    core_x[0, 0, 0, 3:5] = 1.0
+    z_w_km = torch.arange(nz + 1, device=dev, dtype=torch.float32) * (dz_val * 1.0e-3)
+    w_t = 12.0 * torch.exp(-((z_w_km - 7.0) / 3.0) ** 2).view(nz + 1, 1, 1, 1) * is_storm[t_idx].view(1, n_t, 1, 1) * core_x
+
+    teacher_crm = CRMState(
+        rho_d=rho_h[:, t_idx].view(nz, n_t, 1, 1).expand(nz, n_t, ny_full, nx_full).contiguous(),
+        u=torch.zeros((nz, n_t, ny_full, nx_full), device=dev),
+        v=torch.zeros((nz, n_t, ny_full, nx_full), device=dev),
+        w=w_t.contiguous(),
+        theta_m=thm_h[:, t_idx].view(nz, n_t, 1, 1).expand(nz, n_t, ny_full, nx_full).contiguous(),
+        q_n=(qv_h[:, t_idx] + qc_h[:, t_idx] + qi_h[:, t_idx]).view(nz, n_t, 1, 1).expand(nz, n_t, ny_full, nx_full).contiguous(),
+        q_p=qp_h[:, t_idx].view(nz, n_t, 1, 1).expand(nz, n_t, ny_full, nx_full).contiguous(),
+        q_v=qv_h[:, t_idx].view(nz, n_t, 1, 1).expand(nz, n_t, ny_full, nx_full).contiguous(),
+        q_c=(qc_h[:, t_idx].view(nz, n_t, 1, 1) * core_x).contiguous(),
+        q_i=(qi_h[:, t_idx].view(nz, n_t, 1, 1) * core_x).contiguous(),
+        qke=torch.full((nz, n_t, ny_full, nx_full), 0.1, device=dev),
+        dx=dx, dy=dx,
+        q_r=(qr_h[:, t_idx].view(nz, n_t, 1, 1) * core_x).contiguous(),
+        q_s=(qs_h[:, t_idx].view(nz, n_t, 1, 1) * core_x).contiguous(),
+        q_g=(qg_h[:, t_idx].view(nz, n_t, 1, 1) * core_x).contiguous(),
+    )
+
+    ld = init_lightning_self_distill_state(device=dev)
+    ex_st = None
+    diag = None
+    for _ in range(25):
+        diag, ex_st = step_ossp_distilled_lightning(
+            lightning_scheme="explicit_bulk",
+            explicit_state=ex_st,
+            distill_state=ld,
+            teacher_crm=teacher_crm,
+            t_idx=t_idx, s_idx=s_idx,
+            rho_host=rho_h, theta_m_host=thm_h, q_v_host=qv_h,
+            q_c_host=qc_h, q_i_host=qi_h, q_p_host=qp_h,
+            z_c_host=z_c, dz_c_host=dz_c, area_cell=area_cell,
+            rain_3d=rain_3d, snow_3d=snow_3d, buoy_sfc=buoy_sfc,
+            ny_out=1, nx_out=4, dx_crm=dx, dt=120.0, has_pool=True,
+        )
+
+    assert diag is not None and ex_st is not None
+    assert tuple(ex_st.q_chg.shape) == (5, nz, n_t, ny_full, nx_full)  # Teacher-only VRAM!
+    assert tuple(diag.flash_tot_sub.shape) == (nc, 1, 4)               # Tile-mapped global output!
+    stu_storm_fl = float(diag.flash_tot_cell[s_idx][is_storm[s_idx] > 0.5].mean().item())
+    stu_dry_fl = float(diag.flash_tot_cell[s_idx][is_storm[s_idx] < 0.5].max().item())
+    tea_storm_fl = float(diag.flash_tot_cell[t_idx][is_storm[t_idx] > 0.5].mean().item())
+    assert tea_storm_fl > 0.0 and stu_storm_fl > 0.0, f"Student failed to learn storms: tea={tea_storm_fl:.3e}, stu={stu_storm_fl:.3e}"
+    assert stu_dry_fl == 0.0, f"Expected strictly 0 dry-sky student lightning, got {stu_dry_fl:.3e}"
+
+    # Verify global LNOx mass conservation (area-weighted mean deposition == area-weighted mean production)
+    from aoba.lightning import LNOX_KG_N_PER_FLASH
+    prod_glob = float((diag.flash_tot_cell * LNOX_KG_N_PER_FLASH * area_cell).sum().item())
+    dep_glob = float((diag.n_dep_lnox_cell * area_cell).sum().item())
+    assert abs(prod_glob - dep_glob) / max(prod_glob, 1e-18) < 1.0e-5
+
+    # Verify coupled step_aoba_model with OSSP + explicit_bulk lightning
+    cfg = AOBAConfig(
+        glevel=2, nz=16, z_top=24000.0, crm_nx=4, crm_ny=1, crm_dx=4000.0,
+        dt_host=720.0, rad_scheme="four_band", microphysics_scheme="six_class_2m",
+        ocean_mode="ekman_sw", enable_lightning=True, lightning_scheme="explicit_bulk",
+        enable_crm_self_distill=True, crm_distill_stride=4, crm_distill_warmup_steps=1,
+        crm_distill_dwell_steps=4, use_earth2014=False,
+    )
+    model = init_aoba_model(cfg, device=dev)
+    for _ in range(4):
+        step_aoba_model(model)
+    assert model.lightning_distill is not None and model.explicit_lightning is not None
+    assert model.explicit_lightning.q_chg.shape[2] < model.mesh.n_cells  # Teacher-only pool!
+    assert torch.isfinite(model.last_lightning.flash_tot_cell).all()
+    print(
+        f"  [PASS] OSSP teacher explicit_bulk -> student Hurdle distillation on {dev}: "
+        f"tea_storm={tea_storm_fl:.2e}, stu_storm={stu_storm_fl:.2e}, stu_dry={stu_dry_fl:.1e} fl/m2/s"
+    )
+
+
 def main() -> None:
     print("Running SCALE-LT Explicit Bulk Lightning verification tests...")
     for dev in _devices():
@@ -258,6 +372,7 @@ def main() -> None:
         test_takahashi_polarity_reversal(dev)
         test_thunderstorm_dipole_and_breakdown(dev)
         test_coupled_explicit_bulk_integration(dev)
+        test_ossp_distilled_explicit_lightning(dev)
     test_cpu_vs_gpu_parity()
     print("ALL EXPLICIT BULK LIGHTNING TESTS PASSED!")
 

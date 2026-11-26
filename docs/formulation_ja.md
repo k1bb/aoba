@@ -766,6 +766,8 @@ D_{\mathrm{N,LNOx}} &= 0.50\,Y_{\mathrm{N}}\mathcal{F}_{\mathrm{tot}} + 0.50\,\o
 \end{aligned} \tag{5.23}
 $$
 
+オンライン自己蒸留超パラメータ化（`enable_crm_self_distill = true`）有効時は、フル解像度 2 km CRM 発雷（`explicit_bulk` または `diagnostic`）を活性教師セル集合（全セルの `1 / stride`、切替スロットのみ中立初期化し `crm_distill_dwell_steps` 間連続積分）上でのみ厳密実行し、14 個の普遍的コラム物理特徴量（降水・混合相雲水/氷水・CAPE 指標・地表面浮力フラックス等、ゼロ雲ゲート付き）から発雷確率 $P(\mathcal{F}_{\mathrm{tot}} > 0 \mid \mathbf{x})$・発雷時強度 $\mathbb{E}[\ln(1 + \mathcal{F}_{\mathrm{tot}}/\mathcal{F}_0) \mid \text{strike}, \mathbf{x}]$・対地雷割合 $f_{\mathrm{CG}}$ を予測するマップ不要の 2 段階 Hurdle MLP（`LightningSelfDistillNet`）によって全生徒セルへオンライン蒸留する。
+
 ---
 
 ## 6. 境界層乱流・粗度サブレイヤ (RSL)・MYNN 2.5・3D Smagorinsky–Lilly SGS
