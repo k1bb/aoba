@@ -1865,15 +1865,15 @@ def _step_ogcm_voronoi_impl(
         if ws_bc is None:
             nv = int(mesh.n_verts)
             ws_bc = {
-                "div": torch.empty((nzo, nc), device=dev, dtype=dtype),
-                "zeta": torch.empty((nzo, nv), device=dev, dtype=dtype),
-                "eta": torch.empty((nzo, ne), device=dev, dtype=dtype),
-                "lap2": torch.empty((nzo, ne), device=dev, dtype=dtype),
-                "lap4": torch.empty((nzo, ne), device=dev, dtype=dtype),
-                "f_fixed": torch.empty((nzo, ne), device=dev, dtype=dtype),
-                "cor": torch.empty((nzo, ne), device=dev, dtype=dtype),
-                "u_a": torch.empty((nzo, ne), device=dev, dtype=dtype),
-                "u_b": torch.empty((nzo, ne), device=dev, dtype=dtype),
+                "div": torch.zeros((nzo, nc), device=dev, dtype=dtype),
+                "zeta": torch.zeros((nzo, nv), device=dev, dtype=dtype),
+                "eta": torch.zeros((nzo, ne), device=dev, dtype=dtype),
+                "lap2": torch.zeros((nzo, ne), device=dev, dtype=dtype),
+                "lap4": torch.zeros((nzo, ne), device=dev, dtype=dtype),
+                "f_fixed": torch.zeros((nzo, ne), device=dev, dtype=dtype),
+                "cor": torch.zeros((nzo, ne), device=dev, dtype=dtype),
+                "u_a": torch.zeros((nzo, ne), device=dev, dtype=dtype),
+                "u_b": torch.zeros((nzo, ne), device=dev, dtype=dtype),
             }
             cache["ws_bc"] = ws_bc
         lap2_u_wet = dispatch_ogcm_vec_lap_wet_metal(
@@ -1904,6 +1904,7 @@ def _step_ogcm_voronoi_impl(
             cor_3d = dispatch_ogcm_trisk_coriolis_wet_metal(
                 mesh, u_edge=u_s, wet_vf=wet_vf, wet_ef=wet_ef,
                 zeta_buf=ws_bc["zeta"], eta_buf=ws_bc["eta"], rot_out=ws_bc["cor"],
+                pre_zeroed=True,
             )
             u_s = dispatch_ogcm_baroclinic_rk3_update_metal(
                 u0=u, u_s=u_s, cor_3d=cor_3d, f_fixed=f_fixed,

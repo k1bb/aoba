@@ -57,10 +57,14 @@ from aoba.kernels_physics import (
     PHYSICS_METAL_SHADER_SRC,
     run_crm_distill_closure_metal,
     run_crm_distill_extract_metal,
+    run_crm_ens_mean_unc_transpose_metal,
+    run_crm_spatial_head_metal,
     run_crm_student_tile_update_metal,
     run_diagnose_p_T_metal,
     run_dust_column_metal,
     run_natural_aerosol_4sp_metal,
+    run_ngwd_front_extract_metal,
+    run_ngwd_full_metal,
     run_ngwd_propagate_metal,
     run_ocean_bgc_column_metal,
     run_ogcm_baroclinic_f_fixed_metal,
@@ -1572,6 +1576,30 @@ def dispatch_diagnose_p_T_metal(
     lib = _get_gpu_lib(rho_d.device)
     assert lib is not None
     return run_diagnose_p_T_metal(lib, rho_d, theta_m, q_v)
+
+
+def dispatch_ngwd_front_extract_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_ngwd_front_extract_metal(lib, **kwargs)
+
+
+def dispatch_ngwd_full_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_ngwd_full_metal(lib, **kwargs)
+
+
+def dispatch_crm_spatial_head_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_crm_spatial_head_metal(lib, **kwargs)
+
+
+def dispatch_crm_ens_mean_unc_transpose_metal(**kwargs: Any) -> None:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    run_crm_ens_mean_unc_transpose_metal(lib, **kwargs)
 
 
 def dispatch_ogcm_mom_vdiff_metal(mesh: Any, **kwargs: Any) -> torch.Tensor:

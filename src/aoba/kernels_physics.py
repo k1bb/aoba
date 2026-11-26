@@ -5805,6 +5805,7 @@ kernel void crm_distill_closure_col(
 {
     uint nz = uint(u_pack.x);
     uint N = uint(u_pack.y);
+    bool is_soa = (uint(u_pack.z) != 0u);
     if (c >= N) return;
 
     float dt = f_p.x;
@@ -5825,6 +5826,7 @@ kernel void crm_distill_closure_col(
     uint rp_base = c * 8u * nz;
     uint rs_base = c * 3u;
     uint plane = nz * N;
+#define RP_LOAD(f_idx, k_idx) (is_soa ? raw_prof[((f_idx) * nz + (k_idx)) * N + c] : raw_prof[rp_base + (f_idx) * nz + (k_idx)])
 
     // Pass 1: column integrals for convective water, PBL SHF weight, enthalpy, momentum & flux-form cache
     float dm_sum_m = 0.0f;
@@ -5892,7 +5894,7 @@ kernel void crm_distill_closure_col(
 
             w_pre_conv += dm * (qn0 + qp0);
             float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
-            float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.0f);
+            float fp_sig = aoba_sigmoid(RP_LOAD(2u, k) - 2.0f);
             float qp_p = s_conv * min(qnb, 2.0e-3f) * (0.25f * (fp_sig * fp_sig));
             if (k < 64u) {
                 qsat_col[k] = qsat_env;
@@ -5918,8 +5920,8 @@ kernel void crm_distill_closure_col(
     // Pass 1b (in-place, zero scratch array): 2-pass [0.25, 0.50, 0.25] vertical binomial smoothing of rp[0], rp[1]
     for (uint k = 0u; k < nz_c; ++k) {
         float sc_k = sconv_col[k];
-        rp0_s[k] = (sc_k > 0.0f) ? (raw_prof[rp_base + 0u * nz + k] * sc_k) : 0.0f;
-        rp1_s[k] = (sc_k > 0.0f) ? (raw_prof[rp_base + 1u * nz + k] * sc_k) : 0.0f;
+        rp0_s[k] = (sc_k > 0.0f) ? (RP_LOAD(0u, k) * sc_k) : 0.0f;
+        rp1_s[k] = (sc_k > 0.0f) ? (RP_LOAD(1u, k) * sc_k) : 0.0f;
     }
     if (nz_c >= 3u) {
         for (int pass = 0; pass < 2; ++pass) {
@@ -5952,8 +5954,8 @@ kernel void crm_distill_closure_col(
             float l_gate = max(col_rh_gate, pbl_g);
             float d_temp_r = sc_k * l_gate * tanh(rp0_s[k] * 0.2f) * 0.15f;
             dh_raw += cp_d * dm_c_col[k] * d_temp_r;
-            float du_r = sc_k * l_gate * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 4.0f;
-            float dv_r = sc_k * l_gate * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 4.0f;
+            float du_r = sc_k * l_gate * tanh(RP_LOAD(5u, k) * 0.2f) * 4.0f;
+            float dv_r = sc_k * l_gate * tanh(RP_LOAD(6u, k) * 0.2f) * 4.0f;
             du_imp += dm_c_col[k] * du_r;
             dv_imp += dm_c_col[k] * dv_r;
             float dq_lim = l_gate * min(0.015f * qnb_col[k], 1.0e-4f);
@@ -6057,10 +6059,10 @@ kernel void crm_distill_closure_col(
 
             float rh_lin = clamp((qn_n / max(qsat_env, 1.0e-7f) - 0.55f) / 0.40f, 0.0f, 1.0f);
             float rh_gate = rh_lin * rh_lin;
-            float fc_sig = aoba_sigmoid(raw_prof[rp_base + 3u * nz + k] - 2.2f);
+            float fc_sig = aoba_sigmoid(RP_LOAD(3u, k) - 2.2f);
             float f_cond = s_conv * rh_gate * 0.95f * (fc_sig * fc_sig);
             float om_liq_p = clamp((t_env - 253.15f) / 20.0f, 0.0f, 1.0f);
-            float f_ice_nn = aoba_sigmoid(raw_prof[rp_base + 4u * nz + k]);
+            float f_ice_nn = aoba_sigmoid(RP_LOAD(4u, k));
             float f_ice = (t_env <= 253.15f) ? 1.0f : ((1.0f - om_liq_p) * f_ice_nn);
             float q_cond = max(qn_n * f_cond, max(qn_n - qsat_env, 0.0f));
             float qc_pf = q_cond * (1.0f - f_ice);
@@ -6078,7 +6080,7 @@ kernel void crm_distill_closure_col(
             rp1_s[k] += (qc_fall + qi_fall);
 
             d_m_qp += dm * (qp_n - qp0);
-            out_prof[8u * plane + idx] = s_conv * rh_gate * aoba_sigmoid(raw_prof[rp_base + 7u * nz + k] - 2.0f);
+            out_prof[8u * plane + idx] = s_conv * rh_gate * aoba_sigmoid(RP_LOAD(7u, k) - 2.0f);
         } else {
             out_prof[8u * plane + idx] = 0.0f;
         }
@@ -6130,7 +6132,7 @@ kernel void crm_distill_closure_col(
             float qi_n = out_prof[5u * plane + idx];
             float qf_plus_dqps = (k < 64u) ? rp1_s[k] : 0.0f;
             float d_temp_lat = (l_v0 * ((qc_n + qi_n) - (qc0 + qi0) + qf_plus_dqps) + l_f0 * (qi_n - qi0)) / cp_d;
-            float rp0_k = (k < 64u) ? rp0_s[k] : (raw_prof[rp_base + 0u * nz + k] * s_conv);
+            float rp0_k = (k < 64u) ? rp0_s[k] : (RP_LOAD(0u, k) * s_conv);
             float d_temp_r = s_conv * l_gate * tanh(rp0_k * 0.2f) * 0.15f;
             d_temp_cons = dT_shf_scale * pbl_sh + d_temp_lat + d_temp_r + h_corr * s_conv;
         }
@@ -6146,14 +6148,15 @@ kernel void crm_distill_closure_col(
             out_prof[idx] = clamp(thm_post_ls[idx], 150.0f, 10000.0f);
         }
         if (s_conv > 0.0f) {
-            float du_r = s_conv * l_gate * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 4.0f;
-            float dv_r = s_conv * l_gate * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 4.0f;
+            float du_r = s_conv * l_gate * tanh(RP_LOAD(5u, k) * 0.2f) * 4.0f;
+            float dv_r = s_conv * l_gate * tanh(RP_LOAD(6u, k) * 0.2f) * 4.0f;
             out_prof[6u * plane + idx] = u_pre[idx] + du_r + u_corr * s_conv;
             out_prof[7u * plane + idx] = v_pre[idx] + dv_r + v_corr * s_conv;
         } else {
             out_prof[6u * plane + idx] = u_pre[idx];
             out_prof[7u * plane + idx] = v_pre[idx];
         }
+#undef RP_LOAD
     }
 
     if (use_adj) {
@@ -6534,7 +6537,7 @@ kernel void ogcm_eta_edge_wet(
     device const float* f_vert      [[buffer(3)]],   // [nv]
     device const float* wet_ef      [[buffer(4)]],   // [nzo, ne]
     device float* eta_e             [[buffer(5)]],   // [nzo, ne]
-    constant ulong4& u_dim          [[buffer(6)]],   // [nzo, nv, ne, 0]
+    constant ulong4& u_dim          [[buffer(6)]],   // [nzo, nv, ne, pre_zeroed]
     uint gid                        [[thread_position_in_grid]])
 {
     uint nzo = uint(u_dim.x);
@@ -6542,7 +6545,7 @@ kernel void ogcm_eta_edge_wet(
     uint ne = uint(u_dim.z);
     if (gid >= nzo * ne) return;
     if (wet_ef[gid] < 0.5f) {
-        eta_e[gid] = 0.0f;
+        if (u_dim.w == 0u) eta_e[gid] = 0.0f;
         return;
     }
     uint k = gid / ne;
@@ -6560,33 +6563,548 @@ kernel void ogcm_trisk_rot_edge_wet(
     device const float* u_e         [[buffer(3)]],   // [nzo, ne]
     device const float* wet_ef      [[buffer(4)]],   // [nzo, ne]
     device float* rot_out           [[buffer(5)]],   // [nzo, ne]
-    constant ulong4& u_dim          [[buffer(6)]],   // [nzo, nv, ne, 0]
-    uint gid                        [[thread_position_in_grid]])
+    constant ulong4& u_dim          [[buffer(6)]],   // [nzo, nv, ne, pre_zeroed]
+    uint e                          [[thread_position_in_grid]])
 {
     uint nzo = uint(u_dim.x);
     uint ne = uint(u_dim.z);
-    if (gid >= nzo * ne) return;
-    if (wet_ef[gid] < 0.5f) {
-        rot_out[gid] = 0.0f;
+    bool pre_zeroed = (u_dim.w != 0u);
+    if (e >= ne) return;
+    if (wet_ef[e] < 0.5f) {
+        if (!pre_zeroed) {
+            for (uint k = 0u; k < nzo; ++k) rot_out[k * ne + e] = 0.0f;
+        }
         return;
     }
-    uint k = gid / ne;
-    uint e = gid - k * ne;
     uint e10 = e * 10u;
-    uint eb = k * ne;
-    float ee = eta_e[gid];
-    float acc = 0.0f;
+    uint ep_l[10];
+    float wt_l[10];
     for (uint s = 0u; s < 10u; ++s) {
-        float w = w_trisk[e10 + s];
-        if (w != 0.0f) {
-            uint ei = eb + uint(ep[e10 + s]);
-            float ue = u_e[ei];
-            if (ue != 0.0f) {
-                acc = fma(w * (0.5f * (ee + eta_e[ei])), ue, acc);
+        ep_l[s] = uint(ep[e10 + s]);
+        wt_l[s] = w_trisk[e10 + s];
+    }
+    for (uint k = 0u; k < nzo; ++k) {
+        uint idx = k * ne + e;
+        if (wet_ef[idx] < 0.5f) {
+            if (pre_zeroed) break;
+            rot_out[idx] = 0.0f;
+            continue;
+        }
+        uint eb = k * ne;
+        float ee = eta_e[idx];
+        float acc = 0.0f;
+        for (uint s = 0u; s < 10u; ++s) {
+            float w = wt_l[s];
+            if (w != 0.0f) {
+                uint ei = eb + ep_l[s];
+                float ue = u_e[ei];
+                if (ue != 0.0f) {
+                    acc = fma(w * (0.5f * (ee + eta_e[ei])), ue, acc);
+                }
+            }
+        }
+        rot_out[idx] = acc;
+    }
+}
+
+// =========================================================================
+// 27. Fused Non-Orographic GWD (Frontal + Convective) & OSSP Spatial/Ensemble Kernels
+// =========================================================================
+
+kernel void ngwd_front_extract_col(
+    device const float* pres_c      [[buffer(0)]],   // [nz, nc]
+    device const float* theta_m     [[buffer(1)]],   // [nz, nc]
+    device const float* u_cell      [[buffer(2)]],   // [nz, nc]
+    device const float* v_cell      [[buffer(3)]],   // [nz, nc]
+    device float* k_fr_out          [[buffer(4)]],   // [nc]
+    device float* th_fr_out         [[buffer(5)]],   // [nc]
+    device float* u_fr_out          [[buffer(6)]],   // [nc]
+    device float* v_fr_out          [[buffer(7)]],   // [nc]
+    constant ulong4& u_dim          [[buffer(8)]],   // [nz, nc, 0, 0]
+    constant float& p_target        [[buffer(9)]],
+    uint c                          [[thread_position_in_grid]])
+{
+    uint nz = uint(u_dim.x);
+    uint nc = uint(u_dim.y);
+    if (c >= nc || nz < 3u) return;
+    float best_d = 1.0e30f;
+    uint best_k = 1u;
+    for (uint k = 0u; k < nz; ++k) {
+        float d = fabs(pres_c[k * nc + c] - p_target);
+        if (d < best_d) {
+            best_d = d;
+            best_k = k;
+        }
+    }
+    uint kc = clamp(best_k, 1u, nz - 2u);
+    uint idx = kc * nc + c;
+    k_fr_out[c] = float(kc);
+    th_fr_out[c] = theta_m[idx];
+    u_fr_out[c] = u_cell[idx];
+    v_fr_out[c] = v_cell[idx];
+}
+
+kernel void ngwd_full_col(
+    device const float* rho_d       [[buffer(0)]],   // [nz, nc]
+    device const float* pres_c      [[buffer(1)]],   // [nz, nc]
+    device const float* u_cell      [[buffer(2)]],   // [nz, nc]
+    device const float* v_cell      [[buffer(3)]],   // [nz, nc]
+    device const float* theta_m     [[buffer(4)]],   // [nz, nc]
+    device const float* z_rel_c     [[buffer(5)]],   // [nz, nc]
+    device const float* dz_c        [[buffer(6)]],   // [nz, nc]
+    device const float* q_conv_c    [[buffer(7)]],   // [nz, nc] or [1]
+    device const float* fr_active   [[buffer(8)]],   // [nc] or [1]
+    device const float* k_fr_idx    [[buffer(9)]],   // [nc] or [1]
+    device const float* u_fr_in     [[buffer(10)]],  // [nc] or [1]
+    device const float* v_fr_in     [[buffer(11)]],  // [nc] or [1]
+    device const float* c_bins      [[buffer(12)]],  // [M]
+    device float* du_out            [[buffer(13)]],  // [nz, nc]
+    device float* dv_out            [[buffer(14)]],  // [nz, nc]
+    constant ulong4& u_dim          [[buffer(15)]],  // [nz, nc, M, (use_conv<<1)|use_front]
+    constant float4& f_p0           [[buffer(16)]],  // [gravity, k_h, dt, tend_max]
+    constant float4& f_p1           [[buffer(17)]],  // [front_tau0, front_cw, front_eff, dc]
+    constant float4& f_p2           [[buffer(18)]],  // [conv_tau0, conv_qref, conv_eff, 0]
+    uint c                          [[thread_position_in_grid]])
+{
+    uint nz = uint(u_dim.x);
+    uint nc = uint(u_dim.y);
+    uint M = uint(u_dim.z);
+    uint flags = uint(u_dim.w);
+    bool use_front = ((flags & 1u) != 0u);
+    bool use_conv = ((flags & 2u) != 0u);
+    if (c >= nc || nz < 4u || nz > 64u || M > 32u) return;
+
+    float gravity = f_p0.x;
+    float k_h = f_p0.y;
+    float inv_2dt = 0.5f / max(f_p0.z, 1.0f);
+    float tend_max = f_p0.w;
+    float c_min_crit = 2.0f;
+
+    float fr_act = use_front ? fr_active[c] : 0.0f;
+    bool do_front = use_front && (fr_act > 0.0f);
+
+    // Quick convective scan & early-out if column has neither frontal nor convective wave source!
+    float q_max = 0.0f;
+    if (use_conv) {
+        for (uint k = 0u; k < nz; ++k) {
+            uint idx = k * nc + c;
+            if (pres_c[idx] > 8000.0f) {
+                q_max = max(q_max, q_conv_c[idx]);
             }
         }
     }
-    rot_out[gid] = acc;
+    bool do_conv = use_conv && (q_max > 0.05f * f_p2.y);
+
+    if (!do_front && !do_conv) {
+        for (uint k = 0u; k < nz; ++k) {
+            uint idx = k * nc + c;
+            du_out[idx] = 0.0f;
+            dv_out[idx] = 0.0f;
+        }
+        return;
+    }
+
+    float n_int_a[64];
+    float du_col[64];
+    float dv_col[64];
+    float th_prev = theta_m[c];
+    float zr_prev = z_rel_c[c];
+    for (uint k = 0u; k < nz; ++k) {
+        du_col[k] = 0.0f;
+        dv_col[k] = 0.0f;
+        if (k + 1u < nz) {
+            uint idx1 = (k + 1u) * nc + c;
+            float th_cur = theta_m[idx1];
+            float zr_cur = z_rel_c[idx1];
+            float dz_i = max(zr_cur - zr_prev, 10.0f);
+            float th_i = max(0.5f * (th_cur + th_prev), 180.0f);
+            float n2_i = clamp((gravity / th_i) * (th_cur - th_prev) / dz_i, 2.5e-5f, 1.6e-3f);
+            n_int_a[k] = sqrt(n2_i);
+            th_prev = th_cur;
+            zr_prev = zr_cur;
+        }
+    }
+    n_int_a[nz - 1u] = n_int_a[nz - 2u];
+
+    float cb[32];
+    float sgn[32];
+    float tau_l[32];
+    float tau_p[32];
+    for (uint m = 0u; m < M; ++m) cb[m] = c_bins[m];
+
+    // 1. Frontal / jet-exit wave axis (only when fr_act > 0)
+    if (do_front) {
+        float u_f = u_fr_in[c];
+        float v_f = v_fr_in[c];
+        float spd_fr = sqrt(u_f * u_f + v_f * v_f + 1.0e-4f);
+        float ux_fr = u_f / spd_fr;
+        float uy_fr = v_f / spd_fr;
+        int kl = int(k_fr_idx[c] + 0.5f);
+        float inv_cw = 1.0f / max(f_p1.y, 5.0f);
+        float norm_g = 0.0f;
+        for (uint m = 0u; m < M; ++m) {
+            float cr = cb[m] - spd_fr;
+            sgn[m] = (cr >= 0.0f) ? 1.0f : -1.0f;
+            float g_v = (fabs(cr) > c_min_crit) ? exp(-(cr * inv_cw) * (cr * inv_cw)) : 0.0f;
+            tau_l[m] = g_v;
+            tau_p[m] = 0.0f;
+            norm_g += g_v;
+        }
+        float t_scale = (f_p1.x * fr_act) / max(norm_g, 1.0e-6f);
+        for (uint m = 0u; m < M; ++m) tau_l[m] *= t_scale;
+
+        float sat_prefac = 0.5f * k_h * f_p1.z;
+        float u_cur = u_cell[uint(kl) * nc + c] * ux_fr + v_cell[uint(kl) * nc + c] * uy_fr;
+        float r_cur = rho_d[uint(kl) * nc + c];
+        for (uint k = uint(kl); k < nz; ++k) {
+            uint cidx = k * nc + c;
+            float inv_mass = 1.0f / max(r_cur * dz_c[cidx], 1.0e-4f);
+            float r_nxt = (k + 1u < nz) ? rho_d[cidx + nc] : r_cur;
+            float u_nxt = (k + 1u < nz) ? (u_cell[cidx + nc] * ux_fr + v_cell[cidx + nc] * uy_fr) : u_cur;
+            float rw = 0.5f * (r_cur + r_nxt);
+            float uw = 0.5f * (u_cur + u_nxt);
+            float sat_base = sat_prefac * (rw / max(n_int_a[k], 5.0e-3f));
+            bool is_l = (k == uint(kl));
+            float acc = 0.0f;
+            for (uint m = 0u; m < M; ++m) {
+                float tin = is_l ? tau_l[m] : tau_p[m];
+                float c_hat = cb[m] - uw;
+                float sg = sgn[m];
+                float tout = 0.0f;
+                if (c_hat * sg > c_min_crit) {
+                    float ac = fabs(c_hat);
+                    tout = min(tin, sat_base * (ac * ac * ac));
+                }
+                float dtau = max(tin - tout, 0.0f);
+                float max_acc = inv_2dt * fabs(cb[m] - u_cur);
+                acc += clamp((sg * dtau) * inv_mass, -max_acc, max_acc);
+                tau_p[m] = tout;
+            }
+            float acc_c = clamp(acc, -tend_max, tend_max);
+            du_col[k] += acc_c * ux_fr;
+            dv_col[k] += acc_c * uy_fr;
+            r_cur = r_nxt;
+            u_cur = u_nxt;
+        }
+    }
+
+    // 2. Convective wave axes (zonal + meridional, only when has_conv)
+    if (do_conv) {
+        float q_thr = 0.10f * q_max;
+        float h_depth = 0.0f;
+        uint k_top = 1u;
+        float wq_sum = 0.0f, u_h_num = 0.0f, v_h_num = 0.0f, n_h_num = 0.0f;
+        for (uint k = 0u; k < nz; ++k) {
+            uint idx = k * nc + c;
+            float qt = (pres_c[idx] > 8000.0f) ? max(q_conv_c[idx], 0.0f) : 0.0f;
+            float dz_k = dz_c[idx];
+            if (qt > q_thr) {
+                h_depth += dz_k;
+                k_top = k;
+            }
+            float wq = qt * dz_k;
+            wq_sum += wq;
+            u_h_num += wq * u_cell[idx];
+            v_h_num += wq * v_cell[idx];
+            n_h_num += wq * n_int_a[k];
+        }
+        h_depth = clamp(h_depth, 1000.0f, 16000.0f);
+        uint kl_c = clamp(k_top, 1u, nz - 2u);
+        float inv_wq = 1.0f / max(wq_sum, 1.0e-12f);
+        float u_h = u_h_num * inv_wq;
+        float v_h = v_h_num * inv_wq;
+        float n_h = clamp(n_h_num * inv_wq, 8.0e-3f, 2.5e-2f);
+        float sigma_c = clamp(n_h * h_depth * (1.0f / 3.14159265359f), 10.0f, 60.0f);
+        float inv_sig = 1.0f / sigma_c;
+        float q_amp = min(q_max / max(f_p2.y, 1.0e-8f), 4.0f);
+        float tau_scale = 0.5f * f_p2.x * (q_amp * q_amp) * (10.0f / max(f_p1.w, 1.0f));
+        float sat_prefac = 0.5f * k_h * f_p2.z;
+
+        for (uint ax = 0u; ax < 2u; ++ax) {
+            float u_src = (ax == 0u) ? u_h : v_h;
+            device const float* vel = (ax == 0u) ? u_cell : v_cell;
+            float norm_s = 0.0f;
+            for (uint m = 0u; m < M; ++m) {
+                float cr = cb[m] - u_src;
+                sgn[m] = (cr >= 0.0f) ? 1.0f : -1.0f;
+                float xm = fabs(cr) * inv_sig;
+                float sp = (fabs(cr) > c_min_crit) ? (xm * exp(-0.5f * xm * xm)) : 0.0f;
+                tau_l[m] = sp;
+                tau_p[m] = 0.0f;
+                norm_s += sp;
+            }
+            float t_sc = tau_scale / max(norm_s, 1.0e-6f);
+            for (uint m = 0u; m < M; ++m) tau_l[m] *= t_sc;
+
+            float u_cur = vel[kl_c * nc + c];
+            float r_cur = rho_d[kl_c * nc + c];
+            for (uint k = kl_c; k < nz; ++k) {
+                uint cidx = k * nc + c;
+                float inv_mass = 1.0f / max(r_cur * dz_c[cidx], 1.0e-4f);
+                float r_nxt = (k + 1u < nz) ? rho_d[cidx + nc] : r_cur;
+                float u_nxt = (k + 1u < nz) ? vel[cidx + nc] : u_cur;
+                float rw = 0.5f * (r_cur + r_nxt);
+                float uw = 0.5f * (u_cur + u_nxt);
+                float sat_base = sat_prefac * (rw / max(n_int_a[k], 5.0e-3f));
+                bool is_l = (k == kl_c);
+                float acc = 0.0f;
+                for (uint m = 0u; m < M; ++m) {
+                    float tin = is_l ? tau_l[m] : tau_p[m];
+                    float c_hat = cb[m] - uw;
+                    float sg = sgn[m];
+                    float tout = 0.0f;
+                    if (c_hat * sg > c_min_crit) {
+                        float ac = fabs(c_hat);
+                        tout = min(tin, sat_base * (ac * ac * ac));
+                    }
+                    float dtau = max(tin - tout, 0.0f);
+                    float max_acc = inv_2dt * fabs(cb[m] - u_cur);
+                    acc += clamp((sg * dtau) * inv_mass, -max_acc, max_acc);
+                    tau_p[m] = tout;
+                }
+                float acc_c = clamp(acc, -tend_max, tend_max);
+                if (ax == 0u) du_col[k] += acc_c;
+                else          dv_col[k] += acc_c;
+                r_cur = r_nxt;
+                u_cur = u_nxt;
+            }
+        }
+    }
+
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * nc + c;
+        du_out[idx] = du_col[k];
+        dv_out[idx] = dv_col[k];
+    }
+}
+
+kernel void crm_spatial_head_eval(
+    device const float* sub_maps    [[buffer(0)]],   // [B, c_in, ny, nx]
+    device const float* gb          [[buffer(1)]],   // [B, 32]
+    device const float* w1          [[buffer(2)]],   // [16, 6, kh, 3] (kh=1 if ny==1 else 3)
+    device const float* b1          [[buffer(3)]],   // [16]
+    device const float* w2          [[buffer(4)]],   // [16, 16, kh, 3]
+    device const float* b2          [[buffer(5)]],   // [16]
+    device const float* wo          [[buffer(6)]],   // [5, 16]
+    device const float* bo          [[buffer(7)]],   // [5]
+    device float* score_cld         [[buffer(8)]],   // [B, ny, nx]
+    device float* score_prec        [[buffer(9)]],   // [B, ny, nx]
+    device float* dthm_cp           [[buffer(10)]],  // [B, ny, nx]
+    device float* dqv_cp            [[buffer(11)]],  // [B, ny, nx]
+    device float* u_gust            [[buffer(12)]],  // [B, ny, nx]
+    constant ulong4& u_dim          [[buffer(13)]],  // [B, c_in, ny, nx]
+    uint tg_id                      [[threadgroup_position_in_grid]],
+    uint lid                        [[thread_position_in_threadgroup]],
+    uint simd_lane                  [[thread_index_in_simdgroup]])
+{
+    uint B = uint(u_dim.x);
+    uint c_in = uint(u_dim.y);
+    uint ny = uint(u_dim.z);
+    uint nx = uint(u_dim.w);
+    uint n_sub = ny * nx;
+    uint b_per_tg = 32u / n_sub;
+    uint loc_b = lid / n_sub;
+    uint s = lid - loc_b * n_sub;
+    uint b = tg_id * b_per_tg + loc_b;
+    bool active = (b < B);
+    uint b_s = active ? b : 0u;
+    uint iy = s / nx;
+    uint ix = s - iy * nx;
+    uint lane_base = simd_lane - s;
+    uint ixm = (ix > 0u) ? (ix - 1u) : (nx - 1u);
+    uint ixp = (ix + 1u < nx) ? (ix + 1u) : 0u;
+
+    float x_in[6];
+    for (uint ci = 0u; ci < 6u; ++ci) {
+        x_in[ci] = (ci < c_in) ? sub_maps[((b_s * c_in + ci) * ny + iy) * nx + ix] : 0.0f;
+    }
+
+    float s_act[16];
+    for (uint co = 0u; co < 16u; ++co) s_act[co] = b1[co];
+
+    if (ny == 1u) {
+        ushort lx0 = ushort(lane_base + ixm);
+        ushort lx1 = ushort(lane_base + ix);
+        ushort lx2 = ushort(lane_base + ixp);
+        for (uint ci = 0u; ci < 6u; ++ci) {
+            float xv = x_in[ci];
+            float v0 = simd_shuffle(xv, lx0);
+            float v1 = xv;
+            float v2 = simd_shuffle(xv, lx2);
+            for (uint co = 0u; co < 16u; ++co) {
+                uint wb = (co * 6u + ci) * 3u;
+                s_act[co] = fma(w1[wb], v0, fma(w1[wb + 1u], v1, fma(w1[wb + 2u], v2, s_act[co])));
+            }
+        }
+    } else {
+        uint iym = (iy > 0u) ? (iy - 1u) : (ny - 1u);
+        uint iyp = (iy + 1u < ny) ? (iy + 1u) : 0u;
+        uint ys[3] = {iym, iy, iyp};
+        uint xs[3] = {ixm, ix, ixp};
+        for (uint ci = 0u; ci < 6u; ++ci) {
+            float xv = x_in[ci];
+            for (uint dy = 0u; dy < 3u; ++dy) {
+                uint ynb = ys[dy] * nx;
+                for (uint dx = 0u; dx < 3u; ++dx) {
+                    float vn = simd_shuffle(xv, ushort(lane_base + ynb + xs[dx]));
+                    uint tap = dy * 3u + dx;
+                    for (uint co = 0u; co < 16u; ++co) {
+                        s_act[co] = fma(w1[(co * 6u + ci) * 9u + tap], vn, s_act[co]);
+                    }
+                }
+            }
+        }
+    }
+
+    // SiLU -> FiLM modulation -> SiLU
+    uint gb_base = b_s * 32u;
+    for (uint co = 0u; co < 16u; ++co) {
+        float h = s_act[co] * aoba_sigmoid(s_act[co]);
+        float g = gb[gb_base + co];
+        float bt = gb[gb_base + 16u + co];
+        float f = h * (1.0f + 0.25f * tanh(g)) + 0.25f * bt;
+        s_act[co] = f * aoba_sigmoid(f);
+    }
+
+    // Conv2 + residual
+    float s2[16];
+    for (uint co = 0u; co < 16u; ++co) s2[co] = b2[co];
+    if (ny == 1u) {
+        ushort lx0 = ushort(lane_base + ixm);
+        ushort lx2 = ushort(lane_base + ixp);
+        for (uint ci = 0u; ci < 16u; ++ci) {
+            float sv = s_act[ci];
+            float v0 = simd_shuffle(sv, lx0);
+            float v1 = sv;
+            float v2 = simd_shuffle(sv, lx2);
+            for (uint co = 0u; co < 16u; ++co) {
+                uint wb = (co * 16u + ci) * 3u;
+                s2[co] = fma(w2[wb], v0, fma(w2[wb + 1u], v1, fma(w2[wb + 2u], v2, s2[co])));
+            }
+        }
+    } else {
+        uint iym = (iy > 0u) ? (iy - 1u) : (ny - 1u);
+        uint iyp = (iy + 1u < ny) ? (iy + 1u) : 0u;
+        uint ys[3] = {iym, iy, iyp};
+        uint xs[3] = {ixm, ix, ixp};
+        for (uint ci = 0u; ci < 16u; ++ci) {
+            float sv = s_act[ci];
+            for (uint dy = 0u; dy < 3u; ++dy) {
+                uint ynb = ys[dy] * nx;
+                for (uint dx = 0u; dx < 3u; ++dx) {
+                    float vn = simd_shuffle(sv, ushort(lane_base + ynb + xs[dx]));
+                    uint tap = dy * 3u + dx;
+                    for (uint co = 0u; co < 16u; ++co) {
+                        s2[co] = fma(w2[(co * 16u + ci) * 9u + tap], vn, s2[co]);
+                    }
+                }
+            }
+        }
+    }
+    for (uint co = 0u; co < 16u; ++co) {
+        s_act[co] += s2[co] * aoba_sigmoid(s2[co]);
+    }
+
+    // 1x1 conv_out -> 5 spatial maps + zero-mean cold-pool reductions via simd_shuffle_xor
+    float lg[5];
+    for (uint o = 0u; o < 5u; ++o) {
+        float acc = bo[o];
+        uint ob = o * 16u;
+        for (uint ci = 0u; ci < 16u; ++ci) {
+            acc = fma(wo[ob + ci], s_act[ci], acc);
+        }
+        lg[o] = acc;
+    }
+    float dt_raw = 8.0f * tanh(lg[2] * 0.25f);
+    float dq_raw = 6.0e-3f * tanh(lg[3] * 0.25f);
+    float dt_sum = dt_raw;
+    float dq_sum = dq_raw;
+    for (uint off = 1u; off < n_sub; off <<= 1u) {
+        dt_sum += simd_shuffle_xor(dt_sum, ushort(off));
+        dq_sum += simd_shuffle_xor(dq_sum, ushort(off));
+    }
+    float inv_nsub = 1.0f / float(n_sub);
+    float ug_v = clamp(aoba_softplus(lg[4] - 2.0f) * 2.0f, 0.0f, 15.0f);
+
+    if (active) {
+        uint out_i = b_s * n_sub + s;
+        score_cld[out_i]  = lg[0];
+        score_prec[out_i] = lg[1];
+        dthm_cp[out_i]    = dt_raw - dt_sum * inv_nsub;
+        dqv_cp[out_i]     = dq_raw - dq_sum * inv_nsub;
+        u_gust[out_i]     = ug_v;
+    }
+}
+
+kernel void crm_ens_mean_unc_transpose(
+    device const float* pa          [[buffer(0)]],   // [B_c, 8, nz]
+    device const float* sa          [[buffer(1)]],   // [B_c, 3]
+    device const float* pb          [[buffer(2)]],   // [B_c, 8, nz]
+    device const float* sb          [[buffer(3)]],   // [B_c, 3]
+    device float* p_mean_soa        [[buffer(4)]],   // [8, nz, N_tot]
+    device float* s_mean            [[buffer(5)]],   // [N_tot, 3]
+    device float* unc_out           [[buffer(6)]],   // [N_tot]
+    constant ulong4& u_dim          [[buffer(7)]],   // [B_c, nz, N_tot, col_off]
+    uint tg_id                      [[threadgroup_position_in_grid]],
+    uint lid                        [[thread_position_in_threadgroup]])
+{
+    uint B_c = uint(u_dim.x);
+    uint nz = uint(u_dim.y);
+    uint N_tot = uint(u_dim.z);
+    uint col_off = uint(u_dim.w);
+
+    uint b_base = tg_id * 32u;
+    uint b_rows = (b_base < B_c) ? min(32u, B_c - b_base) : 0u;
+    if (b_rows == 0u) return;
+
+    threadgroup float sm_m[32 * 33];
+    threadgroup float sm_d[32 * 33];
+
+    float u_prof_sum = 0.0f;
+    uint col_g = col_off + b_base + lid;
+    bool col_ok = (lid < b_rows);
+
+    for (uint f = 0u; f < 8u; ++f) {
+        for (uint k0 = 0u; k0 < nz; k0 += 32u) {
+            uint k_len = min(32u, nz - k0);
+            uint k_r = k0 + lid;
+            bool k_ok = (lid < k_len);
+            for (uint r = 0u; r < b_rows; ++r) {
+                float mv = 0.0f;
+                float dv = 0.0f;
+                if (k_ok) {
+                    uint src_i = ((b_base + r) * 8u + f) * nz + k_r;
+                    float a = pa[src_i];
+                    float b = pb[src_i];
+                    mv = 0.5f * (a + b);
+                    dv = fabs(a - b);
+                }
+                sm_m[r * 33u + lid] = mv;
+                sm_d[r * 33u + lid] = dv;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (col_ok) {
+                for (uint j = 0u; j < k_len; ++j) {
+                    p_mean_soa[(f * nz + k0 + j) * N_tot + col_g] = sm_m[lid * 33u + j];
+                    u_prof_sum += sm_d[lid * 33u + j];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (col_ok) {
+        uint src_s = (b_base + lid) * 3u;
+        uint dst_s = col_g * 3u;
+        float u_scal = 0.0f;
+        for (uint j = 0u; j < 3u; ++j) {
+            float a = sa[src_s + j];
+            float b = sb[src_s + j];
+            s_mean[dst_s + j] = 0.5f * (a + b);
+            u_scal += fabs(a - b);
+        }
+        unc_out[col_g] = u_prof_sum / (8.0f * float(nz)) + u_scal * (1.0f / 3.0f);
+    }
 }
 """
 
@@ -7837,8 +8355,9 @@ def run_ogcm_trisk_coriolis_wet_metal(
     zeta_buf: torch.Tensor | None = None,
     eta_buf: torch.Tensor | None = None,
     rot_out: torch.Tensor | None = None,
+    pre_zeroed: bool = False,
 ) -> torch.Tensor:
-    """Coalesced wet-skipping 3D OGCM vorticity + eta_e + TRiSK Coriolis."""
+    """Coalesced wet-skipping vorticity/eta + hoisted seafloor-skipping TRiSK Coriolis."""
     nzo, ne = u_edge.shape
     nv = int(mc["n_verts"])
     dev = u_edge.device
@@ -7847,10 +8366,145 @@ def run_ogcm_trisk_coriolis_wet_metal(
     rot = rot_out if rot_out is not None else torch.empty((nzo, ne), device=dev, dtype=torch.float32)
     u_c = u_edge.contiguous()
     we_c = wet_ef.contiguous()
+    pz = 1 if (pre_zeroed and eta_buf is not None and rot_out is not None) else 0
     lib.ogcm_vorticity_vert_wet(mc["eov"], mc["vort_w"], u_c, wet_vf.contiguous(), zeta_v, [nzo, nv, ne, 0], threads=nzo * nv)
-    lib.ogcm_eta_edge_wet(mc["v0"], mc["v1"], zeta_v, mc["f_vert"], we_c, eta_e, [nzo, nv, ne, 0], threads=nzo * ne)
-    lib.ogcm_trisk_rot_edge_wet(mc["ep"], mc["w_trisk"], eta_e, u_c, we_c, rot, [nzo, nv, ne, 0], threads=nzo * ne)
+    lib.ogcm_eta_edge_wet(mc["v0"], mc["v1"], zeta_v, mc["f_vert"], we_c, eta_e, [nzo, nv, ne, pz], threads=nzo * ne)
+    lib.ogcm_trisk_rot_edge_wet(mc["ep"], mc["w_trisk"], eta_e, u_c, we_c, rot, [nzo, nv, ne, pz], threads=ne)
     return rot
+
+
+def run_ngwd_front_extract_metal(
+    lib: Any,
+    pres_c: torch.Tensor,
+    theta_m: torch.Tensor,
+    u_cell: torch.Tensor,
+    v_cell: torch.Tensor,
+    p_target_pa: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    nz, nc = pres_c.shape
+    dev = pres_c.device
+    dtype = pres_c.dtype
+    k_fr = torch.empty((nc,), device=dev, dtype=dtype)
+    th_fr = torch.empty((nc,), device=dev, dtype=dtype)
+    u_fr = torch.empty((nc,), device=dev, dtype=dtype)
+    v_fr = torch.empty((nc,), device=dev, dtype=dtype)
+    lib.ngwd_front_extract_col(
+        pres_c.contiguous(), theta_m.contiguous(), u_cell.contiguous(), v_cell.contiguous(),
+        k_fr, th_fr, u_fr, v_fr,
+        [nz, nc, 0, 0], float(p_target_pa), threads=nc,
+    )
+    return k_fr, th_fr, u_fr, v_fr
+
+
+def run_ngwd_full_metal(
+    lib: Any,
+    rho_d: torch.Tensor,
+    pres_c: torch.Tensor,
+    u_cell: torch.Tensor,
+    v_cell: torch.Tensor,
+    theta_m: torch.Tensor,
+    z_rel_c: torch.Tensor,
+    dz_c: torch.Tensor,
+    q_conv_c: torch.Tensor | None,
+    fr_active: torch.Tensor | None,
+    k_fr_idx: torch.Tensor | None,
+    u_fr: torch.Tensor | None,
+    v_fr: torch.Tensor | None,
+    c_bins: torch.Tensor,
+    use_front: bool,
+    use_conv: bool,
+    k_h: float,
+    dt: float,
+    tend_max: float,
+    front_tau0: float,
+    front_cw: float,
+    front_eff: float,
+    dc: float,
+    conv_tau0: float,
+    conv_qref: float,
+    conv_eff: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    nz, nc = rho_d.shape
+    dev = rho_d.device
+    dtype = rho_d.dtype
+    dummy_f = rho_d.view(-1)
+    du_out = torch.empty_like(u_cell)
+    dv_out = torch.empty_like(v_cell)
+    flags = (2 if use_conv else 0) | (1 if use_front else 0)
+    lib.ngwd_full_col(
+        rho_d.contiguous(), pres_c.contiguous(), u_cell.contiguous(), v_cell.contiguous(),
+        theta_m.contiguous(), z_rel_c.contiguous(), dz_c.contiguous(),
+        q_conv_c.contiguous() if q_conv_c is not None else dummy_f,
+        fr_active.contiguous() if fr_active is not None else dummy_f,
+        k_fr_idx.contiguous() if k_fr_idx is not None else dummy_f,
+        u_fr.contiguous() if u_fr is not None else dummy_f,
+        v_fr.contiguous() if v_fr is not None else dummy_f,
+        c_bins.contiguous(), du_out, dv_out,
+        [nz, nc, int(c_bins.numel()), flags],
+        [float(C.GRAVITY), float(k_h), float(dt), float(tend_max)],
+        [float(front_tau0), float(front_cw), float(front_eff), float(dc)],
+        [float(conv_tau0), float(conv_qref), float(conv_eff), 0.0],
+        threads=nc,
+    )
+    return du_out, dv_out
+
+
+def run_crm_spatial_head_metal(
+    lib: Any,
+    sub_maps: torch.Tensor,
+    gb: torch.Tensor,
+    w1: torch.Tensor,
+    b1: torch.Tensor,
+    w2: torch.Tensor,
+    b2: torch.Tensor,
+    wo: torch.Tensor,
+    bo: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, c_in, ny, nx = sub_maps.shape
+    n_sub = int(ny * nx)
+    dev = sub_maps.device
+    w1_use = w1.sum(dim=2).contiguous() if ny == 1 else w1.contiguous()
+    w2_use = w2.sum(dim=2).contiguous() if ny == 1 else w2.contiguous()
+    sc = torch.empty((B, ny, nx), device=dev, dtype=torch.float32)
+    sp = torch.empty((B, ny, nx), device=dev, dtype=torch.float32)
+    dt_cp = torch.empty((B, ny, nx), device=dev, dtype=torch.float32)
+    dq_cp = torch.empty((B, ny, nx), device=dev, dtype=torch.float32)
+    ug = torch.empty((B, ny, nx), device=dev, dtype=torch.float32)
+    b_per_tg = 32 // n_sub
+    n_tg = (B + b_per_tg - 1) // b_per_tg
+    lib.crm_spatial_head_eval(
+        sub_maps.float().contiguous(), gb.float().contiguous(),
+        w1_use.float(), b1.float().contiguous(),
+        w2_use.float(), b2.float().contiguous(),
+        wo.float().contiguous(), bo.float().contiguous(),
+        sc, sp, dt_cp, dq_cp, ug,
+        [B, c_in, ny, nx],
+        threads=(n_tg * 32,), group_size=(32,),
+    )
+    return sc, sp, dt_cp, dq_cp, ug
+
+
+def run_crm_ens_mean_unc_transpose_metal(
+    lib: Any,
+    pa: torch.Tensor,
+    sa: torch.Tensor,
+    pb: torch.Tensor,
+    sb: torch.Tensor,
+    p_mean_soa: torch.Tensor,
+    s_mean: torch.Tensor,
+    unc_out: torch.Tensor,
+    col_off: int,
+) -> None:
+    B_c, _, nz = pa.shape
+    N_tot = int(unc_out.shape[0])
+    n_tg = (B_c + 31) // 32
+    lib.crm_ens_mean_unc_transpose(
+        pa.float().contiguous(), sa.float().contiguous(),
+        pb.float().contiguous(), sb.float().contiguous(),
+        p_mean_soa, s_mean, unc_out,
+        [B_c, nz, N_tot, int(col_off)],
+        threads=(n_tg * 32,), group_size=(32,),
+    )
 
 
 def run_diagnose_p_T_metal(
@@ -8407,6 +9061,7 @@ def run_crm_distill_closure_metal(
     tau_x: torch.Tensor,
     tau_y: torch.Tensor,
     dt: float,
+    is_soa: bool = False,
 ) -> dict[str, torch.Tensor]:
     nz, n_col = rho_d.shape
     dev = rho_d.device
@@ -8421,7 +9076,7 @@ def run_crm_distill_closure_metal(
         qp_pre.contiguous(), qc_pre.contiguous(), qi_pre.contiguous(),
         u_pre.contiguous(), v_pre.contiguous(), sfc_5,
         out_prof, out_scal,
-        [nz, n_col, 0, 0],
+        [nz, n_col, 1 if is_soa else 0, 0],
         [float(dt), float(C.CP_D), float(C.L_V0), float(C.L_F0)],
         [float(C.RV_OVER_RD), float(C.P_REF), float(C.T_FREEZE), float(C.EPS_WATER)],
         threads=n_col,

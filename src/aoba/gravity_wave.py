@@ -38,7 +38,12 @@ import math
 import torch
 
 from aoba import constants as C
-from aoba.kernels import can_use_crm_metal, dispatch_ngwd_propagate_metal
+from aoba.kernels import (
+    can_use_crm_metal,
+    dispatch_ngwd_front_extract_metal,
+    dispatch_ngwd_full_metal,
+    dispatch_ngwd_propagate_metal,
+)
 from aoba.runtime import can_use_cuda_graph, run_cuda_graph_cached
 from aoba.scvt_mesh import SCVTMesh
 
@@ -278,17 +283,43 @@ def _compute_nonorographic_gwd_impl(
     dtype = rho_d.dtype
     device = rho_d.device
 
-    # 1. Brunt-Vaisala frequency N at internal interfaces [Nz - 1, N_cells]
-    dz_int = torch.clamp(z_rel_c[1:] - z_rel_c[:-1], min=10.0)
-    thm_int = torch.clamp(0.5 * (theta_m[1:] + theta_m[:-1]), min=180.0)
-    n2_int = torch.clamp((C.GRAVITY / thm_int) * (theta_m[1:] - theta_m[:-1]) / dz_int, 2.5e-5, 1.6e-3)
-    n_int = torch.sqrt(n2_int)
-
     # Discrete ground-based phase-speed spectrum [-c_max, ..., +c_max]
     n_bins = max(int(n_phase_bins), 5)
     c_bins = torch.linspace(-NGWD_CMAX, NGWD_CMAX, n_bins, device=device, dtype=dtype)
     dc = float((2.0 * NGWD_CMAX) / max(n_bins - 1, 1))
     k_h = 2.0 * math.pi / max(NGWD_WAVELENGTH_M, 1.0e4)
+    use_front = NGWD_FRONT_TAU0 > 0.0 and NGWD_FRONT_EFF > 0.0
+    use_conv = q_conv_c is not None and NGWD_CONV_TAU0 > 0.0 and NGWD_CONV_EFF > 0.0
+
+    if not use_front and not use_conv:
+        z = torch.zeros_like(u_cell)
+        return z, z
+
+    if can_use_crm_metal(rho_d) and nz <= 64 and n_bins <= 32:
+        k_fr_idx = u_fr = v_fr = fr_active = None
+        if use_front:
+            k_fr_idx, th_fr, u_fr, v_fr = dispatch_ngwd_front_extract_metal(
+                pres_c=pres_c, theta_m=theta_m, u_cell=u_cell, v_cell=v_cell,
+                p_target_pa=NGWD_FRONT_LAUNCH_HPA * 100.0,
+            )
+            ff = compute_frontogenesis_2d(mesh, th_fr, u_fr, v_fr)
+            ff_ratio = (ff - NGWD_FRONT_THRESH) / max(NGWD_FRONT_THRESH, 1.0e-18)
+            fr_active = torch.sigmoid(2.5 * ff_ratio) * (ff > 0.5 * NGWD_FRONT_THRESH).to(dtype)
+        return dispatch_ngwd_full_metal(
+            rho_d=rho_d, pres_c=pres_c, u_cell=u_cell, v_cell=v_cell,
+            theta_m=theta_m, z_rel_c=z_rel_c, dz_c=dz_c, q_conv_c=q_conv_c,
+            fr_active=fr_active, k_fr_idx=k_fr_idx, u_fr=u_fr, v_fr=v_fr,
+            c_bins=c_bins, use_front=use_front, use_conv=use_conv,
+            k_h=k_h, dt=dt, tend_max=NGWD_TEND_MAX,
+            front_tau0=NGWD_FRONT_TAU0, front_cw=NGWD_FRONT_CW, front_eff=NGWD_FRONT_EFF, dc=dc,
+            conv_tau0=NGWD_CONV_TAU0, conv_qref=NGWD_CONV_QREF, conv_eff=NGWD_CONV_EFF,
+        )
+
+    # 1. Brunt-Vaisala frequency N at internal interfaces [Nz - 1, N_cells]
+    dz_int = torch.clamp(z_rel_c[1:] - z_rel_c[:-1], min=10.0)
+    thm_int = torch.clamp(0.5 * (theta_m[1:] + theta_m[:-1]), min=180.0)
+    n2_int = torch.clamp((C.GRAVITY / thm_int) * (theta_m[1:] - theta_m[:-1]) / dz_int, 2.5e-5, 1.6e-3)
+    n_int = torch.sqrt(n2_int)
 
     u_proj_list: list[torch.Tensor] = []
     tau_list: list[torch.Tensor] = []
@@ -296,7 +327,6 @@ def _compute_nonorographic_gwd_impl(
     u_src_list: list[torch.Tensor] = []
     eff_list: list[float] = []
 
-    use_front = NGWD_FRONT_TAU0 > 0.0 and NGWD_FRONT_EFF > 0.0
     if use_front:
         p_target_pa = NGWD_FRONT_LAUNCH_HPA * 100.0
         k_fr_idx = torch.clamp(torch.argmin(torch.abs(pres_c - p_target_pa), dim=0), min=1, max=nz - 2)

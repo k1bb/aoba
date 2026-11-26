@@ -57,6 +57,8 @@ from aoba.kernels import (
     can_use_elem_metal,
     dispatch_crm_distill_closure_metal,
     dispatch_crm_distill_extract_metal,
+    dispatch_crm_ens_mean_unc_transpose_metal,
+    dispatch_crm_spatial_head_metal,
     dispatch_rad_distill_closure_metal,
     dispatch_rad_distill_extract_metal,
     mean_2d,
@@ -870,6 +872,24 @@ class SubgridSpatialHead(nn.Module):
         self, h_col: torch.Tensor, sub_maps: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return `(score_cld, score_prec, dthm_cp [K], dqv_cp [kg kg^-1], u_gust [m s^-1])`."""
+        ny_m, nx_m = int(sub_maps.shape[2]), int(sub_maps.shape[3])
+        n_sub_m = ny_m * nx_m
+        if (
+            not torch.is_grad_enabled()
+            and self.c_hid == 16
+            and 1 < n_sub_m <= 32
+            and (32 % n_sub_m == 0)
+            and int(sub_maps.shape[1]) <= _N_SPATIAL_IN
+            and sub_maps.device.type in ("mps", "cuda")
+            and can_use_elem_metal(self.conv1.weight)
+        ):
+            gb = self.film(h_col)
+            return dispatch_crm_spatial_head_metal(
+                sub_maps=sub_maps, gb=gb,
+                w1=self.conv1.weight, b1=self.conv1.bias,
+                w2=self.conv2.weight, b2=self.conv2.bias,
+                wo=self.conv_out.weight.view(5, 16), bo=self.conv_out.bias,
+            )
         if int(sub_maps.shape[1]) < _N_SPATIAL_IN:
             pad_c = _N_SPATIAL_IN - int(sub_maps.shape[1])
             z_pad = torch.zeros(
@@ -1834,10 +1854,18 @@ def predict_student_columns(
             u_i, v_i, shf_i, evap_i, tx_i, ty_i,
         ) = inp[0:16]
         sm_i = inp[16] if len(inp) > 16 else None
-        pa_all = torch.empty((n_s, _N_PROF_OUT, nz), device=dev, dtype=torch.float32)
-        sa_all = torch.empty((n_s, _N_SCAL_OUT), device=dev, dtype=torch.float32)
-        pb_all = torch.empty((n_s, _N_PROF_OUT, nz), device=dev, dtype=torch.float32)
-        sb_all = torch.empty((n_s, _N_SCAL_OUT), device=dev, dtype=torch.float32)
+        use_fused_ens = can_use_elem_metal(rho_i)
+        if use_fused_ens:
+            p_mean_soa = torch.empty((_N_PROF_OUT, nz, n_s), device=dev, dtype=torch.float32)
+            s_mean_all = torch.empty((n_s, _N_SCAL_OUT), device=dev, dtype=torch.float32)
+            unc_v = torch.empty((n_s,), device=dev, dtype=torch.float32)
+            pa_all = sa_all = pb_all = sb_all = None
+        else:
+            p_mean_soa = s_mean_all = unc_v = None
+            pa_all = torch.empty((n_s, _N_PROF_OUT, nz), device=dev, dtype=torch.float32)
+            sa_all = torch.empty((n_s, _N_SCAL_OUT), device=dev, dtype=torch.float32)
+            pb_all = torch.empty((n_s, _N_PROF_OUT, nz), device=dev, dtype=torch.float32)
+            sb_all = torch.empty((n_s, _N_SCAL_OUT), device=dev, dtype=torch.float32)
         if want_sp and sm_i is not None:
             ny_s, nx_s = int(sm_i.shape[-2]), int(sm_i.shape[-1])
             sc_all = torch.empty((n_s, ny_s, nx_s), device=dev, dtype=torch.float32)
@@ -1866,10 +1894,18 @@ def predict_student_columns(
                 pa, sa, pb, sb, h_lat = state.net.forward_with_latent(x_i[i0:i1])
                 if want_sp and sm_i is not None:
                     sc_c, sp_c, dtc_c, dqc_c, ugc_c = state.net.spatial_head(h_lat, sm_i[i0:i1])
-            pa_all[i0:i1] = pa.float()
-            sa_all[i0:i1] = sa.float()
-            pb_all[i0:i1] = pb.float()
-            sb_all[i0:i1] = sb.float()
+            if use_fused_ens:
+                assert p_mean_soa is not None and s_mean_all is not None and unc_v is not None
+                dispatch_crm_ens_mean_unc_transpose_metal(
+                    pa=pa, sa=sa, pb=pb, sb=sb,
+                    p_mean_soa=p_mean_soa, s_mean=s_mean_all, unc_out=unc_v, col_off=i0,
+                )
+            else:
+                assert pa_all is not None and sa_all is not None and pb_all is not None and sb_all is not None
+                pa_all[i0:i1] = pa.float()
+                sa_all[i0:i1] = sa.float()
+                pb_all[i0:i1] = pb.float()
+                sb_all[i0:i1] = sb.float()
             if want_sp and sc_all is not None and sp_all is not None and dt_cp_all is not None and dq_cp_all is not None and ug_all is not None:
                 sc_all[i0:i1] = sc_c.float()
                 sp_all[i0:i1] = sp_c.float()
@@ -1877,13 +1913,25 @@ def predict_student_columns(
                 dq_cp_all[i0:i1] = dqc_c.float()
                 ug_all[i0:i1] = ugc_c.float()
 
-        p_mean = 0.5 * (pa_all + pb_all)
-        s_mean = 0.5 * (sa_all + sb_all)
-        out_d = apply_exact_conservation_closure(
-            p_mean, s_mean, rho_i, dz_i, ex_i, ts_i, thm_i, qn_i,
-            qp_i, qc_i, qi_i, u_i, v_i, shf_i, evap_i, tx_i, ty_i, dt,
-        )
-        unc_v = (pa_all - pb_all).abs().reshape(n_s, -1).mean(dim=-1) + (sa_all - sb_all).abs().mean(dim=1)
+        if use_fused_ens:
+            assert p_mean_soa is not None and s_mean_all is not None and unc_v is not None
+            out_d = dispatch_crm_distill_closure_metal(
+                raw_prof=p_mean_soa, raw_scal=s_mean_all,
+                rho_d=rho_i, dz_c=dz_i, exner=ex_i, temp_sfc=ts_i,
+                thm_post_ls=thm_i, qn_post_ls=qn_i,
+                qp_pre=qp_i, qc_pre=qc_i, qi_pre=qi_i,
+                u_pre=u_i, v_pre=v_i, shf=shf_i, evap=evap_i,
+                tau_x=tx_i, tau_y=ty_i, dt=dt, is_soa=True,
+            )
+        else:
+            assert pa_all is not None and sa_all is not None and pb_all is not None and sb_all is not None
+            p_mean = 0.5 * (pa_all + pb_all)
+            s_mean = 0.5 * (sa_all + sb_all)
+            out_d = apply_exact_conservation_closure(
+                p_mean, s_mean, rho_i, dz_i, ex_i, ts_i, thm_i, qn_i,
+                qp_i, qc_i, qi_i, u_i, v_i, shf_i, evap_i, tx_i, ty_i, dt,
+            )
+            unc_v = (pa_all - pb_all).abs().reshape(n_s, -1).mean(dim=-1) + (sa_all - sb_all).abs().mean(dim=1)
         res = [
             out_d["theta_m"], out_d["q_n"], out_d["q_p"], out_d["q_v"], out_d["q_c"], out_d["q_i"],
             out_d["u"], out_d["v"], out_d["f_cld"],
