@@ -379,13 +379,15 @@ def apply_exact_conservation_closure(
     qsat_env = torch.clamp(C.EPS_WATER * es_env / torch.clamp(p_env - es_env, min=100.0), min=1.0e-7, max=0.10)
     dm = torch.clamp(rho_d * dz_c, min=1.0e-6)                # [nz, N] kg m^-2
 
-    # Column moisture activity gate (RH_max > 0.72) ensures dry, clear, stably stratified columns evolve
-    # under pure host dynamics + radiation + MYNN PBL mixing with zero spurious ML drift, while moist
-    # and convective columns receive full 3D convective heating, moisture, cloud, and momentum tendencies.
+    # Column moisture activity gate (RH_max > 0.72) keeps dry upper/mid-tropospheric air free of
+    # spurious ML drift, while a smooth boundary-layer gate pbl_gate (p >= 690 hPa, z <= ~3.1 km)
+    # remains active on clear subtropical columns so students capture the exact CRM - 1D_MYNN PBL
+    # heat/moisture/momentum mixing residual without creating SST or evaporation biases.
     conv_f = in_conv.to(dm.dtype)
     rh_pre_max = (qn0 / torch.clamp(qsat_env, min=1.0e-7) * conv_f).amax(dim=0)
     col_rh_gate = torch.clamp((rh_pre_max - 0.72) / 0.25, min=0.0, max=1.0)
-    conv_gate = col_rh_gate.unsqueeze(0)
+    pbl_gate = torch.clamp((exner - 0.90) / 0.05, min=0.0, max=1.0)
+    layer_gate = torch.maximum(col_rh_gate.unsqueeze(0), pbl_gate)
 
     # Vertically smooth raw convective heating & moisture logits with 2-pass [0.25, 0.5, 0.25]
     # binomial filter (zero transfer at 2*dz) so neural residuals represent coherent convective
@@ -399,13 +401,13 @@ def apply_exact_conservation_closure(
             rp1_mid = 0.25 * rp1_s[:-2] + 0.50 * rp1_s[1:-1] + 0.25 * rp1_s[2:]
             rp1_s = torch.cat([0.75 * rp1_s[:1] + 0.25 * rp1_s[1:2], rp1_mid, 0.25 * rp1_s[-2:-1] + 0.75 * rp1_s[-1:]], dim=0)
 
-    # Predict physically bounded convective temperature & momentum residuals gated by column moisture activity
-    d_temp_raw = s_conv * conv_gate * torch.tanh(rp0_s * 0.2) * 0.15
+    # Predict physically bounded convective/PBL temperature & momentum residuals
+    d_temp_raw = s_conv * layer_gate * torch.tanh(rp0_s * 0.2) * 0.15
     f_qp_logit = rp[2]
     f_cond_logit = rp[3]
     f_ice_logit = rp[4]
-    d_u_raw = s_conv * conv_gate * torch.tanh(rp[5] * 0.2) * 4.0  # bounded [m s^-1] per step
-    d_v_raw = s_conv * conv_gate * torch.tanh(rp[6] * 0.2) * 4.0
+    d_u_raw = s_conv * layer_gate * torch.tanh(rp[5] * 0.2) * 4.0  # bounded [m s^-1] per step
+    d_v_raw = s_conv * layer_gate * torch.tanh(rp[6] * 0.2) * 4.0
     f_prec_pred = col_rh_gate * torch.sigmoid(raw_scal[:, 2] - 1.0)  # subgrid precipitating area fraction in [0, 1)
 
     dm_sum_m = torch.clamp((dm * s_conv).sum(dim=0), min=1.0e-3)
@@ -421,10 +423,10 @@ def apply_exact_conservation_closure(
     p_tot_mass = torch.where(w_avail_conv > 0.05, p_tot_mass, torch.zeros_like(p_tot_mass))
 
     # Apply surface evaporation into lowest layer, then smooth moisture-proportional zero-sum convective
-    # transport gated by col_rh_gate (strictly zero in dry/clear air; never injects phantom q_sat water aloft).
+    # and PBL transport gated by layer_gate (zero in dry air aloft; active in PBL on clear ocean).
     qn_base = qn0.clone()
     qn_base[0] = torch.clamp(qn_base[0] + (evap * dt) / torch.clamp(dm[0], min=1.0e-4), min=0.0)
-    dq_lim = conv_gate * torch.clamp(0.015 * qn_base, max=1.0e-4)
+    dq_lim = layer_gate * torch.clamp(0.015 * qn_base, max=1.0e-4)
     d_qn_raw = s_conv * torch.tanh(rp1_s * 0.2) * dq_lim
     w_bal = conv_f * dq_lim * (qn_base * 1.0e3)
     dm_dqn_sum = (dm * conv_f * d_qn_raw).sum(dim=0)
@@ -1300,11 +1302,18 @@ def _select_hybrid_teacher_indices(
             rot_idx = torch.nonzero(cohort_id == active_cohort, as_tuple=False).squeeze(-1)
             base_sel = rot_idx[:min(int(rot_idx.numel()), n_teach)]
     elif dwell_steps >= 48 and stride >= 3 and n_teach >= 8:
-        anchor_all = torch.nonzero(cohort_id == 0, as_tuple=False).squeeze(-1)
+        # Slowly rotating multi-day anchor backbone (8 * dwell_steps >= 480 steps = 4 days at dt=720 s)
+        # preserves multi-day convective self-aggregation memory while rotating uniformly across all
+        # cohorts so zero ocean/land/sea-ice cells ever suffer permanent surface-flux imprinting.
+        dwell_anchor = max(8 * dwell_steps, 480)
+        post_steps = steps_seen - warmup_steps
+        anchor_cohort = (post_steps // dwell_anchor) % stride
+        anchor_all = torch.nonzero(cohort_id == anchor_cohort, as_tuple=False).squeeze(-1)
         n_anchor = min(int(anchor_all.numel()), max(n_teach // 2, 1))
         anchor_sel = anchor_all[:n_anchor]
 
-        rot_cohort = 1 + (((steps_seen - warmup_steps) // dwell_steps) % (stride - 1))
+        rot_offset = 1 + ((post_steps // dwell_steps) % (stride - 1))
+        rot_cohort = (anchor_cohort + rot_offset) % stride
         rot_all = torch.nonzero(cohort_id == rot_cohort, as_tuple=False).squeeze(-1)
         n_rot_keep = min(int(rot_all.numel()), max(n_teach - n_anchor - n_ood, 0))
         base_sel = torch.cat([anchor_sel, rot_all[:n_rot_keep]], dim=0) if n_rot_keep > 0 else anchor_sel

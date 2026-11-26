@@ -1142,7 +1142,7 @@ def _step_crm_physics_and_dynamics_impl(
         # Wicker & Skamarock, 2002 stability limit is 1.25 in 2D -> 0.675 gives dt_sub = 45 s at dx = 4 km),
         # while step_crm_rk3_hevi sub-steps horizontal acoustic waves automatically.
         cfl_adv = 0.675 if is_2d_crm else 0.45
-        u_ref_cfl = 60.0
+        u_ref_cfl = 60.0 if is_2d_crm else 75.0
         dt_cfl_max = min(45.0 if is_2d_crm else 60.0, cfl_adv * min(crm.dx, crm.dy) / u_ref_cfl)
         n_sub = max(n_dyn_substeps, int(math.ceil(dt_crm / max(dt_cfl_max, 0.1))))
     dt_sub = dt_crm / float(max(n_sub, 1))

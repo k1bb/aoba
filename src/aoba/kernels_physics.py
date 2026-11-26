@@ -5593,11 +5593,6 @@ kernel void crm_distill_closure_col(
             }
 
             denom_h += cp_d * dm * s_conv;
-
-            float du_r = s_conv * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 4.0f;
-            float dv_r = s_conv * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 4.0f;
-            du_imp += dm * du_r;
-            dv_imp += dm * dv_r;
         } else if (k < 128u) {
             qsat_col[k] = 1.0e-7f;
             qnb_col[k] = 0.0f;
@@ -5608,15 +5603,12 @@ kernel void crm_distill_closure_col(
     float dm_sum_safe = max(dm_sum_m, 1.0e-3f);
     float w_avail_conv = max(w_pre_conv + evap * dt, 1.0e-8f);
     float col_rh_gate = clamp((rh_pre_max - 0.72f) / 0.25f, 0.0f, 1.0f);
-    // Scale raw column-integrated convective momentum residuals by col_rh_gate (linear in gate)
-    du_imp *= col_rh_gate;
-    dv_imp *= col_rh_gate;
     float pf_sig = aoba_sigmoid(raw_scal[rs_base + 0u] - 2.0f);
     float p_frac = 0.25f * col_rh_gate * (pf_sig * pf_sig);
     float p_tot_mass = (w_avail_conv > 0.05f) ? max(p_frac * w_avail_conv, 0.0f) : 0.0f;
 
     // Pass 1b (register-only): 2-pass [0.25, 0.50, 0.25] vertical binomial smoothing of rp[0], rp[1]
-    // to eliminate 2*dz sawtooth injection, followed by moisture-proportional zero-sum redistribution.
+    // to eliminate 2*dz sawtooth injection, followed by layer-gated convective & PBL redistribution.
     float rp0_s[128];
     float rp1_s[128];
     float tmp_s[128];
@@ -5649,9 +5641,16 @@ kernel void crm_distill_closure_col(
     float dqnr_col[128];
     for (uint k = 0u; k < nz; ++k) {
         if (k < 128u && sconv_col[k] > 0.0f) {
-            float d_temp_r = sconv_col[k] * col_rh_gate * tanh(rp0_s[k] * 0.2f) * 0.15f;
+            float ex_k = exner[k * N + c];
+            float pbl_g = clamp((ex_k - 0.90f) / 0.05f, 0.0f, 1.0f);
+            float l_gate = max(col_rh_gate, pbl_g);
+            float d_temp_r = sconv_col[k] * l_gate * tanh(rp0_s[k] * 0.2f) * 0.15f;
             dh_raw += cp_d * dm_c_col[k] * d_temp_r;
-            float dq_lim = col_rh_gate * min(0.015f * qnb_col[k], 1.0e-4f);
+            float du_r = sconv_col[k] * l_gate * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 4.0f;
+            float dv_r = sconv_col[k] * l_gate * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 4.0f;
+            du_imp += dm_c_col[k] * du_r;
+            dv_imp += dm_c_col[k] * dv_r;
+            float dq_lim = l_gate * min(0.015f * qnb_col[k], 1.0e-4f);
             float dqn_r = sconv_col[k] * tanh(rp1_s[k] * 0.2f) * dq_lim;
             float wb = dq_lim * (qnb_col[k] * 1.0e3f);
             wbal_col[k] = wb;
@@ -5819,6 +5818,7 @@ kernel void crm_distill_closure_col(
         float qv0 = max(qn0 - qc0 - qi0, 0.0f);
         float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
         float d_temp_cons = 0.0f;
+        float l_gate = max(col_rh_gate, clamp((ex - 0.90f) / 0.05f, 0.0f, 1.0f));
         if (s_conv > 0.0f) {
             float pbl_sh = clamp(1.0f - (ex0 - ex) * inv_pbl_ex, 0.0f, 1.0f) * s_conv;
             float qc_n = out_prof[4u * plane + idx];
@@ -5827,7 +5827,7 @@ kernel void crm_distill_closure_col(
             float dqps_k = (k < 128u) ? dqps_col[k] : 0.0f;
             float d_temp_lat = (l_v0 * ((qc_n + qi_n + qf_k) - (qc0 + qi0) + dqps_k) + l_f0 * (qi_n - qi0)) / cp_d;
             float rp0_k = (k < 128u) ? rp0_s[k] : (raw_prof[rp_base + 0u * nz + k] * s_conv);
-            float d_temp_r = s_conv * col_rh_gate * tanh(rp0_k * 0.2f) * 0.15f;
+            float d_temp_r = s_conv * l_gate * tanh(rp0_k * 0.2f) * 0.15f;
             d_temp_cons = dT_shf_scale * pbl_sh + d_temp_lat + d_temp_r + h_corr * s_conv;
         }
         if (use_adj) {
@@ -5844,8 +5844,8 @@ kernel void crm_distill_closure_col(
             out_prof[idx] = clamp(thm_post_ls[idx], 150.0f, 10000.0f);
         }
         if (s_conv > 0.0f) {
-            float du_r = s_conv * col_rh_gate * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 4.0f;
-            float dv_r = s_conv * col_rh_gate * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 4.0f;
+            float du_r = s_conv * l_gate * tanh(raw_prof[rp_base + 5u * nz + k] * 0.2f) * 4.0f;
+            float dv_r = s_conv * l_gate * tanh(raw_prof[rp_base + 6u * nz + k] * 0.2f) * 4.0f;
             out_prof[6u * plane + idx] = u_pre[idx] + du_r + u_corr * s_conv;
             out_prof[7u * plane + idx] = v_pre[idx] + dv_r + v_corr * s_conv;
         } else {
