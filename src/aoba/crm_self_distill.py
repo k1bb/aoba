@@ -435,15 +435,15 @@ def apply_exact_conservation_closure(
     d_qn_bal = d_qn_raw - (dm_dqn_sum / dm_wbal_sum).unsqueeze(0) * w_bal
     qn_trans = torch.clamp(qn_base + d_qn_bal, min=0.0)
 
-    # Predict suspended precipitating hydrometeors q_p cleanly without rescaling q_n:
-    # pre-existing falling q_p (qp0 > qp_prov) exits directly as surface precipitation rather than
-    # being sprayed back into q_n across upper-tropospheric layers via a column multiplier.
+    # Predict suspended precipitating hydrometeors q_p cleanly without rescaling q_n or
+    # self-amplifying pre-existing qp0: gated by col_rh_gate and bounded by moist air qn_base
+    # so student cells never convert cloud/vapor into invisible suspended q_p clear-sky holes.
     fp_sig = torch.sigmoid(f_qp_logit - 2.0)
-    qp_prov = s_conv * torch.clamp(qn_base + qp0, max=6.0e-3) * (0.5 * (fp_sig * fp_sig))
+    qp_prov = s_conv * col_rh_gate.unsqueeze(0) * torch.clamp(qn_base, max=2.0e-3) * (0.25 * (fp_sig * fp_sig))
     w_qn_tr = (dm * conv_f * qn_trans).sum(dim=0)
     w_qp0 = (dm * conv_f * qp0).sum(dim=0)
     w_qp_prov = (dm * conv_f * qp_prov).sum(dim=0)
-    qp_cap_col = w_qp0 + 0.5 * w_qn_tr
+    qp_cap_col = w_qp0 + 0.15 * w_qn_tr
     qp_sc = torch.where(
         w_qp_prov > qp_cap_col,
         qp_cap_col / torch.clamp(w_qp_prov, min=1.0e-6),
@@ -453,11 +453,12 @@ def apply_exact_conservation_closure(
     w_qp_conv = (dm * conv_f * qp_conv).sum(dim=0)
 
     # Extract only the net non-precipitating sink needed for precipitation + suspended q_p growth,
-    # preferentially from cloudy/high-RH layers (qc0 + qi0 and RH > 0.60).
+    # preferentially from warm liquid clouds and moist lower/mid-tropospheric layers so heavy warm
+    # rain does not strip cold upper-tropospheric cirrus anvils dry (preventing clear-sky OLR holes).
     p_need_qn = torch.clamp(p_tot_mass + (w_qp_conv - w_qp0), min=0.0)
     rh_trans = torch.clamp(qn_trans / torch.clamp(qsat_env, min=1.0e-7), min=0.0, max=2.0)
     rh_p = torch.clamp((rh_trans - 0.60) / 0.35, min=0.0, max=1.0)
-    w_p_layer = conv_f * (qn_trans * (rh_p * rh_p + 0.01) + 5.0 * (qc0 + qi0))
+    w_p_layer = conv_f * (qn_trans * (rh_p * rh_p + 0.01) + 2.0 * qc0 + 0.25 * qi0)
     w_p_sum = torch.clamp((dm * w_p_layer).sum(dim=0), min=1.0e-6)
     dq_psink = torch.minimum(
         (p_need_qn / w_p_sum).unsqueeze(0) * w_p_layer,
@@ -471,9 +472,10 @@ def apply_exact_conservation_closure(
 
     # Partition convective q_n into (q_v, q_c, q_i) strictly preserving q_v + q_c + q_i == q_n
     # and thermodynamic saturation consistency (q_v <= qsat_env, homogeneous freezing T <= 253.15 K,
-    # liquid-only T >= 273.15 K), while gating subgrid condensate by local RH (RH > 0.55) and
-    # conservatively precipitating excess condensate above grid-mean autoconversion/sedimentation limits.
-    rh_gate = torch.clamp((qn_new / torch.clamp(qsat_env, min=1.0e-7) - 0.72) / 0.25, min=0.0, max=1.0)
+    # liquid-only T >= 273.15 K), with a smooth C^1 quadratic RH gate starting at RH = 0.55 so clear
+    # dry skies stay cloud-free while anvil/cirrus edges transition continuously without binary OLR holes.
+    rh_lin = torch.clamp((qn_new / torch.clamp(qsat_env, min=1.0e-7) - 0.55) / 0.40, min=0.0, max=1.0)
+    rh_gate = rh_lin * rh_lin
     fc_sig = torch.sigmoid(f_cond_logit - 2.2)
     f_cond = s_conv * rh_gate * 0.95 * (fc_sig * fc_sig)
     f_cld_pred = s_conv * rh_gate * torch.sigmoid(rp[7] - 2.0)

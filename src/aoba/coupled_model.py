@@ -55,9 +55,9 @@ from aoba.radiation_ckd import CH4_PREIND_PPMV, N2O_PREIND_PPMV, compute_ckd_rad
 from aoba.runtime import maybe_cuda_compile
 from aoba.scvt_dynamics import (
     GlobalAtmosState,
+    apply_scvt_storm_smagorinsky,
     fct_advect_scvt,
     fct_advect_scvt_batch,
-    hyperdiffuse_scvt_scalar_conservative,
     init_global_hydrostatic_atmosphere,
     step_scvt_rk3_hevi,
 )
@@ -2511,8 +2511,9 @@ def step_aoba_model(
         mesh, torch.stack(adv_list, dim=0),
         m_old_host, m_new_host, uh_mean, om_mean, dt,
     )
-    atmos.q_n = hyperdiffuse_scvt_scalar_conservative(mesh, q_adv[0], m_new_host, coeff=0.008)
+    atmos.q_n = q_adv[0]
     atmos.q_p = q_adv[1]
+    apply_scvt_storm_smagorinsky(atmos, mesh, dt)
     qc_adv = torch.clamp(q_adv[2], min=0.0)
     qi_adv = torch.clamp(q_adv[3], min=0.0)
     qci_adv = qc_adv + qi_adv

@@ -274,20 +274,22 @@ def compute_scalar_laplacian_cell(
     return compute_scvt_divergence(mesh, grad_e)
 
 
-def hyperdiffuse_scvt_scalar_conservative(
+def apply_scvt_storm_smagorinsky(
+    state: GlobalAtmosState,
     mesh: SCVTMesh,
-    q_cell: torch.Tensor,
-    mass_cell: torch.Tensor,
-    coeff: float = 0.008,
-) -> torch.Tensor:
-    """Apply mass-conserving, positivity-preserving 4th-order hyperdiffusion on SCVT cells `[Nz, N_cells]`.
+    dt: float,
+    div_thresh: float = 1.5e-5,
+    cs_scalar: float = 0.65,
+    cs_div: float = 0.85,
+) -> None:
+    """Apply thresholded, strictly monotone, mass-conserving 2D Smagorinsky eddy mixing on SCVT host fields.
 
-    Uses flux-divergence form `F_e = (coeff * d_min^4) * m_e * grad(lap2(q))` (AOBA Formulation Eq. 8.5;
-    Skamarock et al., 2012, Sec. 3d) paired with a Zalesak outgoing-flux edge limiter so global tracer
-    mass `sum_i A_i * m_i * q_i` is conserved to float32 precision while guaranteeing `q_new >= 0`.
+    Activates strictly where horizontal convergence/divergence exceeds `div_thresh` [s^-1]
+    (AOBA Formulation Eq. 8.5; Skamarock et al., 2012, Sec. 3d; Zängl et al., 2015, Sec. 2.5),
+    leaving quiet synoptic fronts, jets, and cloud bands completely undamped (`K_h == 0`) while
+    damping runaway gridpoint-storm convergence, moisture, enthalpy, and vertical velocity without
+    any non-monotone biharmonic Gibbs ringing.
     """
-    if coeff <= 0.0:
-        return q_cell
     dx_min = getattr(mesh, "_dc_edge_min_m", None)
     if dx_min is None:
         dx_min = float(mesh.dc_edge.min().item())
@@ -295,21 +297,38 @@ def hyperdiffuse_scvt_scalar_conservative(
     c0 = mesh.cells_on_edge[:, 0]
     c1 = mesh.cells_on_edge[:, 1]
     dc_e = mesh.dc_edge.unsqueeze(0)
-    m_e = 0.5 * (mass_cell[:, c0] + mass_cell[:, c1])
-    lap2_q = compute_scalar_laplacian_cell(mesh, q_cell)
-    flx_e = (coeff * (dx_min ** 4)) * m_e * ((lap2_q[:, c1] - lap2_q[:, c0]) / dc_e)
+    div_c = compute_scvt_divergence(mesh, state.u_edge)
+    div_e = 0.5 * (div_c[:, c0].abs() + div_c[:, c1].abs())
+    div_exc = torch.clamp(div_e - div_thresh, min=0.0)
 
-    # Positivity-preserving outgoing-flux edge limiter (preserves exact edge-pair mass conservation)
-    le_f = flx_e * mesh.dv_edge.unsqueeze(0)
-    out_ce = torch.clamp(le_f[:, mesh.edges_on_cell] * mesh.edge_sign_on_cell, min=0.0)
-    f_out_c = out_ce.sum(dim=-1) / mesh.area_cell.unsqueeze(0)
-    avail_c = 0.95 * mass_cell * torch.clamp(q_cell, min=0.0)
-    alpha_c = torch.clamp(avail_c / torch.clamp(f_out_c, min=1.0e-30), min=0.0, max=1.0)
-    alpha_e = torch.where(flx_e >= 0.0, alpha_c[:, c0], alpha_c[:, c1])
-    flx_lim = flx_e * alpha_e
+    k_cap = 0.12 * (dx_min ** 2) / max(dt, 1.0)
+    kh_sc = torch.clamp(((cs_scalar * dc_e) ** 2) * div_exc, max=k_cap)
+    kh_dv = torch.clamp(((cs_div * dc_e) ** 2) * div_exc, max=k_cap)
 
-    div_f = compute_scvt_divergence(mesh, flx_lim)
-    return torch.clamp(q_cell - div_f / torch.clamp(mass_cell, min=1.0e-5), min=0.0)
+    m = state.rho_d * state.dz_c
+    m_e = 0.5 * (m[:, c0] + m[:, c1])
+    inv_m = 1.0 / torch.clamp(m, min=1.0e-5)
+
+    # 1. Monotone mass-conserving moisture mixing (preserves discrete maximum principle & q_n >= 0)
+    flx_qn = -(dt * kh_sc) * m_e * ((state.q_n[:, c1] - state.q_n[:, c0]) / dc_e)
+    state.q_n = torch.clamp(state.q_n - compute_scvt_divergence(mesh, flx_qn) * inv_m, min=0.0)
+
+    # 2. Monotone enthalpy-conserving Theta_m mixing
+    flx_th = -(dt * kh_sc) * m_e * ((state.theta_m[:, c1] - state.theta_m[:, c0]) / dc_e)
+    state.theta_m = torch.clamp(
+        state.theta_m - compute_scvt_divergence(mesh, flx_th) * inv_m, min=150.0, max=10000.0
+    )
+
+    # 3. Nonlinear purely-divergent momentum damping: du/dt = +K_h,div * grad(div u)
+    state.u_edge = state.u_edge + (dt * kh_dv) * ((div_c[:, c1] - div_c[:, c0]) / dc_e)
+
+    # 4. Monotone horizontal mixing on interior vertical velocity w
+    kh_w = 0.5 * (kh_sc[:-1] + kh_sc[1:])
+    flx_w = -(dt * kh_w) * ((state.w[1:-1, c1] - state.w[1:-1, c0]) / dc_e)
+    state.w = torch.cat(
+        [state.w[:1], state.w[1:-1] - compute_scvt_divergence(mesh, flx_w), state.w[-1:]],
+        dim=0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -811,8 +830,8 @@ def _step_scvt_rk3_hevi_impl(
     inv_dt = 1.0 / max(dt_dyn, 1.0)
     nu_div = 0.02 * (dx_min ** 2) * inv_dt
     nu_4 = 0.0002 * (dx_min ** 4) * inv_dt
-    nu_4_div = 0.010 * (dx_min ** 4) * inv_dt
-    nu_4_s = 0.006 * (dx_min ** 4) * inv_dt
+    nu_4_div = 0.0018 * (dx_min ** 4) * inv_dt
+    nu_4_s = 0.0010 * (dx_min ** 4) * inv_dt
 
     lap2_u0, grad_div_u0 = compute_vector_laplacian_edge(mesh, state.u_edge)
     lap4_u0, _ = compute_vector_laplacian_edge(mesh, lap2_u0)

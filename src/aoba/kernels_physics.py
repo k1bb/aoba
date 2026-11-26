@@ -5588,7 +5588,7 @@ kernel void crm_distill_closure_col(
             w_pre_conv += dm * (qn0 + qp0);
             float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
             float fp_sig = aoba_sigmoid(raw_prof[rp_base + 2u * nz + k] - 2.0f);
-            float qp_p = s_conv * min(qnb + qp0, 6.0e-3f) * (0.5f * (fp_sig * fp_sig));
+            float qp_p = s_conv * min(qnb, 2.0e-3f) * (0.25f * (fp_sig * fp_sig));
             if (k < 128u) {
                 qsat_col[k] = qsat_env;
                 qnb_col[k] = qnb;
@@ -5663,6 +5663,7 @@ kernel void crm_distill_closure_col(
             dm_dqn_sum += dm_c_col[k] * dqn_r;
             dm_wbal_sum += dm_c_col[k] * wb;
             w_qp0_sum += dm_c_col[k] * max(qp_pre[k * N + c], 0.0f);
+            qp_p_col[k] *= col_rh_gate;
             w_qp_prov_sum += dm_c_col[k] * qp_p_col[k];
         } else if (k < 128u) {
             wbal_col[k] = 0.0f;
@@ -5690,7 +5691,7 @@ kernel void crm_distill_closure_col(
             float qn_tr = max(qnb_col[k] + dqn_bal, 0.0f);
             float rh_tr = clamp(qn_tr / max(qsat_col[k], 1.0e-7f), 0.0f, 2.0f);
             float rh_p = clamp((rh_tr - 0.60f) / 0.35f, 0.0f, 1.0f);
-            float wp_l = qn_tr * (rh_p * rh_p + 0.01f) + 5.0f * (qc0_k + qi0_k);
+            float wp_l = qn_tr * (rh_p * rh_p + 0.01f) + 2.0f * qc0_k + 0.25f * qi0_k;
             qn_tr_col[k] = qn_tr;
             wp_l_col[k] = wp_l;
             w_qn_tr_sum += dm_c_col[k] * qn_tr;
@@ -5700,7 +5701,7 @@ kernel void crm_distill_closure_col(
             wp_l_col[k] = 0.0f;
         }
     }
-    float qp_cap_col = w_qp0_sum + 0.5f * w_qn_tr_sum;
+    float qp_cap_col = w_qp0_sum + 0.15f * w_qn_tr_sum;
     float qp_sc = (w_qp_prov_sum > qp_cap_col) ? (qp_cap_col / max(w_qp_prov_sum, 1.0e-6f)) : 1.0f;
     float w_qp_conv_sum = w_qp_prov_sum * qp_sc;
     float p_need_qn = max(p_tot_mass + (w_qp_conv_sum - w_qp0_sum), 0.0f);
@@ -5760,7 +5761,8 @@ kernel void crm_distill_closure_col(
             qp_n = qp_p_col[k] * qp_sc;
             w_post_conv += dm * (qn_n + qp_n);
 
-            float rh_gate = clamp((qn_n / max(qsat_env, 1.0e-7f) - 0.72f) / 0.25f, 0.0f, 1.0f);
+            float rh_lin = clamp((qn_n / max(qsat_env, 1.0e-7f) - 0.55f) / 0.40f, 0.0f, 1.0f);
+            float rh_gate = rh_lin * rh_lin;
             float fc_sig = aoba_sigmoid(raw_prof[rp_base + 3u * nz + k] - 2.2f);
             float f_cond = s_conv * rh_gate * 0.95f * (fc_sig * fc_sig);
             float om_liq_p = clamp((t_env - 253.15f) / 20.0f, 0.0f, 1.0f);
