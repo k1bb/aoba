@@ -2724,24 +2724,12 @@ async function fetchMonitorOnce() {
         MON.rawWave = wave;
         MON.solarDeclDeg = declDeg;
 
-        const nowMs = performance.now();
-        const canInterp = MON.currFrame && MON.currFrame.t2 && MON.currFrame.t2.length === t2.length &&
-          meta.source === "live_preview.npz" && newSimDays !== null && MON.currFrame.simDays !== null &&
-          (newSimDays > MON.currFrame.simDays) && (newSimDays - MON.currFrame.simDays) < 0.25;
-        MON.prevFrame = canInterp ? MON.currFrame : null;
-        MON.currFrame = { t2, ir, olr, ocnSpd, lwp, iwp, windSpd, subLon, declDeg, simDays: newSimDays };
-        MON.frameArriveMs = nowMs;
-        if (canInterp && MON.wallSPerDay > 0) {
-          const dtModelDays = newSimDays - MON.prevFrame.simDays;
-          const expectMs = dtModelDays * MON.wallSPerDay * 1000.0;
-          MON.frameIntervalMs = Math.max(350.0, Math.min(3500.0, expectMs));
-        } else {
-          MON.frameIntervalMs = 850.0;
-        }
-        if (!MON.prevFrame) {
-          MON.rawT2 = t2; MON.rawIR = ir; MON.rawOLR = olr;
-          MON.rawOcnSpd = ocnSpd; MON.rawLWP = lwp; MON.rawIWP = iwp; MON.rawWindSpd = windSpd;
-          GLOBE_VIEW.subsolarLon = subLon;
+        MON.rawT2 = t2; MON.rawIR = ir; MON.rawOLR = olr;
+        MON.rawOcnSpd = ocnSpd; MON.rawLWP = lwp; MON.rawIWP = iwp; MON.rawWindSpd = windSpd;
+        GLOBE_VIEW.subsolarLon = subLon;
+        const syncDayNow = document.getElementById("globe-sync-day")?.checked ?? true;
+        if (!GLOBE_VIEW.manualOverride && syncDayNow && !GLOBE_VIEW.dragging) {
+          GLOBE_VIEW.lon0 = GLOBE_VIEW.subsolarLon;
         }
         markHeroDirty();
       }
@@ -3427,25 +3415,7 @@ function renderOneGlobe(canvasId, kind, geo) {
 }
 
 let _lastAnimTs = 0;
-let _lastInterpTs = 0;
 let _lastRenderKey = "";
-const _INTERP_BUFS = {};
-function _blendU8(key, prevA, currA, a) {
-  if (!currA) return null;
-  if (!prevA || prevA.length !== currA.length || a >= 0.995) return currA;
-  if (a <= 0.005) return prevA;
-  let dst = _INTERP_BUFS[key];
-  if (!dst || dst.length !== currA.length) {
-    dst = new Uint8Array(currA.length);
-    _INTERP_BUFS[key] = dst;
-  }
-  const n = currA.length;
-  for (let i = 0; i < n; i++) {
-    const pv = prevA[i];
-    dst[i] = (pv + a * (currA[i] - pv) + 0.5) | 0;
-  }
-  return dst;
-}
 
 function animateGlobes(ts) {
   requestAnimationFrame(animateGlobes);
@@ -3454,32 +3424,7 @@ function animateGlobes(ts) {
   const dt = Math.min((ts - (_lastAnimTs || ts)) / 1000.0, 0.1);
   _lastAnimTs = ts;
 
-  // Model-time-synchronized 30 fps frame interpolation between prevFrame -> currFrame (0% model overhead!)
   const syncDay = document.getElementById("globe-sync-day")?.checked ?? true;
-  if (MON.prevFrame && MON.currFrame && (ts - _lastInterpTs) >= 32.0) {
-    const a = Math.max(0.0, Math.min(1.0, (ts - MON.frameArriveMs) / Math.max(MON.frameIntervalMs || 850.0, 200.0)));
-    if (a < 1.0 || MON._lastAlpha < 1.0) {
-      _lastInterpTs = ts;
-      MON._lastAlpha = a;
-      const pf = MON.prevFrame, cf = MON.currFrame;
-      MON.rawT2 = _blendU8("t2", pf.t2, cf.t2, a);
-      MON.rawIR = _blendU8("ir", pf.ir, cf.ir, a);
-      MON.rawOLR = _blendU8("olr", pf.olr, cf.olr, a);
-      MON.rawOcnSpd = _blendU8("ocn", pf.ocnSpd, cf.ocnSpd, a);
-      MON.rawLWP = _blendU8("lwp", pf.lwp, cf.lwp, a);
-      MON.rawIWP = _blendU8("iwp", pf.iwp, cf.iwp, a);
-      MON.rawWindSpd = _blendU8("wspd", pf.windSpd, cf.windSpd, a);
-      // Shortest circular arc interpolation for sun longitude
-      let dLon = cf.subLon - pf.subLon;
-      if (dLon > 180.0) dLon -= 360.0;
-      if (dLon < -180.0) dLon += 360.0;
-      GLOBE_VIEW.subsolarLon = wrapLonDeg(pf.subLon + a * dLon);
-      if (!GLOBE_VIEW.manualOverride && syncDay && !GLOBE_VIEW.dragging) {
-        GLOBE_VIEW.lon0 = GLOBE_VIEW.subsolarLon;
-      }
-      _heroDirty = true;
-    }
-  }
   if (!syncDay && (document.getElementById("globe-spin")?.checked ?? true) && !GLOBE_VIEW.dragging) {
     const spd = Number(document.getElementById("globe-speed")?.value ?? 12);
     GLOBE_VIEW.lon0 = wrapLonDeg(GLOBE_VIEW.lon0 + spd * dt);
