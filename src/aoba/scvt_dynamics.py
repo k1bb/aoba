@@ -553,7 +553,8 @@ def _scvt_fast_acoustic_hevi_cpu_gpu(
 
     for _ in range(n_ac):
         p_k = pres_s + dp_dThm_s * (Thm_k - Thm_s)
-        pgf_e = -(p_k[:, c1] * fac_z1 - p_k[:, c0] * fac_z0) / (rtot_e * dc_e)
+        # Symmetric-difference PGF: fac_z0 holds fz_avg = 1 + 0.5*(e1+e0), fac_z1 holds fz_dif = e1 - e0
+        pgf_e = -(fac_z0 * (p_k[:, c1] - p_k[:, c0]) + fac_z1 * (0.5 * (p_k[:, c1] + p_k[:, c0]))) / (rtot_e * dc_e)
 
         u_next = (u_k + dt_ac * (tend_u_slow + pgf_e)) / (1.0 + dt_ac * sponge_c)
         u_int_next = 0.5 * (u_next[:-1] + u_next[1:])
@@ -688,8 +689,13 @@ def _scvt_rk3_stage_prep_core(
     thm_e = 0.5 * (thm_s[:, c0] + thm_s[:, c1]) - 0.15 * torch.sign(u_s) * (thm_s[:, c1] - thm_s[:, c0])
     rtot_e = torch.clamp(0.5 * (rtot_s[:, c0] + rtot_s[:, c1]), min=1.0e-5)
     dz_10 = z_c[:, c1] - z_c[:, c0]
-    fac_z0 = torch.exp(-0.5 * (rtot_s[:, c0] * C.GRAVITY / torch.clamp(pres_s[:, c0], min=0.1)) * dz_10)
-    fac_z1 = torch.exp(+0.5 * (rtot_s[:, c1] * C.GRAVITY / torch.clamp(pres_s[:, c1], min=0.1)) * dz_10)
+    a0 = -0.5 * (rtot_s[:, c0] * C.GRAVITY / torch.clamp(pres_s[:, c0], min=0.1)) * dz_10
+    a1 = +0.5 * (rtot_s[:, c1] * C.GRAVITY / torch.clamp(pres_s[:, c1], min=0.1)) * dz_10
+    e0 = torch.expm1(a0)
+    e1 = torch.expm1(a1)
+    # Symmetric-difference PGF coefficients (fac_z0 = fz_avg, fac_z1 = fz_dif) eliminate cancellation
+    fac_z0 = 1.0 + 0.5 * (e1 + e0)
+    fac_z1 = e1 - e0
 
     ke_edge = area_e * (u_s * u_s)
     ke_cell = 0.5 * (ke_edge[:, edges_on_cell] * valid_ce).sum(dim=-1) / area_c
@@ -833,22 +839,26 @@ def _step_scvt_rk3_hevi_impl(
         dx_min = float(mesh.dc_edge.min().item())
         setattr(mesh, "_dc_edge_min_m", dx_min)
     inv_dt = 1.0 / max(dt_dyn, 1.0)
-    nu_div = 0.02 * (dx_min ** 2) * inv_dt
-    nu_4 = 0.0002 * (dx_min ** 4) * inv_dt
-    nu_4_div = 0.0018 * (dx_min ** 4) * inv_dt
-    nu_4_s = 0.0010 * (dx_min ** 4) * inv_dt
+    dx2 = dx_min * dx_min
+    c_div = 0.02 * inv_dt
+    c4_u = 0.0002 * inv_dt
+    c4_div = 0.0018 * inv_dt
+    c4_s = 0.0010 * inv_dt
 
+    # Scale-normalized O(1) biharmonic operators (dx2 * del^2) prevent float32 underflow/overflow
+    # across arbitrary planetary radii and mesh resolutions (Glevel-2 .. Glevel-11).
     lap2_u0, grad_div_u0 = compute_vector_laplacian_edge(mesh, state.u_edge)
-    lap4_u0, _ = compute_vector_laplacian_edge(mesh, lap2_u0)
+    lap2_u_nd = dx2 * lap2_u0
+    lap4_u_nd = dx2 * compute_vector_laplacian_edge(mesh, lap2_u_nd)[0]
     div_u0 = compute_scvt_divergence(mesh, state.u_edge)
-    lap2_div0 = compute_scalar_laplacian_cell(mesh, div_u0)
-    grad_lap2_div0 = (lap2_div0[:, c1] - lap2_div0[:, c0]) / dc_e
-    visc_u = nu_div * grad_div_u0 - nu_4 * lap4_u0 - nu_4_div * grad_lap2_div0
+    lap2_div_nd = dx2 * compute_scalar_laplacian_cell(mesh, div_u0)
+    grad_lap2_div_nd = dx2 * ((lap2_div_nd[:, c1] - lap2_div_nd[:, c0]) / dc_e)
+    visc_u = (c_div * dx2) * grad_div_u0 - c4_u * lap4_u_nd - c4_div * grad_lap2_div_nd
 
     m0 = state.rho_d * dz_c                   # Coupled dry mass [Nz, N_cells] [kg m^-2]
     m0_e = 0.5 * (m0[:, c0] + m0[:, c1])
-    lap2_th0 = compute_scalar_laplacian_cell(mesh, state.theta_m)
-    flx_th4 = nu_4_s * m0_e * ((lap2_th0[:, c1] - lap2_th0[:, c0]) / dc_e)
+    lap2_th_nd = dx2 * compute_scalar_laplacian_cell(mesh, state.theta_m)
+    flx_th4 = (c4_s * dx2) * m0_e * ((lap2_th_nd[:, c1] - lap2_th_nd[:, c0]) / dc_e)
     visc_Thm = -compute_scvt_divergence(mesh, flx_th4)
 
     Thm0 = m0 * state.theta_m                 # Coupled Theta_m [Nz, N_cells] [kg K m^-2]
@@ -1009,7 +1019,7 @@ def _step_scvt_rk3_hevi_impl(
 
             for _ in range(n_ac):
                 p_k = pres_s + dp_dThm_s * (Thm_k - Thm_s)
-                pgf_e = -(p_k[:, c1] * fac_z1 - p_k[:, c0] * fac_z0) / (rtot_e * dc_e)
+                pgf_e = -(fac_z0 * (p_k[:, c1] - p_k[:, c0]) + fac_z1 * (0.5 * (p_k[:, c1] + p_k[:, c0]))) / (rtot_e * dc_e)
 
                 u_next = (u_k + dt_ac * (tend_u_slow + pgf_e)) / (1.0 + dt_ac * sponge_c)
                 u_int_next = 0.5 * (u_next[:-1] + u_next[1:])
@@ -1089,10 +1099,10 @@ def _step_scvt_rk3_hevi_impl(
             uh_final = uh_accum * inv_nac
             om_final = om_accum * inv_nac
 
-    # Scale-selective horizontal 4th-order hyperdiffusion on interior vertical velocity w
-    lap2_w = compute_scalar_laplacian_cell(mesh, w_s[1:-1])
-    lap4_w = compute_scalar_laplacian_cell(mesh, lap2_w)
-    w_s = torch.cat([w_s[:1], w_s[1:-1] - (nu_4_s * dt_dyn) * lap4_w, w_s[-1:]], dim=0)
+    # Scale-selective O(1)-normalized horizontal 4th-order hyperdiffusion on interior vertical velocity w
+    lap2_w_nd = dx2 * compute_scalar_laplacian_cell(mesh, w_s[1:-1])
+    lap4_w_nd = dx2 * compute_scalar_laplacian_cell(mesh, lap2_w_nd)
+    w_s = torch.cat([w_s[:1], w_s[1:-1] - (c4_s * dt_dyn) * lap4_w_nd, w_s[-1:]], dim=0)
 
     state.rho_d = m_s / dz_c
     state.u_edge = u_s

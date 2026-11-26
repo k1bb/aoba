@@ -3984,9 +3984,15 @@ kernel void scvt_rk3_prep_edge(
     float m_edge_v = 0.5f * (m_s[i0] + m_s[i1]);
     float thm_e_v = 0.5f * (th0 + th1) - 0.15f * sgn_u * (th1 - th0);
     float inv_rtot_dc = idc / max(0.5f * (rt0 + rt1), 1.0e-5f);
-    float fz0_sc = exp(-0.5f * (rt0 * gravity / p0) * dz10) * inv_rtot_dc;
-    float fz1_sc = exp( 0.5f * (rt1 * gravity / p1) * dz10) * inv_rtot_dc;
-    edge_c4[gid] = float4(fz0_sc, fz1_sc, m_edge_v, thm_e_v);
+    // Exact symmetric-difference + expm1 PGF weights eliminate float32 cancellation on flat/sloped terrain:
+    //   p1*exp(a1) - p0*exp(a0) == (1 + 0.5*(e1+e0))*(p1 - p0) + (e1 - e0)*0.5*(p1 + p0)
+    float a0 = -0.5f * (rt0 * gravity / p0) * dz10;
+    float a1 =  0.5f * (rt1 * gravity / p1) * dz10;
+    float e0 = (fabs(a0) < 1.0e-3f) ? (a0 * (1.0f + a0 * (0.5f + a0 * (0.16666667f + a0 * 0.041666668f)))) : (exp(a0) - 1.0f);
+    float e1 = (fabs(a1) < 1.0e-3f) ? (a1 * (1.0f + a1 * (0.5f + a1 * (0.16666667f + a1 * 0.041666668f)))) : (exp(a1) - 1.0f);
+    float fz_avg_sc = (1.0f + 0.5f * (e1 + e0)) * inv_rtot_dc;
+    float fz_dif_sc = (e1 - e0) * inv_rtot_dc;
+    edge_c4[gid] = float4(fz_avg_sc, fz_dif_sc, m_edge_v, thm_e_v);
 
     float grad_ke = (ke_cell[i1] - ke_cell[i0]) * idc;
 

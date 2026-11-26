@@ -1399,7 +1399,7 @@ kernel void scvt_slope_top_cell(
 kernel void scvt_fast_edge(
     device const int* c0_arr       [[buffer(0)]],   // [N_edges]
     device const int* c1_arr       [[buffer(1)]],   // [N_edges]
-    device const float4* edge_c4   [[buffer(2)]],   // [nz, N_edges]: (fz0/(rtot*dc), fz1/(rtot*dc), m_edge, thm_e)
+    device const float4* edge_c4   [[buffer(2)]],   // [nz, N_edges]: (fz_avg/(rtot*dc), fz_dif/(rtot*dc), m_edge, thm_e)
     device const float* tend_u_sl  [[buffer(3)]],   // [nz, N_edges]
     device const float* sponge_c   [[buffer(4)]],   // [nz]
     device const float* p_cell     [[buffer(5)]],   // [nz, N_cells]
@@ -1425,7 +1425,8 @@ kernel void scvt_fast_edge(
     float p0 = p_cell[cbase + c0];
     float p1 = p_cell[cbase + c1];
     float4 ec = edge_c4[gid];
-    float pgf = -(p1 * ec.y - p0 * ec.x);
+    // Symmetric-difference PGF: -(fz_avg*(p1 - p0) + fz_dif*0.5*(p1 + p0)) / (rtot_e * dc_e)
+    float pgf = -fma(ec.x, (p1 - p0), ec.y * (0.5f * (p1 + p0)));
 
     float u0 = u_c[gid];
     float dt_ac = f_p.x;
@@ -5213,15 +5214,28 @@ def _get_scvt_mesh_cache(mesh: Any) -> dict[str, Any]:
         eoc = mesh.edges_on_cell.to(torch.int32).contiguous()
         eov = mesh.edges_on_vert.to(torch.int32).contiguous()
         ep = mesh.trisk_edges.to(torch.int32).contiguous()
-        div_w = (mesh.edge_sign_on_cell * mesh.dv_edge[mesh.edges_on_cell] / mesh.area_cell.unsqueeze(-1)).contiguous()
-        vort_w = (mesh.edge_sign_on_vert * mesh.dc_edge[mesh.edges_on_vert] / mesh.area_vert.unsqueeze(-1)).contiguous()
-        inv_dc = (1.0 / mesh.dc_edge).contiguous()
-        inv_dv = (1.0 / torch.clamp(mesh.dv_edge, min=100.0)).contiguous()
-        w_edge = 0.5 * mesh.dc_edge * mesh.dv_edge
-        active_c = (mesh.edge_sign_on_cell != 0.0).to(w_edge.dtype)
-        inv_area_c = 1.0 / mesh.area_cell.unsqueeze(-1)
-        rec_ew = ((w_edge * mesh.east_normal_edge)[mesh.edges_on_cell] * active_c * inv_area_c).contiguous()
-        rec_nw = ((w_edge * mesh.north_normal_edge)[mesh.edges_on_cell] * active_c * inv_area_c).contiguous()
+        # Compute pre-scaled metric operator weights in CPU float64 to avoid double-rounding in float32
+        dev = mesh.area_cell.device
+        dt_f = mesh.area_cell.dtype
+        eoc64 = mesh.edges_on_cell.detach().cpu()
+        eov64 = mesh.edges_on_vert.detach().cpu()
+        dc64 = mesh.dc_edge.detach().cpu().to(torch.float64)
+        dv64 = mesh.dv_edge.detach().cpu().to(torch.float64)
+        ac64 = mesh.area_cell.detach().cpu().to(torch.float64)
+        av64 = mesh.area_vert.detach().cpu().to(torch.float64)
+        esgn_c64 = mesh.edge_sign_on_cell.detach().cpu().to(torch.float64)
+        esgn_v64 = mesh.edge_sign_on_vert.detach().cpu().to(torch.float64)
+        en64 = mesh.east_normal_edge.detach().cpu().to(torch.float64)
+        nn64 = mesh.north_normal_edge.detach().cpu().to(torch.float64)
+        div_w = (esgn_c64 * dv64[eoc64] / ac64.unsqueeze(-1)).to(device=dev, dtype=dt_f).contiguous()
+        vort_w = (esgn_v64 * dc64[eov64] / av64.unsqueeze(-1)).to(device=dev, dtype=dt_f).contiguous()
+        inv_dc = (1.0 / dc64).to(device=dev, dtype=dt_f).contiguous()
+        inv_dv = (1.0 / torch.clamp(dv64, min=100.0)).to(device=dev, dtype=dt_f).contiguous()
+        w_edge64 = 0.5 * dc64 * dv64
+        active_c64 = (esgn_c64 != 0.0).to(torch.float64)
+        inv_ac64 = 1.0 / ac64.unsqueeze(-1)
+        rec_ew = ((w_edge64 * en64)[eoc64] * active_c64 * inv_ac64).to(device=dev, dtype=dt_f).contiguous()
+        rec_nw = ((w_edge64 * nn64)[eoc64] * active_c64 * inv_ac64).to(device=dev, dtype=dt_f).contiguous()
         mc = {
             "c0": c0, "c1": c1, "v0": v0, "v1": v1,
             "eoc": eoc, "eov": eov, "ep": ep,

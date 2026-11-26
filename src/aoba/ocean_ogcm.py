@@ -528,15 +528,23 @@ def _get_ogcm_static_cache(ogcm: OceanOGCMState, mesh: SCVTMesh, is_ocean: torch
     f_sub_e = torch.sqrt(f_edge * f_edge + tau_sub_inv * tau_sub_inv)
     fk_coef_e = 0.06 * torch.clamp(mesh.dc_edge.to(dtype) / 500.0, min=1.0, max=8.0) / f_sub_e
 
-    # Static Voronoi Redi geometric weights & scalar h_max (eliminates per-step CPU-GPU sync!)
-    w_vor_edge = 0.5 * mesh.dc_edge * mesh.dv_edge
-    active_eoc = (mesh.edge_sign_on_cell != 0.0).to(dtype)
-    inv_area_c = 1.0 / mesh.area_cell
-    active_w_c = (active_eoc * inv_area_c.unsqueeze(-1)).contiguous()
-    div_w = (mesh.edge_sign_on_cell.to(dtype) * mesh.dv_edge[mesh.edges_on_cell].to(dtype)) * inv_area_c.unsqueeze(-1)
-    vort_w = (
-        mesh.edge_sign_on_vert.to(dtype) * mesh.dc_edge[mesh.edges_on_vert].to(dtype)
-    ) / mesh.area_vert.to(dtype).unsqueeze(-1)
+    # Static Voronoi Redi & C-grid metric weights built in CPU float64 to avoid double-rounding in float32
+    dc64 = mesh.dc_edge.detach().cpu().to(torch.float64)
+    dv64 = mesh.dv_edge.detach().cpu().to(torch.float64)
+    ac64 = mesh.area_cell.detach().cpu().to(torch.float64)
+    av64 = mesh.area_vert.detach().cpu().to(torch.float64)
+    eoc64 = mesh.edges_on_cell.detach().cpu()
+    eov64 = mesh.edges_on_vert.detach().cpu()
+    esgn_c64 = mesh.edge_sign_on_cell.detach().cpu().to(torch.float64)
+    esgn_v64 = mesh.edge_sign_on_vert.detach().cpu().to(torch.float64)
+    w_vor_edge = (0.5 * dc64 * dv64).to(device=dev, dtype=dtype)
+    active_eoc = (esgn_c64 != 0.0).to(device=dev, dtype=dtype)
+    inv_ac64 = 1.0 / ac64
+    inv_area_c = inv_ac64.to(device=dev, dtype=dtype)
+    active_w_c = ((esgn_c64 != 0.0).to(torch.float64) * inv_ac64.unsqueeze(-1)).to(device=dev, dtype=dtype).contiguous()
+    div_w = (esgn_c64 * dv64[eoc64] * inv_ac64.unsqueeze(-1)).to(device=dev, dtype=dtype)
+    vort_w = (esgn_v64 * dc64[eov64] / av64.unsqueeze(-1)).to(device=dev, dtype=dtype)
+    inv_dc_edge = (1.0 / dc64).to(device=dev, dtype=dtype)
     h_max = float(ogcm.h_col.max().item()) if bool(is_ocean.any()) else 100.0
     f_abs = torch.clamp(torch.abs(mesh.f_cell.to(dtype)), min=1.0e-5)
     h_col_kpp = torch.clamp(ogcm.h_col, min=50.0, max=500.0)
@@ -575,7 +583,7 @@ def _get_ogcm_static_cache(ogcm: OceanOGCMState, mesh: SCVTMesh, is_ocean: torch
         "h_max": h_max,
         "f_abs": f_abs,
         "h_col_kpp": h_col_kpp,
-        "inv_dc_edge": 1.0 / mesh.dc_edge,
+        "inv_dc_edge": inv_dc_edge,
     }
     setattr(ogcm, "_static_cache", cache)
     return cache
@@ -1862,6 +1870,11 @@ def _step_ogcm_voronoi_impl(
     w_vor_edge = cache["w_vor_edge"]
     active_w_c = cache["active_w_c"]
 
+    # Scale-normalized O(1) biharmonic rates avoid O(10^+-22) intermediate float32 scaling
+    dc2 = dc_min * dc_min
+    a_h_nd = a_h / max(dc2, 1.0)
+    nu_4_nd = nu_4 / max(dc2 * dc2, 1.0)
+
     if use_gpu_ogcm:
         wet_vf = cache.get("wet_vf")
         if wet_vf is None:
@@ -1887,10 +1900,12 @@ def _step_ogcm_voronoi_impl(
             mesh, u_edge=u, wet_cf=wet_cf, wet_vf=wet_vf, wet_ef=wet_ef,
             div_buf=ws_bc["div_u"], zeta_buf=ws_bc["zeta"], lap_out=ws_bc["lap2"],
         )
+        lap2_u_wet.mul_(dc2)
         lap4_u = dispatch_ogcm_vec_lap_wet_metal(
             mesh, u_edge=lap2_u_wet, wet_cf=wet_cf, wet_vf=wet_vf, wet_ef=wet_ef,
             div_buf=ws_bc["div"], zeta_buf=ws_bc["zeta"], lap_out=ws_bc["lap4"],
         )
+        lap4_u.mul_(dc2)
         w_vor_u2 = w_vor_edge.unsqueeze(0) * (u * u)
         ke_c = 0.5 * dispatch_scvt_weighted_edge_sum_metal(mesh, w_vor_u2, active_w_c) * wet_cf
         # Fold `+a_div * grad(div u)` directly into Bernoulli potential `-inv_rho * grad(p_bern)`
@@ -1900,7 +1915,7 @@ def _step_ogcm_voronoi_impl(
         f_fixed = dispatch_ogcm_baroclinic_f_fixed_metal(
             mesh,
             p_baroc=p_bern, lap2_u=lap2_u_wet, lap4_u=lap4_u, tau_n_e=tau_n_e,
-            h_e0_safe=h_e_safe[0], wet_ef=wet_ef, a_h=a_h, nu_4=nu_4, out=ws_bc["f_fixed"],
+            h_e0_safe=h_e_safe[0], wet_ef=wet_ef, a_h=a_h_nd, nu_4=nu_4_nd, out=ws_bc["f_fixed"],
         )
         is_bot_f = cache.get("is_bot_ef")
         if is_bot_f is None:
@@ -1937,9 +1952,9 @@ def _step_ogcm_voronoi_impl(
             u_star_raw = solve_tridiagonal_batched(a_m, b_m, d_m, u_star)
     else:
         lap2_u, grad_div_u = compute_vector_laplacian_edge(mesh, u)
-        lap2_u_wet = lap2_u * wet_ef
-        lap4_u, _ = compute_vector_laplacian_edge(mesh, lap2_u_wet)
-        visc_h_edge = (a_h * lap2_u_wet + a_div * grad_div_u - nu_4 * lap4_u) * wet_ef
+        lap2_u_nd = (dc2 * lap2_u) * wet_ef
+        lap4_u_nd = dc2 * compute_vector_laplacian_edge(mesh, lap2_u_nd)[0]
+        visc_h_edge = (a_h_nd * lap2_u_nd + a_div * grad_div_u - nu_4_nd * lap4_u_nd) * wet_ef
         w_vor_u2 = w_vor_edge.unsqueeze(0) * (u * u)
         ke_c = (
             0.5
