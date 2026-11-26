@@ -3103,12 +3103,12 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
   ctx.drawImage(canvas._offCv, 0, 0);
 }
 
-/* --- EARTH.NULLSCHOOL.NET ANIMATED PARTICLE STREAMLINES ON ORTHOGRAPHIC 3D GLOBE --- */
-const STREAM_STATE = { hero: [], mini: [], lastLon: null, lastLat: null };
+/* --- EARTH.NULLSCHOOL.NET ANIMATED SPHERICAL RIBBON STREAMLINES --- */
+const STREAM_STATE = { mini: [] };
+const _TRAIL_LEN = 18;
 
 function _spawnParticle(isOcean) {
-  // Uniform on sphere (cos-weighted latitude)
-  for (let tries = 0; tries < 12; tries++) {
+  for (let tries = 0; tries < 14; tries++) {
     const u = Math.random() * 2 - 1;
     const lat = Math.asin(Math.max(-0.985, Math.min(0.985, u))) * (180 / Math.PI);
     const lon = Math.random() * 360 - 180;
@@ -3120,9 +3120,10 @@ function _spawnParticle(isOcean) {
       const wet = MON.rawOcnWet ? (MON.rawOcnWet[gi] === 1) : (MON.rawSurf[gi] === 0);
       if (!wet) continue;
     }
-    return { lat, lon, age: Math.floor(Math.random() * 65), maxAge: 55 + Math.floor(Math.random() * 55) };
+    const maxAge = 95 + Math.floor(Math.random() * 95);
+    return { lat, lon, age: Math.floor(Math.random() * maxAge * 0.5), maxAge, trail: [[lat, lon]], spd: 0.0 };
   }
-  return { lat: (Math.random() - 0.5) * 140, lon: Math.random() * 360 - 180, age: 0, maxAge: 65 };
+  return { lat: (Math.random() - 0.5) * 140, lon: Math.random() * 360 - 180, age: 0, maxAge: 120, trail: [], spd: 0.0 };
 }
 
 function onOcnPanelModeChange(doReset = true) {
@@ -3150,7 +3151,7 @@ function resetStreamParticles() {
   const ocnMode = document.getElementById("ocn-panel-mode")?.value || "ocean";
   const isOcnM = (ocnMode === "ocean") && !(MON.raster && MON.raster.ocn_is_wind);
   STREAM_STATE.mini = [];
-  for (let i = 0; i < 1800; i++) STREAM_STATE.mini.push(_spawnParticle(isOcnM));
+  for (let i = 0; i < 950; i++) STREAM_STATE.mini.push(_spawnParticle(isOcnM));
   const c = document.getElementById("globeOCNStream");
   if (c) c.getContext("2d").clearRect(0, 0, c.width, c.height);
 }
@@ -3167,44 +3168,34 @@ function _sampleVec(lat, lon, uArr, vArr, vMax) {
   return [(u8 / 255.0 * 2.0 - 1.0) * vMax, (v8 / 255.0 * 2.0 - 1.0) * vMax];
 }
 
-function _streamColor(normSpd) {
-  const t = Math.max(0, Math.min(1, normSpd));
-  if (t < 0.25) return `rgba(56,189,248,${0.48 + t})`;
-  if (t < 0.50) return `rgba(52,211,153,${0.72 + 0.3*(t-0.25)})`;
-  if (t < 0.78) return `rgba(253,224,71,0.92)`;
-  return `rgba(244,114,182,0.98)`;
-}
-
 function _stepStreamCanvas(canvasId, particles, uArr, vArr, vMax, isOcean, size, R, dt) {
   const cv = document.getElementById(canvasId);
   if (!cv || !MON.raster) return;
   const ctx = cv.getContext("2d");
-  if (!uArr || !vArr) { ctx.clearRect(0, 0, size, size); return; }
-
-  // Fade previous frame smoothly for comet-tail trails
-  ctx.save();
-  ctx.globalCompositeOperation = "destination-in";
-  ctx.fillStyle = "rgba(0,0,0,0.88)";
-  ctx.fillRect(0, 0, size, size);
-  ctx.restore();
+  ctx.clearRect(0, 0, size, size);
+  if (!uArr || !vArr) return;
 
   const cx = size * 0.5, cy = size * 0.5;
   const lat0 = GLOBE_VIEW.lat0 * Math.PI / 180;
   const lon0 = GLOBE_VIEW.lon0 * Math.PI / 180;
   const sinL0 = Math.sin(lat0), cosL0 = Math.cos(lat0);
   const deg2rad = Math.PI / 180;
-  const spdMul = Number(document.getElementById("stream-speed")?.value || 1.1);
-  // Scale physical velocity to pleasant degrees/sec on globe
-  const advScale = (isOcean ? 18.0 : 1.05) * spdMul * Math.min(dt, 0.05);
+  // Graceful RK2 spherical advection (continuous curved streamlines, never wiped on rotation!)
+  const advScale = (isOcean ? 10.5 : 0.48) * Math.min(dt, 0.045);
   const rH = MON.raster.height || 360, rW = MON.raster.width || 720;
 
   ctx.save();
   ctx.beginPath(); ctx.arc(cx, cy, R - 1, 0, Math.PI * 2); ctx.clip();
-  ctx.lineWidth = size > 340 ? 1.45 : 1.2;
+  ctx.lineWidth = 1.15;
   ctx.lineCap = "round";
 
-  // Bucket strokes into 4 speed colors for ultra-fast batched Canvas rendering!
-  const paths = [[], [], [], []];
+  // 3 tapered opacity layers (tail -> mid -> bright head) for silky nullschool ribbons!
+  const layers = [
+    { style: "rgba(224,242,254,0.22)", segs: [] },
+    { style: "rgba(186,230,253,0.48)", segs: [] },
+    { style: "rgba(255,255,255,0.88)", segs: [] },
+  ];
+
   for (let i = 0; i < particles.length; i++) {
     const p = particles[i];
     p.age++;
@@ -3212,16 +3203,22 @@ function _stepStreamCanvas(canvasId, particles, uArr, vArr, vMax, isOcean, size,
       particles[i] = _spawnParticle(isOcean);
       continue;
     }
-    const [u, v] = _sampleVec(p.lat, p.lon, uArr, vArr, vMax);
-    const spd = Math.hypot(u, v);
-    if (spd < (isOcean ? 0.008 : 0.25)) {
-      p.age += 6;
+    const [u1, v1] = _sampleVec(p.lat, p.lon, uArr, vArr, vMax);
+    const spd1 = Math.hypot(u1, v1);
+    if (spd1 < (isOcean ? 0.006 : 0.2)) {
+      p.age += 4;
+      if (p.trail.length > 0) p.trail.shift();
       continue;
     }
-    const lat1 = p.lat, lon1 = p.lon;
-    const cosL = Math.max(0.18, Math.cos(lat1 * deg2rad));
-    const lat2 = Math.max(-85, Math.min(85, lat1 + v * advScale));
-    const lon2 = wrapLonDeg(lon1 + (u * advScale) / cosL);
+    // RK2 midpoint step on sphere
+    const cosL1 = Math.max(0.18, Math.cos(p.lat * deg2rad));
+    const midLat = Math.max(-85, Math.min(85, p.lat + 0.5 * v1 * advScale));
+    const midLon = wrapLonDeg(p.lon + (0.5 * u1 * advScale) / cosL1);
+    const [u2, v2] = _sampleVec(midLat, midLon, uArr, vArr, vMax);
+    const cosLm = Math.max(0.18, Math.cos(midLat * deg2rad));
+    const lat2 = Math.max(-85, Math.min(85, p.lat + v2 * advScale));
+    const lon2 = wrapLonDeg(p.lon + (u2 * advScale) / cosLm);
+
     if (isOcean && (MON.rawOcnWet || MON.rawSurf)) {
       const row = Math.max(0, Math.min(rH - 1, Math.floor((90 - lat2) * (rH / 180))));
       const col = Math.max(0, Math.min(rW - 1, Math.floor((lon2 + 180) * (rW / 360))));
@@ -3229,32 +3226,40 @@ function _stepStreamCanvas(canvasId, particles, uArr, vArr, vMax, isOcean, size,
       const wet = MON.rawOcnWet ? (MON.rawOcnWet[gi] === 1) : (MON.rawSurf[gi] === 0);
       if (!wet) { particles[i] = _spawnParticle(true); continue; }
     }
-    p.lat = lat2; p.lon = lon2;
+    p.lat = lat2; p.lon = lon2; p.spd = spd1;
+    p.trail.push([lat2, lon2]);
+    if (p.trail.length > _TRAIL_LEN) p.trail.shift();
 
-    // Project start and end onto orthographic hemisphere
-    const phi1 = lat1 * deg2rad, dl1 = lon1 * deg2rad - lon0;
-    const z1 = sinL0 * Math.sin(phi1) + cosL0 * Math.cos(phi1) * Math.cos(dl1);
-    if (z1 <= 0.02) continue;
-    const phi2 = lat2 * deg2rad, dl2 = lon2 * deg2rad - lon0;
-    const z2 = sinL0 * Math.sin(phi2) + cosL0 * Math.cos(phi2) * Math.cos(dl2);
-    if (z2 <= 0.02) continue;
+    // Project entire spherical ribbon onto current orthographic hemisphere!
+    const tr = p.trail;
+    const m = tr.length;
+    if (m < 2) continue;
+    // Quick hemisphere check on head before projecting all points
+    const phiH = lat2 * deg2rad, dlH = lon2 * deg2rad - lon0;
+    const zH = sinL0 * Math.sin(phiH) + cosL0 * Math.cos(phiH) * Math.cos(dlH);
+    if (zH < -0.15) continue;
 
-    const x1 = cx + R * Math.cos(phi1) * Math.sin(dl1);
-    const y1 = cy - R * (cosL0 * Math.sin(phi1) - sinL0 * Math.cos(phi1) * Math.cos(dl1));
-    const x2 = cx + R * Math.cos(phi2) * Math.sin(dl2);
-    const y2 = cy - R * (cosL0 * Math.sin(phi2) - sinL0 * Math.cos(phi2) * Math.cos(dl2));
-    if (Math.hypot(x2 - x1, y2 - y1) > 22) continue;
-
-    const normS = spd / (isOcean ? 0.55 : 18.0);
-    const b = normS < 0.25 ? 0 : (normS < 0.55 ? 1 : (normS < 0.85 ? 2 : 3));
-    paths[b].push(x1, y1, x2, y2);
+    let prevX = null, prevY = null;
+    for (let j = 0; j < m; j++) {
+      const phi = tr[j][0] * deg2rad, dl = tr[j][1] * deg2rad - lon0;
+      const z = sinL0 * Math.sin(phi) + cosL0 * Math.cos(phi) * Math.cos(dl);
+      if (z <= 0.01) { prevX = null; continue; }
+      const x = cx + R * Math.cos(phi) * Math.sin(dl);
+      const y = cy - R * (cosL0 * Math.sin(phi) - sinL0 * Math.cos(phi) * Math.cos(dl));
+      if (prevX !== null && Math.hypot(x - prevX, y - prevY) < 18) {
+        const frac = j / (m - 1);
+        const lb = frac < 0.38 ? 0 : (frac < 0.78 ? 1 : 2);
+        layers[lb].segs.push(prevX, prevY, x, y);
+      }
+      prevX = x; prevY = y;
+    }
   }
-  const cols = ["rgba(56,189,248,0.62)", "rgba(52,211,153,0.82)", "rgba(253,224,71,0.92)", "rgba(244,114,182,0.98)"];
-  for (let b = 0; b < 4; b++) {
-    const arr = paths[b];
+
+  for (let b = 0; b < 3; b++) {
+    const arr = layers[b].segs;
     if (!arr.length) continue;
     ctx.beginPath();
-    ctx.strokeStyle = cols[b];
+    ctx.strokeStyle = layers[b].style;
     for (let k = 0; k < arr.length; k += 4) {
       ctx.moveTo(arr[k], arr[k+1]);
       ctx.lineTo(arr[k+2], arr[k+3]);
@@ -3431,15 +3436,6 @@ function animateGlobes(ts) {
   }
   const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
   const rKey = `${GLOBE_VIEW.lat0.toFixed(3)}|${GLOBE_VIEW.lon0.toFixed(3)}|${MON.raster?.sim_days ?? "idle"}|${MON.raster?.step ?? ""}|${MON.esmField ?? "lai"}|${drawGrid}|${LANG}`;
-  const viewMoved = (STREAM_STATE.lastLon !== null) && (Math.abs(GLOBE_VIEW.lon0 - STREAM_STATE.lastLon) > 0.15 || Math.abs(GLOBE_VIEW.lat0 - STREAM_STATE.lastLat) > 0.15);
-  if (viewMoved) {
-    ["globeStreamOverlay", "globeOCNStream", "globeTheaterStream"].forEach(id => {
-      const c = document.getElementById(id);
-      if (c) c.getContext("2d").clearRect(0, 0, c.width, c.height);
-    });
-  }
-  STREAM_STATE.lastLon = GLOBE_VIEW.lon0;
-  STREAM_STATE.lastLat = GLOBE_VIEW.lat0;
 
   if (rKey !== _lastRenderKey || _heroDirty) {
     _lastRenderKey = rKey;
