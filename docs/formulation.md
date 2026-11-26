@@ -1354,14 +1354,19 @@ The initial atmosphere is constructed by discrete trapezoidal hydrostatic integr
 
 ### 8.2 SCVT Host RK3–HEVI Acoustic-Split Solver & Batched Zalesak FCT (`src/aoba/scvt_dynamics.py`)
 
-At each dynamical step $\Delta t_{\mathrm{dyn}}$ (automatically sub-stepped to $\Delta t_{\mathrm{adv,host}} = \min(900, 0.40 d_{\min}/100)$), scale-selective horizontal divergence damping $\nu_{\mathrm{div}}$ and fourth-order hyperviscosity $\nu_4$ are evaluated to suppress grid-scale divergence noise and Hollingsworth computational modes:
+At each dynamical step $\Delta t_{\mathrm{dyn}}$ (automatically sub-stepped to $\Delta t_{\mathrm{adv,host}} = \min(900, 0.40 d_{\min}/100)$), scale-selective horizontal divergence damping $\nu_{\mathrm{div}}$ and eigenvalue-matched fourth-order hyperdiffusion $(\nu_4, \nu_{4,\mathrm{div}}, \nu_{4,s})$ are applied to suppress grid-scale divergence noise, Hollingsworth computational modes, and single-cell convective grid-point storms while preserving synoptic waves and jets (Skamarock et al., 2012, Sec. 3d). Because the maximum discrete Voronoi vector biharmonic eigenvalue ($\approx 410\,d_{\min}^{-4}$) exceeds the scalar biharmonic eigenvalue ($\approx 30.5\,d_{\min}^{-4}$) by more than an order of magnitude, purely divergent horizontal flow $\nabla(\nabla^2(\nabla\cdot\mathbf{u}))$, conservative flux-form thermodynamic mixing of $\Theta_m$, interior vertical velocity $w$, and positivity-limited flux-form moisture mixing of $q_n$ use scalar-eigenvalue-matched coefficients:
 
 $$
 \begin{aligned}
 \nu_{\mathrm{div}} &= 0.02\,\frac{d_{\min}^2}{\Delta t_{\mathrm{dyn}}}, \qquad \nu_4 = 0.0002\,\frac{d_{\min}^4}{\Delta t_{\mathrm{dyn}}}, \\
-\mathcal{D}_u &= \nu_{\mathrm{div}}\nabla(\nabla\cdot\mathbf{u}) - \nu_4\nabla^4\mathbf{u}, \qquad \mathcal{D}_{\Theta_m} = -0.5\,\nu_4 m_0\nabla^4\theta_m
+\nu_{4,\mathrm{div}} &= 0.010\,\frac{d_{\min}^4}{\Delta t_{\mathrm{dyn}}}, \qquad \nu_{4,s} = 0.006\,\frac{d_{\min}^4}{\Delta t_{\mathrm{dyn}}}, \\
+\mathcal{D}_u &= \nu_{\mathrm{div}}\nabla(\nabla\cdot\mathbf{u}) - \nu_4\nabla^4\mathbf{u} - \nu_{4,\mathrm{div}}\nabla\!\big(\nabla^2(\nabla\cdot\mathbf{u})\big), \\
+\mathcal{D}_{\Theta_m} &= -\nabla\cdot\!\big(\nu_{4,s}\,\bar{m}_e\,\nabla(\nabla^2\theta_m)\big), \qquad \Delta w_{\mathrm{diff}} = -\nu_{4,s}\Delta t_{\mathrm{dyn}}\,\nabla^4 w, \\
+q_n^{\mathrm{diff}} &= q_n - \frac{1}{m}\nabla\cdot\!\Big(\alpha_e\,(0.008\,d_{\min}^4)\,\bar{m}_e\,\nabla(\nabla^2 q_n)\Big)
 \end{aligned} \tag{8.5}
 $$
+
+where $\alpha_e \in [0, 1]$ is the outgoing-flux Zalesak limiter computed on each cell from $0.95\,m_i q_{n,i}$, ensuring strict non-negativity and exact spherical water-mass conservation alongside exact $\Theta_m$ conservation.
 
 Within each of the three Wicker–Skamarock RK3 stages ($\Delta\tau \in \{\Delta t_{\mathrm{dyn}}/3, \Delta t_{\mathrm{dyn}}/2, \Delta t_{\mathrm{dyn}}\}$), slow tendencies comprising the nonlinear TRiSK Coriolis/vorticity term $\sum_{e'} w_{e,e'}\frac{\eta_e+\eta_{e'}}{2}u_{e'}$, kinetic-energy gradient $-\nabla K$, vertical momentum advection, and dissipation are frozen while fast acoustic sub-steps ($\Delta t_{\mathrm{ac,max}} = \min(\max(0.16 d_{\min}/350, 1), 300)\ \mathrm{s}$, vertical implicit weight $\beta_{\mathrm{HEVI}} = 0.60$) are integrated. Over steep terrain, horizontal pressure gradients apply the Klemp (2011) hydrostatic exponential factors $(f_{z0}, f_{z1})$, horizontal mass flux uses forward off-centering $U_h^{(k)}$, and explicit vertical advection of $\theta_m$ at interior interfaces $k + \tfrac{1}{2}$ uses the conservative MPAS-A third-order upwind-biased flux reconstruction ($\beta_v = 0.25$; Skamarock & Gassmann, 2011, Eq. 5; Skamarock et al., 2012, Eq. 20) to damp grid-scale $2\Delta z$ vertical computational modes without static vertical diffusion:
 

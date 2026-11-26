@@ -1354,14 +1354,19 @@ $$
 
 ### 8.2 SCVT 親格子 RK3–HEVI 音波分離解法とバッチ Zalesak FCT (`src/aoba/scvt_dynamics.py`)
 
-各力学ステップ $\Delta t_{\mathrm{dyn}}$（移流 CFL 制限 $\Delta t_{\mathrm{adv,host}} = \min(900, 0.40 d_{\min}/100)$ による自動サブステップ）では、格子スケール発散雑音と Hollingsworth 計算モードを抑制するスケール選択的水平発散減衰 $\nu_{\mathrm{div}}$ および 4 階超粘性 $\nu_4$ を評価する：
+各力学ステップ $\Delta t_{\mathrm{dyn}}$（移流 CFL 制限 $\Delta t_{\mathrm{adv,host}} = \min(900, 0.40 d_{\min}/100)$ による自動サブステップ）では、格子スケール発散雑音、Hollingsworth 計算モードおよび単一セル対流グリッドポイントストームを総観規模波動やジェットを減衰させずに抑止するため、水平発散減衰 $\nu_{\mathrm{div}}$ と固有値整合型の 4 階超拡散 $(\nu_4, \nu_{4,\mathrm{div}}, \nu_{4,s})$ を適用する（Skamarock et al., 2012, Sec. 3d）。ボロノイ C 格子の離散ベクトル重調和最大固有値（$\approx 410\,d_{\min}^{-4}$）はスカラー重調和最大固有値（$\approx 30.5\,d_{\min}^{-4}$）より 1 桁以上大きいため、純発散成分 $\nabla(\nabla^2(\nabla\cdot\mathbf{u}))$、保存型フラックス形式の $\Theta_m$ 混合、内部鉛直速度 $w$、および非負制限付き保存型フラックス形式の総非降水水分 $q_n$ 混合にはスカラー固有値に整合した係数を用いる：
 
 $$
 \begin{aligned}
 \nu_{\mathrm{div}} &= 0.02\,\frac{d_{\min}^2}{\Delta t_{\mathrm{dyn}}}, \qquad \nu_4 = 0.0002\,\frac{d_{\min}^4}{\Delta t_{\mathrm{dyn}}}, \\
-\mathcal{D}_u &= \nu_{\mathrm{div}}\nabla(\nabla\cdot\mathbf{u}) - \nu_4\nabla^4\mathbf{u}, \qquad \mathcal{D}_{\Theta_m} = -0.5\,\nu_4 m_0\nabla^4\theta_m
+\nu_{4,\mathrm{div}} &= 0.010\,\frac{d_{\min}^4}{\Delta t_{\mathrm{dyn}}}, \qquad \nu_{4,s} = 0.006\,\frac{d_{\min}^4}{\Delta t_{\mathrm{dyn}}}, \\
+\mathcal{D}_u &= \nu_{\mathrm{div}}\nabla(\nabla\cdot\mathbf{u}) - \nu_4\nabla^4\mathbf{u} - \nu_{4,\mathrm{div}}\nabla\!\big(\nabla^2(\nabla\cdot\mathbf{u})\big), \\
+\mathcal{D}_{\Theta_m} &= -\nabla\cdot\!\big(\nu_{4,s}\,\bar{m}_e\,\nabla(\nabla^2\theta_m)\big), \qquad \Delta w_{\mathrm{diff}} = -\nu_{4,s}\Delta t_{\mathrm{dyn}}\,\nabla^4 w, \\
+q_n^{\mathrm{diff}} &= q_n - \frac{1}{m}\nabla\cdot\!\Big(\alpha_e\,(0.008\,d_{\min}^4)\,\bar{m}_e\,\nabla(\nabla^2 q_n)\Big)
 \end{aligned} \tag{8.5}
 $$
+
+ここで $\alpha_e \in [0, 1]$ は各セルの利用可能水分質量 $0.95\,m_i q_{n,i}$ から算出される流出フラックス Zalesak リミタであり、厳密な非負性と球面総水分質量保存を $\Theta_m$ 厳密保存と同時に保証する。
 
 3 段 Wicker–Skamarock RK3（$\Delta\tau \in \{\Delta t_{\mathrm{dyn}}/3, \Delta t_{\mathrm{dyn}}/2, \Delta t_{\mathrm{dyn}}\}$）の各段で、非線形 TRiSK コリオリ・渦度項 $\sum_{e'} w_{e,e'}\frac{\eta_e+\eta_{e'}}{2}u_{e'}$、運動エネルギー勾配 $-\nabla K$、鉛直運動量移流および散逸項からなる低速傾向を凍結し、高速音波サブステップ（最大時間刻み $\Delta t_{\mathrm{ac,max}} = \min(\max(0.16 d_{\min}/350, 1), 300)\ \mathrm{s}$, 鉛直陰的重み $\beta_{\mathrm{HEVI}} = 0.60$）を積分する。山岳上の水平気圧傾度力には Klemp (2011) の静水圧指数係数 $(f_{z0}, f_{z1})$ を適用し、水平質量フラックスには前向きオフセンタリング $U_h^{(k)}$ を用いる。さらに内部境界面 $k + \tfrac{1}{2}$ の陽的鉛直 $\theta_m$ 移流には保存型 MPAS-A 3 次上風バイアス流束再構成（$\beta_v = 0.25$; Skamarock & Gassmann, 2011, Eq. 5; Skamarock et al., 2012, Eq. 20）を適用し、静的な鉛直数値拡散を加えずに格子スケール $2\Delta z$ 鉛直計算モードを減衰させる：
 

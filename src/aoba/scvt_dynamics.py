@@ -274,6 +274,44 @@ def compute_scalar_laplacian_cell(
     return compute_scvt_divergence(mesh, grad_e)
 
 
+def hyperdiffuse_scvt_scalar_conservative(
+    mesh: SCVTMesh,
+    q_cell: torch.Tensor,
+    mass_cell: torch.Tensor,
+    coeff: float = 0.008,
+) -> torch.Tensor:
+    """Apply mass-conserving, positivity-preserving 4th-order hyperdiffusion on SCVT cells `[Nz, N_cells]`.
+
+    Uses flux-divergence form `F_e = (coeff * d_min^4) * m_e * grad(lap2(q))` (AOBA Formulation Eq. 8.5;
+    Skamarock et al., 2012, Sec. 3d) paired with a Zalesak outgoing-flux edge limiter so global tracer
+    mass `sum_i A_i * m_i * q_i` is conserved to float32 precision while guaranteeing `q_new >= 0`.
+    """
+    if coeff <= 0.0:
+        return q_cell
+    dx_min = getattr(mesh, "_dc_edge_min_m", None)
+    if dx_min is None:
+        dx_min = float(mesh.dc_edge.min().item())
+        setattr(mesh, "_dc_edge_min_m", dx_min)
+    c0 = mesh.cells_on_edge[:, 0]
+    c1 = mesh.cells_on_edge[:, 1]
+    dc_e = mesh.dc_edge.unsqueeze(0)
+    m_e = 0.5 * (mass_cell[:, c0] + mass_cell[:, c1])
+    lap2_q = compute_scalar_laplacian_cell(mesh, q_cell)
+    flx_e = (coeff * (dx_min ** 4)) * m_e * ((lap2_q[:, c1] - lap2_q[:, c0]) / dc_e)
+
+    # Positivity-preserving outgoing-flux edge limiter (preserves exact edge-pair mass conservation)
+    le_f = flx_e * mesh.dv_edge.unsqueeze(0)
+    out_ce = torch.clamp(le_f[:, mesh.edges_on_cell] * mesh.edge_sign_on_cell, min=0.0)
+    f_out_c = out_ce.sum(dim=-1) / mesh.area_cell.unsqueeze(0)
+    avail_c = 0.95 * mass_cell * torch.clamp(q_cell, min=0.0)
+    alpha_c = torch.clamp(avail_c / torch.clamp(f_out_c, min=1.0e-30), min=0.0, max=1.0)
+    alpha_e = torch.where(flx_e >= 0.0, alpha_c[:, c0], alpha_c[:, c1])
+    flx_lim = flx_e * alpha_e
+
+    div_f = compute_scvt_divergence(mesh, flx_lim)
+    return torch.clamp(q_cell - div_f / torch.clamp(mass_cell, min=1.0e-5), min=0.0)
+
+
 # ---------------------------------------------------------------------------
 # 3. Positive-Definite Zalesak FCT Tracer Advection on SCVT Voronoi Grid
 # ---------------------------------------------------------------------------
@@ -760,25 +798,35 @@ def _step_scvt_rk3_hevi_impl(
     sponge_w = vgrid.sponge_w[1:-1].unsqueeze(1)
     sponge_c = vgrid.sponge_c.unsqueeze(1)
 
-    # Scale-aware horizontal divergence damping & del^4 hyperviscosity (Skamarock et al., 2012, Sec. 3d)
-    # Note: on hexagonal Voronoi grids dv_edge ~ dc_edge / sqrt(3), so max(|lambda(lap4)|) ~ 480 / dc_min^4;
-    # setting nu_4 = 0.0002 * dc_min^4 / dt_dyn keeps |dt_dyn * nu_4 * lambda_max| < 0.10 unconditionally!
+    # Scale-aware horizontal divergence damping & del^4 hyperviscosity (AOBA Formulation Eq. 8.5;
+    # Skamarock et al., 2012, Sec. 3d). On Voronoi C-grids max(|lambda(lap4_vec)|) ~ 410 / dc_min^4
+    # while max(|lambda(lap4_scalar)|) ~ 30.5 / dc_min^4 (13.4x smaller), so vector momentum uses
+    # nu_4 whereas purely divergent flow (grad(lap2(div u))) and scalar Theta_m / w use eigenvalue-
+    # matched coefficients (nu_4_div, nu_4_s) in conservative flux-divergence form to damp single-cell
+    # gridpoint-storm CISK modes without affecting synoptic Rossby waves or jets.
     dx_min = getattr(mesh, "_dc_edge_min_m", None)
     if dx_min is None:
         dx_min = float(mesh.dc_edge.min().item())
         setattr(mesh, "_dc_edge_min_m", dx_min)
-    nu_div = 0.02 * (dx_min ** 2) / max(dt_dyn, 1.0)
-    nu_4 = 0.0002 * (dx_min ** 4) / max(dt_dyn, 1.0)
+    inv_dt = 1.0 / max(dt_dyn, 1.0)
+    nu_div = 0.02 * (dx_min ** 2) * inv_dt
+    nu_4 = 0.0002 * (dx_min ** 4) * inv_dt
+    nu_4_div = 0.010 * (dx_min ** 4) * inv_dt
+    nu_4_s = 0.006 * (dx_min ** 4) * inv_dt
 
     lap2_u0, grad_div_u0 = compute_vector_laplacian_edge(mesh, state.u_edge)
     lap4_u0, _ = compute_vector_laplacian_edge(mesh, lap2_u0)
-    visc_u = nu_div * grad_div_u0 - nu_4 * lap4_u0
-
-    lap2_th0 = compute_scalar_laplacian_cell(mesh, state.theta_m)
-    lap4_th0 = compute_scalar_laplacian_cell(mesh, lap2_th0)
-    visc_Thm = -(0.5 * nu_4) * (state.rho_d * dz_c) * lap4_th0
+    div_u0 = compute_scvt_divergence(mesh, state.u_edge)
+    lap2_div0 = compute_scalar_laplacian_cell(mesh, div_u0)
+    grad_lap2_div0 = (lap2_div0[:, c1] - lap2_div0[:, c0]) / dc_e
+    visc_u = nu_div * grad_div_u0 - nu_4 * lap4_u0 - nu_4_div * grad_lap2_div0
 
     m0 = state.rho_d * dz_c                   # Coupled dry mass [Nz, N_cells] [kg m^-2]
+    m0_e = 0.5 * (m0[:, c0] + m0[:, c1])
+    lap2_th0 = compute_scalar_laplacian_cell(mesh, state.theta_m)
+    flx_th4 = nu_4_s * m0_e * ((lap2_th0[:, c1] - lap2_th0[:, c0]) / dc_e)
+    visc_Thm = -compute_scvt_divergence(mesh, flx_th4)
+
     Thm0 = m0 * state.theta_m                 # Coupled Theta_m [Nz, N_cells] [kg K m^-2]
     u0 = state.u_edge
     w0 = state.w
@@ -1029,6 +1077,11 @@ def _step_scvt_rk3_hevi_impl(
             inv_nac = 1.0 / float(n_ac)
             uh_final = uh_accum * inv_nac
             om_final = om_accum * inv_nac
+
+    # Scale-selective horizontal 4th-order hyperdiffusion on interior vertical velocity w
+    lap2_w = compute_scalar_laplacian_cell(mesh, w_s[1:-1])
+    lap4_w = compute_scalar_laplacian_cell(mesh, lap2_w)
+    w_s = torch.cat([w_s[:1], w_s[1:-1] - (nu_4_s * dt_dyn) * lap4_w, w_s[-1:]], dim=0)
 
     state.rho_d = m_s / dz_c
     state.u_edge = u_s
