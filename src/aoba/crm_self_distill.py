@@ -422,41 +422,48 @@ def apply_exact_conservation_closure(
     p_tot_mass = torch.clamp(p_frac * w_avail_conv, min=0.0)
     p_tot_mass = torch.where(w_avail_conv > 0.05, p_tot_mass, torch.zeros_like(p_tot_mass))
 
-    # Apply surface evaporation into lowest layer, then smooth moisture-proportional zero-sum convective
-    # and PBL transport gated by layer_gate (zero in dry air aloft; active in PBL on clear ocean).
+    # Apply surface evaporation into lowest layer, then smooth zero-sum convective and PBL transport
+    # gated by layer_gate with matching projection weight w_bal = conv_f * dq_lim so a uniform logit
+    # offset lies strictly in the zero-tendency nullspace and never pumps lower-tropospheric residuals aloft.
     qn_base = qn0.clone()
     qn_base[0] = torch.clamp(qn_base[0] + (evap * dt) / torch.clamp(dm[0], min=1.0e-4), min=0.0)
     dq_lim = layer_gate * torch.clamp(0.015 * qn_base, max=1.0e-4)
     d_qn_raw = s_conv * torch.tanh(rp1_s * 0.2) * dq_lim
-    w_bal = conv_f * dq_lim * (qn_base * 1.0e3)
+    w_bal = conv_f * dq_lim
     dm_dqn_sum = (dm * conv_f * d_qn_raw).sum(dim=0)
     dm_wbal_sum = torch.clamp((dm * w_bal).sum(dim=0), min=1.0e-8)
     d_qn_bal = d_qn_raw - (dm_dqn_sum / dm_wbal_sum).unsqueeze(0) * w_bal
     qn_trans = torch.clamp(qn_base + d_qn_bal, min=0.0)
-    # Extract precipitation sink preferentially from high-RH/cloudy layers (RH > 0.60 weighting)
-    rh_trans = torch.clamp(qn_trans / torch.clamp(qsat_env, min=1.0e-7), min=0.0, max=2.0)
-    rh_p = torch.clamp((rh_trans - 0.60) / 0.35, min=0.0, max=1.0)
-    w_p_layer = conv_f * qn_trans * (rh_p * rh_p + 0.02)
-    w_p_sum = torch.clamp((dm * w_p_layer).sum(dim=0), min=1.0e-6)
-    dq_psink = torch.minimum(
-        (p_tot_mass / w_p_sum).unsqueeze(0) * w_p_layer,
-        0.9 * qn_trans,
-    )
-    qn_prov = torch.clamp(qn_trans - dq_psink, min=0.0)
+
+    # Predict suspended precipitating hydrometeors q_p cleanly without rescaling q_n:
+    # pre-existing falling q_p (qp0 > qp_prov) exits directly as surface precipitation rather than
+    # being sprayed back into q_n across upper-tropospheric layers via a column multiplier.
     fp_sig = torch.sigmoid(f_qp_logit - 2.0)
     qp_prov = s_conv * torch.clamp(qn_base + qp0, max=6.0e-3) * (0.5 * (fp_sig * fp_sig))
-
-    w_prov_conv = (dm * conv_f * (qn_prov + qp_prov)).sum(dim=0)
-    w_target_conv = torch.clamp(w_avail_conv - p_tot_mass, min=0.0)
-    zero_prov = w_prov_conv <= 1.0e-5
-    w_prov_safe = torch.where(zero_prov, torch.ones_like(w_prov_conv), w_prov_conv)
-    scale_w = torch.where(
-        zero_prov,
-        torch.ones_like(w_target_conv),
-        torch.clamp(w_target_conv / torch.clamp(w_prov_safe, min=1.0e-5), min=0.0, max=50.0),
+    w_qn_tr = (dm * conv_f * qn_trans).sum(dim=0)
+    w_qp0 = (dm * conv_f * qp0).sum(dim=0)
+    w_qp_prov = (dm * conv_f * qp_prov).sum(dim=0)
+    qp_cap_col = w_qp0 + 0.5 * w_qn_tr
+    qp_sc = torch.where(
+        w_qp_prov > qp_cap_col,
+        qp_cap_col / torch.clamp(w_qp_prov, min=1.0e-6),
+        torch.ones_like(w_qp_prov),
     )
-    qn_conv = torch.where(zero_prov.unsqueeze(0), qn_base, qn_prov * scale_w.unsqueeze(0))
-    qp_conv = torch.where(zero_prov.unsqueeze(0), qp0, qp_prov * scale_w.unsqueeze(0))
+    qp_conv = qp_prov * qp_sc.unsqueeze(0)
+    w_qp_conv = (dm * conv_f * qp_conv).sum(dim=0)
+
+    # Extract only the net non-precipitating sink needed for precipitation + suspended q_p growth,
+    # preferentially from cloudy/high-RH layers (qc0 + qi0 and RH > 0.60).
+    p_need_qn = torch.clamp(p_tot_mass + (w_qp_conv - w_qp0), min=0.0)
+    rh_trans = torch.clamp(qn_trans / torch.clamp(qsat_env, min=1.0e-7), min=0.0, max=2.0)
+    rh_p = torch.clamp((rh_trans - 0.60) / 0.35, min=0.0, max=1.0)
+    w_p_layer = conv_f * (qn_trans * (rh_p * rh_p + 0.01) + 5.0 * (qc0 + qi0))
+    w_p_sum = torch.clamp((dm * w_p_layer).sum(dim=0), min=1.0e-6)
+    dq_psink = torch.minimum(
+        (p_need_qn / w_p_sum).unsqueeze(0) * w_p_layer,
+        0.9 * qn_trans,
+    )
+    qn_conv = torch.clamp(qn_trans - dq_psink, min=0.0)
     qn_new = torch.where(in_conv, qn_conv, qn0)
     qp_new = torch.where(in_conv, qp_conv, qp0)
     w_post_conv = (dm * conv_f * (qn_new + qp_new)).sum(dim=0)
@@ -1483,8 +1490,8 @@ def _compute_distill_loss(
         qsat2 = torch.clamp(torch.cat([qsat_in, qsat_in], dim=1), min=1.0e-5)
         s_conv2 = torch.clamp((ex2 - 0.50) / 0.14, min=0.0, max=1.0).square()
         rh_err = (qn_p2 - qn_t2) / qsat2
-        l_rh = (s_conv2 * F.smooth_l1_loss(rh_err, torch.zeros_like(rh_err), beta=0.01, reduction="none")).mean()
-        loss = loss + 8.0 * l_rh
+        l_rh = (s_conv2 * F.smooth_l1_loss(rh_err, torch.zeros_like(rh_err), beta=0.003, reduction="none")).mean()
+        loss = loss + 10.0 * l_rh
 
     # Column-integrated LWP, IWP, & RWP [g m^-2] loss prevents clear-sky stratospheric levels from diluting cloud/precip paths
     if dm is not None:

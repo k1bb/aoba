@@ -5640,6 +5640,8 @@ kernel void crm_distill_closure_col(
 
     float dm_dqn_sum = 0.0f;
     float dm_wbal_sum = 0.0f;
+    float w_qp0_sum = 0.0f;
+    float w_qp_prov_sum = 0.0f;
     float wbal_col[128];
     float dqnr_col[128];
     for (uint k = 0u; k < nz; ++k) {
@@ -5655,37 +5657,54 @@ kernel void crm_distill_closure_col(
             dv_imp += dm_c_col[k] * dv_r;
             float dq_lim = l_gate * min(0.015f * qnb_col[k], 1.0e-4f);
             float dqn_r = sconv_col[k] * tanh(rp1_s[k] * 0.2f) * dq_lim;
-            float wb = dq_lim * (qnb_col[k] * 1.0e3f);
+            float wb = dq_lim;
             wbal_col[k] = wb;
             dqnr_col[k] = dqn_r;
             dm_dqn_sum += dm_c_col[k] * dqn_r;
             dm_wbal_sum += dm_c_col[k] * wb;
+            w_qp0_sum += dm_c_col[k] * max(qp_pre[k * N + c], 0.0f);
+            w_qp_prov_sum += dm_c_col[k] * qp_p_col[k];
         } else if (k < 128u) {
             wbal_col[k] = 0.0f;
             dqnr_col[k] = 0.0f;
         }
     }
     float dqn_corr = dm_dqn_sum / max(dm_wbal_sum, 1.0e-8f);
+    float w_qn_tr_sum = 0.0f;
     float w_p_sum = 0.0f;
     float qn_tr_col[128];
     float wp_l_col[128];
     for (uint k = 0u; k < nz; ++k) {
         if (k < 128u && sconv_col[k] > 0.0f) {
+            uint idx = k * N + c;
+            float qn0_k = max(qn_post_ls[idx], 0.0f);
+            float qc0_k = max(qc_pre[idx], 0.0f);
+            float qi0_k = max(qi_pre[idx], 0.0f);
+            float qci0_k = qc0_k + qi0_k;
+            if (qci0_k > qn0_k) {
+                float sc = qn0_k / max(qci0_k, 1.0e-12f);
+                qc0_k *= sc;
+                qi0_k *= sc;
+            }
             float dqn_bal = dqnr_col[k] - dqn_corr * wbal_col[k];
             float qn_tr = max(qnb_col[k] + dqn_bal, 0.0f);
             float rh_tr = clamp(qn_tr / max(qsat_col[k], 1.0e-7f), 0.0f, 2.0f);
             float rh_p = clamp((rh_tr - 0.60f) / 0.35f, 0.0f, 1.0f);
-            float wp_l = qn_tr * (rh_p * rh_p + 0.02f);
+            float wp_l = qn_tr * (rh_p * rh_p + 0.01f) + 5.0f * (qc0_k + qi0_k);
             qn_tr_col[k] = qn_tr;
             wp_l_col[k] = wp_l;
+            w_qn_tr_sum += dm_c_col[k] * qn_tr;
             w_p_sum += dm_c_col[k] * wp_l;
         } else if (k < 128u) {
             qn_tr_col[k] = 0.0f;
             wp_l_col[k] = 0.0f;
         }
     }
-    float inv_wp_sum = p_tot_mass / max(w_p_sum, 1.0e-6f);
-    float w_prov_conv = 0.0f;
+    float qp_cap_col = w_qp0_sum + 0.5f * w_qn_tr_sum;
+    float qp_sc = (w_qp_prov_sum > qp_cap_col) ? (qp_cap_col / max(w_qp_prov_sum, 1.0e-6f)) : 1.0f;
+    float w_qp_conv_sum = w_qp_prov_sum * qp_sc;
+    float p_need_qn = max(p_tot_mass + (w_qp_conv_sum - w_qp0_sum), 0.0f);
+    float inv_wp_sum = p_need_qn / max(w_p_sum, 1.0e-6f);
     float p_sink_mass = 0.0f;
     float dqps_col[128];
     for (uint k = 0u; k < nz; ++k) {
@@ -5696,17 +5715,12 @@ kernel void crm_distill_closure_col(
             qn_tr_col[k] = qn_p;
             dqps_col[k] = dq_psink;
             p_sink_mass += dm_c_col[k] * dq_psink;
-            w_prov_conv += dm_c_col[k] * (qn_p + qp_p_col[k]);
         } else if (k < 128u) {
             dqps_col[k] = 0.0f;
         }
     }
 
-    float w_target_conv = max(w_avail_conv - p_tot_mass, 0.0f);
-    bool zero_prov = (w_prov_conv <= 1.0e-5f);
-    float scale_w = clamp(w_target_conv / max(w_prov_conv, 1.0e-5f), 0.0f, 50.0f);
-
-    // Pass 2: convective rescaled water, condensate partition, autoconversion fallout & precip integral
+    // Pass 2: convective water, condensate partition, autoconversion fallout & precip integral
     float w_post_conv = 0.0f;
     float p_fall_mass = 0.0f;
     float d_m_qp = 0.0f;
@@ -5742,9 +5756,8 @@ kernel void crm_distill_closure_col(
             float t_env = clamp(t_post_ls, 180.0f, 340.0f);
             float qsat_env = qsat_col[k];
 
-            float qnb = (k == 0u) ? max(qn0 + dq_evap0, 0.0f) : qn0;
-            qn_n = zero_prov ? qnb : (qn_tr_col[k] * scale_w);
-            qp_n = zero_prov ? qp0 : (qp_p_col[k] * scale_w);
+            qn_n = qn_tr_col[k];
+            qp_n = qp_p_col[k] * qp_sc;
             w_post_conv += dm * (qn_n + qp_n);
 
             float rh_gate = clamp((qn_n / max(qsat_env, 1.0e-7f) - 0.72f) / 0.25f, 0.0f, 1.0f);
