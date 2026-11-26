@@ -1507,13 +1507,21 @@ kernel void scvt_fast_cell_hevi(
     }
     uint k_top = uint(max(int(k_slope_top[c] + 0.5f), 0));
 
-    // Single thread-local array (`dp[64]` = 256 B) eliminates 10x[64] register spills!
+    // 3x[64] (768 B) thread-local buffers eliminate Pass-1 DRAM write + Pass-2 DRAM read of m_n/Thm_n (-1.26 GB/step).
     float dp[64];
+    float m_dag[64];
+    float T_dag[64];
 
-    // 4-scalar sliding window for 3rd-order upwind vertical theta_m advection
-    float th_0  = Thm_c[c] / max(m_c[c], 1.0e-4f);
-    float th_p1 = (nz > 1u) ? (Thm_c[n_cells + c] / max(m_c[n_cells + c], 1.0e-4f)) : th_0;
-    float th_p2 = (nz > 2u) ? (Thm_c[2u * n_cells + c] / max(m_c[2u * n_cells + c], 1.0e-4f)) : th_p1;
+    // 4-scalar sliding window for 3rd-order upwind vertical theta_m advection (register-caches m_c/Thm_c)
+    float m_0   = m_c[c];
+    float T_0   = Thm_c[c];
+    float m_p1  = (nz > 1u) ? m_c[n_cells + c] : m_0;
+    float T_p1  = (nz > 1u) ? Thm_c[n_cells + c] : T_0;
+    float m_p2  = (nz > 2u) ? m_c[2u * n_cells + c] : m_p1;
+    float T_p2  = (nz > 2u) ? Thm_c[2u * n_cells + c] : T_p1;
+    float th_0  = T_0 / max(m_0, 1.0e-4f);
+    float th_p1 = T_p1 / max(m_p1, 1.0e-4f);
+    float th_p2 = T_p2 / max(m_p2, 1.0e-4f);
     float th_m1 = th_0;
 
     float om_dn = 0.0f;
@@ -1572,12 +1580,12 @@ kernel void scvt_fast_cell_hevi(
             }
         }
 
-        float mk = m_c[cidx];
-        float Thmk = Thm_c[cidx];
+        float mk = m_0;
+        float Thmk = T_0;
         float md = mk - dt_ac * (d_m + (om_up - om_dn));
         float Td = Thmk + dt_ac * (-d_Th - (thw_up * om_up - thw_dn * om_dn) + tend_Thm[cidx]);
-        m_n[cidx] = md;
-        Thm_n[cidx] = Td;
+        m_dag[k] = md;
+        T_dag[k] = Td;
 
         float tr_k = Thm_ref[cidx];
         float p_blend_k = fma(dp_dThm_s[cidx], (1.0f - beta) * (Thmk - tr_k) + beta * (Td - tr_k), pres_s[cidx]);
@@ -1603,12 +1611,16 @@ kernel void scvt_fast_cell_hevi(
         p_blend_prev = p_blend_k;
         rtot_blend_prev = rtot_blend_k;
 
+        m_0 = m_p1; T_0 = T_p1;
+        m_p1 = m_p2; T_p1 = T_p2;
         th_m1 = th_0;
         th_0 = th_p1;
         th_p1 = th_p2;
         if (k + 3u < nz) {
             uint idx3 = (k + 3u) * n_cells + c;
-            th_p2 = Thm_c[idx3] / max(m_c[idx3], 1.0e-4f);
+            m_p2 = m_c[idx3];
+            T_p2 = Thm_c[idx3];
+            th_p2 = T_p2 / max(m_p2, 1.0e-4f);
         }
     }
 
@@ -1639,8 +1651,8 @@ kernel void scvt_fast_cell_hevi(
                 om_accum[cidx] += (1.0f - beta) * om_old_m + beta * om_new;
             }
         }
-        m_n[cidx]   = max(m_n[cidx] - b_dt * (dom_up - dom_dn), 1.0e-3f);
-        float T_fin = Thm_n[cidx] - b_dt * (thw_up * dom_up - thw_dn * dom_dn);
+        m_n[cidx]   = max(m_dag[k] - b_dt * (dom_up - dom_dn), 1.0e-3f);
+        float T_fin = T_dag[k] - b_dt * (thw_up * dom_up - thw_dn * dom_dn);
         Thm_n[cidx] = T_fin;
         if (write_p) {
             p_cell_n[cidx] = fma(dp_dThm_s[cidx], T_fin - Thm_ref[cidx], pres_s[cidx]);
@@ -3342,7 +3354,11 @@ kernel void crm_2d_rk3_stage_fused_simd(
     float inv_nac_tot = 1.0f / float(n_ac2 * n_sub_grp);
 
     device float4* sb = stage_buf + (ulong(tg_id) * ulong(nz) * 256ul) + ulong(lid);
+    // 3x[64] (768 B) keeps rho & Thm off DRAM across all acoustic substeps and all 3 RK3 stages
+    // (flushed once on stg == 2 && last_ac), eliminating ~9.5 GB/host-step of DRAM round-trips.
     float d_star[64];
+    float r_loc[64];
+    float T_loc[64];
 
     for (uint sub = 0u; sub < n_sub_grp; ++sub) {
         bool first_sub = (sub == 0u);
@@ -3372,16 +3388,15 @@ kernel void crm_2d_rk3_stage_fused_simd(
             float dt_ac   = dtau_2d / float(n_ac);
             float bdt2    = (beta * dt_ac) * (beta * dt_ac);
             uint accum    = (stg == 2u) ? 1u : 0u;
+            bool write_out_stage = (stg == 2u);
 
-            device const float* rho_in = (stg == 0u) ? r_base : r_dst;
-            device const float* Thm_in = (stg == 0u) ? T_base : T_dst;
             device const float* u_in   = (stg == 0u) ? u_base : u_dst;
             device const float* v_in   = (stg == 0u) ? v_base : v_dst;
             device const float* w_in   = (stg == 0u) ? w_base : w_dst;
 
             // ---- Pass 0 fused with ac == 0 Forward (zero stage_buf reads on ac == 0!) ----
-            float r_cur = rho_in[tid];
-            float T_cur = Thm_in[tid];
+            float r_cur = (stg == 0u) ? r_base[tid] : r_loc[0];
+            float T_cur = (stg == 0u) ? T_base[tid] : T_loc[0];
             float q_cur = 1.0f + q_n_in[tid] + q_p_in[tid];
             float u_cur = u_in[tid];
             float v_cur = v_in[tid];
@@ -3418,8 +3433,8 @@ kernel void crm_2d_rk3_stage_fused_simd(
                 float thm_next = 0.0f, dp_next = 0.0f, ap_next = 0.0f, rtot_next = 0.0f, inv_dz_next = 1.0f;
                 if (k + 1u < nz) {
                     uint idx_n = (k + 1u) * M + tid;
-                    r_next = rho_in[idx_n];
-                    T_next = Thm_in[idx_n];
+                    r_next = (stg == 0u) ? r_base[idx_n] : r_loc[k + 1u];
+                    T_next = (stg == 0u) ? T_base[idx_n] : T_loc[k + 1u];
                     q_next = 1.0f + q_n_in[idx_n] + q_p_in[idx_n];
                     u_next = u_in[idx_n];
                     v_next = v_in[idx_n];
@@ -3550,11 +3565,11 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     - (thm_w_above0 * fz_old_above0 - thm_w_below0 * fz_old_below0) * inv_dz_cur
                     + t_thm_k
                 );
-                // Safe to write u_dst/r_dst/T_dst[idx] now: Pass 0 already loaded next layer & shuffled cur layer!
+                // Store provisional r_dag0/T_dag0 in thread-local r_loc/T_loc (zero DRAM traffic!)
+                r_loc[k] = r_dag0;
+                T_loc[k] = T_dag0;
                 if (active) {
                     u_dst[idx] = u_n;
-                    r_dst[idx] = r_dag0;
-                    T_dst[idx] = T_dag0;
                     if (accum != 0u) {
                         float fx_sum = first_acc0 ? fx_k : (fx_acc[idx] + fx_k);
                         fx_acc[idx] = last_acc0 ? (fx_sum * inv_nac_tot) : fx_sum;
@@ -3649,6 +3664,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
                 bool last_ac  = (ac + 1u == n_ac);
                 bool first_acc = first_sub && first_ac;
                 bool last_acc  = last_sub && last_ac;
+                bool flush_dram = write_out_stage && last_ac;
 
                 if (ac > 0u) {
                     float p_blend_prev = 0.0f;
@@ -3663,8 +3679,8 @@ kernel void crm_2d_rk3_stage_fused_simd(
                         float4 c0 = sb[k * 256u + 0u];
                         float4 c1 = sb[k * 256u + 64u];
 
-                        float r_cur_a = r_dst[idx];
-                        float T_cur_a = T_dst[idx];
+                        float r_cur_a = r_loc[k];
+                        float T_cur_a = T_loc[k];
                         float u_old   = u_dst[idx];
 
                         float ap = c0.x;
@@ -3708,10 +3724,8 @@ kernel void crm_2d_rk3_stage_fused_simd(
                             - (thm_w_above * fz_old_above - thm_w_below * fz_old_below) * inv_dz_k
                             + c1.z
                         );
-                        if (active) {
-                            r_dst[idx] = r_dag;
-                            T_dst[idx] = T_dag;
-                        }
+                        r_loc[k] = r_dag;
+                        T_loc[k] = T_dag;
 
                         float p_blend = fma(dp, (1.0f - beta) * T_cur_a + beta * T_dag, ap);
                         float rtot_blend = ((1.0f - beta) * r_cur_a + beta * r_dag) * c1.w;
@@ -3751,10 +3765,16 @@ kernel void crm_2d_rk3_stage_fused_simd(
 
                     float thm_w_m = w1_m.y;
                     float inv_dz_l = inv_dz_c[k_layer * dz_cols + col_dz];
+                    float r_nl = max(r_loc[k_layer] - beta * dt_ac * (dfz_above - dfz_cur) * inv_dz_l, 1.0e-5f);
+                    float T_nl = T_loc[k_layer] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) * inv_dz_l;
+                    r_loc[k_layer] = r_nl;
+                    T_loc[k_layer] = T_nl;
                     if (active) {
                         w_dst[w_idx] = w_new;
-                        r_dst[w_idx] = max(r_dst[w_idx] - beta * dt_ac * (dfz_above - dfz_cur) * inv_dz_l, 1.0e-5f);
-                        T_dst[w_idx] = T_dst[w_idx] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) * inv_dz_l;
+                        if (flush_dram) {
+                            r_dst[w_idx] = r_nl;
+                            T_dst[w_idx] = T_nl;
+                        }
                         if (accum != 0u) {
                             float fz_inc = fz_old_m + beta * dfz_cur;
                             float fz_sum = first_acc ? fz_inc : (fz_acc[w_idx] + fz_inc);
@@ -3764,12 +3784,18 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     dfz_above = dfz_cur;
                     thm_w_above = thm_w_m;
                 }
+                float inv_dz_0 = inv_dz_c[col_dz];
+                float r_n0 = max(r_loc[0] - beta * dt_ac * dfz_above * inv_dz_0, 1.0e-5f);
+                float T_n0 = T_loc[0] - beta * dt_ac * (thm_w_above * dfz_above) * inv_dz_0;
+                r_loc[0] = r_n0;
+                T_loc[0] = T_n0;
                 if (active) {
-                    float inv_dz_0 = inv_dz_c[col_dz];
                     w_dst[tid] = 0.0f;
                     w_dst[nz * M + tid] = 0.0f;
-                    r_dst[tid] = max(r_dst[tid] - beta * dt_ac * dfz_above * inv_dz_0, 1.0e-5f);
-                    T_dst[tid] = T_dst[tid] - beta * dt_ac * (thm_w_above * dfz_above) * inv_dz_0;
+                    if (flush_dram) {
+                        r_dst[tid] = r_n0;
+                        T_dst[tid] = T_n0;
+                    }
                     if (accum != 0u && last_acc) {
                         fz_acc[tid] = 0.0f;
                         fz_acc[nz * M + tid] = 0.0f;
@@ -4290,29 +4316,22 @@ kernel void scvt_div_cell(
     device const float* flux_e     [[buffer(2)]],   // [nz, N_edges]
     device float* div_out          [[buffer(3)]],   // [nz, N_cells]
     device const uint* u_params    [[buffer(4)]],   // [nz, N_cells, N_edges]
-    uint c [[thread_position_in_grid]])
+    uint gid [[thread_position_in_grid]])
 {
     uint nz = u_params[0];
     uint n_cells = u_params[1];
     uint n_edges = u_params[2];
-    if (c >= n_cells) return;
+    if (gid >= nz * n_cells) return;
+    uint k = gid / n_cells;
+    uint c = gid - k * n_cells;
     uint c6 = c * 6u;
-    uint e0 = uint(eoc[c6]);      float w0 = div_w[c6];
-    uint e1 = uint(eoc[c6 + 1u]); float w1 = div_w[c6 + 1u];
-    uint e2 = uint(eoc[c6 + 2u]); float w2 = div_w[c6 + 2u];
-    uint e3 = uint(eoc[c6 + 3u]); float w3 = div_w[c6 + 3u];
-    uint e4 = uint(eoc[c6 + 4u]); float w4 = div_w[c6 + 4u];
-    uint e5 = uint(eoc[c6 + 5u]); float w5 = div_w[c6 + 5u];
-    for (uint k = 0u; k < nz; ++k) {
-        uint eb = k * n_edges;
-        float acc = w0 * flux_e[eb + e0]
-                  + w1 * flux_e[eb + e1]
-                  + w2 * flux_e[eb + e2]
-                  + w3 * flux_e[eb + e3]
-                  + w4 * flux_e[eb + e4]
-                  + w5 * flux_e[eb + e5];
-        div_out[k * n_cells + c] = acc;
-    }
+    uint eb = k * n_edges;
+    div_out[gid] = div_w[c6]      * flux_e[eb + uint(eoc[c6])]
+                 + div_w[c6 + 1u] * flux_e[eb + uint(eoc[c6 + 1u])]
+                 + div_w[c6 + 2u] * flux_e[eb + uint(eoc[c6 + 2u])]
+                 + div_w[c6 + 3u] * flux_e[eb + uint(eoc[c6 + 3u])]
+                 + div_w[c6 + 4u] * flux_e[eb + uint(eoc[c6 + 4u])]
+                 + div_w[c6 + 5u] * flux_e[eb + uint(eoc[c6 + 5u])];
 }
 
 kernel void scvt_vorticity_vert(
@@ -4321,20 +4340,19 @@ kernel void scvt_vorticity_vert(
     device const float* u_e        [[buffer(2)]],   // [nz, N_edges]
     device float* zeta_out         [[buffer(3)]],   // [nz, N_verts]
     device const uint* u_params    [[buffer(4)]],   // [nz, N_verts, N_edges]
-    uint v [[thread_position_in_grid]])
+    uint gid [[thread_position_in_grid]])
 {
     uint nz = u_params[0];
     uint n_verts = u_params[1];
     uint n_edges = u_params[2];
-    if (v >= n_verts) return;
+    if (gid >= nz * n_verts) return;
+    uint k = gid / n_verts;
+    uint v = gid - k * n_verts;
     uint v3 = v * 3u;
-    uint e0 = uint(eov[v3]);      float w0 = vort_w[v3];
-    uint e1 = uint(eov[v3 + 1u]); float w1 = vort_w[v3 + 1u];
-    uint e2 = uint(eov[v3 + 2u]); float w2 = vort_w[v3 + 2u];
-    for (uint k = 0u; k < nz; ++k) {
-        uint eb = k * n_edges;
-        zeta_out[k * n_verts + v] = w0 * u_e[eb + e0] + w1 * u_e[eb + e1] + w2 * u_e[eb + e2];
-    }
+    uint eb = k * n_edges;
+    zeta_out[gid] = vort_w[v3]      * u_e[eb + uint(eov[v3])]
+                  + vort_w[v3 + 1u] * u_e[eb + uint(eov[v3 + 1u])]
+                  + vort_w[v3 + 2u] * u_e[eb + uint(eov[v3 + 2u])];
 }
 
 kernel void scvt_vec_lap_edge(
@@ -4349,28 +4367,21 @@ kernel void scvt_vec_lap_edge(
     device float* lap_out          [[buffer(8)]],   // [nz, N_edges]
     device float* grad_div_out     [[buffer(9)]],   // [nz, N_edges]
     device const uint* u_params    [[buffer(10)]],  // [nz, N_cells, N_verts, N_edges]
-    uint e [[thread_position_in_grid]])
+    uint gid [[thread_position_in_grid]])
 {
     uint nz = u_params[0];
     uint n_cells = u_params[1];
     uint n_verts = u_params[2];
     uint n_edges = u_params[3];
-    if (e >= n_edges) return;
-    uint c0e = uint(c0_arr[e]);
-    uint c1e = uint(c1_arr[e]);
-    uint v0e = uint(v0_arr[e]);
-    uint v1e = uint(v1_arr[e]);
-    float idc = inv_dc[e];
-    float idv = inv_dv[e];
-    for (uint k = 0u; k < nz; ++k) {
-        uint cbase = k * n_cells;
-        uint vbase = k * n_verts;
-        float gd = (div_c[cbase + c1e] - div_c[cbase + c0e]) * idc;
-        float rc = -(zeta_v[vbase + v1e] - zeta_v[vbase + v0e]) * idv;
-        uint oidx = k * n_edges + e;
-        grad_div_out[oidx] = gd;
-        lap_out[oidx] = gd + rc;
-    }
+    if (gid >= nz * n_edges) return;
+    uint k = gid / n_edges;
+    uint e = gid - k * n_edges;
+    uint cbase = k * n_cells;
+    uint vbase = k * n_verts;
+    float gd = (div_c[cbase + uint(c1_arr[e])] - div_c[cbase + uint(c0_arr[e])]) * inv_dc[e];
+    float rc = -(zeta_v[vbase + uint(v1_arr[e])] - zeta_v[vbase + uint(v0_arr[e])]) * inv_dv[e];
+    grad_div_out[gid] = gd;
+    lap_out[gid] = gd + rc;
 }
 
 kernel void scvt_scalar_grad_edge(
@@ -4380,19 +4391,16 @@ kernel void scvt_scalar_grad_edge(
     device const float* phi_c      [[buffer(3)]],   // [nz, N_cells]
     device float* grad_out         [[buffer(4)]],   // [nz, N_edges]
     device const uint* u_params    [[buffer(5)]],   // [nz, N_cells, N_edges]
-    uint e [[thread_position_in_grid]])
+    uint gid [[thread_position_in_grid]])
 {
     uint nz = u_params[0];
     uint n_cells = u_params[1];
     uint n_edges = u_params[2];
-    if (e >= n_edges) return;
-    uint c0e = uint(c0_arr[e]);
-    uint c1e = uint(c1_arr[e]);
-    float idc = inv_dc[e];
-    for (uint k = 0u; k < nz; ++k) {
-        uint cbase = k * n_cells;
-        grad_out[k * n_edges + e] = (phi_c[cbase + c1e] - phi_c[cbase + c0e]) * idc;
-    }
+    if (gid >= nz * n_edges) return;
+    uint k = gid / n_edges;
+    uint e = gid - k * n_edges;
+    uint cbase = k * n_cells;
+    grad_out[gid] = (phi_c[cbase + uint(c1_arr[e])] - phi_c[cbase + uint(c0_arr[e])]) * inv_dc[e];
 }
 
 kernel void scvt_eta_edge(
@@ -5250,7 +5258,7 @@ def run_scvt_div_metal(lib: Any, mesh: Any, flux_edge: torch.Tensor) -> torch.Te
     nc = mc["n_cells"]
     out = torch.empty((nz, nc), device=flux_edge.device, dtype=torch.float32)
     up = _scvt_u_param(mc, ("div", nz), [nz, nc, mc["n_edges"]], flux_edge.device)
-    lib.scvt_div_cell(mc["eoc"], mc["div_w"], flux_edge.contiguous(), out, up, threads=nc)
+    lib.scvt_div_cell(mc["eoc"], mc["div_w"], flux_edge.contiguous(), out, up, threads=nz * nc)
     return out
 
 
@@ -5260,7 +5268,7 @@ def run_scvt_vorticity_metal(lib: Any, mesh: Any, u_edge: torch.Tensor) -> torch
     nv = mc["n_verts"]
     out = torch.empty((nz, nv), device=u_edge.device, dtype=torch.float32)
     up = _scvt_u_param(mc, ("vor", nz), [nz, nv, mc["n_edges"]], u_edge.device)
-    lib.scvt_vorticity_vert(mc["eov"], mc["vort_w"], u_edge.contiguous(), out, up, threads=nv)
+    lib.scvt_vorticity_vert(mc["eov"], mc["vort_w"], u_edge.contiguous(), out, up, threads=nz * nv)
     return out
 
 
@@ -5275,7 +5283,7 @@ def run_scvt_vec_lap_metal(lib: Any, mesh: Any, u_edge: torch.Tensor) -> tuple[t
     up = _scvt_u_param(mc, ("vlap", nz), [nz, mc["n_cells"], mc["n_verts"], ne], u_edge.device)
     lib.scvt_vec_lap_edge(
         mc["c0"], mc["c1"], mc["v0"], mc["v1"], mc["inv_dc"], mc["inv_dv"],
-        div_c, zeta_v, lap, gd, up, threads=ne,
+        div_c, zeta_v, lap, gd, up, threads=nz * ne,
     )
     return lap, gd
 
@@ -5286,7 +5294,7 @@ def run_scvt_scalar_lap_metal(lib: Any, mesh: Any, phi_cell: torch.Tensor) -> to
     ne = mc["n_edges"]
     grad_e = torch.empty((nz, ne), device=phi_cell.device, dtype=torch.float32)
     up = _scvt_u_param(mc, ("sgrad", nz), [nz, mc["n_cells"], ne], phi_cell.device)
-    lib.scvt_scalar_grad_edge(mc["c0"], mc["c1"], mc["inv_dc"], phi_cell.contiguous(), grad_e, up, threads=ne)
+    lib.scvt_scalar_grad_edge(mc["c0"], mc["c1"], mc["inv_dc"], phi_cell.contiguous(), grad_e, up, threads=nz * ne)
     return run_scvt_div_metal(lib, mesh, grad_e)
 
 

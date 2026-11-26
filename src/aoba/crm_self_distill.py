@@ -2058,6 +2058,7 @@ def extract_rad_distill_features(
     o3_vmr_c: torch.Tensor | None = None,
     q_dust_c: torch.Tensor | None = None,
     tau_aero_sw_c: torch.Tensor | None = None,
+    cell_sub: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build flat dimensionless per-subcolumn ICA radiation features `[M, 9*nz + 13]` plus `(cp_layer, s_inc)`."""
     co2_f = math.log(max(float(co2_ppmv), 1.0) / 284.317)
@@ -2071,11 +2072,22 @@ def extract_rad_distill_features(
             emiss_sfc=emiss_sfc, mu0=mu0, s_toa=s_toa,
             co2_f=co2_f, ch4_f=ch4_f, n2o_f=n2o_f,
             o3_vmr_c=o3_vmr_c, q_dust_c=q_dust_c, tau_aero_sw_c=tau_aero_sw_c,
+            cell_sub=cell_sub,
         )
 
     nz, m_col = pres_c.shape
     dev = pres_c.device
     dtype = pres_c.dtype
+    cs = max(int(cell_sub), 1)
+    if cs > 1:
+        def _maybe_exp(arr: torch.Tensor | None) -> torch.Tensor | None:
+            if arr is not None and int(arr.shape[1]) * cs == m_col:
+                return arr.unsqueeze(-1).expand(nz, -1, cs).reshape(nz, m_col)
+            return arr
+        dz_c = _maybe_exp(dz_c)  # type: ignore[assignment]
+        o3_vmr_c = _maybe_exp(o3_vmr_c)
+        q_dust_c = _maybe_exp(q_dust_c)
+        tau_aero_sw_c = _maybe_exp(tau_aero_sw_c)
 
     dm_dry = torch.clamp(rho_d_c * dz_c, min=1.0e-6)
     cp_layer = (C.CP_D + C.CP_V * torch.clamp(qv_c, min=0.0)) * dm_dry  # [nz, M] J m^-2 K^-1

@@ -6204,19 +6204,19 @@ kernel void crm_distill_closure_col(
 kernel void rad_distill_extract_col(
     device const float* pres_c     [[buffer(0)]],   // [nz, M]
     device const float* temp_c     [[buffer(1)]],   // [nz, M]
-    device const float* dz_c       [[buffer(2)]],   // [nz, M]
+    device const float* dz_c       [[buffer(2)]],   // [nz, M] or [nz, M/cell_sub]
     device const float* rho_d_c    [[buffer(3)]],   // [nz, M]
     device const float* qv_c       [[buffer(4)]],   // [nz, M]
     device const float* qc_c       [[buffer(5)]],   // [nz, M]
     device const float* qi_c       [[buffer(6)]],   // [nz, M]
-    device const float* o3_c       [[buffer(7)]],   // [nz, M] or [1]
-    device const float* q_dust_c   [[buffer(8)]],   // [nz, M] or [1]
-    device const float* tau_aero_c [[buffer(9)]],   // [nz, M] or [1]
+    device const float* o3_c       [[buffer(7)]],   // [nz, M] or [nz, M/cell_sub] or [1]
+    device const float* q_dust_c   [[buffer(8)]],   // [nz, M] or [nz, M/cell_sub] or [1]
+    device const float* tau_aero_c [[buffer(9)]],   // [nz, M] or [nz, M/cell_sub] or [1]
     device const float* sfc_8      [[buffer(10)]],  // [8, M]: t_sfc, alb_vd, alb_vf, alb_nd, alb_nf, emiss, mu0, s_toa
     device float* x_out            [[buffer(11)]],  // [M, 9*nz + 13]
     device float* cp_layer_out     [[buffer(12)]],  // [nz, M]
     device float* s_inc_out        [[buffer(13)]],  // [M]
-    constant ulong4& u_pack        [[buffer(14)]],  // [nz, M, d_in, (has_aero<<2)|(has_dust<<1)|has_o3]
+    constant ulong4& u_pack        [[buffer(14)]],  // [nz, M, d_in, (cell_sub<<8)|(aero_c<<6)|(dust_c<<5)|(o3_c<<4)|(dz_c<<3)|(has_aero<<2)|(has_dust<<1)|has_o3]
     constant float4& f_p0          [[buffer(15)]],  // [cp_d, cp_v, co2_f, ch4_f]
     constant float4& f_p1          [[buffer(16)]],  // [n2o_f, 0, 0, 0]
     uint grp                       [[threadgroup_position_in_grid]],
@@ -6226,18 +6226,25 @@ kernel void rad_distill_extract_col(
     uint M = uint(u_pack.y);
     uint d_in = uint(u_pack.z);
     uint flags = uint(u_pack.w);
-    bool has_o3   = (flags & 1u) != 0u;
-    bool has_dust = (flags & 2u) != 0u;
-    bool has_aero = (flags & 4u) != 0u;
+    bool has_o3     = (flags & 1u) != 0u;
+    bool has_dust   = (flags & 2u) != 0u;
+    bool has_aero   = (flags & 4u) != 0u;
+    bool dz_cell    = (flags & 8u) != 0u;
+    bool o3_cell    = (flags & 16u) != 0u;
+    bool dust_cell  = (flags & 32u) != 0u;
+    bool aero_cell  = (flags & 64u) != 0u;
+    uint cell_sub   = max(flags >> 8u, 1u);
+    uint M_cell     = M / cell_sub;
     uint c0 = grp * 32u;
     if (c0 >= M) return;
     uint n_valid = (c0 + 32u <= M) ? 32u : (M - c0);
     uint c = c0 + lane;
+    uint c_cell = c / cell_sub;
     bool active = (lane < n_valid);
 
-    // 5 x 32x33 bank-conflict-free shared-memory transpose slab (21.1 KB):
-    // reads qv/qc/qi ONCE (no duplicate DRAM pass) and cuts 36 barriers -> 8 barriers.
-    threadgroup float sm_t[5u * 32u * 33u];
+    // 2 x 32x33 bank-conflict-free shared-memory transpose slab (8.4 KB):
+    // triples GPU core occupancy on Apple Silicon vs 21.1 KB while staying 100% coalesced.
+    threadgroup float sm_t[2u * 32u * 33u];
     const uint s_str = 32u * 33u;
 
     float cp_d = f_p0.x;
@@ -6247,23 +6254,13 @@ kernel void rad_distill_extract_col(
     for (uint k0 = 0u; k0 < nz; k0 += 32u) {
         uint klen = (k0 + 32u <= nz) ? 32u : (nz - k0);
 
-        // Pass A: features 0..4 (T, log p, qv, qc, qi) + cp_layer_out + cwp_tot in ONE single read pass
+        // Pair 0: T, log(p)
         if (active) {
             for (uint dk = 0u; dk < klen; ++dk) {
                 uint idx = (k0 + dk) * M + c;
-                float qv = max(qv_c[idx], 0.0f);
-                float qc = max(qc_c[idx], 0.0f);
-                float qi = max(qi_c[idx], 0.0f);
-                float dm = max(rho_d_c[idx] * dz_c[idx], 1.0e-6f);
-                cp_layer_out[idx] = (cp_d + cp_v * qv) * dm;
-                cwp_tot += (qc + qi) * dm;
-
                 uint s_off = lane * 33u + dk;
                 sm_t[0u * s_str + s_off] = (temp_c[idx] - 250.0f) * 0.02f;
                 sm_t[1u * s_str + s_off] = (log(max(pres_c[idx], 1.0f)) - 10.0f) * 0.4f;
-                sm_t[2u * s_str + s_off] = aoba_log1p(qv * 1.0e3f);
-                sm_t[3u * s_str + s_off] = aoba_log1p(qc * 1.0e4f);
-                sm_t[4u * s_str + s_off] = aoba_log1p(qi * 1.0e4f);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6274,23 +6271,22 @@ kernel void rad_distill_extract_col(
                 uint rs = r * 33u + lane;
                 x_out[xb + 0u * nz] = sm_t[0u * s_str + rs];
                 x_out[xb + 1u * nz] = sm_t[1u * s_str + rs];
-                x_out[xb + 2u * nz] = sm_t[2u * s_str + rs];
-                x_out[xb + 3u * nz] = sm_t[3u * s_str + rs];
-                x_out[xb + 4u * nz] = sm_t[4u * s_str + rs];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Pass B: features 5..8 (dm, o3, dust, aerosol)
+        // Pair 1: qv, dm + cp_layer_out
         if (active) {
             for (uint dk = 0u; dk < klen; ++dk) {
-                uint idx = (k0 + dk) * M + c;
+                uint k = k0 + dk;
+                uint idx = k * M + c;
+                uint dz_idx = dz_cell ? (k * M_cell + c_cell) : idx;
+                float qv = max(qv_c[idx], 0.0f);
+                float dm = max(rho_d_c[idx] * dz_c[dz_idx], 1.0e-6f);
+                cp_layer_out[idx] = (cp_d + cp_v * qv) * dm;
                 uint s_off = lane * 33u + dk;
-                float dm = max(rho_d_c[idx] * dz_c[idx], 1.0e-6f);
-                sm_t[0u * s_str + s_off] = aoba_log1p(dm * 1.0e-3f);
-                if (has_o3)   sm_t[1u * s_str + s_off] = aoba_log1p(max(o3_c[idx], 0.0f) * 1.0e6f);
-                if (has_dust) sm_t[2u * s_str + s_off] = aoba_log1p(max(q_dust_c[idx], 0.0f) * 1.0e6f);
-                if (has_aero) sm_t[3u * s_str + s_off] = aoba_log1p(max(tau_aero_c[idx], 0.0f) * 10.0f);
+                sm_t[0u * s_str + s_off] = aoba_log1p(qv * 1.0e3f);
+                sm_t[1u * s_str + s_off] = aoba_log1p(dm * 1.0e-3f);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6299,13 +6295,85 @@ kernel void rad_distill_extract_col(
             for (uint r = 0u; r < n_valid; ++r) {
                 uint xb = (c0 + r) * d_in + k_col;
                 uint rs = r * 33u + lane;
-                x_out[xb + 5u * nz] = sm_t[0u * s_str + rs];
-                x_out[xb + 6u * nz] = has_o3   ? sm_t[1u * s_str + rs] : 0.0f;
-                x_out[xb + 7u * nz] = has_dust ? sm_t[2u * s_str + rs] : 0.0f;
-                x_out[xb + 8u * nz] = has_aero ? sm_t[3u * s_str + rs] : 0.0f;
+                x_out[xb + 2u * nz] = sm_t[0u * s_str + rs];
+                x_out[xb + 5u * nz] = sm_t[1u * s_str + rs];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Pair 2: qc, qi + cwp_tot
+        if (active) {
+            for (uint dk = 0u; dk < klen; ++dk) {
+                uint k = k0 + dk;
+                uint idx = k * M + c;
+                uint dz_idx = dz_cell ? (k * M_cell + c_cell) : idx;
+                float qc = max(qc_c[idx], 0.0f);
+                float qi = max(qi_c[idx], 0.0f);
+                float dm = max(rho_d_c[idx] * dz_c[dz_idx], 1.0e-6f);
+                cwp_tot += (qc + qi) * dm;
+                uint s_off = lane * 33u + dk;
+                sm_t[0u * s_str + s_off] = aoba_log1p(qc * 1.0e4f);
+                sm_t[1u * s_str + s_off] = aoba_log1p(qi * 1.0e4f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < klen) {
+            uint k_col = k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) {
+                uint xb = (c0 + r) * d_in + k_col;
+                uint rs = r * 33u + lane;
+                x_out[xb + 3u * nz] = sm_t[0u * s_str + rs];
+                x_out[xb + 4u * nz] = sm_t[1u * s_str + rs];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Pair 3: o3, dust
+        if (active) {
+            for (uint dk = 0u; dk < klen; ++dk) {
+                uint k = k0 + dk;
+                uint idx = k * M + c;
+                uint cidx = k * M_cell + c_cell;
+                uint s_off = lane * 33u + dk;
+                sm_t[0u * s_str + s_off] = has_o3   ? aoba_log1p(max(o3_c[o3_cell ? cidx : idx], 0.0f) * 1.0e6f) : 0.0f;
+                sm_t[1u * s_str + s_off] = has_dust ? aoba_log1p(max(q_dust_c[dust_cell ? cidx : idx], 0.0f) * 1.0e6f) : 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < klen) {
+            uint k_col = k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) {
+                uint xb = (c0 + r) * d_in + k_col;
+                uint rs = r * 33u + lane;
+                x_out[xb + 6u * nz] = sm_t[0u * s_str + rs];
+                x_out[xb + 7u * nz] = sm_t[1u * s_str + rs];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Feature 8: aerosol optical depth (skip shared-memory round-trip when absent)
+        if (has_aero) {
+            if (active) {
+                for (uint dk = 0u; dk < klen; ++dk) {
+                    uint k = k0 + dk;
+                    uint aidx = aero_cell ? (k * M_cell + c_cell) : (k * M + c);
+                    sm_t[lane * 33u + dk] = aoba_log1p(max(tau_aero_c[aidx], 0.0f) * 10.0f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane < klen) {
+                uint k_col = k0 + lane;
+                for (uint r = 0u; r < n_valid; ++r) {
+                    x_out[(c0 + r) * d_in + k_col + 8u * nz] = sm_t[r * 33u + lane];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else if (lane < klen) {
+            uint k_col = k0 + lane;
+            for (uint r = 0u; r < n_valid; ++r) {
+                x_out[(c0 + r) * d_in + k_col + 8u * nz] = 0.0f;
+            }
+        }
     }
 
     // 13 trailing surface & greenhouse-gas scalars (transposed via sm_t)
@@ -9128,16 +9196,31 @@ def run_rad_distill_extract_metal(
     o3_vmr_c: torch.Tensor | None = None,
     q_dust_c: torch.Tensor | None = None,
     tau_aero_sw_c: torch.Tensor | None = None,
+    cell_sub: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     nz, m_col = pres_c.shape
     dev = pres_c.device
     dtype = pres_c.dtype
     d_in = 9 * nz + 13
     dummy1 = torch.zeros(1, device=dev, dtype=dtype)
+    cs = max(int(cell_sub), 1)
     has_o3 = 1 if o3_vmr_c is not None else 0
     has_dust = 1 if q_dust_c is not None else 0
     has_aero = 1 if tau_aero_sw_c is not None else 0
-    flags = (has_aero << 2) | (has_dust << 1) | has_o3
+    dz_cell = 1 if (cs > 1 and int(dz_c.shape[1]) * cs == m_col) else 0
+    o3_cell = 1 if (o3_vmr_c is not None and cs > 1 and int(o3_vmr_c.shape[1]) * cs == m_col) else 0
+    dust_cell = 1 if (q_dust_c is not None and cs > 1 and int(q_dust_c.shape[1]) * cs == m_col) else 0
+    aero_cell = 1 if (tau_aero_sw_c is not None and cs > 1 and int(tau_aero_sw_c.shape[1]) * cs == m_col) else 0
+    flags = (
+        (cs << 8)
+        | (aero_cell << 6)
+        | (dust_cell << 5)
+        | (o3_cell << 4)
+        | (dz_cell << 3)
+        | (has_aero << 2)
+        | (has_dust << 1)
+        | has_o3
+    )
     sfc_8 = torch.stack([t_sfc, alb_vd, alb_vf, alb_nd, alb_nf, emiss_sfc, mu0, s_toa], dim=0).contiguous()
     x_out = torch.empty((m_col, d_in), device=dev, dtype=dtype)
     cp_layer = torch.empty((nz, m_col), device=dev, dtype=dtype)
