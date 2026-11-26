@@ -4678,13 +4678,16 @@ kernel void crm_student_tile_update_col(
     float shf_mean = sm_red[0];
     float evap_mean = sm_red[1];
 
-    float dt_v_s = clamp((shf_s - shf_mean) * inv_cp_dm_ex, -3.0f, 3.0f);
-    float dq_v_s = clamp((evap_s - evap_mean) * inv_dm, -2.0e-3f, 2.0e-3f);
+    float dt_v_s;
+    float dq_v_s;
     float dthm_cp_s = 0.0f;
     if (has_cp != 0u) {
         dthm_cp_s = dthm_cp[base_c + s];
-        dt_v_s = clamp(dt_v_s + dthm_cp_s, -8.0f, 8.0f);
-        dq_v_s = clamp(dq_v_s + dqv_cp[base_c + s], -6.0e-3f, 6.0e-3f);
+        dt_v_s = clamp(dthm_cp_s, -8.0f, 8.0f);
+        dq_v_s = clamp(dqv_cp[base_c + s], -6.0e-3f, 6.0e-3f);
+    } else {
+        dt_v_s = clamp((shf_s - shf_mean) * inv_cp_dm_ex, -3.0f, 3.0f);
+        dq_v_s = clamp((evap_s - evap_mean) * inv_dm, -2.0e-3f, 2.0e-3f);
     }
     sm_a[s] = dt_v_s;
     sm_b[s] = dq_v_s;
@@ -4824,7 +4827,7 @@ kernel void crm_student_tile_update_col(
         float u_s = u_c + damp * (u_old - sm_red[1]);
         float v_s = v_c + damp * (v_old - sm_red[2]);
         if (k == 0u) {
-            thm_s += dthm_anom_s;
+            thm_s = thm_c + dthm_anom_s;
             qv_s = qv_0_mc_s;
             if (has_cp != 0u) {
                 u_s = u_c + u_cp_anom_s;

@@ -724,8 +724,8 @@ def reconstruct_subgrid_heterogeneity(
 
 
 def apply_subgrid_surface_microclimate(
-    crm_thm_0: torch.Tensor,   # [N_s, ny, nx] lowest-layer theta_m (updated with cell mean + damped anom)
-    crm_qv_0: torch.Tensor,    # [N_s, ny, nx] lowest-layer q_v
+    crm_thm_0: torch.Tensor,   # [N_s, ny, nx] lowest-layer theta_m (cell mean preserved)
+    crm_qv_0: torch.Tensor,    # [N_s, ny, nx] lowest-layer q_v (cell mean preserved)
     rho_0: torch.Tensor,       # [N_s] lowest-layer dry air density [kg m^-3]
     dz_0: torch.Tensor,        # [N_s] lowest-layer thickness [m]
     exner_0: torch.Tensor,     # [N_s] lowest-layer Exner function [-]
@@ -733,39 +733,44 @@ def apply_subgrid_surface_microclimate(
     evap_3d: torch.Tensor,     # [N_s, ny, nx] subgrid evaporation [kg m^-2 s^-1]
     dt: float,
     *,
-    dthm_cp: torch.Tensor | None = None,  # [N_s, ny, nx] optional teacher-distilled cold-pool theta_m' [K]
-    dqv_cp: torch.Tensor | None = None,   # [N_s, ny, nx] optional teacher-distilled cold-pool q_v' [kg kg^-1]
+    dthm_cp: torch.Tensor | None = None,  # [N_s, ny, nx] optional teacher-distilled total theta_m' [K]
+    dqv_cp: torch.Tensor | None = None,   # [N_s, ny, nx] optional teacher-distilled total q_v' [kg kg^-1]
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Inject exact zero-mean near-surface `(theta_m', q_v')` microclimate & cold-pool anomalies.
+    """Reconstruct exact zero-mean near-surface `(theta_m', q_v')` microclimate & cold-pool anomalies.
 
-    Combines surface-driven `(SHF', evap')` microclimate with optional teacher-distilled
-    convective cold-pool `(dthm_cp, dqv_cp)` anomalies while strictly preserving cell-mean
-    enthalpy and water vapor mass (`q_v >= 0`).
+    When teacher-distilled `(dthm_cp, dqv_cp)` state anomalies are supplied by
+    `SubgridSpatialHead`, they directly replace the lowest-layer anomaly around the
+    cell mean (preventing recursive `0.85 * old + dthm_cp` amplification). Otherwise,
+    pure surface-flux anomalies `(SHF', evap')` drive the lowest-layer microclimate
+    while preserving exact cell-mean enthalpy and non-negative water vapor mass.
     """
     if int(shf_3d.shape[-2] * shf_3d.shape[-1]) <= 1:
         return crm_thm_0, crm_qv_0
-    dm_0 = torch.clamp(rho_0 * dz_0, min=1.0).unsqueeze(-1).unsqueeze(-1)
-    ex_0 = torch.clamp(exner_0, min=0.1).unsqueeze(-1).unsqueeze(-1)
-    shf_a = shf_3d - mean_2d(shf_3d, keepdim=True)
-    evap_a = evap_3d - mean_2d(evap_3d, keepdim=True)
-
-    d_thm = torch.clamp((shf_a * dt) / (C.CP_D * dm_0 * ex_0), -3.0, 3.0)
-    if dthm_cp is not None:
-        d_thm = torch.clamp(d_thm + dthm_cp, -8.0, 8.0)
-    d_thm = d_thm - mean_2d(d_thm, keepdim=True)
-    thm_out = crm_thm_0 + d_thm
-
+    thm_mean = mean_2d(crm_thm_0, keepdim=True)
     qv_mean = mean_2d(crm_qv_0, keepdim=True)
-    d_qv = torch.clamp((evap_a * dt) / dm_0, -2.0e-3, 2.0e-3)
+    if dthm_cp is not None:
+        d_thm = torch.clamp(dthm_cp, -8.0, 8.0)
+    else:
+        dm_0 = torch.clamp(rho_0 * dz_0, min=1.0).unsqueeze(-1).unsqueeze(-1)
+        ex_0 = torch.clamp(exner_0, min=0.1).unsqueeze(-1).unsqueeze(-1)
+        shf_a = shf_3d - mean_2d(shf_3d, keepdim=True)
+        d_thm = torch.clamp((shf_a * dt) / (C.CP_D * dm_0 * ex_0), -3.0, 3.0)
+    d_thm = d_thm - mean_2d(d_thm, keepdim=True)
+    thm_out = thm_mean + d_thm
+
     if dqv_cp is not None:
-        d_qv = torch.clamp(d_qv + dqv_cp, -6.0e-3, 6.0e-3)
+        d_qv = torch.clamp(dqv_cp, -6.0e-3, 6.0e-3)
+    else:
+        dm_0 = torch.clamp(rho_0 * dz_0, min=1.0).unsqueeze(-1).unsqueeze(-1)
+        evap_a = evap_3d - mean_2d(evap_3d, keepdim=True)
+        d_qv = torch.clamp((evap_a * dt) / dm_0, -2.0e-3, 2.0e-3)
     d_qv = d_qv - mean_2d(d_qv, keepdim=True)
-    qv_cand = torch.clamp(crm_qv_0 + d_qv, min=0.0)
+    qv_cand = torch.clamp(qv_mean + d_qv, min=0.0)
     qv_cand_mean = mean_2d(qv_cand, keepdim=True)
     qv_out = torch.where(
         qv_cand_mean > 1.0e-10,
         qv_cand * (qv_mean / torch.clamp(qv_cand_mean, min=1.0e-10)),
-        crm_qv_0,
+        qv_mean.expand_as(crm_qv_0),
     )
     return thm_out, qv_out
 

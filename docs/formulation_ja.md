@@ -1486,7 +1486,7 @@ h_{\mathrm{corr}} &= \frac{\Delta H_{\mathrm{precip}} - c_{pd}\sum_k \Delta m_k 
 \end{aligned} \tag{8.15}
 $$
 
-放射代理モデルの各サブカラムは、夜側（$\mu_0 \le 0$）で短波フラックスが厳密に零となり、長波フラックスは地表 Planck 放射 $\sigma T_{\mathrm{sfc}}^4$ に解析的にスケールし、放射加熱率鉛直プロファイルは列フラックス発散保存則を厳密に満たす。オンライン学習では、境界層重視の真気温・鉛直気温減率・1 ステップ変化量（$\Delta q_n, \Delta T$）・飽和比正規化水分（$\Delta q_n / q_{\mathrm{sat}}$）の Smooth-$L_1$ 損失に、一様射影零空間沿いの飽和ドリフトを抑止する温度・運動量ロジットのゲージ固定正則化を組み合わせる：
+放射代理モデルの各サブカラムは、夜側（$\mu_0 \le 0$）で短波フラックスが厳密に零となり、長波フラックスは地表 Planck 放射 $\sigma T_{\mathrm{sfc}}^4$ に解析的にスケールし、放射加熱率鉛直プロファイルは列フラックス発散保存則を厳密に満たす。学生セルの最下層サブグリッド偏差 $(\theta_{m,0}', q_{v,0}')$ および冷気プール突風 $(u_0', v_0')$ は、前ステップ偏差へ累積させることなく、周期 2D `SubgridSpatialHead` が予測する状態偏差からセル平均周りに厳密ゼロ平均保存で直接再構成する（`crm_student_tile_update_col`）。オンライン学習では、境界層重視の真気温・鉛直気温減率・1 ステップ変化量（$\Delta q_n, \Delta T$）・飽和比正規化水分（$\Delta q_n / q_{\mathrm{sat}}$）の Smooth-$L_1$ 損失に、一様射影零空間沿いの飽和ドリフトを抑止する温度・運動量ロジットのゲージ固定正則化を組み合わせる：
 
 $$
 \sum_{k=0}^{N_z-1} c_{p,\mathrm{moist},k}\,\Delta m_k\,Q_{\mathrm{rad},k} = (\mathrm{ASR} - \mathrm{OLR}) - (F_{\mathrm{SW,sfc}}^{\mathrm{net}} + F_{\mathrm{LW,sfc}}^{\mathrm{net}}) \tag{8.16}
