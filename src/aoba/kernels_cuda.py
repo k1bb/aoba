@@ -163,6 +163,19 @@ def _transform_body_code(code: str) -> str:
         "AOBA_SYNCTHREADS()",
         code,
     )
+    code = re.sub(
+        r"\bsimdgroup_barrier\s*\(\s*mem_flags::(?:mem_threadgroup|mem_device)(?:\s*\|\s*mem_flags::(?:mem_threadgroup|mem_device))?\s*\)",
+        "AOBA_SYNCWARP()",
+        code,
+    )
+    # Strip Metal address-space qualifier on pointers/references to shared memory
+    # (e.g., `threadgroup float* wm = ...` -> `float* wm = ...`) before turning
+    # shared array declarations (`threadgroup float sm[...]`) into `__shared__`.
+    code = re.sub(
+        r"\bthreadgroup\s+((?:const\s+)?[A-Za-z_]\w*\s*[*&])",
+        r"\1",
+        code,
+    )
     code = re.sub(r"\bthreadgroup\b", "AOBA_SHARED", code)
     code = re.sub(r"\bdevice\s+const\b", "const", code)
     code = re.sub(r"\bdevice\b\s+", "", code)
@@ -202,6 +215,7 @@ struct aoba_ulong4 {
 #define AOBA_DEVICE __device__ __forceinline__
 #define AOBA_SHARED __shared__
 #define AOBA_SYNCTHREADS() __syncthreads()
+#define AOBA_SYNCWARP() __syncwarp()
 
 AOBA_DEVICE float2 aoba_float2(float x, float y) { return make_float2(x, y); }
 AOBA_DEVICE float2 aoba_float2(float v) { return make_float2(v, v); }

@@ -25,6 +25,7 @@ from aoba.radiation_rrtmgp import compute_rrtmgp_radiation
 
 
 def test_cuda_transpilation() -> None:
+    import re
     cpp_src, cuda_src, specs = build_cuda_extension_sources(_all_shader_src())
     names = {s.name for s in specs}
     required = {
@@ -33,13 +34,24 @@ def test_cuda_transpilation() -> None:
         "rad_ckd_hd_col",
         "microphysics_6class_col",
         "ozone_chem_col",
+        "crm_ens_mean_unc_transpose",
+        "ogcm_multi_vdiff_col",
+        "ocean_bgc_column_col",
+        "crm_lightning_col",
+        "land_carbon_cn_fire_prep_tile",
     }
     missing = required - names
     assert not missing, f"Missing CUDA transpiled kernels: {missing}"
     assert "AOBA_SHARED" in cuda_src and "AOBA_SYNCTHREADS()" in cuda_src
+    assert "AOBA_SYNCWARP()" in cuda_src
     assert "aoba_shfl_xor" in cuda_src
+    assert "simdgroup_barrier" not in cuda_src, "Untranspiled simdgroup_barrier in CUDA source"
+    assert "mem_flags::" not in cuda_src, "Untranspiled Metal mem_flags:: in CUDA source"
+    assert not re.search(r"\bAOBA_SHARED\s+(?:const\s+)?[A-Za-z_]\w*\s*[*&]", cuda_src), (
+        "Invalid __shared__ pointer declaration in CUDA source"
+    )
     assert "launch_rad_rrtmgp_lw_grp" in cpp_src
-    print(f"[PASS] CUDA transpilation verified ({len(specs)} total kernels, all 5 ESM kernels present)")
+    print(f"[PASS] CUDA transpilation verified ({len(specs)} total kernels, all ESM/CUDA invariants satisfied)")
 
 
 def test_gpu_parity() -> None:
