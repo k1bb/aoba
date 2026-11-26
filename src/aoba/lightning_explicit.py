@@ -198,26 +198,41 @@ def solve_electric_potential_poisson(
 
     # 2D real FFT of charge density along (y, x): [Nz, nc, ny, n_kx]
     rhs_phys = rho_q_tot * (dz2.view(nz, nc, 1, 1) / EPSILON_0)
-    rhs_hat = torch.fft.rfft2(rhs_phys, dim=(-2, -1))  # complex64
+    lib = None
+    if (
+        rho_q_tot.device.type in ("mps", "cuda")
+        and rho_q_tot.dtype == torch.float32
+        and nz <= 128
+        and not rho_q_tot.requires_grad
+    ):
+        from aoba.kernels import _get_gpu_lib
+        from aoba.kernels_esm import run_explicit_lightning_poisson_metal
 
-    # Pack real and imaginary parts into one batched real tridiagonal solve [Nz, 2 * nc * m_k]
-    rhs_ri = torch.stack([rhs_hat.real, rhs_hat.imag], dim=1).reshape(nz, 2 * nc * m_k)
+        lib = _get_gpu_lib(rho_q_tot.device)
+        if lib is not None:
+            phi_e = run_explicit_lightning_poisson_metal(lib, rhs_phys.contiguous(), dz2, dx_m, dy_m)
 
-    # Build real tridiagonal coefficients: -c_dn*Phi_{k-1} + (c_dn + c_up + lam*dz)*Phi_k - c_up*Phi_{k+1} = rhs
-    a_col = -c_dn.clone()
-    a_col[0] = 0.0
-    d_col = -c_up.clone()
-    d_col[-1] = 0.0
-    b_base = (c_dn + c_up).unsqueeze(-1) + dz2.unsqueeze(-1) * lam_h  # [Nz, nc, m_k]
+    if lib is None:
+        rhs_hat = torch.fft.rfft2(rhs_phys, dim=(-2, -1))  # complex64
 
-    # Expand across real/imag pair (factor 2)
-    a_tri = a_col.unsqueeze(-1).expand(nz, nc, m_k).unsqueeze(1).expand(nz, 2, nc, m_k).reshape(nz, 2 * nc * m_k).contiguous()
-    b_tri = b_base.unsqueeze(1).expand(nz, 2, nc, m_k).reshape(nz, 2 * nc * m_k).contiguous()
-    d_tri = d_col.unsqueeze(-1).expand(nz, nc, m_k).unsqueeze(1).expand(nz, 2, nc, m_k).reshape(nz, 2 * nc * m_k).contiguous()
+        # Pack real and imaginary parts into one batched real tridiagonal solve [Nz, 2 * nc * m_k]
+        rhs_ri = torch.stack([rhs_hat.real, rhs_hat.imag], dim=1).reshape(nz, 2 * nc * m_k)
 
-    phi_ri = solve_tridiagonal_batched(a_tri, b_tri, d_tri, rhs_ri.contiguous()).view(nz, 2, nc, ny, n_kx)
-    phi_hat = torch.complex(phi_ri[:, 0], phi_ri[:, 1])
-    phi_e = torch.fft.irfft2(phi_hat, s=(ny, nx), dim=(-2, -1)).to(dtype)
+        # Build real tridiagonal coefficients: -c_dn*Phi_{k-1} + (c_dn + c_up + lam*dz)*Phi_k - c_up*Phi_{k+1} = rhs
+        a_col = -c_dn.clone()
+        a_col[0] = 0.0
+        d_col = -c_up.clone()
+        d_col[-1] = 0.0
+        b_base = (c_dn + c_up).unsqueeze(-1) + dz2.unsqueeze(-1) * lam_h  # [Nz, nc, m_k]
+
+        # Expand across real/imag pair (factor 2)
+        a_tri = a_col.unsqueeze(-1).expand(nz, nc, m_k).unsqueeze(1).expand(nz, 2, nc, m_k).reshape(nz, 2 * nc * m_k).contiguous()
+        b_tri = b_base.unsqueeze(1).expand(nz, 2, nc, m_k).reshape(nz, 2 * nc * m_k).contiguous()
+        d_tri = d_col.unsqueeze(-1).expand(nz, nc, m_k).unsqueeze(1).expand(nz, 2, nc, m_k).reshape(nz, 2 * nc * m_k).contiguous()
+
+        phi_ri = solve_tridiagonal_batched(a_tri, b_tri, d_tri, rhs_ri.contiguous()).view(nz, 2, nc, ny, n_kx)
+        phi_hat = torch.complex(phi_ri[:, 0], phi_ri[:, 1])
+        phi_e = torch.fft.irfft2(phi_hat, s=(ny, nx), dim=(-2, -1)).to(dtype)
 
     # 3D Electric Field E = -nabla Phi
     if nx > 1:
@@ -246,41 +261,54 @@ def solve_electric_potential_poisson(
     return phi_e, e_x, e_y, e_z
 
 
-def _advect_sediment_charges(
+def _advect_horizontal_charges(
     q_chg: torch.Tensor,          # [5, Nz, N_cells, Ny, Nx]
     u_stag: torch.Tensor | None,  # [Nz, N_cells, Ny, Nx]
     v_stag: torch.Tensor | None,  # [Nz, N_cells, Ny, Nx]
-    w_stag: torch.Tensor,         # [Nz+1, N_cells, Ny, Nx]
-    vt_5: torch.Tensor,           # [5, Nz, N_cells, Ny, Nx] downward fall speeds >= 0 [m s^-1]
-    dz_c: torch.Tensor,           # [Nz, N_cells] or [Nz]
     dx: float,
     dy: float,
     dt: float,
 ) -> torch.Tensor:
-    """Conservatively transport 5 hydrometeor charges via CFL-safe horizontal donor-cell & implicit vertical sweep."""
+    """Simultaneous conservative periodic horizontal donor-cell advection of 5 hydrometeor charges."""
+    _, _, _, ny, nx = q_chg.shape
+    has_u = u_stag is not None and nx > 1
+    has_v = v_stag is not None and ny > 1
+    if not (has_u or has_v):
+        return q_chg.clone()
+    cfl_lim = 0.225 if (has_u and has_v) else 0.45
+    q_out = q_chg.clone()
+    if has_u:
+        u_face = u_stag.unsqueeze(0)
+        c_max_x = cfl_lim * dx / max(dt, 1.0e-3)
+        u_eff = torch.clamp(u_face, -c_max_x, c_max_x)
+        q_xp1 = torch.roll(q_chg, shifts=-1, dims=-1)
+        fx = torch.clamp(u_eff, min=0.0) * q_chg + torch.clamp(u_eff, max=0.0) * q_xp1
+        q_out = q_out - (dt / dx) * (fx - torch.roll(fx, shifts=1, dims=-1))
+    if has_v:
+        v_face = v_stag.unsqueeze(0)
+        c_max_y = cfl_lim * dy / max(dt, 1.0e-3)
+        v_eff = torch.clamp(v_face, -c_max_y, c_max_y)
+        q_yp1 = torch.roll(q_chg, shifts=-1, dims=-2)
+        fy = torch.clamp(v_eff, min=0.0) * q_chg + torch.clamp(v_eff, max=0.0) * q_yp1
+        q_out = q_out - (dt / dy) * (fy - torch.roll(fy, shifts=1, dims=-2))
+    return q_out
+
+
+def _sediment_vertical_charges(
+    q_chg: torch.Tensor,          # [5, Nz, N_cells, Ny, Nx]
+    w_stag: torch.Tensor,         # [Nz+1, N_cells, Ny, Nx]
+    vt_5: torch.Tensor,           # [5, Nz, N_cells, Ny, Nx] downward fall speeds >= 0 [m s^-1]
+    dz_c: torch.Tensor,           # [Nz, N_cells] or [Nz]
+    dt: float,
+) -> torch.Tensor:
+    """Unconditionally stable implicit vertical advection & gravitational sedimentation sweep."""
     ns, nz, nc, ny, nx = q_chg.shape
     dev = q_chg.device
     dtype = q_chg.dtype
     q_out = q_chg
 
-    # 1. Conservative periodic horizontal donor-cell advection (CFL-capped to <= 0.45 per axis)
-    if u_stag is not None and nx > 1:
-        u_face = u_stag.unsqueeze(0)  # face i+1/2 [1, Nz, nc, ny, nx]
-        c_max_x = 0.45 * dx / max(dt, 1.0e-3)
-        u_eff = torch.clamp(u_face, -c_max_x, c_max_x)
-        q_xp1 = torch.roll(q_out, shifts=-1, dims=-1)
-        fx = torch.clamp(u_eff, min=0.0) * q_out + torch.clamp(u_eff, max=0.0) * q_xp1
-        q_out = q_out - (dt / dx) * (fx - torch.roll(fx, shifts=1, dims=-1))
-    if v_stag is not None and ny > 1:
-        v_face = v_stag.unsqueeze(0)
-        c_max_y = 0.45 * dy / max(dt, 1.0e-3)
-        v_eff = torch.clamp(v_face, -c_max_y, c_max_y)
-        q_yp1 = torch.roll(q_out, shifts=-1, dims=-2)
-        fy = torch.clamp(v_eff, min=0.0) * q_out + torch.clamp(v_eff, max=0.0) * q_yp1
-        q_out = q_out - (dt / dy) * (fy - torch.roll(fy, shifts=1, dims=-2))
-
-    # 2. Unconditionally stable implicit vertical advection + gravitational sedimentation
-    #    Net vertical velocity at interfaces k+1/2 (k = 0..nz-2): w_net = w_stag[1:-1] - 0.5*(vt[k] + vt[k+1])
+    # Unconditionally stable implicit vertical advection + gravitational sedimentation
+    # Net vertical velocity at interfaces k+1/2 (k = 0..nz-2): w_net = w_stag[1:-1] - 0.5*(vt[k] + vt[k+1])
     if dz_c.ndim == 2:
         dz_5 = dz_c.to(device=dev, dtype=dtype).view(1, nz, nc, 1, 1).expand(ns, nz, nc, ny, nx)
     else:
@@ -353,6 +381,84 @@ def step_explicit_bulk_lightning_and_lnox(
     dx_m = max(float(dx), 1.0)
     dy_m = max(float(dx if dy is None else dy), 1.0)
     dt_s = max(float(dt), 1.0)
+
+    # Fast fused Metal/CUDA 3-kernel path (MPS & CUDA, float32, nz <= 128, zero mid-step sync)
+    if (
+        dev.type in ("mps", "cuda")
+        and dtype == torch.float32
+        and nz <= 128
+        and not rho_d.requires_grad
+    ):
+        from aoba.kernels import _get_gpu_lib
+        from aoba.kernels_esm import run_explicit_bulk_lightning_metal
+
+        lib = _get_gpu_lib(dev)
+        if lib is not None:
+            q_out, phi_e, e_mag, e_z, flash_tot_sub, flash_cg_sub, f_cg_sub, ccd_km = (
+                run_explicit_bulk_lightning_metal(
+                    lib,
+                    state.q_chg,
+                    rho_d,
+                    theta_m,
+                    q_v,
+                    q_c,
+                    q_i,
+                    q_p,
+                    w_stag,
+                    z_c,
+                    dz_c,
+                    dx=dx_m,
+                    dy=dy_m,
+                    dt=dt_s,
+                    u_stag=u_stag,
+                    v_stag=v_stag,
+                    q_r_prog=q_r_prog,
+                    q_s_prog=q_s_prog,
+                    q_g_prog=q_g_prog,
+                    n_i_prog=n_i_prog,
+                    n_s_prog=n_s_prog,
+                    n_g_prog=n_g_prog,
+                    rho_rain=RHO_RAIN,
+                    rho_snow=RHO_SNOW,
+                    rho_graupel=RHO_GRAUPEL,
+                    t0_precip=T0_PRECIP,
+                    t00_precip=T00_PRECIP,
+                    t0_graupel=T0_GRAUPEL,
+                    t00_graupel=T00_GRAUPEL,
+                    eps0=EPSILON_0,
+                    e_crit_sl=E_CRIT_SEA_LEVEL,
+                    extent_frac=E_DISCHARGE_EXTENT_FRAC,
+                    neut_frac=DISCHARGE_NEUT_FRAC,
+                    q_per_flash=Q_CHARGE_PER_FLASH_C,
+                    z_cg_max=Z_CG_CHANNEL_MAX_M,
+                )
+            )
+            state.q_chg = q_out
+            state.phi_e = phi_e
+            state.e_mag = e_mag
+            state.e_z = e_z
+
+            flash_tot_cell = flash_tot_sub.reshape(nc, -1).mean(dim=-1)
+            flash_cg_cell = flash_cg_sub.reshape(nc, -1).mean(dim=-1)
+            lnox_local_sub = LNOX_KG_N_PER_FLASH * flash_tot_sub
+            lnox_cell = lnox_local_sub.reshape(nc, -1).mean(dim=-1)
+            area_w = area_cell.to(device=dev, dtype=dtype)
+            area_sum = torch.clamp(area_w.sum(), min=1.0)
+            lnox_global_mean = (lnox_cell * area_w).sum() / area_sum
+            n_dep_lnox_sub = (
+                LNOX_LOCAL_DEP_FRAC * lnox_local_sub + (1.0 - LNOX_LOCAL_DEP_FRAC) * lnox_global_mean
+            )
+            n_dep_lnox_cell = n_dep_lnox_sub.reshape(nc, -1).mean(dim=-1)
+            return LightningDiagnostics(
+                flash_tot_sub=flash_tot_sub,
+                flash_cg_sub=flash_cg_sub,
+                f_cg_sub=f_cg_sub,
+                cold_cloud_km_sub=ccd_km,
+                flash_tot_cell=flash_tot_cell,
+                flash_cg_cell=flash_cg_cell,
+                n_dep_lnox_sub=n_dep_lnox_sub,
+                n_dep_lnox_cell=n_dep_lnox_cell,
+            )
 
     _, _, temp = diagnose_pressure_temperature(rho_d, theta_m, q_v)
     rho_pos = torch.clamp(rho_d, min=1.0e-4)
@@ -428,14 +534,15 @@ def step_explicit_bulk_lightning_and_lnox(
     dq_s_sep = torch.clamp(-dt_s * r_gs * dq_coll, -Q_CHG_CLAMP_C_M3, Q_CHG_CLAMP_C_M3)
     dq_g_sep = -(dq_i_sep + dq_s_sep)  # exact conservation of zero net charge creation!
 
-    q_chg = state.q_chg.clone()
+    # 3b. Simultaneous conservative periodic horizontal donor-cell advection before charging + vertical sweep
+    q_chg = _advect_horizontal_charges(state.q_chg, u_stag, v_stag, dx_m, dy_m, dt_s)
     q_chg[2] = q_chg[2] + dq_i_sep
     q_chg[3] = q_chg[3] + dq_s_sep
     q_chg[4] = q_chg[4] + dq_g_sep
 
-    # 4. Conservative 3D transport & implicit gravitational sedimentation separating opposite charges
+    # 4. Implicit vertical advection & gravitational sedimentation separating opposite charges
     vt_5 = torch.stack([vt_c, vt_r, vt_i, vt_s, vt_g], dim=0)
-    q_chg = _advect_sediment_charges(q_chg, u_stag, v_stag, w_stag, vt_5, dz_c, dx_m, dy_m, dt_s)
+    q_chg = _sediment_vertical_charges(q_chg, w_stag, vt_5, dz_c, dt_s)
 
     # 5. Melting / complete-evaporation transfer & exact exponential ionic relaxation (Chiu, 1978)
     #    Melting graupel/snow above 0 C transfers charge into rain; absent hydrometeors neutralize

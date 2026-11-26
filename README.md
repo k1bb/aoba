@@ -50,8 +50,8 @@
    - **Prognostic 3D Ozone & Natural Aerosols**: Four ozone modes (`rcemip`, `latitude_seasonal`, `climatology`, `prognostic` 3D Chapman + $\mathrm{HO}_x/\mathrm{NO}_x/\mathrm{ClO}_x$/PSC photochemistry + Brewer–Dobson transport; `src/aoba/ozone_chemistry.py`), 4-species natural aerosols (sea salt, FlexPFT-coupled DMS/$\mathrm{SO}_4$, wildfire BC/OC, BVOC-SOA; `src/aoba/aerosols.py`), map-free mineral dust (`src/aoba/dust.py`), snow BC/dust darkening, and stable water isotopes ($\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$; `src/aoba/water_isotopes.py`).
    - **Optional Emission-Driven, Paleoclimate, & Exoplanet Switches**: Selectable $\mathrm{CO}_2$ modes (`constant` / `scenario` / `csv` / `prognostic` 3D transport), prognostic $\mathrm{CH}_4/\mathrm{N}_2\mathrm{O}$ (`src/aoba/trace_gas_cycle.py`), volcanic/solar forcing (`src/aoba/volcanic_solar.py`), silicate weathering & Milankovitch orbital evolution (`src/aoba/planetary_geochem.py`), accelerated Glen-law SIA dynamic ice sheets (`src/aoba/icesheet.py`), and exoplanet presets (`earth`, `proxima_b`, `trappist_1e`, `mars_early`; `src/aoba/planetary_presets.py`).
 
-7. **101 Single-Source Fused Metal / CUDA Kernels, Universal Grid Remapping, & Centralized 323-Parameter `AOBA Studio`**:
-   - **Single-Source GPU Backend**: All **101 fused GPU kernels** across `kernels.py`, `kernels_extra.py`, `kernels_physics.py`, and `kernels_esm.py` execute natively on Apple Silicon (`mps` Metal shaders) and NVIDIA GPUs (`cuda` via deterministic Metal→CUDA C++17 transpilation in `src/aoba/kernels_cuda.py`), with automatic CUDA Graph capture/replay (`src/aoba/runtime.py`) and zero mid-step CPU–GPU synchronizations.
+7. **104 Single-Source Fused Metal / CUDA Kernels, Universal Grid Remapping, & Centralized 323-Parameter `AOBA Studio`**:
+   - **Single-Source GPU Backend**: All **104 fused GPU kernels** across `kernels.py`, `kernels_extra.py`, `kernels_physics.py`, and `kernels_esm.py` execute natively on Apple Silicon (`mps` Metal shaders) and NVIDIA GPUs (`cuda` via deterministic Metal→CUDA C++17 transpilation in `src/aoba/kernels_cuda.py`), with automatic CUDA Graph capture/replay (`src/aoba/runtime.py`) and zero mid-step CPU–GPU synchronizations.
    - **Centralized Registry, Presets, & Diagnostics**: All **323 global parameters across 14 sections** live in [`config/aoba_default.toml`](config/aoba_default.toml) with 100% bilingual documentation (`src/aoba/param_docs.py`), **11 ready-to-run presets** in `config/presets/`, universal cross-grid restart remapping (`AG4 → AG6`, arbitrary `nz`/`ocean_glevel`), 30-class Köppen–Geiger diagnostics (`src/aoba/koppen.py`), CMIP7 Data Request v1.2 output (`src/aoba/cmip7_diag.py`), and the bilingual `AOBA Studio` Web workbench (`scripts/aoba_config_gui.py`).
 
 8. **Single-Precision (`float32`) Design Rationale & Numerical Safeguards**:
@@ -75,7 +75,7 @@ aoba/
 │   └── assets/               # Icon & 7 schematic SVG diagrams
 ├── data/                     # Local Earth2014 topography/bathymetry & validation caches
 ├── src/
-│   └── aoba/                 # PyTorch + 101 single-source Metal/CUDA modules (56 files)
+│   └── aoba/                 # PyTorch + 104 single-source Metal/CUDA modules (56 files)
 ├── tests/                    # 27 unit, conservation, kernel & OSSP test suites (CPU/MPS/CUDA)
 ├── scripts/                  # Coupled runners, offline OGCM accelerator, GUI & plotting tools
 ├── notebooks/                # Colab A100/H100 auto-resume notebook

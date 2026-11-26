@@ -38,6 +38,9 @@ def test_cuda_transpilation() -> None:
         "ogcm_multi_vdiff_col",
         "ocean_bgc_column_col",
         "crm_lightning_col",
+        "explicit_lightning_charge_col",
+        "explicit_lightning_poisson_thomas",
+        "explicit_lightning_discharge_grp",
         "land_carbon_cn_fire_prep_tile",
     }
     missing = required - names

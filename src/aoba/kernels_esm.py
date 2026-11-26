@@ -2290,6 +2290,684 @@ kernel void dynamic_lake_step_col(
     diag_out[11u * nc + col] = tau_x;
     diag_out[12u * nc + col] = tau_y;
 }
+
+// -------------------------------------------------------------------------
+// 20e. SCALE-LT Explicit Bulk Lightning: Fused Charging, 3D Advection,
+//      Implicit Sedimentation, Melting, & Ionic Relaxation (1 thread / subcol)
+//      AOBA Formulation Eqs. (5.19)-(5.20)
+// -------------------------------------------------------------------------
+kernel void explicit_lightning_charge_col(
+    device const float* q_chg_in    [[buffer(0)]],  // [5, nz, nc, ny, nx]
+    device float* q_chg_out         [[buffer(1)]],  // [5, nz, nc, ny, nx]
+    device float* rhs_phys_out      [[buffer(2)]],  // [nz, nc, ny, nx] = rho_q_tot * dz / eps0
+    device float* ccd_km_out        [[buffer(3)]],  // [nc, ny, nx]
+    device const float* rho_d       [[buffer(4)]],  // [nz, nc, ny, nx]
+    device const float* theta_m     [[buffer(5)]],  // [nz, nc, ny, nx]
+    device const float* q_v         [[buffer(6)]],  // [nz, nc, ny, nx]
+    device const float* q_c         [[buffer(7)]],  // [nz, nc, ny, nx]
+    device const float* q_i         [[buffer(8)]],  // [nz, nc, ny, nx]
+    device const float* q_p         [[buffer(9)]],  // [nz, nc, ny, nx]
+    device const float* q_r_opt     [[buffer(10)]], // [nz, nc, ny, nx] or dummy
+    device const float* q_s_opt     [[buffer(11)]], // [nz, nc, ny, nx] or dummy
+    device const float* q_g_opt     [[buffer(12)]], // [nz, nc, ny, nx] or dummy
+    device const float* n_i_opt     [[buffer(13)]], // [nz, nc, ny, nx] or dummy
+    device const float* n_s_opt     [[buffer(14)]], // [nz, nc, ny, nx] or dummy
+    device const float* n_g_opt     [[buffer(15)]], // [nz, nc, ny, nx] or dummy
+    device const float* u_opt       [[buffer(16)]], // [nz, nc, ny, nx] or dummy
+    device const float* v_opt       [[buffer(17)]], // [nz, nc, ny, nx] or dummy
+    device const float* w_stag      [[buffer(18)]], // [nz+1, nc, ny, nx]
+    device const float* z_c         [[buffer(19)]], // [nz, z_cols]
+    device const float* dz_c        [[buffer(20)]], // [nz, z_cols]
+    constant ulong4& u_p0           [[buffer(21)]], // [nz, nc, ny, nx]
+    constant ulong4& u_p1           [[buffer(22)]], // [flags, z_cols, 0, 0]
+    constant float4& f_p0           [[buffer(23)]], // [dx, dy, dt, rd_over_cv]
+    constant float4& f_p1           [[buffer(24)]], // [p_ref, r_d, rv_over_rd, t_freeze]
+    constant float4& f_p2           [[buffer(25)]], // [rho_rain, rho_snow, rho_graupel, t0_precip]
+    constant float4& f_p3           [[buffer(26)]], // [t00_precip, t0_graupel, t00_graupel, inv_eps0]
+    uint col                        [[thread_position_in_grid]]
+) {
+    uint nz = uint(u_p0.x);
+    uint nc = uint(u_p0.y);
+    uint ny = uint(u_p0.z);
+    uint nx = uint(u_p0.w);
+    uint M = nc * ny * nx;
+    if (col >= M || nz == 0u || nz > RAD_MAX_NZ) return;
+
+    uint flags = uint(u_p1.x);
+    uint z_cols = uint(u_p1.y);
+    bool has_6q  = (flags & 1u) != 0u;
+    bool has_qr  = (flags & 2u) != 0u;
+    bool has_qs  = (flags & 4u) != 0u;
+    bool has_ni  = (flags & 8u) != 0u;
+    bool has_ns  = (flags & 16u) != 0u;
+    bool has_ng  = (flags & 32u) != 0u;
+    bool has_u   = ((flags & 64u) != 0u) && (nx > 1u);
+    bool has_v   = ((flags & 128u) != 0u) && (ny > 1u);
+
+    float dx = f_p0.x;
+    float dy = f_p0.y;
+    float dt = f_p0.z;
+    float rd_over_cv = f_p0.w;
+    float p_ref = f_p1.x;
+    float r_d = f_p1.y;
+    float rv_over_rd = f_p1.z;
+    float t_freeze = f_p1.w;
+    float rho_rain = f_p2.x;
+    float rho_snow = f_p2.y;
+    float rho_graupel = f_p2.z;
+    float t0_precip = f_p2.w;
+    float t00_precip = f_p3.x;
+    float t0_graupel = f_p3.y;
+    float t00_graupel = f_p3.z;
+    float inv_eps0 = f_p3.w;
+
+    uint ix = col % nx;
+    uint rem = col / nx;
+    uint iy = rem % ny;
+    uint c = rem / ny;
+    uint zc_col = (z_cols > 1u) ? c : 0u;
+
+    uint ix_p = (ix + 1u < nx) ? (ix + 1u) : 0u;
+    uint ix_m = (ix > 0u) ? (ix - 1u) : (nx - 1u);
+    uint iy_p = (iy + 1u < ny) ? (iy + 1u) : 0u;
+    uint iy_m = (iy > 0u) ? (iy - 1u) : (ny - 1u);
+
+    uint col_xp = (c * ny + iy) * nx + ix_p;
+    uint col_xm = (c * ny + iy) * nx + ix_m;
+    uint col_yp = (c * ny + iy_p) * nx + ix;
+    uint col_ym = (c * ny + iy_m) * nx + ix;
+
+    const float PI_F = 3.141592653589793f;
+    const float RHO_AIR_REF = 1.225f;
+    const float RHO_CLOUD_ICE = 500.0f;
+    const float DQ_MAX = 2.5e-14f;
+    const float REBOUND_GI = 0.90f;
+    const float Q_CLAMP = 5.0e-8f;
+    float decay_ion = exp(-dt / 600.0f);
+    float decay_dry = exp(-dt / 60.0f);
+    float melt_time_fac = 1.0f - exp(-dt / 180.0f);
+    float cfl_lim = (has_u && has_v) ? 0.225f : 0.45f;
+    float c_max_x = cfl_lim * dx / max(dt, 1.0e-3f);
+    float c_max_y = cfl_lim * dy / max(dt, 1.0e-3f);
+    float dt_over_dx = dt / dx;
+    float dt_over_dy = dt / dy;
+
+    float temp_arr[RAD_MAX_NZ];
+    float dq_i_arr[RAD_MAX_NZ];
+    float dq_s_arr[RAD_MAX_NZ];
+    float melt_to_r[RAD_MAX_NZ];
+    float rho_sum[RAD_MAX_NZ];
+    float vt_k[RAD_MAX_NZ];
+    float c_p[RAD_MAX_NZ];
+    float d_p[RAD_MAX_NZ];
+
+    float z_freeze = 0.0f;
+    float z_ice_top = 0.0f;
+
+    // Pass 0: Thermodynamics, hydrometeor properties, Takahashi charging, cold-cloud depth
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * M + col;
+        float rd = rho_d[idx];
+        float th = theta_m[idx];
+        float qv = max(q_v[idx], 0.0f);
+        float arg = max(r_d * rd * th / p_ref, 1.0e-8f);
+        float exner = pow(arg, rd_over_cv);
+        float temp = exner * (th / (1.0f + rv_over_rd * qv));
+        temp_arr[k] = temp;
+        melt_to_r[k] = 0.0f;
+        rho_sum[k] = 0.0f;
+
+        float rho_pos = max(rd, 1.0e-4f);
+        float qc_p = max(q_c[idx], 0.0f);
+        float qi_p = max(q_i[idx], 0.0f);
+        float qs_v, qg_v;
+        if (has_6q) {
+            qs_v = has_qs ? max(q_s_opt[idx], 0.0f) : 0.0f;
+            qg_v = max(q_g_opt[idx], 0.0f);
+        } else {
+            float f_ice_p = clamp((t0_precip - temp) / max(t0_precip - t00_precip, 1.0f), 0.0f, 1.0f);
+            float f_graup = clamp((temp - t00_graupel) / max(t0_graupel - t00_graupel, 1.0f), 0.0f, 1.0f);
+            float qp_p = max(q_p[idx], 0.0f);
+            float qp_ice = f_ice_p * qp_p;
+            qg_v = qp_ice * f_graup;
+            qs_v = qp_ice * (1.0f - f_graup);
+        }
+
+        float z_val = z_c[k * z_cols + zc_col];
+        if (temp >= t_freeze && z_val > z_freeze) z_freeze = z_val;
+        if ((qi_p + qs_v + qg_v) >= 1.0e-5f && z_val > z_ice_top) z_ice_top = z_val;
+
+        float rho_fac = sqrt(RHO_AIR_REF / rho_pos);
+        float vtg = 0.0f;
+        float dg = 2.0e-4f;
+        float ng_v = 1.0f;
+        if (qg_v > 1.0e-7f) {
+            float mg = rho_pos * qg_v;
+            ng_v = has_ng ? max(rho_pos * n_g_opt[idx], 1.0f)
+                          : max(4.0e6f * sqrt(sqrt(max(mg / (PI_F * rho_graupel * 4.0e6f) + 1.0e-24f, 1.0e-24f))), 1.0f);
+            dg = clamp(pow(6.0f * mg / (PI_F * rho_graupel * ng_v) + 1.0e-20f, 1.0f / 3.0f), 2.0e-4f, 1.5e-2f);
+            vtg = clamp(94.5f * sqrt(dg) * rho_fac, 0.5f, 12.0f);
+        }
+        vt_k[k] = vtg;
+
+        // Takahashi (1978) / Sato et al. (2019) polarity-reversal charging (Eq. 5.19)
+        // Compute cloud-ice and snow sizes/fall-speeds strictly inside active mixed-phase riming zones
+        float t_c = temp - t_freeze;
+        float dq_i = 0.0f;
+        float dq_s = 0.0f;
+        if (t_c < 0.0f && qg_v > 1.0e-6f && qc_p > 0.0f && (qi_p > 1.0e-7f || qs_v > 1.0e-6f)) {
+            float lwc = 1.0e3f * rho_pos * qc_p;
+            float t_rev = -10.0f - 10.0f * tanh(0.65f * (lwc - 0.55f));
+            float pol = tanh((t_c - t_rev) * 0.25f);
+            float lwc_f = lwc / (lwc + 0.15f);
+            float t_gate = esm_sigmoid((t_c + 40.0f) / 3.0f) * esm_sigmoid(-t_c / 1.5f);
+            float dq_coll = DQ_MAX * pol * lwc_f * t_gate;
+            if (qi_p > 1.0e-7f) {
+                float mi = rho_pos * qi_p;
+                float ni_v = has_ni ? max(rho_pos * n_i_opt[idx], 1.0f)
+                                    : max(1.0e5f * sqrt(max(mi * 1.0e3f, 0.0f)), 1.0f);
+                float di = clamp(pow(6.0f * mi / (PI_F * RHO_CLOUD_ICE * ni_v) + 1.0e-20f, 1.0f / 3.0f), 2.0e-5f, 5.0e-4f);
+                float vti = clamp(0.45f * rho_fac, 0.05f, 1.5f);
+                float dgi = dg + di;
+                float r_gi = REBOUND_GI * (0.25f * PI_F) * (dgi * dgi) * fabs(vtg - vti) * ng_v * ni_v;
+                dq_i = clamp(-dt * r_gi * dq_coll, -Q_CLAMP, Q_CLAMP);
+            }
+            if (qs_v > 1.0e-6f) {
+                float ms = rho_pos * qs_v;
+                float ns_v = has_ns ? max(rho_pos * n_s_opt[idx], 1.0f)
+                                    : max(3.0e6f * sqrt(sqrt(max(ms / (PI_F * rho_snow * 3.0e6f) + 1.0e-24f, 1.0e-24f))), 1.0f);
+                float ds = clamp(pow(6.0f * ms / (PI_F * rho_snow * ns_v) + 1.0e-20f, 1.0f / 3.0f), 1.0e-4f, 6.0e-3f);
+                float vts = clamp(4.84f * sqrt(sqrt(ds)) * rho_fac, 0.2f, 3.0f);
+                float dgs = dg + ds;
+                float r_gs = REBOUND_GI * (0.25f * PI_F) * (dgs * dgs) * fabs(vtg - vts) * ng_v * ns_v;
+                dq_s = clamp(-dt * r_gs * dq_coll, -Q_CLAMP, Q_CLAMP);
+            }
+        }
+        dq_i_arr[k] = dq_i;
+        dq_s_arr[k] = dq_s;
+    }
+    ccd_km_out[col] = max((z_ice_top - z_freeze) * 1.0e-3f, 0.0f);
+
+    // Process 5 species in order s = 4 (g), 3 (s), 2 (i), 1 (r), 0 (c) so melting flows g,s -> r in 1 pass
+    for (int si = 4; si >= 0; --si) {
+        uint s = uint(si);
+        uint s_off = s * nz * M;
+
+        // Compute fall speed vt_k[k] for species s (s=4 already populated in Pass 0)
+        if (s != 4u) {
+            for (uint k = 0u; k < nz; ++k) {
+                uint idx = k * M + col;
+                if (s == 0u) {
+                    vt_k[k] = 0.0f;
+                } else {
+                    float rho_pos = max(rho_d[idx], 1.0e-4f);
+                    float rho_fac = sqrt(RHO_AIR_REF / rho_pos);
+                    float temp = temp_arr[k];
+                    if (s == 2u) {
+                        float qi_p = max(q_i[idx], 0.0f);
+                        vt_k[k] = (qi_p > 1.0e-7f) ? clamp(0.45f * rho_fac, 0.05f, 1.5f) : 0.0f;
+                    } else if (s == 3u) {
+                        float qs_v;
+                        if (has_6q) {
+                            qs_v = has_qs ? max(q_s_opt[idx], 0.0f) : 0.0f;
+                        } else {
+                            float f_ice_p = clamp((t0_precip - temp) / max(t0_precip - t00_precip, 1.0f), 0.0f, 1.0f);
+                            float f_graup = clamp((temp - t00_graupel) / max(t0_graupel - t00_graupel, 1.0f), 0.0f, 1.0f);
+                            qs_v = f_ice_p * max(q_p[idx], 0.0f) * (1.0f - f_graup);
+                        }
+                        if (qs_v > 1.0e-7f) {
+                            float ms = rho_pos * qs_v;
+                            float ns_v = has_ns ? max(rho_pos * n_s_opt[idx], 1.0f)
+                                                : max(3.0e6f * sqrt(sqrt(max(ms / (PI_F * rho_snow * 3.0e6f) + 1.0e-24f, 1.0e-24f))), 1.0f);
+                            float ds = clamp(pow(6.0f * ms / (PI_F * rho_snow * ns_v) + 1.0e-20f, 1.0f / 3.0f), 1.0e-4f, 6.0e-3f);
+                            vt_k[k] = clamp(4.84f * sqrt(sqrt(ds)) * rho_fac, 0.2f, 3.0f);
+                        } else {
+                            vt_k[k] = 0.0f;
+                        }
+                    } else { // s == 1u (rain)
+                        float qr_v;
+                        if (has_6q) {
+                            qr_v = has_qr ? max(q_r_opt[idx], 0.0f) : 0.0f;
+                        } else {
+                            float f_ice_p = clamp((t0_precip - temp) / max(t0_precip - t00_precip, 1.0f), 0.0f, 1.0f);
+                            qr_v = (1.0f - f_ice_p) * max(q_p[idx], 0.0f);
+                        }
+                        if (qr_v > 1.0e-7f) {
+                            float mr = rho_pos * qr_v;
+                            float dr = clamp(sqrt(sqrt(mr / (PI_F * rho_rain * 8.0e6f) + 1.0e-24f)), 1.0e-4f, 5.0e-3f);
+                            vt_k[k] = clamp(842.0f * pow(dr, 0.8f) * rho_fac, 0.5f, 10.0f);
+                        } else {
+                            vt_k[k] = 0.0f;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Forward Thomas sweep combining horizontal donor-cell advection, non-inductive sep, & vertical implicit transport
+        float w_pos_prev = 0.0f;
+        float w_neg_prev = 0.0f;
+        float v_bot = max(vt_k[0], 0.0f);
+
+        for (uint k = 0u; k < nz; ++k) {
+            uint k_off = k * M;
+            uint q_idx = s_off + k_off + col;
+            float q_orig = q_chg_in[q_idx];
+            float q_val = q_orig;
+
+            // Simultaneous conservative periodic horizontal donor-cell advection
+            if (has_u) {
+                float u_r = clamp(u_opt[k_off + col], -c_max_x, c_max_x);
+                float u_l = clamp(u_opt[k_off + col_xm], -c_max_x, c_max_x);
+                float q_xp = q_chg_in[s_off + k_off + col_xp];
+                float q_xm = q_chg_in[s_off + k_off + col_xm];
+                float fx_r = max(u_r, 0.0f) * q_orig + min(u_r, 0.0f) * q_xp;
+                float fx_l = max(u_l, 0.0f) * q_xm + min(u_l, 0.0f) * q_orig;
+                q_val -= dt_over_dx * (fx_r - fx_l);
+            }
+            if (has_v) {
+                float v_u = clamp(v_opt[k_off + col], -c_max_y, c_max_y);
+                float v_d = clamp(v_opt[k_off + col_ym], -c_max_y, c_max_y);
+                float q_yp = q_chg_in[s_off + k_off + col_yp];
+                float q_ym = q_chg_in[s_off + k_off + col_ym];
+                float fy_u = max(v_u, 0.0f) * q_orig + min(v_u, 0.0f) * q_yp;
+                float fy_d = max(v_d, 0.0f) * q_ym + min(v_d, 0.0f) * q_orig;
+                q_val -= dt_over_dy * (fy_u - fy_d);
+            }
+
+            // Add strict zero-sum non-inductive charge separation
+            if (s == 2u) q_val += dq_i_arr[k];
+            else if (s == 3u) q_val += dq_s_arr[k];
+            else if (s == 4u) q_val -= (dq_i_arr[k] + dq_s_arr[k]);
+
+            float dz_k = max(dz_c[k * z_cols + zc_col], 1.0f);
+            float w_pos_cur = 0.0f;
+            float w_neg_cur = 0.0f;
+            if (k + 1u < nz) {
+                float w_int = w_stag[(k + 1u) * M + col] - 0.5f * (vt_k[k] + vt_k[k + 1u]);
+                w_pos_cur = max(w_int, 0.0f);
+                w_neg_cur = min(w_int, 0.0f);
+            }
+
+            float dl = (k == 0u) ? 0.0f : (-dt * w_pos_prev);
+            float du = (k + 1u < nz) ? (dt * w_neg_cur) : 0.0f;
+            float out_up = dt * w_pos_cur;
+            float out_dn = (k == 0u) ? (dt * v_bot) : (-dt * w_neg_prev);
+            float diag = dz_k + out_up + out_dn;
+            float rhs = dz_k * q_val;
+
+            if (k == 0u) {
+                float inv_d = 1.0f / diag;
+                c_p[0] = du * inv_d;
+                d_p[0] = rhs * inv_d;
+            } else {
+                float inv_d = 1.0f / (diag - dl * c_p[k - 1u]);
+                c_p[k] = du * inv_d;
+                d_p[k] = (rhs - dl * d_p[k - 1u]) * inv_d;
+            }
+
+            w_pos_prev = w_pos_cur;
+            w_neg_prev = w_neg_cur;
+        }
+
+        // Backward Thomas substitution + melting transfer + ionic relaxation + total charge accumulation
+        float q_above = 0.0f;
+        for (int ki = int(nz) - 1; ki >= 0; --ki) {
+            uint k = uint(ki);
+            float q_new = (k == nz - 1u) ? d_p[k] : (d_p[k] - c_p[k] * q_above);
+            q_above = q_new;
+
+            float temp = temp_arr[k];
+            if (s == 3u || s == 4u) {
+                float mf = clamp((temp - t_freeze) / 3.0f, 0.0f, 1.0f) * melt_time_fac;
+                melt_to_r[k] += mf * q_new;
+                q_new *= (1.0f - mf);
+            } else if (s == 1u) {
+                q_new += melt_to_r[k];
+            }
+
+            uint idx = k * M + col;
+            float qm = 0.0f;
+            if (s == 0u) qm = max(q_c[idx], 0.0f);
+            else if (s == 2u) qm = max(q_i[idx], 0.0f);
+            else if (has_6q) {
+                if (s == 1u) qm = has_qr ? max(q_r_opt[idx], 0.0f) : 0.0f;
+                else if (s == 3u) qm = has_qs ? max(q_s_opt[idx], 0.0f) : 0.0f;
+                else qm = max(q_g_opt[idx], 0.0f);
+            } else {
+                float f_ice_p = clamp((t0_precip - temp) / max(t0_precip - t00_precip, 1.0f), 0.0f, 1.0f);
+                float qp_p = max(q_p[idx], 0.0f);
+                if (s == 1u) qm = (1.0f - f_ice_p) * qp_p;
+                else {
+                    float f_graup = clamp((temp - t00_graupel) / max(t0_graupel - t00_graupel, 1.0f), 0.0f, 1.0f);
+                    qm = (s == 4u) ? (f_ice_p * qp_p * f_graup) : (f_ice_p * qp_p * (1.0f - f_graup));
+                }
+            }
+            float decay = (qm > 1.0e-8f) ? decay_ion : decay_dry;
+            q_new = clamp(q_new * decay, -Q_CLAMP, Q_CLAMP);
+            q_chg_out[s_off + k * M + col] = q_new;
+            rho_sum[k] += q_new;
+        }
+    }
+
+    // Write pre-scaled Poisson RHS = rho_q_tot * dz / eps0 directly for rfft2
+    for (uint k = 0u; k < nz; ++k) {
+        float dz_k = max(dz_c[k * z_cols + zc_col], 1.0f);
+        rhs_phys_out[k * M + col] = rho_sum[k] * dz_k * inv_eps0;
+    }
+}
+
+// -------------------------------------------------------------------------
+// 20f. SCALE-LT Explicit Bulk Lightning: Exact Batched Complex Thomas Solver
+//      in Fourier Space (1 thread per (c, ky, kx) mode; zero matrix allocs)
+//      AOBA Formulation Eq. (5.21)
+// -------------------------------------------------------------------------
+kernel void explicit_lightning_poisson_thomas(
+    device const float* rhs_hat_ri  [[buffer(0)]], // [nz, nc, ny, n_kx, 2]
+    device float* phi_hat_ri        [[buffer(1)]], // [nz, nc, ny, n_kx, 2]
+    device const float* dz_c        [[buffer(2)]], // [nz, z_cols]
+    constant ulong4& u_p0           [[buffer(3)]], // [nz, nc, ny, nx]
+    constant ulong4& u_p1           [[buffer(4)]], // [n_kx, z_cols, 0, 0]
+    constant float4& f_p0           [[buffer(5)]], // [dx, dy, 0, 0]
+    uint tid                        [[thread_position_in_grid]]
+) {
+    uint nz = uint(u_p0.x);
+    uint nc = uint(u_p0.y);
+    uint ny = uint(u_p0.z);
+    uint nx = uint(u_p0.w);
+    uint n_kx = uint(u_p1.x);
+    uint z_cols = uint(u_p1.y);
+    uint m_tot = nc * ny * n_kx;
+    if (tid >= m_tot || nz == 0u || nz > RAD_MAX_NZ) return;
+
+    uint ix_k = tid % n_kx;
+    uint rem = tid / n_kx;
+    uint iy = rem % ny;
+    uint c = rem / ny;
+    uint zc_col = (z_cols > 1u) ? c : 0u;
+
+    const float PI_F = 3.141592653589793f;
+    float dx = f_p0.x;
+    float dy = f_p0.y;
+    float sx = sin(PI_F * float(ix_k) / float(max(nx, 1u)));
+    float lam_x = (4.0f / (dx * dx)) * sx * sx;
+    float lam_y = 0.0f;
+    if (ny > 1u) {
+        float sy = sin(PI_F * float(iy) / float(ny));
+        lam_y = (4.0f / (dy * dy)) * sy * sy;
+    }
+    float lam_h = lam_x + lam_y;
+
+    float c_star[RAD_MAX_NZ];
+    float d_re[RAD_MAX_NZ];
+    float d_im[RAD_MAX_NZ];
+
+    float dz_cur = max(dz_c[0u * z_cols + zc_col], 1.0f);
+    float dz_prev = dz_cur;
+    for (uint k = 0u; k < nz; ++k) {
+        float dz_next = (k + 1u < nz) ? max(dz_c[(k + 1u) * z_cols + zc_col], 1.0f) : dz_cur;
+        float dz_dn = (k == 0u) ? (0.5f * dz_cur) : (0.5f * (dz_prev + dz_cur));
+        float dz_up = (k + 1u == nz) ? (0.5f * dz_cur) : (0.5f * (dz_cur + dz_next));
+        float c_dn = 1.0f / dz_dn;
+        float c_up = 1.0f / dz_up;
+
+        float a = (k == 0u) ? 0.0f : -c_dn;
+        float d = (k + 1u == nz) ? 0.0f : -c_up;
+        float b = c_dn + c_up + dz_cur * lam_h;
+
+        uint idx = (k * m_tot + tid) * 2u;
+        float r_re = rhs_hat_ri[idx];
+        float r_im = rhs_hat_ri[idx + 1u];
+
+        if (k == 0u) {
+            float inv_b = 1.0f / b;
+            c_star[0] = d * inv_b;
+            d_re[0] = r_re * inv_b;
+            d_im[0] = r_im * inv_b;
+        } else {
+            float inv_b = 1.0f / (b - a * c_star[k - 1u]);
+            c_star[k] = d * inv_b;
+            d_re[k] = (r_re - a * d_re[k - 1u]) * inv_b;
+            d_im[k] = (r_im - a * d_im[k - 1u]) * inv_b;
+        }
+        dz_prev = dz_cur;
+        dz_cur = dz_next;
+    }
+
+    float p_re_ab = 0.0f;
+    float p_im_ab = 0.0f;
+    for (int ki = int(nz) - 1; ki >= 0; --ki) {
+        uint k = uint(ki);
+        float p_re = (k == nz - 1u) ? d_re[k] : (d_re[k] - c_star[k] * p_re_ab);
+        float p_im = (k == nz - 1u) ? d_im[k] : (d_im[k] - c_star[k] * p_im_ab);
+        p_re_ab = p_re;
+        p_im_ab = p_im;
+        uint idx = (k * m_tot + tid) * 2u;
+        phi_hat_ri[idx] = p_re;
+        phi_hat_ri[idx + 1u] = p_im;
+    }
+}
+
+// -------------------------------------------------------------------------
+// 20g. SCALE-LT Explicit Bulk Lightning: E-Field Gradient, Breakdown Trigger,
+//      Fast Untriggered Early Exit, Zero-Sum IC/CG Discharge & Flash Rate
+//      1 Threadgroup (64 threads) per Host Cell c
+//      AOBA Formulation Eqs. (5.22)-(5.23)
+// -------------------------------------------------------------------------
+kernel void explicit_lightning_discharge_grp(
+    device float* q_chg             [[buffer(0)]], // [5, nz, nc, ny, nx] updated in-place
+    device const float* phi_e       [[buffer(1)]], // [nz, nc, ny, nx]
+    device const float* rho_d       [[buffer(2)]], // [nz, nc, ny, nx]
+    device const float* z_c         [[buffer(3)]], // [nz, z_cols]
+    device const float* dz_c        [[buffer(4)]], // [nz, z_cols]
+    device float* e_mag_out         [[buffer(5)]], // [nz, nc, ny, nx]
+    device float* e_z_out           [[buffer(6)]], // [nz, nc, ny, nx]
+    device float* flash_tot_out     [[buffer(7)]], // [nc, ny, nx]
+    device float* flash_cg_out      [[buffer(8)]], // [nc, ny, nx]
+    device float* f_cg_out          [[buffer(9)]], // [nc, ny, nx]
+    constant ulong4& u_p0           [[buffer(10)]], // [nz, nc, ny, nx]
+    constant ulong4& u_p1           [[buffer(11)]], // [z_cols, 0, 0, 0]
+    constant float4& f_p0           [[buffer(12)]], // [dx, dy, dt, e_crit_sl]
+    constant float4& f_p1           [[buffer(13)]], // [extent_frac, neut_frac, q_per_flash, z_cg_max]
+    uint ltid                       [[thread_position_in_threadgroup]],
+    uint c                          [[threadgroup_position_in_grid]]
+) {
+    uint nz = uint(u_p0.x);
+    uint nc = uint(u_p0.y);
+    uint ny = uint(u_p0.z);
+    uint nx = uint(u_p0.w);
+    uint z_cols = uint(u_p1.x);
+    if (c >= nc || nz == 0u || nz > RAD_MAX_NZ) return;
+
+    uint n_sub = ny * nx;
+    uint M = nc * n_sub;
+    uint zc_col = (z_cols > 1u) ? c : 0u;
+
+    float dx = f_p0.x;
+    float dy = f_p0.y;
+    float dt = f_p0.z;
+    float e_crit_sl = f_p0.w;
+    float ext_frac = f_p1.x;
+    float neut_frac = f_p1.y;
+    float q_per_flash = f_p1.z;
+    float z_cg_max = f_p1.w;
+    const float RHO_AIR_REF = 1.225f;
+    float inv_2dx = 0.5f / dx;
+    float inv_2dy = 0.5f / dy;
+
+    threadgroup float sh_a[64];
+    threadgroup float sh_b[64];
+
+    // Pass 1: Compute 3D E-field from phi_e, write e_mag & e_z, find max |E|/E_crit
+    float loc_max_ratio = 0.0f;
+    for (uint sub = ltid; sub < n_sub; sub += 64u) {
+        uint ix = sub % nx;
+        uint iy = sub / nx;
+        uint ix_p = (ix + 1u < nx) ? (ix + 1u) : 0u;
+        uint ix_m = (ix > 0u) ? (ix - 1u) : (nx - 1u);
+        uint iy_p = (iy + 1u < ny) ? (iy + 1u) : 0u;
+        uint iy_m = (iy > 0u) ? (iy - 1u) : (ny - 1u);
+
+        uint col = c * n_sub + sub;
+        uint col_xp = (c * ny + iy) * nx + ix_p;
+        uint col_xm = (c * ny + iy) * nx + ix_m;
+        uint col_yp = (c * ny + iy_p) * nx + ix;
+        uint col_ym = (c * ny + iy_m) * nx + ix;
+
+        float dz_cur = max(dz_c[0u * z_cols + zc_col], 1.0f);
+        float dz_prev = dz_cur;
+        float phi_cur = phi_e[0u * M + col];
+        float phi_prev = 0.0f;
+
+        for (uint k = 0u; k < nz; ++k) {
+            uint k_off = k * M;
+            uint idx = k_off + col;
+            float dz_next = (k + 1u < nz) ? max(dz_c[(k + 1u) * z_cols + zc_col], 1.0f) : dz_cur;
+            float phi_next = (k + 1u < nz) ? phi_e[(k + 1u) * M + col] : 0.0f;
+
+            float ex = (nx > 1u) ? (-(phi_e[k_off + col_xp] - phi_e[k_off + col_xm]) * inv_2dx) : 0.0f;
+            float ey = (ny > 1u) ? (-(phi_e[k_off + col_yp] - phi_e[k_off + col_ym]) * inv_2dy) : 0.0f;
+            float ez = 0.0f;
+            if (nz > 1u) {
+                float f_dn = (k == 0u) ? (phi_cur / (0.5f * dz_cur))
+                                       : ((phi_cur - phi_prev) / (0.5f * (dz_prev + dz_cur)));
+                float f_up = (k + 1u == nz) ? (-phi_cur / (0.5f * dz_cur))
+                                            : ((phi_next - phi_cur) / (0.5f * (dz_cur + dz_next)));
+                ez = -0.5f * (f_dn + f_up);
+            }
+            float emag = sqrt(ex * ex + ey * ey + ez * ez + 1.0e-12f);
+            e_mag_out[idx] = emag;
+            e_z_out[idx] = ez;
+
+            float rho_pos = max(rho_d[idx], 1.0e-4f);
+            float e_crit = e_crit_sl * max(rho_pos / RHO_AIR_REF, 0.05f);
+            float er = emag / e_crit;
+            if (er > loc_max_ratio) loc_max_ratio = er;
+
+            phi_prev = phi_cur;
+            phi_cur = phi_next;
+            dz_prev = dz_cur;
+            dz_cur = dz_next;
+        }
+    }
+
+    sh_a[ltid] = loc_max_ratio;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = 32u; off > 0u; off >>= 1u) {
+        if (ltid < off) sh_a[ltid] = max(sh_a[ltid], sh_a[ltid + off]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float dom_max_ratio = sh_a[0];
+
+    // Fast uniform early exit: non-thunderstorm cells skip touching q_chg completely!
+    if (dom_max_ratio < 1.0f) {
+        for (uint sub = ltid; sub < n_sub; sub += 64u) {
+            uint col = c * n_sub + sub;
+            flash_tot_out[col] = 0.0f;
+            flash_cg_out[col] = 0.0f;
+            f_cg_out[col] = 0.0f;
+        }
+        return;
+    }
+
+    // Pass 2a (triggered domains): detect CG connection and IC channel-volume charge imbalance
+    float neut_eff = min(neut_frac * clamp(dom_max_ratio, 1.0f, 3.0f), 0.80f);
+    float z0 = z_c[0u * z_cols + zc_col];
+    float dz0 = max(dz_c[0u * z_cols + zc_col], 1.0f);
+    float area_sub = dx * dy;
+
+    float loc_any_cg = 0.0f;
+    float loc_dq_vol = 0.0f;
+    float loc_chan_vol = 0.0f;
+
+    for (uint sub = ltid; sub < n_sub; sub += 64u) {
+        uint col = c * n_sub + sub;
+        float rho0 = max(rho_d[0u * M + col], 1.0e-4f);
+        float ec0 = max(e_crit_sl * max(rho0 / RHO_AIR_REF, 0.05f), 1.0f);
+        if (fabs(e_z_out[0u * M + col]) / ec0 >= 0.25f) loc_any_cg = 1.0f;
+
+        for (uint k = 0u; k < nz; ++k) {
+            uint idx = k * M + col;
+            float rho_pos = max(rho_d[idx], 1.0e-4f);
+            float e_crit = e_crit_sl * max(rho_pos / RHO_AIR_REF, 0.05f);
+            if (e_mag_out[idx] >= ext_frac * e_crit) {
+                float dz_k = max(dz_c[k * z_cols + zc_col], 1.0f);
+                float z_agl = z_c[k * z_cols + zc_col] - z0 + 0.5f * dz0;
+                if (z_agl <= z_cg_max) loc_any_cg = 1.0f;
+
+                float qsum = 0.0f;
+                for (uint s = 0u; s < 5u; ++s) qsum += q_chg[s * nz * M + idx];
+                float cvol = dz_k * area_sub;
+                loc_dq_vol += (-neut_eff * qsum) * cvol;
+                loc_chan_vol += cvol;
+            }
+        }
+    }
+
+    sh_a[ltid] = loc_any_cg;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = 32u; off > 0u; off >>= 1u) {
+        if (ltid < off) sh_a[ltid] = max(sh_a[ltid], sh_a[ltid + off]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    bool is_cg_dom = (sh_a[0] > 0.5f);
+
+    sh_a[ltid] = loc_dq_vol;
+    sh_b[ltid] = loc_chan_vol;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = 32u; off > 0u; off >>= 1u) {
+        if (ltid < off) {
+            sh_a[ltid] += sh_a[ltid + off];
+            sh_b[ltid] += sh_b[ltid + off];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    bool ic_only = (!is_cg_dom) && (sh_b[0] > 1.0f);
+    float imbal_mean = ic_only ? (sh_a[0] / max(sh_b[0], 1.0f)) : 0.0f;
+
+    // Pass 2b: Apply in-place charge neutralization (+ exact IC zero-sum) and compute flash rates
+    for (uint sub = ltid; sub < n_sub; sub += 64u) {
+        uint col = c * n_sub + sub;
+        float rho0 = max(rho_d[0u * M + col], 1.0e-4f);
+        float ec0 = max(e_crit_sl * max(rho0 / RHO_AIR_REF, 0.05f), 1.0f);
+        bool is_cg_sub = (fabs(e_z_out[0u * M + col]) / ec0 >= 0.25f);
+        float dq_abs_col_dz = 0.0f;
+
+        for (uint k = 0u; k < nz; ++k) {
+            uint idx = k * M + col;
+            float rho_pos = max(rho_d[idx], 1.0e-4f);
+            float e_crit = e_crit_sl * max(rho_pos / RHO_AIR_REF, 0.05f);
+            if (e_mag_out[idx] >= ext_frac * e_crit) {
+                float dz_k = max(dz_c[k * z_cols + zc_col], 1.0f);
+                float z_agl = z_c[k * z_cols + zc_col] - z0 + 0.5f * dz0;
+                if (z_agl <= z_cg_max) is_cg_sub = true;
+
+                float qv5[5];
+                float abs_sum = 0.0f;
+                for (uint s = 0u; s < 5u; ++s) {
+                    float qv = q_chg[s * nz * M + idx];
+                    qv5[s] = qv;
+                    abs_sum += fabs(qv);
+                }
+                float inv_abs = 1.0f / max(abs_sum, 1.0e-18f);
+                float dq_tot = 0.0f;
+                for (uint s = 0u; s < 5u; ++s) {
+                    float dq = -neut_eff * qv5[s];
+                    if (ic_only) dq -= (fabs(qv5[s]) * inv_abs) * imbal_mean;
+                    q_chg[s * nz * M + idx] = qv5[s] + dq;
+                    dq_tot += dq;
+                }
+                dq_abs_col_dz += fabs(dq_tot) * dz_k;
+            }
+        }
+
+        float flash_tot = (0.5f * dq_abs_col_dz) / (q_per_flash * dt);
+        float f_cg = (flash_tot > 0.0f && is_cg_sub) ? 1.0f : 0.0f;
+        flash_tot_out[col] = flash_tot;
+        f_cg_out[col] = f_cg;
+        flash_cg_out[col] = flash_tot * f_cg;
+    }
+}
 """
 
 
@@ -3070,3 +3748,223 @@ def run_dynamic_lake_step_metal(
     lake.evap = diag_out[10].contiguous()
     lake.tau_x = diag_out[11].contiguous()
     lake.tau_y = diag_out[12].contiguous()
+
+
+def run_explicit_lightning_poisson_metal(
+    lib: Any,
+    rhs_phys: torch.Tensor,
+    dz_c: torch.Tensor,
+    dx: float,
+    dy: float,
+) -> torch.Tensor:
+    """Solve 2D/3D periodic-horizontal Dirichlet-vertical Poisson via rfft2 + fused Thomas + irfft2."""
+    nz, nc, ny, nx = rhs_phys.shape
+    dev = rhs_phys.device
+    rhs_hat = torch.fft.rfft2(rhs_phys, dim=(-2, -1))
+    n_kx = int(rhs_hat.shape[-1])
+    rhs_ri = torch.view_as_real(rhs_hat).contiguous()
+    phi_ri = torch.empty_like(rhs_ri)
+
+    if dz_c.ndim == 2:
+        dz_b = dz_c.to(device=dev, dtype=torch.float32).contiguous()
+        z_cols = int(dz_b.shape[1])
+    else:
+        dz_b = dz_c.to(device=dev, dtype=torch.float32).view(nz, 1).contiguous()
+        z_cols = 1
+
+    m_tot = nc * ny * n_kx
+    lib.explicit_lightning_poisson_thomas(
+        rhs_ri,
+        phi_ri,
+        dz_b,
+        [int(nz), int(nc), int(ny), int(nx)],
+        [int(n_kx), int(z_cols), 0, 0],
+        [float(dx), float(dy), 0.0, 0.0],
+        threads=m_tot,
+    )
+    phi_hat = torch.view_as_complex(phi_ri)
+    return torch.fft.irfft2(phi_hat, s=(ny, nx), dim=(-2, -1)).to(torch.float32).contiguous()
+
+
+def run_explicit_bulk_lightning_metal(
+    lib: Any,
+    q_chg: torch.Tensor,
+    rho_d: torch.Tensor,
+    theta_m: torch.Tensor,
+    q_v: torch.Tensor,
+    q_c: torch.Tensor,
+    q_i: torch.Tensor,
+    q_p: torch.Tensor,
+    w_stag: torch.Tensor,
+    z_c: torch.Tensor,
+    dz_c: torch.Tensor,
+    *,
+    dx: float,
+    dy: float,
+    dt: float,
+    u_stag: torch.Tensor | None = None,
+    v_stag: torch.Tensor | None = None,
+    q_r_prog: torch.Tensor | None = None,
+    q_s_prog: torch.Tensor | None = None,
+    q_g_prog: torch.Tensor | None = None,
+    n_i_prog: torch.Tensor | None = None,
+    n_s_prog: torch.Tensor | None = None,
+    n_g_prog: torch.Tensor | None = None,
+    rho_rain: float,
+    rho_snow: float,
+    rho_graupel: float,
+    t0_precip: float,
+    t00_precip: float,
+    t0_graupel: float,
+    t00_graupel: float,
+    eps0: float,
+    e_crit_sl: float,
+    extent_frac: float,
+    neut_frac: float,
+    q_per_flash: float,
+    z_cg_max: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Execute 3-kernel fused Metal/CUDA SCALE-LT explicit bulk lightning & discharge step."""
+    nz, nc, ny, nx = rho_d.shape
+    dev = rho_d.device
+    m_sub = nc * ny * nx
+
+    q_in = q_chg.contiguous()
+    q_out = torch.empty_like(q_in)
+    rhs_phys = torch.empty((nz, nc, ny, nx), dtype=torch.float32, device=dev)
+    ccd_km = torch.empty((nc, ny, nx), dtype=torch.float32, device=dev)
+
+    rho_b = rho_d.contiguous()
+    th_b = theta_m.contiguous()
+    qv_b = q_v.contiguous()
+    qc_b = q_c.contiguous()
+    qi_b = q_i.contiguous()
+    qp_b = q_p.contiguous()
+    w_b = w_stag.contiguous()
+
+    flags = 0
+    if q_g_prog is not None:
+        flags |= 1
+        qg_b = q_g_prog.contiguous()
+        if q_r_prog is not None:
+            flags |= 2
+            qr_b = q_r_prog.contiguous()
+        else:
+            qr_b = qc_b
+        if q_s_prog is not None:
+            flags |= 4
+            qs_b = q_s_prog.contiguous()
+        else:
+            qs_b = qc_b
+    else:
+        qr_b = qc_b
+        qs_b = qc_b
+        qg_b = qc_b
+
+    if n_i_prog is not None:
+        flags |= 8
+        ni_b = n_i_prog.contiguous()
+    else:
+        ni_b = qc_b
+    if n_s_prog is not None:
+        flags |= 16
+        ns_b = n_s_prog.contiguous()
+    else:
+        ns_b = qc_b
+    if n_g_prog is not None:
+        flags |= 32
+        ng_b = n_g_prog.contiguous()
+    else:
+        ng_b = qc_b
+
+    if u_stag is not None and nx > 1:
+        flags |= 64
+        u_b = u_stag.contiguous()
+    else:
+        u_b = qc_b
+    if v_stag is not None and ny > 1:
+        flags |= 128
+        v_b = v_stag.contiguous()
+    else:
+        v_b = qc_b
+
+    if z_c.ndim == 2:
+        zc_b = z_c.to(device=dev, dtype=torch.float32).contiguous()
+        dz_b = dz_c.to(device=dev, dtype=torch.float32).contiguous()
+        z_cols = int(zc_b.shape[1])
+    else:
+        zc_b = z_c.to(device=dev, dtype=torch.float32).view(nz, 1).contiguous()
+        dz_b = dz_c.to(device=dev, dtype=torch.float32).view(nz, 1).contiguous()
+        z_cols = 1
+
+    # Kernel 1: Fused horizontal advection + Takahashi charging + vertical implicit Thomas + melting + decay
+    lib.explicit_lightning_charge_col(
+        q_in,
+        q_out,
+        rhs_phys,
+        ccd_km,
+        rho_b,
+        th_b,
+        qv_b,
+        qc_b,
+        qi_b,
+        qp_b,
+        qr_b,
+        qs_b,
+        qg_b,
+        ni_b,
+        ns_b,
+        ng_b,
+        u_b,
+        v_b,
+        w_b,
+        zc_b,
+        dz_b,
+        [int(nz), int(nc), int(ny), int(nx)],
+        [int(flags), int(z_cols), 0, 0],
+        [float(dx), float(dy), float(dt), float(C.R_D / C.CV_D)],
+        [float(C.P_REF), float(C.R_D), float(C.RV_OVER_RD), float(C.T_FREEZE)],
+        [float(rho_rain), float(rho_snow), float(rho_graupel), float(t0_precip)],
+        [float(t00_precip), float(t0_graupel), float(t00_graupel), float(1.0 / eps0)],
+        threads=m_sub,
+    )
+
+    # Kernel 2: Exact 2D/3D periodic-horizontal / Dirichlet-vertical Poisson (rfft2 + fused Thomas + irfft2)
+    phi_e = run_explicit_lightning_poisson_metal(lib, rhs_phys, dz_b, dx, dy)
+
+    # Kernel 3: E-field gradient + early-exit breakdown trigger + zero-sum IC/CG discharge + flash rates
+    e_mag = torch.empty((nz, nc, ny, nx), dtype=torch.float32, device=dev)
+    e_z = torch.empty((nz, nc, ny, nx), dtype=torch.float32, device=dev)
+    flash_tot_sub = torch.empty((nc, ny, nx), dtype=torch.float32, device=dev)
+    flash_cg_sub = torch.empty((nc, ny, nx), dtype=torch.float32, device=dev)
+    f_cg_sub = torch.empty((nc, ny, nx), dtype=torch.float32, device=dev)
+
+    lib.explicit_lightning_discharge_grp(
+        q_out,
+        phi_e,
+        rho_b,
+        zc_b,
+        dz_b,
+        e_mag,
+        e_z,
+        flash_tot_sub,
+        flash_cg_sub,
+        f_cg_sub,
+        [int(nz), int(nc), int(ny), int(nx)],
+        [int(z_cols), 0, 0, 0],
+        [float(dx), float(dy), float(dt), float(e_crit_sl)],
+        [float(extent_frac), float(neut_frac), float(q_per_flash), float(z_cg_max)],
+        threads=(nc * 64,),
+        group_size=(64,),
+    )
+
+    return q_out, phi_e, e_mag, e_z, flash_tot_sub, flash_cg_sub, f_cg_sub, ccd_km

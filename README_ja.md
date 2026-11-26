@@ -50,8 +50,8 @@
    - **予報 3D オゾン・自然エアロゾル・水同位体**: 4 種のオゾンモード（`rcemip`, `latitude_seasonal`, `climatology`, `prognostic` 3D Chapman ＋ $\mathrm{HO}_x/\mathrm{NO}_x/\mathrm{ClO}_x$/PSC 光化学＋Brewer–Dobson 輸送；`src/aoba/ozone_chemistry.py`）、4 種の自然エアロゾル（海塩・FlexPFT 結合 DMS/$\mathrm{SO}_4$・火災 BC/OC・BVOC-SOA；`src/aoba/aerosols.py`）、マップ不要の鉱物ダスト（`src/aoba/dust.py`）、積雪 BC/ダスト暗色化、および安定水同位体（$\mathrm{H}_2^{18}\mathrm{O}$, $\mathrm{HDO}$；`src/aoba/water_isotopes.py`）を搭載します。
    - **任意の排出量駆動・古気候・系外惑星オプション**: 選択式 $\mathrm{CO}_2$ モード（`constant` / `scenario` / `csv` / `prognostic` 3D 輸送）、予報 $\mathrm{CH}_4/\mathrm{N}_2\mathrm{O}$（`src/aoba/trace_gas_cycle.py`）、火山・太陽強制（`src/aoba/volcanic_solar.py`）、珪酸塩風化とミランコビッチ軌道変動（`src/aoba/planetary_geochem.py`）、加速 Glen 流動則 SIA 動的氷床（`src/aoba/icesheet.py`）、および惑星プリセット（`earth`, `proxima_b`, `trappist_1e`, `mars_early`；`src/aoba/planetary_presets.py`）を備えます。
 
-7. **101 個の単一ソース融合 Metal/CUDA カーネル、汎用異格子リスタート再補間、323 パラメータ一元管理 `AOBA Studio`**:
-   - **単一ソース GPU バックエンド**: `kernels.py`・`kernels_extra.py`・`kernels_physics.py`・`kernels_esm.py` に記述された **全 101 個の融合 GPU カーネル**が、Apple Silicon（`mps` Metal シェーダー）および NVIDIA GPU（`src/aoba/kernels_cuda.py` による決定論的 Metal→CUDA C++17 自動トランスパイル）の双方でネイティブ動作し、自動 CUDA Graphs キャプチャ/リプレイ（`src/aoba/runtime.py`）によりステップ途中の CPU–GPU 同期ゼロを実現しています。
+7. **104 個の単一ソース融合 Metal/CUDA カーネル、汎用異格子リスタート再補間、323 パラメータ一元管理 `AOBA Studio`**:
+   - **単一ソース GPU バックエンド**: `kernels.py`・`kernels_extra.py`・`kernels_physics.py`・`kernels_esm.py` に記述された **全 104 個の融合 GPU カーネル**が、Apple Silicon（`mps` Metal シェーダー）および NVIDIA GPU（`src/aoba/kernels_cuda.py` による決定論的 Metal→CUDA C++17 自動トランスパイル）の双方でネイティブ動作し、自動 CUDA Graphs キャプチャ/リプレイ（`src/aoba/runtime.py`）によりステップ途中の CPU–GPU 同期ゼロを実現しています。
    - **設定管理・プリセット・標準診断**: 全 14 セクション・**323 パラメータ**を [`config/aoba_default.toml`](config/aoba_default.toml) に一元化し（日英 100% 物理解説 `src/aoba/param_docs.py`）、**11 本の即実行プリセット**（`config/presets/`）、任意解像度・層数間（例：`AG4 → AG6`）の汎用リスタート再補間、30 クラス Köppen–Geiger 気候帯診断（`src/aoba/koppen.py`）、CMIP7 Data Request v1.2 出力（`src/aoba/cmip7_diag.py`）、および対話型 Web ワークベンチ `AOBA Studio`（`scripts/aoba_config_gui.py`）を提供します。
 
 8. **単精度（`float32`）ネイティブ設計と長期保存性・数値安定性対策**:
@@ -75,7 +75,7 @@ aoba/
 │   └── assets/               # アイコン ＆ 概念図 SVG 7 点
 ├── data/                     # Earth2014 地形・検証データ（ローカル専用）
 ├── src/
-│   └── aoba/                 # PyTorch + 101 融合 Metal/CUDA パッケージ（全 56 モジュール）
+│   └── aoba/                 # PyTorch + 104 融合 Metal/CUDA パッケージ（全 56 モジュール）
 ├── tests/                    # 単体・保存則・カーネル・OSSP 検証スイート（全 27 本）
 ├── scripts/                  # 結合実行・オフライン OGCM 加速・GUI・可視化ツール
 ├── notebooks/                # Colab A100/H100 自動再開ノートブック

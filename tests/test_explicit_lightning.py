@@ -181,6 +181,76 @@ def test_coupled_explicit_bulk_integration(dev: torch.device) -> None:
     print(f"  [PASS] Coupled step_aoba_model (explicit_bulk + six_class_2m) on {dev}")
 
 
+def test_cpu_vs_gpu_parity() -> None:
+    """Verify strict numerical parity between CPU PyTorch reference and 3-kernel Metal/CUDA GPU path."""
+    gpu_devs = [d for d in _devices() if d.type in ("mps", "cuda")]
+    if not gpu_devs:
+        return
+    gdev = gpu_devs[0]
+
+    nz, nc, ny, nx = 24, 3, 4, 8
+    dx = 2000.0
+    dz_val = 600.0
+    dz_c = torch.full((nz, nc), dz_val, dtype=torch.float32)
+    z_c = ((torch.arange(nz, dtype=torch.float32) + 0.5) * dz_val).view(nz, 1).expand(nz, nc).contiguous()
+    area_cell = torch.full((nc,), 1.0e10, dtype=torch.float32)
+
+    temp_1d = torch.clamp(300.0 - 6.5e-3 * z_c[:, 0], min=200.0)
+    pres_1d = 101325.0 * torch.pow(temp_1d / 300.0, 9.81 / (287.04 * 6.5e-3))
+    rho_1d = pres_1d / (287.04 * temp_1d)
+    exner_1d = torch.pow(pres_1d / 100000.0, 287.04 / 1004.64)
+    thm_1d = temp_1d / exner_1d
+
+    rho_d = rho_1d.view(nz, 1, 1, 1).expand(nz, nc, ny, nx).contiguous()
+    theta_m = thm_1d.view(nz, 1, 1, 1).expand(nz, nc, ny, nx).contiguous()
+    q_v = torch.full((nz, nc, ny, nx), 2.0e-3)
+
+    # Cell 0: active thunderstorm (triggers discharge); Cell 1: mild clouds (untriggered); Cell 2: dry
+    z_km = z_c[:, 0] * 1.0e-3
+    core = torch.zeros((1, nc, ny, nx))
+    core[0, 0, 1:3, 3:5] = 1.0
+    core[0, 1, 1:3, 3:5] = 0.05
+    q_c = (2.2e-3 * torch.exp(-((z_km - 6.5) / 1.8) ** 2).view(nz, 1, 1, 1) * core).contiguous()
+    q_g = (4.5e-3 * torch.exp(-((z_km - 7.5) / 2.5) ** 2).view(nz, 1, 1, 1) * core).contiguous()
+    q_s = (2.0e-3 * torch.exp(-((z_km - 8.5) / 2.2) ** 2).view(nz, 1, 1, 1) * core).contiguous()
+    q_i = (1.0e-3 * torch.exp(-((z_km - 9.5) / 2.2) ** 2).view(nz, 1, 1, 1) * core).contiguous()
+    q_r = (2.0e-3 * torch.exp(-((z_km - 2.5) / 1.5) ** 2).view(nz, 1, 1, 1) * core).contiguous()
+    q_p = q_r + q_s + q_g
+    u_stag = torch.full((nz, nc, ny, nx), 2.5)
+    v_stag = torch.full((nz, nc, ny, nx), -1.5)
+    w_stag = torch.zeros((nz + 1, nc, ny, nx))
+    z_w_km = torch.arange(nz + 1, dtype=torch.float32) * (dz_val * 1.0e-3)
+    w_stag[:] = 12.0 * torch.exp(-((z_w_km - 7.0) / 3.0) ** 2).view(nz + 1, 1, 1, 1) * core
+
+    st_c = init_explicit_lightning_state(nz, nc, ny, nx, device="cpu")
+    st_g = init_explicit_lightning_state(nz, nc, ny, nx, device=gdev)
+
+    for _ in range(8):
+        d_c = step_explicit_bulk_lightning_and_lnox(
+            st_c, rho_d, theta_m, q_v, q_c, q_i, q_p, w_stag, z_c, dz_c, area_cell,
+            dx=dx, dy=dx, dt=120.0, u_stag=u_stag, v_stag=v_stag, q_r_prog=q_r, q_s_prog=q_s, q_g_prog=q_g,
+        )
+        d_g = step_explicit_bulk_lightning_and_lnox(
+            st_g, rho_d.to(gdev), theta_m.to(gdev), q_v.to(gdev), q_c.to(gdev), q_i.to(gdev), q_p.to(gdev),
+            w_stag.to(gdev), z_c.to(gdev), dz_c.to(gdev), area_cell.to(gdev),
+            dx=dx, dy=dx, dt=120.0, u_stag=u_stag.to(gdev), v_stag=v_stag.to(gdev),
+            q_r_prog=q_r.to(gdev), q_s_prog=q_s.to(gdev), q_g_prog=q_g.to(gdev),
+        )
+
+    rel_q = float((st_c.q_chg - st_g.q_chg.cpu()).abs().max() / st_c.q_chg.abs().max().clamp(min=1e-18))
+    rel_phi = float((st_c.phi_e - st_g.phi_e.cpu()).abs().max() / st_c.phi_e.abs().max().clamp(min=1e-12))
+    rel_e = float((st_c.e_mag - st_g.e_mag.cpu()).abs().max() / st_c.e_mag.abs().max().clamp(min=1e-12))
+    rel_fl = float((d_c.flash_tot_cell - d_g.flash_tot_cell.cpu()).abs().max() / d_c.flash_tot_cell.abs().max().clamp(min=1e-18))
+    assert d_c.flash_tot_cell[0].item() > 0.0 and d_c.flash_tot_cell[1].item() == 0.0
+    assert rel_q < 2.0e-4 and rel_phi < 2.0e-4 and rel_e < 2.0e-4 and rel_fl < 2.0e-4, (
+        f"CPU vs {gdev} parity failed: rel_q={rel_q:.3e}, rel_phi={rel_phi:.3e}, rel_e={rel_e:.3e}, rel_fl={rel_fl:.3e}"
+    )
+    print(
+        f"  [PASS] CPU vs {gdev} 3-kernel parity (8 steps, active+quiet+dry): "
+        f"rel_q={rel_q:.2e}, rel_phi={rel_phi:.2e}, rel_e={rel_e:.2e}, rel_fl={rel_fl:.2e}"
+    )
+
+
 def main() -> None:
     print("Running SCALE-LT Explicit Bulk Lightning verification tests...")
     for dev in _devices():
@@ -188,6 +258,7 @@ def main() -> None:
         test_takahashi_polarity_reversal(dev)
         test_thunderstorm_dipole_and_breakdown(dev)
         test_coupled_explicit_bulk_integration(dev)
+    test_cpu_vs_gpu_parity()
     print("ALL EXPLICIT BULK LIGHTNING TESTS PASSED!")
 
 
