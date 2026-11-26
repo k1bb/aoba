@@ -1269,6 +1269,18 @@ f_{\mathrm{out},i} &= -\operatorname{expm1}\!\left(-\frac{v_{\mathrm{riv},i}}{L_
 \end{aligned} \tag{7.46}
 $$
 
+陸域炭素・窒素循環および海洋生物地球化学が有効な場合、同一の Priority-Flood 河川網上で陸域溶脱窒素 $F_{\mathrm{leach},i}$、河川溶存・懸濁炭素輸出 $F_{C,\mathrm{riv},i} = 0.02\,R_{h,i}$（Regnier et al., 2013）、および風化アルカリ度 $F_{\mathrm{Alk},i}$ を Kahan 補償付き河道貯留量 $S_{X,i}$ として沿岸海洋セルへ輸送する。河川窒素には水温依存の河道内・河畔帯脱窒（$k_{\mathrm{denit},20} = 0.03\ \mathrm{d^{-1}}$, $Q_{10} = 2$; Seitzinger et al., 2002）を適用し、河口凝集を経て外洋へ到達する生物利用可能鉄フラックス（$c_{\mathrm{Fe,est}} = 10^{-7}\ \mathrm{mol\ kg^{-1}}$; Raiswell & Canfield, 2012）は河口淡水流入 $F_{\mathrm{mouth},i}$ に比例して与える：
+
+$$
+\begin{aligned}
+f_{\mathrm{denit},i} &= -\operatorname{expm1}\!\left(-k_{\mathrm{denit},20}\,2^{(T_{\mathrm{sfc},i}-293.15)/10}\Delta t\right), \\
+\Delta S_{X,i} &= F_{X,i} A_i \Delta t + \sum_{j\in\mathrm{up}(i)} f_{\mathrm{out},j}(1 - f_{\mathrm{loss},j})S_{X,j} - \big[f_{\mathrm{out},i} + (1 - f_{\mathrm{out},i})f_{\mathrm{loss},i}\big]S_{X,i}, \\
+F_{\mathrm{Fe,mouth},i} &= c_{\mathrm{Fe,est}}\,F_{\mathrm{mouth},i}
+\end{aligned} \tag{7.46b}
+$$
+
+ここで窒素では $f_{\mathrm{loss},i} = f_{\mathrm{denit},i}$、河川炭素およびアルカリ度では $f_{\mathrm{loss},i} = 0$ である。河口到達フラックス $(F_{\mathrm{N,mouth}}, F_{\mathrm{C,mouth}}, F_{\mathrm{Alk,mouth}}, F_{\mathrm{Fe,mouth}})$ は保存的に海洋格子へ再配分され、海洋表層の $\mathrm{NO}_3, \mathrm{DIC}, \mathrm{Alk}, \mathrm{Fe}_{\mathrm{sfc}}$ へ供給される（第 9.8 節）。
+
 ### 7.10 マップフリー自律動的湖沼モデル（地形凹地＋2 層 FLake 熱力学・湖氷、`src/aoba/lakes.py`, `enable_dynamic_lakes`）
 
 気候変化に伴う内陸湖の拡大・縮小・乾燥消失（例：完新世中期「緑のサハラ」のメガチャド湖、アラル海の干拓・乾燥化、氷床後退に伴う氷河湖アガシの形成と決壊）を湖沼分布マップや規定水深マップを一切用いずに表現する。固体地球の `Earth2014` 岩盤凹地（非海洋・非氷床ピクセルにおける $z_{\mathrm{SUR}} - z_{\mathrm{BED}} > 0.5\ \mathrm{m}$ の面積率 $f_{\mathrm{bed},i}$ と体積 $V_{\mathrm{bed},i}$）と、谷底標高 $z_{\mathrm{valley},i}$（粗格子でのアマゾン川・コンゴ川渓谷偽ダムを回避するセル内最小非海洋標高 `z_min_land`、氷床連動時は動的地形更新に追従）上の Barnes et al. (2014) Priority-Flood 閉凹地深さ $d_{\mathrm{pf},i} = \max(z_{\mathrm{filled},i} - z_{\mathrm{valley},i}, 0)$ から、各陸域 Voronoi セルの幾何学的最大貯留容量 $(f_{\mathrm{cap},i}, h_{\mathrm{cap},i}, V_{\mathrm{cap},i})$ を決定する：
@@ -1702,7 +1714,14 @@ $$
 
 ### 9.8 FlexPFT 海洋生物地球化学・OMIP/mocsy 2.0 炭酸系・$\mathrm{O}_2$ / OMZ 脱窒 (`src/aoba/ocean_bgc.py`)
 
-`enable_ocean_bgc = true` 時、7 種（$\mathrm{O}_2$ 有効時 8 種）の 3D トレーサ（$\mathrm{NO}_3, P, Z, D_N, D_C, \mathrm{DIC}, \mathrm{Alk}, \mathrm{O}_2$）を OGCM と同一のバッチ偏差形式移流・回転 Redi・増分陰的鉛直混合で輸送する。表層溶存鉄 $\mathrm{Fe}_{\mathrm{sfc}}\ [\mathrm{nM}]$ は大気ダスト沈着（鉄含有 $3.5\%$・可溶率 $2\%$）と時定数 90 日の除去の緩和で予報し、鉄制限因子 $\mathrm{Fe}_{\mathrm{sfc}}/(\mathrm{Fe}_{\mathrm{sfc}}+0.20)$ を水中 PAR へ結合する。
+`enable_ocean_bgc = true` 時、7 種（$\mathrm{O}_2$ 有効時 8 種）の 3D トレーサ（$\mathrm{NO}_3, P, Z, D_N, D_C, \mathrm{DIC}, \mathrm{Alk}, \mathrm{O}_2$）を OGCM と同一のバッチ偏差形式移流・回転 Redi・増分陰的鉛直混合で輸送する。表層溶存鉄 $\mathrm{Fe}_{\mathrm{sfc}}\ [\mathrm{nM}]$ は鉱物ダスト沈着（鉄含有 $3.5\%$・可溶率 $2\%$）、山火事黒色炭素（BC）由来可溶鉄沈着（鉄/BC 質量比 $4\%$・可溶率 $15\%$; Ito et al., 2019）、および河川河口からの生物利用可能鉄供給（式 7.46b）を時定数 $\tau_{\mathrm{Fe}} = 90\ \mathrm{d}$ の除去（背景値 $\mathrm{Fe}_{\mathrm{bg}} = 0.25\ \mathrm{nM}$）と緩和させて予報し、鉄制限因子 $\mathrm{Fe}_{\mathrm{sfc}}/(\mathrm{Fe}_{\mathrm{sfc}}+0.20)$ を水中 PAR へ結合する。同時に落雷 $\mathrm{LNO}_x$・山火事揮発窒素・河川窒素/炭素/アルカリ度流入を Kahan 補償加算で表層 $\mathrm{NO}_3, \mathrm{DIC}, \mathrm{Alk}$ へ供給する：
+
+$$
+\begin{aligned}
+S_{\mathrm{Fe}} &= \frac{1.253\times 10^4\,F_{\mathrm{dust,dep}} + 1.07\times 10^5\,F_{\mathrm{BC,dep}} + 10^6\,F_{\mathrm{Fe,riv}}}{h_0}, \\
+\mathrm{Fe}_{\mathrm{sfc}}^{n+1} &= \mathrm{Fe}_{\mathrm{sfc}}^n + \big(\mathrm{Fe}_{\mathrm{bg}} + S_{\mathrm{Fe}}\tau_{\mathrm{Fe}} - \mathrm{Fe}_{\mathrm{sfc}}^n\big)\Big[-\operatorname{expm1}\!\left(-\frac{\Delta t}{\tau_{\mathrm{Fe}}}\right)\Big]
+\end{aligned} \tag{9.12b}
+$$
 
 1. **FlexPFT 最適光順化・可変 N:C クオータ（Pahlow et al., 2013; Smith et al., 2016; Sasai et al., 2022, Eqs. 2–7）**：クロロフィル自己遮蔽（消散係数 $k_d = 0.04 + 0.03\,\mathrm{Chl}$）下の層平均 PAR $I_k$ と Arrhenius 温度関数 $F(T)$（$E_a = 48\ \mathrm{kJ\ mol^{-1}}$）に対し、最適葉緑体 $\mathrm{Chl:C}$ 比 $\hat{\theta}$ をオーバーフロー回避型 Lambert-$W_0(e^y)$ で、潜在硝酸吸収 $\hat{V}^N$・最適細胞 N:C クオータ $Q$・最適配分比 $f_V$・比成長率 $\mu_{\mathrm{fl}}$ およびクロロフィル濃度 $\mathrm{Chl}$ を解析的に求める：
 
@@ -1734,6 +1753,14 @@ f_{\mathrm{denit}} &= \frac{1}{1 + (\mathrm{O}_2/5.0)^2}
 \end{aligned} \tag{9.15}
 $$
 
+百年〜千年スケールの海洋固定窒素収支を OMZ 脱窒と均衡させるため、温暖（$T_c > 18\ ^\circ\mathrm{C}$）・低硝酸・鉄律速下の表層海洋ジアゾトロフ窒素固定（Monteiro et al., 2011; Landolfi et al., 2017）により第 0 層へ $\Delta\mathrm{NO}_{3,\mathrm{fix}}$ を供給し、硝化に伴うアルカリ度減少 $-\Delta\mathrm{NO}_{3,\mathrm{fix}}$ を同時に計上する：
+
+$$
+\Delta\mathrm{NO}_{3,\mathrm{fix}} = r_{\mathrm{fix},\max}\,\frac{\Delta t}{86400}\left[\operatorname{clamp}\!\left(\frac{T_{c,0} - 18}{10},\ 0,\ 1\right)\right]^2 \frac{K_{N,\mathrm{inh}}}{K_{N,\mathrm{inh}} + \mathrm{NO}_{3,0}}\,\frac{\mathrm{Fe}_{\mathrm{sfc}}}{\mathrm{Fe}_{\mathrm{sfc}} + 0.20}\,(1 - f_{\mathrm{ice}}) \tag{9.15b}
+$$
+
+ここで $r_{\mathrm{fix},\max} = 0.012\ \mathrm{mmol\ N\ m^{-3}\ d^{-1}}$、$K_{N,\mathrm{inh}} = 1.5\ \mathrm{mmol\ N\ m^{-3}}$ である。
+
 ---
 
 ## 10. 大気化学 (`o3_mode`)・自然/火山エアロゾル・炭素/微量気体循環 (`co2_mode`)・水安定同位体
@@ -1764,7 +1791,7 @@ f_{\mathrm{seas}}(\phi, \mathrm{DOY}) &= 1 + 0.16\sin\phi\cos\!\left(\frac{2\pi(
 \end{aligned} \tag{10.1}
 $$
 
-`o3_mode = "prognostic"`（融合 GPU カーネル `ozone_chem_col`）では、球殻空気質量因子 $\mathrm{AMF} = 35/\sqrt{1224\mu_0^2 + 1}$ 上の累積路程 $(S_{\mathrm{O_2}}, S_{\mathrm{O_3}})$ から Herzberg・Schumann–Runge・Hartley・Chappuis・UV-B の各光解離係数 $(J_{\mathrm{O_2}}, J_{\mathrm{O_3}}, J_{\mathrm{O(^1D)}})$ を算出し、JPL 評価 19（Burkholder et al., 2019）の Chapman 反応速度 $(k_2, k_3)$、成層圏 $\mathrm{NO}_x$（$\mathrm{N}_2\mathrm{O}$ 連動）・$\mathrm{HO}_x$（$q_v$ 連動）・極域成層圏雲 PSC（$T < 195\ \mathrm{K}$, $(\mathrm{eCl}/3.5)^2$ 依存）、対流圏 $\mathrm{CH}_4/\mathrm{LNO}_x/\text{山火事}$ 生成と $\mathrm{O}(^1D)+\mathrm{H}_2\mathrm{O}$ 消滅、および Wesely (1989) 乾性沈着（海面 $0.0005$・裸地 $0.0008$・クチクラ $0.0018$・気孔 $0.0042\,\mu_0\ \mathrm{m\ s^{-1}}$）を合わせた奇酸素 Riccati 方程式を、桁落ちのない正平衡根 $\chi_{\mathrm{eq}}$ と厳密指数緩和で積分する：
+`o3_mode = "prognostic"`（融合 GPU カーネル `ozone_chem_col`）では、球殻空気質量因子 $\mathrm{AMF} = 35/\sqrt{1224\mu_0^2 + 1}$ 上の累積路程 $(S_{\mathrm{O_2}}, S_{\mathrm{O_3}})$ から Herzberg・Schumann–Runge・Hartley・Chappuis・UV-B の各光解離係数 $(J_{\mathrm{O_2}}, J_{\mathrm{O_3}}, J_{\mathrm{O(^1D)}})$ を算出し、JPL 評価 19（Burkholder et al., 2019）の Chapman 反応速度 $(k_2, k_3)$、成層圏 $\mathrm{NO}_x$（$\mathrm{N}_2\mathrm{O}$ 連動）・$\mathrm{HO}_x$（$q_v$ 連動）・極域成層圏雲 PSC（$T < 195\ \mathrm{K}$, $(\mathrm{eCl}/3.5)^2$ 依存）、対流圏 $\mathrm{CH}_4/\mathrm{LNO}_x/\text{山火事}/\text{BVOC}$ 前駆体生成（生物起源 VOC 放出を $F_{\mathrm{prec}} = F_{\mathrm{fire,C}} + 0.5\,F_{\mathrm{SOA}}$ として結合）と $\mathrm{O}(^1D)+\mathrm{H}_2\mathrm{O}$ 消滅、および Wesely (1989) 乾性沈着（海面 $0.0005$・裸地 $0.0008$・クチクラ $0.0018$・気孔 $0.0042\,\mu_0\ \mathrm{m\ s^{-1}}$）を合わせた奇酸素 Riccati 方程式を、桁落ちのない正平衡根 $\chi_{\mathrm{eq}}$ と厳密指数緩和で積分する：
 
 $$
 \begin{aligned}

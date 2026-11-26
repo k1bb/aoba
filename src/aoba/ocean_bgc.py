@@ -152,6 +152,7 @@ class OceanBGCState:
     fgo2: torch.Tensor | None = None           # [N_cells] air-sea O2 flux (pos into ocean) [mol O2 m^-2 s^-1]
     denit_moln_m2s: torch.Tensor | None = None # [N_cells] column anaerobic denitrification [mol N m^-2 s^-1]
     omz_col_frac: torch.Tensor | None = None   # [N_cells] fraction of water column with O2 < 20 mmol m^-3
+    n2fix_moln_m2s: torch.Tensor | None = None # [N_cells] surface diazotrophic N2 fixation [mol N m^-2 s^-1]
 
 
 O2_GLOBAL_MEAN: float = 205.0          # Reference mean ocean dissolved O2 [mmol m^-3]
@@ -159,6 +160,8 @@ R_O2_TO_C: float = 138.0 / 106.0       # Anderson & Sarmiento (1994) photosynthe
 O2_SUBOXIC_MMOL: float = 20.0          # OMZ hypoxia threshold [mmol O2 m^-3] (Paulmier & Ruiz-Pino, 2009)
 O2_HALF_SAT_MMOL: float = 5.0          # Monod half-saturation for aerobic remineralization [mmol m^-3]
 R_DENIT_N_PER_O2: float = 0.8          # Stoichiometric NO3 consumed per O2-equivalent in denitrification [-]
+N2FIX_MAX_MMOL_M3_D: float = 0.012     # Warm-oligotrophic diazotroph N2 fixation rate (~120 Tg N/yr globally; Monteiro et al., 2011)
+N2FIX_KN_INHIB: float = 1.5            # NO3 half-inhibition for N2 fixation [mmol N m^-3]
 
 
 def compute_o2_saturation_mmol_m3(temp_k: torch.Tensor, sal_psu: torch.Tensor) -> torch.Tensor:
@@ -240,6 +243,27 @@ def _step_ocean_o2_omz_column(
     h_tot = torch.clamp((h_eff * wet_cf).sum(dim=0), min=1.0)
     bgc.omz_col_frac = ((bgc.o2 < O2_SUBOXIC_MMOL).to(bgc.o2.dtype) * h_eff * wet_cf).sum(dim=0) / h_tot
 
+    # 3. Surface Marine Diazotrophic N2 Fixation (Monteiro et al., 2011; Landolfi et al., 2017):
+    #    Warm (>20 C), low-NO3, Fe-modulated surface N2 fixation balancing OMZ denitrification
+    t0_f = t_c[0]
+    f_t_fix = torch.clamp((t0_f - 18.0) / 10.0, 0.0, 1.0) ** 2
+    f_n_inhib = N2FIX_KN_INHIB / (N2FIX_KN_INHIB + torch.clamp(bgc.no3[0], min=0.0))
+    f_fe_fix = (
+        torch.clamp(bgc.fe_sfc, min=0.0) / (torch.clamp(bgc.fe_sfc, min=0.0) + 0.20)
+        if bgc.fe_sfc is not None
+        else torch.full_like(t0_f, 0.65)
+    )
+    f_ice_open = 1.0 - torch.clamp(f_seaice, 0.0, 1.0)
+    dno3_fix = (N2FIX_MAX_MMOL_M3_D * (float(dt) / C.SECONDS_PER_DAY)) * f_t_fix * f_n_inhib * f_fe_fix * f_ice_open * wet0
+    no3_0_f, no3_0_fc = _kahan_add(bgc.no3[0], dno3_fix, bgc.no3_comp[0])
+    bgc.no3[0] = no3_0_f * wet0
+    bgc.no3_comp[0] = no3_0_fc * wet0
+    # N2 -> NO3- nitrification decreases alkalinity by 1 eq / mol NO3-
+    alk_0_f, alk_0_fc = _kahan_add(bgc.alk[0], -dno3_fix, bgc.alk_comp[0])
+    bgc.alk[0] = alk_0_f * wet0
+    bgc.alk_comp[0] = alk_0_fc * wet0
+    bgc.n2fix_moln_m2s = (dno3_fix * h0_safe * 1.0e-3) / max(float(dt), 1.0)
+
 
 def apply_atmospheric_bgc_deposition(
     bgc: OceanBGCState,
@@ -248,33 +272,57 @@ def apply_atmospheric_bgc_deposition(
     lnox_dep_kgn_m2s: torch.Tensor | None,
     alk_weath_mol_m2s: torch.Tensor | None,
     dt: float,
+    *,
+    bc_dep_kgm2s: torch.Tensor | None = None,
+    fire_n_dep_kgn_m2s: torch.Tensor | None = None,
+    river_n_kgn_m2s: torch.Tensor | None = None,
+    river_c_kgc_m2s: torch.Tensor | None = None,
+    river_fe_mol_m2s: torch.Tensor | None = None,
 ) -> None:
-    """Couple atmospheric dust Fe, lightning LNOx N, and silicate-weathering Alk into surface ocean BGC.
+    """Couple atmospheric (dust + pyrogenic BC Fe, lightning + wildfire N) and riverine (N, C, Alk, Fe)
+    inputs into surface ocean FlexPFT BGC via Kahan compensated summation.
 
-    References: Jickells et al. (2005, Science), Moore et al. (2004, GBC), Schumann & Huntrieser (2007).
+    References: Jickells et al. (2005, Science), Moore et al. (2004, GBC), Ito et al. (2019, Sci. Adv.),
+    Seitzinger et al. (2002), Regnier et al. (2013), Raiswell & Canfield (2012).
     """
     wet0 = ogcm.wet_c[0].to(bgc.no3.dtype)
     h0 = torch.clamp(ogcm.h_c[0], min=10.0)
     if bgc.fe_sfc is None:
         bgc.fe_sfc = torch.where(ogcm.wet_c[0], torch.full_like(h0, 0.35), torch.zeros_like(h0))
-    # 1. Surface dissolved Fe [nM = umol m^-3]: dust soluble Fe (3.5% Fe * 2% sol / 55.845 g/mol) + 0.25 nM deep supply vs scavenging
+    # 1. Surface dissolved Fe [nM = umol m^-3]: mineral dust + pyrogenic BC soluble Fe + coastal river Fe
     fe_bg = 0.25
     tau_fe = 90.0 * C.SECONDS_PER_DAY
     k_fe = 1.0 / tau_fe
     fe_in_nm_s = torch.zeros_like(h0)
     if dust_dep_kgm2s is not None:
         # 1 kg dust -> 0.035 * 0.02 = 7e-4 kg Fe = 1.253e4 umol Fe -> / h0 [m] = nM
-        fe_in_nm_s = (torch.clamp(dust_dep_kgm2s, min=0.0) * 1.253e4) / h0
+        fe_in_nm_s = fe_in_nm_s + (torch.clamp(dust_dep_kgm2s, min=0.0) * 1.253e4) / h0
+    if bc_dep_kgm2s is not None:
+        # Pyrogenic wildfire aerosol soluble Fe (~4% Fe/BC mass * 15% solubility -> 1.07e5 umol Fe / kg BC; Ito et al., 2019)
+        fe_in_nm_s = fe_in_nm_s + (torch.clamp(bc_dep_kgm2s, min=0.0) * 1.07e5) / h0
+    if river_fe_mol_m2s is not None:
+        # Coastal riverine bioavailable Fe [mol Fe m^-2 s^-1] -> * 1e6 [umol] / h0 [m] = nM s^-1
+        fe_in_nm_s = fe_in_nm_s + (torch.clamp(river_fe_mol_m2s, min=0.0) * 1.0e6) / h0
     fe_eq = fe_bg + fe_in_nm_s * tau_fe
     fe_new = bgc.fe_sfc + (fe_eq - bgc.fe_sfc) * (-math.expm1(-k_fe * float(dt)))
-    bgc.fe_sfc = torch.clamp(fe_new, min=0.05, max=4.0) * wet0
+    bgc.fe_sfc = torch.clamp(fe_new, min=0.05, max=6.0) * wet0
 
-    # 2. Atmospheric LNOx N deposition -> surface NO3 [mmol N m^-3] via Kahan compensated summation
-    if lnox_dep_kgn_m2s is not None:
-        dno3 = ((torch.clamp(lnox_dep_kgn_m2s, min=0.0) * float(dt) / 0.014007) * 1.0e3 / h0) * wet0
+    # 2. Atmospheric (LNOx + wildfire) & riverine N delivery -> surface NO3 [mmol N m^-3] via Kahan summation
+    n_tot_kgn = None
+    for n_src in (lnox_dep_kgn_m2s, fire_n_dep_kgn_m2s, river_n_kgn_m2s):
+        if n_src is not None:
+            v_pos = torch.clamp(n_src, min=0.0)
+            n_tot_kgn = v_pos if n_tot_kgn is None else (n_tot_kgn + v_pos)
+    if n_tot_kgn is not None:
+        dno3 = ((n_tot_kgn * float(dt) / 0.014007) * 1.0e3 / h0) * wet0
         bgc.no3[0], bgc.no3_comp[0] = _kahan_add(bgc.no3[0], dno3, bgc.no3_comp[0])
 
-    # 3. Silicate-weathering riverine alkalinity -> surface Alk [mmol eq m^-3] via Kahan summation
+    # 3. Riverine fluvial carbon (DIC+DOC) delivery -> surface DIC [mmol C m^-3] via Kahan summation
+    if river_c_kgc_m2s is not None:
+        ddic = ((torch.clamp(river_c_kgc_m2s, min=0.0) * float(dt) / 0.012011) * 1.0e3 / h0) * wet0
+        bgc.dic[0], bgc.dic_comp[0] = _kahan_add(bgc.dic[0], ddic, bgc.dic_comp[0])
+
+    # 4. Riverine / silicate-weathering alkalinity -> surface Alk [mmol eq m^-3] via Kahan summation
     if alk_weath_mol_m2s is not None:
         dalk = ((torch.clamp(alk_weath_mol_m2s, min=0.0) * float(dt)) * 1.0e3 / h0) * wet0
         bgc.alk[0], bgc.alk_comp[0] = _kahan_add(bgc.alk[0], dalk, bgc.alk_comp[0])
@@ -748,9 +796,9 @@ def step_ocean_bgc_flexpft(
     w_vel: torch.Tensor,
     h0_new: torch.Tensor,
     dh0_eff: torch.Tensor,
-    a_t: torch.Tensor,
-    b_t: torch.Tensor,
-    d_t: torch.Tensor,
+    a_t: torch.Tensor | None,
+    b_t: torch.Tensor | None,
+    d_t: torch.Tensor | None,
     c_dif: torch.Tensor,
     h_eff: torch.Tensor,
     cache: dict,
@@ -761,9 +809,20 @@ def step_ocean_bgc_flexpft(
     dt: float,
     enable_full_redi: bool = True,
     enable_o2_omz: bool = False,
+    *,
+    h_old_z: torch.Tensor | None = None,
+    h_new_z: torch.Tensor | None = None,
+    w_star: torch.Tensor | None = None,
+    enable_fct_zstar: bool = False,
+    c0_i32: torch.Tensor | None = None,
+    c1_i32: torch.Tensor | None = None,
+    eoc_i32: torch.Tensor | None = None,
+    active_w_c: torch.Tensor | None = None,
+    use_gpu_ogcm: bool = False,
 ) -> None:
     """Advance 3D FlexPFT marine BGC tracers by `dt` [s]: transport + vertical mixing + FlexPFT + CO2 (+ O2/OMZ)."""
-    from aoba.ocean_ogcm import _ogcm_advect_redi_batch
+    from aoba.ocean_ogcm import KAPPA_REDI_HORIZ, _ogcm_advect_redi_batch
+    from aoba.kernels import dispatch_ogcm_fct_zstar_metal, dispatch_ogcm_multi_vdiff_metal
 
     dev = bgc.dic.device
     dtype = bgc.dic.dtype
@@ -793,11 +852,12 @@ def step_ocean_bgc_flexpft(
         bgc.fgo2 = torch.zeros((nc,), device=dev, dtype=dtype)
         bgc.denit_moln_m2s = torch.zeros((nc,), device=dev, dtype=dtype)
         bgc.omz_col_frac = torch.zeros((nc,), device=dev, dtype=dtype)
+        bgc.n2fix_moln_m2s = torch.zeros((nc,), device=dev, dtype=dtype)
 
     use_o2 = enable_o2_omz and bgc.o2 is not None and bgc.o2_comp is not None
     nt = 8 if use_o2 else 7
 
-    # 1. Batched [nt, nzo, nc] Conservative 3D Advection + Full Rotated Redi Diffusion
+    # 1. Conservative 3D Advection + Full Rotated Redi Diffusion
     ref_key = f"bgc_ref_b_{nt}"
     bgc_ref = cache.get(ref_key)
     if bgc_ref is None:
@@ -806,11 +866,6 @@ def step_ocean_bgc_flexpft(
             ref_vals.append(O2_GLOBAL_MEAN)
         bgc_ref = torch.tensor(ref_vals, device=dev, dtype=dtype).view(nt, 1, 1)
         cache[ref_key] = bgc_ref
-    znl_key = f"bgc_zero_nl_{nt}"
-    zero_nl = cache.get(znl_key)
-    if zero_nl is None or zero_nl.shape != (nt, nzo - 1, nc):
-        zero_nl = torch.zeros((nt, nzo - 1, nc), device=dev, dtype=dtype)
-        cache[znl_key] = zero_nl
     zero_c = cache.get("bgc_zero_c")
     if zero_c is None or zero_c.shape != (nzo, nc):
         zero_c = torch.zeros((nzo, nc), device=dev, dtype=dtype)
@@ -824,60 +879,147 @@ def step_ocean_bgc_flexpft(
     qt = torch.stack(q_list, dim=0)
     ct = torch.stack(c_list, dim=0)
 
-    adv_b_fn = maybe_cuda_compile(_ogcm_advect_redi_batch, device=dev)
-    qt, ct = adv_b_fn(
-        qt, ct, zero_nl, h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
-        dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
-        c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
-        bgc_ref, dt, enable_full_redi,
+    on_gpu_f32 = get_active_gpu_backend(dev) in ("mps", "cuda") and dtype == torch.float32
+    use_gpu_fct = (
+        use_gpu_ogcm
+        and on_gpu_f32
+        and enable_fct_zstar
+        and h_old_z is not None
+        and h_new_z is not None
+        and w_star is not None
+        and c0_i32 is not None
+        and c1_i32 is not None
+        and eoc_i32 is not None
+        and active_w_c is not None
     )
+    if use_gpu_fct:
+        # Process tracers in B=2 pairs to reuse T+S's cached FCT+z* workspace with ZERO extra GPU VRAM!
+        zero_nl_2 = cache.get("bgc_zero_nl_2")
+        if zero_nl_2 is None or zero_nl_2.shape != (2, nzo - 1, nc):
+            zero_nl_2 = torch.zeros((2, nzo - 1, nc), device=dev, dtype=dtype)
+            cache["bgc_zero_nl_2"] = zero_nl_2
+        for i0 in range(0, nt, 2):
+            i1 = min(i0 + 2, nt)
+            bi = i1 - i0
+            dispatch_ogcm_fct_zstar_metal(
+                q=qt[i0:i1],
+                q_comp=ct[i0:i1],
+                f_nl_q=zero_nl_2[:bi],
+                h_u_edge=h_u_edge,
+                sx_int=sx_int,
+                w_star=w_star,
+                h_e=h_e,
+                h_old_z=h_old_z,
+                h_new_z=h_new_z,
+                dz_c_int=dz_c_int,
+                inv_dc_edge=inv_dc_edge,
+                wet_cf=wet_cf,
+                wet_ef=wet_ef,
+                wet_int_cf=wet_int_cf,
+                wet_int_ef=wet_int_ef,
+                c0_i32=c0_i32,
+                c1_i32=c1_i32,
+                eoc_i32=eoc_i32,
+                div_w=div_w,
+                w_vor_edge=w_vor_edge,
+                active_w=active_w_c,
+                q_ref=bgc_ref[i0:i1],
+                dt=dt,
+                kappa_redi=float(KAPPA_REDI_HORIZ),
+                enable_full_redi=bool(enable_full_redi),
+                in_place=True,
+            )
+    else:
+        znl_key = f"bgc_zero_nl_{nt}"
+        zero_nl = cache.get(znl_key)
+        if zero_nl is None or zero_nl.shape != (nt, nzo - 1, nc):
+            zero_nl = torch.zeros((nt, nzo - 1, nc), device=dev, dtype=dtype)
+            cache[znl_key] = zero_nl
+        adv_b_fn = maybe_cuda_compile(_ogcm_advect_redi_batch, device=dev)
+        qt, ct = adv_b_fn(
+            qt, ct, zero_nl, h_u_edge, sx_int, w_vel, h_e, h_c_safe, h0_new, dh0_eff,
+            dz_c_int, inv_dc_edge, wet_cf, wet_ef, wet_int_cf, wet_int_ef,
+            c0, c1, eoc, div_w, w_vor_edge, active_eoc, inv_area_c,
+            bgc_ref, dt, enable_full_redi,
+        )
 
-    # 2. Batched [nt, nzo, nc] Strictly Conservative Flux-Increment Implicit Vertical Mixing
-    z_row = torch.zeros((nt, 1, nc), device=dev, dtype=dtype)
-    q_diff = qt[:, 1:] - qt[:, :-1]
-    c_dif_b = c_dif.unsqueeze(0)
-    h_eff_b = h_eff.unsqueeze(0)
-    f_exp = c_dif_b * q_diff
-    rhs = (torch.cat([f_exp, z_row], dim=1) - torch.cat([z_row, f_exp], dim=1)) / h_eff_b
-    rhs_flat = rhs.permute(1, 0, 2).reshape(nzo, nt * nc)
-    a_b = a_t.unsqueeze(1).expand(nzo, nt, nc).reshape(nzo, nt * nc)
-    b_b = b_t.unsqueeze(1).expand(nzo, nt, nc).reshape(nzo, nt * nc)
-    d_b = d_t.unsqueeze(1).expand(nzo, nt, nc).reshape(nzo, nt * nc)
-    dq_imp = solve_tridiagonal_batched(a_b, b_b, d_b, rhs_flat).view(nzo, nt, nc).permute(1, 0, 2)
-    f_imp = c_dif_b * (q_diff + (dq_imp[:, 1:] - dq_imp[:, :-1]))
-    dq_cons = ((torch.cat([f_imp, z_row], dim=1) - torch.cat([z_row, f_imp], dim=1)) / h_eff_b) * wet_cf.unsqueeze(0)
+    # 2. Strictly Conservative Flux-Increment Implicit Vertical Mixing
+    if on_gpu_f32 and 2 <= nzo <= 64:
+        # Factor shared tridiagonal ONCE per ocean column across all B tracers (zero temp 3D buffers)
+        clamp_mask = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | ((1 << 7) if use_o2 else 0)
+        qt, ct = dispatch_ogcm_multi_vdiff_metal(
+            q=qt, q_comp=ct, c_dif=c_dif, h_eff=h_eff, wet_cf=wet_cf, clamp_nonneg_mask=clamp_mask
+        )
+        bgc.no3, bgc.no3_comp = qt[0], ct[0]
+        bgc.phy = qt[1]
+        bgc.zoo = qt[2]
+        bgc.det_n = qt[3]
+        bgc.det_c = qt[4]
+        bgc.dic, bgc.dic_comp = qt[5], ct[5]
+        bgc.alk, bgc.alk_comp = qt[6], ct[6]
+        if use_o2:
+            bgc.o2, bgc.o2_comp = qt[7], ct[7]
+    else:
+        if a_t is None or b_t is None or d_t is None:
+            z_row_1 = torch.zeros((1, nc), device=dev, dtype=dtype)
+            a_t = torch.cat([z_row_1, -c_dif / h_eff[1:]], dim=0)
+            d_t = torch.cat([-c_dif / h_eff[:-1], z_row_1], dim=0)
+            b_t = 1.0 - a_t - d_t
+        z_row = torch.zeros((nt, 1, nc), device=dev, dtype=dtype)
+        q_diff = qt[:, 1:] - qt[:, :-1]
+        c_dif_b = c_dif.unsqueeze(0)
+        h_eff_b = h_eff.unsqueeze(0)
+        f_exp = c_dif_b * q_diff
+        rhs = (torch.cat([f_exp, z_row], dim=1) - torch.cat([z_row, f_exp], dim=1)) / h_eff_b
+        rhs_flat = rhs.permute(1, 0, 2).reshape(nzo, nt * nc)
+        a_b = a_t.unsqueeze(1).expand(nzo, nt, nc).reshape(nzo, nt * nc)
+        b_b = b_t.unsqueeze(1).expand(nzo, nt, nc).reshape(nzo, nt * nc)
+        d_b = d_t.unsqueeze(1).expand(nzo, nt, nc).reshape(nzo, nt * nc)
+        dq_imp = solve_tridiagonal_batched(a_b, b_b, d_b, rhs_flat).view(nzo, nt, nc).permute(1, 0, 2)
+        f_imp = c_dif_b * (q_diff + (dq_imp[:, 1:] - dq_imp[:, :-1]))
+        dq_cons = ((torch.cat([f_imp, z_row], dim=1) - torch.cat([z_row, f_imp], dim=1)) / h_eff_b) * wet_cf.unsqueeze(0)
 
-    qt_k, ct_k = _kahan_add(qt, dq_cons, ct)
-    bgc.no3, bgc.no3_comp = qt_k[0], ct_k[0]
-    bgc.phy = torch.clamp(qt[1] + dq_cons[1], min=0.0) * wet_cf
-    bgc.zoo = torch.clamp(qt[2] + dq_cons[2], min=0.0) * wet_cf
-    bgc.det_n = torch.clamp(qt[3] + dq_cons[3], min=0.0) * wet_cf
-    bgc.det_c = torch.clamp(qt[4] + dq_cons[4], min=0.0) * wet_cf
-    bgc.dic, bgc.dic_comp = qt_k[5], ct_k[5]
-    bgc.alk, bgc.alk_comp = qt_k[6], ct_k[6]
-    if use_o2:
-        bgc.o2, bgc.o2_comp = torch.clamp(qt_k[7], min=0.0) * wet_cf, ct_k[7] * wet_cf
+        qt_k, ct_k = _kahan_add(qt, dq_cons, ct)
+        bgc.no3, bgc.no3_comp = qt_k[0], ct_k[0]
+        bgc.phy = torch.clamp(qt[1] + dq_cons[1], min=0.0) * wet_cf
+        bgc.zoo = torch.clamp(qt[2] + dq_cons[2], min=0.0) * wet_cf
+        bgc.det_n = torch.clamp(qt[3] + dq_cons[3], min=0.0) * wet_cf
+        bgc.det_c = torch.clamp(qt[4] + dq_cons[4], min=0.0) * wet_cf
+        bgc.dic, bgc.dic_comp = qt_k[5], ct_k[5]
+        bgc.alk, bgc.alk_comp = qt_k[6], ct_k[6]
+        if use_o2:
+            bgc.o2, bgc.o2_comp = torch.clamp(qt_k[7], min=0.0) * wet_cf, ct_k[7] * wet_cf
 
-    # 3. FlexPFT Ecosystem Reactions, Implicit Sinking, & OMIP/mocsy Air-Sea CO2 Exchange
+    # 3. FlexPFT Ecosystem Reactions, Implicit Sinking, O2/OMZ+Diazotrophy, & OMIP/mocsy Air-Sea CO2 Exchange
     sw_par_eff = sw_par_sfc
     if bgc.fe_sfc is not None:
         fe_lim = torch.clamp((bgc.fe_sfc / (bgc.fe_sfc + 0.20)) / 0.75, min=0.25, max=1.35)
         sw_par_eff = sw_par_sfc * fe_lim
 
-    if get_active_gpu_backend(dev) in ("mps", "cuda"):
+    if on_gpu_f32:
         (
             bgc.no3, bgc.phy, bgc.zoo, bgc.det_n, bgc.det_c, bgc.dic, bgc.alk,
             bgc.no3_comp, bgc.dic_comp, bgc.alk_comp,
             bgc.chl, bgc.npp_c, bgc.c_to_n_phy, bgc.fgco2, bgc.spco2_uatm, bgc.ph_sfc, bgc.intpp, bgc.epc100,
+            o2_out, o2_c_out, fgo2_out, denit_out, omz_out, n2fix_out,
         ) = dispatch_ocean_bgc_column_metal(
             no3=bgc.no3, phy=bgc.phy, zoo=bgc.zoo, det_n=bgc.det_n, det_c=bgc.det_c, dic=bgc.dic, alk=bgc.alk,
             no3_comp=bgc.no3_comp, dic_comp=bgc.dic_comp, alk_comp=bgc.alk_comp,
             temp_k=ogcm.temp, sal_psu=ogcm.sal, h_c=ogcm.h_c, wet_cf=wet_cf,
             h0_new=h0_new, sw_par_sfc=sw_par_eff, u10_ocn=u10_ocn, f_seaice=f_seaice,
             co2_ppmv=float(co2_ppmv), dt=float(dt), rho_sw=float(C.RHO_SEAWATER),
+            o2=bgc.o2 if use_o2 else None,
+            o2_comp=bgc.o2_comp if use_o2 else None,
+            fe_sfc=bgc.fe_sfc,
+            in_place=True,
         )
         if use_o2:
-            _step_ocean_o2_omz_column(bgc, ogcm, u10_ocn, f_seaice, h0_new, wet_cf, dt)
+            bgc.o2 = o2_out
+            bgc.o2_comp = o2_c_out
+            bgc.fgo2 = fgo2_out
+            bgc.denit_moln_m2s = denit_out
+            bgc.omz_col_frac = omz_out
+            bgc.n2fix_moln_m2s = n2fix_out
         return
 
     # Deepest wet cell mask (CPU fallback)

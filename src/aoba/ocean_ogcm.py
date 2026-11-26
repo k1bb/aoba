@@ -2196,9 +2196,10 @@ def _step_ogcm_voronoi_impl(
     if ogcm.bgc is not None:
         from aoba.ocean_bgc import PAR_FRAC_SW, step_ocean_bgc_flexpft
 
-        if a_t is None:
+        if c_dif is None or h_eff is None:
             c_dif = (dt * kv / dz_c_int) * wet_int_cf
             h_eff = torch.cat([h0_vdiff.unsqueeze(0), h_c_vdiff[1:]], dim=0)
+        if a_t is None and not (use_gpu_ogcm and 2 <= nzo <= 64 and T.dtype == torch.float32):
             z_row = torch.zeros_like(T[0:1])
             a_t = torch.cat([z_row, -c_dif / h_eff[1:]], dim=0)
             d_t = torch.cat([-c_dif / h_eff[:-1], z_row], dim=0)
@@ -2237,6 +2238,15 @@ def _step_ogcm_voronoi_impl(
             dt=dt,
             enable_full_redi=bool(ENABLE_FULL_REDI),
             enable_o2_omz=bool(enable_o2_omz),
+            h_old_z=h_old_z if enable_fct_zstar else None,
+            h_new_z=h_new_z if enable_fct_zstar else None,
+            w_star=w_star if enable_fct_zstar else None,
+            enable_fct_zstar=bool(enable_fct_zstar),
+            c0_i32=c0_i32 if use_gpu_ogcm else None,
+            c1_i32=c1_i32 if use_gpu_ogcm else None,
+            eoc_i32=eoc_i32 if use_gpu_ogcm else None,
+            active_w_c=active_w_c if use_gpu_ogcm else None,
+            use_gpu_ogcm=bool(use_gpu_ogcm),
         )
 
     # 11. Dynamic Sea-Ice Drift (after recording thermodynamic mass change, so advection doesn't alias brine!)

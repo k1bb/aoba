@@ -376,6 +376,181 @@ def step_land_carbon_and_fire(
     dt_yr = dt / SEC_PER_YEAR
     inv_dt = 1.0 / max(dt, 1.0)
 
+    from aoba.kernels import dispatch_land_carbon_cn_fire_metal, get_active_gpu_backend
+
+    if get_active_gpu_backend(dev) in ("mps", "cuda") and dtype == torch.float32:
+        use_maml_patch = (maml_shape is not None) and (maml_shape[1] * maml_shape[2] > 1)
+        cg_raw = (
+            torch.clamp(flash_cg_m2s, min=0.0)
+            if flash_cg_m2s is not None
+            else torch.full_like(lc.c_leaf, FIRE_BG_CG_FLASH_M2S)
+        )
+        if use_maml_patch and flash_cg_m2s is not None:
+            assert maml_shape is not None
+            nc_cg, ny_cg, nx_cg = maml_shape
+            cg_3d = cg_raw.view(nc_cg, ny_cg, nx_cg)
+            cg_cell_mean = (
+                cg_3d.reshape(nc_cg, ny_cg * nx_cg)
+                .mean(dim=-1, keepdim=True)
+                .expand(nc_cg, ny_cg * nx_cg)
+                .reshape(-1)
+            )
+            cg_rate = 0.50 * cg_raw + 0.50 * cg_cell_mean
+        else:
+            cg_rate = cg_raw
+
+        vc25_in = vcmax25_eff if vcmax25_eff is not None else torch.full_like(lc.c_leaf, 45.0)
+        fevg_in = f_evg if f_evg is not None else torch.full_like(lc.c_leaf, 0.5)
+        transp_in = transp_kgm2s if transp_kgm2s is not None else torch.zeros_like(lc.c_leaf)
+        n_dep_in = n_dep_kgn_m2s if n_dep_kgn_m2s is not None else torch.zeros_like(lc.c_leaf)
+
+        f_in = torch.stack(
+            [
+                gpp_umol, resp_leaf_umol, h_canopy, f_snow, t_sfc_k, vpd_pa,
+                u10_ms, precip_kgm2s, vc25_in, fevg_in, transp_in, n_dep_in, cg_rate,
+            ],
+            dim=0,
+        ).contiguous()
+        c_1d_io = torch.stack(
+            [
+                lc.c_leaf, lc.c_root, lc.c_wood, lc.c_lit_fast, lc.c_lit_slow,
+                lc.c_leaf_comp, lc.c_root_comp, lc.c_wood_comp, lc.c_lit_fast_comp, lc.c_lit_slow_comp,
+            ],
+            dim=0,
+        ).contiguous()
+        c_soil_io = lc.c_soil.contiguous()
+        c_soil_comp_io = lc.c_soil_comp.contiguous()
+
+        if enable_nitrogen:
+            assert lc.n_leaf is not None and lc.n_root is not None and lc.n_wood is not None
+            assert lc.n_lit_fast is not None and lc.n_lit_slow is not None and lc.n_min is not None
+            assert lc.n_soil is not None and lc.n_soil_comp is not None
+            assert lc.n_leaf_comp is not None and lc.n_root_comp is not None and lc.n_wood_comp is not None
+            assert lc.n_lit_fast_comp is not None and lc.n_lit_slow_comp is not None and lc.n_min_comp is not None
+            n_1d_io = torch.stack(
+                [
+                    lc.n_leaf, lc.n_root, lc.n_wood, lc.n_lit_fast, lc.n_lit_slow, lc.n_min,
+                    lc.n_leaf_comp, lc.n_root_comp, lc.n_wood_comp,
+                    lc.n_lit_fast_comp, lc.n_lit_slow_comp, lc.n_min_comp,
+                ],
+                dim=0,
+            ).contiguous()
+            n_soil_io = lc.n_soil.contiguous()
+            n_soil_comp_io = lc.n_soil_comp.contiguous()
+        else:
+            dummy_n = torch.empty((1,), device=dev, dtype=dtype)
+            n_1d_io = dummy_n
+            n_soil_io = dummy_n
+            n_soil_comp_io = dummy_n
+
+        phi_in = lc.phi_n if lc.phi_n is not None else torch.ones_like(lc.c_leaf)
+        fa_in = lc.fire_accum if lc.fire_accum is not None else torch.zeros_like(lc.c_leaf)
+        fr_in = lc.f_root_alloc if lc.f_root_alloc is not None else torch.full_like(lc.c_leaf, 0.35)
+        aux_io = torch.stack([phi_in, lc.fire_di, fa_in, fr_in], dim=0).contiguous()
+
+        fire_out, n_diag_out, f_burn, fire_cn = dispatch_land_carbon_cn_fire_metal(
+            surf_type_i32=surf_type.to(torch.int32).contiguous(),
+            f_in=f_in,
+            t_soil=t_soil.contiguous(),
+            w_liq=w_liq_soil.contiguous(),
+            w_ice=w_ice_soil.contiguous(),
+            c_1d_io=c_1d_io,
+            c_soil_io=c_soil_io,
+            c_soil_comp_io=c_soil_comp_io,
+            n_1d_io=n_1d_io,
+            n_soil_io=n_soil_io,
+            n_soil_comp_io=n_soil_comp_io,
+            aux_io=aux_io,
+            enable_n=bool(enable_nitrogen),
+            use_maml=bool(use_maml_patch),
+            maml_shape=maml_shape,
+            dt=float(dt),
+            sec_per_yr=float(SEC_PER_YEAR),
+            crm_dx_m=float(crm_dx_m),
+            soil_porosity=float(SOIL_POROSITY),
+        )
+
+        # Unpack updated pools & diagnostics
+        lc.c_leaf = c_1d_io[0]
+        lc.c_root = c_1d_io[1]
+        lc.c_wood = c_1d_io[2]
+        lc.c_lit_fast = c_1d_io[3]
+        lc.c_lit_slow = c_1d_io[4]
+        lc.c_leaf_comp = c_1d_io[5]
+        lc.c_root_comp = c_1d_io[6]
+        lc.c_wood_comp = c_1d_io[7]
+        lc.c_lit_fast_comp = c_1d_io[8]
+        lc.c_lit_slow_comp = c_1d_io[9]
+        lc.c_soil = c_soil_io
+        lc.c_soil_comp = c_soil_comp_io
+
+        lc.phi_n = aux_io[0]
+        lc.fire_di = aux_io[1]
+        if use_maml_patch:
+            lc.fire_accum = aux_io[2]
+            lc.patch_burned_flag = f_burn
+        else:
+            lc.patch_burned_flag = (f_burn > 1.0e-6).to(dtype)
+        lc.f_root_alloc = aux_io[3]
+
+        lc.fire_intensity_kw_m = fire_out[3]
+        lc.fire_scorch_m = fire_out[4]
+        p_mort = fire_out[5]
+        lc.fire_mort_frac = p_mort
+
+        gpp = fire_out[7]
+        ra_eff = fire_out[8]
+        npp_eff = gpp - ra_eff
+        rh_flux = fire_out[9]
+        fire_c_flux = fire_cn[0]
+
+        if enable_nitrogen:
+            lc.n_leaf = n_1d_io[0]
+            lc.n_root = n_1d_io[1]
+            lc.n_wood = n_1d_io[2]
+            lc.n_lit_fast = n_1d_io[3]
+            lc.n_lit_slow = n_1d_io[4]
+            lc.n_min = n_1d_io[5]
+            lc.n_leaf_comp = n_1d_io[6]
+            lc.n_root_comp = n_1d_io[7]
+            lc.n_wood_comp = n_1d_io[8]
+            lc.n_lit_fast_comp = n_1d_io[9]
+            lc.n_lit_slow_comp = n_1d_io[10]
+            lc.n_min_comp = n_1d_io[11]
+            lc.n_soil = n_soil_io
+            lc.n_soil_comp = n_soil_comp_io
+            lc.bnf_kgn_m2s = n_diag_out[0]
+            lc.n_uptake_kgn_m2s = n_diag_out[1]
+            lc.n_dep_kgn_m2s = n_diag_out[2]
+            lc.n_leach_kgn_m2s = n_diag_out[3]
+            lc.n_denit_kgn_m2s = n_diag_out[4]
+            lc.n_fire_kgn_m2s = fire_cn[1]
+            if bio is not None:
+                bio.n_avail_fac = lc.phi_n.clone()
+
+        if enable_fire_veg_feedback and bio is not None:
+            lai_drop = torch.clamp(f_burn * (0.35 + 0.55 * p_mort), 0.0, 0.92)
+            hc_drop = torch.clamp(f_burn * (0.65 * p_mort), 0.0, 0.85)
+            is_land_b = surf_type == SURF_LAND
+            if bio.lai_evg is not None and bio.lai_dec is not None:
+                bio.lai_evg = torch.where(is_land_b, bio.lai_evg * (1.0 - lai_drop), bio.lai_evg)
+                bio.lai_dec = torch.where(is_land_b, bio.lai_dec * (1.0 - lai_drop), bio.lai_dec)
+                bio.lai = torch.where(is_land_b, torch.clamp(bio.lai_evg + bio.lai_dec, 0.0, 8.0), bio.lai)
+            else:
+                bio.lai = torch.where(is_land_b, torch.clamp(bio.lai * (1.0 - lai_drop), 0.0, 8.0), bio.lai)
+            bio.h_canopy = torch.where(is_land_b, torch.clamp(bio.h_canopy * (1.0 - hc_drop), min=0.10), bio.h_canopy)
+
+        lc.gpp_kgc_m2s = gpp
+        lc.ra_kgc_m2s = ra_eff
+        lc.npp_kgc_m2s = npp_eff
+        lc.rh_kgc_m2s = rh_flux
+        lc.fire_c_kgc_m2s = fire_c_flux
+        lc.nbp_kgc_m2s = npp_eff - rh_flux - fire_c_flux
+        lc.fire_bc_kg_m2s = FIRE_EF_BC * fire_c_flux
+        lc.fire_oc_kg_m2s = FIRE_EF_OC * fire_c_flux
+        lc.burned_frac_s = f_burn * inv_dt
+        return
+
     # 1. GPP & Autotrophic Respiration (Leaf + Stem + Root maintenance + Growth)
     gpp = torch.clamp(gpp_umol, min=0.0) * UMOL_TO_KG_C * is_land
     r_leaf = torch.clamp(resp_leaf_umol, min=0.0) * UMOL_TO_KG_C * is_land

@@ -58,10 +58,12 @@ from aoba.kernels_physics import (
     run_crm_distill_closure_metal,
     run_crm_distill_extract_metal,
     run_crm_ens_mean_unc_transpose_metal,
+    run_crm_lightning_metal,
     run_crm_spatial_head_metal,
     run_crm_student_tile_update_metal,
     run_diagnose_p_T_metal,
     run_dust_column_metal,
+    run_land_carbon_cn_fire_metal,
     run_natural_aerosol_4sp_metal,
     run_ngwd_front_extract_metal,
     run_ngwd_full_metal,
@@ -74,6 +76,7 @@ from aoba.kernels_physics import (
     run_ogcm_gm_bolus_edge_metal,
     run_ogcm_kpp_vdiff_metal,
     run_ogcm_mom_vdiff_metal,
+    run_ogcm_multi_vdiff_metal,
     run_ogcm_pre_kpp_metal,
     run_ogcm_tracer_vdiff_freeze_metal,
     run_ogcm_trisk_coriolis_wet_metal,
@@ -1711,6 +1714,24 @@ def dispatch_ocean_bgc_column_metal(**kwargs: Any):
     lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_ocean_bgc_column_metal(lib, **kwargs)
+
+
+def dispatch_ogcm_multi_vdiff_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_ogcm_multi_vdiff_metal(lib, **kwargs)
+
+
+def dispatch_crm_lightning_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_crm_lightning_metal(lib, **kwargs)
+
+
+def dispatch_land_carbon_cn_fire_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_land_carbon_cn_fire_metal(lib, **kwargs)
 
 
 def dispatch_scvt_reconstruct_winds_metal(mesh: Any, u_edge: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

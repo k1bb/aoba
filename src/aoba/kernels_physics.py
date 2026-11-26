@@ -2816,77 +2816,98 @@ kernel void ogcm_fct_edge(
     uint nc = uint(u_dim.z);
     uint ne = uint(u_dim.w);
     uint slice_e = nzo * ne;
-    if (gid >= B * slice_e) return;
+    if (gid >= slice_e) return;
 
-    uint b = gid / slice_e;
-    uint loc = gid - b * slice_e;
+    uint loc = gid;
     uint k = loc / ne;
     uint e = loc - k * ne;
 
     float we = wet_ef[loc];
     bool full_redi = (f_p.y > 0.5f);
+    uint slice_se = (nzo - 1u) * ne;
     if (we < 0.5f) {
-        fl_h_out[gid] = 0.0f;
-        ah_e_out[gid] = 0.0f;
-        f_dif_out[gid] = 0.0f;
-        if (full_redi && k + 1u < nzo) {
-            s_dqdx_ew_out[b * ((nzo - 1u) * ne) + k * ne + e] = 0.0f;
+        for (uint b = 0u; b < B; ++b) {
+            uint eidx = b * slice_e + loc;
+            fl_h_out[eidx] = 0.0f;
+            ah_e_out[eidx] = 0.0f;
+            f_dif_out[eidx] = 0.0f;
+            if (full_redi && k + 1u < nzo) {
+                s_dqdx_ew_out[b * slice_se + k * ne + e] = 0.0f;
+            }
         }
         return;
     }
 
+    // Hoist all tracer-invariant geometry, flow, and Redi slope loads ONCE across all B tracers
     uint c0 = uint(c0_arr[e]);
     uint c1 = uint(c1_arr[e]);
-    uint q_b = b * (nzo * nc);
-    uint q_k = q_b + k * nc;
-    float q0 = qp[q_k + c0];
-    float q1 = qp[q_k + c1];
-
     float hu = h_u_edge[loc];
-    float fl = (max(hu, 0.0f) * q0 + min(hu, 0.0f) * q1) * we;
-    float fh = (0.5f * hu * (q0 + q1)) * we;
-    fl_h_out[gid] = fl;
-    ah_e_out[gid] = (fh - fl) * we;
+    float hu_pos = max(hu, 0.0f) * we;
+    float hu_neg = min(hu, 0.0f) * we;
+    float hu_half = 0.5f * hu * we;
+    float inv_dc_we = inv_dc[e] * we;
+    float neg_k_he = -f_p.x * h_e[loc] * we;
+    uint vol_c = nzo * nc;
+    uint kc0 = k * nc + c0;
+    uint kc1 = k * nc + c1;
 
-    float inv_dc_e = inv_dc[e];
-    float dq_dx = ((q1 - q0) * inv_dc_e) * we;
-    float kappa = f_p.x;
-
+    float sx_hi = 0.0f, inv_dz0_hi = 0.0f, inv_dz1_hi = 0.0f, wie_hi = 0.0f, we_p1_idc = 0.0f, sx_wve_hi = 0.0f;
+    float sx_lo = 0.0f, inv_dz0_lo = 0.0f, inv_dz1_lo = 0.0f, wie_lo = 0.0f;
     if (full_redi) {
-        float sx_dqdz_lo = 0.0f;
-        float sx_dqdz_hi = 0.0f;
         if (k + 1u < nzo) {
             uint k_int = k * ne + e;
-            float wie = wet_int_ef[k_int];
-            uint q_kp1 = q_b + (k + 1u) * nc;
+            wie_hi = wet_int_ef[k_int];
             uint wc_int = k * nc;
-            float dqdz0 = ((qp[q_kp1 + c0] - q0) / dz_c_int[wc_int + c0]) * wet_int_cf[wc_int + c0];
-            float dqdz1 = ((qp[q_kp1 + c1] - q1) / dz_c_int[wc_int + c1]) * wet_int_cf[wc_int + c1];
-            float dqdz_e = 0.5f * (dqdz0 + dqdz1) * wie;
-            float sx_k = sx_int[k_int];
-            sx_dqdz_hi = sx_k * dqdz_e;
-
-            // Cross-slope vertical flux term on interface k+1/2
-            float we_p1 = wet_ef[(k + 1u) * ne + e];
-            float dq_dx_p1 = ((qp[q_kp1 + c1] - qp[q_kp1 + c0]) * inv_dc_e) * we_p1;
-            float dq_dx_int = 0.5f * (dq_dx + dq_dx_p1) * wie;
-            s_dqdx_ew_out[b * ((nzo - 1u) * ne) + k_int] = (sx_k * dq_dx_int) * w_vor_edge[e];
+            inv_dz0_hi = wet_int_cf[wc_int + c0] / dz_c_int[wc_int + c0];
+            inv_dz1_hi = wet_int_cf[wc_int + c1] / dz_c_int[wc_int + c1];
+            sx_hi = sx_int[k_int];
+            we_p1_idc = inv_dc[e] * wet_ef[(k + 1u) * ne + e];
+            sx_wve_hi = sx_hi * w_vor_edge[e];
         }
         if (k > 0u) {
             uint km1 = k - 1u;
             uint km1_int = km1 * ne + e;
-            float wie = wet_int_ef[km1_int];
-            uint q_km1 = q_b + km1 * nc;
+            wie_lo = wet_int_ef[km1_int];
             uint wc_int = km1 * nc;
-            float dqdz0 = ((q0 - qp[q_km1 + c0]) / dz_c_int[wc_int + c0]) * wet_int_cf[wc_int + c0];
-            float dqdz1 = ((q1 - qp[q_km1 + c1]) / dz_c_int[wc_int + c1]) * wet_int_cf[wc_int + c1];
-            float dqdz_e = 0.5f * (dqdz0 + dqdz1) * wie;
-            sx_dqdz_lo = sx_int[km1_int] * dqdz_e;
+            inv_dz0_lo = wet_int_cf[wc_int + c0] / dz_c_int[wc_int + c0];
+            inv_dz1_lo = wet_int_cf[wc_int + c1] / dz_c_int[wc_int + c1];
+            sx_lo = sx_int[km1_int];
         }
-        float sx_dqdz_lay = 0.5f * (sx_dqdz_hi + sx_dqdz_lo);
-        f_dif_out[gid] = (-kappa * h_e[loc] * (dq_dx + sx_dqdz_lay)) * we;
-    } else {
-        f_dif_out[gid] = (-kappa * h_e[loc] * dq_dx) * we;
+    }
+
+    for (uint b = 0u; b < B; ++b) {
+        uint q_b = b * vol_c;
+        float q0 = qp[q_b + kc0];
+        float q1 = qp[q_b + kc1];
+        float fl = hu_pos * q0 + hu_neg * q1;
+        float fh = hu_half * (q0 + q1);
+        uint eidx = b * slice_e + loc;
+        fl_h_out[eidx] = fl;
+        ah_e_out[eidx] = (fh - fl) * we;
+
+        float dq_dx = (q1 - q0) * inv_dc_we;
+        if (full_redi) {
+            float sx_dqdz_hi = 0.0f;
+            float sx_dqdz_lo = 0.0f;
+            if (k + 1u < nzo) {
+                float q0_p1 = qp[q_b + kc0 + nc];
+                float q1_p1 = qp[q_b + kc1 + nc];
+                float dqdz_e = 0.5f * ((q0_p1 - q0) * inv_dz0_hi + (q1_p1 - q1) * inv_dz1_hi) * wie_hi;
+                sx_dqdz_hi = sx_hi * dqdz_e;
+                float dq_dx_p1 = (q1_p1 - q0_p1) * we_p1_idc;
+                float dq_dx_int = 0.5f * (dq_dx + dq_dx_p1) * wie_hi;
+                s_dqdx_ew_out[b * slice_se + k * ne + e] = sx_wve_hi * dq_dx_int;
+            }
+            if (k > 0u) {
+                float q0_m1 = qp[q_b + kc0 - nc];
+                float q1_m1 = qp[q_b + kc1 - nc];
+                float dqdz_e = 0.5f * ((q0 - q0_m1) * inv_dz0_lo + (q1 - q1_m1) * inv_dz1_lo) * wie_lo;
+                sx_dqdz_lo = sx_lo * dqdz_e;
+            }
+            f_dif_out[eidx] = neg_k_he * (dq_dx + 0.5f * (sx_dqdz_hi + sx_dqdz_lo));
+        } else {
+            f_dif_out[eidx] = neg_k_he * dq_dx;
+        }
     }
 }
 
@@ -2912,58 +2933,67 @@ kernel void ogcm_fct_cell_td(
     uint nc = uint(u_dim.z);
     uint ne = uint(u_dim.w);
     uint vol = nzo * nc;
-    if (gid >= B * vol) return;
+    if (gid >= vol) return;
 
-    uint b = gid / vol;
-    uint loc = gid - b * vol;
+    uint loc = gid;
     uint k = loc / nc;
     uint c = loc - k * nc;
     float wc = wet_cf[loc];
+    uint slice_vi = (nzo - 1u) * nc;
     if (wc < 0.5f) {
-        qp_td_out[gid] = 0.0f;
-        if (k + 1u < nzo) {
-            uint vi = b * ((nzo - 1u) * nc) + k * nc + c;
-            fl_v_out[vi] = 0.0f;
-            av_int_out[vi] = 0.0f;
+        for (uint b = 0u; b < B; ++b) {
+            qp_td_out[b * vol + loc] = 0.0f;
+            if (k + 1u < nzo) {
+                uint vi = b * slice_vi + loc;
+                fl_v_out[vi] = 0.0f;
+                av_int_out[vi] = 0.0f;
+            }
         }
         return;
     }
 
     uint c6 = c * 6u;
-    uint ebase = b * (nzo * ne) + k * ne;
-
-    float div_fl_h = 0.0f;
+    uint eid[6];
+    float dw[6];
     for (uint d = 0u; d < 6u; ++d) {
-        div_fl_h = fma(div_w[c6 + d], fl_h[ebase + uint(eoc[c6 + d])], div_fl_h);
+        eid[d] = uint(eoc[c6 + d]);
+        dw[d] = div_w[c6 + d];
     }
-    div_fl_h *= wc;
-
-    float q0 = qp[gid];
-    float fl_below = 0.0f;
-    float fl_above = 0.0f;
-    if (k + 1u < nzo) {
-        uint wi_idx = k * nc + c;
-        float w_b = w_star[(k + 1u) * nc + c];
-        float wic = wet_int_cf[wi_idx];
-        float q_p1 = qp[gid + nc];
-        fl_below = ((w_b >= 0.0f) ? (w_b * q_p1) : (w_b * q0)) * wic;
-        float fh_below = (0.5f * w_b * (q0 + q_p1)) * wic;
-        uint vi = b * ((nzo - 1u) * nc) + wi_idx;
-        fl_v_out[vi] = fl_below;
-        av_int_out[vi] = (fh_below - fl_below) * wic;
-    }
-    if (k > 0u) {
-        uint km1 = k - 1u;
-        float w_a = w_star[k * nc + c];
-        float wic = wet_int_cf[km1 * nc + c];
-        float q_m1 = qp[gid - nc];
-        fl_above = ((w_a >= 0.0f) ? (w_a * q0) : (w_a * q_m1)) * wic;
-    }
-
+    float w_b = (k + 1u < nzo) ? w_star[(k + 1u) * nc + c] : 0.0f;
+    float wic_b = (k + 1u < nzo) ? wet_int_cf[loc] : 0.0f;
+    float w_a = (k > 0u) ? w_star[k * nc + c] : 0.0f;
+    float wic_a = (k > 0u) ? wet_int_cf[loc - nc] : 0.0f;
     float h_old_s = max(h_old_z[loc], 1.0f);
-    float h_new_s = max(h_new_z[loc], 1.0f);
-    float vin_fl = fl_below - fl_above;
-    qp_td_out[gid] = ((h_old_s * q0 + dt * (-div_fl_h + vin_fl)) / h_new_s) * wc;
+    float inv_h_new_wc = wc / max(h_new_z[loc], 1.0f);
+    uint slice_e = nzo * ne;
+    uint ke_base = k * ne;
+
+    for (uint b = 0u; b < B; ++b) {
+        uint ebase = b * slice_e + ke_base;
+        float div_fl_h = 0.0f;
+        for (uint d = 0u; d < 6u; ++d) {
+            div_fl_h = fma(dw[d], fl_h[ebase + eid[d]], div_fl_h);
+        }
+        div_fl_h *= wc;
+
+        uint qidx = b * vol + loc;
+        float q0 = qp[qidx];
+        float fl_below = 0.0f;
+        float fl_above = 0.0f;
+        if (k + 1u < nzo) {
+            float q_p1 = qp[qidx + nc];
+            fl_below = ((w_b >= 0.0f) ? (w_b * q_p1) : (w_b * q0)) * wic_b;
+            float fh_below = (0.5f * w_b * (q0 + q_p1)) * wic_b;
+            uint vi = b * slice_vi + loc;
+            fl_v_out[vi] = fl_below;
+            av_int_out[vi] = (fh_below - fl_below) * wic_b;
+        }
+        if (k > 0u) {
+            float q_m1 = qp[qidx - nc];
+            fl_above = ((w_a >= 0.0f) ? (w_a * q0) : (w_a * q_m1)) * wic_a;
+        }
+        qp_td_out[qidx] = (h_old_s * q0 + dt * (-div_fl_h + (fl_below - fl_above))) * inv_h_new_wc;
+    }
 }
 
 kernel void ogcm_fct_bounds_ratios(
@@ -2990,82 +3020,104 @@ kernel void ogcm_fct_bounds_ratios(
     uint nc = uint(u_dim.z);
     uint ne = uint(u_dim.w);
     uint vol = nzo * nc;
-    if (gid >= B * vol) return;
+    if (gid >= vol) return;
 
-    uint b = gid / vol;
-    uint loc = gid - b * vol;
+    uint loc = gid;
     uint k = loc / nc;
     uint c = loc - k * nc;
     float wc = wet_cf[loc];
     if (wc < 0.5f) {
-        r_plus_out[gid] = 1.0f;
-        r_minus_out[gid] = 1.0f;
+        for (uint b = 0u; b < B; ++b) {
+            r_plus_out[b * vol + loc] = 1.0f;
+            r_minus_out[b * vol + loc] = 1.0f;
+        }
         return;
     }
 
     uint c6 = c * 6u;
-    uint qbase = b * vol + k * nc;
-    uint ebase = b * (nzo * ne) + k * ne;
-
-    float q0 = qp[gid];
-    float qtd0 = qp_td[gid];
-    float q_max = max(q0, qtd0);
-    float q_min = min(q0, qtd0);
-
-    float p_plus_h = 0.0f;
-    float p_minus_h = 0.0f;
+    uint eid[6];
+    uint nb[6];
+    float dw[6];
+    uint wet_nb_mask = 0u;
+    uint ke_base = k * ne;
     for (uint d = 0u; d < 6u; ++d) {
-        uint eid = uint(eoc[c6 + d]);
-        if (wet_ef[k * ne + eid] > 0.5f) {
-            uint c0i = uint(c0_arr[eid]);
-            uint c1i = uint(c1_arr[eid]);
-            uint nb = (c0i == c) ? c1i : c0i;
-            float qn = qp[qbase + nb];
-            float qtn = qp_td[qbase + nb];
-            q_max = max(q_max, max(qn, qtn));
-            q_min = min(q_min, min(qn, qtn));
+        uint e_d = uint(eoc[c6 + d]);
+        eid[d] = e_d;
+        dw[d] = div_w[c6 + d];
+        if (wet_ef[ke_base + e_d] > 0.5f) {
+            uint c0i = uint(c0_arr[e_d]);
+            uint c1i = uint(c1_arr[e_d]);
+            nb[d] = (c0i == c) ? c1i : c0i;
+            wet_nb_mask |= (1u << d);
+        } else {
+            nb[d] = c;
         }
-        float a_in = -(div_w[c6 + d] * ah_e[ebase + eid]);
-        p_plus_h  += max(a_in, 0.0f);
-        p_minus_h += max(-a_in, 0.0f);
     }
-
-    float p_plus_v = 0.0f;
-    float p_minus_v = 0.0f;
-    uint vi_base = b * ((nzo - 1u) * nc);
-    if (k + 1u < nzo) {
-        if (wet_int_cf[k * nc + c] > 0.5f) {
-            float q_dn = qp[gid + nc];
-            float qt_dn = qp_td[gid + nc];
-            q_max = max(q_max, max(q_dn, qt_dn));
-            q_min = min(q_min, min(q_dn, qt_dn));
-        }
-        float av_b = av_int[vi_base + k * nc + c];
-        p_plus_v  += max(av_b, 0.0f);
-        p_minus_v += max(-av_b, 0.0f);
-    }
-    if (k > 0u) {
-        uint km1 = k - 1u;
-        if (wet_int_cf[km1 * nc + c] > 0.5f) {
-            float q_up = qp[gid - nc];
-            float qt_up = qp_td[gid - nc];
-            q_max = max(q_max, max(q_up, qt_up));
-            q_min = min(q_min, min(q_up, qt_up));
-        }
-        float av_a = av_int[vi_base + km1 * nc + c];
-        p_plus_v  += max(-av_a, 0.0f);
-        p_minus_v += max(av_a, 0.0f);
-    }
-
-    float p_plus  = dt * (p_plus_h  + p_plus_v)  * wc;
-    float p_minus = dt * (p_minus_h + p_minus_v) * wc;
+    bool w_dn = (k + 1u < nzo) && (wet_int_cf[loc] > 0.5f);
+    bool w_up = (k > 0u) && (wet_int_cf[loc - nc] > 0.5f);
     float h_new_s = max(h_new_z[loc], 1.0f);
-    float q_plus  = h_new_s * max(q_max - qtd0, 0.0f);
-    float q_minus = h_new_s * max(qtd0 - q_min, 0.0f);
+    float dt_wc = dt * wc;
     float eps = 1.0e-12f;
+    uint slice_e = nzo * ne;
+    uint slice_vi = (nzo - 1u) * nc;
 
-    r_plus_out[gid]  = (p_plus  > eps) ? clamp(q_plus  / (p_plus  + eps), 0.0f, 1.0f) : 1.0f;
-    r_minus_out[gid] = (p_minus > eps) ? clamp(q_minus / (p_minus + eps), 0.0f, 1.0f) : 1.0f;
+    for (uint b = 0u; b < B; ++b) {
+        uint qidx = b * vol + loc;
+        uint qbase = b * vol + k * nc;
+        uint ebase = b * slice_e + ke_base;
+        float q0 = qp[qidx];
+        float qtd0 = qp_td[qidx];
+        float q_max = max(q0, qtd0);
+        float q_min = min(q0, qtd0);
+
+        float p_plus_h = 0.0f;
+        float p_minus_h = 0.0f;
+        for (uint d = 0u; d < 6u; ++d) {
+            if ((wet_nb_mask & (1u << d)) != 0u) {
+                float qn = qp[qbase + nb[d]];
+                float qtn = qp_td[qbase + nb[d]];
+                q_max = max(q_max, max(qn, qtn));
+                q_min = min(q_min, min(qn, qtn));
+            }
+            float a_in = -(dw[d] * ah_e[ebase + eid[d]]);
+            p_plus_h  += max(a_in, 0.0f);
+            p_minus_h += max(-a_in, 0.0f);
+        }
+
+        float p_plus_v = 0.0f;
+        float p_minus_v = 0.0f;
+        uint vi_base = b * slice_vi;
+        if (k + 1u < nzo) {
+            if (w_dn) {
+                float q_dn = qp[qidx + nc];
+                float qt_dn = qp_td[qidx + nc];
+                q_max = max(q_max, max(q_dn, qt_dn));
+                q_min = min(q_min, min(q_dn, qt_dn));
+            }
+            float av_b = av_int[vi_base + loc];
+            p_plus_v  += max(av_b, 0.0f);
+            p_minus_v += max(-av_b, 0.0f);
+        }
+        if (k > 0u) {
+            if (w_up) {
+                float q_up = qp[qidx - nc];
+                float qt_up = qp_td[qidx - nc];
+                q_max = max(q_max, max(q_up, qt_up));
+                q_min = min(q_min, min(q_up, qt_up));
+            }
+            float av_a = av_int[vi_base + loc - nc];
+            p_plus_v  += max(-av_a, 0.0f);
+            p_minus_v += max(av_a, 0.0f);
+        }
+
+        float p_plus  = dt_wc * (p_plus_h  + p_plus_v);
+        float p_minus = dt_wc * (p_minus_h + p_minus_v);
+        float q_plus  = h_new_s * max(q_max - qtd0, 0.0f);
+        float q_minus = h_new_s * max(qtd0 - q_min, 0.0f);
+
+        r_plus_out[qidx]  = (p_plus  > eps) ? clamp(q_plus  / (p_plus  + eps), 0.0f, 1.0f) : 1.0f;
+        r_minus_out[qidx] = (p_minus > eps) ? clamp(q_minus / (p_minus + eps), 0.0f, 1.0f) : 1.0f;
+    }
 }
 
 kernel void ogcm_fct_limit_kahan(
@@ -3102,118 +3154,142 @@ kernel void ogcm_fct_limit_kahan(
     uint nc = uint(u_dim.z);
     uint ne = uint(u_dim.w);
     uint vol = nzo * nc;
-    if (gid >= B * vol) return;
+    if (gid >= vol) return;
 
-    uint b = gid / vol;
-    uint loc = gid - b * vol;
+    uint loc = gid;
     uint k = loc / nc;
     uint c = loc - k * nc;
     float wc = wet_cf[loc];
     if (wc < 0.5f) {
-        float q_old = q_in[gid];
-        float y = q_comp_in[gid];
-        float t = q_old + y;
-        q_out[gid] = t;
-        q_comp_out[gid] = (fabs(q_old) >= fabs(y)) ? ((q_old - t) + y) : ((y - t) + q_old);
+        for (uint b = 0u; b < B; ++b) {
+            uint qidx = b * vol + loc;
+            float q_old = q_in[qidx];
+            float y = q_comp_in[qidx];
+            float t = q_old + y;
+            q_out[qidx] = t;
+            q_comp_out[qidx] = (fabs(q_old) >= fabs(y)) ? ((q_old - t) + y) : ((y - t) + q_old);
+        }
         return;
     }
 
     uint c6 = c * 6u;
-    uint qbase = b * vol + k * nc;
-    uint ebase = b * (nzo * ne) + k * ne;
+    uint ke_base = k * ne;
+    uint eid[6];
+    uint c0_r[6];
+    uint c1_r[6];
+    float dw[6];
+    float aw[6];
+    float we_r[6];
+    for (uint d = 0u; d < 6u; ++d) {
+        uint e_d = uint(eoc[c6 + d]);
+        eid[d] = e_d;
+        dw[d] = div_w[c6 + d];
+        aw[d] = active_w[c6 + d];
+        if (dw[d] != 0.0f) {
+            c0_r[d] = uint(c0_arr[e_d]);
+            c1_r[d] = uint(c1_arr[e_d]);
+            we_r[d] = wet_ef[ke_base + e_d];
+        } else {
+            c0_r[d] = 0u;
+            c1_r[d] = 0u;
+            we_r[d] = 0.0f;
+        }
+    }
 
     float dt = f_p.x;
     float kappa = f_p.y;
     bool full_redi = (f_p.z > 0.5f);
     float inv_dt_safe = 1.0f / max(dt, 1.0f);
-
-    float div_h = 0.0f;
-    for (uint d = 0u; d < 6u; ++d) {
-        float w = div_w[c6 + d];
-        if (w != 0.0f) {
-            uint eid = uint(eoc[c6 + d]);
-            uint eidx = ebase + eid;
-            float a_e = ah_e[eidx];
-            uint c0i = uint(c0_arr[eid]);
-            uint c1i = uint(c1_arr[eid]);
-            float c_lim = ((a_e >= 0.0f)
-                ? min(r_minus[qbase + c0i], r_plus[qbase + c1i])
-                : min(r_plus[qbase + c0i], r_minus[qbase + c1i])) * wet_ef[k * ne + eid];
-            float f_tot = fl_h[eidx] + c_lim * a_e + f_dif[eidx];
-            div_h = fma(w, f_tot, div_h);
-        }
-    }
-    div_h *= wc;
-
-    float rp0 = r_plus[gid];
-    float rm0 = r_minus[gid];
-    float qp0 = qp[gid];
     float h_new_0 = max(h_new_z[loc], 1.0f);
-    uint vi_base = b * ((nzo - 1u) * nc);
-    uint se_base = b * ((nzo - 1u) * ne);
-
-    float fv_below = 0.0f;
-    if (k + 1u < nzo) {
-        uint wi_idx = k * nc + c;
-        float wic = wet_int_cf[wi_idx];
-        uint vi = vi_base + wi_idx;
-        float av_b = av_int[vi];
-        float cv_b = ((av_b >= 0.0f) ? min(r_minus[gid + nc], rp0) : min(r_plus[gid + nc], rm0)) * wic;
-        float f_adv_v = fl_v[vi] + cv_b * av_b;
-
-        float f_redi_b = 0.0f;
-        if (full_redi && wic > 0.5f) {
-            uint se_k = se_base + k * ne;
-            float sdg = 0.0f;
-            for (uint d = 0u; d < 6u; ++d) {
-                sdg = fma(active_w[c6 + d], s_dqdx_ew[se_k + uint(eoc[c6 + d])], sdg);
-            }
-            f_redi_b = kappa * sdg * wic;
-        }
-        float h_min_b = min(h_new_0, max(h_new_z[(k + 1u) * nc + c], 1.0f));
-        float q_span_b = fabs(qp[gid + nc] - qp0) + 0.5f;
-        float cap_b = 0.35f * h_min_b * q_span_b * inv_dt_safe;
-        float fnl_b = clamp(f_nl_q[vi], -cap_b, cap_b) * wic;
-        fv_below = f_adv_v + f_redi_b + fnl_b;
-    }
-
-    float fv_above = 0.0f;
-    if (k > 0u) {
-        uint km1 = k - 1u;
-        uint wi_idx = km1 * nc + c;
-        float wic = wet_int_cf[wi_idx];
-        uint vi = vi_base + wi_idx;
-        float av_a = av_int[vi];
-        float cv_a = ((av_a >= 0.0f) ? min(rm0, r_plus[gid - nc]) : min(rp0, r_minus[gid - nc])) * wic;
-        float f_adv_v = fl_v[vi] + cv_a * av_a;
-
-        float f_redi_a = 0.0f;
-        if (full_redi && wic > 0.5f) {
-            uint se_km1 = se_base + km1 * ne;
-            float sdg = 0.0f;
-            for (uint d = 0u; d < 6u; ++d) {
-                sdg = fma(active_w[c6 + d], s_dqdx_ew[se_km1 + uint(eoc[c6 + d])], sdg);
-            }
-            f_redi_a = kappa * sdg * wic;
-        }
-        float h_min_a = min(max(h_new_z[km1 * nc + c], 1.0f), h_new_0);
-        float q_span_a = fabs(qp0 - qp[gid - nc]) + 0.5f;
-        float cap_a = 0.35f * h_min_a * q_span_a * inv_dt_safe;
-        float fnl_a = clamp(f_nl_q[vi], -cap_a, cap_a) * wic;
-        fv_above = f_adv_v + f_redi_a + fnl_a;
-    }
-
+    float inv_h_new_wc = wc / h_new_0;
     float dh_z = h_new_z[loc] - h_old_z[loc];
-    float v_inflow = fv_below - fv_above;
-    float dq_fct = ((dt * (-div_h + v_inflow) - dh_z * qp0) / h_new_0) * wc;
+    float wic_b = (k + 1u < nzo) ? wet_int_cf[loc] : 0.0f;
+    float h_min_b = (k + 1u < nzo) ? min(h_new_0, max(h_new_z[loc + nc], 1.0f)) : 1.0f;
+    float wic_a = (k > 0u) ? wet_int_cf[loc - nc] : 0.0f;
+    float h_min_a = (k > 0u) ? min(max(h_new_z[loc - nc], 1.0f), h_new_0) : 1.0f;
+    uint slice_e = nzo * ne;
+    uint slice_vi = (nzo - 1u) * nc;
+    uint slice_se = (nzo - 1u) * ne;
 
-    // Exact Neumaier / Kahan compensated summation
-    float q_old = q_in[gid];
-    float y = dq_fct + q_comp_in[gid];
-    float t = q_old + y;
-    float new_comp = (fabs(q_old) >= fabs(y)) ? ((q_old - t) + y) : ((y - t) + q_old);
-    q_out[gid] = t;
-    q_comp_out[gid] = new_comp;
+    for (uint b = 0u; b < B; ++b) {
+        uint qidx = b * vol + loc;
+        uint qbase = b * vol + k * nc;
+        uint ebase = b * slice_e + ke_base;
+
+        float div_h = 0.0f;
+        for (uint d = 0u; d < 6u; ++d) {
+            float w = dw[d];
+            if (w != 0.0f) {
+                uint eidx = ebase + eid[d];
+                float a_e = ah_e[eidx];
+                float c_lim = ((a_e >= 0.0f)
+                    ? min(r_minus[qbase + c0_r[d]], r_plus[qbase + c1_r[d]])
+                    : min(r_plus[qbase + c0_r[d]], r_minus[qbase + c1_r[d]])) * we_r[d];
+                float f_tot = fl_h[eidx] + c_lim * a_e + f_dif[eidx];
+                div_h = fma(w, f_tot, div_h);
+            }
+        }
+        div_h *= wc;
+
+        float rp0 = r_plus[qidx];
+        float rm0 = r_minus[qidx];
+        float qp0 = qp[qidx];
+        uint vi_base = b * slice_vi;
+        uint se_base = b * slice_se;
+
+        float fv_below = 0.0f;
+        if (k + 1u < nzo) {
+            uint vi = vi_base + loc;
+            float av_b = av_int[vi];
+            float cv_b = ((av_b >= 0.0f) ? min(r_minus[qidx + nc], rp0) : min(r_plus[qidx + nc], rm0)) * wic_b;
+            float f_adv_v = fl_v[vi] + cv_b * av_b;
+
+            float f_redi_b = 0.0f;
+            if (full_redi && wic_b > 0.5f) {
+                uint se_k = se_base + ke_base;
+                float sdg = 0.0f;
+                for (uint d = 0u; d < 6u; ++d) {
+                    sdg = fma(aw[d], s_dqdx_ew[se_k + eid[d]], sdg);
+                }
+                f_redi_b = kappa * sdg * wic_b;
+            }
+            float q_span_b = fabs(qp[qidx + nc] - qp0) + 0.5f;
+            float cap_b = 0.35f * h_min_b * q_span_b * inv_dt_safe;
+            float fnl_b = clamp(f_nl_q[vi], -cap_b, cap_b) * wic_b;
+            fv_below = f_adv_v + f_redi_b + fnl_b;
+        }
+
+        float fv_above = 0.0f;
+        if (k > 0u) {
+            uint vi = vi_base + loc - nc;
+            float av_a = av_int[vi];
+            float cv_a = ((av_a >= 0.0f) ? min(rm0, r_plus[qidx - nc]) : min(rp0, r_minus[qidx - nc])) * wic_a;
+            float f_adv_v = fl_v[vi] + cv_a * av_a;
+
+            float f_redi_a = 0.0f;
+            if (full_redi && wic_a > 0.5f) {
+                uint se_km1 = se_base + (k - 1u) * ne;
+                float sdg = 0.0f;
+                for (uint d = 0u; d < 6u; ++d) {
+                    sdg = fma(aw[d], s_dqdx_ew[se_km1 + eid[d]], sdg);
+                }
+                f_redi_a = kappa * sdg * wic_a;
+            }
+            float q_span_a = fabs(qp0 - qp[qidx - nc]) + 0.5f;
+            float cap_a = 0.35f * h_min_a * q_span_a * inv_dt_safe;
+            float fnl_a = clamp(f_nl_q[vi], -cap_a, cap_a) * wic_a;
+            fv_above = f_adv_v + f_redi_a + fnl_a;
+        }
+
+        float dq_fct = (dt * (-div_h + (fv_below - fv_above)) - dh_z * qp0) * inv_h_new_wc;
+
+        float q_old = q_in[qidx];
+        float y = dq_fct + q_comp_in[qidx];
+        float t = q_old + y;
+        float new_comp = (fabs(q_old) >= fabs(y)) ? ((q_old - t) + y) : ((y - t) + q_old);
+        q_out[qidx] = t;
+        q_comp_out[qidx] = new_comp;
+    }
 }
 
 // =========================================================================
@@ -3235,15 +3311,19 @@ kernel void ocean_bgc_column_col(
     device const float* sal_psu     [[buffer(11)]], // [nzo, nc]
     device const float* h_c         [[buffer(12)]], // [nzo, nc]
     device const float* wet_cf      [[buffer(13)]], // [nzo, nc]
-    device const float* sfc_in      [[buffer(14)]], // [4, nc]: h0_new, sw_par_sfc, u10_ocn, f_seaice
+    device const float* sfc_in      [[buffer(14)]], // [5, nc]: h0_new, sw_par_sfc, u10_ocn, f_seaice, fe_sfc
     device float* diag_3d           [[buffer(15)]], // [3, nzo, nc]: chl, npp_c, c_to_n
-    device float* diag_2d           [[buffer(16)]], // [5, nc]: fgco2, spco2_uatm, ph_sfc, intpp, epc100
-    constant ulong4& u_dim          [[buffer(17)]], // [nzo, nc, 0, 0]
-    constant float4& f_p0           [[buffer(18)]], // [dt, co2_ppmv, rho_sw, 0]
+    device float* diag_2d           [[buffer(16)]], // [9, nc]: fgco2, spco2, ph, intpp, epc100, fgo2, denit, omz_frac, n2fix
+    device float* o2_io             [[buffer(17)]], // [nzo, nc] (dummy [1] when has_o2==0)
+    device float* o2_comp_io        [[buffer(18)]], // [nzo, nc] (dummy [1] when has_o2==0)
+    constant ulong4& u_dim          [[buffer(19)]], // [nzo, nc, has_o2, has_fe]
+    constant float4& f_p0           [[buffer(20)]], // [dt, co2_ppmv, rho_sw, 0]
     uint c                          [[thread_position_in_grid]])
 {
     uint nzo = uint(u_dim.x);
     uint nc = uint(u_dim.y);
+    bool has_o2 = (uint(u_dim.z) != 0u);
+    bool has_fe = (uint(u_dim.w) != 0u);
     if (c >= nc || nzo == 0u || nzo > 64u) return;
 
     float wet0 = wet_cf[c];
@@ -3254,7 +3334,7 @@ kernel void ocean_bgc_column_col(
             diag_3d[nzo * nc + idx] = 0.0f;
             diag_3d[2u * nzo * nc + idx] = 0.0f;
         }
-        for (uint d = 0u; d < 5u; ++d) {
+        for (uint d = 0u; d < 9u; ++d) {
             diag_2d[d * nc + c] = 0.0f;
         }
         return;
@@ -3271,6 +3351,7 @@ kernel void ocean_bgc_column_col(
     float sw_par = sfc_in[nc + c];
     float u10 = sfc_in[2u * nc + c];
     float f_ice = clamp(sfc_in[3u * nc + c], 0.0f, 1.0f);
+    float fe_sfc = has_fe ? max(sfc_in[4u * nc + c], 0.0f) : 0.35f;
     float i_sfc = max(sw_par, 0.0f) * (1.0f - f_ice);
 
     float tau_top = 0.0f;
@@ -3282,21 +3363,57 @@ kernel void ocean_bgc_column_col(
     float dic0_val = 0.0f;
     float dic0_cmp = 0.0f;
     float alk0_val = 0.0f;
+    float alk0_cmp = 0.0f;
+    float no30_val = 0.0f;
+    float no30_cmp = 0.0f;
 
-    // Constants (Sasai et al., 2022; Aumont et al., 2015; Orr et al., 2017)
+    // Optional O2/OMZ column accumulators
+    float fgo2_val = 0.0f;
+    float do2_sfc_val = 0.0f;
+    float denit_acc = 0.0f;
+    float omz_h_acc = 0.0f;
+    float h_tot_acc = 0.0f;
+    float n2fix_val = 0.0f;
+    if (has_o2) {
+        float tc0 = clamp(temp_k[c] - 273.15f, -2.0f, 40.0f);
+        float ts0 = log((298.15f - tc0) / (273.15f + tc0));
+        float s0_o2 = clamp(sal_psu[c], 0.0f, 45.0f);
+        float ts2 = ts0 * ts0;
+        float ts3 = ts2 * ts0;
+        float ts4 = ts2 * ts2;
+        float ts5 = ts4 * ts0;
+        float ln_c = 5.80871f + 3.20291f * ts0 + 4.17887f * ts2 + 5.10006f * ts3
+            - 9.86643e-2f * ts4 + 3.80369f * ts5
+            + s0_o2 * (-7.01577e-3f - 7.70028e-3f * ts0 - 1.13864e-2f * ts2 - 9.51519e-3f * ts3)
+            - 2.75915e-7f * (s0_o2 * s0_o2);
+        float o2_sat = clamp(exp(clamp(ln_c, 4.0f, 6.5f)) * (rho_sw * 1.0e-3f), 120.0f, 450.0f);
+        float sc_o2 = clamp(1920.4f + tc0 * (-135.6f + tc0 * (5.2122f + tc0 * (-0.10939f + tc0 * 0.00093777f))), 150.0f, 2500.0f);
+        float u10_c = clamp(u10, 0.0f, 40.0f);
+        float kw_o2 = (0.251f * (0.01f / 3600.0f)) * (u10_c * u10_c) * sqrt(660.0f / sc_o2) * (1.0f - f_ice);
+        float h0_s = max(h0_new, 10.0f);
+        float f_ex = _aoba_neg_expm1_neg(clamp((kw_o2 / h0_s) * dt, 0.0f, 20.0f));
+        do2_sfc_val = (o2_sat - o2_io[c]) * f_ex;
+        fgo2_val = (do2_sfc_val * h0_s * 1.0e-3f) * inv_dt;
+    }
+
+    // Constants (Sasai et al., 2022; Aumont et al., 2015; Orr et al., 2017; Monteiro et al., 2011)
     const float i_thresh = (0.80f * 0.05f) / 2.0f;
     const float ea_over_r = 4.8e4f / 8.314462618f;
     const float inv_tref = 1.0f / 293.15f;
     const float r_cn_zoo = 106.0f / 16.0f;
+    const float r_o2_c = 138.0f / 106.0f;
 
     for (uint k = 0u; k < nzo; ++k) {
         uint idx = k * nc + c;
         float wk = wet_cf[idx];
         if (wk < 0.5f) {
-            diag_3d[idx] = 0.0f;
-            diag_3d[nzo * nc + idx] = 0.0f;
-            diag_3d[2u * nzo * nc + idx] = 0.0f;
-            continue;
+            for (uint kk = k; kk < nzo; ++kk) {
+                uint kidx = kk * nc + c;
+                diag_3d[kidx] = 0.0f;
+                diag_3d[nzo * nc + kidx] = 0.0f;
+                diag_3d[2u * nzo * nc + kidx] = 0.0f;
+            }
+            break;
         }
         bool is_bot = (k + 1u >= nzo) || (wet_cf[(k + 1u) * nc + c] < 0.5f);
 
@@ -3314,52 +3431,54 @@ kernel void ocean_bgc_column_col(
         float dic_c = dic_comp_io[idx];
         float alk_c = alk_comp_io[idx];
 
-        // 1. PAR attenuation with chlorophyll self-shading
-        float chl_est = clamp(phy_v * 1.59f, 0.0f, 30.0f);
-        float kd = 0.04f + 0.03f * chl_est;
-        float tau_par = kd * hc_k;
-        float i_top = i_sfc * exp(-min(tau_top, 40.0f));
-        tau_top += tau_par;
-        float att = (tau_par > 1.0e-4f)
-            ? (_aoba_neg_expm1_neg(tau_par) / max(tau_par, 1.0e-4f))
-            : (1.0f - 0.5f * tau_par + (1.0f / 6.0f) * tau_par * tau_par);
-        float par_k = i_top * att;
-
-        // 2. FlexPFT optimal quota Q, theta_hat, mu_fl
-        float t_safe = clamp(temp_k[idx], 270.0f, 315.0f);
+        // 1. PAR attenuation with chlorophyll self-shading (skip photic exp/Lambert when aphotic)
+        float t_raw = temp_k[idx];
+        float t_safe = clamp(t_raw, 270.0f, 315.0f);
         float f_temp = exp(-ea_over_r * (1.0f / t_safe - inv_tref));
-        float v0 = 1.4f * f_temp;
+        float n_pos = max(no3_v, 0.0f);
 
         float theta_hat = 0.0f;
-        if (par_k > i_thresh) {
-            float i_safe = max(par_k, i_thresh + 1.0e-6f);
-            float x_light = (2.0f * i_safe) / (0.80f * v0);
-            float r_maint = (0.05f * f_temp) / v0;
-            float y_arg = log(1.0f + r_maint) + 1.0f + x_light;
-            float w_val = _aoba_lambert_w0_exp(y_arg);
-            float th_raw = (1.0f / 0.80f) + (v0 / (2.0f * i_safe)) * (1.0f - w_val);
-            theta_hat = clamp(th_raw, 0.0f, 1.0f);
+        float mu_fl = 0.0f;
+        float q_quota = 0.12f;
+        if (i_sfc > 1.0e-6f && tau_top < 30.0f) {
+            float chl_est = clamp(phy_v * 1.59f, 0.0f, 30.0f);
+            float kd = 0.04f + 0.03f * chl_est;
+            float tau_par = kd * hc_k;
+            float i_top = i_sfc * exp(-min(tau_top, 40.0f));
+            tau_top += tau_par;
+            float att = (tau_par > 1.0e-4f)
+                ? (_aoba_neg_expm1_neg(tau_par) / max(tau_par, 1.0e-4f))
+                : (1.0f - 0.5f * tau_par + (1.0f / 6.0f) * tau_par * tau_par);
+            float par_k = i_top * att;
+
+            float v0 = 1.4f * f_temp;
+            if (par_k > i_thresh) {
+                float i_safe = max(par_k, i_thresh + 1.0e-6f);
+                float x_light = (2.0f * i_safe) / (0.80f * v0);
+                float r_maint = (0.05f * f_temp) / v0;
+                float y_arg = log(1.0f + r_maint) + 1.0f + x_light;
+                float w_val = _aoba_lambert_w0_exp(y_arg);
+                float th_raw = (1.0f / 0.80f) + (v0 / (2.0f * i_safe)) * (1.0f - w_val);
+                theta_hat = clamp(th_raw, 0.0f, 1.0f);
+            }
+            float arg_s = clamp((2.0f * theta_hat * par_k) / v0, 0.0f, 40.0f);
+            float v_light = v0 * _aoba_neg_expm1_neg(arg_s);
+
+            float v0_n = 1.0f * f_temp;
+            float v_hat_n = (v0_n * n_pos) / (n_pos + 1.0f + 2.0f * sqrt(n_pos + 1.0e-12f) + 1.0e-12f);
+            float v_n_safe = max(v_hat_n, 1.0e-9f);
+            float b_cost = (v_light / v_n_safe) + 0.60f;
+            float gamma_q = max(0.0195f * b_cost, 1.0e-5f);
+            q_quota = clamp(0.0195f * (1.0f + sqrt(1.0f + 1.0f / gamma_q)), 0.0195f * 1.05f, 0.25f);
+            if (v_light > 1.0e-9f && n_pos > 1.0e-9f) {
+                float fv_raw = (1.0f - 0.0195f / q_quota) / (1.0f + (v_hat_n / max(v_light, 1.0e-9f)) * (0.60f + 1.0f / q_quota));
+                float f_v = clamp(fv_raw, 0.0f, 0.99f);
+                mu_fl = (f_v * v_hat_n) / q_quota;
+            }
+        } else {
+            // Exact dark-limit quota (v_light = 0 -> b_cost = 0.60)
+            q_quota = clamp(0.0195f * (1.0f + sqrt(1.0f + 1.0f / (0.0195f * 0.60f))), 0.0195f * 1.05f, 0.25f);
         }
-        float arg_s = clamp((2.0f * theta_hat * par_k) / v0, 0.0f, 40.0f);
-        float v_light = v0 * _aoba_neg_expm1_neg(arg_s);
-
-        float n_pos = max(no3_v, 0.0f);
-        float v0_n = 1.0f * f_temp;
-        float a0_n = 1.0f * f_temp;
-        float ratio_va = v0_n / max(a0_n, 1.0e-6f);
-        float v_hat_n = (v0_n * n_pos) / (n_pos + ratio_va + 2.0f * sqrt(ratio_va * n_pos + 1.0e-12f) + 1.0e-12f);
-
-        float v_n_safe = max(v_hat_n, 1.0e-9f);
-        float b_cost = (v_light / v_n_safe) + 0.60f;
-        float gamma_q = max(0.0195f * b_cost, 1.0e-5f);
-        float q_quota = clamp(0.0195f * (1.0f + sqrt(1.0f + 1.0f / gamma_q)), 0.0195f * 1.05f, 0.25f);
-
-        float f_v = 0.0f;
-        if (v_light > 1.0e-9f && n_pos > 1.0e-9f) {
-            float fv_raw = (1.0f - 0.0195f / q_quota) / (1.0f + (v_hat_n / max(v_light, 1.0e-9f)) * (0.60f + 1.0f / q_quota));
-            f_v = clamp(fv_raw, 0.0f, 0.99f);
-        }
-        float mu_fl = (f_v * v_hat_n) / q_quota;
         float c_to_n = 1.0f / q_quota;
 
         // 3. Strictly conservative NPZD + flexible carbon reactions
@@ -3449,30 +3568,104 @@ kernel void ocean_bgc_column_col(
             alk_v = t;
         }
 
-        no3_io[idx] = no3_v;
-        no3_comp_io[idx] = no3_c;
+        float npp_k = dc_up * inv_dt;
+
+        // 4b. Fused 3D Dissolved O2 / OMZ Denitrification (when enable_ocean_o2_omz is active)
+        if (has_o2) {
+            float o2_v = o2_io[idx];
+            float o2_c = o2_comp_io[idx];
+            float o2_cur = max(o2_v, 0.0f);
+            float o2_prod = r_o2_c * max(npp_k, 0.0f) * dt;
+            float tc_k = clamp(t_raw - 273.15f, -2.0f, 40.0f);
+            float f_t_rem = exp(clamp(0.0693f * (tc_k - 20.0f), -2.0f, 2.0f));
+            float rem_c_k = (0.06f / 86400.0f) * f_t_rem * max(dc_k, 0.0f);
+            float o2_dem_r = r_o2_c * rem_c_k;
+            float f_ox = o2_cur / (o2_cur + 5.0f);
+            float k_o2_loss = (o2_dem_r * f_ox) / max(o2_cur, 1.0e-4f);
+            float do2_cons = o2_cur * _aoba_neg_expm1_neg(clamp(k_o2_loss * dt, 0.0f, 20.0f));
+            float do2_tot = o2_prod - do2_cons + ((k == 0u) ? do2_sfc_val : 0.0f);
+            {
+                float d_eff = do2_tot + o2_c;
+                float t = o2_v + d_eff;
+                o2_c = (fabs(o2_v) >= fabs(d_eff)) ? ((o2_v - t) + d_eff) : ((d_eff - t) + o2_v);
+                o2_v = clamp(t, 0.0f, 500.0f);
+            }
+            o2_io[idx] = o2_v;
+            o2_comp_io[idx] = o2_c;
+
+            // OMZ anaerobic denitrification (O2 < 20 mmol m^-3)
+            float omz_gate = clamp((20.0f - o2_v) / 20.0f, 0.0f, 1.0f);
+            float no3_p2 = max(no3_v, 0.0f);
+            float denit_r = 0.8f * o2_dem_r * (1.0f - f_ox) * omz_gate;
+            float k_den = denit_r / max(no3_p2, 1.0e-4f);
+            float dno3_den = no3_p2 * _aoba_neg_expm1_neg(clamp(k_den * dt, 0.0f, 10.0f));
+            if (dno3_den > 0.0f) {
+                float d_eff = -dno3_den + no3_c;
+                float t = no3_v + d_eff;
+                no3_c = (fabs(no3_v) >= fabs(d_eff)) ? ((no3_v - t) + d_eff) : ((d_eff - t) + no3_v);
+                no3_v = max(t, 0.0f);
+            }
+            float h_o2 = (k == 0u) ? max(h0_new, 10.0f) : hc_k;
+            denit_acc += dno3_den * h_o2;
+            h_tot_acc += h_o2;
+            if (o2_v < 20.0f) omz_h_acc += h_o2;
+        }
+
         phy_io[idx] = phy_new;
         zoo_io[idx] = zoo_new;
         det_n_io[idx] = dn_k;
         det_c_io[idx] = dc_k;
-        alk_io[idx] = alk_v;
-        alk_comp_io[idx] = alk_c;
 
         if (k == 0u) {
+            no30_val = no3_v;
+            no30_cmp = no3_c;
             dic0_val = dic_v;
             dic0_cmp = dic_c;
             alk0_val = alk_v;
+            alk0_cmp = alk_c;
         } else {
+            no3_io[idx] = no3_v;
+            no3_comp_io[idx] = no3_c;
             dic_io[idx] = dic_v;
             dic_comp_io[idx] = dic_c;
+            alk_io[idx] = alk_v;
+            alk_comp_io[idx] = alk_c;
         }
 
-        float npp_k = dc_up * inv_dt;
         diag_3d[idx] = phy_new * (theta_hat / q_quota);
         diag_3d[nzo * nc + idx] = npp_k;
         diag_3d[2u * nzo * nc + idx] = c_to_n;
         intpp_acc += npp_k * hk;
     }
+
+    // 4c. Surface Marine Diazotrophic N2 Fixation (balances OMZ denitrification over 1000-yr spin-up)
+    if (has_o2) {
+        float tc0_f = clamp(temp_k[c] - 273.15f, -2.0f, 40.0f);
+        float ft_fix = clamp((tc0_f - 18.0f) / 10.0f, 0.0f, 1.0f);
+        ft_fix = ft_fix * ft_fix;
+        float fn_inh = 1.5f / (1.5f + max(no30_val, 0.0f));
+        float f_fe = has_fe ? (fe_sfc / (fe_sfc + 0.20f)) : 0.65f;
+        float dno3_fix = (0.012f * dt_day) * ft_fix * fn_inh * f_fe * (1.0f - f_ice);
+        if (dno3_fix > 0.0f) {
+            {
+                float d_eff = dno3_fix + no30_cmp;
+                float t = no30_val + d_eff;
+                no30_cmp = (fabs(no30_val) >= fabs(d_eff)) ? ((no30_val - t) + d_eff) : ((d_eff - t) + no30_val);
+                no30_val = t;
+            }
+            {
+                float d_eff = -dno3_fix + alk0_cmp;
+                float t = alk0_val + d_eff;
+                alk0_cmp = (fabs(alk0_val) >= fabs(d_eff)) ? ((alk0_val - t) + d_eff) : ((d_eff - t) + alk0_val);
+                alk0_val = t;
+            }
+        }
+        n2fix_val = (dno3_fix * max(h0_new, 10.0f) * 1.0e-3f) * inv_dt;
+    }
+    no3_io[c] = no30_val;
+    no3_comp_io[c] = no30_cmp;
+    alk_io[c] = alk0_val;
+    alk_comp_io[c] = alk0_cmp;
 
     // 5. Surface OMIP / mocsy 2.0 Carbonate Equilibrium & Wanninkhof (2014) Air-Sea CO2 Flux
     float t_k = clamp(temp_k[c], 271.15f, 315.0f);
@@ -3556,6 +3749,10 @@ kernel void ocean_bgc_column_col(
     diag_2d[2u * nc + c] = ph_tot;
     diag_2d[3u * nc + c] = intpp_acc * 1.0e-3f;
     diag_2d[4u * nc + c] = epc_100;
+    diag_2d[5u * nc + c] = fgo2_val;
+    diag_2d[6u * nc + c] = has_o2 ? ((denit_acc * 1.0e-3f) * inv_dt) : 0.0f;
+    diag_2d[7u * nc + c] = has_o2 ? (omz_h_acc / max(h_tot_acc, 1.0f)) : 0.0f;
+    diag_2d[8u * nc + c] = n2fix_val;
 }
 
 // =========================================================================
@@ -7183,6 +7380,692 @@ kernel void crm_ens_mean_unc_transpose(
         unc_out[col_g] = u_prof_sum / (8.0f * float(nz)) + u_scal * (1.0f / 3.0f);
     }
 }
+
+// =========================================================================
+// 35. Fused Multi-Tracer OGCM Flux-Increment Implicit Vertical Diffusion
+//     Factors tridiagonal matrix ONCE per ocean column across all B tracers
+//     with exact telescoping flux + Neumaier/Kahan summation (zero temp 3D)
+// =========================================================================
+kernel void ogcm_multi_vdiff_col(
+    device float* q_io              [[buffer(0)]],  // [B, nzo, nc] in-place
+    device float* q_comp_io         [[buffer(1)]],  // [B, nzo, nc] in-place
+    device const float* c_dif       [[buffer(2)]],  // [nzo-1, nc]
+    device const float* h_eff       [[buffer(3)]],  // [nzo, nc]
+    device const float* wet_cf      [[buffer(4)]],  // [nzo, nc]
+    constant ulong4& u_dim          [[buffer(5)]],  // [B, nzo, nc, clamp_nonneg_mask]
+    uint c                          [[thread_position_in_grid]])
+{
+    uint B = uint(u_dim.x);
+    uint nzo = uint(u_dim.y);
+    uint nc = uint(u_dim.z);
+    uint clamp_mask = uint(u_dim.w);
+    if (c >= nc || nzo < 2u || nzo > 64u || B == 0u) return;
+    if (wet_cf[c] < 0.5f) return;
+
+    float c_st[64];
+    float inv_den[64];
+    float dq_st[64];
+
+    // Factor shared tridiagonal operator (I + L) ONCE per column across all B tracers
+    uint k_bot = 0u;
+    float cd_prev = 0.0f;
+    float cp_prev = 0.0f;
+    for (uint k = 0u; k < nzo; ++k) {
+        uint idx = k * nc + c;
+        if (wet_cf[idx] < 0.5f) break;
+        k_bot = k;
+        float hk = h_eff[idx];
+        float cd_k = (k + 1u < nzo && wet_cf[(k + 1u) * nc + c] > 0.5f) ? c_dif[idx] : 0.0f;
+        float a_k = (k > 0u) ? (-cd_prev / hk) : 0.0f;
+        float d_k = (k + 1u < nzo) ? (-cd_k / hk) : 0.0f;
+        float b_k = 1.0f - a_k - d_k;
+        float inv_d = (k == 0u) ? (1.0f / b_k) : (1.0f / (b_k - a_k * cp_prev));
+        cp_prev = d_k * inv_d;
+        c_st[k] = cp_prev;
+        inv_den[k] = inv_d;
+        cd_prev = cd_k;
+    }
+
+    uint stride_b = nzo * nc;
+    for (uint b = 0u; b < B; ++b) {
+        uint base = b * stride_b;
+        bool do_clamp = ((clamp_mask & (1u << b)) != 0u);
+
+        // Forward Thomas sweep for increment dq
+        float q_cur = q_io[base + c];
+        float cd_p = 0.0f;
+        float f_p = 0.0f;
+        float x_prev = 0.0f;
+        for (uint k = 0u; k <= k_bot; ++k) {
+            uint idx = k * nc + c;
+            float hk = h_eff[idx];
+            float cd_k = (k < k_bot) ? c_dif[idx] : 0.0f;
+            float q_next = (k < k_bot) ? q_io[base + (k + 1u) * nc + c] : q_cur;
+            float f_k = cd_k * (q_next - q_cur);
+            float rhs = (f_k - f_p) / hk;
+            float a_k = (k > 0u) ? (-cd_p / hk) : 0.0f;
+            x_prev = (k == 0u) ? (rhs * inv_den[0]) : ((rhs - a_k * x_prev) * inv_den[k]);
+            dq_st[k] = x_prev;
+            cd_p = cd_k;
+            f_p = f_k;
+            q_cur = q_next;
+        }
+        // Back-substitution
+        float x_next = dq_st[k_bot];
+        for (int k = int(k_bot) - 1; k >= 0; --k) {
+            uint uk = uint(k);
+            x_next = dq_st[uk] - c_st[uk] * x_next;
+            dq_st[uk] = x_next;
+        }
+        // Telescoping flux reconstruction + Neumaier/Kahan update
+        float f_imp_p = 0.0f;
+        float qk = q_io[base + c];
+        for (uint k = 0u; k <= k_bot; ++k) {
+            uint idx = k * nc + c;
+            float hk = h_eff[idx];
+            float q_n = (k < k_bot) ? q_io[base + (k + 1u) * nc + c] : qk;
+            float f_imp_k = (k < k_bot) ? (c_dif[idx] * ((q_n - qk) + (dq_st[k + 1u] - dq_st[k]))) : 0.0f;
+            float dq_cons = (f_imp_k - f_imp_p) / hk;
+            float qc_old = q_comp_io[base + idx];
+            float d_eff = dq_cons + qc_old;
+            float q_new = qk + d_eff;
+            float qc_new = (fabs(qk) >= fabs(d_eff)) ? ((qk - q_new) + d_eff) : ((d_eff - q_new) + qk);
+            q_io[base + idx] = do_clamp ? max(q_new, 0.0f) : q_new;
+            q_comp_io[base + idx] = qc_new;
+            f_imp_p = f_imp_k;
+            qk = q_n;
+        }
+    }
+}
+
+// =========================================================================
+// 36. Fused CRM Non-Inductive Charging Lightning & Cold-Cloud Depth Kernel
+//     1 thread per subcolumn (c, s): zero 4D intermediate allocations
+// =========================================================================
+kernel void crm_lightning_col(
+    device const float* rho_d       [[buffer(0)]],  // [nz, M]
+    device const float* theta_m     [[buffer(1)]],  // [nz, M]
+    device const float* q_v         [[buffer(2)]],  // [nz, M]
+    device const float* q_i         [[buffer(3)]],  // [nz, M]
+    device const float* q_p         [[buffer(4)]],  // [nz, M]
+    device const float* w_stag      [[buffer(5)]],  // [nz+1, M]
+    device const float* z_c         [[buffer(6)]],  // [nz, nc] or [nz]
+    device const float* dz_c        [[buffer(7)]],  // [nz, nc] or [nz]
+    device const float* q_g_prog    [[buffer(8)]],  // [nz, M] (dummy [1] if has_qg==0)
+    device const float* q_s_prog    [[buffer(9)]],  // [nz, M] (dummy [1] if has_qs==0)
+    device float* out_4             [[buffer(10)]], // [4, M]: flash_tot, flash_cg, f_cg, ccd_km
+    constant ulong4& u_dim          [[buffer(11)]], // [nz, nc, n_sub, flags]
+    constant float4& f_p0           [[buffer(12)]], // [cal_factor, p_ref, r_d, cp_d]
+    constant float4& f_p1           [[buffer(13)]], // [rv_over_rd, t0_p, t00_p, t0_g]
+    constant float4& f_p2           [[buffer(14)]], // [t00_g, t_freeze, 0, 0]
+    uint tid                        [[thread_position_in_grid]])
+{
+    uint nz = uint(u_dim.x);
+    uint nc = uint(u_dim.y);
+    uint n_sub = uint(u_dim.z);
+    uint flags = uint(u_dim.w);
+    uint M = nc * n_sub;
+    if (tid >= M || nz == 0u) return;
+
+    uint c = tid / n_sub;
+    bool has_qg = ((flags & 1u) != 0u);
+    bool has_qs = ((flags & 2u) != 0u);
+    bool z_is_2d = ((flags & 4u) != 0u);
+
+    float c_scale = f_p0.x;
+    float p_ref = f_p0.y;
+    float r_d = f_p0.z;
+    float cp_d = f_p0.w;
+    float cv_d = cp_d - r_d;
+    float gamma_d = cp_d / cv_d;
+    float kappa_d = r_d / cp_d;
+    float rv_over_rd = f_p1.x;
+    float t0_p = f_p1.y;
+    float t00_p = f_p1.z;
+    float t0_g = f_p1.w;
+    float t00_g = f_p2.x;
+    float t_freeze = f_p2.y;
+    float inv_dt_p = 1.0f / max(t0_p - t00_p, 1.0f);
+    float inv_dt_g = 1.0f / max(t0_g - t00_g, 1.0f);
+
+    float gfx_max = 0.0f;
+    float gfx_chg = 0.0f;
+    float iwp_tot = 0.0f;
+    float z_freeze = 0.0f;
+    float z_ice_top = 0.0f;
+
+    float w_prev = w_stag[tid];
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * M + tid;
+        uint zidx = z_is_2d ? (k * nc + c) : k;
+        float rd = rho_d[idx];
+        float thm = theta_m[idx];
+        float qv = q_v[idx];
+        float qi_pos = max(q_i[idx], 0.0f);
+        float w_next = w_stag[(k + 1u) * M + tid];
+        float w_up = max(0.5f * (w_prev + w_next), 0.0f);
+        w_prev = w_next;
+
+        // Exact thermodynamic diagnosis T(rho_d, theta_m, q_v)
+        float arg_p = max((rd * r_d * thm) / p_ref, 1.0e-12f);
+        float pres = p_ref * pow(arg_p, gamma_d);
+        float pi_ex = pow(max(pres / p_ref, 1.0e-12f), kappa_d);
+        float temp = (thm * pi_ex) / max(1.0f + rv_over_rd * qv, 0.5f);
+
+        float q_g = 0.0f;
+        float q_p_ice = 0.0f;
+        if (has_qg) {
+            q_g = max(q_g_prog[idx], 0.0f);
+            float q_s = has_qs ? max(q_s_prog[idx], 0.0f) : 0.0f;
+            q_p_ice = q_g + q_s;
+        } else {
+            float f_ice_p = clamp((t0_p - temp) * inv_dt_p, 0.0f, 1.0f);
+            float f_graup = clamp((temp - t00_g) * inv_dt_g, 0.0f, 1.0f);
+            q_p_ice = f_ice_p * max(q_p[idx], 0.0f);
+            q_g = q_p_ice * f_graup;
+        }
+
+        float dz_k = dz_c[zidx];
+        float zc_k = z_c[zidx];
+        float q_ice_tot = qi_pos + q_p_ice;
+        iwp_tot += rd * dz_k * q_ice_tot;
+
+        if (w_up > 0.0f && q_g > 0.0f) {
+            float dt_c = (temp - 258.15f) * (1.0f / 7.0f);
+            float t_wt = exp(-(dt_c * dt_c));
+            float base_g = t_wt * rd * (1000.0f * q_g);
+            float g_lin = base_g * w_up;
+            if (g_lin > gfx_max) gfx_max = g_lin;
+            float g_chg = base_g * pow(w_up, 1.25f);
+            if (g_chg > gfx_chg) gfx_chg = g_chg;
+        }
+        if (temp >= t_freeze && zc_k > z_freeze) z_freeze = zc_k;
+        if (q_ice_tot >= 1.0e-5f && zc_k > z_ice_top) z_ice_top = zc_k;
+    }
+
+    float f1 = 0.042f * gfx_chg;
+    float core_r = gfx_max / (gfx_max + 1.0f);
+    float f2 = 0.20f * iwp_tot * (core_r * core_r);
+    float inv_5min_km2 = 1.0f / (300.0f * 1.0e6f);
+    float flash_tot = max(c_scale * (0.95f * f1 + 0.05f * f2) * inv_5min_km2, 0.0f);
+
+    float ccd_km = max((z_ice_top - z_freeze) * 1.0e-3f, 0.0f);
+    float h_p = clamp(ccd_km, 5.5f, 14.0f);
+    float h2 = h_p * h_p;
+    float h3 = h2 * h_p;
+    float h4 = h2 * h2;
+    float z_ic_cg = clamp(0.021f * h4 - 0.648f * h3 + 7.493f * h2 - 36.54f * h_p + 63.09f, 1.0f, 19.0f);
+    float f_cg = 1.0f / (1.0f + z_ic_cg);
+    float flash_cg = flash_tot * f_cg;
+
+    out_4[tid] = flash_tot;
+    out_4[M + tid] = flash_cg;
+    out_4[2u * M + tid] = f_cg;
+    out_4[3u * M + tid] = ccd_km;
+}
+
+// =========================================================================
+// 37. Fused Land Carbon + Nitrogen + 5-Layer Permafrost + SPITFIRE Wildfire
+//     Early-skips ~70% ocean tiles immediately; 5-layer soil in registers
+// =========================================================================
+kernel void land_carbon_cn_fire_prep_tile(
+    device const int* surf_type     [[buffer(0)]],  // [M] (1 = SURF_LAND)
+    device const float* f_in        [[buffer(1)]],  // [14, M]
+    device const float* t_soil      [[buffer(2)]],  // [5, M]
+    device const float* w_liq       [[buffer(3)]],  // [5, M]
+    device const float* w_ice       [[buffer(4)]],  // [5, M]
+    device float* c_1d_io           [[buffer(5)]],  // [10, M]: cl, cr, cw, clf, cls, comp_l, comp_r, comp_w, comp_lf, comp_ls
+    device float* c_soil_io         [[buffer(6)]],  // [5, M]
+    device float* c_soil_comp_io    [[buffer(7)]],  // [5, M]
+    device float* n_1d_io           [[buffer(8)]],  // [12, M]: nl, nr, nw, nlf, nls, nmin + 6 comps
+    device float* n_soil_io         [[buffer(9)]],  // [5, M]
+    device float* n_soil_comp_io    [[buffer(10)]], // [5, M]
+    device float* aux_io            [[buffer(11)]], // [4, M]: phi_n, fire_di, fire_accum, f_root_alloc
+    device float* fire_out          [[buffer(12)]], // [10, M]: can_sust, fdi, d_major, i_byram, sh_m, p_mort, p_burn_cont, gpp, ra_eff, rh_kg
+    device float* n_diag_out        [[buffer(13)]], // [5, M]: bnf, u_soil, n_dep_in, n_leach, n_denit
+    constant ulong4& u_dim          [[buffer(14)]], // [M, enable_n, use_maml, 0]
+    constant float4& f_p0           [[buffer(15)]], // [dt, sec_per_yr, crm_dx_m, soil_porosity]
+    uint i                          [[thread_position_in_grid]])
+{
+    uint M = uint(u_dim.x);
+    bool enable_n = (uint(u_dim.y) != 0u);
+    if (i >= M) return;
+
+    if (surf_type[i] != 1) {
+        aux_io[i] = 1.0f;
+        aux_io[M + i] = 0.0f;
+        aux_io[2u * M + i] = 0.0f;
+        aux_io[3u * M + i] = 0.35f;
+        for (uint k = 0u; k < 10u; ++k) fire_out[k * M + i] = 0.0f;
+        for (uint k = 0u; k < 5u; ++k) n_diag_out[k * M + i] = 0.0f;
+        return;
+    }
+
+    float dt = f_p0.x;
+    float sec_yr = f_p0.y;
+    float crm_dx = f_p0.z;
+    float soil_por = f_p0.w;
+    float dt_yr = dt / sec_yr;
+    float inv_dt = 1.0f / max(dt, 1.0f);
+
+    // Unpack forcing [14, M]
+    float gpp_umol = f_in[i];
+    float rleaf_umol = f_in[M + i];
+    float h_canopy = max(f_in[2u * M + i], 0.0f);
+    float f_snow = f_in[3u * M + i];
+    float t_sfc_k = f_in[4u * M + i];
+    float vpd_pa = f_in[5u * M + i];
+    float u10_ms = f_in[6u * M + i];
+    float precip_s = f_in[7u * M + i];
+    float vc25_in = f_in[8u * M + i];
+    float fevg_in = f_in[9u * M + i];
+    float transp_s = max(f_in[10u * M + i], 0.0f);
+    float n_dep_s = max(f_in[11u * M + i], 0.0f);
+    float cg_rate = max(f_in[12u * M + i], 0.0f);
+
+    float c_leaf = c_1d_io[i];
+    float c_root = c_1d_io[M + i];
+    float c_wood = c_1d_io[2u * M + i];
+    float c_lf   = c_1d_io[3u * M + i];
+    float c_ls   = c_1d_io[4u * M + i];
+    float cl_cmp = c_1d_io[5u * M + i];
+    float cr_cmp = c_1d_io[6u * M + i];
+    float cw_cmp = c_1d_io[7u * M + i];
+    float clf_cmp = c_1d_io[8u * M + i];
+    float cls_cmp = c_1d_io[9u * M + i];
+
+    float gpp = max(gpp_umol, 0.0f) * 12.011e-9f;
+    float r_leaf = max(rleaf_umol, 0.0f) * 12.011e-9f;
+    float t0_c = clamp(t_soil[i] - 273.15f, -40.0f, 50.0f);
+    float q10_veg = pow(2.0f, 0.1f * (t0_c - 25.0f));
+    float r_maint = r_leaf + c_wood * (0.012f / sec_yr) * q10_veg + c_root * (0.25f / sec_yr) * q10_veg;
+    float surplus = max(gpp - r_maint, 0.0f);
+    float ra = r_maint + 0.25f * surplus;
+    float npp = gpp - ra;
+
+    float f_wood_base = 0.05f + 0.42f * (h_canopy / (h_canopy + 4.0f));
+    float f_root_base = 0.45f * (1.0f - f_wood_base);
+    float phi_prev = enable_n ? clamp(aux_io[i], 0.15f, 1.0f) : 1.0f;
+    float f_root, f_wood, f_leaf;
+    if (enable_n) {
+        f_root = clamp(f_root_base + 0.35f * (1.0f - phi_prev), 0.15f, 0.72f);
+        float rem_abg = 1.0f - f_root;
+        f_wood = rem_abg * (f_wood_base / max(1.0f - f_root_base, 0.10f));
+        f_leaf = rem_abg - f_wood;
+    } else {
+        f_wood = f_wood_base;
+        f_leaf = 0.55f * (1.0f - f_wood);
+        f_root = 1.0f - f_wood - f_leaf;
+    }
+    aux_io[3u * M + i] = f_root;
+
+    float d_npp = npp * dt;
+    float live_tot = max(c_leaf + c_wood + c_root, 1.0e-8f);
+    float neg_draw = max(-d_npp, 0.0f);
+    float neg_cap = min(neg_draw, 0.5f * live_tot);
+    float ra_eff = ra - (neg_draw - neg_cap) * inv_dt;
+    float pos_in = max(d_npp, 0.0f);
+
+    float tau_leaf_eff = 1.5f * (1.0f + 0.80f * (1.0f - phi_prev));
+    float f_turn_l = _aoba_neg_expm1_neg(dt_yr / tau_leaf_eff);
+    float f_turn_r = _aoba_neg_expm1_neg(dt_yr / 2.0f);
+    float f_turn_w = _aoba_neg_expm1_neg(dt_yr / 40.0f);
+
+    // 5-layer soil environment (depths: 0.05, 0.15, 0.40, 0.80, 1.60 m = 3.00 m total)
+    const float dz[5] = {0.05f, 0.15f, 0.40f, 0.80f, 1.60f};
+    const float z_mid[5] = {0.025f, 0.125f, 0.40f, 1.00f, 2.20f};
+    float f_t_s[5], f_frz[5], f_mst[5], env_s[5], sat_0 = 0.0f;
+    float w_root_col = 0.0f;
+    for (uint k = 0u; k < 5u; ++k) {
+        uint idx = k * M + i;
+        float tsc = clamp(t_soil[idx] - 273.15f, -45.0f, 50.0f);
+        float ft = pow(2.0f, 0.1f * (tsc - 25.0f));
+        float wl = w_liq[idx];
+        float wi = w_ice[idx];
+        float fi = clamp(wi / max(wl + wi, 1.0e-6f), 0.0f, 1.0f);
+        float ff = (1.0f - fi) + 0.05f * fi;
+        float sf = clamp(wl / soil_por, 0.0f, 1.0f);
+        float fm = clamp(0.15f + 0.85f * sin(3.14159265359f * clamp(sf, 0.0f, 0.95f)), 0.10f, 1.0f);
+        f_t_s[k] = ft;
+        f_frz[k] = ff;
+        f_mst[k] = fm;
+        env_s[k] = ft * ff * fm;
+        if (k == 0u) sat_0 = sf;
+        if (k < 3u) w_root_col += wl * dz[k] * 1000.0f;
+    }
+    w_root_col = max(w_root_col, 15.0f);
+
+    // Optional Stocker CN-Model Nitrogen Demand, Uptake & FUN BNF
+    float nturn_l_tot = 0.0f, nturn_r_tot = 0.0f, nturn_w_tot = 0.0f;
+    float nturn_l_lit = 0.0f, nturn_r_lit = 0.0f;
+    float n_in_l = 0.0f, n_in_r = 0.0f, n_in_w = 0.0f;
+    float u_soil = 0.0f, bnf_sym = 0.0f, bnf_asym = 0.0f;
+    if (enable_n) {
+        float nl = n_1d_io[i];
+        float nr = n_1d_io[M + i];
+        float nw = n_1d_io[2u * M + i];
+        float nmin = n_1d_io[5u * M + i];
+
+        float f_cold_n = 1.0f / (1.0f + exp(t0_c * 0.2f));
+        float lma_kgc = 0.045f + 0.055f * clamp(fevg_in, 0.0f, 1.0f) + 0.025f * f_cold_n + 0.035f * (1.0f - phi_prev);
+        float vc25 = clamp(vc25_in, 5.0f, 200.0f);
+        float n_area_opt = 1.76e-5f * vc25 + 0.016f * lma_kgc;
+        float cn_leaf_opt = clamp(lma_kgc / max(n_area_opt, 1.0e-4f), 15.0f, 65.0f);
+
+        nturn_l_tot = f_turn_l * max(nl, 0.0f);
+        nturn_r_tot = f_turn_r * max(nr, 0.0f);
+        nturn_w_tot = f_turn_w * max(nw, 0.0f);
+        float n_retrans = 0.50f * nturn_l_tot + 0.25f * nturn_r_tot;
+        nturn_l_lit = 0.50f * nturn_l_tot;
+        nturn_r_lit = 0.75f * nturn_r_tot;
+
+        float w_nl = f_leaf / cn_leaf_opt;
+        float w_nr = f_root / 45.0f;
+        float w_nw = f_wood / 250.0f;
+        float d_n_gross = pos_in * (w_nl + w_nr + w_nw);
+        float d_n_net = max(d_n_gross - n_retrans, 0.0f);
+
+        float nmin_av = max(nmin, 0.0f);
+        float f_mass = _aoba_neg_expm1_neg(min((transp_s * dt) / w_root_col, 0.5f));
+        float u_mass = f_mass * nmin_av;
+        float cr_pos = max(c_root, 0.0f);
+        float root_eff = cr_pos / (cr_pos + 0.25f);
+        float k_diff = 8.0f * f_mst[0] * f_frz[0] * root_eff;
+        float f_diff = _aoba_neg_expm1_neg(min(k_diff * dt_yr, 20.0f));
+        float u_diff = f_diff * max(nmin_av - u_mass, 0.0f);
+        u_soil = min(d_n_net, u_mass + u_diff);
+
+        float d_n_rem = max(d_n_net - u_soil, 0.0f);
+        float tc_bnf = clamp(t0_c, -15.0f, 45.0f);
+        float ex_b = clamp(-3.62f + 0.27f * tc_bnf * (1.0f - 0.5f * tc_bnf / 25.15f), -6.0f, 4.0f);
+        float cost_fix = clamp(5.0f * (exp(-ex_b) - 1.0f) + 5.0f, 4.0f, 200.0f);
+        float c_bnf_cap = 0.022f * pos_in;
+        bnf_sym = min(d_n_rem, c_bnf_cap / cost_fix);
+        float c_bnf_spent = bnf_sym * cost_fix;
+        float f_t_bnf = clamp(5.0f / cost_fix, 0.0f, 1.0f);
+        bnf_asym = (2.0e-4f * dt_yr) * f_t_bnf * f_mst[0] * f_frz[0];
+
+        float n_sup = n_retrans + u_soil + bnf_sym;
+        float phi_inst = (d_n_gross > 1.0e-12f) ? clamp(n_sup / max(d_n_gross, 1.0e-12f), 0.15f, 1.0f) : phi_prev;
+        float a_phi = _aoba_neg_expm1_neg(dt / (15.0f * 86400.0f));
+        aux_io[i] = clamp((1.0f - a_phi) * phi_prev + a_phi * phi_inst, 0.15f, 1.0f);
+
+        float w_nsum = max(w_nl + w_nr + w_nw, 1.0e-8f);
+        n_in_l = n_sup * (w_nl / w_nsum);
+        n_in_r = n_sup * (w_nr / w_nsum);
+        n_in_w = n_sup - n_in_l - n_in_r;
+
+        pos_in = max(pos_in - c_bnf_spent, 0.0f);
+        ra_eff += c_bnf_spent * inv_dt;
+    }
+
+    // Carbon growth + turnover (Neumaier/Kahan)
+    float in_l = f_leaf * pos_in - neg_cap * (c_leaf / live_tot);
+    float in_w = f_wood * pos_in - neg_cap * (c_wood / live_tot);
+    float in_r = f_root * pos_in - neg_cap * (c_root / live_tot);
+    { float d=in_l+cl_cmp; float t=c_leaf+d; cl_cmp=(fabs(c_leaf)>=fabs(d))?((c_leaf-t)+d):((d-t)+c_leaf); c_leaf=t; }
+    { float d=in_r+cr_cmp; float t=c_root+d; cr_cmp=(fabs(c_root)>=fabs(d))?((c_root-t)+d):((d-t)+c_root); c_root=t; }
+    { float d=in_w+cw_cmp; float t=c_wood+d; cw_cmp=(fabs(c_wood)>=fabs(d))?((c_wood-t)+d):((d-t)+c_wood); c_wood=t; }
+
+    float turn_l = f_turn_l * max(c_leaf, 0.0f);
+    float turn_r = f_turn_r * max(c_root, 0.0f);
+    float turn_w = f_turn_w * max(c_wood, 0.0f);
+    { float d=-turn_l+cl_cmp; float t=c_leaf+d; cl_cmp=(fabs(c_leaf)>=fabs(d))?((c_leaf-t)+d):((d-t)+c_leaf); c_leaf=t; }
+    { float d=-turn_r+cr_cmp; float t=c_root+d; cr_cmp=(fabs(c_root)>=fabs(d))?((c_root-t)+d):((d-t)+c_root); c_root=t; }
+    { float d=-turn_w+cw_cmp; float t=c_wood+d; cw_cmp=(fabs(c_wood)>=fabs(d))?((c_wood-t)+d):((d-t)+c_wood); c_wood=t; }
+    { float d=(turn_l+turn_r)+clf_cmp; float t=c_lf+d; clf_cmp=(fabs(c_lf)>=fabs(d))?((c_lf-t)+d):((d-t)+c_lf); c_lf=t; }
+    { float d=turn_w+cls_cmp; float t=c_ls+d; cls_cmp=(fabs(c_ls)>=fabs(d))?((c_ls-t)+d):((d-t)+c_ls); c_ls=t; }
+
+    // Litter + 5-layer soil C decomposition & cryoturbation
+    float k_lf = _aoba_neg_expm1_neg(min((dt_yr / 0.7f) * env_s[0], 20.0f));
+    float k_ls = _aoba_neg_expm1_neg(min((dt_yr / 4.0f) * env_s[0], 20.0f));
+    float dec_lf = k_lf * max(c_lf, 0.0f);
+    float dec_ls = k_ls * max(c_ls, 0.0f);
+    { float d=-dec_lf+clf_cmp; float t=c_lf+d; clf_cmp=(fabs(c_lf)>=fabs(d))?((c_lf-t)+d):((d-t)+c_lf); c_lf=t; }
+    { float d=-dec_ls+cls_cmp; float t=c_ls+d; cls_cmp=(fabs(c_ls)>=fabs(d))?((c_ls-t)+d):((d-t)+c_ls); c_ls=t; }
+
+    float rh_lit_kg = 0.70f * dec_lf + 0.55f * dec_ls;
+    float humif_in = 0.30f * dec_lf + 0.45f * dec_ls;
+
+    float cs[5], csc[5], ks_arr[5];
+    float rh_soil_kg = 0.0f;
+    for (uint k = 0u; k < 5u; ++k) {
+        uint idx = k * M + i;
+        float v = c_soil_io[idx];
+        float vc = c_soil_comp_io[idx];
+        float din = (k == 0u) ? (0.70f * humif_in) : ((k == 1u) ? (0.30f * humif_in) : 0.0f);
+        if (din != 0.0f) { float d=din+vc; float t=v+d; vc=(fabs(v)>=fabs(d))?((v-t)+d):((d-t)+v); v=t; }
+        float ks = _aoba_neg_expm1_neg(min((dt_yr / 35.0f) * exp(-z_mid[k] * 2.0f) * env_s[k], 20.0f));
+        ks_arr[k] = ks;
+        float dec = ks * max(v, 0.0f);
+        rh_soil_kg += dec;
+        { float d=-dec+vc; float t=v+d; vc=(fabs(v)>=fabs(d))?((v-t)+d):((d-t)+v); v=t; }
+        cs[k] = v;
+        csc[k] = vc;
+    }
+    float f_cmix[4];
+    for (uint k = 0u; k < 4u; ++k) {
+        float c0 = max(cs[k], 0.0f) / dz[k];
+        float c1 = max(cs[k + 1u], 0.0f) / dz[k + 1u];
+        float dz_i = 0.5f * (dz[k] + dz[k + 1u]);
+        float fm = -(5.0e-4f * dt_yr) * (c1 - c0) / dz_i;
+        float fc = 0.25f * min(max(cs[k], 0.0f), max(cs[k + 1u], 0.0f));
+        f_cmix[k] = clamp(fm, -fc, fc);
+    }
+    for (uint k = 0u; k < 5u; ++k) {
+        float dm = ((k > 0u) ? f_cmix[k - 1u] : 0.0f) - ((k < 4u) ? f_cmix[k] : 0.0f);
+        float d = dm + csc[k];
+        float t = cs[k] + d;
+        csc[k] = (fabs(cs[k]) >= fabs(d)) ? ((cs[k] - t) + d) : ((d - t) + cs[k]);
+        c_soil_io[k * M + i] = t;
+        c_soil_comp_io[k * M + i] = csc[k];
+    }
+
+    // Store pre-fire 1D carbon pools
+    c_1d_io[i] = c_leaf; c_1d_io[M + i] = c_root; c_1d_io[2u * M + i] = c_wood;
+    c_1d_io[3u * M + i] = c_lf; c_1d_io[4u * M + i] = c_ls;
+    c_1d_io[5u * M + i] = cl_cmp; c_1d_io[6u * M + i] = cr_cmp; c_1d_io[7u * M + i] = cw_cmp;
+    c_1d_io[8u * M + i] = clf_cmp; c_1d_io[9u * M + i] = cls_cmp;
+
+    // Nitrogen 1D + 5-layer soil pools + leaching/denitrification
+    if (enable_n) {
+        float nl = n_1d_io[i], nr = n_1d_io[M + i], nw = n_1d_io[2u * M + i];
+        float nlf = n_1d_io[3u * M + i], nls = n_1d_io[4u * M + i], nmin = n_1d_io[5u * M + i];
+        float nlc = n_1d_io[6u * M + i], nrc = n_1d_io[7u * M + i], nwc = n_1d_io[8u * M + i];
+        float nlfc = n_1d_io[9u * M + i], nlsc = n_1d_io[10u * M + i], nminc = n_1d_io[11u * M + i];
+
+        { float d=(n_in_l-nturn_l_tot)+nlc; float t=nl+d; nlc=(fabs(nl)>=fabs(d))?((nl-t)+d):((d-t)+nl); nl=t; }
+        { float d=(n_in_r-nturn_r_tot)+nrc; float t=nr+d; nrc=(fabs(nr)>=fabs(d))?((nr-t)+d):((d-t)+nr); nr=t; }
+        { float d=(n_in_w-nturn_w_tot)+nwc; float t=nw+d; nwc=(fabs(nw)>=fabs(d))?((nw-t)+d):((d-t)+nw); nw=t; }
+        { float d=(nturn_l_lit+nturn_r_lit)+nlfc; float t=nlf+d; nlfc=(fabs(nlf)>=fabs(d))?((nlf-t)+d):((d-t)+nlf); nlf=t; }
+        { float d=nturn_w_tot+nlsc; float t=nls+d; nlsc=(fabs(nls)>=fabs(d))?((nls-t)+d):((d-t)+nls); nls=t; }
+
+        float dec_nlf = k_lf * max(nlf, 0.0f);
+        float dec_nls = k_ls * max(nls, 0.0f);
+        { float d=-dec_nlf+nlfc; float t=nlf+d; nlfc=(fabs(nlf)>=fabs(d))?((nlf-t)+d):((d-t)+nlf); nlf=t; }
+        { float d=-dec_nls+nlsc; float t=nls+d; nlsc=(fabs(nls)>=fabs(d))?((nls-t)+d):((d-t)+nls); nls=t; }
+
+        float n_lit_rel = dec_nlf + dec_nls;
+        float n_hum_tgt = humif_in / 14.0f;
+        float n_immob = min(max(n_hum_tgt - n_lit_rel, 0.0f), 0.5f * max(nmin - u_soil, 0.0f));
+        float n_hum_act = (n_lit_rel >= n_hum_tgt) ? n_hum_tgt : (n_lit_rel + n_immob);
+        float n_min_lit = n_lit_rel - n_hum_act;
+
+        float ns[5], nsc[5];
+        float n_min_soil = 0.0f;
+        for (uint k = 0u; k < 5u; ++k) {
+            uint idx = k * M + i;
+            float v = n_soil_io[idx];
+            float vc = n_soil_comp_io[idx];
+            float din = (k == 0u) ? (0.70f * n_hum_act) : ((k == 1u) ? (0.30f * n_hum_act) : 0.0f);
+            if (din != 0.0f) { float d=din+vc; float t=v+d; vc=(fabs(v)>=fabs(d))?((v-t)+d):((d-t)+v); v=t; }
+            float dec = ks_arr[k] * max(v, 0.0f);
+            n_min_soil += dec;
+            { float d=-dec+vc; float t=v+d; vc=(fabs(v)>=fabs(d))?((v-t)+d):((d-t)+v); v=t; }
+            ns[k] = v; nsc[k] = vc;
+        }
+        float f_nmix[4];
+        for (uint k = 0u; k < 4u; ++k) {
+            float c0 = max(ns[k], 0.0f) / dz[k];
+            float c1 = max(ns[k + 1u], 0.0f) / dz[k + 1u];
+            float dz_i = 0.5f * (dz[k] + dz[k + 1u]);
+            float fm = -(5.0e-4f * dt_yr) * (c1 - c0) / dz_i;
+            float fc = 0.25f * min(max(ns[k], 0.0f), max(ns[k + 1u], 0.0f));
+            f_nmix[k] = clamp(fm, -fc, fc);
+        }
+        for (uint k = 0u; k < 5u; ++k) {
+            float dm = ((k > 0u) ? f_nmix[k - 1u] : 0.0f) - ((k < 4u) ? f_nmix[k] : 0.0f);
+            float d = dm + nsc[k];
+            float t = ns[k] + d;
+            nsc[k] = (fabs(ns[k]) >= fabs(d)) ? ((ns[k] - t) + d) : ((d - t) + ns[k]);
+            n_soil_io[k * M + i] = t;
+            n_soil_comp_io[k * M + i] = nsc[k];
+        }
+
+        float n_dep_in = n_dep_s * dt;
+        float dn_bio = n_dep_in + bnf_asym + n_min_lit + n_min_soil - u_soil;
+        { float d=dn_bio+nminc; float t=nmin+d; nminc=(fabs(nmin)>=fabs(d))?((nmin-t)+d):((d-t)+nmin); nmin=t; }
+
+        float nmin_pos = max(nmin, 0.0f);
+        float k_leach = 0.60f * clamp((sat_0 - 0.35f) / 0.65f, 0.0f, 1.0f) * f_frz[0];
+        float k_denit = 0.80f * clamp((sat_0 - 0.65f) / 0.35f, 0.0f, 1.0f) * f_t_s[0] * f_frz[0];
+        float k_ltot = k_leach + k_denit;
+        float n_loss = _aoba_neg_expm1_neg(min(k_ltot * dt_yr, 20.0f)) * nmin_pos;
+        float n_leach = (k_ltot > 1.0e-12f) ? (n_loss * (k_leach / max(k_ltot, 1.0e-12f))) : 0.0f;
+        float n_denit = n_loss - n_leach;
+        { float d=-n_loss+nminc; float t=nmin+d; nminc=(fabs(nmin)>=fabs(d))?((nmin-t)+d):((d-t)+nmin); nmin=t; }
+
+        n_1d_io[i] = nl; n_1d_io[M + i] = nr; n_1d_io[2u * M + i] = nw;
+        n_1d_io[3u * M + i] = nlf; n_1d_io[4u * M + i] = nls; n_1d_io[5u * M + i] = nmin;
+        n_1d_io[6u * M + i] = nlc; n_1d_io[7u * M + i] = nrc; n_1d_io[8u * M + i] = nwc;
+        n_1d_io[9u * M + i] = nlfc; n_1d_io[10u * M + i] = nlsc; n_1d_io[11u * M + i] = nminc;
+
+        n_diag_out[i] = (bnf_sym + bnf_asym) * inv_dt;
+        n_diag_out[M + i] = u_soil * inv_dt;
+        n_diag_out[2u * M + i] = n_dep_in * inv_dt;
+        n_diag_out[3u * M + i] = n_leach * inv_dt;
+        n_diag_out[4u * M + i] = n_denit * inv_dt;
+    }
+
+    // 5. SPITFIRE Fire Risk, Rothermel Spread, Byram Intensity, Scorch & Mortality
+    float t_air_c = clamp(t_sfc_k - 273.15f, -40.0f, 55.0f);
+    float dp_dep = clamp(vpd_pa / 160.0f, 0.0f, 35.0f);
+    float di_inc = max(t_air_c, 0.0f) * dp_dep * (dt / 86400.0f);
+    bool wet_rst = (precip_s * 86400.0f > 3.0f) || (f_snow > 0.20f);
+    float di_new = wet_rst ? 0.0f : clamp(aux_io[M + i] + di_inc, 0.0f, 5000.0f);
+    aux_io[M + i] = di_new;
+
+    float fdi = _aoba_neg_expm1_neg(3.0e-4f * di_new);
+    float fuel_lit = max(c_lf + c_ls, 0.0f);
+    float f_fuel = clamp((fuel_lit - 0.12f) / 0.45f, 0.0f, 1.0f);
+    float r_m = clamp(1.0f - fdi * (1.0f - 0.45f * sat_0), 0.05f, 1.0f);
+    float eta_m = clamp(1.0f + r_m * (-2.59f + r_m * (5.11f - 3.52f * r_m)), 0.0f, 1.0f);
+    float u_fwd = max(u10_ms, 0.0f) * (1.0f - 0.45f * tanh(h_canopy * 0.125f));
+    float u_fwd_mmin = u_fwd * 60.0f;
+    float u_fwd_cap = min(u_fwd_mmin, 1200.0f);
+    float phi_w = (u_fwd_cap > 0.0f) ? (0.05f * pow(u_fwd_cap, 0.85f)) : 0.0f;
+    float ros_f = clamp(3.5f * eta_m * (1.0f + phi_w) * f_fuel, 0.0f, 50.0f);
+    float ros_b = ros_f * exp(-0.012f * min(u_fwd_mmin, 500.0f));
+    float e_u = 1.0f - exp(-0.03f * min(u_fwd, 30.0f));
+    float l_b = (e_u > 0.0f) ? (1.0f + 8.729f * pow(e_u, 2.155f)) : 1.0f;
+    float t_fire_min = 241.0f / (1.0f + 240.0f * exp(-11.06f * fdi));
+    float d_major = (ros_f + ros_b) * t_fire_min;
+    float a_fire = min((0.25f * 3.14159265359f / l_b) * (d_major * d_major), crm_dx * crm_dx);
+
+    float fc_dm = 2.0f * (0.70f * max(c_lf, 0.0f) + 0.35f * max(c_ls, 0.0f));
+    float i_byram = 18000.0f * fc_dm * (ros_f / 60.0f);
+    float can_s = (i_byram >= 50.0f) ? 1.0f : 0.0f;
+    float sh_m = (can_s > 0.5f) ? (0.11f * pow(max(i_byram, 0.0f), 2.0f / 3.0f)) : 0.0f;
+    float f_ck = clamp((sh_m - 0.35f * h_canopy) / max(0.65f * h_canopy, 0.5f), 0.0f, 1.0f);
+    float p_crown = 0.85f * (f_ck * f_ck * f_ck);
+    float d_bark = 0.8f + ((h_canopy > 0.0f) ? (1.8f * pow(h_canopy * 0.1f, 0.6f)) : 0.0f);
+    float tau_l = 1.5f + 0.002f * min(i_byram, 5000.0f);
+    float tau_c = max(2.9f * d_bark * d_bark, 0.5f);
+    float p_camb = clamp((tau_l / tau_c - 0.22f) / 1.78f, 0.0f, 1.0f);
+    float p_mort = clamp(1.0f - (1.0f - p_crown) * (1.0f - p_camb), 0.0f, 1.0f) * can_s;
+
+    float n_ig = 0.04f * cg_rate * fdi * dt;
+    float rate_s = min(n_ig * a_fire * inv_dt, 1.50f / sec_yr) * can_s;
+    float p_burn_cont = _aoba_neg_expm1_neg(clamp(rate_s * dt, 0.0f, 0.25f));
+
+    fire_out[i] = can_s;
+    fire_out[M + i] = fdi;
+    fire_out[2u * M + i] = d_major;
+    fire_out[3u * M + i] = i_byram * can_s;
+    fire_out[4u * M + i] = sh_m;
+    fire_out[5u * M + i] = p_mort;
+    fire_out[6u * M + i] = p_burn_cont;
+    fire_out[7u * M + i] = gpp;
+    fire_out[8u * M + i] = ra_eff;
+    fire_out[9u * M + i] = (rh_lit_kg + rh_soil_kg) * inv_dt;
+}
+
+kernel void land_carbon_fire_commit_tile(
+    device const int* surf_type     [[buffer(0)]],  // [M]
+    device const float* f_burn_in   [[buffer(1)]],  // [M]
+    device const float* p_mort_in   [[buffer(2)]],  // [M]
+    device float* c_1d_io           [[buffer(3)]],  // [10, M]
+    device float* n_1d_io           [[buffer(4)]],  // [12, M]
+    device float* fire_c_n_out      [[buffer(5)]],  // [2, M]: fire_c_flux, fire_n_vol_flux
+    constant ulong4& u_dim          [[buffer(6)]],  // [M, enable_n, 0, 0]
+    constant float4& f_p0           [[buffer(7)]],  // [inv_dt, 0, 0, 0]
+    uint i                          [[thread_position_in_grid]])
+{
+    uint M = uint(u_dim.x);
+    bool enable_n = (uint(u_dim.y) != 0u);
+    if (i >= M) return;
+    if (surf_type[i] != 1) {
+        fire_c_n_out[i] = 0.0f;
+        fire_c_n_out[M + i] = 0.0f;
+        return;
+    }
+    float fb = f_burn_in[i];
+    if (fb <= 0.0f) {
+        fire_c_n_out[i] = 0.0f;
+        fire_c_n_out[M + i] = 0.0f;
+        return;
+    }
+    float inv_dt = f_p0.x;
+    float pm = p_mort_in[i];
+    float w_eff = 0.10f * (0.25f + 0.75f * pm);
+    float l_eff = 0.55f * (0.30f + 0.70f * pm);
+
+    float cl = c_1d_io[i], cw = c_1d_io[2u * M + i], clf = c_1d_io[3u * M + i], cls = c_1d_io[4u * M + i];
+    float clc = c_1d_io[5u * M + i], cwc = c_1d_io[7u * M + i], clfc = c_1d_io[8u * M + i], clsc = c_1d_io[9u * M + i];
+    float b_lf = (fb * 0.70f) * max(clf, 0.0f);
+    float b_ls = (fb * 0.70f) * max(cls, 0.0f);
+    float b_l  = (fb * l_eff) * max(cl, 0.0f);
+    float b_w  = (fb * w_eff) * max(cw, 0.0f);
+    { float d=-b_l+clc; float t=cl+d; clc=(fabs(cl)>=fabs(d))?((cl-t)+d):((d-t)+cl); cl=t; }
+    { float d=-b_w+cwc; float t=cw+d; cwc=(fabs(cw)>=fabs(d))?((cw-t)+d):((d-t)+cw); cw=t; }
+    { float d=-b_lf+clfc; float t=clf+d; clfc=(fabs(clf)>=fabs(d))?((clf-t)+d):((d-t)+clf); clf=t; }
+    { float d=-b_ls+clsc; float t=cls+d; clsc=(fabs(cls)>=fabs(d))?((cls-t)+d):((d-t)+cls); cls=t; }
+    c_1d_io[i] = cl; c_1d_io[2u * M + i] = cw; c_1d_io[3u * M + i] = clf; c_1d_io[4u * M + i] = cls;
+    c_1d_io[5u * M + i] = clc; c_1d_io[7u * M + i] = cwc; c_1d_io[8u * M + i] = clfc; c_1d_io[9u * M + i] = clsc;
+    fire_c_n_out[i] = (b_lf + b_ls + b_l + b_w) * inv_dt;
+
+    if (enable_n) {
+        float nl = n_1d_io[i], nw = n_1d_io[2u * M + i], nlf = n_1d_io[3u * M + i], nls = n_1d_io[4u * M + i], nmin = n_1d_io[5u * M + i];
+        float nlc = n_1d_io[6u * M + i], nwc = n_1d_io[8u * M + i], nlfc = n_1d_io[9u * M + i], nlsc = n_1d_io[10u * M + i], nminc = n_1d_io[11u * M + i];
+        float bn_lf = (fb * 0.70f) * max(nlf, 0.0f);
+        float bn_ls = (fb * 0.70f) * max(nls, 0.0f);
+        float bn_l  = (fb * l_eff) * max(nl, 0.0f);
+        float bn_w  = (fb * w_eff) * max(nw, 0.0f);
+        { float d=-bn_l+nlc; float t=nl+d; nlc=(fabs(nl)>=fabs(d))?((nl-t)+d):((d-t)+nl); nl=t; }
+        { float d=-bn_w+nwc; float t=nw+d; nwc=(fabs(nw)>=fabs(d))?((nw-t)+d):((d-t)+nw); nw=t; }
+        { float d=-bn_lf+nlfc; float t=nlf+d; nlfc=(fabs(nlf)>=fabs(d))?((nlf-t)+d):((d-t)+nlf); nlf=t; }
+        { float d=-bn_ls+nlsc; float t=nls+d; nlsc=(fabs(nls)>=fabs(d))?((nls-t)+d):((d-t)+nls); nls=t; }
+        float bn_tot = bn_lf + bn_ls + bn_l + bn_w;
+        float n_vol = 0.85f * bn_tot;
+        float n_ash = bn_tot - n_vol;
+        { float d=n_ash+nminc; float t=nmin+d; nminc=(fabs(nmin)>=fabs(d))?((nmin-t)+d):((d-t)+nmin); nmin=t; }
+        n_1d_io[i] = nl; n_1d_io[2u * M + i] = nw; n_1d_io[3u * M + i] = nlf; n_1d_io[4u * M + i] = nls; n_1d_io[5u * M + i] = nmin;
+        n_1d_io[6u * M + i] = nlc; n_1d_io[8u * M + i] = nwc; n_1d_io[9u * M + i] = nlfc; n_1d_io[10u * M + i] = nlsc; n_1d_io[11u * M + i] = nminc;
+        fire_c_n_out[M + i] = n_vol * inv_dt;
+    } else {
+        fire_c_n_out[M + i] = 0.0f;
+    }
+}
 """
 
 
@@ -8085,6 +8968,7 @@ def run_ogcm_fct_zstar_metal(
     dt: float,
     kappa_redi: float,
     enable_full_redi: bool,
+    in_place: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute batched `[B, nzo, nc]` OGCM Zalesak FCT + z* + Redi + Kahan on GPU (Metal/CUDA)."""
     B, nzo, nc = q.shape
@@ -8135,36 +9019,36 @@ def run_ogcm_fct_zstar_metal(
 
     u_dim = [B, nzo, nc, ne]
     redi_f = 1.0 if enable_full_redi else 0.0
-    n_edge_tot = B * nzo * ne
-    n_cell_tot = B * nzo * nc
+    n_edge_1 = nzo * ne
+    n_cell_1 = nzo * nc
 
     lib.ogcm_fct_edge(
         c0_i32, c1_i32, idc_c, wve_c, dz_c, qp, hu_c, he_c, wef_c, wic_c, wie_c, sx_c,
         fl_h, ah_e, f_dif, s_dqdx_ew,
         u_dim, [float(kappa_redi), redi_f, 0.0, 0.0],
-        threads=n_edge_tot,
+        threads=n_edge_1,
     )
     lib.ogcm_fct_cell_td(
         eoc_i32, dw_c, qp, ho_c, hn_c, fl_h, ws_c, wcf_c, wic_c,
         qp_td, fl_v, av_int,
         u_dim, float(dt),
-        threads=n_cell_tot,
+        threads=n_cell_1,
     )
     lib.ogcm_fct_bounds_ratios(
         c0_i32, c1_i32, eoc_i32, dw_c, qp, qp_td, hn_c, ah_e, av_int, wcf_c, wef_c, wic_c,
         r_plus, r_minus,
         u_dim, float(dt),
-        threads=n_cell_tot,
+        threads=n_cell_1,
     )
-    q_out = torch.empty_like(q_c)
-    q_comp_out = torch.empty_like(qc_c)
+    q_out = q_c if in_place else torch.empty_like(q_c)
+    q_comp_out = qc_c if in_place else torch.empty_like(qc_c)
     lib.ogcm_fct_limit_kahan(
         c0_i32, c1_i32, eoc_i32, dw_c, aw_c,
         q_c, qc_c, qp, fnl_c, ho_c, hn_c, fl_h, ah_e, f_dif, s_dqdx_ew,
         fl_v, av_int, r_plus, r_minus, wcf_c, wef_c, wic_c,
         q_out, q_comp_out,
         u_dim, [float(dt), float(kappa_redi), redi_f, 0.0],
-        threads=n_cell_tot,
+        threads=n_cell_1,
     )
     return q_out, q_comp_out
 
@@ -8192,38 +9076,47 @@ def run_ocean_bgc_column_metal(
     co2_ppmv: float,
     dt: float,
     rho_sw: float,
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-]:
+    *,
+    o2: torch.Tensor | None = None,
+    o2_comp: torch.Tensor | None = None,
+    fe_sfc: torch.Tensor | None = None,
+    in_place: bool = True,
+) -> tuple[Any, ...]:
     nzo, nc = no3.shape
     dev = no3.device
     dtype = no3.dtype
 
-    no3_io = no3.contiguous().clone()
-    phy_io = phy.contiguous().clone()
-    zoo_io = zoo.contiguous().clone()
-    dn_io = det_n.contiguous().clone()
-    dc_io = det_c.contiguous().clone()
-    dic_io = dic.contiguous().clone()
-    alk_io = alk.contiguous().clone()
-    no3_c = no3_comp.contiguous().clone()
-    dic_c = dic_comp.contiguous().clone()
-    alk_c = alk_comp.contiguous().clone()
+    def _prep(t: torch.Tensor) -> torch.Tensor:
+        tc = t.contiguous()
+        return tc if in_place else tc.clone()
 
-    sfc_in = torch.stack([h0_new, sw_par_sfc, u10_ocn, f_seaice], dim=0).contiguous()
+    no3_io = _prep(no3)
+    phy_io = _prep(phy)
+    zoo_io = _prep(zoo)
+    dn_io = _prep(det_n)
+    dc_io = _prep(det_c)
+    dic_io = _prep(dic)
+    alk_io = _prep(alk)
+    no3_c = _prep(no3_comp)
+    dic_c = _prep(dic_comp)
+    alk_c = _prep(alk_comp)
+
+    has_o2 = 1 if (o2 is not None and o2_comp is not None) else 0
+    has_fe = 1 if (fe_sfc is not None) else 0
+    o2_io = _prep(o2) if has_o2 else torch.empty((1,), dtype=dtype, device=dev)
+    o2_c = _prep(o2_comp) if has_o2 else torch.empty((1,), dtype=dtype, device=dev)
+    fe_in = fe_sfc if has_fe else torch.zeros_like(h0_new)
+
+    sfc_in = torch.stack([h0_new, sw_par_sfc, u10_ocn, f_seaice, fe_in], dim=0).contiguous()
     diag_3d = torch.empty((3, nzo, nc), dtype=dtype, device=dev)
-    diag_2d = torch.empty((5, nc), dtype=dtype, device=dev)
+    diag_2d = torch.empty((9, nc), dtype=dtype, device=dev)
 
     lib.ocean_bgc_column_col(
         no3_io, phy_io, zoo_io, dn_io, dc_io, dic_io, alk_io,
         no3_c, dic_c, alk_c,
         temp_k.contiguous(), sal_psu.contiguous(), h_c.contiguous(), wet_cf.contiguous(),
-        sfc_in, diag_3d, diag_2d,
-        [nzo, nc, 0, 0],
+        sfc_in, diag_3d, diag_2d, o2_io, o2_c,
+        [nzo, nc, has_o2, has_fe],
         [float(dt), float(co2_ppmv), float(rho_sw), 0.0],
         threads=nc,
     )
@@ -8232,7 +9125,158 @@ def run_ocean_bgc_column_metal(
         no3_c, dic_c, alk_c,
         diag_3d[0], diag_3d[1], diag_3d[2],
         diag_2d[0], diag_2d[1], diag_2d[2], diag_2d[3], diag_2d[4],
+        o2_io if has_o2 else None,
+        o2_c if has_o2 else None,
+        diag_2d[5], diag_2d[6], diag_2d[7], diag_2d[8],
     )
+
+
+def run_ogcm_multi_vdiff_metal(
+    lib: Any,
+    q: torch.Tensor,        # [B, nzo, nc]
+    q_comp: torch.Tensor,   # [B, nzo, nc]
+    c_dif: torch.Tensor,    # [nzo-1, nc]
+    h_eff: torch.Tensor,    # [nzo, nc]
+    wet_cf: torch.Tensor,   # [nzo, nc]
+    clamp_nonneg_mask: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused GPU multi-tracer OGCM flux-increment vertical diffusion (shared Thomas factorization)."""
+    B, nzo, nc = q.shape
+    q_io = q.contiguous()
+    qc_io = q_comp.contiguous()
+    lib.ogcm_multi_vdiff_col(
+        q_io, qc_io,
+        c_dif.contiguous(), h_eff.contiguous(), wet_cf.contiguous(),
+        [B, nzo, nc, int(clamp_nonneg_mask)],
+        threads=nc,
+    )
+    return q_io, qc_io
+
+
+def run_crm_lightning_metal(
+    lib: Any,
+    rho_d: torch.Tensor,
+    theta_m: torch.Tensor,
+    q_v: torch.Tensor,
+    q_i: torch.Tensor,
+    q_p: torch.Tensor,
+    w_stag: torch.Tensor,
+    z_c: torch.Tensor,
+    dz_c: torch.Tensor,
+    cal_factor: float,
+    q_g_prog: torch.Tensor | None = None,
+    q_s_prog: torch.Tensor | None = None,
+    t0_precip: float = 283.16,
+    t00_precip: float = 268.16,
+    t0_graupel: float = 283.16,
+    t00_graupel: float = 223.16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused GPU CRM non-inductive charging lightning & cold-cloud depth diagnosis."""
+    nz, nc, ny, nx = rho_d.shape
+    n_sub = ny * nx
+    M = nc * n_sub
+    dev = rho_d.device
+    dtype = rho_d.dtype
+    has_qg = 1 if q_g_prog is not None else 0
+    has_qs = 2 if q_s_prog is not None else 0
+    z_2d = 4 if z_c.ndim == 2 else 0
+    flags = has_qg | has_qs | z_2d
+    dummy = torch.empty((1,), device=dev, dtype=dtype)
+    out_4 = torch.empty((4, M), device=dev, dtype=dtype)
+    lib.crm_lightning_col(
+        rho_d.reshape(nz, M).contiguous(),
+        theta_m.reshape(nz, M).contiguous(),
+        q_v.reshape(nz, M).contiguous(),
+        q_i.reshape(nz, M).contiguous(),
+        q_p.reshape(nz, M).contiguous(),
+        w_stag.reshape(nz + 1, M).contiguous(),
+        z_c.contiguous(),
+        dz_c.contiguous(),
+        q_g_prog.reshape(nz, M).contiguous() if q_g_prog is not None else dummy,
+        q_s_prog.reshape(nz, M).contiguous() if q_s_prog is not None else dummy,
+        out_4,
+        [nz, nc, n_sub, flags],
+        [float(cal_factor), float(C.P_REF), float(C.R_D), float(C.CP_D)],
+        [float(C.RV_OVER_RD), float(t0_precip), float(t00_precip), float(t0_graupel)],
+        [float(t00_graupel), float(C.T_FREEZE), 0.0, 0.0],
+        threads=M,
+    )
+    sh3 = (nc, ny, nx)
+    return out_4[0].view(sh3), out_4[1].view(sh3), out_4[2].view(sh3), out_4[3].view(sh3)
+
+
+def run_land_carbon_cn_fire_metal(
+    lib: Any,
+    surf_type_i32: torch.Tensor,
+    f_in: torch.Tensor,
+    t_soil: torch.Tensor,
+    w_liq: torch.Tensor,
+    w_ice: torch.Tensor,
+    c_1d_io: torch.Tensor,
+    c_soil_io: torch.Tensor,
+    c_soil_comp_io: torch.Tensor,
+    n_1d_io: torch.Tensor,
+    n_soil_io: torch.Tensor,
+    n_soil_comp_io: torch.Tensor,
+    aux_io: torch.Tensor,
+    *,
+    enable_n: bool,
+    use_maml: bool,
+    maml_shape: tuple[int, int, int] | None,
+    dt: float,
+    sec_per_yr: float,
+    crm_dx_m: float,
+    soil_porosity: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused GPU terrestrial C/N + 5-layer permafrost + MAML SPITFIRE wildfire step."""
+    M = int(surf_type_i32.shape[0])
+    dev = f_in.device
+    dtype = f_in.dtype
+    fire_out = torch.empty((10, M), device=dev, dtype=dtype)
+    n_diag_out = torch.empty((5, M), device=dev, dtype=dtype)
+    lib.land_carbon_cn_fire_prep_tile(
+        surf_type_i32, f_in, t_soil, w_liq, w_ice,
+        c_1d_io, c_soil_io, c_soil_comp_io,
+        n_1d_io, n_soil_io, n_soil_comp_io,
+        aux_io, fire_out, n_diag_out,
+        [M, 1 if enable_n else 0, 1 if use_maml else 0, 0],
+        [float(dt), float(sec_per_yr), float(crm_dx_m), float(soil_porosity)],
+        threads=M,
+    )
+    can_s = fire_out[0]
+    fdi = fire_out[1]
+    d_major = fire_out[2]
+    p_mort = fire_out[5]
+    p_burn_cont = fire_out[6]
+    is_land_b = (surf_type_i32 == 1)
+
+    if use_maml and maml_shape is not None:
+        nc_m, ny_m, nx_m = maml_shape
+        acc_new = torch.where(is_land_b, aux_io[2] + p_burn_cont, torch.zeros_like(p_burn_cont))
+        did_burn = (acc_new >= 1.0) & (can_s > 0.5)
+        spread_reach = (d_major >= 0.40 * float(crm_dx_m)) & did_burn
+        if ny_m > 1 or nx_m > 1:
+            sr_3d = spread_reach.view(nc_m, ny_m, nx_m)
+            nb_fire = torch.roll(sr_3d, 1, dims=-1) | torch.roll(sr_3d, -1, dims=-1)
+            if ny_m > 1:
+                nb_fire = nb_fire | torch.roll(sr_3d, 1, dims=-2) | torch.roll(sr_3d, -1, dims=-2)
+            dry_nb = nb_fire.reshape(-1) & (can_s > 0.5) & (fdi > 0.25) & (acc_new >= 0.50)
+            did_burn = did_burn | dry_nb
+        aux_io[2] = torch.where(did_burn, torch.zeros_like(acc_new), torch.clamp(acc_new, 0.0, 0.9999))
+        f_burn = did_burn.to(dtype)
+    else:
+        f_burn = p_burn_cont
+
+    fire_cn = torch.empty((2, M), device=dev, dtype=dtype)
+    inv_dt = 1.0 / max(float(dt), 1.0)
+    lib.land_carbon_fire_commit_tile(
+        surf_type_i32, f_burn.contiguous(), p_mort.contiguous(),
+        c_1d_io, n_1d_io, fire_cn,
+        [M, 1 if enable_n else 0, 0, 0],
+        [float(inv_dt), 0.0, 0.0, 0.0],
+        threads=M,
+    )
+    return fire_out, n_diag_out, f_burn, fire_cn
 
 
 _SCVT_PREP_WS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}

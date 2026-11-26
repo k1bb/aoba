@@ -49,6 +49,17 @@ class RiverRoutingState:
     storage_comp: torch.Tensor     # [N_cells] float32 Kahan compensation for storage_kg [kg]
     discharge_m3s: torch.Tensor    # [N_cells] float32 instantaneous river discharge [m^3 s^-1]
     mouth_flux_kgm2s: torch.Tensor # [N_cells] float32 freshwater discharge into ocean cells [kg m^-2 s^-1]
+    # Optional Kahan-compensated riverine biogeochemical solute transport (Land -> River -> Coastal Ocean)
+    storage_n_kg: torch.Tensor | None = None      # [N_cells] river channel dissolved N storage [kg N]
+    storage_n_comp: torch.Tensor | None = None    # [N_cells] Kahan compensation [kg N]
+    storage_c_kg: torch.Tensor | None = None      # [N_cells] river channel fluvial C (DIC+DOC) storage [kg C]
+    storage_c_comp: torch.Tensor | None = None    # [N_cells] Kahan compensation [kg C]
+    storage_alk_mol: torch.Tensor | None = None   # [N_cells] river channel weathering alkalinity storage [mol eq]
+    storage_alk_comp: torch.Tensor | None = None  # [N_cells] Kahan compensation [mol eq]
+    mouth_n_kgn_m2s: torch.Tensor | None = None   # [N_cells] coastal ocean N delivery [kg N m^-2 s^-1]
+    mouth_c_kgc_m2s: torch.Tensor | None = None   # [N_cells] coastal ocean C delivery [kg C m^-2 s^-1]
+    mouth_alk_mol_m2s: torch.Tensor | None = None # [N_cells] coastal ocean Alk delivery [mol eq m^-2 s^-1]
+    mouth_fe_mol_m2s: torch.Tensor | None = None  # [N_cells] coastal ocean bioavailable Fe delivery [mol Fe m^-2 s^-1]
 
 
 def build_priority_flood_network(
@@ -304,3 +315,94 @@ def step_river_routing_voronoi(
     mouth_flux = (inflow_up_kg * is_ocn_f) / torch.clamp(area_cell * dt, min=1.0)
     river.mouth_flux_kgm2s = mouth_flux
     return mouth_flux
+
+
+# Riverine biogeochemical solute parameters (Seitzinger et al., 2002; Regnier et al., 2013; Raiswell & Canfield, 2012)
+RIVER_DENIT_K20_S: float = 0.03 / 86400.0  # In-stream / riparian denitrification rate at 20 degC (~20-30% basin removal) [s^-1]
+RIVER_FE_ESTUARINE_MOL_KG: float = 1.0e-7  # Bioavailable riverine Fe surviving estuarine flocculation (~0.1 uM = 1e-7 mol/kg)
+
+
+def step_river_solute_routing(
+    river: RiverRoutingState,
+    area_cell: torch.Tensor,
+    dt: float,
+    *,
+    n_leach_kgn_m2s: torch.Tensor | None = None,
+    c_export_kgc_m2s: torch.Tensor | None = None,
+    alk_src_mol_m2s: torch.Tensor | None = None,
+    t_sfc_k: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Route terrestrial leached N, fluvial C, weathering Alk, and coastal Fe down the Voronoi river graph.
+
+    Uses the exact same exponential linear-reservoir outflow `f_out = -expm1(-(v/L)*dt)` and
+    Kahan compensated summation as water routing, guaranteeing strict solute mass conservation
+    along the land -> river -> coastal ocean continuum.
+    """
+    dev = river.storage_kg.device
+    dtype = river.storage_kg.dtype
+    nc = int(river.storage_kg.shape[0])
+    is_land_f = river.is_land_river.to(dtype)
+    is_ocn_f = 1.0 - is_land_f
+
+    if river.storage_n_kg is None:
+        z = torch.zeros((nc,), device=dev, dtype=dtype)
+        river.storage_n_kg = z.clone()
+        river.storage_n_comp = z.clone()
+        river.storage_c_kg = z.clone()
+        river.storage_c_comp = z.clone()
+        river.storage_alk_mol = z.clone()
+        river.storage_alk_comp = z.clone()
+    assert river.storage_n_comp is not None and river.storage_c_kg is not None and river.storage_c_comp is not None
+    assert river.storage_alk_mol is not None and river.storage_alk_comp is not None
+
+    k_rate = river.flow_vel_ms / torch.clamp(river.reach_len_m, min=1.0)
+    f_out = -torch.expm1(-torch.clamp(k_rate * dt, min=0.0, max=40.0))
+    inv_area_dt = 1.0 / torch.clamp(area_cell * dt, min=1.0)
+
+    # Temperature-dependent in-stream denitrification factor for riverine NO3 (Q10 ~ 2)
+    if t_sfc_k is not None:
+        tc_r = torch.clamp(t_sfc_k - 273.15, min=0.0, max=40.0)
+        f_denit_riv = -torch.expm1(-torch.clamp(RIVER_DENIT_K20_S * torch.exp(0.0693 * (tc_r - 20.0)) * dt, min=0.0, max=10.0))
+    else:
+        f_denit_riv = torch.full((nc,), -math.expm1(-RIVER_DENIT_K20_S * dt), device=dev, dtype=dtype)
+
+    def _route_one(
+        stor: torch.Tensor,
+        comp: torch.Tensor,
+        src_flux: torch.Tensor | None,
+        f_loss: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if src_flux is not None:
+            in_loc = torch.clamp(src_flux, min=0.0) * area_cell * dt * is_land_f
+            s_mid, c_mid = _kahan_add(stor, in_loc, comp)
+        else:
+            s_mid, c_mid = stor, comp
+        s_pos = torch.clamp(s_mid, min=0.0) * is_land_f
+        loss_inst = (s_pos * f_loss) if f_loss is not None else torch.zeros_like(s_pos)
+        s_avail = torch.clamp(s_pos - loss_inst, min=0.0)
+        out_m = (s_avail * f_out) * is_land_f
+        in_up = torch.zeros_like(out_m)
+        in_up.scatter_add_(0, river.downstream_idx, out_m)
+        net_d = (in_up * is_land_f) - out_m - loss_inst
+        s_new, c_new = _kahan_add(s_mid, net_d, c_mid)
+        s_new = torch.clamp(s_new, min=0.0) * is_land_f
+        c_new = c_new * is_land_f
+        mouth_f = (in_up * is_ocn_f) * inv_area_dt
+        return s_new, c_new, mouth_f
+
+    river.storage_n_kg, river.storage_n_comp, mouth_n = _route_one(
+        river.storage_n_kg, river.storage_n_comp, n_leach_kgn_m2s, f_loss=f_denit_riv
+    )
+    river.storage_c_kg, river.storage_c_comp, mouth_c = _route_one(
+        river.storage_c_kg, river.storage_c_comp, c_export_kgc_m2s, f_loss=None
+    )
+    river.storage_alk_mol, river.storage_alk_comp, mouth_alk = _route_one(
+        river.storage_alk_mol, river.storage_alk_comp, alk_src_mol_m2s, f_loss=None
+    )
+    mouth_fe = torch.clamp(river.mouth_flux_kgm2s, min=0.0) * RIVER_FE_ESTUARINE_MOL_KG * is_ocn_f
+
+    river.mouth_n_kgn_m2s = mouth_n
+    river.mouth_c_kgc_m2s = mouth_c
+    river.mouth_alk_mol_m2s = mouth_alk
+    river.mouth_fe_mol_m2s = mouth_fe
+    return mouth_n, mouth_c, mouth_alk, mouth_fe

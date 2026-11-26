@@ -3904,33 +3904,101 @@ def step_aoba_model(
             accel_factor=cfg.weathering_accel_factor,
         )
         alk_weath_cell = model.weathering.alk_flux_mol_m2s
-    # 8b-4. Land-Atmosphere-Ocean BGC Deposition (Dust Fe + LNOx NO3 + Weathering Alk -> FlexPFT)
+    # 8b-4. Land-River-Atmosphere-Ocean BGC Nutrient Coupling
+    #       (Atmospheric Dust+Pyrogenic BC Fe, Lightning LNOx + Wildfire N, & Riverine N, C, Alk, Fe -> FlexPFT)
     if (
-        (bool(cfg.enable_bgc_fe_lnox_coupling) or alk_weath_cell is not None)
+        (bool(cfg.enable_bgc_fe_lnox_coupling) or alk_weath_cell is not None or bool(cfg.enable_river_routing))
         and model.ogcm is not None
         and model.ogcm.bgc is not None
     ):
         from aoba.ocean_bgc import apply_atmospheric_bgc_deposition
 
         du_bgc = f_dust_dep_cell if bool(cfg.enable_bgc_fe_lnox_coupling) else None
+        bc_bgc = (
+            model.aerosols.dep_bc_kgm2s
+            if (bool(cfg.enable_bgc_fe_lnox_coupling) and model.aerosols is not None and getattr(model.aerosols, "dep_bc_kgm2s", None) is not None)
+            else None
+        )
         ln_bgc = (light_diag.n_dep_lnox_cell if light_diag is not None else None) if bool(cfg.enable_bgc_fe_lnox_coupling) else None
+        # Wildfire volatilized N -> 50% local + 50% global well-mixed atmospheric N deposition
+        fire_n_bgc = None
+        if bool(cfg.enable_bgc_fe_lnox_coupling) and model.land_carbon is not None and getattr(model.land_carbon, "n_fire_kgn_m2s", None) is not None:
+            nf_raw = model.land_carbon.n_fire_kgn_m2s
+            nf_cell = _sub_to_cell(nf_raw, nc, n_sub) if int(nf_raw.shape[0]) == m_sub else nf_raw
+            a_tot_n = torch.clamp(mesh.area_cell.sum(), min=1.0)
+            nf_glob = (torch.clamp(nf_cell, min=0.0) * mesh.area_cell).sum() / a_tot_n
+            fire_n_bgc = 0.50 * torch.clamp(nf_cell, min=0.0) + 0.50 * nf_glob
+
+        # Voronoi Riverine Solute Transport: Land N leaching + fluvial C + weathering Alk + estuarine Fe -> Coastal Ocean
+        riv_n_bgc = None
+        riv_c_bgc = None
+        riv_fe_bgc = None
         alk_bgc = alk_weath_cell
+        if bool(cfg.enable_river_routing) and model.river is not None:
+            from aoba.river_routing import step_river_solute_routing
+
+            n_leach_c = None
+            c_exp_c = None
+            if model.land_carbon is not None:
+                if getattr(model.land_carbon, "n_leach_kgn_m2s", None) is not None:
+                    nl_r = model.land_carbon.n_leach_kgn_m2s
+                    n_leach_c = _sub_to_cell(nl_r, nc, n_sub) if int(nl_r.shape[0]) == m_sub else nl_r
+                rh_r = model.land_carbon.rh_kgc_m2s
+                rh_c = _sub_to_cell(rh_r, nc, n_sub) if int(rh_r.shape[0]) == m_sub else rh_r
+                # ~2.0% of terrestrial heterotrophic respiration exported as fluvial DIC+DOC (~1.0 PgC/yr; Regnier et al., 2013)
+                c_exp_c = 0.02 * torch.clamp(rh_c, min=0.0)
+            if alk_weath_cell is not None:
+                alk_src_riv = alk_weath_cell
+            else:
+                # Map-free baseline chemical weathering alkalinity (~1.0 mol eq m^-3 of terrestrial liquid runoff)
+                runoff_liq_alk = torch.clamp(_sub_to_cell(sfc_diag_sub.runoff_total - sfc_diag_sub.runoff_ice, nc, n_sub), min=0.0)
+                alk_src_riv = runoff_liq_alk * 1.0e-3  # [kg m^-2 s^-1] * 1e-3 [m^3 kg^-1] * 1.0 [mol m^-3]
+            riv_n_bgc, riv_c_bgc, alk_bgc, riv_fe_bgc = step_river_solute_routing(
+                model.river,
+                mesh.area_cell,
+                dt,
+                n_leach_kgn_m2s=n_leach_c,
+                c_export_kgc_m2s=c_exp_c,
+                alk_src_mol_m2s=alk_src_riv,
+                t_sfc_k=t_air,
+            )
+
         if has_indep_ocn:
             from aoba.ocean_coupler import atm_to_ocn_conservative_flux, atm_to_ocn_intensive
 
             if du_bgc is not None:
                 du_bgc = atm_to_ocn_intensive(model.ocn_coupler, du_bgc)
+            if bc_bgc is not None:
+                bc_bgc = atm_to_ocn_intensive(model.ocn_coupler, bc_bgc)
             if ln_bgc is not None:
                 ln_bgc = atm_to_ocn_intensive(model.ocn_coupler, ln_bgc)
+            if fire_n_bgc is not None:
+                fire_n_bgc = atm_to_ocn_intensive(model.ocn_coupler, fire_n_bgc)
+            if riv_n_bgc is not None:
+                riv_n_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_n_bgc, ocean_only_source=True)
+            if riv_c_bgc is not None:
+                riv_c_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_c_bgc, ocean_only_source=True)
+            if riv_fe_bgc is not None:
+                riv_fe_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_fe_bgc, ocean_only_source=True)
             if alk_bgc is not None:
-                alk_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, alk_bgc, ocean_only_source=False)
-        elif alk_bgc is not None:
-            # Spread land weathering alkalinity evenly onto wet ocean surface cells
+                alk_bgc = atm_to_ocn_conservative_flux(
+                    model.ocn_coupler, alk_bgc, ocean_only_source=(bool(cfg.enable_river_routing) and model.river is not None)
+                )
+        elif alk_bgc is not None and not (bool(cfg.enable_river_routing) and model.river is not None):
+            # Fallback when river routing is disabled: spread land weathering alkalinity evenly onto ocean
             w0 = model.ogcm.wet_c[0].to(alk_bgc.dtype)
             a_ocn_sum = torch.clamp((mesh.area_cell * w0).sum(), min=1.0)
             alk_tot = (alk_bgc * mesh.area_cell).sum()
             alk_bgc = (alk_tot / a_ocn_sum) * w0
-        apply_atmospheric_bgc_deposition(model.ogcm.bgc, model.ogcm, du_bgc, ln_bgc, alk_bgc, dt)
+
+        apply_atmospheric_bgc_deposition(
+            model.ogcm.bgc, model.ogcm, du_bgc, ln_bgc, alk_bgc, dt,
+            bc_dep_kgm2s=bc_bgc,
+            fire_n_dep_kgn_m2s=fire_n_bgc,
+            river_n_kgn_m2s=riv_n_bgc,
+            river_c_kgc_m2s=riv_c_bgc,
+            river_fe_mol_m2s=riv_fe_bgc,
+        )
     # 8b-5. Prognostic Natural CH4 & N2O Cycles (Wetland/Permafrost + Fire + Denit/Marine-OMZ + OH/UV)
     if bool(cfg.enable_prognostic_ch4_n2o):
         from aoba.trace_gas_cycle import init_trace_gas_cycle_state, step_trace_gas_cycle
@@ -4028,6 +4096,10 @@ def step_aoba_model(
                 fire_c_cell = _sub_to_cell(model.land_carbon.fire_c_kgc_m2s, nc, n_sub)
             else:
                 fire_c_cell = model.land_carbon.fire_c_kgc_m2s
+        if bool(cfg.enable_bvoc_soa) and model.aerosols is not None and getattr(model.aerosols, "emis_soa_kgm2s", None) is not None:
+            # Biogenic VOC (isoprene/monoterpene) photochemical contribution to tropospheric O3 precursors
+            bvoc_o3_eq = 0.50 * torch.clamp(model.aerosols.emis_soa_kgm2s, min=0.0)
+            fire_c_cell = bvoc_o3_eq if fire_c_cell is None else (fire_c_cell + bvoc_o3_eq)
         step_prognostic_ozone(
             oz=model.ozone,
             pres_c=pres_host_oz,

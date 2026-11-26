@@ -1269,6 +1269,18 @@ f_{\mathrm{out},i} &= -\operatorname{expm1}\!\left(-\frac{v_{\mathrm{riv},i}}{L_
 \end{aligned} \tag{7.46}
 $$
 
+When terrestrial carbon-nitrogen cycling and marine biogeochemistry are active, the same Priority-Flood graph routes leached dissolved nitrogen $F_{\mathrm{leach},i}$, fluvial carbon export $F_{C,\mathrm{riv},i} = 0.02\,R_{h,i}$ (Regnier et al., 2013), and weathering alkalinity $F_{\mathrm{Alk},i}$ down to coastal ocean cells with Kahan-compensated channel storage $S_{X,i}$. Dissolved nitrogen undergoes temperature-dependent in-stream and riparian denitrification ($k_{\mathrm{denit},20} = 0.03\ \mathrm{d^{-1}}$, $Q_{10} = 2$; Seitzinger et al., 2002), while bioavailable estuarine iron surviving flocculation ($c_{\mathrm{Fe,est}} = 10^{-7}\ \mathrm{mol\ kg^{-1}}$; Raiswell & Canfield, 2012) scales with freshwater coastal inflow $F_{\mathrm{mouth},i}$:
+
+$$
+\begin{aligned}
+f_{\mathrm{denit},i} &= -\operatorname{expm1}\!\left(-k_{\mathrm{denit},20}\,2^{(T_{\mathrm{sfc},i}-293.15)/10}\Delta t\right), \\
+\Delta S_{X,i} &= F_{X,i} A_i \Delta t + \sum_{j\in\mathrm{up}(i)} f_{\mathrm{out},j}(1 - f_{\mathrm{loss},j})S_{X,j} - \big[f_{\mathrm{out},i} + (1 - f_{\mathrm{out},i})f_{\mathrm{loss},i}\big]S_{X,i}, \\
+F_{\mathrm{Fe,mouth},i} &= c_{\mathrm{Fe,est}}\,F_{\mathrm{mouth},i}
+\end{aligned} \tag{7.46b}
+$$
+
+where $f_{\mathrm{loss},i} = f_{\mathrm{denit},i}$ for nitrogen and $f_{\mathrm{loss},i} = 0$ for fluvial carbon and alkalinity. Coastal ocean deliveries $(F_{\mathrm{N,mouth}}, F_{\mathrm{C,mouth}}, F_{\mathrm{Alk,mouth}}, F_{\mathrm{Fe,mouth}})$ are conservatively remapped onto the ocean mesh and enter surface ocean $\mathrm{NO}_3$, $\mathrm{DIC}$, $\mathrm{Alk}$, and $\mathrm{Fe}_{\mathrm{sfc}}$ (Section 9.8).
+
 ### 7.10 Map-Free Autonomous Dynamic Lake Model (Topographic Depressions & 2-Layer FLake Thermodynamics, `src/aoba/lakes.py`, `enable_dynamic_lakes`)
 
 Inland lakes expand, contract, freeze, overflow, or desiccate completely in response to climate and topographic evolution (e.g., Green Sahara Mega-Lake Chad, Aral Sea desiccation, proglacial Lake Agassiz) without prescribed lake-mask or depth lookup maps. Maximum geometric basin capacities $(f_{\mathrm{cap},i}, h_{\mathrm{cap},i}, V_{\mathrm{cap},i})$ emerge solely from solid-Earth `Earth2014` bedrock depressions ($z_{\mathrm{SUR}} - z_{\mathrm{BED}} > 0.5\ \mathrm{m}$ on non-ocean, non-ice pixels yielding $f_{\mathrm{bed},i}, V_{\mathrm{bed},i}$) combined with Barnes et al. (2014) Priority-Flood closed-depression sill depth $d_{\mathrm{pf},i} = \max(z_{\mathrm{filled},i} - z_{\mathrm{valley},i}, 0)$ evaluated on valley-floor elevation $z_{\mathrm{valley},i}$ (`z_min_land`, eliminating coarse-mesh river-canyon aliasing along the Amazon and Congo while updating dynamically under glacial isostasy):
@@ -1702,7 +1714,14 @@ All 11 sea-ice fields ($a_{0..4}, v_{0..4}, \mathrm{SWE}_{\mathrm{ice}}$) are ad
 
 ### 9.8 FlexPFT Marine Biogeochemistry, OMIP/mocsy 2.0 Carbonate System & $\mathrm{O}_2$ / OMZ Denitrification (`src/aoba/ocean_bgc.py`)
 
-When `enable_ocean_bgc = true`, 7 (or 8 with $\mathrm{O}_2$) 3D tracers ($\mathrm{NO}_3, P, Z, D_N, D_C, \mathrm{DIC}, \mathrm{Alk}, \mathrm{O}_2$) share the OGCM batched anomaly-form advection, rotated Redi diffusion, and increment implicit vertical mixing. Surface dissolved iron $\mathrm{Fe}_{\mathrm{sfc}}\ [\mathrm{nM}]$ is prognosed by relaxing atmospheric dust deposition ($3.5\%$ Fe content, $2\%$ solubility) against a 90-day scavenging timescale, coupling iron limitation $\mathrm{Fe}_{\mathrm{sfc}}/(\mathrm{Fe}_{\mathrm{sfc}}+0.20)$ into underwater PAR.
+When `enable_ocean_bgc = true`, seven (or eight with $\mathrm{O}_2$) 3D tracers ($\mathrm{NO}_3, P, Z, D_N, D_C, \mathrm{DIC}, \mathrm{Alk}, \mathrm{O}_2$) share the OGCM batched anomaly-form advection, rotated Redi diffusion, and increment implicit vertical mixing. Surface dissolved iron $\mathrm{Fe}_{\mathrm{sfc}}\ [\mathrm{nM}]$ is prognosed by relaxing mineral dust deposition ($3.5\%$ Fe content, $2\%$ solubility), pyrogenic wildfire black-carbon deposition ($4\%$ Fe/BC mass, $15\%$ solubility; Ito et al., 2019), and coastal riverine bioavailable iron delivery (Eq. 7.46b) against a 90-day scavenging timescale ($\tau_{\mathrm{Fe}} = 90\ \mathrm{d}$, background $\mathrm{Fe}_{\mathrm{bg}} = 0.25\ \mathrm{nM}$), coupling iron limitation $\mathrm{Fe}_{\mathrm{sfc}}/(\mathrm{Fe}_{\mathrm{sfc}}+0.20)$ into underwater PAR, while atmospheric $\mathrm{LNO}_x$, wildfire-volatilized nitrogen, and riverine nitrogen, carbon, and alkalinity enter surface $\mathrm{NO}_3$, $\mathrm{DIC}$, and $\mathrm{Alk}$ via Kahan summation:
+
+$$
+\begin{aligned}
+S_{\mathrm{Fe}} &= \frac{1.253\times 10^4\,F_{\mathrm{dust,dep}} + 1.07\times 10^5\,F_{\mathrm{BC,dep}} + 10^6\,F_{\mathrm{Fe,riv}}}{h_0}, \\
+\mathrm{Fe}_{\mathrm{sfc}}^{n+1} &= \mathrm{Fe}_{\mathrm{sfc}}^n + \big(\mathrm{Fe}_{\mathrm{bg}} + S_{\mathrm{Fe}}\tau_{\mathrm{Fe}} - \mathrm{Fe}_{\mathrm{sfc}}^n\big)\Big[-\operatorname{expm1}\!\left(-\frac{\Delta t}{\tau_{\mathrm{Fe}}}\right)\Big]
+\end{aligned} \tag{9.12b}
+$$
 
 1. **FlexPFT Optimal Photoacclimation & Flexible N:C Quota (Pahlow et al., 2013; Smith et al., 2016; Sasai et al., 2022, Eqs. 2–7)**: Under chlorophyll self-shading ($k_d = 0.04 + 0.03\,\mathrm{Chl}$), layer-mean PAR $I_k$, and Arrhenius temperature scaling $F(T)$ ($E_a = 48\ \mathrm{kJ\ mol^{-1}}$), optimal chloroplast $\mathrm{Chl:C}$ ratio $\hat{\theta}$ (overflow-safe Lambert-$W_0(e^y)$), optimal cell N:C quota $Q$, specific growth rate $\mu_{\mathrm{fl}}$, and chlorophyll $\mathrm{Chl}$ are solved analytically:
 
@@ -1734,6 +1753,14 @@ f_{\mathrm{denit}} &= \frac{1}{1 + (\mathrm{O}_2/5.0)^2}
 \end{aligned} \tag{9.15}
 $$
 
+To close the centennial-to-millennial marine fixed-nitrogen budget against OMZ denitrification, warm ($T_c > 18\ ^\circ\mathrm{C}$), nitrate-depleted, iron-modulated surface marine diazotrophic $\mathrm{N}_2$ fixation (Monteiro et al., 2011; Landolfi et al., 2017) adds $\Delta\mathrm{NO}_{3,\mathrm{fix}}$ to Layer 0 with compensating nitrification alkalinity change $-\Delta\mathrm{NO}_{3,\mathrm{fix}}$:
+
+$$
+\Delta\mathrm{NO}_{3,\mathrm{fix}} = r_{\mathrm{fix},\max}\,\frac{\Delta t}{86400}\left[\operatorname{clamp}\!\left(\frac{T_{c,0} - 18}{10},\ 0,\ 1\right)\right]^2 \frac{K_{N,\mathrm{inh}}}{K_{N,\mathrm{inh}} + \mathrm{NO}_{3,0}}\,\frac{\mathrm{Fe}_{\mathrm{sfc}}}{\mathrm{Fe}_{\mathrm{sfc}} + 0.20}\,(1 - f_{\mathrm{ice}}) \tag{9.15b}
+$$
+
+with $r_{\mathrm{fix},\max} = 0.012\ \mathrm{mmol\ N\ m^{-3}\ d^{-1}}$ and $K_{N,\mathrm{inh}} = 1.5\ \mathrm{mmol\ N\ m^{-3}}$.
+
 ---
 
 ## 10. Atmospheric Chemistry (`o3_mode`), Natural/Volcanic Aerosols, Carbon & Trace-Gas Cycles (`co2_mode`) & Water Isotopes
@@ -1764,7 +1791,7 @@ f_{\mathrm{seas}}(\phi, \mathrm{DOY}) &= 1 + 0.16\sin\phi\cos\!\left(\frac{2\pi(
 \end{aligned} \tag{10.1}
 $$
 
-In `o3_mode = "prognostic"` (fused GPU kernel `ozone_chem_col`), slant-column paths $(S_{\mathrm{O_2}}, S_{\mathrm{O_3}})$ along spherical air-mass factor $\mathrm{AMF} = 35/\sqrt{1224\mu_0^2 + 1}$ yield Herzberg, Schumann–Runge, Hartley, Chappuis, and UV-B photolysis rates $(J_{\mathrm{O_2}}, J_{\mathrm{O_3}}, J_{\mathrm{O(^1D)}})$. Combined with JPL Evaluation 19 (Burkholder et al., 2019) Chapman kinetics $(k_2, k_3)$, stratospheric $\mathrm{NO}_x$ (coupled to $\mathrm{N}_2\mathrm{O}$), $\mathrm{HO}_x$ (coupled to $q_v$), polar stratospheric cloud (PSC) loss ($T < 195\ \mathrm{K}$, scaling as $(\mathrm{eCl}/3.5)^2$), tropospheric $\mathrm{CH}_4/\mathrm{LNO}_x/\text{fire}$ production and $\mathrm{O}(^1D)+\mathrm{H}_2\mathrm{O}$ loss, and Wesely (1989) dry deposition ($0.0005$ ocean, $0.0008$ bare soil, $0.0018$ cuticle, $0.0042\,\mu_0\ \mathrm{m\ s^{-1}}$ stomatal), the odd-oxygen Riccati equation is integrated via its cancellation-free positive root $\chi_{\mathrm{eq}}$ and exact exponential relaxation:
+In `o3_mode = "prognostic"` (fused GPU kernel `ozone_chem_col`), slant-column paths $(S_{\mathrm{O_2}}, S_{\mathrm{O_3}})$ along spherical air-mass factor $\mathrm{AMF} = 35/\sqrt{1224\mu_0^2 + 1}$ yield Herzberg, Schumann–Runge, Hartley, Chappuis, and UV-B photolysis rates $(J_{\mathrm{O_2}}, J_{\mathrm{O_3}}, J_{\mathrm{O(^1D)}})$. Combined with JPL Evaluation 19 (Burkholder et al., 2019) Chapman kinetics $(k_2, k_3)$, stratospheric $\mathrm{NO}_x$ (coupled to $\mathrm{N}_2\mathrm{O}$), $\mathrm{HO}_x$ (coupled to $q_v$), polar stratospheric cloud (PSC) loss ($T < 195\ \mathrm{K}$, scaling as $(\mathrm{eCl}/3.5)^2$), tropospheric $\mathrm{CH}_4/\mathrm{LNO}_x/\text{fire}/\text{BVOC}$ precursor production (coupling biogenic VOC emissions via $F_{\mathrm{prec}} = F_{\mathrm{fire,C}} + 0.5\,F_{\mathrm{SOA}}$) and $\mathrm{O}(^1D)+\mathrm{H}_2\mathrm{O}$ loss, and Wesely (1989) dry deposition ($0.0005$ ocean, $0.0008$ bare soil, $0.0018$ cuticle, $0.0042\,\mu_0\ \mathrm{m\ s^{-1}}$ stomatal), the odd-oxygen Riccati equation is integrated via its cancellation-free positive root $\chi_{\mathrm{eq}}$ and exact exponential relaxation:
 
 $$
 \begin{aligned}

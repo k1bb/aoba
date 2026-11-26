@@ -94,72 +94,93 @@ def compute_crm_lightning_and_lnox(
     nz, nc, ny, nx = rho_d.shape
     dev = rho_d.device
     dtype = rho_d.dtype
-
-    _, _, temp = diagnose_pressure_temperature(rho_d, theta_m, q_v)
-    w_c = 0.5 * (w_stag[:-1] + w_stag[1:])
-    w_up = torch.clamp(w_c, min=0.0)
-
-    # Use true prognostic graupel/snow when 6-class 2-moment microphysics is active; else KR03 split
-    q_i_pos = torch.clamp(q_i, min=0.0)
-    if q_g_prog is not None:
-        q_g = torch.clamp(q_g_prog, min=0.0)
-        q_s = torch.clamp(q_s_prog, min=0.0) if q_s_prog is not None else torch.zeros_like(q_g)
-        q_p_ice = q_g + q_s
-    else:
-        f_ice_p = torch.clamp((T0_PRECIP - temp) / max(T0_PRECIP - T00_PRECIP, 1.0), 0.0, 1.0)
-        f_graup = torch.clamp((temp - T00_GRAUPEL) / max(T0_GRAUPEL - T00_GRAUPEL, 1.0), 0.0, 1.0)
-        q_p_pos = torch.clamp(q_p, min=0.0)
-        q_p_ice = f_ice_p * q_p_pos
-        q_g = q_p_ice * f_graup
-
-    # Broadcast vertical metrics to [Nz, N_cells, 1, 1]
-    if z_c.ndim == 2:
-        zc_4d = z_c.view(nz, nc, 1, 1)
-        dz_4d = dz_c.view(nz, nc, 1, 1)
-    else:
-        zc_4d = z_c.view(nz, 1, 1, 1)
-        dz_4d = dz_c.view(nz, 1, 1, 1)
-
-    # 1. McCaul et al. (2009, Eqs. 1-3) non-inductive charging proxies (purely physical, map-free)
-    #    F1: upward graupel mass flux [g m^-2 s^-1] weighted around the -15 degC charging zone
-    t_wt = torch.exp(-(((temp - LIGHTNING_T_CHARGE_K) / LIGHTNING_T_SIGMA_K) ** 2))
-    gfx_lin = t_wt * rho_d * w_up * (1000.0 * q_g)
-    gfx_max = gfx_lin.amax(dim=0)  # [N_cells, Ny, Nx]
-    gfx_chg = (t_wt * rho_d * torch.pow(w_up, LIGHTNING_UPDRAFT_EXP) * (1000.0 * q_g)).amax(dim=0)
-    f1 = LIGHTNING_F1_COEF * gfx_chg  # [N_cells, Ny, Nx]
-
-    #    F2: vertically integrated total ice-phase hydrometeor mass [kg m^-2]
-    iwp_tot = (rho_d * dz_4d * (q_i_pos + q_p_ice)).sum(dim=0)
-    #    Strict zero-at-zero quadratic Hill gate on active mixed-phase graupel flux so inert cirrus
-    #    and weak stratiform clouds (gfx == 0) spark strictly zero lightning
-    has_active_core = (gfx_max / (gfx_max + LIGHTNING_CORE_HALF_SAT)) ** 2
-    f2 = LIGHTNING_F2_COEF * iwp_tot * has_active_core
-
     c_scale = LIGHTNING_CAL_FACTOR if cal_factor is None else float(cal_factor)
-    # Convert McCaul units [flashes (5 min)^-1 km^-2] -> SI [flashes m^-2 s^-1]
-    inv_5min_km2 = 1.0 / (300.0 * 1.0e6)
-    flash_tot_sub = torch.clamp(
-        c_scale * (LIGHTNING_W1_WEIGHT * f1 + LIGHTNING_W2_WEIGHT * f2) * inv_5min_km2,
-        min=0.0,
-    )
 
-    # 2. Price & Rind (1993, Eq. 1) cold-cloud depth (CCD) IC/CG partitioning
-    is_warm = temp >= C.T_FREEZE
-    z_freeze = torch.where(is_warm, zc_4d, torch.zeros_like(temp)).amax(dim=0)
-    has_ice = (q_i_pos + q_p_ice) >= LIGHTNING_ICE_TOP_THRESH
-    z_ice_top = torch.where(has_ice, zc_4d, torch.zeros_like(temp)).amax(dim=0)
-    ccd_km_raw = torch.clamp((z_ice_top - z_freeze) * 1.0e-3, min=0.0)
-    h_poly = torch.clamp(ccd_km_raw, min=5.5, max=14.0)
-    h2 = h_poly * h_poly
-    h3 = h2 * h_poly
-    h4 = h2 * h2
-    z_ic_cg = torch.clamp(
-        0.021 * h4 - 0.648 * h3 + 7.493 * h2 - 36.54 * h_poly + 63.09,
-        min=1.0,
-        max=19.0,
-    )
-    f_cg_sub = 1.0 / (1.0 + z_ic_cg)
-    flash_cg_sub = flash_tot_sub * f_cg_sub
+    from aoba.kernels import dispatch_crm_lightning_metal, get_active_gpu_backend
+
+    if get_active_gpu_backend(dev) in ("mps", "cuda") and dtype == torch.float32:
+        flash_tot_sub, flash_cg_sub, f_cg_sub, ccd_km_raw = dispatch_crm_lightning_metal(
+            rho_d=rho_d,
+            theta_m=theta_m,
+            q_v=q_v,
+            q_i=q_i,
+            q_p=q_p,
+            w_stag=w_stag,
+            z_c=z_c,
+            dz_c=dz_c,
+            cal_factor=c_scale,
+            q_g_prog=q_g_prog,
+            q_s_prog=q_s_prog,
+            t0_precip=float(T0_PRECIP),
+            t00_precip=float(T00_PRECIP),
+            t0_graupel=float(T0_GRAUPEL),
+            t00_graupel=float(T00_GRAUPEL),
+        )
+    else:
+        _, _, temp = diagnose_pressure_temperature(rho_d, theta_m, q_v)
+        w_c = 0.5 * (w_stag[:-1] + w_stag[1:])
+        w_up = torch.clamp(w_c, min=0.0)
+
+        # Use true prognostic graupel/snow when 6-class 2-moment microphysics is active; else KR03 split
+        q_i_pos = torch.clamp(q_i, min=0.0)
+        if q_g_prog is not None:
+            q_g = torch.clamp(q_g_prog, min=0.0)
+            q_s = torch.clamp(q_s_prog, min=0.0) if q_s_prog is not None else torch.zeros_like(q_g)
+            q_p_ice = q_g + q_s
+        else:
+            f_ice_p = torch.clamp((T0_PRECIP - temp) / max(T0_PRECIP - T00_PRECIP, 1.0), 0.0, 1.0)
+            f_graup = torch.clamp((temp - T00_GRAUPEL) / max(T0_GRAUPEL - T00_GRAUPEL, 1.0), 0.0, 1.0)
+            q_p_pos = torch.clamp(q_p, min=0.0)
+            q_p_ice = f_ice_p * q_p_pos
+            q_g = q_p_ice * f_graup
+
+        # Broadcast vertical metrics to [Nz, N_cells, 1, 1]
+        if z_c.ndim == 2:
+            zc_4d = z_c.view(nz, nc, 1, 1)
+            dz_4d = dz_c.view(nz, nc, 1, 1)
+        else:
+            zc_4d = z_c.view(nz, 1, 1, 1)
+            dz_4d = dz_c.view(nz, 1, 1, 1)
+
+        # 1. McCaul et al. (2009, Eqs. 1-3) non-inductive charging proxies (purely physical, map-free)
+        #    F1: upward graupel mass flux [g m^-2 s^-1] weighted around the -15 degC charging zone
+        t_wt = torch.exp(-(((temp - LIGHTNING_T_CHARGE_K) / LIGHTNING_T_SIGMA_K) ** 2))
+        gfx_lin = t_wt * rho_d * w_up * (1000.0 * q_g)
+        gfx_max = gfx_lin.amax(dim=0)  # [N_cells, Ny, Nx]
+        gfx_chg = (t_wt * rho_d * torch.pow(w_up, LIGHTNING_UPDRAFT_EXP) * (1000.0 * q_g)).amax(dim=0)
+        f1 = LIGHTNING_F1_COEF * gfx_chg  # [N_cells, Ny, Nx]
+
+        #    F2: vertically integrated total ice-phase hydrometeor mass [kg m^-2]
+        iwp_tot = (rho_d * dz_4d * (q_i_pos + q_p_ice)).sum(dim=0)
+        #    Strict zero-at-zero quadratic Hill gate on active mixed-phase graupel flux so inert cirrus
+        #    and weak stratiform clouds (gfx == 0) spark strictly zero lightning
+        has_active_core = (gfx_max / (gfx_max + LIGHTNING_CORE_HALF_SAT)) ** 2
+        f2 = LIGHTNING_F2_COEF * iwp_tot * has_active_core
+
+        # Convert McCaul units [flashes (5 min)^-1 km^-2] -> SI [flashes m^-2 s^-1]
+        inv_5min_km2 = 1.0 / (300.0 * 1.0e6)
+        flash_tot_sub = torch.clamp(
+            c_scale * (LIGHTNING_W1_WEIGHT * f1 + LIGHTNING_W2_WEIGHT * f2) * inv_5min_km2,
+            min=0.0,
+        )
+
+        # 2. Price & Rind (1993, Eq. 1) cold-cloud depth (CCD) IC/CG partitioning
+        is_warm = temp >= C.T_FREEZE
+        z_freeze = torch.where(is_warm, zc_4d, torch.zeros_like(temp)).amax(dim=0)
+        has_ice = (q_i_pos + q_p_ice) >= LIGHTNING_ICE_TOP_THRESH
+        z_ice_top = torch.where(has_ice, zc_4d, torch.zeros_like(temp)).amax(dim=0)
+        ccd_km_raw = torch.clamp((z_ice_top - z_freeze) * 1.0e-3, min=0.0)
+        h_poly = torch.clamp(ccd_km_raw, min=5.5, max=14.0)
+        h2 = h_poly * h_poly
+        h3 = h2 * h_poly
+        h4 = h2 * h2
+        z_ic_cg = torch.clamp(
+            0.021 * h4 - 0.648 * h3 + 7.493 * h2 - 36.54 * h_poly + 63.09,
+            min=1.0,
+            max=19.0,
+        )
+        f_cg_sub = 1.0 / (1.0 + z_ic_cg)
+        flash_cg_sub = flash_tot_sub * f_cg_sub
 
     flash_tot_cell = flash_tot_sub.reshape(flash_tot_sub.shape[0], -1).mean(dim=-1)
     flash_cg_cell = flash_cg_sub.reshape(flash_cg_sub.shape[0], -1).mean(dim=-1)
