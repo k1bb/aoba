@@ -1557,12 +1557,20 @@ def step_ogcm_voronoi(
     enable_tidal_mixing: bool = True,
     enable_o2_omz: bool = False,
     langmuir_fac: torch.Tensor | None = None,
+    deep_tracer_accel: float = 1.0,
+    step_bgc: bool = True,
+    dt_bgc_scale: float = 1.0,
 ) -> None:
     """Advance 3D SCVT Voronoi OGCM (`temp`, `sal`, `u_edge`, `eta`) & dynamic sea ice by `dt` [s].
 
     Synchronizes Layer 0 `ogcm.temp[0]` with `sfc.t_ocean_ml` (incorporating surface radiative
     and turbulent heating already applied by `step_surface`) and returns updated `sfc.t_ocean_ml`
     and `sfc.m_seaice` conserving global enthalpy, salt, and sea-ice mass.
+
+    When ``deep_tracer_accel > 1.0`` (offline deep-ocean spin-up only; Bryan, 1984, JPO 14, 666-673),
+    applies a smooth cosine depth-dependent tracer acceleration ``alpha(z)`` rising from ``1.0``
+    above 300 m to ``deep_tracer_accel`` below 1500 m while keeping upper-ocean dynamics, sea ice,
+    and air-sea fluxes strictly synchronous (``1.0x``).
     """
     dev = ogcm.temp.device
     dtype = ogcm.temp.dtype
@@ -1573,7 +1581,7 @@ def step_ogcm_voronoi(
     is_ocean = sfc.surf_type == SURF_OCEAN
     cache = _get_ogcm_static_cache(ogcm, mesh, is_ocean)
 
-    if can_use_cuda_graph(dev) and ogcm.bgc is None:
+    if can_use_cuda_graph(dev) and (ogcm.bgc is None or not step_bgc):
         has_evp = ogcm.seaice_evp is not None
         has_sw = sw_net_ocn is not None
         has_riv = river_mouth_flux is not None
@@ -1611,7 +1619,7 @@ def step_ogcm_voronoi(
             bool(has_sw), bool(has_riv), bool(has_lang),
             bool(enable_fct_zstar), bool(enable_scale_aware_gm),
             bool(enable_submeso), bool(enable_tidal_mixing),
-            round(float(dt), 6),
+            round(float(dt), 6), round(float(deep_tracer_accel), 4),
         )
 
         def _cg_body(inp: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -1666,6 +1674,9 @@ def step_ogcm_voronoi(
                 enable_tidal_mixing=enable_tidal_mixing,
                 enable_o2_omz=enable_o2_omz,
                 langmuir_fac=lang_i,
+                deep_tracer_accel=deep_tracer_accel,
+                step_bgc=False,
+                dt_bgc_scale=1.0,
             )
             res = [
                 ogcm_v.temp, ogcm_v.sal, ogcm_v.t_comp, ogcm_v.s_comp,
@@ -1717,6 +1728,9 @@ def step_ogcm_voronoi(
         enable_tidal_mixing=enable_tidal_mixing,
         enable_o2_omz=enable_o2_omz,
         langmuir_fac=langmuir_fac,
+        deep_tracer_accel=deep_tracer_accel,
+        step_bgc=step_bgc,
+        dt_bgc_scale=dt_bgc_scale,
     )
 
 
@@ -1746,6 +1760,9 @@ def _step_ogcm_voronoi_impl(
     enable_tidal_mixing: bool = True,
     enable_o2_omz: bool = False,
     langmuir_fac: torch.Tensor | None = None,
+    deep_tracer_accel: float = 1.0,
+    step_bgc: bool = True,
+    dt_bgc_scale: float = 1.0,
 ) -> None:
     """Core 3D Voronoi OGCM + sea-ice advancement body (shared across CUDA Graph & MPS/CPU)."""
     dev = ogcm.temp.device
@@ -2082,6 +2099,20 @@ def _step_ogcm_voronoi_impl(
 
     # 8. 3D Conservative Flux-Form Tracer Advection (Anomaly Form q' = q - q_ref to minimize float32 cancellation)
     #    + Full Rotated Redi Diffusion + KPP Non-Local Flux + Neumaier/Kahan Compensated Summation
+    #    + Optional Bryan (1984) smooth deep-ocean tracer acceleration alpha(z) for offline spin-up.
+    use_deep_accel = float(deep_tracer_accel) > 1.0001
+    alpha_z: torch.Tensor | None = None
+    if use_deep_accel:
+        akey = ("bryan_alpha", round(float(deep_tracer_accel), 4))
+        alpha_z = cache.get(akey)
+        if alpha_z is None:
+            s_z = torch.clamp((ogcm.z_c.to(dtype) - 300.0) / 1200.0, 0.0, 1.0)
+            alpha_1d = 1.0 + (float(deep_tracer_accel) - 1.0) * 0.5 * (1.0 - torch.cos(math.pi * s_z))
+            alpha_z = alpha_1d.unsqueeze(1).contiguous()  # [nzo, 1]
+            cache[akey] = alpha_z
+        T_pre_adv, S_pre_adv = T, S
+        t_comp_pre, s_comp_pre = t_comp, s_comp
+
     if enable_fct_zstar:
         # FESOM2-style exact z* proportional column stretching h*_k = h_c * (1 + eta / H) + Zalesak FCT
         # (Danilov et al., 2017; Adcroft & Campin, 2004). Exact continuity:
@@ -2165,12 +2196,24 @@ def _step_ogcm_voronoi_impl(
         T, S = ts_q[0], ts_q[1]
         t_comp, s_comp = ts_c[0], ts_c[1]
 
+    if use_deep_accel and alpha_z is not None:
+        deep_mask = (alpha_z > 1.0001) & wet_c
+        T_acc, t_comp_acc = _kahan_add(T_pre_adv, alpha_z * (T - T_pre_adv), t_comp_pre)
+        S_acc, s_comp_acc = _kahan_add(S_pre_adv, alpha_z * (S - S_pre_adv), s_comp_pre)
+        T = torch.where(deep_mask, torch.clamp(T_acc, min=270.0, max=315.0), T)
+        S = torch.where(deep_mask, torch.clamp(S_acc, min=0.5, max=45.0), S)
+        t_comp = torch.where(deep_mask, t_comp_acc, t_comp)
+        s_comp = torch.where(deep_mask, s_comp_acc, s_comp)
+
     # 9-10. Strictly Conservative Flux-Increment Implicit Vertical Mixing (Float32-Safe!) & Freezing Check
     #    Solving `(I + L) dq = -L q` and reconstructing telescoping fluxes `F_imp = c_dif * d(q + dq)`
     #    prevents float32 diagonal underflow (`1.0f + c_dif/h == 1.0f` in the abyssal ocean) from
     #    creating spurious heat/salt, while `_kahan_add` retains sub-ULP deep-ocean tendencies.
-    h_c_vdiff = torch.clamp(h_new_z, min=1.0) if enable_fct_zstar else h_c_safe
-    h0_vdiff = h_c_vdiff[0] if enable_fct_zstar else h0_new
+    #    Under Bryan (1984) deep acceleration, dividing h_c_vdiff by alpha(z) preserves unconditional
+    #    implicit stability and exact Bryan-weighted conservation sum_k (h_k / alpha_k) q_k.
+    h_c_vdiff_phys = torch.clamp(h_new_z, min=1.0) if enable_fct_zstar else h_c_safe
+    h_c_vdiff = (h_c_vdiff_phys / alpha_z) if (use_deep_accel and alpha_z is not None) else h_c_vdiff_phys
+    h0_vdiff = h_c_vdiff_phys[0] if enable_fct_zstar else h0_new
     a_t: torch.Tensor | None = None
     b_t: torch.Tensor | None = None
     d_t: torch.Tensor | None = None
@@ -2217,17 +2260,24 @@ def _step_ogcm_voronoi_impl(
     ogcm.s_comp = s_comp
 
     # 10b. FlexPFT Marine Biogeochemistry & OMIP/mocsy 2.0 Carbonate Chemistry
-    if ogcm.bgc is not None:
+    if ogcm.bgc is not None and step_bgc:
         from aoba.ocean_bgc import PAR_FRAC_SW, step_ocean_bgc_flexpft
 
-        if c_dif is None or h_eff is None:
-            c_dif = (dt * kv / dz_c_int) * wet_int_cf
-            h_eff = torch.cat([h0_vdiff.unsqueeze(0), h_c_vdiff[1:]], dim=0)
-        if a_t is None and not (use_gpu_ogcm and 2 <= nzo <= 64 and T.dtype == torch.float32):
+        dt_bgc = float(dt) * float(dt_bgc_scale)
+        if c_dif is None or h_eff is None or abs(float(dt_bgc_scale) - 1.0) > 1.0e-6:
+            c_dif_bgc = (dt_bgc * kv / dz_c_int) * wet_int_cf
+            h_eff_bgc = torch.cat([h0_vdiff.unsqueeze(0), h_c_vdiff_phys[1:]], dim=0)
+        else:
+            c_dif_bgc = c_dif
+            h_eff_bgc = torch.cat([h0_vdiff.unsqueeze(0), h_c_vdiff_phys[1:]], dim=0)
+        a_t_bgc, b_t_bgc, d_t_bgc = a_t, b_t, d_t
+        if (a_t_bgc is None or abs(float(dt_bgc_scale) - 1.0) > 1.0e-6 or use_deep_accel) and not (
+            use_gpu_ogcm and 2 <= nzo <= 64 and T.dtype == torch.float32
+        ):
             z_row = torch.zeros_like(T[0:1])
-            a_t = torch.cat([z_row, -c_dif / h_eff[1:]], dim=0)
-            d_t = torch.cat([-c_dif / h_eff[:-1], z_row], dim=0)
-            b_t = 1.0 - a_t - d_t
+            a_t_bgc = torch.cat([z_row, -c_dif_bgc / h_eff_bgc[1:]], dim=0)
+            d_t_bgc = torch.cat([-c_dif_bgc / h_eff_bgc[:-1], z_row], dim=0)
+            b_t_bgc = 1.0 - a_t_bgc - d_t_bgc
 
         par_in = (
             sw_par_ocn
@@ -2240,6 +2290,16 @@ def _step_ogcm_voronoi_impl(
             # Fallback 10 m wind speed estimate from surface wind stress magnitude |tau| = rho_a * C_d * u10^2
             tau_mag = torch.sqrt(tau_x_sfc * tau_x_sfc + tau_y_sfc * tau_y_sfc + 1.0e-12)
             u10_in = torch.sqrt(tau_mag / (1.225 * 1.3e-3))
+
+        bgc_pre = None
+        if use_deep_accel and alpha_z is not None:
+            bgc_fields = ("dic", "alk", "no3", "po4", "fe", "o2")
+            bgc_pre = {
+                fn: getattr(ogcm.bgc, fn).clone()
+                for fn in bgc_fields
+                if getattr(ogcm.bgc, fn, None) is not None
+            }
+
         step_ocean_bgc_flexpft(
             bgc=ogcm.bgc,
             ogcm=ogcm,
@@ -2249,17 +2309,17 @@ def _step_ogcm_voronoi_impl(
             w_vel=w_vel,
             h0_new=h0_vdiff,
             dh0_eff=dh0_eff,
-            a_t=a_t,
-            b_t=b_t,
-            d_t=d_t,
-            c_dif=c_dif,
-            h_eff=h_eff,
+            a_t=a_t_bgc,
+            b_t=b_t_bgc,
+            d_t=d_t_bgc,
+            c_dif=c_dif_bgc,
+            h_eff=h_eff_bgc,
             cache=cache,
             sw_par_sfc=par_in,
             u10_ocn=u10_in,
             f_seaice=f_seaice,
             co2_ppmv=co2_ppmv,
-            dt=dt,
+            dt=dt_bgc,
             enable_full_redi=bool(ENABLE_FULL_REDI),
             enable_o2_omz=bool(enable_o2_omz),
             h_old_z=h_old_z if enable_fct_zstar else None,
@@ -2272,6 +2332,14 @@ def _step_ogcm_voronoi_impl(
             active_w_c=active_w_c if use_gpu_ogcm else None,
             use_gpu_ogcm=bool(use_gpu_ogcm),
         )
+
+        if bgc_pre is not None and alpha_z is not None:
+            deep_mask = (alpha_z > 1.0001) & wet_c
+            for fn, v_pre in bgc_pre.items():
+                v_post = getattr(ogcm.bgc, fn)
+                vmin = 100.0 if fn in ("dic", "alk") else 0.0
+                v_acc = torch.clamp(v_pre + alpha_z * (v_post - v_pre), min=vmin)
+                setattr(ogcm.bgc, fn, torch.where(deep_mask, v_acc, v_post))
 
     # 11. Dynamic Sea-Ice Drift (after recording thermodynamic mass change, so advection doesn't alias brine!)
     if enable_seaice_drift:

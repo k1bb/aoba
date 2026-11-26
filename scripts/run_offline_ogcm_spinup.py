@@ -292,12 +292,18 @@ def main() -> None:
     parser.add_argument("--base-restart", type=str, default="", help="Phase-1 restart.pt (default: latest year_XXXX/restart.pt)")
     parser.add_argument("--forcing-year-start", type=int, default=21)
     parser.add_argument("--forcing-year-end", type=int, default=30)
-    parser.add_argument("--years", type=int, default=1000, help="Maximum offline ocean spin-up years")
+    parser.add_argument("--years", type=int, default=1000, help="Maximum offline ocean surface years")
     parser.add_argument("--dt-ocn", type=float, default=3600.0, help="Offline ocean timestep [s] (default 3600 s)")
-    parser.add_argument("--stop-deep-drift", type=float, default=0.01, help="Auto-stop when 50-yr deep (>1500m) drift < value [K/century]")
+    parser.add_argument("--deep-accel", type=float, default=1.0, help="Bryan (1984) deep-ocean (>1500m) tracer acceleration factor (e.g. 6.0)")
+    parser.add_argument("--bgc-stride", type=int, default=1, help="Call FlexPFT BGC every N ocean steps (e.g. 4 for 4h BGC cadence)")
+    parser.add_argument("--sync-tail-years", type=int, default=20, help="Final synchronous (1x) polish years after deep-accel convergence")
+    parser.add_argument("--stop-deep-drift", type=float, default=0.01, help="Auto-stop when deep (>1500m) drift < value [K/deep-century]")
     parser.add_argument("--out-dir", type=str, required=True, help="Output directory for Phase-2 offline spin-up")
     parser.add_argument("--device", type=str, default="")
     args = parser.parse_args()
+    deep_accel_req = max(float(args.deep_accel), 1.0)
+    bgc_stride = max(int(args.bgc_stride), 1)
+    sync_tail_yr = max(int(args.sync_tail_years), 0) if deep_accel_req > 1.0001 else 0
 
     coupled_dir = Path(args.coupled_dir).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
@@ -315,7 +321,11 @@ def main() -> None:
     hw = apply_runtime_tuning(dev)
     print(f"=== AOBA Phase-2 Self-Forced Offline 3D OGCM Spin-Up on {dev} [{hw.chip_name}] ===", flush=True)
     print(f"  Base restart : {base_restart}", flush=True)
-    print(f"  Forcing years: {args.forcing_year_start}..{args.forcing_year_end} | dt_ocn={args.dt_ocn:.0f} s | max={args.years} yr", flush=True)
+    print(
+        f"  Forcing years: {args.forcing_year_start}..{args.forcing_year_end} | dt_ocn={args.dt_ocn:.0f} s | "
+        f"max={args.years} yr | deep_accel={deep_accel_req:.1f}x | bgc_stride={bgc_stride} | sync_tail={sync_tail_yr} yr",
+        flush=True,
+    )
 
     ckpt = torch.load(base_restart, map_location="cpu", weights_only=False)
     cfg: AOBAConfig = ckpt["cfg"]
@@ -432,7 +442,13 @@ def main() -> None:
         prev_ohc_j = m_cur["ohc_j"]
         deep_hist = [m_cur["t_ocn_deep_k"]]
 
-    for yr in range(start_year, args.years + 1):
+    in_sync_tail = False
+    sync_tail_rem = sync_tail_yr
+    deep_eq_yr = 0.0
+    drift_win = max(10, int(round(50.0 / deep_accel_req)))
+
+    for yr in range(start_year, args.years + sync_tail_yr + 1):
+        active_accel = 1.0 if in_sync_tail else deep_accel_req
         t0 = time.perf_counter()
         for step_i in range(steps_per_year):
             frac_yr = (step_i + 0.5) / float(steps_per_year)
@@ -447,6 +463,8 @@ def main() -> None:
                 ocn_sfc, ocn_mesh, frc, mu0, z_ref_rel, dt_step
             )
             u10_o = torch.sqrt(frc["u_zonal_0"] ** 2 + frc["v_merid_0"] ** 2 + 1.0e-6)
+            do_bgc_now = ((step_i + 1) % bgc_stride == 0) or (step_i + 1 == steps_per_year)
+            bgc_scale_now = float(bgc_stride) if ((step_i + 1) % bgc_stride == 0) else float((step_i + 1) % bgc_stride)
             step_ogcm_voronoi(
                 ogcm=model.ogcm,
                 sfc=ocn_sfc,
@@ -467,17 +485,20 @@ def main() -> None:
                 enable_scale_aware_gm=bool(getattr(cfg, "enable_ogcm_scale_aware_gm", True)),
                 enable_submeso=bool(getattr(cfg, "enable_ogcm_submeso", True)),
                 enable_tidal_mixing=bool(getattr(cfg, "enable_ogcm_tidal_mixing", True)),
-                enable_current_rel_wind=bool(getattr(cfg, "enable_current_rel_wind", True)),
                 enable_o2_omz=bool(getattr(cfg, "enable_ocean_o2_omz", False)),
+                deep_tracer_accel=active_accel,
+                step_bgc=do_bgc_now,
+                dt_bgc_scale=bgc_scale_now,
             )
         synchronize_device(dev)
         wall_yr = time.perf_counter() - t0
+        deep_eq_yr += active_accel
         m = diagnose_ocean_spinup_metrics(model.ogcm, ocn_sfc, ocn_mesh)
         ohc_flux = (m["ohc_j"] - prev_ohc_j) / (yr_sec * a_earth_m2)
         prev_ohc_j = m["ohc_j"]
         deep_hist.append(m["t_ocn_deep_k"])
-        if len(deep_hist) > 50:
-            deep_drift = (deep_hist[-1] - deep_hist[-51]) * 2.0  # K per century over last 50 yr
+        if len(deep_hist) > drift_win:
+            deep_drift = (deep_hist[-1] - deep_hist[-1 - drift_win]) * (100.0 / (drift_win * max(active_accel, 1.0)))
         else:
             deep_drift = float("nan")
 
@@ -509,9 +530,10 @@ def main() -> None:
         with open(csv_path, "a", newline="") as f:
             csv.writer(f).writerow(row)
 
-        if yr == 1 or yr % 10 == 0 or yr == args.years:
+        if yr == 1 or yr % 10 == 0 or yr == args.years or in_sync_tail:
+            tag = "SYNC-TAIL" if in_sync_tail else f"ACCEL {active_accel:.1f}x"
             print(
-                f"[OFFLINE OGCM Y{yr:04d}/{args.years:04d}] dOHC={ohc_flux:+5.2f} W/m2 | "
+                f"[OFFLINE OGCM Y{yr:04d} ({tag}, deep~{deep_eq_yr:.0f}yr)] dOHC={ohc_flux:+5.2f} W/m2 | "
                 f"Tocn(glob/up/mid/deep)={m['t_ocn_global_k']:.3f}/{m['t_ocn_0_300m_k']:.2f}/"
                 f"{m['t_ocn_300_1500m_k']:.2f}/{m['t_ocn_deep_k']:.3f} K | S={m['s_ocn_global_psu']:.4f} | "
                 f"AMOC={m['amoc_26n_sv']:.1f} Sv | ACC={m['acc_drake_sv']:.1f} Sv{bgc_str} | "
@@ -519,11 +541,20 @@ def main() -> None:
                 flush=True,
             )
 
-        if yr % 50 == 0 or yr == args.years or (math.isfinite(deep_drift) and abs(deep_drift) < args.stop_deep_drift and yr >= 200):
+        converged_now = (
+            (not in_sync_tail)
+            and math.isfinite(deep_drift)
+            and abs(deep_drift) < args.stop_deep_drift
+            and deep_eq_yr >= 200.0
+        )
+        reached_max_accel = (not in_sync_tail) and (yr >= args.years)
+
+        if yr % 25 == 0 or converged_now or reached_max_accel or (in_sync_tail and sync_tail_rem <= 1):
             tmp_ck = off_ckpt_path.with_suffix(".pt.tmp")
             torch.save(
                 {
                     "year": yr,
+                    "deep_eq_yr": deep_eq_yr,
                     "ogcm": _serialize_ogcm(model.ogcm),
                     "sfc": {k: getattr(ocn_sfc, k).detach().cpu() for k in ocn_keys if getattr(ocn_sfc, k, None) is not None},
                 },
@@ -531,9 +562,24 @@ def main() -> None:
             )
             os.replace(tmp_ck, off_ckpt_path)
 
-        if math.isfinite(deep_drift) and abs(deep_drift) < args.stop_deep_drift and yr >= 200:
-            print(f"=== Deep-ocean equilibrium criterion met (|drift|={abs(deep_drift):.4f} < {args.stop_deep_drift} K/century) at Year {yr}! ===", flush=True)
-            break
+        if in_sync_tail:
+            sync_tail_rem -= 1
+            if sync_tail_rem <= 0:
+                print(f"=== Phase-2 synchronous polish tail complete at Year {yr} (deep~{deep_eq_yr:.0f} yr)! ===", flush=True)
+                break
+        elif converged_now or reached_max_accel:
+            reason = (
+                f"deep equilibrium met (|drift|={abs(deep_drift):.4f} < {args.stop_deep_drift} K/100yr)"
+                if converged_now
+                else f"reached max accelerated years ({args.years} surf yr, deep~{deep_eq_yr:.0f} yr)"
+            )
+            if sync_tail_yr > 0:
+                print(f"=== {reason} at Year {yr}; starting {sync_tail_yr}-yr synchronous (1x) polish tail... ===", flush=True)
+                in_sync_tail = True
+                sync_tail_rem = sync_tail_yr
+            else:
+                print(f"=== {reason} at Year {yr}! ===", flush=True)
+                break
 
     inject_offline_ocean_into_restart(
         base_restart_path=base_restart,
