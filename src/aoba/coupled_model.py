@@ -195,6 +195,7 @@ class AOBAConfig:
     crm_sfc_tiles: int = 0                   # Surface tiles/cell for large CRMs (0 = 1:1 with crm_ny*crm_nx; e.g. 8 for RCE_large)
     enable_crm_self_distill: bool = False    # Online self-distilling / active-learning 2D/3D CRM acceleration
     enable_rad_self_distill: bool = False    # Online per-subcolumn ICA radiation self-distillation paired with CRM
+    enable_distill_shadow_diag: bool = True  # Pre-update shadow evaluation on teachers (Host Atmos + Land Tiles)
     crm_distill_stride: int = 13             # Teacher column stride (1 in `stride` columns run genuine CRM/Rad/step)
     crm_distill_warmup_steps: int = 24       # Initial 100%-CRM warmup steps before activating student inference
     crm_distill_dwell_steps: int = 12        # Continuous teacher dwell steps (>=48 enables 50% persistent RCEMIP anchor)
@@ -1461,6 +1462,7 @@ def step_aoba_model(
         rad_sel = None
         if use_rad_distill and model.rad_distill is not None:
             from aoba.crm_self_distill import (
+                evaluate_rad_shadow_on_teachers,
                 extract_rad_distill_features,
                 pack_rad_teacher_context_and_targets,
                 predict_rad_student_columns,
@@ -1575,6 +1577,7 @@ def step_aoba_model(
             # 3p-b. Student cells at tile resolution `(ny_t, nx_t)`: RadSelfDistillNet or genuine tile ICA
             if use_rad_distill and model.rad_distill is not None:
                 from aoba.crm_self_distill import (
+                    evaluate_rad_shadow_on_teachers,
                     extract_rad_distill_features,
                     pack_rad_teacher_context_and_targets,
                     predict_rad_student_columns,
@@ -1595,6 +1598,20 @@ def step_aoba_model(
                     q_dust_c=(qd_t[:, tr_s] if qd_t is not None else None),
                     tau_aero_sw_c=(ao_t[0][:, tr_s] if ao_t is not None else None),
                 )
+                if bool(cfg.enable_distill_shadow_diag):
+                    land_mask_rt = _s2f((sfc_sub.surf_type[t_sfc] == SURF_LAND).to(t_rad_t.dtype), n_tr)[tr_s]
+                    t_cell_sub_rt = t_pool_idx.unsqueeze(1).expand(n_tr, n_crm_full).reshape(-1)[tr_s]
+                    evaluate_rad_shadow_on_teachers(
+                        model.rad_distill, x_rt, cp_rt_raw, s_inc_rt,
+                        alb_vd_t[tr_s], alb_vf_t[tr_s], alb_nd_t[tr_s], alb_nf_t[tr_s],
+                        emiss_t[tr_s], t_rad_t[tr_s],
+                        q_rad_t=q_rad_t[:, tr_s], sw1d_t=sw1d_t[tr_s], sw1f_t=sw1f_t[tr_s],
+                        sw2d_t=sw2d_t[tr_s], sw2f_t=sw2f_t[tr_s], lwd_t=lwd_t[tr_s],
+                        olr_t=olr_t[tr_s], asr_t=asr_t[tr_s],
+                        land_mask_sub=land_mask_rt,
+                        t_cell_idx_sub=t_cell_sub_rt,
+                        step_count=model.step_count,
+                    )
                 cp_rt, cs_rt, tqr_rt, ts_rt = pack_rad_teacher_context_and_targets(
                     cp_rt_raw, s_inc_rt,
                     alb_vd_t[tr_s], alb_vf_t[tr_s], alb_nd_t[tr_s], alb_nf_t[tr_s], emiss_t[tr_s], t_rad_t[tr_s],
@@ -1827,6 +1844,20 @@ def step_aoba_model(
                 q_rad_t[:, tr_s], sw1d_t[tr_s], sw1f_t[tr_s], sw2d_t[tr_s], sw2f_t[tr_s],
                 lwd_t[tr_s], olr_t[tr_s], asr_t[tr_s],
             )
+            if bool(cfg.enable_distill_shadow_diag):
+                land_mask_rt = _s2c((sfc_sub.surf_type[t_sfc] == SURF_LAND).to(t_rad_t.dtype), n_tr)[tr_s]
+                t_cell_sub_rt = t_ridx.unsqueeze(1).expand(n_tr, n_crm).reshape(-1)[tr_s]
+                evaluate_rad_shadow_on_teachers(
+                    model.rad_distill, x_rt, cp_rt_raw, s_inc_rt,
+                    alb_vd_t[tr_s], alb_vf_t[tr_s], alb_nd_t[tr_s], alb_nf_t[tr_s],
+                    emiss_t[tr_s], t_rad_t[tr_s],
+                    q_rad_t=q_rad_t[:, tr_s], sw1d_t=sw1d_t[tr_s], sw1f_t=sw1f_t[tr_s],
+                    sw2d_t=sw2d_t[tr_s], sw2f_t=sw2f_t[tr_s], lwd_t=lwd_t[tr_s],
+                    olr_t=olr_t[tr_s], asr_t=asr_t[tr_s],
+                    land_mask_sub=land_mask_rt,
+                    t_cell_idx_sub=t_cell_sub_rt,
+                    step_count=model.step_count,
+                )
             n_rgrad_d = 4 if model.rad_distill.steps_seen < model.rad_distill.warmup_steps else 2
             train_rad_student_online(
                 model.rad_distill, x_rt, cp_rt, cs_rt, tqr_rt, ts_rt, n_grad_steps=n_rgrad_d
@@ -2051,6 +2082,20 @@ def step_aoba_model(
                     q_rad_sub[:, rw_idx], sw1d_c[rw_idx], sw1f_c[rw_idx],
                     sw2d_c[rw_idx], sw2f_c[rw_idx], lwd_c[rw_idx], olr_c[rw_idx], asr_c[rw_idx],
                 )
+                if bool(cfg.enable_distill_shadow_diag):
+                    land_mask_rw = _s2c((sfc_sub.surf_type == SURF_LAND).to(t_rad_crm.dtype))[rw_idx]
+                    t_cell_sub_rw = torch.div(rw_idx, max(n_crm, 1), rounding_mode="floor")
+                    evaluate_rad_shadow_on_teachers(
+                        model.rad_distill, x_rw, cp_rw_raw, s_inc_rw,
+                        alb_vd_crm[rw_idx], alb_vf_crm[rw_idx], alb_nd_crm[rw_idx], alb_nf_crm[rw_idx],
+                        emiss_crm[rw_idx], t_rad_crm[rw_idx],
+                        q_rad_t=q_rad_sub[:, rw_idx], sw1d_t=sw1d_c[rw_idx], sw1f_t=sw1f_c[rw_idx],
+                        sw2d_t=sw2d_c[rw_idx], sw2f_t=sw2f_c[rw_idx], lwd_t=lwd_c[rw_idx],
+                        olr_t=olr_c[rw_idx], asr_t=asr_c[rw_idx],
+                        land_mask_sub=land_mask_rw,
+                        t_cell_idx_sub=t_cell_sub_rw,
+                        step_count=model.step_count,
+                    )
                 train_rad_student_online(model.rad_distill, x_rw, cp_rw, cs_rw, tqr_rw, ts_rw)
                 model.rad_distill.teacher_frac_last = 1.0
                 model.rad_distill.steps_seen += 1
@@ -2706,6 +2751,7 @@ def step_aoba_model(
                 apply_subgrid_surface_microclimate,
                 compute_pool_org_invariants,
                 compute_subgrid_structure_features,
+                evaluate_crm_shadow_on_teachers,
                 extract_crm_distill_features,
                 extract_spatial_targets,
                 extract_subgrid_spatial_maps,
@@ -3004,20 +3050,47 @@ def step_aoba_model(
                 thm_t_post, qn_t_post, qp_t_post, qc_t_post, qi_t_post, u_t_post, v_t_post,
                 sp_t.precip_rain, sp_t.precip_snow, f_cld_t, f_prec_t,
             )
+            thm0_t_tile = _crm3d_to_tile3d(sub_crm_t.theta_m[0], from_full=has_pool)
+            qv0_t_tile = _crm3d_to_tile3d(sub_crm_t.q_v[0], from_full=has_pool)
+            u0_t_tile = _crm3d_to_tile3d(sub_crm_t.u[0], from_full=has_pool)
+            v0_t_tile = _crm3d_to_tile3d(sub_crm_t.v[0], from_full=has_pool)
             tgt_maps_t, has_map_t = (
                 extract_spatial_targets(
                     _crm4d_to_tile4d(sub_crm_t.q_c, from_full=has_pool),
                     _crm4d_to_tile4d(sub_crm_t.q_i, from_full=has_pool),
                     rain_t_tile, snow_t_tile,
                     rho_pre_sd[:, t_idx] * atmos.dz_c[:, t_idx],
-                    thm0_3d=_crm3d_to_tile3d(sub_crm_t.theta_m[0], from_full=has_pool),
-                    qv0_3d=_crm3d_to_tile3d(sub_crm_t.q_v[0], from_full=has_pool),
-                    u0_3d=_crm3d_to_tile3d(sub_crm_t.u[0], from_full=has_pool),
-                    v0_3d=_crm3d_to_tile3d(sub_crm_t.v[0], from_full=has_pool),
+                    thm0_3d=thm0_t_tile,
+                    qv0_3d=qv0_t_tile,
+                    u0_3d=u0_t_tile,
+                    v0_3d=v0_t_tile,
                 )
                 if sub_maps_all_sd is not None
                 else (None, None)
             )
+            if bool(cfg.enable_distill_shadow_diag):
+                wind0_t_tile = _crm3d_to_tile3d(
+                    torch.hypot(sub_crm_t.u[0], sub_crm_t.v[0]), from_full=has_pool
+                )
+                land_mask_t_tile = (sfc_sub.surf_type.reshape(nc, ny_t, nx_t)[t_idx] == SURF_LAND)
+                evaluate_crm_shadow_on_teachers(
+                    model.crm_distill, x_all_sd[t_idx],
+                    rho_pre_sd[:, t_idx], atmos.dz_c[:, t_idx], exner_mynn_sd[:, t_idx], temp_mynn_sd[0, t_idx],
+                    thm_mynn_sd[:, t_idx], qn_mynn_sd[:, t_idx], qp_pre_sd[:, t_idx],
+                    qc_mynn_sd[:, t_idx], qi_mynn_sd[:, t_idx], u_mynn_sd[:, t_idx], v_mynn_sd[:, t_idx],
+                    zero_sfc_sd[t_idx], zero_sfc_sd[t_idx], zero_sfc_sd[t_idx], zero_sfc_sd[t_idx],
+                    dt,
+                    thm_t_post=thm_t_post, qn_t_post=qn_t_post, qc_t_post=qc_t_post, qi_t_post=qi_t_post,
+                    u_t_post=u_t_post, v_t_post=v_t_post,
+                    rain_t_cell=sp_t.precip_rain, snow_t_cell=sp_t.precip_snow, f_cld_t=f_cld_t,
+                    sub_maps_t=(sub_maps_all_sd[t_idx] if sub_maps_all_sd is not None else None),
+                    rain_t_tile=rain_t_tile, snow_t_tile=snow_t_tile,
+                    thm0_t_tile=thm0_t_tile, qv0_t_tile=qv0_t_tile, wind0_t_tile=wind0_t_tile,
+                    land_mask_tile=land_mask_t_tile,
+                    shf_tile=sfc_diag_tile["shf"][t_idx], evap_tile=sfc_diag_tile["evap"][t_idx],
+                    t_cell_idx=t_idx,
+                    step_count=model.step_count,
+                )
             n_cgrad = 4 if ((has_pool or sparse_warmup_crm) and model.crm_distill.steps_seen < model.crm_distill.warmup_steps) else 2
             train_student_online(
                 model.crm_distill, x_all_sd[t_idx], ctx_p_t, ctx_s_t, tgt_p_t, tgt_s_t, dt,
@@ -3459,20 +3532,48 @@ def step_aoba_model(
                 atmos.q_c[:, w_idx], atmos.q_i[:, w_idx], u_post_w, v_post_w,
                 rain_cell_w[w_idx], snow_cell_w[w_idx], f_cld_w, f_prec_w,
             )
+            rain_w_tile = rain_new_sub.reshape(nc, ny_t, nx_t)[w_idx]
+            snow_w_tile = snow_new_sub.reshape(nc, ny_t, nx_t)[w_idx]
+            thm0_w_tile = _crm3d_to_tile3d(crm.theta_m[0, w_idx])
+            qv0_w_tile = _crm3d_to_tile3d(crm.q_v[0, w_idx])
+            u0_w_tile = _crm3d_to_tile3d(crm.u[0, w_idx])
+            v0_w_tile = _crm3d_to_tile3d(crm.v[0, w_idx])
             tgt_maps_w, has_map_w = (
                 extract_spatial_targets(
                     _crm4d_to_tile4d(crm.q_c[:, w_idx]), _crm4d_to_tile4d(crm.q_i[:, w_idx]),
-                    rain_new_sub.reshape(nc, ny_t, nx_t)[w_idx],
-                    snow_new_sub.reshape(nc, ny_t, nx_t)[w_idx],
+                    rain_w_tile,
+                    snow_w_tile,
                     rho_pre_sd[:, w_idx] * atmos.dz_c[:, w_idx],
-                    thm0_3d=_crm3d_to_tile3d(crm.theta_m[0, w_idx]),
-                    qv0_3d=_crm3d_to_tile3d(crm.q_v[0, w_idx]),
-                    u0_3d=_crm3d_to_tile3d(crm.u[0, w_idx]),
-                    v0_3d=_crm3d_to_tile3d(crm.v[0, w_idx]),
+                    thm0_3d=thm0_w_tile,
+                    qv0_3d=qv0_w_tile,
+                    u0_3d=u0_w_tile,
+                    v0_3d=v0_w_tile,
                 )
                 if sub_maps_all_sd is not None
                 else (None, None)
             )
+            if bool(cfg.enable_distill_shadow_diag):
+                wind0_w_tile = _crm3d_to_tile3d(torch.hypot(crm.u[0, w_idx], crm.v[0, w_idx]))
+                land_mask_w_tile = (sfc_sub.surf_type.reshape(nc, ny_t, nx_t)[w_idx] == SURF_LAND)
+                evaluate_crm_shadow_on_teachers(
+                    model.crm_distill, x_all_sd[w_idx],
+                    rho_pre_sd[:, w_idx], atmos.dz_c[:, w_idx], exner_mynn_w, temp_mynn_w[0],
+                    thm_mynn_w, qn_mynn_w, qp_pre_sd[:, w_idx],
+                    qc_mynn_w, qi_mynn_w, u_mynn_w, v_mynn_w,
+                    zero_sfc_w, zero_sfc_w, zero_sfc_w, zero_sfc_w,
+                    dt,
+                    thm_t_post=atmos.theta_m[:, w_idx], qn_t_post=atmos.q_n[:, w_idx],
+                    qc_t_post=atmos.q_c[:, w_idx], qi_t_post=atmos.q_i[:, w_idx],
+                    u_t_post=u_post_w, v_t_post=v_post_w,
+                    rain_t_cell=rain_cell_w[w_idx], snow_t_cell=snow_cell_w[w_idx], f_cld_t=f_cld_w,
+                    sub_maps_t=(sub_maps_all_sd[w_idx] if sub_maps_all_sd is not None else None),
+                    rain_t_tile=rain_w_tile, snow_t_tile=snow_w_tile,
+                    thm0_t_tile=thm0_w_tile, qv0_t_tile=qv0_w_tile, wind0_t_tile=wind0_w_tile,
+                    land_mask_tile=land_mask_w_tile,
+                    shf_tile=sfc_diag_tile["shf"][w_idx], evap_tile=sfc_diag_tile["evap"][w_idx],
+                    t_cell_idx=w_idx,
+                    step_count=model.step_count,
+                )
             train_student_online(
                 model.crm_distill, x_all_sd[w_idx], ctx_p_w, ctx_s_w, tgt_p_w, tgt_s_w, dt,
                 sub_maps_fresh=(sub_maps_all_sd[w_idx] if sub_maps_all_sd is not None else None),

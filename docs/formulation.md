@@ -1523,6 +1523,26 @@ $$
 \sum_{k=0}^{N_z-1} c_{p,\mathrm{moist},k}\,\Delta m_k\,Q_{\mathrm{rad},k} = (\mathrm{ASR} - \mathrm{OLR}) - (F_{\mathrm{SW,sfc}}^{\mathrm{net}} + F_{\mathrm{LW,sfc}}^{\mathrm{net}}) \tag{8.16}
 $$
 
+When `enable_distill_shadow_diag` is active, each surrogate is evaluated in shadow mode on the current active teacher columns strictly prior to the online gradient update (`evaluate_crm_shadow_on_teachers`, `evaluate_rad_shadow_on_teachers`), yielding an unbiased prequential out-of-sample measure of physical-versus-surrogate divergence across regime shifts such as abrupt $\mathrm{CO}_2$ quadrupling without perturbing model state or training trajectories. Host-atmosphere coupling fidelity weights vertical profiles by dry-air column mass $\Delta m_{k,i} = \rho_{d,k,i}\Delta z_{k,i}$ (for $\theta_m, q_n, q_c + q_i, u, v$) and by moist heat capacity $c_{p,\mathrm{moist},k,i}\Delta m_{k,i}$ (for radiative heating $Q_{\mathrm{rad}}$) alongside cell-mean precipitation $P$ and top-of-atmosphere fluxes $(\mathrm{OLR}, \mathrm{ASR})$:
+
+$$
+\begin{aligned}
+\mathrm{RMSE}_{\mathrm{atm}}(\psi) &= \sqrt{\frac{\sum_{i\in\mathcal{T}}\sum_{k=0}^{N_z-1} \Delta m_{k,i}\big(\hat{\psi}_{k,i} - \psi_{k,i}^{\mathrm{phys}}\big)^2}{\sum_{i\in\mathcal{T}}\sum_{k=0}^{N_z-1} \Delta m_{k,i}}}, \\
+\mathrm{RMSE}_{\mathrm{rad}}(Q_{\mathrm{rad}}) &= \sqrt{\frac{\sum_{m\in\mathcal{T}_{\mathrm{rad}}}\sum_{k=0}^{N_z-1} c_{p,\mathrm{moist},k,m}\Delta m_{k,m}\big(\hat{Q}_{\mathrm{rad},k,m} - Q_{\mathrm{rad},k,m}^{\mathrm{phys}}\big)^2}{\sum_{m\in\mathcal{T}_{\mathrm{rad}}}\sum_{k=0}^{N_z-1} c_{p,\mathrm{moist},k,m}\Delta m_{k,m}}}
+\end{aligned} \tag{8.17}
+$$
+
+where $\mathcal{T}$ denotes the evaluated teacher host columns, $\mathcal{T}_{\mathrm{rad}}$ the evaluated teacher radiation subcolumns, $\hat{\psi}$ the pre-update surrogate prediction, and $\psi^{\mathrm{phys}}$ the physical CRM or radiative transfer output. Land-surface coupling fidelity restricts the comparison to land surface tiles ($\mathbb{I}_{\mathrm{land},i,j} = 1$) at MAML tile resolution $(N_{y,\mathrm{tile}}, N_{x,\mathrm{tile}})$, applying the identical rank-weighted tile precipitation, zero-mean cold-pool microclimate $(\theta_{m,0}, q_{v,0})$, and gust-augmented surface wind speed $|\mathbf{u}_0|$ reconstruction used by student cells together with tile-level downward shortwave ($\mathrm{SW}_\downarrow$), photosynthetically active radiation ($\mathrm{PAR}$), and downward longwave ($\mathrm{LW}_\downarrow$) fluxes:
+
+$$
+\begin{aligned}
+\mathrm{RMSE}_{\mathrm{land}}(\phi) &= \sqrt{\frac{\sum_{i\in\mathcal{T}}\sum_{j=1}^{N_{\mathrm{tile}}} \mathbb{I}_{\mathrm{land},i,j}\big(\hat{\phi}_{i,j} - \phi_{i,j}^{\mathrm{phys}}\big)^2}{\sum_{i\in\mathcal{T}}\sum_{j=1}^{N_{\mathrm{tile}}} \mathbb{I}_{\mathrm{land},i,j}}}, \\
+r_{\mathrm{land,anom}}(P) &= \operatorname{corr}_{\mathbb{I}_{\mathrm{land}}=1}\!\left(\hat{P}_{i,j} - \overline{\hat{P}}_i,\ P_{i,j}^{\mathrm{phys}} - \overline{P}_i^{\mathrm{phys}}\right)
+\end{aligned} \tag{8.18}
+$$
+
+where $\phi \in \{\theta_{m,0}, q_{v,0}, |\mathbf{u}_0|, P_{\mathrm{tile}}, \mathrm{SW}_\downarrow, \mathrm{PAR}, \mathrm{LW}_\downarrow\}$ and overbars denote host-cell tile means.
+
 ---
 
 ## 9. Ocean Circulation (`ocean_mode`), Independent Fine Ocean, Surface Waves, EVP–ITD Sea Ice & FlexPFT Marine BGC

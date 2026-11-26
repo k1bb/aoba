@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import is_dataclass
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
+import json
 import math
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 from typing import Any
@@ -1272,6 +1275,11 @@ def _build_monthly_mean_xarray(
         "t_ocean_ml": "K", "t_canopy": "K", "m_seaice": "kg m-2", "swe_land": "kg m-2",
         "w_root": "kg m-2", "lai": "m2 m-2", "precip_mm_day": "mm day-1",
         "olr": "W m-2", "asr": "W m-2", "evap_mm_day": "mm day-1", "gpp": "umol m-2 s-1",
+        # Complete-optimality EEO vegetation & cloud/sea-ice diagnostics for spin-up & paper verification
+        "h_canopy": "m", "f_evg": "1", "f_c4": "1", "s_root_cap": "kg m-2",
+        "vcmax25": "umol m-2 s-1", "chi_leaf": "1",
+        "clt": "%", "lwp": "kg m-2", "iwp": "kg m-2", "prw": "kg m-2",
+        "siconc": "%", "sithick": "m",
     }
     units_2d_ocn = {
         "ocn_eta": "m",
@@ -1319,6 +1327,32 @@ def _build_monthly_mean_xarray(
                     data_vars[name] = (("time", "n_cell"), arr, {"units": "m"})
         data_vars["koppen_code"] = (("time", "n_cell"), kg30.detach().cpu().numpy()[None, :])
         data_vars["koppen_major"] = (("time", "n_cell"), kg5.detach().cpu().numpy()[None, :])
+        if getattr(model, "crm_distill", None) is not None or getattr(model, "rad_distill", None) is not None:
+            from aoba.crm_self_distill import consume_distill_shadow_maps
+
+            sh_maps = consume_distill_shadow_maps(
+                getattr(model, "crm_distill", None),
+                getattr(model, "rad_distill", None),
+                reset=False,
+            )
+            _sh_units = {
+                "shadow_atm_dthm_k": "K",
+                "shadow_atm_dprec_mmd": "mm day-1",
+                "shadow_atm_unc": "1",
+                "shadow_land_dthm0_k": "K",
+                "shadow_land_dprec_mmd": "mm day-1",
+                "shadow_rad_dolr_wm2": "W m-2",
+                "shadow_rad_bias_olr_wm2": "W m-2",
+                "shadow_land_dlwd_wm2": "W m-2",
+                "shadow_land_dswd_wm2": "W m-2",
+                "shadow_teacher_visits": "1",
+            }
+            for sk, sv in sh_maps.items():
+                data_vars[sk] = (
+                    ("time", "n_cell"),
+                    sv.detach().cpu().numpy().astype(np.float32)[None, :],
+                    {"units": _sh_units.get(sk, "1")},
+                )
     if include_3d:
         for name, unit in units_3d.items():
             if name in sums:
@@ -1510,6 +1544,205 @@ def _write_live_preview_atomic(
     os.replace(tmp_path, out_path)
 
 
+def _ensure_csv_header_upgraded(csv_path: Path, expected_header: list[str]) -> None:
+    """Safely upgrade an existing CSV file's header if new diagnostic columns were appended."""
+    if not csv_path.exists():
+        return
+    try:
+        with open(csv_path, "r", newline="") as f:
+            rows = list(csv.reader(f))
+    except OSError:
+        return
+    if not rows:
+        return
+    old_hdr = rows[0]
+    if old_hdr == expected_header:
+        return
+    if len(old_hdr) < len(expected_header) and expected_header[:len(old_hdr)] == old_hdr:
+        pad = ["nan"] * (len(expected_header) - len(old_hdr))
+        tmp_p = csv_path.with_name(f".{csv_path.name}.upgrade.tmp")
+        with open(tmp_p, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(expected_header)
+            for r in rows[1:]:
+                w.writerow(r + pad)
+        os.replace(tmp_p, csv_path)
+
+
+def _git_version_info() -> tuple[str, bool]:
+    """Return `(short_sha, is_dirty)` of the AOBA repository without failing if git is absent."""
+    repo = Path(__file__).resolve().parents[1]
+    try:
+        sha = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        ).strip()
+        st = subprocess.check_output(
+            ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        ).strip()
+        return sha, bool(st)
+    except Exception:
+        return "unknown", False
+
+
+def _serialize_applied_config(cfg: AOBAConfig, out_cfg: OutputConfig) -> dict[str, Any]:
+    """Build a JSON-serializable canonical snapshot of all model + output parameters."""
+    flat: dict[str, Any] = {}
+    for k, v in asdict(cfg).items():
+        if isinstance(v, (int, float, str, bool)) or v is None:
+            flat[k] = v
+        else:
+            flat[k] = str(v)
+    for k, v in asdict(out_cfg).items():
+        if k == "out_dir":
+            continue
+        if isinstance(v, (int, float, str, bool)) or v is None:
+            flat[f"output.{k}"] = v
+        else:
+            flat[f"output.{k}"] = str(v)
+    return flat
+
+
+def _record_tuning_history(
+    out_root: Path,
+    cfg: AOBAConfig,
+    out_cfg: OutputConfig,
+    *,
+    sim_year: int,
+    sim_date: str,
+    sim_days: float,
+    step_count: int,
+    source_ckpt: str = "",
+    prev_ckpt_cfg: dict[str, Any] | None = None,
+    note: str = "",
+) -> dict[str, Any]:
+    """Automatically log initial configuration, code commits, and any parameter changes over spin-up.
+
+    Writes both machine-readable `tuning_history.jsonl` and publication-ready `tuning_history.md`
+    (with exact simulated year, date, step, git commit, parameter diffs, and tuning rationale).
+    """
+    cur_cfg = _serialize_applied_config(cfg, out_cfg)
+    git_sha, git_dirty = _git_version_info()
+    snap_path = out_root / "last_applied_config.json"
+    jsonl_path = out_root / "tuning_history.jsonl"
+    md_path = out_root / "tuning_history.md"
+
+    prev_cfg: dict[str, Any] | None = None
+    prev_sha: str | None = None
+    event = "INIT"
+    if snap_path.exists():
+        try:
+            prev_rec = json.loads(snap_path.read_text(encoding="utf-8"))
+            prev_cfg = prev_rec.get("config")
+            prev_sha = prev_rec.get("git_commit")
+            event = "RESUME"
+        except (OSError, json.JSONDecodeError):
+            prev_cfg = None
+    elif prev_ckpt_cfg is not None:
+        prev_cfg = prev_ckpt_cfg
+        event = "PHASE_TRANSITION"
+
+    diffs: dict[str, dict[str, Any]] = {}
+    if prev_cfg is not None:
+        all_keys = sorted(set(prev_cfg.keys()) | set(cur_cfg.keys()))
+        for k in all_keys:
+            v_old = prev_cfg.get(k)
+            v_new = cur_cfg.get(k)
+            if v_old != v_new:
+                diffs[k] = {"old": v_old, "new": v_new}
+        if diffs and event == "RESUME":
+            event = "CONFIG_CHANGE"
+        elif prev_sha is not None and prev_sha != git_sha and event == "RESUME":
+            event = "CODE_CHANGE"
+
+    should_log = (event != "RESUME") or bool(diffs) or bool(note.strip()) or not jsonl_path.exists()
+    ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if should_log:
+        entry: dict[str, Any] = {
+            "timestamp_utc": ts_utc,
+            "event": event,
+            "sim_year": int(sim_year),
+            "sim_date": str(sim_date),
+            "sim_days": round(float(sim_days), 3),
+            "step": int(step_count),
+            "git_commit": git_sha,
+            "git_dirty": bool(git_dirty),
+            "source_ckpt": str(source_ckpt),
+            "note": str(note.strip()),
+            "changes": diffs,
+        }
+        if event == "INIT":
+            entry["initial_summary"] = {
+                "glevel": cfg.glevel,
+                "ocean_glevel": cfg.ocean_glevel,
+                "nz": cfg.nz,
+                "ocean_nz": cfg.ocean_nz,
+                "crm_nx": cfg.crm_nx,
+                "crm_ny": cfg.crm_ny,
+                "crm_dx": cfg.crm_dx,
+                "crm_sfc_tiles": cfg.crm_sfc_tiles,
+                "enable_crm_self_distill": cfg.enable_crm_self_distill,
+                "enable_rad_self_distill": cfg.enable_rad_self_distill,
+                "crm_distill_stride": cfg.crm_distill_stride,
+                "co2_mode": cfg.co2_mode,
+                "co2_scenario": cfg.co2_scenario,
+                "co2_ppmv": cfg.co2_ppmv,
+                "rad_scheme": cfg.rad_scheme,
+                "microphysics_scheme": cfg.microphysics_scheme,
+            }
+        with open(jsonl_path, "a", encoding="utf-8") as f_j:
+            f_j.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        if not md_path.exists():
+            md_path.write_text(
+                "# AOBA Spin-Up & Experiment Tuning History\n\n"
+                "| UTC Time | Event | Sim Year | Sim Date | Step | Git | Changes (`old -> new`) | Note |\n"
+                "| :--- | :--- | ---: | :--- | ---: | :--- | :--- | :--- |\n",
+                encoding="utf-8",
+            )
+        if diffs:
+            chg_str = "; ".join(f"`{k}`: `{v['old']}` -> `{v['new']}`" for k, v in diffs.items())
+        elif event == "INIT":
+            chg_str = (
+                f"Initial run: G{cfg.glevel}z{cfg.nz} / CRM {cfg.crm_ny}x{cfg.crm_nx}@{cfg.crm_dx:.0f}m / "
+                f"OG{cfg.ocean_glevel or cfg.glevel}z{cfg.ocean_nz} / CO2={cfg.co2_mode}:{cfg.co2_scenario if cfg.co2_mode=='scenario' else cfg.co2_ppmv}"
+            )
+        else:
+            chg_str = "(no parameter diff)"
+        git_lbl = f"`{git_sha}{'*' if git_dirty else ''}`"
+        note_clean = note.strip().replace("|", "/").replace("\n", " ") or (f"from `{Path(source_ckpt).name}`" if source_ckpt else "-")
+        with open(md_path, "a", encoding="utf-8") as f_m:
+            f_m.write(
+                f"| {ts_utc} | {event} | {sim_year} | {sim_date} | {step_count} | {git_lbl} | {chg_str} | {note_clean} |\n"
+            )
+        print(f"[TUNING LOG] Recorded {event} at Y{sim_year:04d} ({sim_date}, step {step_count}): {len(diffs)} param diff(s)", flush=True)
+
+    snap_tmp = out_root / ".last_applied_config.json.tmp"
+    snap_tmp.write_text(
+        json.dumps(
+            {
+                "timestamp_utc": ts_utc,
+                "git_commit": git_sha,
+                "git_dirty": bool(git_dirty),
+                "sim_year": int(sim_year),
+                "sim_date": str(sim_date),
+                "step": int(step_count),
+                "config": cur_cfg,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    os.replace(snap_tmp, snap_path)
+    return cur_cfg
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Multi-year AOBA climate integration (TOML-configurable Zarr v3 output)")
     parser.add_argument("--config", type=str, default="", help="Path to unified AOBA TOML configuration file")
@@ -1535,6 +1768,7 @@ def main() -> None:
     parser.add_argument("--icesheet-isostasy-tau-yr", type=float, default=None)
     parser.add_argument("--cmip7-output", action="store_true", default=None, help="Enable CMIP7 Data Request v1.2 ESM-BCV monthly Zarr stream")
     parser.add_argument("--enable-ocean-bgc", action="store_true", default=None, help="Enable FlexPFT marine BGC & OMIP/mocsy 2.0 carbonate chemistry")
+    parser.add_argument("--tuning-note", type=str, default="", help="Optional provenance note recorded in tuning_history.md / tuning_history.jsonl")
     args = parser.parse_args()
 
     if args.config:
@@ -1624,12 +1858,16 @@ def main() -> None:
     prev_ohc_j: float | None = None
     prev_ohc_time_sec: float | None = None
     resumed_existing = False
+    loaded_ckpt_path = ""
+    loaded_ckpt_cfg: dict[str, Any] | None = None
     if not args.no_resume:
         for y in range(years, 0, -1):
             y_dir = out_root / f"year_{y:04d}"
             if (y_dir / "_COMPLETE").exists() and (y_dir / "restart.pt").exists():
                 print(f"Resuming from completed Year {y:04d} ({y_dir / 'restart.pt'})...", flush=True)
                 ckpt_yr = _load_restart_into_model(model, y_dir / "restart.pt", dev)
+                loaded_ckpt_path = str(y_dir / "restart.pt")
+                loaded_ckpt_cfg = ckpt_yr.get("applied_config", None)
                 prev_ohc_j = ckpt_yr.get("prev_ohc_j", None)
                 prev_ohc_time_sec = ckpt_yr.get("prev_ohc_time_sec", None)
                 start_year = y + 1
@@ -1640,6 +1878,8 @@ def main() -> None:
             if mid_pt.exists():
                 print(f"Resuming mid-year from {mid_pt}...", flush=True)
                 ckpt_mid = _load_restart_into_model(model, mid_pt, dev)
+                loaded_ckpt_path = str(mid_pt)
+                loaded_ckpt_cfg = ckpt_mid.get("applied_config", None)
                 start_year = y
                 resumed_existing = True
                 prev_ohc_j = ckpt_mid.get("prev_ohc_j", None)
@@ -1656,6 +1896,36 @@ def main() -> None:
                         cmip7_acc.load_state_dict(ckpt_mid["resume_cmip7_state"], dev)
                 break
 
+    if not resumed_existing and args.init_from_restart:
+        init_pt = Path(args.init_from_restart).expanduser()
+        if not init_pt.exists():
+            raise FileNotFoundError(f"--init-from-restart file not found: {init_pt}")
+        print(f"Warm-starting from external restart checkpoint: {init_pt}...", flush=True)
+        ckpt_ext = _load_restart_into_model(model, init_pt, dev)
+        loaded_ckpt_path = str(init_pt)
+        loaded_ckpt_cfg = ckpt_ext.get("applied_config", None)
+        elapsed_yr = int(math.floor(model.sim_time_sec / (C.SECONDS_PER_DAY * days_per_year) + 1.0e-6))
+        start_year = max(1, min(years, elapsed_yr + 1))
+        print(
+            f"  Continuing at date {model.calendar.date_at(model.sim_time_sec).iso_datetime} "
+            f"(start_year={start_year:04d}/{years:04d})",
+            flush=True,
+        )
+
+    # Automatic spin-up tuning & provenance history log (`tuning_history.jsonl` + `tuning_history.md`)
+    applied_cfg_snapshot = _record_tuning_history(
+        out_root,
+        cfg,
+        out_cfg,
+        sim_year=start_year,
+        sim_date=model.calendar.date_at(model.sim_time_sec).iso_date,
+        sim_days=model.sim_time_sec / C.SECONDS_PER_DAY,
+        step_count=model.step_count,
+        source_ckpt=loaded_ckpt_path,
+        prev_ckpt_cfg=loaded_ckpt_cfg,
+        note=args.tuning_note,
+    )
+
     # Continuous ocean + coupled spin-up monitor CSV across all years & restarts
     spinup_csv = out_root / "spinup_monitor.csv"
     _SPINUP_HEADER = [
@@ -1666,8 +1936,17 @@ def main() -> None:
         "t_ocn_global_k", "t_ocn_0_300m_k", "t_ocn_300_1500m_k", "t_ocn_deep_k",
         "s_ocn_global_psu", "ohc_zj", "ocn_ke_jm2", "ocn_eta_rms_m",
         "ocn_hbl_mean_m", "ocn_hbl_max_m", "amoc_26n_sv", "amoc_max_sv", "acc_drake_sv",
+        # Extended Letter-paper spin-up, EEO vegetation, sea-ice extent/vol, MOC/OHT & OSSP shadow columns
+        "co2_ppmv", "clt_pct", "lwp_gm2", "iwp_gm2", "prw_kgm2",
+        "gpp_pgc_yr", "lai_land_mean", "hcanopy_land_m", "fevg_land", "fc4_land",
+        "seaice_ext_nh_mkm2", "seaice_ext_sh_mkm2", "seaice_vol_nh_km3", "seaice_vol_sh_km3",
+        "amoc_26n_depth_m", "aabw_30s_sv", "oht_atl_26n_pw",
+        "land_c_veg_pgc", "land_c_soil_pgc",
+        "shadow_atm_dthm_k", "shadow_rad_dolr_wm2", "shadow_land_dthm0_k", "shadow_land_dlwd_wm2",
     ]
     a_earth_m2 = float(model.mesh.area_cell.detach().cpu().to(torch.float64).sum().item())
+    if spinup_csv.exists() and (resumed_existing or start_year > 1 or resume_step_in_yr > 0):
+        _ensure_csv_header_upgraded(spinup_csv, _SPINUP_HEADER)
     if not spinup_csv.exists() or (start_year == 1 and resume_step_in_yr == 0 and not resumed_existing):
         with open(spinup_csv, "w", newline="") as f_sp:
             csv.writer(f_sp).writerow(_SPINUP_HEADER)
@@ -1700,6 +1979,18 @@ def main() -> None:
                     f"{m0.get('amoc_26n_sv', float('nan')):.2f}",
                     f"{m0.get('amoc_max_sv', float('nan')):.2f}",
                     f"{m0.get('acc_drake_sv', float('nan')):.2f}",
+                    f"{model.current_co2_ppmv():.2f}",
+                    "nan", "nan", "nan", "nan",
+                    "nan", "nan", "nan", "nan", "nan",
+                    f"{m0.get('seaice_ext_nh_mkm2', float('nan')):.3f}",
+                    f"{m0.get('seaice_ext_sh_mkm2', float('nan')):.3f}",
+                    f"{m0.get('seaice_vol_nh_km3', float('nan')):.3f}",
+                    f"{m0.get('seaice_vol_sh_km3', float('nan')):.3f}",
+                    f"{m0.get('amoc_26n_depth_m', float('nan')):.1f}",
+                    f"{m0.get('aabw_30s_sv', float('nan')):.2f}",
+                    f"{m0.get('oht_atl_26n_pw', float('nan')):.3f}",
+                    "nan", "nan",
+                    "nan", "nan", "nan", "nan",
                 ])
     elif prev_ohc_j is None and model.ogcm is not None:
         ocn_mesh_r = model.ocn_mesh if model.ocn_mesh is not None else model.mesh
@@ -1708,19 +1999,26 @@ def main() -> None:
         prev_ohc_j = m_res.get("ohc_j", None)
         prev_ohc_time_sec = model.sim_time_sec
 
-    if not resumed_existing and args.init_from_restart:
-        init_pt = Path(args.init_from_restart).expanduser()
-        if not init_pt.exists():
-            raise FileNotFoundError(f"--init-from-restart file not found: {init_pt}")
-        print(f"Warm-starting from external restart checkpoint: {init_pt}...", flush=True)
-        _load_restart_into_model(model, init_pt, dev)
-        elapsed_yr = int(math.floor(model.sim_time_sec / (C.SECONDS_PER_DAY * days_per_year) + 1.0e-6))
-        start_year = max(1, min(years, elapsed_yr + 1))
-        print(
-            f"  Continuing at date {model.calendar.date_at(model.sim_time_sec).iso_datetime} "
-            f"(start_year={start_year:04d}/{years:04d})",
-            flush=True,
-        )
+    # Continuous pre-update teacher-student shadow divergence CSV (Host Atmosphere + Land Surface)
+    from aoba.crm_self_distill import CRM_SHADOW_KEYS, RAD_SHADOW_KEYS, read_distill_shadow_metrics
+
+    shadow_enabled = bool(cfg.enable_distill_shadow_diag) and (
+        bool(cfg.enable_crm_self_distill) or bool(cfg.enable_rad_self_distill)
+    )
+    shadow_csv = (out_root / "distill_shadow.csv") if shadow_enabled else None
+    _SHADOW_HEADER = [
+        "year", "date", "step", "sim_days", "co2_ppmv",
+        "crm_teacher_frac", "rad_teacher_frac",
+        *CRM_SHADOW_KEYS,
+        *RAD_SHADOW_KEYS,
+    ]
+    shadow_stride_steps = max(int(cfg.rad_stride), 1)
+    last_shadow_metrics: dict[str, float] = {}
+    if shadow_csv is not None and (
+        not shadow_csv.exists() or (start_year == 1 and resume_step_in_yr == 0 and not resumed_existing)
+    ):
+        with open(shadow_csv, "w", newline="") as f_sh:
+            csv.writer(f_sh).writerow(_SHADOW_HEADER)
 
     # Expose initial T2 / OLR / LAI + Earth2014 continents immediately for Tab 5 live globes
     _write_live_preview_atomic(
@@ -1964,6 +2262,25 @@ def main() -> None:
                     gpp_c = model.rad_cache.get("gpp", torch.zeros_like(model.sfc.t_ocean_ml))
                     olr_c = model.rad_cache.get("olr", torch.zeros_like(model.sfc.t_ocean_ml))
                     asr_c = model.rad_cache.get("asr", torch.zeros_like(model.sfc.t_ocean_ml))
+                    bio_m = model.sfc.bio
+                    fc4_m = torch.clamp(bio_m.f_c4, 0.0, 1.0)
+                    fevg_m = torch.clamp(bio_m.f_evg, 0.0, 1.0) if bio_m.f_evg is not None else torch.zeros_like(fc4_m)
+                    vcmax_m = (1.0 - fc4_m) * bio_m.vcmax25_c3 + fc4_m * bio_m.vcmax25_c4
+                    chi_m = bio_m.chi_leaf if bio_m.chi_leaf is not None else torch.zeros_like(fc4_m)
+                    dz_4m = model.atmos.dz_c[:, :, None, None]
+                    lwp_sub_m = (model.crm.rho_d * model.crm.q_c * dz_4m).sum(dim=0)
+                    iwp_sub_m = (model.crm.rho_d * model.crm.q_i * dz_4m).sum(dim=0)
+                    nc_m = model.mesh.n_cells
+                    clt_m = (((lwp_sub_m + iwp_sub_m) > 1.0e-4).to(olr_c.dtype).reshape(nc_m, -1).mean(dim=-1)) * 100.0
+                    lwp_m = lwp_sub_m.reshape(nc_m, -1).mean(dim=-1)
+                    iwp_m = iwp_sub_m.reshape(nc_m, -1).mean(dim=-1)
+                    prw_m = (model.atmos.rho_d * model.atmos.q_v * model.atmos.dz_c).sum(dim=0)
+                    f_ice_m = torch.clamp(torch.sqrt(torch.clamp(model.sfc.m_seaice, min=0.0) / 450.0), 0.0, 1.0)
+                    sithick_m = torch.where(
+                        f_ice_m > 1.0e-3,
+                        (torch.clamp(model.sfc.m_seaice, min=0.0) / C.RHO_SEAICE) / torch.clamp(f_ice_m, min=1.0e-3),
+                        torch.zeros_like(f_ice_m),
+                    )
                     sample.update({
                         "t_ocean_ml": model.sfc.t_ocean_ml,
                         "t_canopy": model.sfc.t_canopy,
@@ -1976,6 +2293,18 @@ def main() -> None:
                         "asr": asr_c,
                         "evap_mm_day": evap * C.SECONDS_PER_DAY,
                         "gpp": gpp_c,
+                        "h_canopy": bio_m.h_canopy,
+                        "f_evg": fevg_m,
+                        "f_c4": fc4_m,
+                        "s_root_cap": bio_m.s_root_cap,
+                        "vcmax25": vcmax_m,
+                        "chi_leaf": chi_m,
+                        "clt": clt_m,
+                        "lwp": lwp_m,
+                        "iwp": iwp_m,
+                        "prw": prw_m,
+                        "siconc": f_ice_m * 100.0,
+                        "sithick": sithick_m,
                     })
                     if model.ogcm is not None:
                         og = model.ogcm
@@ -2043,6 +2372,30 @@ def main() -> None:
                 if cmip7_acc is not None:
                     cmip7_acc.sample(model)
 
+            if shadow_csv is not None and (
+                step_in_yr % shadow_stride_steps == 0
+                or step_in_yr == 1
+                or step_in_yr == steps_per_year
+            ):
+                sm = read_distill_shadow_metrics(model.crm_distill, model.rad_distill)
+                if sm:
+                    last_shadow_metrics = sm
+                    co2_sh = model.current_co2_ppmv()
+                    sh_row = [
+                        year,
+                        diag.date_str,
+                        int(model.step_count),
+                        f"{diag.sim_time_days:.4f}",
+                        f"{co2_sh:.2f}",
+                        f"{sm.get('crm_teacher_frac', float('nan')):.4f}",
+                        f"{sm.get('rad_teacher_frac', float('nan')):.4f}",
+                    ]
+                    for k_sh in (*CRM_SHADOW_KEYS, *RAD_SHADOW_KEYS):
+                        v_sh = sm.get(k_sh, float("nan"))
+                        sh_row.append(f"{v_sh:.5g}" if math.isfinite(v_sh) else "nan")
+                    with open(shadow_csv, "a", newline="") as f_sh:
+                        csv.writer(f_sh).writerow(sh_row)
+
             if step_in_yr % csv_stride_steps == 0 or step_in_yr == steps_per_year:
                 synchronize_device(dev)
                 wall_day = time.perf_counter() - t_day0
@@ -2067,6 +2420,31 @@ def main() -> None:
                         f"Ice={day_accum['ice'] * inv_d:5.2f} Mkm2 | {wall_day:5.1f} s/d",
                         flush=True,
                     )
+                    if last_shadow_metrics:
+                        sm_p = last_shadow_metrics
+                        co2_p = model.current_co2_ppmv()
+                        print(
+                            f"  [SHADOW ATMOS | CO2={co2_p:6.1f} ppmv] "
+                            f"dTh={sm_p.get('atm_rmse_thm_k', float('nan')):.3f}K "
+                            f"dQn={sm_p.get('atm_rmse_qn_gkg', float('nan')):.3f}g/kg "
+                            f"dP={sm_p.get('atm_rmse_prec_mmd', float('nan')):.2f}mm/d(r={sm_p.get('atm_corr_prec', float('nan')):.2f}) | "
+                            f"dOLR={sm_p.get('rad_rmse_olr_wm2', float('nan')):.2f}({sm_p.get('rad_bias_olr_wm2', float('nan')):+.2f}) "
+                            f"dASR={sm_p.get('rad_rmse_asr_wm2', float('nan')):.2f} "
+                            f"dQrad={sm_p.get('rad_rmse_qrad_kd', float('nan')):.2f}K/d | "
+                            f"unc={sm_p.get('atm_unc_mean', float('nan')):.3f}",
+                            flush=True,
+                        )
+                        print(
+                            f"  [SHADOW LAND  | tiles={int(sm_p.get('sfc_n_land_tiles', 0))}] "
+                            f"dTh0={sm_p.get('sfc_rmse_thm0_k', float('nan')):.3f}K "
+                            f"dQv0={sm_p.get('sfc_rmse_qv0_gkg', float('nan')):.3f}g/kg "
+                            f"dU0={sm_p.get('sfc_rmse_wind0_ms', float('nan')):.2f}m/s "
+                            f"dP={sm_p.get('sfc_rmse_prec_mmd', float('nan')):.2f}mm/d(r_an={sm_p.get('sfc_corr_prec_anom', float('nan')):.2f}) | "
+                            f"dSWdn={sm_p.get('sfc_rad_rmse_swdn_wm2', float('nan')):.1f} "
+                            f"dPAR={sm_p.get('sfc_rad_rmse_par_wm2', float('nan')):.1f} "
+                            f"dLWdn={sm_p.get('sfc_rad_rmse_lwd_wm2', float('nan')):.2f}({sm_p.get('sfc_rad_bias_lwd_wm2', float('nan')):+.2f}) W/m2",
+                            flush=True,
+                        )
                 for k in day_accum:
                     day_accum[k] = 0.0
                 day_cnt = 0
@@ -2111,6 +2489,36 @@ def main() -> None:
                     prev_ohc_j = ohc_now
                     prev_ohc_time_sec = model.sim_time_sec
                 mon_num = m_idx + 1
+                # Monthly global cloud, EEO vegetation, land-carbon, and shadow-divergence summaries
+                a_h64 = model.mesh.area_cell.detach().cpu().to(torch.float64)
+                a_h_tot = max(float(a_h64.sum().item()), 1.0)
+                is_lnd_64 = (model.mesh.surf_type.detach().cpu() == SURF_LAND).to(torch.float64)
+                a_lnd_tot = max(float((a_h64 * is_lnd_64).sum().item()), 1.0)
+                def _gmean(key: str) -> float:
+                    if m_cnt <= 0 or key not in m_sums:
+                        return float("nan")
+                    return float(((m_sums[key].detach().cpu().double() / float(m_cnt)) * a_h64).sum().item() / a_h_tot)
+                def _lmean(t_dev: torch.Tensor) -> float:
+                    return float((t_dev.detach().cpu().double() * a_h64 * is_lnd_64).sum().item() / a_lnd_tot)
+                clt_mon = _gmean("clt")
+                lwp_mon = _gmean("lwp") * 1.0e3
+                iwp_mon = _gmean("iwp") * 1.0e3
+                prw_mon = _gmean("prw")
+                bio_now = model.sfc.bio
+                lai_lnd = _lmean(bio_now.lai)
+                hc_lnd = _lmean(bio_now.h_canopy)
+                fevg_lnd = _lmean(torch.clamp(bio_now.f_evg, 0.0, 1.0)) if bio_now.f_evg is not None else float("nan")
+                fc4_lnd = _lmean(torch.clamp(bio_now.f_c4, 0.0, 1.0))
+                # Global terrestrial GPP [PgC/yr] from monthly mean gpp [umol CO2 m^-2 s^-1]
+                gpp_pgc_yr = m_gpp * 12.011e-9 * a_h_tot * (C.DAYS_PER_YEAR * C.SECONDS_PER_DAY) * 1.0e-12
+                lc_veg_pgc = float("nan")
+                lc_soil_pgc = float("nan")
+                if model.land_carbon is not None:
+                    from aoba.land_carbon import diagnose_land_carbon_metrics
+
+                    _lc_sp = diagnose_land_carbon_metrics(model.land_carbon, model.mesh.area_cell, model.mesh.surf_type)
+                    lc_veg_pgc = float(_lc_sp.get("c_veg_pgc", float("nan")))
+                    lc_soil_pgc = float(_lc_sp.get("c_soil_pgc", float("nan")))
                 with open(spinup_csv, "a", newline="") as f_sp:
                     csv.writer(f_sp).writerow([
                         year, mon_num, diag.date_str, f"{diag.sim_time_days:.2f}",
@@ -2133,6 +2541,21 @@ def main() -> None:
                         f"{ocn_m.get('amoc_26n_sv', float('nan')):.2f}",
                         f"{ocn_m.get('amoc_max_sv', float('nan')):.2f}",
                         f"{ocn_m.get('acc_drake_sv', float('nan')):.2f}",
+                        f"{model.current_co2_ppmv():.2f}",
+                        f"{clt_mon:.2f}", f"{lwp_mon:.2f}", f"{iwp_mon:.2f}", f"{prw_mon:.2f}",
+                        f"{gpp_pgc_yr:.2f}", f"{lai_lnd:.3f}", f"{hc_lnd:.2f}", f"{fevg_lnd:.3f}", f"{fc4_lnd:.3f}",
+                        f"{ocn_m.get('seaice_ext_nh_mkm2', float('nan')):.3f}",
+                        f"{ocn_m.get('seaice_ext_sh_mkm2', float('nan')):.3f}",
+                        f"{ocn_m.get('seaice_vol_nh_km3', float('nan')):.3f}",
+                        f"{ocn_m.get('seaice_vol_sh_km3', float('nan')):.3f}",
+                        f"{ocn_m.get('amoc_26n_depth_m', float('nan')):.1f}",
+                        f"{ocn_m.get('aabw_30s_sv', float('nan')):.2f}",
+                        f"{ocn_m.get('oht_atl_26n_pw', float('nan')):.3f}",
+                        f"{lc_veg_pgc:.1f}", f"{lc_soil_pgc:.1f}",
+                        f"{last_shadow_metrics.get('atm_rmse_thm_k', float('nan')):.4f}",
+                        f"{last_shadow_metrics.get('rad_rmse_olr_wm2', float('nan')):.3f}",
+                        f"{last_shadow_metrics.get('sfc_rmse_thm0_k', float('nan')):.4f}",
+                        f"{last_shadow_metrics.get('sfc_rad_rmse_lwd_wm2', float('nan')):.3f}",
                     ])
                 if ocn_m:
                     print(
@@ -2273,6 +2696,14 @@ def main() -> None:
                 if cmip7_acc is not None and cmip7_acc.sample_count > 0:
                     append_zarr(cmip7_acc.to_xarray(model), cmip7_zarr)
                     cmip7_acc.reset()
+                if getattr(model, "crm_distill", None) is not None or getattr(model, "rad_distill", None) is not None:
+                    from aoba.crm_self_distill import consume_distill_shadow_maps
+
+                    consume_distill_shadow_maps(
+                        getattr(model, "crm_distill", None),
+                        getattr(model, "rad_distill", None),
+                        reset=True,
+                    )
                 m_sums.clear()
                 m_cnt = 0
                 m_idx += 1
@@ -2308,6 +2739,7 @@ def main() -> None:
                         "prev_ohc_j": prev_ohc_j,
                         "prev_ohc_time_sec": prev_ohc_time_sec,
                         "resume_cmip7_state": cmip7_acc.state_dict_cpu() if cmip7_acc is not None else None,
+                        "applied_config": applied_cfg_snapshot,
                     },
                 )
                 print(f"[Saved mid-year restart at {diag.date_str} (step {step_in_yr}/{steps_per_year})]", flush=True)
@@ -2329,6 +2761,7 @@ def main() -> None:
                 extra={
                     "prev_ohc_j": prev_ohc_j,
                     "prev_ohc_time_sec": prev_ohc_time_sec,
+                    "applied_config": applied_cfg_snapshot,
                 },
             )
             (y_dir / "_COMPLETE").touch()

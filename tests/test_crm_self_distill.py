@@ -589,6 +589,163 @@ def test_ogcm_gpu_fused_parity_and_async_ocean_stride() -> None:
     )
 
 
+def test_shadow_divergence_abrupt_4xco2_atmos_and_land() -> None:
+    """Verify pre-update shadow evaluation detects an abrupt-4xCO2 spike and subsequent online
+    relaxation for BOTH Host Atmosphere and Land Surface coupling fidelity, plus spatial maps,
+    fine-ocean CMIP7/MOC/EEO outputs, and automatic tuning-history logging."""
+    import json
+    import math
+    import tempfile
+    from pathlib import Path
+
+    from aoba.cmip7_diag import CMIP7MonthlyAccumulator, export_cmip7_fx_xarray
+    from aoba.crm_self_distill import (
+        CRM_SHADOW_KEYS,
+        RAD_SHADOW_KEYS,
+        consume_distill_shadow_maps,
+        read_distill_shadow_metrics,
+    )
+    from aoba.surface import SURF_LAND
+
+    torch.manual_seed(17)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(17)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(17)
+    dev = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    cfg = AOBAConfig(
+        glevel=2, nz=18, z_top=30000.0, z_sponge_base=24000.0,
+        crm_ny=1, crm_nx=4, crm_dx=4000.0, crm_sfc_tiles=4,
+        dt_host=720.0, n_host_dyn_substeps=1, n_crm_dyn_substeps=4,
+        rad_stride=1, rad_scheme="ckd", o3_mode="rcemip",
+        co2_mode="constant", co2_ppmv=284.3,
+        ocean_mode="ekman_sw", use_earth2014=False,
+        enable_dust=False, enable_natural_aerosols=False,
+        enable_land_carbon=False, enable_ocean_bgc=False, enable_river_routing=False,
+        enable_crm_self_distill=True, enable_rad_self_distill=True,
+        enable_distill_shadow_diag=True,
+        crm_distill_stride=4, crm_distill_warmup_steps=8, crm_distill_dwell_steps=64,
+        crm_distill_hidden_dim=64, crm_distill_replay_size=2048,
+    )
+    model = init_aoba_model(cfg, device=dev)
+    # Assign a deterministic ~40% continental landmass so land-tile shadow metrics are exercised
+    is_land = (model.mesh.lat_cell.abs() < 0.85) & (model.mesh.lon_cell > -0.5) & (model.mesh.lon_cell < 2.2)
+    model.mesh.surf_type = torch.where(is_land, torch.full_like(model.mesh.surf_type, SURF_LAND), model.mesh.surf_type)
+    model.sfc.surf_type = model.mesh.surf_type.clone()
+    if model.sfc_sub is not None:
+        model.sfc_sub.surf_type = model.mesh.surf_type.unsqueeze(1).expand(-1, 4).reshape(-1).clone()
+
+    # Phase 1: piControl (284.3 ppmv) spin-in so CRM & radiation students converge
+    for _ in range(36):
+        step_aoba_model(model)
+    pre = read_distill_shadow_metrics(model.crm_distill, model.rad_distill)
+    for k in (*CRM_SHADOW_KEYS, *RAD_SHADOW_KEYS):
+        assert k in pre and math.isfinite(pre[k]), f"Missing/non-finite shadow metric {k}: {pre.get(k)}"
+    assert pre["sfc_n_land_tiles"] > 0.0 and pre["sfc_rad_n_land"] > 0.0, (
+        f"Expected active land tiles in shadow diagnostics, got {pre['sfc_n_land_tiles']} / {pre['sfc_rad_n_land']}"
+    )
+
+    # Phase 2: Abrupt 4xCO2 shock (284.3 -> 1137.27 ppmv) — measure pre-update OOD jump on the very next step
+    model.cfg.co2_ppmv = 1137.27
+    step_aoba_model(model)
+    shock = read_distill_shadow_metrics(model.crm_distill, model.rad_distill)
+    d_olr_bias = abs(shock["rad_bias_olr_wm2"] - pre["rad_bias_olr_wm2"])
+    d_lwd_bias = abs(shock["sfc_rad_bias_lwd_wm2"] - pre["sfc_rad_bias_lwd_wm2"])
+    assert shock["rad_rmse_olr_wm2"] > pre["rad_rmse_olr_wm2"] + 1.5 or d_olr_bias > 3.0, (
+        f"Host Atmos OLR shadow did not react to abrupt 4xCO2: pre={pre['rad_rmse_olr_wm2']:.2f}({pre['rad_bias_olr_wm2']:+.2f}), "
+        f"shock={shock['rad_rmse_olr_wm2']:.2f}({shock['rad_bias_olr_wm2']:+.2f})"
+    )
+    assert shock["sfc_rad_rmse_lwd_wm2"] > pre["sfc_rad_rmse_lwd_wm2"] + 1.5 or d_lwd_bias > 2.0, (
+        f"Land Surface LW_dn shadow did not react to abrupt 4xCO2: pre={pre['sfc_rad_rmse_lwd_wm2']:.2f}({pre['sfc_rad_bias_lwd_wm2']:+.2f}), "
+        f"shock={shock['sfc_rad_rmse_lwd_wm2']:.2f}({shock['sfc_rad_bias_lwd_wm2']:+.2f})"
+    )
+
+    # Phase 3: Online adaptation under 4xCO2 — verify both Host Atmosphere and Land Surface divergence settle
+    post_hist: list[dict[str, float]] = []
+    for _ in range(28):
+        step_aoba_model(model)
+        post_hist.append(read_distill_shadow_metrics(model.crm_distill, model.rad_distill))
+    post = post_hist[-1]
+    post_olr_avg = sum(h["rad_rmse_olr_wm2"] for h in post_hist[-4:]) / 4.0
+    post_olr_bias_avg = sum(abs(h["rad_bias_olr_wm2"]) for h in post_hist[-4:]) / 4.0
+    post_lwd_avg = sum(h["sfc_rad_rmse_lwd_wm2"] for h in post_hist[-4:]) / 4.0
+    assert post_olr_avg < max(shock["rad_rmse_olr_wm2"], pre["rad_rmse_olr_wm2"]) and post_olr_bias_avg < abs(shock["rad_bias_olr_wm2"]), (
+        f"Host Atmos OLR shadow divergence did not relax after 4xCO2: shock={shock['rad_rmse_olr_wm2']:.2f}({shock['rad_bias_olr_wm2']:+.2f}), "
+        f"post_avg={post_olr_avg:.2f}(|bias|={post_olr_bias_avg:.2f})"
+    )
+    assert post_lwd_avg < max(shock["sfc_rad_rmse_lwd_wm2"], pre["sfc_rad_rmse_lwd_wm2"]), (
+        f"Land Surface LW_dn shadow RMSE did not settle after 4xCO2: shock={shock['sfc_rad_rmse_lwd_wm2']:.2f}, post_avg={post_lwd_avg:.2f}"
+    )
+
+    # Verify per-cell spatial shadow divergence maps
+    s_maps = consume_distill_shadow_maps(model.crm_distill, model.rad_distill, reset=True)
+    for req_k in (
+        "shadow_atm_dthm_k", "shadow_atm_dprec_mmd", "shadow_atm_unc",
+        "shadow_land_dthm0_k", "shadow_rad_dolr_wm2", "shadow_land_dlwd_wm2", "shadow_teacher_visits",
+    ):
+        assert req_k in s_maps and s_maps[req_k].shape == (model.mesh.n_cells,), f"Bad spatial shadow map {req_k}"
+    assert int((s_maps["shadow_teacher_visits"] > 0).sum().item()) > 0
+    assert torch.isfinite(s_maps["shadow_land_dlwd_wm2"]).any()
+
+    # Verify CMIP7 + MOC/OHT + EEO + spatial shadow export with independent fine ocean (G1 atmos + G2 ocean)
+    cfg_fo = AOBAConfig(
+        glevel=1, ocean_glevel=2, nz=12, z_top=30000.0, z_sponge_base=24000.0,
+        crm_ny=1, crm_nx=8, crm_dx=4000.0, crm_sfc_tiles=4,
+        dt_host=720.0, n_host_dyn_substeps=1, n_crm_dyn_substeps=2,
+        rad_stride=1, rad_scheme="four_band", o3_mode="rcemip",
+        ocean_mode="ogcm_3d", ocean_nz=8, ocean_stride=1, use_earth2014=False,
+        enable_dust=False, enable_natural_aerosols=False,
+        enable_land_carbon=False, enable_ocean_bgc=False, enable_river_routing=False,
+        enable_crm_self_distill=True, enable_rad_self_distill=True,
+        enable_distill_shadow_diag=True,
+        crm_distill_stride=4, crm_distill_warmup_steps=2, crm_distill_dwell_steps=4,
+        crm_distill_hidden_dim=32, crm_distill_replay_size=512,
+    )
+    m_fo = init_aoba_model(cfg_fo, device=dev)
+    acc = CMIP7MonthlyAccumulator(include_plev19=True, include_ocean_3d=True)
+    for _ in range(3):
+        step_aoba_model(m_fo)
+        acc.update_step_extrema(m_fo, end_of_day=True)
+        acc.sample(m_fo)
+    ds_fx = export_cmip7_fx_xarray(m_fo)
+    ds_mon = acc.to_xarray(m_fo)
+    assert "areacello" in ds_fx and ds_fx["deptho"].dims == ("n_cell_ocn",)
+    assert ds_mon["tos"].dims == ("time", "n_cell_ocn") and ds_mon["thetao"].dims == ("time", "lev", "n_cell_ocn")
+    assert ds_mon["siconc"].dims == ("time", "n_cell_ocn")
+    for req_v in ("msftmz_atl", "msftmz_glob", "oht_atl", "oht_glob", "hcanopy", "fevg", "fc4", "fapar", "chi_leaf", "shadow_atm_dthm_k", "shadow_rad_dolr_wm2"):
+        assert req_v in ds_mon, f"Missing Letter-paper CMIP7 variable: {req_v}"
+
+    # Verify automatic tuning-history logging (INIT -> CONFIG_CHANGE)
+    import importlib.util
+
+    run_script = Path(__file__).resolve().parents[1] / "scripts" / "run_g5_30yr.py"
+    spec = importlib.util.spec_from_file_location("_aoba_run_mod", str(run_script))
+    assert spec is not None and spec.loader is not None
+    run_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run_mod)
+    from aoba.params import OutputConfig
+
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        out_c = OutputConfig()
+        run_mod._record_tuning_history(td_p, cfg_fo, out_c, sim_year=1, sim_date="2000-03-20", sim_days=0.0, step_count=0, note="initial spinup")
+        cfg_fo2 = AOBAConfig(**{**cfg_fo.__dict__, "co2_ppmv": 1137.27, "glevel": 2})
+        run_mod._record_tuning_history(td_p, cfg_fo2, out_c, sim_year=1001, sim_date="3000-03-20", sim_days=365250.0, step_count=43830000, note="abrupt 4xCO2")
+        lines = [json.loads(l) for l in (td_p / "tuning_history.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert len(lines) == 2 and lines[0]["event"] == "INIT" and lines[1]["event"] == "CONFIG_CHANGE"
+        assert lines[1]["changes"]["co2_ppmv"] == {"old": 284.3, "new": 1137.27}
+        assert lines[1]["changes"]["glevel"] == {"old": 1, "new": 2}
+        assert "abrupt 4xCO2" in (td_p / "tuning_history.md").read_text(encoding="utf-8")
+
+    print(
+        f"  [PASS] Shadow divergence abrupt-4xCO2 + fine-ocean CMIP7/MOC/EEO + tuning log ({dev}): "
+        f"Host OLR RMSE {pre['rad_rmse_olr_wm2']:.2f} -> {shock['rad_rmse_olr_wm2']:.2f} -> {post['rad_rmse_olr_wm2']:.2f} W/m2 "
+        f"(bias {pre['rad_bias_olr_wm2']:+.2f} -> {shock['rad_bias_olr_wm2']:+.2f} -> {post['rad_bias_olr_wm2']:+.2f}) | "
+        f"Land LWdn RMSE {pre['sfc_rad_rmse_lwd_wm2']:.2f} -> {shock['sfc_rad_rmse_lwd_wm2']:.2f} -> {post['sfc_rad_rmse_lwd_wm2']:.2f} W/m2 | "
+        f"Host dTh={post['atm_rmse_thm_k']:.3f}K Land dTh0={post['sfc_rmse_thm0_k']:.3f}K"
+    )
+
+
 if __name__ == "__main__":
     test_exact_column_conservation_closure()
     print("  [PASS] Exact column conservation closure (water, enthalpy, momentum, non-negativity)")
@@ -604,4 +761,5 @@ if __name__ == "__main__":
     print("  [PASS] General 2D isotropic surface-tile grid & exact Kronecker block avg/expand")
     test_sparse_3d_crm_pool_slot_preservation_and_coupled_tica()
     test_ogcm_gpu_fused_parity_and_async_ocean_stride()
+    test_shadow_divergence_abrupt_4xco2_atmos_and_land()
     print("ALL CRM + RADIATION SELF-DISTILLATION TESTS PASSED!")

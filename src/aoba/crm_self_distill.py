@@ -1256,6 +1256,12 @@ class CRMSelfDistillState:
     mem_prec_fast: torch.Tensor | None = None   # [n_cells] 1.5 h convective precipitation EMA [mm/d]
     mem_prec_slow: torch.Tensor | None = None   # [n_cells] 4.0 h convective/cold-pool memory [mm/d]
     mem_buoy_slow: torch.Tensor | None = None   # [n_cells] 3.0 h positive surface buoyancy EMA [m^2 s^-3]
+    # Pre-update shadow evaluation on teacher columns (Host Atmosphere + Land-Tile coupling fidelity)
+    shadow_metrics_gpu: torch.Tensor | None = None
+    shadow_step: int = -1
+    # Per-cell spatial shadow divergence accumulators (reset monthly for Zarr maps, zero CPU sync)
+    shadow_map_sum: torch.Tensor | None = None   # [5, n_cells]: atm_dthm, atm_dprec, atm_unc, land_dthm0, land_dprec
+    shadow_map_cnt: torch.Tensor | None = None   # [2, n_cells]: atm_visits, land_visits
 
 
 def _ensure_convective_memory(state: CRMSelfDistillState, ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2028,6 +2034,532 @@ def pack_teacher_context_and_targets(
 
 
 # ---------------------------------------------------------------------------
+# 4b. Pre-Update Shadow Student-on-Teacher Divergence Diagnostics (Host + Land)
+# ---------------------------------------------------------------------------
+CRM_SHADOW_KEYS: tuple[str, ...] = (
+    "atm_rmse_thm_k",
+    "atm_bias_thm_k",
+    "atm_rmse_qn_gkg",
+    "atm_bias_qn_gkg",
+    "atm_rmse_qci_gkg",
+    "atm_rmse_fcld",
+    "atm_rmse_uv_ms",
+    "atm_rmse_prec_mmd",
+    "atm_bias_prec_mmd",
+    "atm_corr_prec",
+    "atm_unc_mean",
+    "sfc_rmse_thm0_k",
+    "sfc_bias_thm0_k",
+    "sfc_rmse_qv0_gkg",
+    "sfc_bias_qv0_gkg",
+    "sfc_rmse_wind0_ms",
+    "sfc_bias_wind0_ms",
+    "sfc_rmse_prec_mmd",
+    "sfc_bias_prec_mmd",
+    "sfc_corr_prec_anom",
+    "sfc_n_land_tiles",
+)
+
+RAD_SHADOW_KEYS: tuple[str, ...] = (
+    "rad_rmse_olr_wm2",
+    "rad_bias_olr_wm2",
+    "rad_rmse_asr_wm2",
+    "rad_bias_asr_wm2",
+    "rad_rmse_qrad_kd",
+    "rad_bias_qrad_kd",
+    "rad_unc_mean",
+    "sfc_rad_rmse_swdn_wm2",
+    "sfc_rad_bias_swdn_wm2",
+    "sfc_rad_rmse_par_wm2",
+    "sfc_rad_rmse_lwd_wm2",
+    "sfc_rad_bias_lwd_wm2",
+    "sfc_rad_n_land",
+)
+
+
+@torch.no_grad()
+def _pearson_corr_1d(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Zero-sync Pearson correlation on GPU with safe zero-variance guard."""
+    if mask is not None:
+        w = mask.to(dtype=a.dtype)
+        cnt = torch.clamp(w.sum(), min=1.0)
+        ma = (a * w).sum() / cnt
+        mb = (b * w).sum() / cnt
+        da = (a - ma) * w
+        db = (b - mb) * w
+    else:
+        da = a - a.mean()
+        db = b - b.mean()
+    va = (da * da).sum()
+    vb = (db * db).sum()
+    denom = torch.sqrt(torch.clamp(va * vb, min=1.0e-12))
+    return torch.where((va > 1.0e-12) & (vb > 1.0e-12), torch.clamp((da * db).sum() / denom, -1.0, 1.0), torch.zeros_like(va))
+
+
+@torch.no_grad()
+def evaluate_crm_shadow_on_teachers(
+    state: CRMSelfDistillState,
+    x_t: torch.Tensor,               # [N_t, d_in]
+    rho_d: torch.Tensor,             # [nz, N_t]
+    dz_c: torch.Tensor,              # [nz, N_t]
+    exner: torch.Tensor,             # [nz, N_t]
+    temp_sfc: torch.Tensor,          # [N_t]
+    thm_post_ls: torch.Tensor,       # [nz, N_t]
+    qn_post_ls: torch.Tensor,        # [nz, N_t]
+    qp_pre: torch.Tensor,            # [nz, N_t]
+    qc_pre: torch.Tensor,            # [nz, N_t]
+    qi_pre: torch.Tensor,            # [nz, N_t]
+    u_pre: torch.Tensor,             # [nz, N_t]
+    v_pre: torch.Tensor,             # [nz, N_t]
+    shf: torch.Tensor,               # [N_t]
+    evap: torch.Tensor,              # [N_t]
+    tau_x: torch.Tensor,             # [N_t]
+    tau_y: torch.Tensor,             # [N_t]
+    dt: float,
+    *,
+    thm_t_post: torch.Tensor,        # [nz, N_t] teacher host-mean post-CRM theta_m
+    qn_t_post: torch.Tensor,         # [nz, N_t]
+    qc_t_post: torch.Tensor,         # [nz, N_t]
+    qi_t_post: torch.Tensor,         # [nz, N_t]
+    u_t_post: torch.Tensor,          # [nz, N_t]
+    v_t_post: torch.Tensor,          # [nz, N_t]
+    rain_t_cell: torch.Tensor,       # [N_t] [kg m^-2 s^-1]
+    snow_t_cell: torch.Tensor,       # [N_t] [kg m^-2 s^-1]
+    f_cld_t: torch.Tensor,           # [nz, N_t]
+    sub_maps_t: torch.Tensor | None = None,      # [N_t, 8, ny_t, nx_t]
+    rain_t_tile: torch.Tensor | None = None,     # [N_t, ny_t, nx_t] [kg m^-2 s^-1]
+    snow_t_tile: torch.Tensor | None = None,     # [N_t, ny_t, nx_t] [kg m^-2 s^-1]
+    thm0_t_tile: torch.Tensor | None = None,     # [N_t, ny_t, nx_t] [K]
+    qv0_t_tile: torch.Tensor | None = None,      # [N_t, ny_t, nx_t] [kg kg^-1]
+    wind0_t_tile: torch.Tensor | None = None,    # [N_t, ny_t, nx_t] [m s^-1]
+    land_mask_tile: torch.Tensor | None = None,  # [N_t, ny_t, nx_t] float/bool (1=land)
+    shf_tile: torch.Tensor | None = None,        # [N_t, ny_t, nx_t]
+    evap_tile: torch.Tensor | None = None,       # [N_t, ny_t, nx_t]
+    t_cell_idx: torch.Tensor | None = None,      # [N_t] int64 host cell indices for spatial map accumulation
+    step_count: int = 0,
+    max_eval_cols: int = 512,
+) -> None:
+    """Evaluate the pre-update CRM student in shadow mode on active teacher columns (zero CPU-GPU sync).
+
+    Computes both Host-Atmosphere coupling divergence (`atm_*`) and Land-Surface tile coupling
+    divergence (`sfc_*`) strictly BEFORE `train_student_online`, giving an unbiased prequential
+    out-of-sample measure of ML-vs-physical CRM agreement (AOBA Formulation Eqs. 8.17-8.18).
+    """
+    n_t = int(x_t.shape[0])
+    if n_t == 0:
+        return
+    if n_t > max_eval_cols:
+        step_s = max(n_t // max_eval_cols, 1)
+        sl = slice(0, n_t, step_s)
+        x_t = x_t[sl]
+        rho_d = rho_d[:, sl]
+        dz_c = dz_c[:, sl]
+        exner = exner[:, sl]
+        temp_sfc = temp_sfc[sl]
+        thm_post_ls = thm_post_ls[:, sl]
+        qn_post_ls = qn_post_ls[:, sl]
+        qp_pre = qp_pre[:, sl]
+        qc_pre = qc_pre[:, sl]
+        qi_pre = qi_pre[:, sl]
+        u_pre = u_pre[:, sl]
+        v_pre = v_pre[:, sl]
+        shf = shf[sl]
+        evap = evap[sl]
+        tau_x = tau_x[sl]
+        tau_y = tau_y[sl]
+        thm_t_post = thm_t_post[:, sl]
+        qn_t_post = qn_t_post[:, sl]
+        qc_t_post = qc_t_post[:, sl]
+        qi_t_post = qi_t_post[:, sl]
+        u_t_post = u_t_post[:, sl]
+        v_t_post = v_t_post[:, sl]
+        rain_t_cell = rain_t_cell[sl]
+        snow_t_cell = snow_t_cell[sl]
+        f_cld_t = f_cld_t[:, sl]
+        if sub_maps_t is not None:
+            sub_maps_t = sub_maps_t[sl]
+        if rain_t_tile is not None:
+            rain_t_tile = rain_t_tile[sl]
+        if snow_t_tile is not None:
+            snow_t_tile = snow_t_tile[sl]
+        if thm0_t_tile is not None:
+            thm0_t_tile = thm0_t_tile[sl]
+        if qv0_t_tile is not None:
+            qv0_t_tile = qv0_t_tile[sl]
+        if wind0_t_tile is not None:
+            wind0_t_tile = wind0_t_tile[sl]
+        if land_mask_tile is not None:
+            land_mask_tile = land_mask_tile[sl]
+        if shf_tile is not None:
+            shf_tile = shf_tile[sl]
+        if evap_tile is not None:
+            evap_tile = evap_tile[sl]
+        if t_cell_idx is not None:
+            t_cell_idx = t_cell_idx[sl]
+        n_t = int(x_t.shape[0])
+
+    stu_out, stu_unc = predict_student_columns(
+        state, x_t, rho_d, dz_c, exner, temp_sfc,
+        thm_post_ls, qn_post_ls, qp_pre, qc_pre, qi_pre, u_pre, v_pre,
+        shf, evap, tau_x, tau_y, dt,
+        sub_maps_stu=sub_maps_t,
+    )
+
+    # --- 1. Host Atmosphere coupling fidelity (mass-weighted column metrics) ---
+    dm = torch.clamp(rho_d * dz_c, min=1.0e-6)
+    w_m = dm / torch.clamp(dm.sum(), min=1.0e-6)
+
+    d_thm = stu_out["theta_m"] - thm_t_post
+    atm_rmse_thm = torch.sqrt(torch.clamp((w_m * d_thm * d_thm).sum(), min=0.0))
+    atm_bias_thm = (w_m * d_thm).sum()
+
+    d_qn = (stu_out["q_n"] - qn_t_post) * 1.0e3
+    atm_rmse_qn = torch.sqrt(torch.clamp((w_m * d_qn * d_qn).sum(), min=0.0))
+    atm_bias_qn = (w_m * d_qn).sum()
+
+    d_qci = ((stu_out["q_c"] + stu_out["q_i"]) - (qc_t_post + qi_t_post)) * 1.0e3
+    atm_rmse_qci = torch.sqrt(torch.clamp((w_m * d_qci * d_qci).sum(), min=0.0))
+
+    d_fcld = stu_out["f_cld"] - f_cld_t
+    atm_rmse_fcld = torch.sqrt(torch.clamp((d_fcld * d_fcld).mean(), min=0.0))
+
+    d_u = stu_out["u"] - u_t_post
+    d_v = stu_out["v"] - v_t_post
+    atm_rmse_uv = torch.sqrt(torch.clamp(0.5 * (w_m * (d_u * d_u + d_v * d_v)).sum(), min=0.0))
+
+    p_stu_c = (stu_out["precip_rain"] + stu_out["precip_snow"]) * C.SECONDS_PER_DAY
+    p_tea_c = (rain_t_cell + snow_t_cell) * C.SECONDS_PER_DAY
+    d_pc = p_stu_c - p_tea_c
+    atm_rmse_prec = torch.sqrt(torch.clamp((d_pc * d_pc).mean(), min=0.0))
+    atm_bias_prec = d_pc.mean()
+    atm_corr_prec = _pearson_corr_1d(p_stu_c, p_tea_c)
+    atm_unc_mean = stu_unc.mean()
+
+    # --- 2. Land-Surface tile coupling fidelity (reconstructing exact MAML tile forcing) ---
+    if rain_t_tile is not None and snow_t_tile is not None and thm0_t_tile is not None and qv0_t_tile is not None:
+        ny_t, nx_t = int(rain_t_tile.shape[-2]), int(rain_t_tile.shape[-1])
+        n_sub = ny_t * nx_t
+        p_tea_tile = (rain_t_tile + snow_t_tile) * C.SECONDS_PER_DAY  # [N_t, ny_t, nx_t]
+
+        # Reconstruct student tile precipitation identically to `crm_student_tile_update_col`
+        if n_sub > 1:
+            f_p_eff = torch.clamp(stu_out["f_prec"], min=1.0 / float(n_sub), max=1.0)
+            fp_n = (f_p_eff * float(n_sub)).view(n_t, 1)
+            sc_p = stu_out.get("score_prec", stu_out.get("score_cld"))
+            if sc_p is not None:
+                ks = sc_p.reshape(n_t, n_sub)
+                # Rank of each tile (0 = largest score), identical to kernel rank loop
+                order = torch.argsort(ks, dim=-1, descending=True)
+                ranks = torch.empty_like(ks)
+                ranks.scatter_(1, order, torch.arange(n_sub, device=ks.device, dtype=ks.dtype).unsqueeze(0).expand(n_t, -1))
+            else:
+                ranks = torch.arange(n_sub, device=p_stu_c.device, dtype=p_stu_c.dtype).unsqueeze(0).expand(n_t, -1)
+            wp = torch.clamp(fp_n - ranks, 0.0, 1.0)
+            m_p = wp / torch.clamp(wp.mean(dim=-1, keepdim=True), min=1.0e-6)
+            p_stu_tile = (p_stu_c.unsqueeze(1) * m_p).reshape(n_t, ny_t, nx_t)
+
+            # Lowest-layer microclimate (cold-pool / flux anomalies) matching `crm_student_tile_update_col`
+            dthm_cp = stu_out.get("dthm_cp")
+            dqv_cp = stu_out.get("dqv_cp")
+            if dthm_cp is not None and dqv_cp is not None:
+                dt_v = torch.clamp(dthm_cp, -8.0, 8.0)
+                dq_v = torch.clamp(dqv_cp, -6.0e-3, 6.0e-3)
+            elif shf_tile is not None and evap_tile is not None:
+                dm0 = torch.clamp(rho_d[0] * dz_c[0], min=1.0).view(n_t, 1, 1)
+                ex0 = torch.clamp(exner[0], min=0.1).view(n_t, 1, 1)
+                dt_v = torch.clamp((shf_tile - shf_tile.mean(dim=(-2, -1), keepdim=True)) * (dt / (C.CP_D * dm0 * ex0)), -3.0, 3.0)
+                dq_v = torch.clamp((evap_tile - evap_tile.mean(dim=(-2, -1), keepdim=True)) * (dt / dm0), -2.0e-3, 2.0e-3)
+            else:
+                dt_v = torch.zeros_like(thm0_t_tile)
+                dq_v = torch.zeros_like(qv0_t_tile)
+            dthm_anom = dt_v - dt_v.mean(dim=(-2, -1), keepdim=True)
+            dqv_anom = dq_v - dq_v.mean(dim=(-2, -1), keepdim=True)
+            thm0_stu_tile = stu_out["theta_m"][0].view(n_t, 1, 1) + dthm_anom
+            qv0_base = stu_out["q_v"][0].view(n_t, 1, 1)
+            qv_cand = torch.clamp(qv0_base + dqv_anom, min=0.0)
+            qcm = qv_cand.mean(dim=(-2, -1), keepdim=True)
+            qv0_stu_tile = torch.where(qcm > 1.0e-10, qv_cand * (qv0_base / torch.clamp(qcm, min=1.0e-10)), qv0_base.expand_as(qv_cand))
+            u_gust = stu_out.get("u_gust")
+            w0_base = torch.hypot(stu_out["u"][0], stu_out["v"][0]).view(n_t, 1, 1)
+            wind0_stu_tile = w0_base + (torch.clamp(u_gust, min=0.0) if u_gust is not None else 0.0)
+        else:
+            p_stu_tile = p_stu_c.view(n_t, 1, 1)
+            thm0_stu_tile = stu_out["theta_m"][0].view(n_t, 1, 1)
+            qv0_stu_tile = stu_out["q_v"][0].view(n_t, 1, 1)
+            wind0_stu_tile = torch.hypot(stu_out["u"][0], stu_out["v"][0]).view(n_t, 1, 1)
+
+        # Restrict surface metrics to LAND tiles (fallback to all tiles on pure-ocean aquaplanet)
+        if land_mask_tile is not None:
+            lm_raw = (land_mask_tile > 0.5).to(dtype=thm0_stu_tile.dtype)
+            n_land = lm_raw.sum()
+            lm = torch.where(n_land > 0.5, lm_raw, torch.ones_like(lm_raw))
+        else:
+            lm = torch.ones_like(thm0_stu_tile)
+            n_land = lm.sum()
+        w_l = lm / torch.clamp(lm.sum(), min=1.0)
+
+        d_th0 = thm0_stu_tile - thm0_t_tile
+        sfc_rmse_thm0 = torch.sqrt(torch.clamp((w_l * d_th0 * d_th0).sum(), min=0.0))
+        sfc_bias_thm0 = (w_l * d_th0).sum()
+
+        d_qv0 = (qv0_stu_tile - qv0_t_tile) * 1.0e3
+        sfc_rmse_qv0 = torch.sqrt(torch.clamp((w_l * d_qv0 * d_qv0).sum(), min=0.0))
+        sfc_bias_qv0 = (w_l * d_qv0).sum()
+
+        if wind0_t_tile is not None:
+            d_w0 = wind0_stu_tile - wind0_t_tile
+            sfc_rmse_wind0 = torch.sqrt(torch.clamp((w_l * d_w0 * d_w0).sum(), min=0.0))
+            sfc_bias_wind0 = (w_l * d_w0).sum()
+        else:
+            sfc_rmse_wind0 = torch.zeros_like(sfc_rmse_thm0)
+            sfc_bias_wind0 = torch.zeros_like(sfc_bias_thm0)
+
+        d_pt = p_stu_tile - p_tea_tile
+        sfc_rmse_prec = torch.sqrt(torch.clamp((w_l * d_pt * d_pt).sum(), min=0.0))
+        sfc_bias_prec = (w_l * d_pt).sum()
+
+        # Subgrid spatial anomaly correlation (do rain bands land on the right tiles?)
+        if n_sub > 1:
+            ps_an = (p_stu_tile - p_stu_tile.mean(dim=(-2, -1), keepdim=True)).reshape(-1)
+            pt_an = (p_tea_tile - p_tea_tile.mean(dim=(-2, -1), keepdim=True)).reshape(-1)
+            sfc_corr_prec_anom = _pearson_corr_1d(ps_an, pt_an, mask=lm.reshape(-1))
+        else:
+            sfc_corr_prec_anom = atm_corr_prec
+    else:
+        z0 = torch.zeros_like(atm_rmse_thm)
+        sfc_rmse_thm0 = sfc_bias_thm0 = z0
+        sfc_rmse_qv0 = sfc_bias_qv0 = z0
+        sfc_rmse_wind0 = sfc_bias_wind0 = z0
+        sfc_rmse_prec = atm_rmse_prec
+        sfc_bias_prec = atm_bias_prec
+        sfc_corr_prec_anom = atm_corr_prec
+        n_land = torch.zeros_like(atm_rmse_thm)
+
+    state.shadow_metrics_gpu = torch.stack([
+        atm_rmse_thm, atm_bias_thm,
+        atm_rmse_qn, atm_bias_qn,
+        atm_rmse_qci, atm_rmse_fcld,
+        atm_rmse_uv,
+        atm_rmse_prec, atm_bias_prec, atm_corr_prec,
+        atm_unc_mean,
+        sfc_rmse_thm0, sfc_bias_thm0,
+        sfc_rmse_qv0, sfc_bias_qv0,
+        sfc_rmse_wind0, sfc_bias_wind0,
+        sfc_rmse_prec, sfc_bias_prec, sfc_corr_prec_anom,
+        n_land,
+    ])
+    state.shadow_step = int(step_count)
+
+    # Zero-sync GPU per-cell spatial shadow divergence accumulation (monthly geographic maps)
+    if t_cell_idx is not None and int(t_cell_idx.numel()) == n_t:
+        dev_m = d_thm.device
+        if state.shadow_map_sum is None or state.shadow_map_sum.shape != (5, state.n_cells):
+            state.shadow_map_sum = torch.zeros((5, state.n_cells), device=dev_m, dtype=torch.float32)
+            state.shadow_map_cnt = torch.zeros((2, state.n_cells), device=dev_m, dtype=torch.float32)
+        assert state.shadow_map_cnt is not None
+        dm_col = dm / torch.clamp(dm.sum(dim=0, keepdim=True), min=1.0e-6)
+        col_dthm = torch.sqrt(torch.clamp((dm_col * d_thm * d_thm).sum(dim=0), min=0.0)).float()
+        col_dprec = d_pc.abs().float()
+        col_unc = stu_unc.float()
+        idx_l = t_cell_idx.to(device=dev_m, dtype=torch.int64)
+        ones_c = torch.ones((n_t,), device=dev_m, dtype=torch.float32)
+        state.shadow_map_sum[0].index_add_(0, idx_l, col_dthm)
+        state.shadow_map_sum[1].index_add_(0, idx_l, col_dprec)
+        state.shadow_map_sum[2].index_add_(0, idx_l, col_unc)
+        state.shadow_map_cnt[0].index_add_(0, idx_l, ones_c)
+        if rain_t_tile is not None and snow_t_tile is not None and thm0_t_tile is not None and qv0_t_tile is not None:
+            lm_cell = (land_mask_tile > 0.5).to(torch.float32) if land_mask_tile is not None else torch.ones_like(thm0_t_tile, dtype=torch.float32)
+            lcnt_c = lm_cell.sum(dim=(-2, -1))
+            has_l = (lcnt_c > 0.5).to(torch.float32)
+            wl_c = lm_cell / torch.clamp(lcnt_c.view(n_t, 1, 1), min=1.0)
+            col_lth0 = torch.sqrt(torch.clamp((wl_c * d_th0 * d_th0).sum(dim=(-2, -1)), min=0.0)).float() * has_l
+            col_lp = torch.sqrt(torch.clamp((wl_c * d_pt * d_pt).sum(dim=(-2, -1)), min=0.0)).float() * has_l
+            state.shadow_map_sum[3].index_add_(0, idx_l, col_lth0)
+            state.shadow_map_sum[4].index_add_(0, idx_l, col_lp)
+            state.shadow_map_cnt[1].index_add_(0, idx_l, has_l)
+
+
+@torch.no_grad()
+def evaluate_rad_shadow_on_teachers(
+    state: RadSelfDistillState,
+    x_rt: torch.Tensor,              # [M_t, d_in]
+    cp_rt: torch.Tensor,             # [nz, M_t]
+    s_inc_rt: torch.Tensor,          # [M_t]
+    alb_vd: torch.Tensor,            # [M_t]
+    alb_vf: torch.Tensor,            # [M_t]
+    alb_nd: torch.Tensor,            # [M_t]
+    alb_nf: torch.Tensor,            # [M_t]
+    emiss_sfc: torch.Tensor,         # [M_t]
+    t_sfc: torch.Tensor,             # [M_t]
+    *,
+    q_rad_t: torch.Tensor,           # [nz, M_t] [K s^-1]
+    sw1d_t: torch.Tensor,            # [M_t] [W m^-2]
+    sw1f_t: torch.Tensor,            # [M_t] [W m^-2]
+    sw2d_t: torch.Tensor,            # [M_t] [W m^-2]
+    sw2f_t: torch.Tensor,            # [M_t] [W m^-2]
+    lwd_t: torch.Tensor,             # [M_t] [W m^-2]
+    olr_t: torch.Tensor,             # [M_t] [W m^-2]
+    asr_t: torch.Tensor,             # [M_t] [W m^-2]
+    land_mask_sub: torch.Tensor | None = None,  # [M_t] float/bool (1=land)
+    t_cell_idx_sub: torch.Tensor | None = None, # [M_t] int64 host cell indices for spatial map accumulation
+    step_count: int = 0,
+    max_eval_cols: int = 2048,
+) -> None:
+    """Evaluate the pre-update radiation student in shadow mode on teacher RRTMGP/CKD subcolumns.
+
+    Measures both Host-Atmosphere radiative fidelity (`rad_*`: OLR, ASR, column heating `Q_rad`)
+    and Land-Surface radiative forcing fidelity (`sfc_rad_*`: downward SW, PAR, downward LW)
+    strictly BEFORE `train_rad_student_online` (zero CPU-GPU sync).
+    """
+    m_t = int(x_rt.shape[0])
+    if m_t == 0:
+        return
+    if m_t > max_eval_cols:
+        step_s = max(m_t // max_eval_cols, 1)
+        sl = slice(0, m_t, step_s)
+        x_rt = x_rt[sl]
+        cp_rt = cp_rt[:, sl]
+        s_inc_rt = s_inc_rt[sl]
+        alb_vd, alb_vf, alb_nd, alb_nf = alb_vd[sl], alb_vf[sl], alb_nd[sl], alb_nf[sl]
+        emiss_sfc, t_sfc = emiss_sfc[sl], t_sfc[sl]
+        q_rad_t = q_rad_t[:, sl]
+        sw1d_t, sw1f_t, sw2d_t, sw2f_t = sw1d_t[sl], sw1f_t[sl], sw2d_t[sl], sw2f_t[sl]
+        lwd_t, olr_t, asr_t = lwd_t[sl], olr_t[sl], asr_t[sl]
+        if land_mask_sub is not None:
+            land_mask_sub = land_mask_sub[sl]
+        if t_cell_idx_sub is not None:
+            t_cell_idx_sub = t_cell_idx_sub[sl]
+
+    out_s, unc_s = predict_rad_student_columns(
+        state, x_rt, cp_rt, s_inc_rt, alb_vd, alb_vf, alb_nd, alb_nf, emiss_sfc, t_sfc,
+    )
+
+    # --- 1. Host Atmosphere radiative fidelity (TOA + cp-weighted column heating) ---
+    d_olr = out_s["olr"] - olr_t
+    rad_rmse_olr = torch.sqrt(torch.clamp((d_olr * d_olr).mean(), min=0.0))
+    rad_bias_olr = d_olr.mean()
+
+    d_asr = out_s["asr"] - asr_t
+    rad_rmse_asr = torch.sqrt(torch.clamp((d_asr * d_asr).mean(), min=0.0))
+    rad_bias_asr = d_asr.mean()
+
+    w_cp = cp_rt / torch.clamp(cp_rt.sum(), min=1.0)
+    d_qr = (out_s["q_rad"] - q_rad_t) * C.SECONDS_PER_DAY
+    rad_rmse_qr = torch.sqrt(torch.clamp((w_cp * d_qr * d_qr).sum(), min=0.0))
+    rad_bias_qr = (w_cp * d_qr).sum()
+    rad_unc_mean = unc_s.mean()
+
+    # --- 2. Land-Surface radiative forcing fidelity (SW_dn, PAR, LW_dn on land tiles) ---
+    if land_mask_sub is not None:
+        lm_raw = (land_mask_sub > 0.5).to(dtype=d_olr.dtype)
+        n_land = lm_raw.sum()
+        lm = torch.where(n_land > 0.5, lm_raw, torch.ones_like(lm_raw))
+    else:
+        lm = torch.ones_like(d_olr)
+        n_land = lm.sum()
+    w_l = lm / torch.clamp(lm.sum(), min=1.0)
+
+    swdn_s = out_s["sw1_dir"] + out_s["sw1_dif"] + out_s["sw2_dir"] + out_s["sw2_dif"]
+    swdn_t = sw1d_t + sw1f_t + sw2d_t + sw2f_t
+    d_swdn = swdn_s - swdn_t
+    sfc_rad_rmse_swdn = torch.sqrt(torch.clamp((w_l * d_swdn * d_swdn).sum(), min=0.0))
+    sfc_rad_bias_swdn = (w_l * d_swdn).sum()
+
+    d_par = (out_s["sw1_dir"] + out_s["sw1_dif"]) - (sw1d_t + sw1f_t)
+    sfc_rad_rmse_par = torch.sqrt(torch.clamp((w_l * d_par * d_par).sum(), min=0.0))
+
+    d_lwd = out_s["lw_dn"] - lwd_t
+    sfc_rad_rmse_lwd = torch.sqrt(torch.clamp((w_l * d_lwd * d_lwd).sum(), min=0.0))
+    sfc_rad_bias_lwd = (w_l * d_lwd).sum()
+
+    state.shadow_metrics_gpu = torch.stack([
+        rad_rmse_olr, rad_bias_olr,
+        rad_rmse_asr, rad_bias_asr,
+        rad_rmse_qr, rad_bias_qr,
+        rad_unc_mean,
+        sfc_rad_rmse_swdn, sfc_rad_bias_swdn,
+        sfc_rad_rmse_par,
+        sfc_rad_rmse_lwd, sfc_rad_bias_lwd,
+        n_land,
+    ])
+    state.shadow_step = int(step_count)
+
+    # Zero-sync GPU per-cell spatial radiation shadow divergence accumulation
+    if t_cell_idx_sub is not None and int(t_cell_idx_sub.numel()) == int(d_olr.numel()):
+        dev_r = d_olr.device
+        if state.shadow_map_sum is None or state.shadow_map_sum.shape != (4, state.n_cells):
+            state.shadow_map_sum = torch.zeros((4, state.n_cells), device=dev_r, dtype=torch.float32)
+            state.shadow_map_cnt = torch.zeros((2, state.n_cells), device=dev_r, dtype=torch.float32)
+        assert state.shadow_map_cnt is not None
+        idx_r = t_cell_idx_sub.to(device=dev_r, dtype=torch.int64)
+        ones_r = torch.ones_like(d_olr, dtype=torch.float32)
+        lm_f = (land_mask_sub > 0.5).to(torch.float32) if land_mask_sub is not None else ones_r
+        state.shadow_map_sum[0].index_add_(0, idx_r, d_olr.abs().float())
+        state.shadow_map_sum[1].index_add_(0, idx_r, d_olr.float())
+        state.shadow_map_sum[2].index_add_(0, idx_r, (d_lwd.abs().float() * lm_f))
+        state.shadow_map_sum[3].index_add_(0, idx_r, (d_swdn.abs().float() * lm_f))
+        state.shadow_map_cnt[0].index_add_(0, idx_r, ones_r)
+        state.shadow_map_cnt[1].index_add_(0, idx_r, lm_f)
+
+
+@torch.no_grad()
+def consume_distill_shadow_maps(
+    crm_state: CRMSelfDistillState | None,
+    rad_state: RadSelfDistillState | None,
+    *,
+    reset: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Finalize per-cell spatial Teacher-Student shadow divergence maps `[n_cells]` and optionally reset."""
+    out: dict[str, torch.Tensor] = {}
+    if crm_state is not None and crm_state.shadow_map_sum is not None and crm_state.shadow_map_cnt is not None:
+        c_atm = crm_state.shadow_map_cnt[0]
+        c_lnd = crm_state.shadow_map_cnt[1]
+        nan_t = torch.full_like(c_atm, float("nan"))
+        out["shadow_atm_dthm_k"] = torch.where(c_atm > 0.5, crm_state.shadow_map_sum[0] / torch.clamp(c_atm, min=1.0), nan_t)
+        out["shadow_atm_dprec_mmd"] = torch.where(c_atm > 0.5, crm_state.shadow_map_sum[1] / torch.clamp(c_atm, min=1.0), nan_t)
+        out["shadow_atm_unc"] = torch.where(c_atm > 0.5, crm_state.shadow_map_sum[2] / torch.clamp(c_atm, min=1.0), nan_t)
+        out["shadow_land_dthm0_k"] = torch.where(c_lnd > 0.5, crm_state.shadow_map_sum[3] / torch.clamp(c_lnd, min=1.0), nan_t)
+        out["shadow_land_dprec_mmd"] = torch.where(c_lnd > 0.5, crm_state.shadow_map_sum[4] / torch.clamp(c_lnd, min=1.0), nan_t)
+        out["shadow_teacher_visits"] = c_atm.clone()
+        if reset:
+            crm_state.shadow_map_sum.zero_()
+            crm_state.shadow_map_cnt.zero_()
+    if rad_state is not None and rad_state.shadow_map_sum is not None and rad_state.shadow_map_cnt is not None:
+        c_rad = rad_state.shadow_map_cnt[0]
+        c_lnd = rad_state.shadow_map_cnt[1]
+        nan_r = torch.full_like(c_rad, float("nan"))
+        out["shadow_rad_dolr_wm2"] = torch.where(c_rad > 0.5, rad_state.shadow_map_sum[0] / torch.clamp(c_rad, min=1.0), nan_r)
+        out["shadow_rad_bias_olr_wm2"] = torch.where(c_rad > 0.5, rad_state.shadow_map_sum[1] / torch.clamp(c_rad, min=1.0), nan_r)
+        out["shadow_land_dlwd_wm2"] = torch.where(c_lnd > 0.5, rad_state.shadow_map_sum[2] / torch.clamp(c_lnd, min=1.0), nan_r)
+        out["shadow_land_dswd_wm2"] = torch.where(c_lnd > 0.5, rad_state.shadow_map_sum[3] / torch.clamp(c_lnd, min=1.0), nan_r)
+        if reset:
+            rad_state.shadow_map_sum.zero_()
+            rad_state.shadow_map_cnt.zero_()
+    return out
+
+
+def read_distill_shadow_metrics(
+    crm_state: CRMSelfDistillState | None,
+    rad_state: RadSelfDistillState | None,
+) -> dict[str, float]:
+    """Read the latest GPU shadow divergence metrics in one batched CPU transfer."""
+    out: dict[str, float] = {}
+    if crm_state is not None and crm_state.shadow_metrics_gpu is not None:
+        vals = crm_state.shadow_metrics_gpu.detach().cpu().tolist()
+        for k, v in zip(CRM_SHADOW_KEYS, vals):
+            out[k] = float(v)
+        out["crm_teacher_frac"] = float(crm_state.teacher_frac_last)
+        out["crm_shadow_step"] = float(crm_state.shadow_step)
+    if rad_state is not None and rad_state.shadow_metrics_gpu is not None:
+        vals = rad_state.shadow_metrics_gpu.detach().cpu().tolist()
+        for k, v in zip(RAD_SHADOW_KEYS, vals):
+            out[k] = float(v)
+        out["rad_teacher_frac"] = float(rad_state.teacher_frac_last)
+        out["rad_shadow_step"] = float(rad_state.shadow_step)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 5. Paired Online Per-Subcolumn ICA Radiation Self-Distillation
 # ---------------------------------------------------------------------------
 _N_RAD_PROF_IN = 9    # (temp, ln_p, qv, qc, qi, dm_dry, o3, q_dust, tau_aero_sw)
@@ -2364,6 +2896,12 @@ class RadSelfDistillState:
     ema_val_rmse_olr: float = 5.0
     ema_val_rmse_asr: float = 5.0
     teacher_frac_last: float = 1.0
+    # Pre-update shadow evaluation on teacher radiation subcolumns (Host Atmosphere + Land Surface)
+    shadow_metrics_gpu: torch.Tensor | None = None
+    shadow_step: int = -1
+    # Per-cell spatial shadow divergence accumulators (reset monthly for Zarr maps, zero CPU sync)
+    shadow_map_sum: torch.Tensor | None = None   # [4, n_cells]: rad_dolr_abs, rad_dolr_bias, land_dlwd_abs, land_dswd_abs
+    shadow_map_cnt: torch.Tensor | None = None   # [2, n_cells]: rad_visits, land_visits
 
 
 def init_rad_self_distill_state(

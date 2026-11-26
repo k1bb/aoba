@@ -2325,21 +2325,32 @@ def diagnose_ocean_spinup_metrics(
         hbl_mean = float("nan")
         hbl_max = float("nan")
 
-    # Hemispheric sea-ice areas [10^6 km^2]
+    # Hemispheric sea-ice area [10^6 km^2], NSIDC >=15% extent [10^6 km^2], and volume [10^3 km^3]
     m_si64 = sfc.m_seaice.detach().cpu().to(torch.float64)
     f_ice = torch.clamp(torch.sqrt(torch.clamp(m_si64, min=0.0) / MC_SEAICE_CRIT), 0.0, 1.0)
+    h_ice_eff = torch.clamp(m_si64, min=0.0) / C.RHO_SEAICE  # grid-cell-mean thickness [m]
     lat_rad = mesh.lat_cell.detach().cpu().to(torch.float64)
     lon_deg = torch.rad2deg(mesh.lon_cell.detach().cpu().to(torch.float64))
     lat_deg = torch.rad2deg(lat_rad)
-    ice_nh = float((area_ocn * f_ice * (lat_rad >= 0.0).to(torch.float64)).sum().item() * 1.0e-12)
-    ice_sh = float((area_ocn * f_ice * (lat_rad < 0.0).to(torch.float64)).sum().item() * 1.0e-12)
+    nh_mask = (lat_rad >= 0.0).to(torch.float64)
+    sh_mask = (lat_rad < 0.0).to(torch.float64)
+    ice_nh = float((area_ocn * f_ice * nh_mask).sum().item() * 1.0e-12)
+    ice_sh = float((area_ocn * f_ice * sh_mask).sum().item() * 1.0e-12)
+    ext_mask = (f_ice >= 0.15).to(torch.float64)
+    ice_ext_nh = float((area_ocn * ext_mask * nh_mask).sum().item() * 1.0e-12)
+    ice_ext_sh = float((area_ocn * ext_mask * sh_mask).sum().item() * 1.0e-12)
+    ice_vol_nh = float((area_ocn * h_ice_eff * nh_mask).sum().item() * 1.0e-12)  # 10^3 km^3 (= 10^12 m^3)
+    ice_vol_sh = float((area_ocn * h_ice_eff * sh_mask).sum().item() * 1.0e-12)
 
     # Meridional overturning streamfunction (AMOC in Atlantic sector, barotropic-mean removed) [Sv]
-    def _amoc_at_lat(lat_c: float, half_w: float = 2.5) -> float:
-        lon_hi = -10.0 if lat_c < 35.0 else 20.0
-        band = wet0 & (lat_deg >= (lat_c - half_w)) & (lat_deg <= (lat_c + half_w)) & (lon_deg >= -82.0) & (lon_deg <= lon_hi)
+    def _amoc_profile_at_lat(lat_c: float, half_w: float = 2.5, atlantic: bool = True) -> tuple[torch.Tensor | None, float]:
+        if atlantic:
+            lon_hi = -10.0 if lat_c < 35.0 else 20.0
+            band = wet0 & (lat_deg >= (lat_c - half_w)) & (lat_deg <= (lat_c + half_w)) & (lon_deg >= -82.0) & (lon_deg <= lon_hi)
+        else:
+            band = wet0 & (lat_deg >= (lat_c - half_w)) & (lat_deg <= (lat_c + half_w))
         if not bool(band.any()):
-            return 0.0
+            return None, 0.0
         dlat_m = C.EARTH_RADIUS * math.radians(2.0 * half_w)
         # Transport per layer [m^3 s^-1]: sum_{i in band} v_k * h_k * area_i / dlat_m
         w_sec = area[band].unsqueeze(0) / dlat_m
@@ -2347,13 +2358,31 @@ def diagnose_ocean_spinup_metrics(
         a_layer = (h_eff[:, band] * w_sec).sum(dim=1)
         a_tot = float(a_layer.sum().item())
         if a_tot <= 0.0:
-            return 0.0
+            return None, 0.0
         t_oc = t_layer - (t_layer.sum() / a_tot) * a_layer
         psi_sv = torch.cumsum(t_oc, dim=0) * 1.0e-6
-        return float(psi_sv.max().item())
+        # Poleward ocean heat transport [PW = 10^15 W] (barotropic-mean-corrected v_oc)
+        v_baro = t_layer.sum() / a_tot
+        oht_pw = float(
+            (C.RHO_SEAWATER * C.CP_SEAWATER * ((v64[:, band] - v_baro) * (t64[:, band] - C.T_FREEZE) * h_eff[:, band] * w_sec).sum().item())
+            * 1.0e-15
+        )
+        return psi_sv, oht_pw
 
-    amoc_26n = _amoc_at_lat(26.5, half_w=2.5)
+    def _amoc_at_lat(lat_c: float, half_w: float = 2.5) -> float:
+        psi_sv, _ = _amoc_profile_at_lat(lat_c, half_w=half_w, atlantic=True)
+        return float(psi_sv.max().item()) if psi_sv is not None else 0.0
+
+    psi_26n, oht_atl_26n = _amoc_profile_at_lat(26.5, half_w=2.5, atlantic=True)
+    if psi_26n is not None:
+        amoc_26n = float(psi_26n.max().item())
+        amoc_26n_depth_m = float(zc[int(torch.argmax(psi_26n).item())].item())
+    else:
+        amoc_26n = 0.0
+        amoc_26n_depth_m = float("nan")
     amoc_max = max(_amoc_at_lat(lat_c, half_w=2.5) for lat_c in (24.0, 26.5, 28.0, 32.0, 36.0, 40.0, 44.0, 48.0, 52.0, 56.0))
+    psi_30s, _ = _amoc_profile_at_lat(-30.0, half_w=2.5, atlantic=False)
+    aabw_30s = float(psi_30s.min().item()) if psi_30s is not None else 0.0
 
     # Antarctic Circumpolar Current (ACC) eastward volume transport through Drake Passage [Sv]
     drake = wet0 & (lon_deg >= -72.0) & (lon_deg <= -58.0) & (lat_deg >= -66.0) & (lat_deg <= -54.0)
@@ -2378,8 +2407,85 @@ def diagnose_ocean_spinup_metrics(
         "ocn_hbl_mean_m": hbl_mean,
         "ocn_hbl_max_m": hbl_max,
         "amoc_26n_sv": amoc_26n,
+        "amoc_26n_depth_m": amoc_26n_depth_m,
         "amoc_max_sv": amoc_max,
+        "aabw_30s_sv": aabw_30s,
+        "oht_atl_26n_pw": oht_atl_26n,
         "acc_drake_sv": acc_drake,
         "seaice_nh_mkm2": ice_nh,
         "seaice_sh_mkm2": ice_sh,
+        "seaice_ext_nh_mkm2": ice_ext_nh,
+        "seaice_ext_sh_mkm2": ice_ext_sh,
+        "seaice_vol_nh_km3": ice_vol_nh,
+        "seaice_vol_sh_km3": ice_vol_sh,
+    }
+
+
+def compute_moc_and_oht_profiles(
+    ogcm: OceanOGCMState,
+    mesh: SCVTMesh,
+    lat_step_deg: float = 4.0,
+) -> dict[str, np.ndarray]:
+    """Compute Atlantic & Global meridional overturning streamfunction [Sv] and ocean heat transport [PW]."""
+    import numpy as np
+
+    _, v_c_dev = reconstruct_cell_winds(mesh, ogcm.u_edge * ogcm.wet_e.to(ogcm.u_edge.dtype))
+    v64 = v_c_dev.detach().cpu().to(torch.float64)
+    area = mesh.area_cell.detach().cpu().to(torch.float64)
+    wet0 = ogcm.wet_c[0].detach().cpu()
+    h_c64 = ogcm.h_c.detach().cpu().to(torch.float64)
+    eta64 = ogcm.eta.detach().cpu().to(torch.float64)
+    h_eff = h_c64.clone()
+    h_eff[0] = torch.where(wet0, torch.clamp(h_c64[0] + eta64, min=10.0), torch.zeros_like(area))
+    t64 = ogcm.temp.detach().cpu().to(torch.float64) + ogcm.t_comp.detach().cpu().to(torch.float64)
+
+    lat_deg = torch.rad2deg(mesh.lat_cell.detach().cpu().to(torch.float64))
+    lon_deg = torch.rad2deg(mesh.lon_cell.detach().cpu().to(torch.float64))
+    nzo = int(ogcm.nz_ocn)
+    lat_bins = np.arange(-76.0, 76.1, lat_step_deg, dtype=np.float32)
+    n_lat = len(lat_bins)
+    half_w = 0.5 * lat_step_deg
+    dlat_m = C.EARTH_RADIUS * math.radians(lat_step_deg)
+
+    msftmz_atl = np.full((n_lat, nzo), np.nan, dtype=np.float32)
+    msftmz_glob = np.full((n_lat, nzo), np.nan, dtype=np.float32)
+    oht_atl = np.full((n_lat,), np.nan, dtype=np.float32)
+    oht_glob = np.full((n_lat,), np.nan, dtype=np.float32)
+
+    for j, lc in enumerate(lat_bins):
+        lat_f = float(lc)
+        b_glob = wet0 & (lat_deg >= (lat_f - half_w)) & (lat_deg < (lat_f + half_w))
+        for is_atl, band, out_psi, out_oht in (
+            (False, b_glob, msftmz_glob, oht_glob),
+            (
+                True,
+                b_glob & (lon_deg >= -82.0) & (lon_deg <= (-10.0 if lat_f < 35.0 else 20.0)) & (lat_f >= -34.0) & (lat_f <= 70.0),
+                msftmz_atl,
+                oht_atl,
+            ),
+        ):
+            if not bool(band.any()):
+                continue
+            w_sec = area[band].unsqueeze(0) / dlat_m
+            t_layer = (v64[:, band] * h_eff[:, band] * w_sec).sum(dim=1)
+            a_layer = (h_eff[:, band] * w_sec).sum(dim=1)
+            a_tot = float(a_layer.sum().item())
+            if a_tot <= 0.0:
+                continue
+            v_baro = t_layer.sum() / a_tot
+            t_oc = t_layer - v_baro * a_layer
+            psi_sv = (torch.cumsum(t_oc, dim=0) * 1.0e-6).numpy().astype(np.float32)
+            out_psi[j, :] = psi_sv
+            oht_val = float(
+                (C.RHO_SEAWATER * C.CP_SEAWATER * ((v64[:, band] - v_baro) * (t64[:, band] - C.T_FREEZE) * h_eff[:, band] * w_sec).sum().item())
+                * 1.0e-15
+            )
+            out_oht[j] = np.float32(oht_val)
+
+    return {
+        "lat_moc": lat_bins,
+        "msftmz_atl": msftmz_atl,
+        "msftmz_glob": msftmz_glob,
+        "oht_atl": oht_atl,
+        "oht_glob": oht_glob,
     }

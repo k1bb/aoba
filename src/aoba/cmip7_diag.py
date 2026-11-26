@@ -133,9 +133,43 @@ CMIP7_META: dict[str, tuple[str, str, str, str, str]] = {
     "jmax25_c4": ("c4_jmax_at_25C", "C4 Acclimated Electron Transport Jmax at 25 degC", "umol m-2 s-1", "", "land"),
     "vpmax25_c4": ("c4_vpmax_at_25C", "C4 Acclimated PEPC Vpmax at 25 degC", "umol m-2 s-1", "", "land"),
     "r25_leaf": ("canopy_leaf_respiration_capacity_at_25C", "Canopy-Effective Leaf Dark Respiration Capacity Rd25 at 25 degC", "umol m-2 s-1", "", "land"),
+    "fapar": ("fraction_of_absorbed_photosynthetically_active_radiation", "Canopy Fraction of Absorbed PAR (1 - exp(-k*LAI))", "1", "", "land"),
+    "chi_leaf": ("leaf_orientation_index", "Optimal Ross-Goudriaan Leaf Orientation Index chi_L", "1", "", "land"),
+    "n_avail_fac": ("nitrogen_availability_factor", "Nitrogen Availability Sufficiency Factor phi_N", "1", "", "land"),
+    "t_home": ("home_thermal_acclimation_temperature", "Multi-Year Thermal-Home Adaptation Temperature T_home", "K", "", "land"),
+    "wue": ("ecosystem_water_use_efficiency", "Ecosystem Water-Use Efficiency (GPP / Transpiration)", "gC kg-1", "", "land"),
+    "alb_vis": ("surface_vis_albedo", "Canopy/Surface Visible Direct Albedo", "1", "", "land"),
+    "alb_nir": ("surface_nir_albedo", "Canopy/Surface Near-Infrared Direct Albedo", "1", "", "land"),
+    "koppen_code": ("koppen_geiger_climate_class", "Emergent 30-Class Koppen-Geiger Climate Index", "1", "", "land"),
+    "koppen_major": ("koppen_geiger_major_group", "Emergent 5-Group Koppen-Geiger Climate Zone", "1", "", "land"),
+    # Terrestrial Carbon Cycle (when enable_land_carbon=true)
+    "cVeg": ("vegetation_carbon_content", "Carbon Mass in Vegetation", "kg m-2", "", "land"),
+    "cSoil": ("soil_carbon_content", "Carbon Mass in Soil Pool", "kg m-2", "", "land"),
+    "npp": ("net_primary_productivity_of_biomass_expressed_as_carbon", "Net Primary Productivity", "kg m-2 s-1", "", "land"),
+    "ra": ("plant_respiration_carbon_flux", "Autotrophic Respiration Carbon Flux", "kg m-2 s-1", "up", "land"),
+    "rh": ("heterotrophic_respiration_carbon_flux", "Heterotrophic Respiration Carbon Flux", "kg m-2 s-1", "up", "land"),
+    "nbp": ("surface_net_downward_mass_flux_of_carbon_dioxide_expressed_as_carbon_due_to_all_land_processes", "Net Biome Productivity", "kg m-2 s-1", "down", "land"),
+    "fFire": ("surface_upward_mass_flux_of_carbon_dioxide_expressed_as_carbon_due_to_emission_from_fires_excluding_anthropogenic_land_use_change", "Wildfire Carbon Emission Flux", "kg m-2 s-1", "up", "land"),
+    # Ocean Overturning Streamfunction & Poleward Heat Transport
+    "msftmz_atl": ("ocean_meridional_overturning_volume_streamfunction", "Atlantic Meridional Overturning Streamfunction (AMOC)", "Sv", "", "ocean"),
+    "msftmz_glob": ("ocean_meridional_overturning_volume_streamfunction", "Global Meridional Overturning Streamfunction", "Sv", "", "ocean"),
+    "oht_atl": ("northward_ocean_heat_transport", "Atlantic Northward Ocean Heat Transport", "PW", "", "ocean"),
+    "oht_glob": ("northward_ocean_heat_transport", "Global Northward Ocean Heat Transport", "PW", "", "ocean"),
+    # OSSP Spatial Teacher-Student Shadow Divergence Maps (Host Atmosphere & Land Surface)
+    "shadow_atm_dthm_k": ("ossp_shadow_atm_theta_m_rmse", "Pre-Update OSSP CRM Shadow Column RMSE of theta_m", "K", "", "atmos"),
+    "shadow_atm_dprec_mmd": ("ossp_shadow_atm_precip_mae", "Pre-Update OSSP CRM Shadow Cell-Mean Precipitation |dP|", "mm day-1", "", "atmos"),
+    "shadow_atm_unc": ("ossp_shadow_atm_epistemic_uncertainty", "OSSP CRM Ensemble Epistemic Uncertainty", "1", "", "atmos"),
+    "shadow_rad_dolr_wm2": ("ossp_shadow_rad_olr_mae", "Pre-Update OSSP Radiation Shadow |dOLR|", "W m-2", "", "atmos"),
+    "shadow_rad_bias_olr_wm2": ("ossp_shadow_rad_olr_bias", "Pre-Update OSSP Radiation Shadow OLR Bias (Student - Physical)", "W m-2", "", "atmos"),
+    "shadow_land_dthm0_k": ("ossp_shadow_land_theta_m0_rmse", "Pre-Update OSSP Land-Tile Shadow RMSE of Lowest-Layer theta_m0", "K", "", "land"),
+    "shadow_land_dprec_mmd": ("ossp_shadow_land_precip_rmse", "Pre-Update OSSP Land-Tile Shadow RMSE of Tile Precipitation", "mm day-1", "", "land"),
+    "shadow_land_dlwd_wm2": ("ossp_shadow_land_lwdn_mae", "Pre-Update OSSP Land-Tile Shadow |dLW_dn|", "W m-2", "", "land"),
+    "shadow_land_dswd_wm2": ("ossp_shadow_land_swdn_mae", "Pre-Update OSSP Land-Tile Shadow |dSW_dn|", "W m-2", "", "land"),
+    "shadow_teacher_visits": ("ossp_shadow_teacher_visit_count", "Monthly Teacher Evaluation Visit Count per Host Cell", "1", "", "atmos"),
 }
 
 CMIP7_PLEV19_VARS: tuple[str, ...] = ("ta", "ua", "va", "wap", "zg", "hus", "hur", "cl")
+CMIP7_OCEAN_2D_VARS: tuple[str, ...] = ("tos", "sos", "zos", "mlotst", "siconc", "sithick", "sivol", "sisnthick")
 CMIP7_OCEAN_3D_VARS: tuple[str, ...] = ("thetao", "so", "uo", "vo", "wo")
 CMIP7_SOIL_3D_VARS: tuple[str, ...] = ("tsl",)
 
@@ -206,37 +240,50 @@ def export_cmip7_fx_xarray(model: "AOBAState") -> xr.Dataset:
         "sftgif": (("n_cell",), sftgif, {"standard_name": "land_ice_area_fraction", "units": "%", "realm": "landIce"}),
         "orog": (("n_cell",), orog, {"standard_name": "surface_altitude", "units": "m", "realm": "atmos"}),
     }
+    coords: dict[str, Any] = {
+        "lat_cell": ("n_cell", np.rad2deg(mesh.lat_cell.detach().cpu().numpy()).astype(np.float32), {"units": "degrees_north"}),
+        "lon_cell": ("n_cell", np.rad2deg(mesh.lon_cell.detach().cpu().numpy()).astype(np.float32), {"units": "degrees_east"}),
+    }
     if model.ogcm is not None:
+        ocn_mesh = model.ocn_mesh if model.ocn_mesh is not None else mesh
+        ocn_dim = "n_cell_ocn" if model.ocn_mesh is not None else "n_cell"
         h_col = model.ogcm.h_col.detach().cpu().numpy().astype(np.float32)
         wet0 = model.ogcm.wet_c[0].detach().cpu().numpy()
         deptho = np.where(wet0, h_col, np.nan).astype(np.float32)
         data_vars["deptho"] = (
-            ("n_cell",), deptho,
+            (ocn_dim,), deptho,
             {"standard_name": "sea_floor_depth_below_geoid", "units": "m", "realm": "ocean"},
         )
+        data_vars["areacello"] = (
+            (ocn_dim,), ocn_mesh.area_cell.detach().cpu().numpy().astype(np.float32),
+            {"standard_name": "cell_area", "units": "m2", "realm": "ocean"},
+        )
+        if model.ocn_mesh is not None:
+            coords["lat_cell_ocn"] = ("n_cell_ocn", np.rad2deg(ocn_mesh.lat_cell.detach().cpu().numpy()).astype(np.float32), {"units": "degrees_north"})
+            coords["lon_cell_ocn"] = ("n_cell_ocn", np.rad2deg(ocn_mesh.lon_cell.detach().cpu().numpy()).astype(np.float32), {"units": "degrees_east"})
 
     return xr.Dataset(
         data_vars=data_vars,
-        coords={
-            "lat_cell": ("n_cell", np.rad2deg(mesh.lat_cell.detach().cpu().numpy()).astype(np.float32), {"units": "degrees_north"}),
-            "lon_cell": ("n_cell", np.rad2deg(mesh.lon_cell.detach().cpu().numpy()).astype(np.float32), {"units": "degrees_east"}),
-        },
+        coords=coords,
         attrs={
             "Conventions": "CF-1.11 UGRID-1.0",
             "cmip7_dreq": "v1.2 ESM-BCV fx",
             "glevel": model.cfg.glevel,
+            "ocean_glevel": model.cfg.ocean_glevel if model.cfg.ocean_glevel > 0 else model.cfg.glevel,
         },
     )
 
 
 def _diagnose_tas_cell(model: "AOBAState") -> torch.Tensor:
     """Fast 2-m air temperature diagnostic `[nc]` [K] for daily `tasmax`/`tasmin` & monthly `tas`."""
+    from aoba.coupled_model import resolve_crm_sfc_tiles
+
     _, _, temp0 = diagnose_pressure_temperature(
         model.atmos.rho_d[0:1], model.atmos.theta_m[0:1], model.atmos.q_v[0:1]
     )
     if model.sfc_sub is not None:
         ss = model.sfc_sub
-        n_sub = model.cfg.crm_ny * model.cfg.crm_nx
+        n_sub = resolve_crm_sfc_tiles(model.cfg)
         t_skin = torch.where(ss.surf_type == SURF_OCEAN, ss.t_ocean_ml, ss.t_canopy).reshape(model.mesh.n_cells, n_sub).mean(dim=-1)
     else:
         t_skin = torch.where(model.mesh.surf_type == SURF_OCEAN, model.sfc.t_ocean_ml, model.sfc.t_canopy)
@@ -265,10 +312,9 @@ def sample_cmip7_fields(
     rc = model.rad_cache
     nc = mesh.n_cells
     nz, _, ny, nx = crm.rho_d.shape
-    n_sub = ny * nx
 
     def _s2c(t: torch.Tensor) -> torch.Tensor:
-        return t.reshape(nc, n_sub).mean(dim=-1)
+        return t.reshape(nc, -1).mean(dim=-1)
 
     pres_c, _, temp_c = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
     u_c, v_c = reconstruct_cell_winds(mesh, atmos.u_edge)
@@ -298,9 +344,13 @@ def sample_cmip7_fields(
     snow = rc.get("snow", torch.zeros_like(tas))
     pr = rain + snow
     if "rain_sub" in rc and "snow_sub" in rc:
-        p_sub = (rc["rain_sub"] + rc["snow_sub"]).reshape(nc, ny, nx)
-        w_max_sub = crm.w.max(dim=0).values
-        prc = (p_sub * (w_max_sub > 0.5).to(tas.dtype)).reshape(nc, -1).mean(dim=-1)
+        p_sub = (rc["rain_sub"] + rc["snow_sub"]).reshape(nc, -1)
+        w_max_sub = crm.w.max(dim=0).values.reshape(nc, -1)
+        if w_max_sub.shape[1] != p_sub.shape[1] and (w_max_sub.shape[1] % p_sub.shape[1] == 0):
+            w_max_sub = w_max_sub.reshape(nc, p_sub.shape[1], -1).max(dim=-1).values
+        elif w_max_sub.shape[1] != p_sub.shape[1]:
+            w_max_sub = w_max_sub.max(dim=-1, keepdim=True).values.expand_as(p_sub)
+        prc = (p_sub * (w_max_sub > 0.5).to(tas.dtype)).mean(dim=-1)
     else:
         prc = torch.zeros_like(pr)
 
@@ -413,9 +463,13 @@ def sample_cmip7_fields(
             fields[name] = vals
             valid_masks[name] = vmask.to(tas.dtype)
 
-    # Ocean 2D & 3D + Sea Ice
+    # Ocean 2D & 3D + Sea Ice (supports independent fine ocean mesh `ocn_mesh` cleanly!)
     is_ocn = (mesh.surf_type == SURF_OCEAN)
     is_ocn_f = is_ocn.to(tas.dtype)
+    ocn_mesh = model.ocn_mesh if model.ocn_mesh is not None else mesh
+    ocn_sfc = model.ocn_sfc if model.ocn_sfc is not None else sfc
+    is_ocn_o = (ocn_mesh.surf_type == SURF_OCEAN)
+    is_ocn_of = is_ocn_o.to(tas.dtype)
     if model.ogcm is not None:
         og = model.ogcm
         wet0_f = og.wet_c[0].to(tas.dtype)
@@ -424,12 +478,13 @@ def sample_cmip7_fields(
         fields["zos"] = og.eta * wet0_f
         fields["mlotst"] = (og.h_bl if og.h_bl is not None else og.h_c[0]) * wet0_f
         hfds_raw = (rsds - rsus) + (rlds - rlus) - hfss - hfls
-        fields["hfds"] = hfds_raw * wet0_f
-        for k in ("tos", "sos", "zos", "mlotst", "hfds"):
+        fields["hfds"] = hfds_raw * is_ocn_f
+        for k in ("tos", "sos", "zos", "mlotst"):
             valid_masks[k] = wet0_f
+        valid_masks["hfds"] = is_ocn_f
         if include_ocean_3d:
             wet_cf = og.wet_c.to(tas.dtype)
-            uo_c, vo_c = reconstruct_cell_winds(mesh, og.u_edge * og.wet_e.to(og.u_edge.dtype))
+            uo_c, vo_c = reconstruct_cell_winds(ocn_mesh, og.u_edge * og.wet_e.to(og.u_edge.dtype))
             wo_c = 0.5 * (og.w_vel[:-1] + og.w_vel[1:])
             fields["thetao"] = (og.temp - C.T_FREEZE) * wet_cf
             fields["so"] = og.sal * wet_cf
@@ -439,21 +494,24 @@ def sample_cmip7_fields(
             for k in CMIP7_OCEAN_3D_VARS:
                 valid_masks[k] = wet_cf
     else:
-        fields["tos"] = (sfc.t_ocean_ml - C.T_FREEZE) * is_ocn_f
-        valid_masks["tos"] = is_ocn_f
+        fields["tos"] = (ocn_sfc.t_ocean_ml - C.T_FREEZE) * is_ocn_of
+        valid_masks["tos"] = is_ocn_of
 
-    # Sea Ice
-    sivol = (torch.clamp(sfc.m_seaice, min=0.0) / C.RHO_SEAICE) * is_ocn_f
-    siconc = torch.clamp(f_ice, 0.0, 1.0) * 100.0 * is_ocn_f
-    has_ice = is_ocn & (f_ice > 1.0e-3)
-    sithick = torch.where(has_ice, sivol / torch.clamp(f_ice, min=1.0e-3), torch.zeros_like(sivol))
-    sisnthick = torch.where(has_ice, (torch.clamp(sfc.swe_seaice, min=0.0) / RHO_SNOWPACK) / torch.clamp(f_ice, min=1.0e-3), torch.zeros_like(sivol))
+    # Sea Ice (evaluated on native ocean mesh `ocn_sfc` when fine ocean is active)
+    from aoba.surface import MC_SEAICE_CRIT
+
+    f_ice_o = torch.clamp(torch.sqrt(torch.clamp(ocn_sfc.m_seaice, min=0.0) / MC_SEAICE_CRIT), 0.0, 1.0)
+    sivol = (torch.clamp(ocn_sfc.m_seaice, min=0.0) / C.RHO_SEAICE) * is_ocn_of
+    siconc = f_ice_o * 100.0 * is_ocn_of
+    has_ice = is_ocn_o & (f_ice_o > 1.0e-3)
+    sithick = torch.where(has_ice, sivol / torch.clamp(f_ice_o, min=1.0e-3), torch.zeros_like(sivol))
+    sisnthick = torch.where(has_ice, (torch.clamp(ocn_sfc.swe_seaice, min=0.0) / RHO_SNOWPACK) / torch.clamp(f_ice_o, min=1.0e-3), torch.zeros_like(sivol))
     fields["siconc"] = siconc
     fields["sivol"] = sivol
     fields["sithick"] = sithick
     fields["sisnthick"] = sisnthick
-    valid_masks["siconc"] = is_ocn_f
-    valid_masks["sivol"] = is_ocn_f
+    valid_masks["siconc"] = is_ocn_of
+    valid_masks["sivol"] = is_ocn_of
     valid_masks["sithick"] = has_ice.to(tas.dtype)
     valid_masks["sisnthick"] = has_ice.to(tas.dtype)
 
@@ -503,6 +561,35 @@ def sample_cmip7_fields(
     fields["jmax25_c4"] = bio.jmax25_c4 * is_land_f
     fields["vpmax25_c4"] = bio.vpmax25_c4 * is_land_f
     fields["r25_leaf"] = r25_eff * is_land_f
+    fields["fapar"] = (1.0 - torch.exp(-0.5 * torch.clamp(bio.lai, min=0.0))) * is_land_f
+    fields["chi_leaf"] = (bio.chi_leaf if bio.chi_leaf is not None else torch.zeros_like(bio.lai)) * is_land_f
+    fields["n_avail_fac"] = (bio.n_avail_fac if bio.n_avail_fac is not None else torch.ones_like(bio.lai)) * is_land_f
+    fields["t_home"] = (bio.ema_temp_home if bio.ema_temp_home is not None else bio.ema_temp_mid) * is_land_f
+    has_tran = is_land & (tran_c > 1.0e-9)
+    fields["wue"] = torch.where(has_tran, (gpp_c * 1.0e3) / torch.clamp(tran_c, min=1.0e-9), torch.zeros_like(gpp_c))
+    if sd is not None:
+        fields["alb_vis"] = _s2c(sd.alb_vis_dir) * is_land_f
+        fields["alb_nir"] = _s2c(sd.alb_nir_dir) * is_land_f
+
+    if model.land_carbon is not None:
+        lc = model.land_carbon
+        def _lc2c(t: torch.Tensor) -> torch.Tensor:
+            if t.shape[0] == nc:
+                return t
+            if t.shape[0] % nc == 0:
+                return t.reshape(nc, -1).mean(dim=-1)
+            return t[:nc]
+        c_veg = _lc2c(lc.c_leaf + lc.c_wood + lc.c_root)
+        c_soil_tot = _lc2c(lc.c_soil.sum(dim=0) if lc.c_soil.ndim == 2 else lc.c_soil) + _lc2c(lc.c_lit_fast + lc.c_lit_slow)
+        fields["cVeg"] = c_veg * is_land_f
+        fields["cSoil"] = c_soil_tot * is_land_f
+        fields["npp"] = _lc2c(lc.npp_kgc_m2s) * is_land_f
+        fields["ra"] = _lc2c(lc.ra_kgc_m2s) * is_land_f
+        fields["rh"] = _lc2c(lc.rh_kgc_m2s) * is_land_f
+        fields["nbp"] = _lc2c(lc.nbp_kgc_m2s) * is_land_f
+        fields["fFire"] = _lc2c(lc.fire_c_kgc_m2s) * is_land_f
+        for k in ("cVeg", "cSoil", "npp", "ra", "rh", "nbp", "fFire"):
+            valid_masks[k] = is_land_f
 
     for k in ("snc", "snw", "mrso", "mrsos", "mrro", "mrros"):
         valid_masks[k] = is_terr_f
@@ -512,8 +599,13 @@ def sample_cmip7_fields(
         "fc4", "lai_c3", "lai_c4", "fevg", "lai_evg", "lai_dec",
         "vcmax25", "jmax25", "vcmax25_c3", "jmax25_c3",
         "vcmax25_c4", "jmax25_c4", "vpmax25_c4", "r25_leaf",
+        "fapar", "chi_leaf", "n_avail_fac", "t_home",
     ):
         valid_masks[k] = is_land_f
+    valid_masks["wue"] = has_tran.to(tas.dtype)
+    if sd is not None:
+        valid_masks["alb_vis"] = is_land_f
+        valid_masks["alb_nir"] = is_land_f
 
     return fields, valid_masks
 
@@ -582,6 +674,7 @@ class CMIP7MonthlyAccumulator:
         t_days = np.array([model.sim_time_sec / C.SECONDS_PER_DAY], dtype=np.float64)
         inv = 1.0 / float(max(self.sample_count, 1))
 
+        ocn_cell_dim = "n_cell_ocn" if model.ocn_mesh is not None else "n_cell"
         data_vars: dict[str, Any] = {}
         for name, s_arr in self.sums.items():
             if name in self.counts:
@@ -595,8 +688,11 @@ class CMIP7MonthlyAccumulator:
                 dims = ("time", "plev", "n_cell")
                 arr_out = arr_np[None, :, :]
             elif name in CMIP7_OCEAN_3D_VARS:
-                dims = ("time", "lev", "n_cell")
+                dims = ("time", "lev", ocn_cell_dim)
                 arr_out = arr_np[None, :, :]
+            elif name in CMIP7_OCEAN_2D_VARS:
+                dims = ("time", ocn_cell_dim)
+                arr_out = arr_np[None, :]
             elif name in CMIP7_SOIL_3D_VARS:
                 dims = ("time", "depth_soil", "n_cell")
                 arr_out = arr_np[None, :, :]
@@ -622,16 +718,49 @@ class CMIP7MonthlyAccumulator:
             data_vars["tasmax"] = (("time", "n_cell"), data_vars["tas"][1].copy(), _var_attrs("tasmax"))
             data_vars["tasmin"] = (("time", "n_cell"), data_vars["tas"][1].copy(), _var_attrs("tasmin"))
 
+        # Emergent Koppen-Geiger climate classification
+        from aoba.coupled_model import diagnose_model_koppen_geiger
+
+        kg30, kg5 = diagnose_model_koppen_geiger(model)
+        data_vars["koppen_code"] = (("time", "n_cell"), kg30.detach().cpu().numpy()[None, :], _var_attrs("koppen_code", cell_methods="area: mean time: point"))
+        data_vars["koppen_major"] = (("time", "n_cell"), kg5.detach().cpu().numpy()[None, :], _var_attrs("koppen_major", cell_methods="area: mean time: point"))
+
+        # Spatial Teacher-Student Shadow Divergence Maps (when OSSP shadow diagnostics active)
+        if getattr(model, "crm_distill", None) is not None or getattr(model, "rad_distill", None) is not None:
+            from aoba.crm_self_distill import consume_distill_shadow_maps
+
+            s_maps = consume_distill_shadow_maps(
+                getattr(model, "crm_distill", None),
+                getattr(model, "rad_distill", None),
+                reset=False,
+            )
+            for sk, sv in s_maps.items():
+                if sk in CMIP7_META:
+                    data_vars[sk] = (("time", "n_cell"), sv.detach().cpu().numpy().astype(np.float32)[None, :], _var_attrs(sk))
+
         coords: dict[str, Any] = {
             "time": ("time", t_days, {"units": "days since 2000-03-20 00:00:00"}),
             "lat_cell": ("n_cell", np.rad2deg(mesh.lat_cell.detach().cpu().numpy()).astype(np.float32), {"units": "degrees_north"}),
             "lon_cell": ("n_cell", np.rad2deg(mesh.lon_cell.detach().cpu().numpy()).astype(np.float32), {"units": "degrees_east"}),
             "depth_soil": ("depth_soil", np.cumsum(SOIL_LAYER_DEPTHS, dtype=np.float32) - 0.5 * np.array(SOIL_LAYER_DEPTHS, dtype=np.float32), {"units": "m", "positive": "down"}),
         }
+        if model.ocn_mesh is not None:
+            coords["lat_cell_ocn"] = ("n_cell_ocn", np.rad2deg(model.ocn_mesh.lat_cell.detach().cpu().numpy()).astype(np.float32), {"units": "degrees_north"})
+            coords["lon_cell_ocn"] = ("n_cell_ocn", np.rad2deg(model.ocn_mesh.lon_cell.detach().cpu().numpy()).astype(np.float32), {"units": "degrees_east"})
         if self.include_plev19:
             coords["plev"] = ("plev", np.array(CMIP7_PLEV19_PA, dtype=np.float32), {"units": "Pa", "positive": "down", "axis": "Z"})
-        if self.include_ocean_3d and model.ogcm is not None:
+        if model.ogcm is not None:
             coords["lev"] = ("lev", model.ogcm.z_c.detach().cpu().numpy().astype(np.float32), {"units": "m", "positive": "down", "axis": "Z"})
+            # Atlantic & Global Meridional Overturning Streamfunction & Poleward Ocean Heat Transport
+            from aoba.ocean_ogcm import compute_moc_and_oht_profiles
+
+            ocn_mesh_m = model.ocn_mesh if model.ocn_mesh is not None else mesh
+            moc_d = compute_moc_and_oht_profiles(model.ogcm, ocn_mesh_m)
+            coords["lat_moc"] = ("lat_moc", moc_d["lat_moc"], {"units": "degrees_north"})
+            data_vars["msftmz_atl"] = (("time", "lat_moc", "lev"), moc_d["msftmz_atl"][None, :, :], _var_attrs("msftmz_atl"))
+            data_vars["msftmz_glob"] = (("time", "lat_moc", "lev"), moc_d["msftmz_glob"][None, :, :], _var_attrs("msftmz_glob"))
+            data_vars["oht_atl"] = (("time", "lat_moc"), moc_d["oht_atl"][None, :], _var_attrs("oht_atl"))
+            data_vars["oht_glob"] = (("time", "lat_moc"), moc_d["oht_glob"][None, :], _var_attrs("oht_glob"))
 
         return xr.Dataset(
             data_vars=data_vars,
@@ -641,7 +770,8 @@ class CMIP7MonthlyAccumulator:
                 "cmip7_dreq": "v1.2 ESM-BCV",
                 "model": "AOBA (Autonomous Optimality Biosphere-Atmosphere)",
                 "glevel": model.cfg.glevel,
-                "co2_ppmv": model.cfg.co2_ppmv,
+                "ocean_glevel": model.cfg.ocean_glevel if model.cfg.ocean_glevel > 0 else model.cfg.glevel,
+                "co2_ppmv": float(model.current_co2_ppmv()),
             },
         )
 

@@ -54,6 +54,7 @@ enable_superparam = true
 crm_sfc_tiles = 0
 enable_crm_self_distill = false
 enable_rad_self_distill = false
+enable_distill_shadow_diag = true
 crm_distill_stride = 13
 crm_distill_warmup_steps = 24
 crm_distill_dwell_steps = 12

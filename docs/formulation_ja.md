@@ -1523,6 +1523,26 @@ $$
 \sum_{k=0}^{N_z-1} c_{p,\mathrm{moist},k}\,\Delta m_k\,Q_{\mathrm{rad},k} = (\mathrm{ASR} - \mathrm{OLR}) - (F_{\mathrm{SW,sfc}}^{\mathrm{net}} + F_{\mathrm{LW,sfc}}^{\mathrm{net}}) \tag{8.16}
 $$
 
+`enable_distill_shadow_diag` が有効な場合、各代理モデルはオンライン勾配更新の直前に現行の教師カラム上でシャドウ評価される（`evaluate_crm_shadow_on_teachers`, `evaluate_rad_shadow_on_teachers`）。これにより、モデル状態や学習軌道に一切影響を与えずに、$\mathrm{CO}_2$ 急増などのレジーム遷移時における物理モデルと代理モデルの不偏な事前更新（prequential）乖離を連続計測できる。ホスト大気結合の一致度は、鉛直プロファイル（$\theta_m, q_n, q_c + q_i, u, v$）を乾燥空気層質量 $\Delta m_{k,i} = \rho_{d,k,i}\Delta z_{k,i}$ で、放射加熱率 $Q_{\mathrm{rad}}$ を湿潤熱容量 $c_{p,\mathrm{moist},k,i}\Delta m_{k,i}$ で重み付けして評価し、セル平均降水 $P$ および大気上端放射フラックス $(\mathrm{OLR}, \mathrm{ASR})$ と併せて記録する：
+
+$$
+\begin{aligned}
+\mathrm{RMSE}_{\mathrm{atm}}(\psi) &= \sqrt{\frac{\sum_{i\in\mathcal{T}}\sum_{k=0}^{N_z-1} \Delta m_{k,i}\big(\hat{\psi}_{k,i} - \psi_{k,i}^{\mathrm{phys}}\big)^2}{\sum_{i\in\mathcal{T}}\sum_{k=0}^{N_z-1} \Delta m_{k,i}}}, \\
+\mathrm{RMSE}_{\mathrm{rad}}(Q_{\mathrm{rad}}) &= \sqrt{\frac{\sum_{m\in\mathcal{T}_{\mathrm{rad}}}\sum_{k=0}^{N_z-1} c_{p,\mathrm{moist},k,m}\Delta m_{k,m}\big(\hat{Q}_{\mathrm{rad},k,m} - Q_{\mathrm{rad},k,m}^{\mathrm{phys}}\big)^2}{\sum_{m\in\mathcal{T}_{\mathrm{rad}}}\sum_{k=0}^{N_z-1} c_{p,\mathrm{moist},k,m}\Delta m_{k,m}}}
+\end{aligned} \tag{8.17}
+$$
+
+ここで $\mathcal{T}$ は評価対象となる教師ホスト列集合、$\mathcal{T}_{\mathrm{rad}}$ は教師放射サブカラム集合、$\hat{\psi}$ は更新前の代理予測値、$\psi^{\mathrm{phys}}$ は物理 CRM または放射伝達スキームの計算値である。陸面タイル結合の一致度は MAML タイル解像度 $(N_{y,\mathrm{tile}}, N_{x,\mathrm{tile}})$ 上の陸面タイル（$\mathbb{I}_{\mathrm{land},i,j} = 1$）に限定し、学生セルと同一の順位重み付きタイル降水・ゼロ平均冷気プール微気候 $(\theta_{m,0}, q_{v,0})$・ガスト補正地表風速 $|\mathbf{u}_0|$ の再構成結果、およびタイル別下向き短波放射（$\mathrm{SW}_\downarrow$）・光合成有効放射（$\mathrm{PAR}$）・下向き長波放射（$\mathrm{LW}_\downarrow$）を物理出力と比較する：
+
+$$
+\begin{aligned}
+\mathrm{RMSE}_{\mathrm{land}}(\phi) &= \sqrt{\frac{\sum_{i\in\mathcal{T}}\sum_{j=1}^{N_{\mathrm{tile}}} \mathbb{I}_{\mathrm{land},i,j}\big(\hat{\phi}_{i,j} - \phi_{i,j}^{\mathrm{phys}}\big)^2}{\sum_{i\in\mathcal{T}}\sum_{j=1}^{N_{\mathrm{tile}}} \mathbb{I}_{\mathrm{land},i,j}}}, \\
+r_{\mathrm{land,anom}}(P) &= \operatorname{corr}_{\mathbb{I}_{\mathrm{land}}=1}\!\left(\hat{P}_{i,j} - \overline{\hat{P}}_i,\ P_{i,j}^{\mathrm{phys}} - \overline{P}_i^{\mathrm{phys}}\right)
+\end{aligned} \tag{8.18}
+$$
+
+ここで $\phi \in \{\theta_{m,0}, q_{v,0}, |\mathbf{u}_0|, P_{\mathrm{tile}}, \mathrm{SW}_\downarrow, \mathrm{PAR}, \mathrm{LW}_\downarrow\}$ であり、上線はホストセル内のタイル平均を表す。
+
 ---
 
 ## 9. 海洋循環 (`ocean_mode`)・独立高解像海洋・波浪・EVP–ITD 海氷・FlexPFT 海洋 BGC

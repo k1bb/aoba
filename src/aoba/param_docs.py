@@ -194,6 +194,10 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "ja": "OSSP サブカラム ICA 放射伝達代理モデルの有効化（既定 false）。教師列（CRM 教師と同期）のみ本物 CKD/RRTMGP 放射を解き、残りのサブカラムを厳密列エネルギー保存制約付き代理 MLP で推論しつつ同時学習する（陸面各タイルのアルベド・射出率はそのまま保持）。",
         "en": "Enable per-subcolumn ICA radiative transfer emulation for Online Surrogate Superparameterization (OSSP; default false). Runs genuine CKD/RRTMGP radiation on teacher columns (synced with CRM teachers) while a column-energy-conserving surrogate MLP emulates the remaining subcolumns online while preserving exact per-tile surface albedo and emissivity.",
     },
+    "enable_distill_shadow_diag": {
+        "ja": "OSSP 教師セル上の事前更新（prequential）シャドウ評価の有効化（既定 true）。CRM・放射のオンライン学習直前に教師セル上で代理モデルを裏実行し、ホスト大気結合（θ_m・q_n・雲・風・降水・OLR・ASR・Q_rad）および陸面タイル結合（最下層 θ_m0・q_v0・風速・タイル降水・下向き SW/PAR/LW）の物理モデルとの乖離を distill_shadow.csv へ連続記録する（状態や学習軌道には一切影響しない）。",
+        "en": "Enable pre-update (prequential) shadow evaluation of OSSP CRM and radiation students on active teacher columns (default true). Evaluates each student strictly before online gradient updates to log physical-vs-surrogate divergence for both Host Atmosphere coupling (theta_m, q_n, cloud, winds, precipitation, OLR, ASR, Q_rad) and Land Surface tile coupling (lowest-layer theta_m0, q_v0, wind speed, tile precipitation, downward SW/PAR/LW) to distill_shadow.csv without affecting model state or training.",
+    },
     "crm_distill_stride": {
         "ja": "OSSP の教師列ストライド [-]。毎ステップ全球の 1/stride の列（既定 13 ≒ 7.7%）のみ本物 2D/3D CRM を実行する。大きいほど高速。",
         "en": "Teacher sampling stride [-] for OSSP (1 in `stride` columns executes the genuine 2D/3D CRM per step; default 13 ≈ 7.7%). Larger values increase speedup.",

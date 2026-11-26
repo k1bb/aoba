@@ -517,6 +517,65 @@ def _read_csv_series(out_root: Path, max_points: int = 800) -> dict[str, list[fl
     return out
 
 
+def _read_shadow_csv_series(out_root: Path, max_points: int = 800) -> dict[str, list[float | None]]:
+    """Read `distill_shadow.csv` for live Teacher-Student shadow divergence plotting (Atmos + Land)."""
+    cols = (
+        "sim_days", "co2_ppmv",
+        "atm_rmse_thm_k", "atm_rmse_qn_gkg", "atm_rmse_prec_mmd", "atm_corr_prec", "atm_unc_mean",
+        "rad_rmse_olr_wm2", "rad_bias_olr_wm2", "rad_rmse_qrad_kd",
+        "sfc_rmse_thm0_k", "sfc_rmse_qv0_gkg", "sfc_rmse_wind0_ms", "sfc_rmse_prec_mmd", "sfc_corr_prec_anom",
+        "sfc_rad_rmse_swdn_wm2", "sfc_rad_rmse_par_wm2", "sfc_rad_rmse_lwd_wm2", "sfc_rad_bias_lwd_wm2",
+    )
+    csv_p = out_root / "distill_shadow.csv"
+    if not csv_p.exists():
+        return {}
+    rows: list[list[float | None]] = []
+    try:
+        with open(csv_p, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                vals: list[float | None] = []
+                ok_day = False
+                for i, c in enumerate(cols):
+                    raw = row.get(c, "")
+                    try:
+                        v = float(raw)
+                        if math.isfinite(v):
+                            vals.append(v)
+                            if i == 0:
+                                ok_day = True
+                        else:
+                            vals.append(None)
+                    except (ValueError, TypeError):
+                        vals.append(None)
+                if ok_day:
+                    rows.append(vals)
+    except OSError:
+        return {}
+
+    if not rows:
+        return {}
+    if len(rows) > max_points:
+        # Preserve spikes (e.g. abrupt 4xCO2 jump) by selecting the peak-OLR-error row within each bucket
+        bucket = max(len(rows) // max_points, 1)
+        idx_olr = cols.index("rad_rmse_olr_wm2")
+        idx_th = cols.index("atm_rmse_thm_k")
+        sampled: list[list[float | None]] = [rows[0]]
+        for i0 in range(1, len(rows) - 1, bucket):
+            grp = rows[i0:min(i0 + bucket, len(rows) - 1)]
+            best = max(grp, key=lambda r: (r[idx_olr] or 0.0) + 10.0 * (r[idx_th] or 0.0))
+            sampled.append(best)
+        sampled.append(rows[-1])
+        rows = sampled
+
+    out: dict[str, list[float | None]] = {c: [] for c in cols}
+    for r in rows:
+        for i, c in enumerate(cols):
+            v = r[i]
+            out[c].append(round(v, 4) if v is not None else None)
+    return out
+
+
 def _tail_log_lines(log_path: Path, n_lines: int = 75) -> str:
     if not log_path.exists():
         return ""
@@ -721,6 +780,7 @@ class RunManager:
             "active_processes": active_procs,
             "managed_run": managed,
             "csv": {},
+            "shadow": {},
             "log_tail": "",
             "frames": [],
             "active_frame_idx": -1,
@@ -736,6 +796,7 @@ class RunManager:
             return payload
 
         payload["csv"] = _read_csv_series(out_root)
+        payload["shadow"] = _read_shadow_csv_series(out_root)
         payload["log_tail"] = _tail_log_lines(out_root / "run.log", n_lines=80)
 
         live_npz = out_root / "live_preview.npz"
@@ -1514,6 +1575,17 @@ _HTML_PAGE = r"""<!DOCTYPE html>
         <div class="log-box" id="run-log-box">...</div>
       </div>
     </div>
+
+    <div class="grid-2" style="margin-top:14px;">
+      <div class="card">
+        <h2 data-i18n="shadow_atm_title">OSSP 教師–学生シャドウ乖離：ホスト大気 (`distill_shadow.csv`)</h2>
+        <canvas id="shadowAtmCanvas" width="700" height="240"></canvas>
+      </div>
+      <div class="card">
+        <h2 data-i18n="shadow_land_title">OSSP 教師–学生シャドウ乖離：陸面タイル (`distill_shadow.csv`)</h2>
+        <canvas id="shadowLandCanvas" width="700" height="240"></canvas>
+      </div>
+    </div>
   </div>
 
   <!-- TAB 6: LIVE TOML & RUN COMMAND -->
@@ -1650,6 +1722,8 @@ const I18N = {
     g_lai_sub: "自律 EEO バイオーム分布（海＝濃紺・氷床＝白）",
     ts_title: "全球平均時系列モニター (daily_global.csv)",
     log_title: "実行ログリアルタイム表示 (run.log)",
+    shadow_atm_title: "OSSP 教師–学生シャドウ乖離：ホスト大気 (distill_shadow.csv)",
+    shadow_land_title: "OSSP 教師–学生シャドウ乖離：陸面タイル (distill_shadow.csv)",
     toml_cmd_title: "設定ファイルを指定した手動実行コマンド",
     btn_copy_cmd: "コマンドをコピー",
     btn_dl_toml: "TOMLダウンロード",
@@ -1737,6 +1811,8 @@ const I18N = {
     g_lai_sub: "Autonomous EEO biomes (Ocean=Navy, Ice=White)",
     ts_title: "Global-Mean Time Series (daily_global.csv)",
     log_title: "Live Run Log (run.log)",
+    shadow_atm_title: "OSSP Teacher–Student Shadow Divergence: Host Atmosphere",
+    shadow_land_title: "OSSP Teacher–Student Shadow Divergence: Land Surface Tiles",
     toml_cmd_title: "CLI Execution Command with Unified TOML",
     btn_copy_cmd: "Copy Command",
     btn_dl_toml: "Download TOML",
@@ -2744,6 +2820,7 @@ async function fetchMonitorOnce() {
     document.getElementById("run-log-box").textContent = data.log_tail || "ログファイルはまだありません。";
     const logEl = document.getElementById("run-log-box"); logEl.scrollTop = logEl.scrollHeight;
     drawTimeSeries(data.csv || {});
+    drawShadowCharts(data.shadow || {});
 
     const csv = data.csv || {};
     if (csv.ts_k && csv.ts_k.length > 0) {
@@ -4154,6 +4231,81 @@ function drawTimeSeries(csv) {
   ctx.fillText(`Day ${days[li].toFixed(0)}`, W - 82, H - 8);
 }
 
+function drawShadowCharts(sh) {
+  const _plotPanel = (canvasId, seriesList) => {
+    const cv = document.getElementById(canvasId);
+    if (!cv) return;
+    const ctx = cv.getContext("2d"), W = cv.width, H = cv.height;
+    ctx.clearRect(0, 0, W, H);
+    const days = sh.sim_days || [];
+    if (days.length < 2) {
+      ctx.fillStyle = "#64748b"; ctx.font = "13px sans-serif";
+      ctx.fillText(LANG === "ja" ? "シャドウ評価 (distill_shadow.csv) 待機中..." : "Waiting for distill_shadow.csv...", 36, H/2);
+      return;
+    }
+    const padL = 48, padR = 16, padT = 30, padB = 26, cw = W - padL - padR, ch = H - padT - padB;
+    ctx.strokeStyle = "#263347"; ctx.strokeRect(padL, padT, cw, ch);
+
+    // Optional dashed CO2 overlay to highlight abrupt 4xCO2 steps
+    const co2 = sh.co2_ppmv || [];
+    if (co2.length === days.length) {
+      const cVals = co2.filter(v => v !== null && v !== undefined);
+      const cMin = Math.min(...cVals, 250), cMax = Math.max(...cVals, cMin + 50);
+      ctx.save(); ctx.setLineDash([4, 4]); ctx.strokeStyle = "rgba(148,163,184,0.55)"; ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      for (let i = 0; i < co2.length; i++) {
+        if (co2[i] === null) continue;
+        const x = padL + (i / (co2.length - 1)) * cw;
+        const y = padT + ch - Math.max(0, Math.min(1, (co2[i] - cMin) / Math.max(cMax - cMin, 1))) * ch;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke(); ctx.restore();
+    }
+
+    let lx = padL + 4;
+    ctx.font = "11px monospace";
+    for (const s of seriesList) {
+      const arr = sh[s.key] || [];
+      const finite = arr.filter(v => v !== null && v !== undefined && Number.isFinite(v));
+      if (finite.length < 2) continue;
+      const vmax = Math.max(s.minMax, Math.max(...finite) * 1.15);
+      ctx.strokeStyle = s.color; ctx.lineWidth = 1.8; ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < arr.length; i++) {
+        const v = arr[i];
+        if (v === null || v === undefined || !Number.isFinite(v)) continue;
+        const x = padL + (i / (arr.length - 1)) * cw;
+        const y = padT + ch - Math.max(0, Math.min(1, v / vmax)) * ch;
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      const lv = finite[finite.length - 1];
+      ctx.fillStyle = s.color;
+      const txt = `${s.lbl}=${lv.toFixed(s.dp)}${s.unit}`;
+      ctx.fillText(txt, lx, 18);
+      lx += ctx.measureText(txt).width + 14;
+    }
+    const li = days.length - 1;
+    ctx.fillStyle = "#94a3b8";
+    ctx.fillText(`Day ${days[0].toFixed(1)}`, padL, H - 8);
+    const co2Last = (co2[li] !== null && co2[li] !== undefined) ? ` | CO2=${co2[li].toFixed(0)}ppm` : "";
+    ctx.fillText(`Day ${days[li].toFixed(1)}${co2Last}`, W - 190, H - 8);
+  };
+
+  _plotPanel("shadowAtmCanvas", [
+    { key: "atm_rmse_thm_k", lbl: "dTh", unit: "K", color: "#f87171", dp: 3, minMax: 0.5 },
+    { key: "rad_rmse_olr_wm2", lbl: "dOLR", unit: "W/m2", color: "#fbbf24", dp: 2, minMax: 5.0 },
+    { key: "atm_rmse_prec_mmd", lbl: "dP", unit: "mm/d", color: "#38bdf8", dp: 2, minMax: 5.0 },
+    { key: "atm_unc_mean", lbl: "unc", unit: "", color: "#c084fc", dp: 3, minMax: 0.2 },
+  ]);
+  _plotPanel("shadowLandCanvas", [
+    { key: "sfc_rmse_thm0_k", lbl: "dTh0", unit: "K", color: "#fb7185", dp: 3, minMax: 0.5 },
+    { key: "sfc_rad_rmse_lwd_wm2", lbl: "dLWdn", unit: "W/m2", color: "#f59e0b", dp: 2, minMax: 5.0 },
+    { key: "sfc_rad_rmse_swdn_wm2", lbl: "dSWdn", unit: "W/m2", color: "#34d399", dp: 1, minMax: 15.0 },
+    { key: "sfc_rmse_prec_mmd", lbl: "dP_land", unit: "mm/d", color: "#60a5fa", dp: 2, minMax: 5.0 },
+  ]);
+}
+
 let _pollBusy = false;
 setInterval(async () => {
   const auto = document.getElementById("auto-poll")?.checked;
@@ -4505,6 +4657,33 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
             self._send_json(rm.build_monitor_payload(
                 out_dir, source=source, frame_req=frame, esm_field=esm_field, last_mtime=if_mtime
             ))
+            return
+
+        if parsed.path == "/api/distill_shadow":
+            qs = parse_qs(parsed.query)
+            out_dir = qs.get("out_dir", [""])[0]
+            rm = self.server.run_manager  # type: ignore[attr-defined]
+            target = out_dir or rm.last_watch_dir
+            out_p = Path(target).expanduser() if target else None
+            self._send_json({"ok": True, "shadow": _read_shadow_csv_series(out_p) if (out_p and out_p.exists()) else {}})
+            return
+
+        if parsed.path == "/api/tuning_history":
+            qs = parse_qs(parsed.query)
+            out_dir = qs.get("out_dir", [""])[0]
+            rm = self.server.run_manager  # type: ignore[attr-defined]
+            target = out_dir or rm.last_watch_dir
+            out_p = Path(target).expanduser() if target else None
+            entries: list[dict[str, Any]] = []
+            if out_p and (out_p / "tuning_history.jsonl").exists():
+                try:
+                    for line in (out_p / "tuning_history.jsonl").read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if line:
+                            entries.append(json.loads(line))
+                except (OSError, json.JSONDecodeError):
+                    pass
+            self._send_json({"ok": True, "entries": entries})
             return
 
         if parsed.path == "/api/co2_catalog":
