@@ -1366,11 +1366,11 @@ $$
 \nu_{4,\mathrm{div}} &= 0.0018\,\frac{d_{\min}^4}{\Delta t_{\mathrm{dyn}}}, \qquad \nu_{4,s} = 0.0010\,\frac{d_{\min}^4}{\Delta t_{\mathrm{dyn}}}, \\
 \mathcal{D}_u &= \nu_{\mathrm{div}}\nabla(\nabla\cdot\mathbf{u}) - \nu_4\nabla^4\mathbf{u} - \nu_{4,\mathrm{div}}\nabla\!\big(\nabla^2(\nabla\cdot\mathbf{u})\big), \\
 \mathcal{D}_{\Theta_m} &= -\nabla\cdot\!\big(\nu_{4,s}\,\bar{m}_e\,\nabla(\nabla^2\theta_m)\big), \qquad \Delta w_{\mathrm{diff}} = -\nu_{4,s}\Delta t_{\mathrm{dyn}}\,\nabla^4 w, \\
-K_{h,\mathrm{sc}} &= \min\!\left((0.65\,d_{c,e})^2\max\!\big(\overline{|\nabla\cdot\mathbf{u}|}_e - 1.5\times 10^{-5},\ 0\big),\ 0.12\,\frac{d_{\min}^2}{\Delta t}\right)
+K_{h,\mathrm{sc}} &= \min\!\left((0.90\,d_{c,e})^2\max\!\big(-(\nabla\cdot\mathbf{u})_{c_0},\ -(\nabla\cdot\mathbf{u})_{c_1},\ 0\big),\ 0.12\,\frac{d_{\min}^2}{\Delta t}\right)
 \end{aligned} \tag{8.5}
 $$
 
-$\overline{|\nabla\cdot\mathbf{u}|}_e > 1.5\times 10^{-5}\ \mathrm{s}^{-1}$ の強収束セルでのみ単調フラックス発散演算子 $\nabla\cdot(\bar{m}_e K_{h,\mathrm{sc}}\nabla\phi)$ が $q_n, \theta_m, w$ を混合し、$K_{h,\mathrm{div}}\nabla(\nabla\cdot\mathbf{u})$（$C_{s,\mathrm{div}} = 0.85$）が純発散流入を減衰させるため、静穏な総観雲域では拡散が厳密に零（$K_h = 0$）となり、ギブス振動ゼロ・離散最大値原理および球面厳密保存を満たす。
+水平収束辺（$\max(-(\nabla\cdot\mathbf{u})_{c_0}, -(\nabla\cdot\mathbf{u})_{c_1}) > 0$）でのみ、閾値不要でスケール不変な単調フラックス発散演算子 $\nabla\cdot(\bar{m}_e K_{h,\mathrm{sc}}\nabla\phi)$ が $q_n, \theta_m, w$ を混合し、$K_{h,\mathrm{div}}\nabla(\nabla\cdot\mathbf{u})$（$C_{s,\mathrm{div}} = 1.25$）が純発散の対流流入を減衰させる。上層の発散アンビル雲（$\nabla\cdot\mathbf{u} \ge 0$）および回転ジェットでは $K_h = 0$ となるため、雲頂構造の鮮鋭さを保ちつつ、ギブス振動ゼロ・離散最大値原理および球面厳密保存を満たす。
 
 3 段 Wicker–Skamarock RK3（$\Delta\tau \in \{\Delta t_{\mathrm{dyn}}/3, \Delta t_{\mathrm{dyn}}/2, \Delta t_{\mathrm{dyn}}\}$）の各段で、非線形 TRiSK コリオリ・渦度項 $\sum_{e'} w_{e,e'}\frac{\eta_e+\eta_{e'}}{2}u_{e'}$、運動エネルギー勾配 $-\nabla K$、鉛直運動量移流および散逸項からなる低速傾向を凍結し、高速音波サブステップ（最大時間刻み $\Delta t_{\mathrm{ac,max}} = \min(\max(0.16 d_{\min}/350, 1), 300)\ \mathrm{s}$, 鉛直陰的重み $\beta_{\mathrm{HEVI}} = 0.60$）を積分する。山岳上の水平気圧傾度力には Klemp (2011) の静水圧指数係数 $(f_{z0}, f_{z1})$ を適用し、水平質量フラックスには前向きオフセンタリング $U_h^{(k)}$ を用いる。さらに内部境界面 $k + \tfrac{1}{2}$ の陽的鉛直 $\theta_m$ 移流には保存型 MPAS-A 3 次上風バイアス流束再構成（$\beta_v = 0.25$; Skamarock & Gassmann, 2011, Eq. 5; Skamarock et al., 2012, Eq. 20）を適用し、静的な鉛直数値拡散を加えずに格子スケール $2\Delta z$ 鉛直計算モードを減衰させる：
 

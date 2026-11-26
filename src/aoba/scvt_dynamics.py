@@ -278,17 +278,16 @@ def apply_scvt_storm_smagorinsky(
     state: GlobalAtmosState,
     mesh: SCVTMesh,
     dt: float,
-    div_thresh: float = 1.5e-5,
-    cs_scalar: float = 0.65,
-    cs_div: float = 0.85,
+    cs_scalar: float = 0.90,
+    cs_div: float = 1.25,
 ) -> None:
-    """Apply thresholded, strictly monotone, mass-conserving 2D Smagorinsky eddy mixing on SCVT host fields.
+    """Apply threshold-free, convergence-only, strictly monotone 2D Smagorinsky eddy mixing on SCVT host fields.
 
-    Activates strictly where horizontal convergence/divergence exceeds `div_thresh` [s^-1]
-    (AOBA Formulation Eq. 8.5; Skamarock et al., 2012, Sec. 3d; Zängl et al., 2015, Sec. 2.5),
-    leaving quiet synoptic fronts, jets, and cloud bands completely undamped (`K_h == 0`) while
-    damping runaway gridpoint-storm convergence, moisture, enthalpy, and vertical velocity without
-    any non-monotone biharmonic Gibbs ringing.
+    Activates purely on horizontally converging storm columns `conv_e = max(-div_c[c0], -div_c[c1], 0)`
+    (AOBA Formulation Eq. 8.5; Smagorinsky, 1963; Skamarock et al., 2012, Sec. 3d; Zängl et al., 2015, Sec. 2.5),
+    leaving upper-tropospheric divergent anvils (`div_c >= 0`) and rotational flow completely undamped (`K_h == 0`)
+    while damping grid-scale moist-convective inflow, moisture, enthalpy, and vertical velocity without
+    any non-monotone biharmonic Gibbs ringing or resolution-dependent cutoff threshold.
     """
     dx_min = getattr(mesh, "_dc_edge_min_m", None)
     if dx_min is None:
@@ -298,12 +297,11 @@ def apply_scvt_storm_smagorinsky(
     c1 = mesh.cells_on_edge[:, 1]
     dc_e = mesh.dc_edge.unsqueeze(0)
     div_c = compute_scvt_divergence(mesh, state.u_edge)
-    div_e = 0.5 * (div_c[:, c0].abs() + div_c[:, c1].abs())
-    div_exc = torch.clamp(div_e - div_thresh, min=0.0)
+    conv_e = torch.clamp(torch.maximum(-div_c[:, c0], -div_c[:, c1]), min=0.0)
 
     k_cap = 0.12 * (dx_min ** 2) / max(dt, 1.0)
-    kh_sc = torch.clamp(((cs_scalar * dc_e) ** 2) * div_exc, max=k_cap)
-    kh_dv = torch.clamp(((cs_div * dc_e) ** 2) * div_exc, max=k_cap)
+    kh_sc = torch.clamp(((cs_scalar * dc_e) ** 2) * conv_e, max=k_cap)
+    kh_dv = torch.clamp(((cs_div * dc_e) ** 2) * conv_e, max=k_cap)
 
     m = state.rho_d * state.dz_c
     m_e = 0.5 * (m[:, c0] + m[:, c1])
