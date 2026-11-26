@@ -13,7 +13,7 @@
 9. [Ocean Circulation (`ocean_mode`), Independent Fine Ocean, Surface Waves, EVP–ITD Sea Ice & FlexPFT Marine BGC](#9-ocean-circulation-ocean_mode-independent-fine-ocean-surface-waves-evpitd-sea-ice--flexpft-marine-bgc)
 10. [Atmospheric Chemistry (`o3_mode`), Natural/Volcanic Aerosols, Carbon & Trace-Gas Cycles (`co2_mode`) & Water Isotopes](#10-atmospheric-chemistry-o3_mode-naturalvolcanic-aerosols-carbon--trace-gas-cycles-co2_mode--water-isotopes)
 11. [Dynamic Ice-Sheet Model, Milankovitch Orbital Evolution & General Planetary Presets](#11-dynamic-ice-sheet-model-milankovitch-orbital-evolution--general-planetary-presets)
-12. [Centralized 307-Parameter TOML Registry, Diagnostics (Köppen–Geiger / CMIP7), Zarr v3 & AOBA Studio](#12-centralized-307-parameter-toml-registry-diagnostics-köppengeiger--cmip7-zarr-v3--aoba-studio)
+12. [Centralized 322-Parameter TOML Registry, Diagnostics (Köppen–Geiger / CMIP7), Zarr v3 & AOBA Studio](#12-centralized-322-parameter-toml-registry-diagnostics-köppengeiger--cmip7-zarr-v3--aoba-studio)
 
 ---
 
@@ -1150,6 +1150,12 @@ R_{n,i} &- H_i(T_i, T_{\mathrm{af}}) - \lambda_i E_i(T_i, q_{\mathrm{af}}) - c_i
 \end{aligned} \tag{7.35}
 $$
 
+To eliminate $2\Delta t$ explicit surface–atmosphere sensible-heat oscillations over tall forest canopies coupled to a thin lowest atmospheric layer ($\Delta z_1 = 60\ \mathrm{m}$), the aerodynamic bulk transfer coefficient $C_x$ ($x \in \{h, m\}$) passes through a $C^\infty$-smooth quadratic Kalnay–Kanamitsu (1988) implicit lowest-layer conductance limiter (`_implicit_coupled_transfer`, $\alpha_{\max} = 1.50$):
+
+$$
+\alpha = \frac{C_x\,\Delta t}{\Delta z_1}, \qquad C_{x,\mathrm{eff}} = \frac{C_x}{\sqrt{1 + (\alpha / \alpha_{\max})^2}} \tag{7.35b}
+$$
+
 The canopy heat storage $S_{\mathrm{can}} = c_{\mathrm{sun}}(T_{\mathrm{sun}}^{n+1} - T_{\mathrm{sun}}^n) + c_{\mathrm{sh}}(T_{\mathrm{sh}}^{n+1} - T_{\mathrm{sh}}^n)$ is subtracted from the net surface energy residual when forming the soil heat flux $G_{\mathrm{soil}} = \mathrm{SW}_{\mathrm{abs}} + \mathrm{LW}_\downarrow - \mathrm{LW}_\uparrow - \mathrm{SHF} - \mathrm{LHF} - Q_{\mathrm{melt}} - S_{\mathrm{can}}$, ensuring exact land–canopy–soil energy conservation. During snowmelt, $T_{\mathrm{gnd}}$ is clamped at $273.15\ \mathrm{K}$ with excess energy routed conservatively to melt; snowpack exceeding $S_{\max} = 1000\ \mathrm{kg\ m^{-2}}$ calves as glacial runoff while recording climatic surface mass balance $\mathrm{SMB}$.
 
 **Dynamic Root Depth, 5-Layer Implicit Richards Hydrology & Enthalpy-Conserving Freeze–Thaw Conduction**: Across 5 universal-loam layers ($0.05, 0.15, 0.40, 0.80, 1.60\ \mathrm{m}$; $w_{\mathrm{sat}} = 0.43$, $\psi_s = -0.20\ \mathrm{m}$, $b = 5.39$, $K_{\mathrm{sat}} = 7.0\times 10^{-6}\ \mathrm{m\ s^{-1}}$), dynamic rooting depth $z_{\mathrm{root}}$, ice-impedance factor $f_{\mathrm{ice}}$ (Swenson et al., 2012; CLM5 Eq. 7.89), and saturated/frozen surface-runoff fraction $f_{\mathrm{sat}}$ are:
@@ -1643,11 +1649,13 @@ $$
 
 $$
 \begin{aligned}
-\frac{\partial \mathbf{u}_o}{\partial t} + (\zeta + f)\hat{\mathbf{k}}\times\mathbf{u}_o &= -g\nabla\eta - \nabla\!\left(\frac{p_{\mathrm{hyd}}}{\rho_0} + K\right) + \frac{\partial}{\partial z}\left(A_v\frac{\partial \mathbf{u}_o}{\partial z}\right) + A_h\nabla^2\mathbf{u}_o - \nu_4\nabla^4\mathbf{u}_o - r_{\mathrm{drag}}\mathbf{u}_o, \\
-K_{k,i} &= \frac{1}{4 A_i}\sum_{e\in\mathcal{E}(i)} d_{c,e} d_{v,e}\,u_{k,e}^2, \\
+\frac{\partial \mathbf{u}_o}{\partial t} + (\zeta + f)\hat{\mathbf{k}}\times\mathbf{u}_o &= -g\nabla\eta - \nabla\!\left(\frac{p_{\mathrm{hyd}}}{\rho_0} + K - a_{\mathrm{div}}\nabla\cdot\mathbf{u}_o\right) + \frac{\partial}{\partial z}\left(A_v\frac{\partial \mathbf{u}_o}{\partial z}\right) + A_h\nabla^2\mathbf{u}_o - \nu_4\nabla^4\mathbf{u}_o - r_{\mathrm{drag}}\mathbf{u}_o, \\
+K_{k,i} &= \frac{1}{4 A_i}\sum_{e\in\mathcal{E}(i)} d_{c,e} d_{v,e}\,u_{k,e}^2, \qquad a_{\mathrm{div}} = 0.030\,\frac{\Delta c_{\min}^2}{\Delta t}, \\
 \nu_4 &= \min\!\left(\beta\,\delta_{M4}^5,\ 10^{-3}\frac{\Delta c_{\min}^4}{\Delta t}\right), \qquad A_h = \min\!\left(\beta\,\delta_{M2}^3,\ 0.04\frac{\Delta c_{\min}^2}{\Delta t}\right)
 \end{aligned} \tag{9.6}
 $$
+
+Here the resolution-scaled divergence damping term $+a_{\mathrm{div}}\nabla(\nabla\cdot\mathbf{u}_o)$ is folded directly into the Bernoulli potential $p_{\mathrm{hyd}}/\rho_0 + K$ at zero extra kernel cost, suppressing the C-grid Hollingsworth–Bernoulli divergent monopole instability while leaving non-divergent geostrophic currents and eddies untouched.
 
 5. **Resolution-Aware GM90, Fox-Kemper Submesoscale Restratification, FCT-$z^*$ Advection, Rotated Redi Diffusion & Increment Implicit Vertical Diffusion**: From neutral slopes $S_x$ ($|S_x| \le 10^{-2}$, tapered linearly across the boundary layer), Hallberg (2013) Rossby-radius-aware GM90 streamfunction $\Psi_{\mathrm{GM}}$ ($\kappa_{\mathrm{GM}} = 800\ \mathrm{m^2\ s^{-1}}$) and Fox-Kemper et al. (2008, Eq. 5; 2011) mixed-layer eddy streamfunction $\Psi_{\mathrm{MLE}}$ yield bolus velocity $u_{\mathrm{GM},k}$. Tracers advance in $z^*$ coordinates ($h^*_k, w^*_{k+1/2}$; Adcroft & Campin, 2004; Danilov et al., 2017) with anomaly-form Zalesak FCT advection, full rotated Redi diffusion ($\kappa_{\mathrm{Redi}} = 1000\ \mathrm{m^2\ s^{-1}}$, diagonal $K_{v,\mathrm{Redi}} \propto S_x^2$ folded into the implicit solve), and increment-form implicit vertical diffusion with telescoping flux reconstruction and Neumaier/Kahan summation:
 
@@ -1663,12 +1671,13 @@ When EVP is disabled, a fallback free-drift plus plastic-ridging sea-ice transpo
 
 ### 9.5 Independent Fine Ocean Grid Coupling (`ocean_glevel > glevel`) & Current-Relative Wind (`src/aoba/ocean_coupler.py`)
 
-For each fine ocean cell $j$ mapped to parent atmospheric cell $p(j) = \arg\max_i(\mathbf{x}_{\mathrm{ocn},j}\cdot\mathbf{x}_{\mathrm{atm},i})$, ocean-to-atmosphere fields use exact wet-area-weighted averaging, atmosphere-to-ocean intensive fluxes are directly gathered, and extensive runoff/river fluxes apply global-integral conservation scaling. Surface increments $(\Delta T_{\mathrm{ml}}, \Delta m_{\mathrm{ice}}, \Delta\mathrm{SWE}_{\mathrm{ice}})$ are applied incrementally to preserve fine-scale SST gradients, accompanied by an exact exponential linearized bulk air–sea thermal feedback ($\lambda_{\mathrm{as}} = 40\ \mathrm{W\ m^{-2}\ K^{-1}}$; Haney, 1971; Barnier et al., 1995; Ma et al., 2016) relative to the inherited parent marine temperature $T_{\mathrm{atm},q(j)}$ so isolated shallow coastal bays beneath coarse land cells cannot overheat while open-ocean parent-cell means remain heat-conserving. When running 3D CRM or standalone GCRM with `enable_current_rel_wind = true`, air–sea fluxes use the current-relative wind $\mathbf{U}_{\mathrm{rel}}$ (Renault et al., 2016):
+For each fine ocean cell $j$ mapped to parent atmospheric cell $p(j) = \arg\max_i(\mathbf{x}_{\mathrm{ocn},j}\cdot\mathbf{x}_{\mathrm{atm},i})$, ocean-to-atmosphere fields use exact wet-area-weighted averaging, atmosphere-to-ocean intensive fluxes are directly gathered, and extensive runoff/river fluxes apply global-integral conservation scaling. Surface heating and ice-mass changes from the coarse atmospheric step are combined into an exact total water+ice enthalpy increment $\Delta E_{\mathrm{atm}} = \rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml,atm}}\,\Delta T_{\mathrm{ml,atm}} - L_{f0}\,\Delta m_{\mathrm{ice,atm}}$ (`apply_atm_surface_increments_to_ocn_sfc`) and partitioned on each fine ocean cell $j$ at its local freezing point $T_f(S_j)$ (so fine warm open-ocean cells and fine ice-covered cells beneath one mixed coarse cell conserve exact enthalpy without artificial sea-ice ratcheting), accompanied by an exact exponential linearized bulk air–sea thermal feedback ($\lambda_{\mathrm{as}} = 40\ \mathrm{W\ m^{-2}\ K^{-1}}$; Haney, 1971; Barnier et al., 1995; Ma et al., 2016) relative to the inherited parent marine temperature $T_{\mathrm{atm},q(j)}$. When running 3D CRM or standalone GCRM with `enable_current_rel_wind = true`, air–sea fluxes use the current-relative wind $\mathbf{U}_{\mathrm{rel}}$ (Renault et al., 2016):
 
 $$
 \begin{aligned}
 \bar{\psi}_{\mathrm{atm},i} &= \frac{\sum_{j:\,p(j)=i} A_{\mathrm{ocn},j}\,w_{\mathrm{wet},j}\,\psi_{\mathrm{ocn},j}}{\sum_{j:\,p(j)=i} A_{\mathrm{ocn},j}\,w_{\mathrm{wet},j}}, \\
-T_{\mathrm{ocn},j}^{n+1} &= T_{\mathrm{ocn},j}^n + \Delta T_{\mathrm{ml},q(j)} - \left[1 - \exp\!\left(-\frac{\lambda_{\mathrm{as}}\,\Delta t}{\rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml},j}}\right)\right]\big(T_{\mathrm{ocn},j}^n - T_{\mathrm{atm},q(j)}^n\big), \\
+\Delta E_{\mathrm{atm},q(j)} &= \rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml,atm},q(j)}\,\Delta T_{\mathrm{ml},q(j)} - L_{f0}\,\Delta m_{\mathrm{ice},q(j)}, \\
+T_{\mathrm{ocn},j}^{n+1} &= T_{\mathrm{ocn},j}^n + \frac{\Delta E_{\mathrm{rem},j}}{\rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml},j}} - \left[1 - \exp\!\left(-\frac{\lambda_{\mathrm{as}}\,\Delta t}{\rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml},j}}\right)\right]\big(T_{\mathrm{ocn},j}^n - T_{\mathrm{atm},q(j)}^n\big), \\
 \mathbf{U}_{\mathrm{rel}} &= \mathbf{u}_a(z_1) - \mathbf{u}_o(z=0)
 \end{aligned} \tag{9.8}
 $$
@@ -1974,16 +1983,16 @@ $$
 
 ---
 
-## 12. Centralized 307-Parameter TOML Registry, Diagnostics (Köppen–Geiger / CMIP7), Zarr v3 & AOBA Studio
+## 12. Centralized 322-Parameter TOML Registry, Diagnostics (Köppen–Geiger / CMIP7), Zarr v3 & AOBA Studio
 
 ### 12.1 Single TOML Registry, Fused GPU Kernels & Native Zarr v3 I/O
 
-All 14 sections and 307 tunable global parameters are centralized in [`config/aoba_default.toml`](../config/aoba_default.toml) (`src/aoba/params.py`), with 100% bilingual physical documentation across all 306 unique keys maintained in [`src/aoba/param_docs.py`](../src/aoba/param_docs.py). Hardware-portable `float32` execution (`cuda` $\to$ `mps` $\to$ `cpu` via `src/aoba/runtime.py`) compiles single-source fused Metal kernels (`kernels.py`, `kernels_physics.py`, `kernels_extra.py`, `kernels_esm.py`) automatically to native CUDA via `kernels_cuda.py`, executing vertical tridiagonal sweeps, settling/sinking, radiation, microphysics, CRM sub-cycles, EVP sea ice, and barotropic ocean sub-cycles with zero mid-step CPU–GPU synchronizations. All native model outputs (`src/aoba/io_zarr.py`) use CF-1.11 / UGRID-1.0 Zarr v3 (`mesh.zarr`, `monthly.zarr`, `snapshots.zarr`, and optionally `cmip7_monthly.zarr` / `cmip7_fx.zarr`), alongside `daily_global.csv` and atomic checkpoints `restart.pt` / `restart_mid.pt` (supporting automatic hydrostatic vertical remapping across differing vertical grids).
+All 14 sections and 322 tunable global parameters are centralized in [`config/aoba_default.toml`](../config/aoba_default.toml) (`src/aoba/params.py`), with 100% bilingual physical documentation across all 321 unique keys maintained in [`src/aoba/param_docs.py`](../src/aoba/param_docs.py) and 11 ready-to-run experiment presets in `config/presets/`. Hardware-portable `float32` execution (`cuda` $\to$ `mps` $\to$ `cpu` via `src/aoba/runtime.py`) compiles 101 single-source fused Metal kernels (`kernels.py`, `kernels_physics.py`, `kernels_extra.py`, `kernels_esm.py`) automatically to native CUDA C++17 via `kernels_cuda.py` alongside automatic CUDA Graph capture/replay, executing vertical tridiagonal sweeps, settling/sinking, radiation, microphysics, CRM sub-cycles, EVP sea ice, barotropic ocean sub-cycles, and OSSP ML feature/closure/spatial-head operations with zero mid-step CPU–GPU synchronizations. All native model outputs (`src/aoba/io_zarr.py`) use CF-1.11 / UGRID-1.0 Zarr v3 (`mesh.zarr`, `monthly.zarr`, `snapshots.zarr`, and optionally `cmip7_monthly.zarr` / `cmip7_fx.zarr`), alongside `daily_global.csv` and atomic checkpoints `restart.pt` / `restart_mid.pt` (supporting universal cross-grid spherical and hydrostatic vertical remapping).
 
 | TOML Section | Keys | Scope |
 | :--- | ---: | :--- |
 | `[grid]` | 16 | SCVT `glevel`, vertical `nz`/`z_top`, CRM `(nx, ny, dx)`, time steps, chunking |
-| `[forcing]` | 83 | All selectable schemes (`rad_scheme`, `microphysics_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`), orbit, calendar, ESM switches |
+| `[forcing]` | 98 | All selectable schemes (`rad_scheme`, `microphysics_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`), OSSP distillation & shadow diagnostics, orbit, calendar, ESM switches |
 | `[icesheet]` | 5 | Dynamic SIA ice-sheet switch, EMA timescale, acceleration factor, isostasy timescale |
 | `[output]` | 23 | Zarr v3 cadence/splitting, CSV, mid-run checkpoints, CMIP7 output |
 | `[constants]` | 26 | Planetary radius, gravity, gas constants, latent heats, ocean/ice constants |
@@ -2004,4 +2013,4 @@ All 14 sections and 307 tunable global parameters are centralized in [`config/ao
 
 ### 12.3 AOBA Studio Workbench (`scripts/aoba_config_gui.py`)
 
-The local web application (`python scripts/aoba_config_gui.py --port 8765`) provides bilingual editing and dropdown selection for all 307 parameters, experiment presets, three synchronized rotating globes (`T₂`, `Precip`, and 10 ESM diagnostics) compared against observational reference ranges (ERA5, CERES EBAF, GPCP, MODIS, NSIDC), and an embedded documentation viewer with KaTeX mathematical typesetting (automatically falling back to the built-in recursive-descent renderer offline) and inline SVG schematic diagrams.
+The local web application (`python scripts/aoba_config_gui.py --port 8765`) provides bilingual editing and dropdown selection for all 322 parameters, experiment presets, three synchronized rotating globes (`T₂`, `Precip`, and 10 ESM diagnostics) compared against observational reference ranges (ERA5, CERES EBAF, GPCP, MODIS, NSIDC), and an embedded documentation viewer with KaTeX mathematical typesetting (automatically falling back to the built-in recursive-descent renderer offline) and inline SVG schematic diagrams.

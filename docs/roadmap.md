@@ -2,58 +2,42 @@
 
 > **Language**: English | [日本語 (roadmap_ja.md)](roadmap_ja.md)
 
-This document summarizes planned verification milestones, resolution targets, parallelization architecture, and candidate physical extensions for AOBA beyond the baseline coupled Earth System Model configuration (`Glevel-5`, `8 × 1` CRM, `nz = 44`, `ocean_nz = 18`, 1850 `piControl`).
+This roadmap outlines upcoming scientific benchmarks, multi-GPU scaling stages, and candidate physical extensions built upon AOBA's current coupled Earth System Model platform (unified SCVT nonhydrostatic dynamics, Online Surrogate Superparameterization `OSSP`, 101 single-source Metal/CUDA kernels, `RRTMGP + 3D-TICA`, 6-class 2-moment microphysics, prognostic 3D $\mathrm{O}_3$, independent fine 64-layer $z^*$ FCT `OG7` ocean, EVP-ITD sea ice, FlexPFT marine BGC + $\mathrm{O}_2$/OMZ, autonomous EEO biosphere + C/N/fire + MAML topo/lakes, natural aerosols, dust, water isotopes, and CMIP7 Zarr v3 output).
 
 ---
 
-## 1. Equilibrium Spin-Up and Quantitative Benchmarking
+## 1. Multi-Century Equilibrium Spin-Up and Flagship `piControl` / `abrupt-4×CO2` Evaluation
 
-The primary milestone for the baseline coupled configuration is multi-century equilibration and quantitative evaluation:
-- **Three-Stage Equilibrium Spin-Up (`30 + 1,000 + 70 yr`)**: Execute a 30-year coupled integration, an accelerated offline 3D SCVT ocean spin-up (up to 1,000 years, terminating automatically once 50-year deep-ocean drift falls below `0.01 K/century`), and a 70-year coupled continuation.
-- **Conservation and Physical Verification**: Audit multi-decadal closure of top-of-atmosphere (TOA) radiative balance, global freshwater and salinity budgets, ocean heat content drift, AMOC and ACC transports, sea-ice extent, terrestrial and marine carbon pools, and thermal acclimation responses.
-- **Observational and Multi-Model Evaluation**: Benchmark equilibrated climatologies against WOA23 ocean hydrography, ERA5 atmospheric reanalysis, and CMIP6 `piControl` multi-model ensembles.
+The immediate scientific milestone is completing and evaluating the full 17-component concentration-driven `ALL-ESM` campaign (`earth_g4z64_g7z64_all_esm_spinup.toml` → `earth_g6z64_g7z64_all_esm_flagship.toml`):
+- **Three-Stage Accelerated Equilibrium Spin-Up**: Couple Phase-1 `AG4z64 + OG7z64 ALL-ESM` (~15 yr), Phase-2 self-forced offline `OG7z64 + FlexPFT BGC + O₂/OMZ + EVP-ITD` deep-ocean spin-up (`scripts/run_offline_ogcm_spinup.py`, auto-stopping at `< 0.01 K/century` deep drift), and Phase-3 coupled re-equilibration (~20 yr), followed by Universal Grid Remap (`AG4 → AG6`) verification and flagship **10-yr `piControl` + 10-yr `abrupt-4×CO2`** production at `AG6z64 + OG7z64`.
+- **Prequential OSSP Regime-Shift Audit**: Quantify out-of-sample host-atmosphere and land-tile shadow divergence (`enable_distill_shadow_diag = true`) across the instantaneous $4\times\mathrm{CO}_2$ jump and subsequent online adaptation, verifying conservation closure and climate-sensitivity fidelity without pre-trained climate weights.
+- **Observational & CMIP Benchmarking**: Evaluate equilibrated climatologies, seasonal precipitation/OLR/cloud patterns, Köppen–Geiger climate zones, autonomous $\mathrm{C}_3/\mathrm{C}_4$/LAI/canopy biomes, AMOC/ACC/OMZ hydrography, and ozone distributions against ERA5, CERES EBAF, GPCP, MODIS, WOA23, and CMIP6/7 ensembles.
 
 ---
 
-## 2. Unified-Grid Resolution and Ocean Vertical Refinement
+## 2. Unified-Grid Resolution Hierarchy & Multi-GPU Parallelization
 
-AOBA shares a single spherical centroidal Voronoi tessellation (SCVT) horizontal mesh across atmosphere, ocean, and land. Relative to the first baroclinic Rossby deformation radius $L_d$ (approximately `200 km` near the equator, `20–40 km` in mid-latitudes, and `5–15 km` at high latitudes), each grid level corresponds to a distinct physical regime:
+AOBA currently achieves single-GPU saturation across Apple Silicon (`mps`) and NVIDIA A100/H100 (`cuda`) via 101 fused kernels and CUDA Graphs (`~25.4 SYPD` for 3D `8×8` `OSSP + OG7` and `~10.0 SYPD` for full 17-component `AG4z64 + OG7z64 ALL-ESM` on 1 A100). Scaling further to eddy-resolving oceans (`OG8–OG9`) and direct global cloud-resolving (`1 × 1`, `G10–G11`) integrations motivates a two-stage multi-GPU architecture:
 
-| Grid Level | Global Cells | Spacing $\Delta x$ | Ocean / Coupled Regime | Resolved Phenomena & Remaining Constraints |
+| Grid Level | Global Cells | Spacing $\Delta x$ | Coupled / Ocean Regime | Target Parallelization |
 |---|---:|---:|---|---|
-| **Glevel-5** (baseline) | 10,242 | ~224 km (~2.0°) | Coarse OGCM | Large-scale wind-driven gyres, AMOC/ACC structure, and global heat/carbon budgets; narrow straits, equatorial undercurrent (EUC), and western boundary current separation remain coarse. |
-| **Glevel-6** | 40,962 | ~112 km (~1.0°) | Standard ESM scale | Matches standard ~1° basin-scale circulation and biogeochemistry; uniform 1° spacing without equatorial refinement softens ENSO dynamics and western boundary separation. |
-| **Glevel-7** | 163,842 | ~56 km (~0.5°) | Non-eddy-resolving ESM target | Resolves equatorial upwelling, EUC, ENSO variability, and major straits (e.g., Indonesian Throughflow) on a uniform grid alongside GM eddy parameterization. |
-| **Glevel-8** | 655,362 | ~28 km (~0.25°) | Eddy-permitting | Spontaneous mesoscale eddy generation in low-to-mid latitudes and sharper SST-front air–sea coupling; high-latitude eddies remain partially unresolved. |
-| **Glevel-9** | 2,621,442 | ~14 km (~0.125°) | Mid-latitude eddy-resolving | Realistic Kuroshio/Gulf Stream separation, Southern Ocean eddy heat transport, and seasonal-to-annual global storm-permitting (`1 × 1`) integrations. |
-| **Glevel-10 / 11** | 10.5M / 41.9M | ~7.0 / 3.5 km | Global cloud-resolving (`1 × 1`) | Multi-week MJO / DYAMOND-class global cloud-resolving integrations and high-latitude shelf/eddy dynamics (requires multi-node GPU domain decomposition). |
+| **Glevel-4 / 5** | 2,562 / 10,242 | ~448 / 224 km | Rapid OSSP spin-up & exploratory coupled ESM | 1 GPU (Mac MPS / A100) |
+| **Glevel-6** | 40,962 | ~112 km (~1.0°) | Flagship HighResMIP-class superparameterized ESM | 1 GPU (A100/H100) |
+| **Glevel-7** | 163,842 | ~56 km (~0.5°) | Eddy-permitting ocean (`OG7z64`), EUC, ENSO & major straits | 1 GPU (independent ocean) / Stage 1 |
+| **Glevel-8** | 655,362 | ~28 km (~0.25°) | Low/mid-latitude mesoscale eddy-permitting ocean & sharp SST fronts | Stage 1–2 (4–8 GPUs) |
+| **Glevel-9** | 2,621,442 | ~14 km (~0.125°) | Mid-latitude eddy-resolving ocean & global storm-permitting (`1 × 1`) | Stage 2 (Multi-node NCCL/MPI) |
+| **Glevel-10 / 11** | 10.5M / 41.9M | ~7.0 / 3.5 km | Global cloud-resolving (`1 × 1`) DYAMOND / MJO integrations | Stage 2 (Multi-node NCCL/MPI) |
 
-### Ocean Vertical Refinement (`ocean_nz`) & High-Resolution Climate Equilibrium Target
-- Increasing `ocean_nz` from `18` to `40–50` layers (with finer upper-500 m spacing) sharpens the thermocline, EUC, deep-water overflows, and euphotic-zone biogeochemistry.
-- Because the coupled atmosphere and embedded CRM account for over 90% of wall-clock runtime, expanding `ocean_nz` adds only a few percent to total compute cost while substantially improving ocean vertical structure.
-- **Primary High-Resolution Climate Equilibrium Target**: **`Glevel-6` (~112 km), `8 × 1` CRM, `nz = 44`, `ocean_nz = 40`** — combining CMIP6 ~1° horizontal scale with a 40-layer ocean while executing on a single GPU for multi-century `30 + 1,000 + 70 yr` equilibrium spin-ups.
+1. **Stage 1 — Intra-Node Column Parallelism (`torch.distributed` over NVLink)**: Partition independent column physics (teacher CRMs, radiation, microphysics, MAML land tiles) across 4–8 GPUs on a single node without horizontal halo exchange, scaling large 3D `RCE_large` CRMs and `Glevel-7` atmospheres linearly.
+2. **Stage 2 — SCVT Horizontal Domain Decomposition (MPI / NCCL Halo Exchange)**: Partition primal/dual SCVT cells across nodes with 1-ring/2-ring halo exchanges for host dynamics, FCT tracers, 3D OGCM, and EVP sea ice to exceed single-GPU VRAM (`> 80 GB`) at `Glevel-8`–`11`.
 
 ---
 
-## 3. Multi-GPU Parallelization
+## 3. Candidate Next-Generation Physical & Biogeochemical Extensions
 
-The current implementation executes on a single GPU (`cuda` / `mps`), well suited for `Glevel-5` (`8 × 1` CRM) multi-decadal integrations and independent ensemble members across 1-GPU jobs. Scaling to `8 × 8` 3D CRM, `Glevel-6`/`Glevel-7` climate runs, and `1 × 1` global cloud-resolving (`Glevel-9`–`11`) integrations motivates a two-stage multi-GPU architecture:
-
-1. **Stage 1 — Intra-Node Column Parallelism (`torch.distributed` over NVLink)**:
-   - Distribute independent host-column physics workloads (embedded CRM, 16-band CKD radiation, 2-moment cloud microphysics, MYNN PBL, and surface/biosphere tiles—roughly 85–90% of runtime) across 4–8 GPUs within a single node while gathering tendencies on the host SCVT mesh.
-   - Provides near-linear throughput and memory scaling for `Glevel-5` with `8 × 8` 3D CRM and `Glevel-6`–`7` superparameterized climate runs without horizontal halo communication.
-2. **Stage 2 — SCVT Horizontal Domain Decomposition (MPI / NCCL Halo Exchange)**:
-   - Partition the SCVT Voronoi mesh across nodes with 1-ring/2-ring halo exchanges for host dynamics, FCT transport, and 3D OGCM/EVP sea-ice operators.
-   - Enables configurations exceeding single-GPU memory (`> 40–80 GB`), including eddy-permitting/eddy-resolving coupled climate (`Glevel-8`–`9`) and global `1 × 1` cloud-resolving experiments (`Glevel-10`–`11`).
-
----
-
-## 4. Candidate Earth System Extensions
-
-Potential physical and biogeochemical extensions beyond the baseline ESM configuration include:
-- **Emission-Driven Carbon Cycle (`esm-piControl`)**: Closed 3D atmospheric $\mathrm{CO}_2$ transport coupled to prognostic terrestrial and marine carbon fluxes so atmospheric $\mathrm{CO}_2$ evolves freely.
-- **Interactive Atmospheric Chemistry**: Prognostic stratospheric and tropospheric $\mathrm{O}_3$ photochemistry ($\mathrm{HO}_x/\mathrm{NO}_x/\mathrm{ClO}_x$, polar stratospheric clouds), wetland $\mathrm{CH}_4$ emissions, soil $\mathrm{N}_2\mathrm{O}$, and interactive OH lifetime feedbacks.
-- **Terrestrial Nutrient Cycling, Deep Permafrost, and Vegetation Demography**: Explicit soil inorganic nitrogen and phosphorus cycles ($\mathrm{NH}_4^+, \mathrm{NO}_3^-$, biological nitrogen fixation, leaching) regulating $\mathrm{CO}_2$ fertilization, deeper anaerobic permafrost carbon and methane dynamics, and size/age-structured vegetation demography with hydraulic mortality.
-- **Modal Aerosol Microphysics and Ice-Nucleating Particles**: Size-resolved aerosol modes (nucleation, coagulation, internal mixing), black-carbon deposition darkening on snow and ice, and prognostic ice-nucleating particle (INP) coupling in mixed-phase clouds.
-- **High-Top Atmosphere and Ice-Shelf Coupling**: Extended stratosphere/mesosphere (`z_top ~ 80 km`, `70–90` layers) for QBO and sudden stratospheric warming representation, together with sub-ice-shelf ocean basal melting and iceberg calving feedbacks.
-- **Optional External Historical and Scenario Forcing**: Modular plug-in support for anthropogenic aerosol emissions, land-use change, volcanic stratospheric aerosol optical depth, and solar spectral irradiance, kept separate from the map-free universal physics core.
+Extensions beyond the current 17-component ESM suite include:
+- **Terrestrial Phosphorus Cycle & Size-Structured Vegetation Demography**: Coupling inorganic/organic soil phosphorus cycling alongside the existing C–N cycle to constrain tropical forest productivity, plus height/age-structured demographic competition and hydraulic drought mortality.
+- **Modal Aerosol Microphysics**: Extending the current 4-species mass aerosols (`sea salt, sulfate, BC, OC/SOA`) and dust to internally mixed lognormal modes with explicit nucleation, coagulation, and sulfate-coated dust INP aging.
+- **Sub-Ice-Shelf Ocean Cavities & Interactive Iceberg Drift**: Coupling floating ice-shelf basal melting and Lagrangian/Eulerian iceberg drift to the existing dynamic SIA ice-sheet and 3D `z*` OGCM for transient Heinrich-event and Antarctic retreat simulations.
+- **Mesosphere-Extended High-Top (`z_top ~ 80–90 km`) & Coupled Stratospheric Chemistry–QBO**: Expanding vertical top height above `65 km` with interactive $\mathrm{H}_2\mathrm{O}$ methane oxidation and detailed halogen/tropospheric $\mathrm{VOC}-\mathrm{NO}_x-\mathrm{O}_3$ chemistry.
+- **Emission-Driven Multi-Millennial Paleoclimate & Glacial Cycles**: Long transient integrations combining the existing Milankovitch orbital module, silicate weathering, prognostic 3D $\mathrm{CO}_2/\mathrm{CH}_4/\mathrm{N}_2\mathrm{O}$, dynamic SIA ice sheets, and dynamic lakes across full 100 kyr glacial–interglacial transitions.

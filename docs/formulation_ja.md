@@ -13,7 +13,7 @@
 9. [海洋循環 (`ocean_mode`)・独立高解像海洋・波浪・EVP–ITD 海氷・FlexPFT 海洋 BGC](#9-海洋循環-ocean_mode独立高解像海洋波浪evpitd-海氷flexpft-海洋-bgc)
 10. [大気化学 (`o3_mode`)・自然/火山エアロゾル・炭素/微量気体循環 (`co2_mode`)・水安定同位体](#10-大気化学-o3_mode自然火山エアロゾル炭素微量気体循環-co2_mode水安定同位体)
 11. [動的氷床モデル・ミランコビッチ軌道進化・汎用惑星プリセット](#11-動的氷床モデルミランコビッチ軌道進化汎用惑星プリセット)
-12. [一元 307 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio](#12-一元-307-パラメータ-toml-レジストリ診断köppengeiger--cmip7zarr-v3aoba-studio)
+12. [一元 322 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio](#12-一元-322-パラメータ-toml-レジストリ診断köppengeiger--cmip7zarr-v3aoba-studio)
 
 ---
 
@@ -1150,6 +1150,12 @@ R_{n,i} &- H_i(T_i, T_{\mathrm{af}}) - \lambda_i E_i(T_i, q_{\mathrm{af}}) - c_i
 \end{aligned} \tag{7.35}
 $$
 
+薄い最下層大気（$\Delta z_1 = 60\ \mathrm{m}$）と高樹冠の組み合わせで生じる $2\Delta t$ 顕熱数値振動を抑止するため、空力バルク輸送係数 $C_x$（$x \in \{h, m\}$）には $C^\infty$ 滑らかな 2 次 Kalnay–Kanamitsu (1988) 陰的最下層コンダクタンスリミッタ（`_implicit_coupled_transfer`, $\alpha_{\max} = 1.50$）を適用する：
+
+$$
+\alpha = \frac{C_x\,\Delta t}{\Delta z_1}, \qquad C_{x,\mathrm{eff}} = \frac{C_x}{\sqrt{1 + (\alpha / \alpha_{\max})^2}} \tag{7.35b}
+$$
+
 樹冠貯熱項 $S_{\mathrm{can}} = c_{\mathrm{sun}}(T_{\mathrm{sun}}^{n+1} - T_{\mathrm{sun}}^n) + c_{\mathrm{sh}}(T_{\mathrm{sh}}^{n+1} - T_{\mathrm{sh}}^n)$ を正味地表面エネルギー残差から差し引いて地中熱フラックス $G_{\mathrm{soil}} = \mathrm{SW}_{\mathrm{abs}} + \mathrm{LW}_\downarrow - \mathrm{LW}_\uparrow - \mathrm{SHF} - \mathrm{LHF} - Q_{\mathrm{melt}} - S_{\mathrm{can}}$ を構成し、陸面–樹冠–土壌系の厳密エネルギー保存を保証する。積雪融解時は $T_{\mathrm{gnd}} \le 273.15\ \mathrm{K}$ にクランプして余剰熱を融雪潜熱へ振り分け、積雪水量が上限 $S_{\max} = 1000\ \mathrm{kg\ m^{-2}}$ を超えた分を氷河流出（calving）として分離するとともに気候的表面質量収支 $\mathrm{SMB}$ を記録する。
 
 **動的根系深さ・5 層陰的 Richards 土壌水文・エンタルピー保存凍土熱伝導**：鉛直 5 層（層厚 $0.05, 0.15, 0.40, 0.80, 1.60\ \mathrm{m}$, 総厚 $3.00\ \mathrm{m}$）の汎用ローム土壌（間隙率 $w_{\mathrm{sat}} = 0.43$, 飽和マトリックポテンシャル $\psi_s = -0.20\ \mathrm{m}$, Clapp–Hornberger 指数 $b = 5.39$, 飽和透水係数 $K_{\mathrm{sat}} = 7.0\times 10^{-6}\ \mathrm{m\ s^{-1}}$）において、最適根圏容量 $S_R$ から動的根系深さ $z_{\mathrm{root}}$、凍土透水阻害係数 $f_{\mathrm{ice}}$（Swenson et al., 2012; CLM5 Eq. 7.89）、および飽和/凍土不浸透地表流出率 $f_{\mathrm{sat}}$ を定める：
@@ -1643,11 +1649,13 @@ $$
 
 $$
 \begin{aligned}
-\frac{\partial \mathbf{u}_o}{\partial t} + (\zeta + f)\hat{\mathbf{k}}\times\mathbf{u}_o &= -g\nabla\eta - \nabla\!\left(\frac{p_{\mathrm{hyd}}}{\rho_0} + K\right) + \frac{\partial}{\partial z}\left(A_v\frac{\partial \mathbf{u}_o}{\partial z}\right) + A_h\nabla^2\mathbf{u}_o - \nu_4\nabla^4\mathbf{u}_o - r_{\mathrm{drag}}\mathbf{u}_o, \\
-K_{k,i} &= \frac{1}{4 A_i}\sum_{e\in\mathcal{E}(i)} d_{c,e} d_{v,e}\,u_{k,e}^2, \\
+\frac{\partial \mathbf{u}_o}{\partial t} + (\zeta + f)\hat{\mathbf{k}}\times\mathbf{u}_o &= -g\nabla\eta - \nabla\!\left(\frac{p_{\mathrm{hyd}}}{\rho_0} + K - a_{\mathrm{div}}\nabla\cdot\mathbf{u}_o\right) + \frac{\partial}{\partial z}\left(A_v\frac{\partial \mathbf{u}_o}{\partial z}\right) + A_h\nabla^2\mathbf{u}_o - \nu_4\nabla^4\mathbf{u}_o - r_{\mathrm{drag}}\mathbf{u}_o, \\
+K_{k,i} &= \frac{1}{4 A_i}\sum_{e\in\mathcal{E}(i)} d_{c,e} d_{v,e}\,u_{k,e}^2, \qquad a_{\mathrm{div}} = 0.030\,\frac{\Delta c_{\min}^2}{\Delta t}, \\
 \nu_4 &= \min\!\left(\beta\,\delta_{M4}^5,\ 10^{-3}\frac{\Delta c_{\min}^4}{\Delta t}\right), \qquad A_h = \min\!\left(\beta\,\delta_{M2}^3,\ 0.04\frac{\Delta c_{\min}^2}{\Delta t}\right)
 \end{aligned} \tag{9.6}
 $$
+
+ここで解像度適応型発散減衰項 $+a_{\mathrm{div}}\nabla(\nabla\cdot\mathbf{u}_o)$ は追加カーネルなしで Bernoulli ポテンシャル $p_{\mathrm{hyd}}/\rho_0 + K$ に統合されており、非発散の地衡流・中規模渦を一切減衰させずに C-grid Hollingsworth–Bernoulli 発散不安定を抑止する。
 
 5. **解像度適応 GM90・Fox-Kemper サブメソ再成層・FCT-$z^*$ 移流・回転 Redi 拡散・増分陰的鉛直拡散**：中立面勾配 $S_x$（$|S_x| \le 10^{-2}$、境界層内線形テーパ）に対し、Hallberg (2013) のロスビー変形半径 $L_d$ 適応 GM90 流れ関数 $\Psi_{\mathrm{GM}}$（$\kappa_{\mathrm{GM}} = 800\ \mathrm{m^2\ s^{-1}}$）と Fox-Kemper et al. (2008, Eq. 5; 2011) の混合層サブメソ渦流れ関数 $\Psi_{\mathrm{MLE}}$ の和からボーラス速度 $u_{\mathrm{GM},k}$ を得る。トレーサ輸送は $z^*$ 座標（層厚 $h^*_k$・相対鉛直流 $w^*_{k+1/2}$; Adcroft & Campin, 2004; Danilov et al., 2017）上の偏差形式 Zalesak FCT 移流および完全回転 Redi 等密度面拡散（$\kappa_{\mathrm{Redi}} = 1000\ \mathrm{m^2\ s^{-1}}$、対角鉛直項 $K_{v,\mathrm{Redi}} \propto S_x^2$ は陰解法へ組込）で積分し、鉛直拡散は float32 桁落ちドリフトを完全排除する増分形式＋厳密テレスコーピングフラックス再構成＋Neumaier/Kahan 加算で解く：
 
@@ -1663,12 +1671,13 @@ EVP 無効時のフォールバックとして自由漂流＋塑性リジング�
 
 ### 9.5 独立高解像度海洋グリッド結合 (`ocean_glevel > glevel`) と海流相対風速 (`src/aoba/ocean_coupler.py`)
 
-細密海洋セル $j$ を包含する親大気セル $p(j) = \arg\max_i(\mathbf{x}_{\mathrm{ocn},j}\cdot\mathbf{x}_{\mathrm{atm},i})$ に対し、海洋 $\to$ 大気は厳密湿潤面積加重平均、大気 $\to$ 海洋の示強量は直接参照、流出・河川などの示量フラックスは全球総量保存スケーリングでマッピングする。大気からの表層増分 $(\Delta T_{\mathrm{ml}}, \Delta m_{\mathrm{ice}}, \Delta\mathrm{SWE}_{\mathrm{ice}})$ は細密 SST 勾配を保ったまま増分結合されるとともに、参照した親海洋セル温度 $T_{\mathrm{atm},q(j)}$ に対する厳密指数積分の線形化バルク海気熱負フィードバック（$\lambda_{\mathrm{as}} = 40\ \mathrm{W\ m^{-2}\ K^{-1}}$; Haney, 1971; Barnier et al., 1995; Ma et al., 2016）を適用することで、外洋親セル平均の熱保存を保ちながら粗い陸セル直下の孤立浅海・内海の過熱暴走を防止する。また 3D CRM または単独全球 CRM かつ `enable_current_rel_wind = true` 時、海面フラックスは海流相対風速 $\mathbf{U}_{\mathrm{rel}}$（Renault et al., 2016）を用いる：
+細密海洋セル $j$ を包含する親大気セル $p(j) = \arg\max_i(\mathbf{x}_{\mathrm{ocn},j}\cdot\mathbf{x}_{\mathrm{atm},i})$ に対し、海洋 $\to$ 大気は厳密湿潤面積加重平均、大気 $\to$ 海洋の示強量は直接参照、流出・河川などの示量フラックスは全球総量保存スケーリングでマッピングする。粗い大気ステップからの表層加熱と海氷質量変化は、水＋海氷の厳密総エンタルピー増分 $\Delta E_{\mathrm{atm}} = \rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml,atm}}\,\Delta T_{\mathrm{ml,atm}} - L_{f0}\,\Delta m_{\mathrm{ice,atm}}$（`apply_atm_surface_increments_to_ocn_sfc`）として統合されたのち各細密海洋セル $j$ の局所結氷点 $T_f(S_j)$ に応じて分配されるため、単一の粗大気セル下に開水面と海氷域が混在しても偽の海氷増殖ラチェットを生じず総熱量を厳密保存する。さらに参照親海洋セル温度 $T_{\mathrm{atm},q(j)}$ に対する厳密指数積分の線形化バルク海気熱負フィードバック（$\lambda_{\mathrm{as}} = 40\ \mathrm{W\ m^{-2}\ K^{-1}}$; Haney, 1971; Barnier et al., 1995; Ma et al., 2016）を併用する。また 3D CRM または単独全球 CRM かつ `enable_current_rel_wind = true` 時、海面フラックスは海流相対風速 $\mathbf{U}_{\mathrm{rel}}$（Renault et al., 2016）を用いる：
 
 $$
 \begin{aligned}
 \bar{\psi}_{\mathrm{atm},i} &= \frac{\sum_{j:\,p(j)=i} A_{\mathrm{ocn},j}\,w_{\mathrm{wet},j}\,\psi_{\mathrm{ocn},j}}{\sum_{j:\,p(j)=i} A_{\mathrm{ocn},j}\,w_{\mathrm{wet},j}}, \\
-T_{\mathrm{ocn},j}^{n+1} &= T_{\mathrm{ocn},j}^n + \Delta T_{\mathrm{ml},q(j)} - \left[1 - \exp\!\left(-\frac{\lambda_{\mathrm{as}}\,\Delta t}{\rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml},j}}\right)\right]\big(T_{\mathrm{ocn},j}^n - T_{\mathrm{atm},q(j)}^n\big), \\
+\Delta E_{\mathrm{atm},q(j)} &= \rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml,atm},q(j)}\,\Delta T_{\mathrm{ml},q(j)} - L_{f0}\,\Delta m_{\mathrm{ice},q(j)}, \\
+T_{\mathrm{ocn},j}^{n+1} &= T_{\mathrm{ocn},j}^n + \frac{\Delta E_{\mathrm{rem},j}}{\rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml},j}} - \left[1 - \exp\!\left(-\frac{\lambda_{\mathrm{as}}\,\Delta t}{\rho_{\mathrm{sw}} c_{p,\mathrm{sw}} h_{\mathrm{ml},j}}\right)\right]\big(T_{\mathrm{ocn},j}^n - T_{\mathrm{atm},q(j)}^n\big), \\
 \mathbf{U}_{\mathrm{rel}} &= \mathbf{u}_a(z_1) - \mathbf{u}_o(z=0)
 \end{aligned} \tag{9.8}
 $$
@@ -1974,16 +1983,16 @@ $$
 
 ---
 
-## 12. 一元 307 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio
+## 12. 一元 322 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio
 
 ### 12.1 単一 TOML 設定管理・融合 GPU カーネル・ネイティブ Zarr v3 出力
 
-全 14 セクション・307 パラメータが [`config/aoba_default.toml`](../config/aoba_default.toml)（`src/aoba/params.py`）に集約され、全 306 ユニークキーの日英物理解説が [`src/aoba/param_docs.py`](../src/aoba/param_docs.py) で管理されている。ハードウェア可搬 `float32` 実行（`src/aoba/runtime.py` による `cuda` $\to$ `mps` $\to$ `cpu` 自動切替）では、単一ソース融合 Metal カーネル（`kernels.py`, `kernels_physics.py`, `kernels_extra.py`, `kernels_esm.py`）を `kernels_cuda.py` でネイティブ CUDA へ自動変換し、鉛直三重対角解法・沈降・放射・微物理・CRM サブサイクル・EVP 海氷・順圧海洋サブサイクルをステップ途中 CPU–GPU 同期ゼロで実行する。モデルコアの全履歴出力（`src/aoba/io_zarr.py`）は CF-1.11 / UGRID-1.0 準拠の Zarr v3（`mesh.zarr`, `monthly.zarr`, `snapshots.zarr`, 選択時 `cmip7_monthly.zarr` / `cmip7_fx.zarr`）、日別全球診断 `daily_global.csv` および原子的チェックポイント `restart.pt` / `restart_mid.pt`（異鉛直解像度間の自動静水圧再補間対応）を使用する。
+全 14 セクション・322 パラメータが [`config/aoba_default.toml`](../config/aoba_default.toml)（`src/aoba/params.py`）に集約され、全 321 ユニークキーの日英物理解説が [`src/aoba/param_docs.py`](../src/aoba/param_docs.py) で、11 本の即実行プリセットが `config/presets/` で管理されている。ハードウェア可搬 `float32` 実行（`src/aoba/runtime.py` による `cuda` $\to$ `mps` $\to$ `cpu` 自動切替）では、全 101 本の単一ソース融合 Metal カーネル（`kernels.py`, `kernels_physics.py`, `kernels_extra.py`, `kernels_esm.py`）を `kernels_cuda.py` でネイティブ CUDA C++17 へ自動変換し、自動 CUDA Graph 記録・再生と合わせて鉛直三重対角解法・沈降・放射・微物理・CRM サブサイクル・EVP 海氷・順圧海洋サブサイクルおよび OSSP ML 特徴抽出・保存クロージャ・空間ヘッドをステップ途中 CPU–GPU 同期ゼロで実行する。モデルコアの全履歴出力（`src/aoba/io_zarr.py`）は CF-1.11 / UGRID-1.0 準拠の Zarr v3（`mesh.zarr`, `monthly.zarr`, `snapshots.zarr`, 選択時 `cmip7_monthly.zarr` / `cmip7_fx.zarr`）、日別全球診断 `daily_global.csv` および原子的チェックポイント `restart.pt` / `restart_mid.pt`（水平・鉛直解像度間の汎用球面・静水圧再補間対応）を使用する。
 
 | TOML セクション | 項目数 | 管轄領域 |
 | :--- | ---: | :--- |
 | `[grid]` | 16 | SCVT `glevel`、鉛直層 `nz`/`z_top`、CRM `(nx, ny, dx)`、時間刻み、チャンク設定 |
-| `[forcing]` | 83 | 全選択制スキーム（`rad_scheme`, `microphysics_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`）、軌道・暦法、ESM スイッチ |
+| `[forcing]` | 98 | 全選択制スキーム（`rad_scheme`, `microphysics_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`）、OSSP 自己蒸留・シャドウ診断、軌道・暦法、ESM スイッチ |
 | `[icesheet]` | 5 | 動的 SIA 氷床有効化、EMA 時定数、加速倍率、アイソスタシー時定数 |
 | `[output]` | 23 | Zarr v3 出力間隔・分割方式、CSV、月末リスタート、CMIP7 出力 |
 | `[constants]` | 26 | 惑星半径・重力・気体定数・潜熱・海水/海氷基礎定数 |
@@ -2004,4 +2013,4 @@ $$
 
 ### 12.3 AOBA Studio ワークベンチ (`scripts/aoba_config_gui.py`)
 
-ローカル Web アプリケーション（`python scripts/aoba_config_gui.py --port 8765`）により、全 307 パラメータの日英解説・列挙型ドロップダウン編集・実験プリセット適用、同期回転 3 地球儀（`T₂`, `Precip`, 10 種 ESM 診断場）と観測基準範囲（ERA5, CERES EBAF, GPCP, MODIS, NSIDC）対比、および KaTeX 数式組版（オフライン時は内蔵再帰下降レンダラへ自動フォールバック）＋SVG 概念図付き内蔵ドキュメントビューアを提供する。
+ローカル Web アプリケーション（`python scripts/aoba_config_gui.py --port 8765`）により、全 322 パラメータの日英解説・列挙型ドロップダウン編集・実験プリセット適用、同期回転 3 地球儀（`T₂`, `Precip`, 10 種 ESM 診断場）と観測基準範囲（ERA5, CERES EBAF, GPCP, MODIS, NSIDC）対比、および KaTeX 数式組版（オフライン時は内蔵再帰下降レンダラへ自動フォールバック）＋SVG 概念図付き内蔵ドキュメントビューアを提供する。
