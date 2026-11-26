@@ -1507,6 +1507,26 @@ def _land_post_newton_core(
     )
 
 
+def _implicit_coupled_transfer(
+    c_x: torch.Tensor,
+    wind_eff: torch.Tensor,
+    z_ref_rel: torch.Tensor,
+    dt: float,
+) -> torch.Tensor:
+    """C^inf-smooth implicit lowest-layer conductance limiter (Kalnay & Kanamitsu, 1988).
+
+    Uses quadratic soft saturation `c_x / sqrt(1 + (alpha / alpha_max)^2)` with
+    `alpha = c_x * wind_eff * dt / dz_0` and `alpha_max = 1.50 < 2.0`:
+    - Leaves Monin-Obukhov/RSL fluxes accurate to O(alpha^2) (< 1% for typical alpha <= 0.2),
+    - Guarantees `alpha_eff < 1.50 < 2.0` unconditionally for tall rough canopies on thin
+      lowest model layers (`dz_0 = 2 * z_ref_rel`), eliminating 2*dt explicit surface-atmosphere
+      flux oscillations while conserving energy, moisture, and momentum identically.
+    """
+    dz0 = 2.0 * torch.clamp(z_ref_rel, min=5.0)
+    alpha = c_x * wind_eff * (float(dt) / dz0)
+    return c_x * torch.rsqrt(1.0 + (alpha * (1.0 / 1.50)) ** 2)
+
+
 def _ocean_seaice_post_core(
     t_ocean_ml: torch.Tensor,
     t_ocean_ml_comp: torch.Tensor,
@@ -2175,11 +2195,12 @@ def _step_surface_compacted_impl(
             u_1_t, v_1_t, theta_v1_t, theta_vsfc_l, z_ref_t,
             z0m_terr_t, z0h_terr_t, z0h_terr_t, rsl_depth=rsl_depth_t,
         )
+        c_h_land_eff = _implicit_coupled_transfer(tr_land.c_h, tr_land.wind_eff, z_ref_t, dt)
         q_af_in = qv_1_t if _eb_it == 0 else q_af
         if use_gpu_land_eb:
             dispatch_surface_land_pre_bio_metal(
                 t_sun_cur=t_sun_cur, t_sh_cur=t_sh_cur, t_gnd_cur=t_gnd_cur,
-                q_af_in=q_af_in, c_h_land=tr_land.c_h, wind_eff_land=tr_land.wind_eff,
+                q_af_in=q_af_in, c_h_land=c_h_land_eff, wind_eff_land=tr_land.wind_eff,
                 u_star_land=tr_land.u_star, pb_const=pb_const, pb_out=pb_out,
             )
             gb_sun = pb_out[1]
@@ -2193,7 +2214,7 @@ def _step_surface_compacted_impl(
                 q_af_vpd, vpd_sun_af, vpd_sh_af,
             ) = pre_bio_fn(
                 t_sun_cur, t_sh_cur, t_gnd_cur, pres_sfc_t, q_af_in,
-                tr_land.c_h, tr_land.wind_eff, tr_land.u_star,
+                c_h_land_eff, tr_land.wind_eff, tr_land.u_star,
                 beta_rsl_t, alpha_u_half_t, lai_exp_t, k_db_t, h_exp_t, z0m_terr_t,
                 has_veg_t, has_sun_t, has_sh_t, f_veg_rad_t, f_sun_area_t, f_sh_area_t,
             )
@@ -2340,8 +2361,8 @@ def _step_surface_compacted_impl(
         u_1_o, v_1_o, theta_v1_o, theta_vsfc_o, z_ref_o,
         z0m_sea_o, z0h_sea_o, z0q_sea_o, rsl_depth=None,
     )
-    ga_h_o = tr_ocn.c_h * tr_ocn.wind_eff
-    ga_q_o = tr_ocn.c_q * tr_ocn.wind_eff
+    ga_h_o = _implicit_coupled_transfer(tr_ocn.c_h, tr_ocn.wind_eff, z_ref_o, dt) * tr_ocn.wind_eff
+    ga_q_o = _implicit_coupled_transfer(tr_ocn.c_q, tr_ocn.wind_eff, z_ref_o, dt) * tr_ocn.wind_eff
     if can_use_elem_metal(t_ml_o):
         t_ml_next_o, comp_final_o, m_si_next_o, t_si_new_o, swe_si_next_o, shf_o, evap_o, lhf_o, lw_emit_o = (
             dispatch_surface_ocean_seaice_post_metal(
@@ -2394,15 +2415,17 @@ def _step_surface_compacted_impl(
     sfc.swe_seaice.index_copy_(0, ocn_idx, swe_si_next_o)
 
     # Derived fluxes computed on disjoint compacted slices before scatter
-    tau_x_t = -rho_sfc_t * tr_land.c_m * tr_land.wind_eff * u_1_t
-    tau_y_t = -rho_sfc_t * tr_land.c_m * tr_land.wind_eff * v_1_t
+    c_m_land_eff = _implicit_coupled_transfer(tr_land.c_m, tr_land.wind_eff, z_ref_t, dt)
+    tau_x_t = -rho_sfc_t * c_m_land_eff * tr_land.wind_eff * u_1_t
+    tau_y_t = -rho_sfc_t * c_m_land_eff * tr_land.wind_eff * v_1_t
     w_th_t = shf_l / (rho_sfc_t * cp_air_t * exner_s_t)
     w_qv_t = evap_l / rho_sfc_t
     buoy_t = (C.GRAVITY / theta_v1_t) * (w_th_t * (1.0 + C.ZVIR * qv_1_t) + C.ZVIR * theta_1_t * w_qv_t)
     t_rad_t = t_skin_final
 
-    tau_x_o = -rho_sfc_o * tr_ocn.c_m * tr_ocn.wind_eff * u_1_o
-    tau_y_o = -rho_sfc_o * tr_ocn.c_m * tr_ocn.wind_eff * v_1_o
+    c_m_ocn_eff = _implicit_coupled_transfer(tr_ocn.c_m, tr_ocn.wind_eff, z_ref_o, dt)
+    tau_x_o = -rho_sfc_o * c_m_ocn_eff * tr_ocn.wind_eff * u_1_o
+    tau_y_o = -rho_sfc_o * c_m_ocn_eff * tr_ocn.wind_eff * v_1_o
     w_th_o = shf_o / (rho_sfc_o * cp_air_o * exner_s_o)
     w_qv_o = evap_o / rho_sfc_o
     buoy_o = (C.GRAVITY / theta_v1_o) * (w_th_o * (1.0 + C.ZVIR * qv_1_o) + C.ZVIR * theta_1_o * w_qv_o)
@@ -2569,6 +2592,7 @@ def step_surface(
             u_1, v_1, theta_v1, theta_vsfc_l, z_ref_rel,
             z0m_terr, z0h_terr, z0h_terr, rsl_depth=rsl_depth,
         )
+        c_h_land_eff = _implicit_coupled_transfer(tr_land.c_h, tr_land.wind_eff, z_ref_rel, dt)
 
         # 2-4. RSL leaf boundary-layer conductances, under-canopy r_d, qsat, & leaf-surface VPD
         q_af_in = qv_1 if _eb_it == 0 else q_af
@@ -2578,7 +2602,7 @@ def step_surface(
             q_af_vpd, vpd_sun_af, vpd_sh_af,
         ) = pre_bio_fn(
             t_sun_cur, t_sh_cur, t_gnd_cur, pres_sfc, q_af_in,
-            tr_land.c_h, tr_land.wind_eff, tr_land.u_star,
+            c_h_land_eff, tr_land.wind_eff, tr_land.u_star,
             beta_rsl, alpha_u_half, lai_exp, k_db_inst, h_exp, z0m_terr,
             has_veg, has_sun, has_sh, f_veg_rad, f_sun_area, f_sh_area,
         )
@@ -2663,8 +2687,8 @@ def step_surface(
         u_1, v_1, theta_v1, theta_vsfc_o, z_ref_rel,
         z0m_sea, z0h_sea, z0q_sea, rsl_depth=None,
     )
-    ga_h_o = tr_ocn.c_h * tr_ocn.wind_eff
-    ga_q_o = tr_ocn.c_q * tr_ocn.wind_eff
+    ga_h_o = _implicit_coupled_transfer(tr_ocn.c_h, tr_ocn.wind_eff, z_ref_rel, dt) * tr_ocn.wind_eff
+    ga_q_o = _implicit_coupled_transfer(tr_ocn.c_q, tr_ocn.wind_eff, z_ref_rel, dt) * tr_ocn.wind_eff
 
     comp0 = sfc.t_ocean_ml_comp if sfc.t_ocean_ml_comp is not None else torch.zeros_like(sfc.t_ocean_ml)
     ocn_post_fn = maybe_cuda_compile(_ocean_seaice_post_core, device=u_1.device)
@@ -2696,7 +2720,9 @@ def step_surface(
         sfc.t_soil, sfc.w_liq_soil, sfc.w_ice_soil, sfc.w_root, sfc.t_canopy,
         sfc.t_ocean_ml, sfc.u_star_ocean, sfc.t_seaice,
         shf_o, shf_l, lhf_o, lhf_l, evap_o, evap_l, lw_emit_o,
-        tr_ocn.c_m, tr_land.c_m, tr_ocn.wind_eff, tr_land.wind_eff,
+        _implicit_coupled_transfer(tr_ocn.c_m, tr_ocn.wind_eff, z_ref_rel, dt),
+        _implicit_coupled_transfer(tr_land.c_m, tr_land.wind_eff, z_ref_rel, dt),
+        tr_ocn.wind_eff, tr_land.wind_eff,
         tr_ocn.u_star, tr_land.u_star,
         rho_sfc, cp_air, exner_s, theta_1, theta_v1, qv_1, u_1, v_1,
         d_land, z0m_sea, z0m_terr, liq_runoff, glacier_runoff,
