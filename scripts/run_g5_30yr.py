@@ -1494,6 +1494,7 @@ def _build_monthly_mean_xarray(
         "vcmax25": "umol m-2 s-1", "chi_leaf": "1",
         "clt": "%", "lwp": "kg m-2", "iwp": "kg m-2", "prw": "kg m-2",
         "siconc": "%", "sithick": "m",
+        "tau_ngwd_col": "Pa", "tau_ogwd_col": "Pa",
     }
     units_2d_ocn = {
         "ocn_eta": "m",
@@ -1611,6 +1612,183 @@ def _build_monthly_mean_xarray(
             "Conventions": "CF-1.11 UGRID-1.0",
             "glevel": model.cfg.glevel,
             "co2_ppmv": model.cfg.co2_ppmv,
+        },
+    )
+
+
+def _build_zonal_bin_matrix(
+    mesh: Any,
+    n_lat: int = 36,
+) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
+    """Precompute area-weighted latitude-band projection matrix `W_zm [n_cell, n_lat]` on device."""
+    dev = mesh.area_cell.device
+    lat_deg = torch.rad2deg(mesh.lat_cell)
+    dlat = 180.0 / float(n_lat)
+    bin_idx = torch.clamp(((lat_deg + 90.0) / dlat).long(), 0, n_lat - 1)
+    area = mesh.area_cell.to(torch.float32)
+    w_mat = torch.zeros((mesh.n_cells, n_lat), device=dev, dtype=torch.float32)
+    w_mat.scatter_(1, bin_idx.unsqueeze(1), area.unsqueeze(1))
+    col_sum = w_mat.sum(dim=0, keepdim=True)
+    w_mat = torch.where(col_sum > 0.0, w_mat / torch.clamp(col_sum, min=1.0e-30), torch.zeros_like(w_mat))
+    lat_centers = (-90.0 + (np.arange(n_lat, dtype=np.float32) + 0.5) * dlat).astype(np.float32)
+    return lat_centers, bin_idx, w_mat
+
+
+def _parse_hf_levels(
+    vgrid: Any,
+    levels_str: str,
+) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
+    """Map comma-separated target altitudes [km] to unique sorted nearest model vertical indices."""
+    zc_km = (vgrid.zeta_c.detach().cpu().numpy() * 1.0e-3).astype(np.float64)
+    targets: list[float] = []
+    for tok in str(levels_str or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            targets.append(float(tok))
+        except ValueError:
+            continue
+    if not targets:
+        targets = [10.0, 20.0, 30.0, 50.0, 75.0]
+    k_uniq = sorted({int(np.argmin(np.abs(zc_km - t))) for t in targets})
+    k_np = np.array(k_uniq, dtype=np.int32)
+    z_np = zc_km[k_np].astype(np.float32)
+    k_dev = torch.tensor(k_uniq, device=vgrid.zeta_c.device, dtype=torch.long)
+    return k_dev, z_np, k_np
+
+
+def _compute_zonal_wave_snapshot(
+    model: AOBAState,
+    u_c: torch.Tensor,
+    v_c: torch.Tensor,
+    temp_c: torch.Tensor,
+    lat_bin_idx: torch.Tensor,
+    w_zm: torch.Tensor,
+) -> dict[str, np.ndarray]:
+    """Compute full-column (`0..z_top`) zonal-mean circulation, resolved wave/EP fluxes & GWD profiles."""
+    w_c = 0.5 * (model.atmos.w[:-1] + model.atmos.w[1:])
+    u_zm = u_c @ w_zm
+    v_zm = v_c @ w_zm
+    t_zm = temp_c @ w_zm
+    w_mean = w_c @ w_zm
+
+    u_p = u_c - u_zm.index_select(1, lat_bin_idx)
+    v_p = v_c - v_zm.index_select(1, lat_bin_idx)
+    t_p = temp_c - t_zm.index_select(1, lat_bin_idx)
+    w_p = w_c - w_mean.index_select(1, lat_bin_idx)
+
+    uw_zm = (u_p * w_p) @ w_zm
+    vw_zm = (v_p * w_p) @ w_zm
+    vt_zm = (v_p * t_p) @ w_zm
+    uv_zm = (u_p * v_p) @ w_zm
+    w_rms = torch.sqrt(torch.clamp((w_p * w_p) @ w_zm, min=0.0))
+    t_rms = torch.sqrt(torch.clamp((t_p * t_p) @ w_zm, min=0.0))
+
+    z_zero = torch.zeros_like(u_zm)
+    du_ngwd = model.rad_cache.get("_du_ngwd", None)
+    dv_ngwd = model.rad_cache.get("_dv_ngwd", None)
+    du_ogwd = model.rad_cache.get("_du_ogwd", None)
+    du_ngwd_zm = (du_ngwd @ w_zm) if du_ngwd is not None else z_zero
+    dv_ngwd_zm = (dv_ngwd @ w_zm) if dv_ngwd is not None else z_zero
+    du_ogwd_zm = (du_ogwd @ w_zm) if du_ogwd is not None else z_zero
+
+    stacked = torch.stack(
+        [
+            u_zm, v_zm, t_zm, w_mean,
+            uw_zm, vw_zm, vt_zm, uv_zm,
+            w_rms, t_rms,
+            du_ngwd_zm, dv_ngwd_zm, du_ogwd_zm,
+        ],
+        dim=0,
+    ).detach().cpu().numpy().astype(np.float32)
+    keys = (
+        "u_zm", "v_zm", "temp_zm", "w_zm",
+        "uw_eddy_zm", "vw_eddy_zm", "vt_eddy_zm", "uv_eddy_zm",
+        "w_rms_zm", "t_rms_zm",
+        "du_ngwd_zm", "dv_ngwd_zm", "du_ogwd_zm",
+    )
+    return {k: stacked[i] for i, k in enumerate(keys)}
+
+
+def _build_highfreq_xarray(
+    model: AOBAState,
+    times_days: list[float],
+    buf_2d: dict[str, list[np.ndarray]],
+    buf_upper: dict[str, list[np.ndarray]],
+    z_hf_km: np.ndarray,
+    k_hf_idx: np.ndarray,
+) -> xr.Dataset:
+    """Package buffered high-frequency 2D convective/wave & upper-air slices into CF/UGRID Zarr Dataset."""
+    mesh = model.mesh
+    t_arr = np.asarray(times_days, dtype=np.float64)
+    lat_deg = np.rad2deg(mesh.lat_cell.detach().cpu().numpy()).astype(np.float32)
+    lon_deg = np.rad2deg(mesh.lon_cell.detach().cpu().numpy()).astype(np.float32)
+    units_2d = {"precip_mm_day": "mm day-1", "olr": "W m-2", "t2_k": "K"}
+    units_up = {"temp_hf": "K", "u_hf": "m s-1", "v_hf": "m s-1", "w_hf": "m s-1"}
+    data_vars: dict[str, Any] = {}
+    for k, u in units_2d.items():
+        if k in buf_2d and buf_2d[k]:
+            data_vars[k] = (("time", "n_cell"), np.stack(buf_2d[k], axis=0).astype(np.float32), {"units": u})
+    t_origin = f"days since {getattr(model.cfg, 'start_date', '2000-03-20') or '2000-03-20'} 00:00:00"
+    coords: dict[str, Any] = {
+        "time": ("time", t_arr, {"units": t_origin}),
+        "lat_cell": ("n_cell", lat_deg, {"units": "degrees_north"}),
+        "lon_cell": ("n_cell", lon_deg, {"units": "degrees_east"}),
+    }
+    if buf_upper and any(buf_upper.values()):
+        for k, u in units_up.items():
+            if k in buf_upper and buf_upper[k]:
+                data_vars[k] = (("time", "nz_hf", "n_cell"), np.stack(buf_upper[k], axis=0).astype(np.float32), {"units": u})
+        coords["nz_hf"] = ("nz_hf", z_hf_km.astype(np.float32), {"units": "km", "positive": "up"})
+        coords["k_hf_idx"] = ("nz_hf", k_hf_idx.astype(np.int32), {"long_name": "0-based vertical model level index"})
+    return xr.Dataset(
+        data_vars=data_vars,
+        coords=coords,
+        attrs={
+            "Conventions": "CF-1.11 UGRID-1.0",
+            "glevel": model.cfg.glevel,
+            "co2_ppmv": model.cfg.co2_ppmv,
+            "z_top_m": float(model.vgrid.z_top),
+            "crm_sponge_base_m": float(min(model.cfg.z_sponge_base, 26000.0) if model.vgrid.z_top > 32000.0 else model.cfg.z_sponge_base),
+        },
+    )
+
+
+def _build_zonal_waves_xarray(
+    model: AOBAState,
+    times_days: list[float],
+    buf_zw: dict[str, list[np.ndarray]],
+    lat_deg_zm: np.ndarray,
+) -> xr.Dataset:
+    """Package buffered full-column zonal-mean wave, EP-flux & GWD profiles into a CF Zarr Dataset."""
+    t_arr = np.asarray(times_days, dtype=np.float64)
+    units_zw = {
+        "u_zm": "m s-1", "v_zm": "m s-1", "temp_zm": "K", "w_zm": "m s-1",
+        "uw_eddy_zm": "m2 s-2", "vw_eddy_zm": "m2 s-2",
+        "vt_eddy_zm": "K m s-1", "uv_eddy_zm": "m2 s-2",
+        "w_rms_zm": "m s-1", "t_rms_zm": "K",
+        "du_ngwd_zm": "m s-2", "dv_ngwd_zm": "m s-2", "du_ogwd_zm": "m s-2",
+    }
+    data_vars: dict[str, Any] = {}
+    for k, u in units_zw.items():
+        if k in buf_zw and buf_zw[k]:
+            data_vars[k] = (("time", "nz", "n_lat"), np.stack(buf_zw[k], axis=0).astype(np.float32), {"units": u})
+    t_origin = f"days since {getattr(model.cfg, 'start_date', '2000-03-20') or '2000-03-20'} 00:00:00"
+    coords: dict[str, Any] = {
+        "time": ("time", t_arr, {"units": t_origin}),
+        "nz": ("nz", model.vgrid.zeta_c.detach().cpu().numpy().astype(np.float32), {"units": "m", "positive": "up"}),
+        "n_lat": ("n_lat", lat_deg_zm.astype(np.float32), {"units": "degrees_north"}),
+    }
+    return xr.Dataset(
+        data_vars=data_vars,
+        coords=coords,
+        attrs={
+            "Conventions": "CF-1.11",
+            "glevel": model.cfg.glevel,
+            "co2_ppmv": model.cfg.co2_ppmv,
+            "z_top_m": float(model.vgrid.z_top),
+            "crm_sponge_base_m": float(min(model.cfg.z_sponge_base, 26000.0) if model.vgrid.z_top > 32000.0 else model.cfg.z_sponge_base),
         },
     )
 
@@ -1981,6 +2159,7 @@ def main() -> None:
     parser.add_argument("--icesheet-accel-spinup-years", type=float, default=None)
     parser.add_argument("--icesheet-isostasy-tau-yr", type=float, default=None)
     parser.add_argument("--cmip7-output", action="store_true", default=None, help="Enable CMIP7 Data Request v1.2 ESM-BCV monthly Zarr stream")
+    parser.add_argument("--highfreq", action="store_true", default=None, help="Enable high-frequency (3-hourly) convective/wave & zonal-wave Zarr streams")
     parser.add_argument("--enable-ocean-bgc", action="store_true", default=None, help="Enable FlexPFT marine BGC & OMIP/mocsy 2.0 carbonate chemistry")
     parser.add_argument("--tuning-note", type=str, default="", help="Optional provenance note recorded in tuning_history.md / tuning_history.jsonl")
     args = parser.parse_args()
@@ -2014,6 +2193,8 @@ def main() -> None:
         cfg.icesheet_isostasy_tau_yr = args.icesheet_isostasy_tau_yr
     if args.cmip7_output is not None:
         out_cfg.cmip7_output_enabled = bool(args.cmip7_output)
+    if args.highfreq is not None:
+        out_cfg.highfreq_enabled = bool(args.highfreq)
     if args.enable_ocean_bgc is not None:
         cfg.enable_ocean_bgc = bool(args.enable_ocean_bgc)
 
@@ -2249,12 +2430,36 @@ def main() -> None:
     sample_stride = max(int(round(out_cfg.monthly_mean_sample_hours * 3600.0 / cfg.dt_host)), 1)
     csv_stride_steps = max(int(out_cfg.daily_csv_interval_days) * steps_per_day, 1)
     preview_stride_steps = max(int(round(3600.0 / cfg.dt_host)), 1)
+    hf_enabled = bool(getattr(out_cfg, "highfreq_enabled", False))
+    hf_stride_steps = max(int(round(float(getattr(out_cfg, "highfreq_interval_hours", 3.0)) * 3600.0 / cfg.dt_host)), 1)
+    hf_include_upper = bool(getattr(out_cfg, "highfreq_include_upper_air", True))
+    hf_k_dev: torch.Tensor | None = None
+    hf_z_km = np.array([], dtype=np.float32)
+    hf_k_np = np.array([], dtype=np.int32)
+    zm_lat_deg = np.array([], dtype=np.float32)
+    zm_bin_idx: torch.Tensor | None = None
+    zm_w_mat: torch.Tensor | None = None
+    if hf_enabled:
+        hf_k_dev, hf_z_km, hf_k_np = _parse_hf_levels(
+            model.vgrid, str(getattr(out_cfg, "highfreq_upper_air_km", "10,20,30,50,75"))
+        )
+        zm_lat_deg, zm_bin_idx, zm_w_mat = _build_zonal_bin_matrix(model.mesh, n_lat=36)
+        print(
+            f"[HighFreq] Enabled: every {getattr(out_cfg, 'highfreq_interval_hours', 3.0):.2g} h "
+            f"({hf_stride_steps} steps) | upper-air levels={hf_z_km.round(1).tolist()} km (k={hf_k_np.tolist()})",
+            flush=True,
+        )
 
     import shutil
 
     single_partition = out_cfg.zarr_dir_partition == "single"
     if single_partition and start_year == 1:
-        for p in (out_root / "monthly.zarr", out_root / "snapshots.zarr"):
+        for p in (
+            out_root / "monthly.zarr",
+            out_root / "snapshots.zarr",
+            out_root / "highfreq.zarr",
+            out_root / "zonal_waves.zarr",
+        ):
             if p.exists():
                 shutil.rmtree(p)
 
@@ -2278,13 +2483,15 @@ def main() -> None:
         monthly_zarr = (out_root / "monthly.zarr") if single_partition else (y_dir / "monthly.zarr")
         snap_zarr = (out_root / "snapshots.zarr") if single_partition else (y_dir / "snapshots.zarr")
         cmip7_zarr = (out_root / "cmip7_monthly.zarr") if single_partition else (y_dir / "cmip7_monthly.zarr")
+        highfreq_zarr = (out_root / "highfreq.zarr") if single_partition else (y_dir / "highfreq.zarr")
+        zonal_waves_zarr = (out_root / "zonal_waves.zarr") if single_partition else (y_dir / "zonal_waves.zarr")
         csv_path = y_dir / "daily_global.csv"
 
         is_mid_resume = (year == start_year and resume_step_in_yr > 0)
 
         # Clean partial current-year Zarr only in yearly-partition mode when starting year fresh
         if not single_partition and not is_mid_resume:
-            for p in (monthly_zarr, snap_zarr, cmip7_zarr):
+            for p in (monthly_zarr, snap_zarr, cmip7_zarr, highfreq_zarr, zonal_waves_zarr):
                 if p.exists():
                     shutil.rmtree(p)
 
@@ -2309,6 +2516,36 @@ def main() -> None:
         hr_precip_sum: torch.Tensor | None = None
         hr_olr_sum: torch.Tensor | None = None
         hr_cnt = 0
+        hf_t2_sum: torch.Tensor | None = None
+        hf_precip_sum: torch.Tensor | None = None
+        hf_olr_sum: torch.Tensor | None = None
+        hf_cnt = 0
+        hf_times: list[float] = []
+        hf_buf_2d: dict[str, list[np.ndarray]] = {"precip_mm_day": [], "olr": [], "t2_k": []}
+        hf_buf_up: dict[str, list[np.ndarray]] = {"temp_hf": [], "u_hf": [], "v_hf": [], "w_hf": []}
+        zw_buf: dict[str, list[np.ndarray]] = {}
+
+        def _flush_highfreq_buffers() -> None:
+            if not hf_enabled or not hf_times:
+                return
+            append_zarr(
+                _build_highfreq_xarray(
+                    model, hf_times, hf_buf_2d, hf_buf_up if hf_include_upper else {}, hf_z_km, hf_k_np
+                ),
+                highfreq_zarr,
+            )
+            if zw_buf:
+                append_zarr(
+                    _build_zonal_waves_xarray(model, hf_times, zw_buf, zm_lat_deg),
+                    zonal_waves_zarr,
+                )
+            hf_times.clear()
+            for v in hf_buf_2d.values():
+                v.clear()
+            for v in hf_buf_up.values():
+                v.clear()
+            for v in zw_buf.values():
+                v.clear()
         t_hr0 = time.perf_counter()
         m_idx = resume_m_idx if is_mid_resume else 0
         m_sums: dict[str, torch.Tensor] = resume_m_sums if is_mid_resume else {}
@@ -2445,6 +2682,43 @@ def main() -> None:
                 hr_olr_sum += olr_inst
             hr_cnt += 1
 
+            if hf_enabled:
+                if hf_t2_sum is None:
+                    hf_t2_sum = t2_inst.clone()
+                    hf_precip_sum = precip_inst.clone()
+                    hf_olr_sum = olr_inst.clone()
+                else:
+                    hf_t2_sum += t2_inst
+                    hf_precip_sum += precip_inst
+                    hf_olr_sum += olr_inst
+                hf_cnt += 1
+                if step_in_yr % hf_stride_steps == 0 and hf_cnt > 0:
+                    inv_hf = 1.0 / float(hf_cnt)
+                    hf_times.append(float(model.sim_time_sec / C.SECONDS_PER_DAY))
+                    hf_buf_2d["precip_mm_day"].append((hf_precip_sum * inv_hf).detach().cpu().numpy().astype(np.float32))
+                    hf_buf_2d["olr"].append((hf_olr_sum * inv_hf).detach().cpu().numpy().astype(np.float32))
+                    hf_buf_2d["t2_k"].append((hf_t2_sum * inv_hf).detach().cpu().numpy().astype(np.float32))
+                    u_hf_full, v_hf_full = reconstruct_cell_winds(model.mesh, model.atmos.u_edge)
+                    _, _, t_hf_full = diagnose_pressure_temperature(
+                        model.atmos.rho_d, model.atmos.theta_m, model.atmos.q_v
+                    )
+                    if hf_include_upper and hf_k_dev is not None and hf_k_dev.numel() > 0:
+                        w_hf_full = 0.5 * (model.atmos.w[:-1] + model.atmos.w[1:])
+                        hf_buf_up["temp_hf"].append(t_hf_full.index_select(0, hf_k_dev).detach().cpu().numpy().astype(np.float32))
+                        hf_buf_up["u_hf"].append(u_hf_full.index_select(0, hf_k_dev).detach().cpu().numpy().astype(np.float32))
+                        hf_buf_up["v_hf"].append(v_hf_full.index_select(0, hf_k_dev).detach().cpu().numpy().astype(np.float32))
+                        hf_buf_up["w_hf"].append(w_hf_full.index_select(0, hf_k_dev).detach().cpu().numpy().astype(np.float32))
+                    if zm_bin_idx is not None and zm_w_mat is not None:
+                        zw_snap = _compute_zonal_wave_snapshot(
+                            model, u_hf_full, v_hf_full, t_hf_full, zm_bin_idx, zm_w_mat
+                        )
+                        for kz, vz in zw_snap.items():
+                            zw_buf.setdefault(kz, []).append(vz)
+                    hf_t2_sum = None
+                    hf_precip_sum = None
+                    hf_olr_sum = None
+                    hf_cnt = 0
+
             if step_in_yr % preview_stride_steps == 0 and hr_cnt > 0:
                 wall_hr = time.perf_counter() - t_hr0
                 t_hr0 = time.perf_counter()
@@ -2544,6 +2818,18 @@ def main() -> None:
                             sample["runoff_glacier"] = sd_sub.runoff_ice.reshape(nc_c, n_sub_c).mean(dim=-1)
                     if model.ozone is not None:
                         sample["o3_tco_du"] = model.ozone.tco_du
+                    _du_ng = model.rad_cache.get("_du_ngwd", None)
+                    _dv_ng = model.rad_cache.get("_dv_ngwd", None)
+                    if _du_ng is not None and _dv_ng is not None:
+                        sample["tau_ngwd_col"] = (
+                            model.atmos.rho_d * model.atmos.dz_c * torch.sqrt(_du_ng * _du_ng + _dv_ng * _dv_ng)
+                        ).sum(dim=0)
+                    _du_og = model.rad_cache.get("_du_ogwd", None)
+                    _dv_og = model.rad_cache.get("_dv_ogwd", None)
+                    if _du_og is not None and _dv_og is not None:
+                        sample["tau_ogwd_col"] = (
+                            model.atmos.rho_d * model.atmos.dz_c * torch.sqrt(_du_og * _du_og + _dv_og * _dv_og)
+                        ).sum(dim=0)
                     if model.icesheet is not None:
                         sample["h_ice"] = model.icesheet.h_ice
                         sample["z_topo_dyn"] = model.mesh.z_topo
@@ -2954,6 +3240,7 @@ def main() -> None:
                 m_sums.clear()
                 m_cnt = 0
                 m_idx += 1
+                _flush_highfreq_buffers()
 
             if out_cfg.snapshots_enabled and step_in_yr in snap_steps:
                 if (
@@ -2973,6 +3260,7 @@ def main() -> None:
 
             cur_cal_month = model.calendar.date_at(model.sim_time_sec).month
             if getattr(out_cfg, "restart_monthly", True) and cur_cal_month != prev_cal_month and step_in_yr < steps_per_year:
+                _flush_highfreq_buffers()
                 _save_restart_atomic(
                     model,
                     y_dir / "restart_mid.pt",
@@ -3001,6 +3289,7 @@ def main() -> None:
                 stop_by_end_date = True
                 break
 
+        _flush_highfreq_buffers()
         if year % max(int(out_cfg.restart_interval_years), 1) == 0 or year == years or stop_by_end_date:
             _save_restart_atomic(
                 model,

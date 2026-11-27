@@ -159,6 +159,10 @@ restart_monthly = true
 cmip7_output_enabled = false
 cmip7_include_plev19 = true
 cmip7_include_ocean_3d = true
+highfreq_enabled = false
+highfreq_interval_hours = 3.0
+highfreq_include_upper_air = true
+highfreq_upper_air_km = "10,20,30,50,75"
 
 # --- Fundamental Physical & Planetary Constants ---
 [constants]

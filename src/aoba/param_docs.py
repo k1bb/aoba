@@ -598,6 +598,22 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "ja": "CMIP7 出力時に 3D 海洋変数（水温・塩分・流速・BGC）を海洋鉛直層 (olevel) で出力する。",
         "en": "Include 3D ocean variables (thetao, so, uo, vo, BGC) on model ocean levels (olevel) in CMIP7 output.",
     },
+    "highfreq_enabled": {
+        "ja": "高頻度2D対流・波動出力 `highfreq.zarr`（降水日周期・Wheeler–Kiladis 赤道波・上層波動）および全鉛直層帯状平均波動・GWD 出力 `zonal_waves.zarr`（QBO・EPフラックス・CRM上面連続性・重力波ドラッグ）を有効化する。",
+        "en": "Enable high-frequency 2D convective/wave output (`highfreq.zarr`: diurnal precipitation cycle, Wheeler–Kiladis equatorial waves, upper-air waves) and full-column zonal-mean wave/GWD diagnostics (`zonal_waves.zarr`: QBO, EP flux, CRM-lid continuity, GWD).",
+    },
+    "highfreq_interval_hours": {
+        "ja": "`highfreq.zarr` および `zonal_waves.zarr` の出力時間間隔 [時間]（既定 3.0 時間＝1日8回；降水日周期・半日潮汐 SW2・準2日波 Q2DW・赤道波スペクトルを解像）。",
+        "en": "Output cadence [hours] for `highfreq.zarr` and `zonal_waves.zarr` (default 3.0 h = 8x/day; resolves diurnal precipitation, SW2/DW1 tides, Q2DW, and equatorial waves).",
+    },
+    "highfreq_include_upper_air": {
+        "ja": "`highfreq.zarr` に指定高度スライスの瞬時上層場（気温・東西風・南北風・鉛直速度）を含める（ジェット流路・ストームトラック・重力波・中間圏ノーマルモード解析用）。",
+        "en": "Include instantaneous upper-air altitude slices (T, u, v, w) in `highfreq.zarr` for jet-stream, storm-track, gravity-wave, and mesospheric normal-mode/tide analysis.",
+    },
+    "highfreq_upper_air_km": {
+        "ja": "`highfreq.zarr` で抽出する上層スライスの目標高度 [km]（カンマ区切り、既定 `10,20,30,50,75`＝ジェット・CRMスポンジ下/上・成層圏界面・中間圏）。各モデルの最近傍鉛直層へ自動対応。",
+        "en": "Comma-separated target altitudes [km] for `highfreq.zarr` upper-air slices (default `10,20,30,50,75`: jet, below/above CRM sponge, stratopause, mesosphere); automatically mapped to nearest valid model levels.",
+    },
 
     # =========================================================================
     # [constants] (26)

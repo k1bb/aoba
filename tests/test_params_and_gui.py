@@ -48,7 +48,7 @@ def test_toml_roundtrip_and_module_sync() -> None:
     defaults = default_config_dict()
     loaded = load_aoba_toml(toml_p)
     assert len(defaults) == 14
-    assert sum(len(v) for v in defaults.values()) == 325
+    assert sum(len(v) for v in defaults.values()) == 329
     assert set(loaded.keys()) == set(defaults.keys())
     for sec in defaults:
         assert set(loaded[sec].keys()) == set(defaults[sec].keys()), f"Key mismatch in [{sec}]"
@@ -129,7 +129,7 @@ def test_gui_server_endpoints() -> None:
             assert len(m_resp["verts_on_cell_b64"]) > 0 and len(m_resp["surf_type_b64"]) > 0
 
         state = json.loads(urllib.request.urlopen(f"{base}/api/state").read().decode("utf-8"))
-        assert state["param_count"] == 325
+        assert state["param_count"] == 329
         assert "grid" in state["config"]
 
         co2_cat = json.loads(urllib.request.urlopen(f"{base}/api/co2_catalog").read().decode("utf-8"))
@@ -252,6 +252,10 @@ def test_runner_cli_with_custom_toml_cpu() -> None:
         cfg["output"]["monthly_mean_include_3d"] = False
         cfg["output"]["snapshots_periods_per_year"] = 2
         cfg["output"]["snapshots_include_subgrid_2d"] = False
+        cfg["output"]["highfreq_enabled"] = True
+        cfg["output"]["highfreq_interval_hours"] = 3.0
+        cfg["output"]["highfreq_include_upper_air"] = True
+        cfg["output"]["highfreq_upper_air_km"] = "5,15,25"
 
         cfg_path = tmp / "test_cfg.toml"
         save_aoba_toml(cfg, cfg_path)
@@ -288,6 +292,18 @@ def test_runner_cli_with_custom_toml_cpu() -> None:
         assert ds_s.sizes["time"] == 2
         assert "temp" in ds_s and "h_ice" in ds_s
         assert "lai_sub" not in ds_s
+
+        assert (out_dir / "highfreq.zarr").exists()
+        assert (out_dir / "zonal_waves.zarr").exists()
+        ds_hf = xr.open_zarr(out_dir / "highfreq.zarr", consolidated=False)
+        assert ds_hf.sizes["time"] == 2
+        for k in ("precip_mm_day", "olr", "t2_k", "temp_hf", "u_hf", "v_hf", "w_hf"):
+            assert k in ds_hf, f"Missing {k} in highfreq.zarr"
+        ds_zw = xr.open_zarr(out_dir / "zonal_waves.zarr", consolidated=False)
+        assert ds_zw.sizes["time"] == 2 and ds_zw.sizes["n_lat"] == 36
+        for k in ("u_zm", "temp_zm", "uw_eddy_zm", "vw_eddy_zm", "vt_eddy_zm", "w_rms_zm", "du_ngwd_zm", "du_ogwd_zm"):
+            assert k in ds_zw, f"Missing {k} in zonal_waves.zarr"
+        assert "tau_ngwd_col" in ds_m and "tau_ogwd_col" in ds_m
 
 
 def test_co2_forcing_modes_and_calendar() -> None:

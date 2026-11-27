@@ -2674,6 +2674,8 @@ def step_aoba_model(
         angle_topo=mesh.angle_topo,
         dt=dt,
     )
+    model.rad_cache["_du_ogwd"] = du_oro_c.detach()
+    model.rad_cache["_dv_ogwd"] = dv_oro_c.detach()
     if cfg.enable_nonoro_gwd:
         pres_host_gwd, _, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
         du_ngwd_c, dv_ngwd_c = compute_nonorographic_gwd(
@@ -2688,8 +2690,13 @@ def step_aoba_model(
             q_conv_c=model.q_conv_diag,
             dt=dt,
         )
+        model.rad_cache["_du_ngwd"] = du_ngwd_c.detach()
+        model.rad_cache["_dv_ngwd"] = dv_ngwd_c.detach()
         du_oro_c = du_oro_c + du_ngwd_c
         dv_oro_c = dv_oro_c + dv_ngwd_c
+    else:
+        model.rad_cache.pop("_du_ngwd", None)
+        model.rad_cache.pop("_dv_ngwd", None)
     du_oro_edge = project_cell_vectors_to_edges(mesh, du_oro_c, dv_oro_c)
 
     # 6. Host SCVT Nonhydrostatic RK3-HEVI Dynamical Core & Voronoi FCT
