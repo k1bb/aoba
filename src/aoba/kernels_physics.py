@@ -7898,7 +7898,7 @@ kernel void land_carbon_cn_fire_prep_tile(
         float u_mass = f_mass * nmin_av;
         float cr_pos = max(c_root, 0.0f);
         float root_eff = cr_pos / (cr_pos + 0.25f);
-        float k_diff = 8.0f * f_mst[0] * f_frz[0] * root_eff;
+        float k_diff = 45.0f * f_mst[0] * f_frz[0] * root_eff;
         float f_diff = _aoba_neg_expm1_neg(min(k_diff * dt_yr, 20.0f));
         float u_diff = f_diff * max(nmin_av - u_mass, 0.0f);
         u_soil = min(d_n_net, u_mass + u_diff);

@@ -312,14 +312,14 @@ z_foliage_cost = 12.227
 k_beer_lai = 0.5
 sigma_zhou = 0.771
 alpha_ema_acclim = 0.067
-evg_cost_ratio_base = 2.55
-evg_cost_ratio_cold = 0.55
-evg_cold_eff_penalty = 0.14
+evg_cost_ratio_base = 2.05
+evg_cost_ratio_cold = 0.40
+evg_cold_eff_penalty = 0.12
 leaf_aging_b_yr = 15.0
 decid_flush_days = 25.0
-evg_offseason_resp25 = 32.0
-evg_frost_crit_k = 233.15
-evg_frost_cost = 18.0
+evg_offseason_resp25 = 48.0
+evg_frost_crit_k = 241.15
+evg_frost_cost = 24.0
 
 # --- Codron (2012) 1.5-Layer Wind-Driven Voronoi Ekman Ocean Parameters ---
 [ocean_ekman]

@@ -1443,7 +1443,7 @@ def update_daily_lai_root_height(
     a0_day_fav = a0_day * torch.clamp(ws_b, 0.0, 1.0)
     a0_fav_prev = bio.ema_ann_a0_fav if bio.ema_ann_a0_fav is not None else bio.ema_ann_a0.clone()
     bio.ema_ann_a0_fav = (1.0 - alpha_yr) * a0_fav_prev + alpha_yr * (a0_day_fav * 365.2425)
-    is_fav = (daily_temp_k > C.T_FREEZE + 5.0) & (ws_b > 0.20)
+    is_fav = (daily_temp_k > C.T_FREEZE + 5.0) & (ws_b > 0.45)
     bio.ema_gsl_frac = (1.0 - alpha_yr) * bio.ema_gsl_frac + alpha_yr * is_fav.to(daily_temp_k.dtype)
 
     # Track off-season temperature T_off and climatological annual minimum temperature T_min,yr
@@ -1500,7 +1500,9 @@ def update_daily_lai_root_height(
     # Temperature-dependent off-season maintenance/stress cost (Q10 ~ 2.0, Heskel et al., 2016)
     f_resp_off = torch.exp(torch.clamp(0.0693 * (bio.ema_offseason_temp - 298.15), min=-6.0, max=3.0))
     # Extreme continental winter frost-damage penalty (Sakai & Larcher, 1987; Givnish, 2002; Larix belt)
+    # and subarctic/alpine tundra winter snow-burial penalty below the thermal xylogenesis treeline (Körner, 2012)
     frost_pen = EVG_FROST_COST * torch.sigmoid((EVG_FROST_CRIT_K - ema_tmin_next) / 4.0)
+    tundra_pen = 18.0 * torch.sigmoid(25.0 * (0.20 - f_gsl)) * torch.sigmoid(0.15 * (95.0 - a0_yr))
 
     b_dec = max(LEAF_AGING_B_YR / 2.5, 1.0)
     flush_frac = torch.clamp(1.0 - DECID_FLUSH_DAYS / torch.clamp(365.2425 * f_gsl, min=15.0), min=0.0)
@@ -1510,6 +1512,7 @@ def update_daily_lai_root_height(
         - (c_evg / tau_evg)
         - EVG_OFFSEASON_RESP25 * f_resp_off * (1.0 - f_gsl)
         - frost_pen
+        - tundra_pen
     )
     f_evg_target = torch.sigmoid(4.0 * (g_evg - g_dec) / max(c_dec, 1.0))
     f_evg_prev = bio.f_evg if bio.f_evg is not None else (0.5 * veg.to(daily_temp_k.dtype))
@@ -1574,16 +1577,21 @@ def update_daily_lai_root_height(
         torch.full_like(sr_target, 20.0),
     )
 
-    # 5. Potential canopy height h_c [m] from vascular water-energy scaling (Kempes et al., 2011, Eqs. 2-5)
-    #    modulated by universal alpine/arctic cambial thermal treeline limitation (Körner, 2012, Ch. 3;
-    #    Paulsen & Körner, 2014: >= ~94 days above 5 degC for woody tree-stem xylogenesis).
-    #    Cap moisture_idx at 1.2 so cold low-PET bogs/plateaus cannot spuriously grow tall forests.
-    moisture_idx = torch.clamp(bio.ema_ann_precip / torch.clamp(bio.ema_ann_pet, min=50.0), 0.0, 1.2)
-    prod_idx = torch.clamp((fapar_max * a0_yr) / 180.0, 0.0, 2.0)
-    # Growing-season length (> 5 C) thermal treeline gate (Körner, 2012: treeline at ~90-100 days -> f_gsl ~ 0.30)
-    treeline_gsl = torch.sigmoid(30.0 * (f_gsl - 0.30))
+    # 5. Potential canopy height h_c [m] from vascular hydraulic balance (Kempes et al., 2011, Eqs. 2-5),
+    #    canopy closure fAPAR_max, woody-vs-C4 herbaceous partition (1 - 0.85 * f_c4), and universal
+    #    thermal xylogenesis treeline (Körner, 2012, Ch. 3; Paulsen & Körner, 2014: A_0 >= ~112 mol C m^-2 yr^-1).
+    #    AOBA Formulation Eq. (7.31).
+    moisture_idx = torch.clamp(bio.ema_ann_precip / torch.clamp(bio.ema_ann_pet, min=50.0), 0.0, 1.30)
+    prod_idx = torch.clamp(a0_yr / 280.0, 0.0, 1.35)
+    woody_fac = torch.clamp(1.0 - 0.85 * bio.f_c4, 0.12, 1.0)
+    treeline_th = torch.sigmoid(0.12 * (a0_yr - 102.0))
     hc_target = torch.clamp(
-        34.0 * torch.pow(moisture_idx, 0.85) * torch.pow(prod_idx, 0.75) * treeline_gsl,
+        38.0
+        * torch.pow(moisture_idx / 1.25, 0.75)
+        * torch.pow(torch.clamp(fapar_max, min=0.0), 0.90)
+        * torch.pow(prod_idx, 0.35)
+        * woody_fac
+        * treeline_th,
         0.05,
         40.0,
     )

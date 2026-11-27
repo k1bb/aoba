@@ -730,7 +730,8 @@ $$
 \begin{aligned}
 T_{\mathrm{rev}}(\mathrm{LWC}_{\mathrm{core}}) &= -10.0 - 10.0\,\tanh\!\big(0.65(\mathrm{LWC}_{\mathrm{core}} - 0.55)\big), \\
 \delta q_{\mathrm{coll}} &= \delta q_{\max}\,\tanh\!\left(\frac{T_C - T_{\mathrm{rev}}}{4.0}\right)\frac{\mathrm{LWC}_{\mathrm{core}}}{\mathrm{LWC}_{\mathrm{core}} + 0.15}\,\sigma\!\left(\frac{T_C + 40}{3.0}\right)\sigma\!\left(-\frac{T_C}{1.5}\right)\,\mathbf{1}_{T_C < 0}, \\
-N_{i,\mathrm{eff}} &= \max\!\left(N_i,\ 4.0\times 10^4\,\max\!\left(1 - \frac{|T_C + 5.5|}{3.5},\ 0\right)\frac{\mathrm{LWC}_{\mathrm{core}}}{\mathrm{LWC}_{\mathrm{core}} + 0.10}\right)
+N_{i,\mathrm{eff}} &= \max\!\left(N_i,\ 0.65\,N_{i,\mathrm{MP}},\ 4.0\times 10^4\,\max\!\left(1 - \frac{|T_C + 5.5|}{3.5},\ 0\right)\frac{\mathrm{LWC}_{\mathrm{core}}}{\mathrm{LWC}_{\mathrm{core}} + 0.10}\right), \\
+N_{x,\mathrm{eff}} &= \max\!\left(N_x,\ 0.65\,N_{x,\mathrm{MP}}\right), \qquad x\in\{s, g\}
 \end{aligned} \tag{5.19}
 $$
 
@@ -1192,7 +1193,7 @@ Kikuzawa (1991, Eq. 5) optimal evergreen leaf lifespan $\tau_{\mathrm{evg}}$ ($b
 $$
 \begin{aligned}
 \tau_{\mathrm{evg}} &= \operatorname{clamp}\!\left(\sqrt{\frac{2 b\, c_{\mathrm{evg}}}{\eta_{\mathrm{evg}} a_{\mathrm{leaf}}}},\ 1,\ 8\right), \\
-g_{\mathrm{evg}} &= \eta_{\mathrm{evg}}\!\left(1 - \frac{\tau_{\mathrm{evg}}}{2b}\right)a_{\mathrm{leaf}} - \frac{c_{\mathrm{evg}}}{\tau_{\mathrm{evg}}} - 32\,f_{\mathrm{resp,off}}(1 - f_{\mathrm{gsl}}) - \mathrm{frost}_{\mathrm{pen}}, \\
+g_{\mathrm{evg}} &= \eta_{\mathrm{evg}}\!\left(1 - \frac{\tau_{\mathrm{evg}}}{2b}\right)a_{\mathrm{leaf}} - \frac{c_{\mathrm{evg}}}{\tau_{\mathrm{evg}}} - 32\,f_{\mathrm{resp,off}}(1 - f_{\mathrm{gsl}}) - \mathrm{frost}_{\mathrm{pen}} - 18\,\sigma\!\big(25(0.20 - f_{\mathrm{gsl}})\big)\sigma\!\big(0.15(95 - A_{0,\mathrm{yr}})\big), \\
 g_{\mathrm{dec}} &= \left(1 - \frac{25}{365.2425 f_{\mathrm{gsl}}}\right)\!\left(1 - \frac{f_{\mathrm{gsl}}}{2 b_{\mathrm{dec}}}\right)a_{\mathrm{leaf}} - c_{\mathrm{dec,eff}}, \\
 f_{\mathrm{evg,tgt}} &= \sigma\!\left(\frac{4(g_{\mathrm{evg}} - g_{\mathrm{dec}})}{c_{\mathrm{dec}}}\right)
 \end{aligned} \tag{7.28}
@@ -1213,13 +1214,13 @@ S_{R,\mathrm{tgt}} &= \operatorname{clamp}\!\big(50 + 1.35\,D_{\mathrm{cum}},\ 5
 \end{aligned} \tag{7.30}
 $$
 
-**5. Available Water-Balance Index, Productivity Index & Thermal Treeline Canopy Height $h_c$ (Kempes et al., 2011; Körner, 2012; Paulsen & Körner, 2014)**: Potential maximum tree height reflects the balance of hydraulic water supply (available water-balance index $\mathrm{MI}$, the nondimensional precipitation-to-PET ratio saturating at $1.2$), annual carbon available for stem wood construction (canopy productivity index $\mathrm{PI}$ normalized by $180\ \mathrm{mol\ C\ m^{-2}\ yr^{-1}}$), and the thermal xylogenesis treeline threshold ($\ge 94$ days above $5^\circ\mathrm{C}$, $f_{\mathrm{gsl}} \approx 0.30$), updated via a 1-year EMA:
+**5. Available Water-Balance Index, Canopy Closure, Woody Cover & Thermal Treeline Canopy Height $h_c$ (Kempes et al., 2011; Körner, 2012; Paulsen & Körner, 2014)**: Potential canopy height combines hydraulic water supply (moisture index $\mathrm{MI}$ saturating at $1.30$), canopy leaf closure ($\mathrm{fAPAR}_{\max}$), annual thermal carbon supply ($\mathrm{PI} = \operatorname{clamp}(A_{0,\mathrm{yr}}/280, 0, 1.35)$), woody-versus-$\mathrm{C}_4$ herbaceous cover ($f_{\mathrm{wood}} = \operatorname{clamp}(1 - 0.85 f_{\mathrm{C4}}, 0.12, 1.0)$), and the thermal xylogenesis treeline threshold ($A_{0,\mathrm{yr}} \approx 102\ \mathrm{mol\ C\ m^{-2}\ yr^{-1}}$), updated via a 1-year EMA:
 
 $$
 \begin{aligned}
-\mathrm{MI} &= \operatorname{clamp}\!\left(\frac{P_{\mathrm{yr}}}{\max(\mathrm{PET}_{\mathrm{yr}},\ 1.0)},\ 0,\ 1.2\right), \\
-\mathrm{PI} &= \operatorname{clamp}\!\left(\frac{\mathrm{fAPAR}_{\max}\,A_{0,\mathrm{yr}}}{180.0},\ 0,\ 2.0\right), \\
-h_{c,\mathrm{tgt}} &= \operatorname{clamp}\!\Big(34.0\,\mathrm{MI}^{0.85}\,\mathrm{PI}^{0.75}\,\sigma\big(30(f_{\mathrm{gsl}} - 0.30)\big),\ 0.05,\ 40.0\Big)\ [\mathrm{m}]
+\mathrm{MI} &= \operatorname{clamp}\!\left(\frac{P_{\mathrm{yr}}}{\max(\mathrm{PET}_{\mathrm{yr}},\ 50.0)},\ 0,\ 1.30\right), \qquad \mathrm{PI} = \operatorname{clamp}\!\left(\frac{A_{0,\mathrm{yr}}}{280.0},\ 0,\ 1.35\right), \\
+f_{\mathrm{wood}} &= \operatorname{clamp}\!\big(1 - 0.85\,f_{\mathrm{C4}},\ 0.12,\ 1.0\big), \\
+h_{c,\mathrm{tgt}} &= \operatorname{clamp}\!\Big(38.0\,\left(\frac{\mathrm{MI}}{1.25}\right)^{0.75}\,\mathrm{fAPAR}_{\max}^{0.90}\,\mathrm{PI}^{0.35}\,f_{\mathrm{wood}}\,\sigma\big(0.12(A_{0,\mathrm{yr}} - 102.0)\big),\ 0.05,\ 40.0\Big)\ [\mathrm{m}]
 \end{aligned} \tag{7.31}
 $$
 
@@ -1346,7 +1347,7 @@ $$
 \mathrm{LMA} &= 0.045 + 0.055\,f_{\mathrm{evg}} + 0.025\,f_{\mathrm{cold}} + 0.035(1 - \phi_N)\ [\mathrm{kg\ C\ m^{-2}}], \qquad \tau_{\mathrm{leaf,eff}} = \tau_{\mathrm{leaf},0}\big[1 + 0.80(1 - \phi_N)\big], \\
 N_{\mathrm{area,opt}} &= 1.76\times 10^{-5}\,V_{c\max 25} + 0.016\,\mathrm{LMA}, \\
 u_{\mathrm{mass}} &= \Big[1 - \exp\!\left(-\frac{E_{\mathrm{tr}}\Delta t}{W_{\mathrm{root,col}}}\right)\Big]N_{\min}, \\
-k_{\mathrm{diff}} &= 8.0\,f_{\mathrm{moist}}\,f_{\mathrm{freeze}}\,\frac{C_r}{C_r + 0.25}, \qquad u_{\mathrm{diff}} = \big(1 - e^{-k_{\mathrm{diff}}\Delta t_{\mathrm{yr}}}\big)(N_{\min} - u_{\mathrm{mass}})
+k_{\mathrm{diff}} &= 45.0\,f_{\mathrm{moist}}\,f_{\mathrm{freeze}}\,\frac{C_r}{C_r + 0.25}, \qquad u_{\mathrm{diff}} = \big(1 - e^{-k_{\mathrm{diff}}\Delta t_{\mathrm{yr}}}\big)(N_{\min} - u_{\mathrm{mass}})
 \end{aligned} \tag{7.43}
 $$
 

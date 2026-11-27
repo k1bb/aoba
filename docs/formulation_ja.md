@@ -730,7 +730,8 @@ $$
 \begin{aligned}
 T_{\mathrm{rev}}(\mathrm{LWC}_{\mathrm{core}}) &= -10.0 - 10.0\,\tanh\!\big(0.65(\mathrm{LWC}_{\mathrm{core}} - 0.55)\big), \\
 \delta q_{\mathrm{coll}} &= \delta q_{\max}\,\tanh\!\left(\frac{T_C - T_{\mathrm{rev}}}{4.0}\right)\frac{\mathrm{LWC}_{\mathrm{core}}}{\mathrm{LWC}_{\mathrm{core}} + 0.15}\,\sigma\!\left(\frac{T_C + 40}{3.0}\right)\sigma\!\left(-\frac{T_C}{1.5}\right)\,\mathbf{1}_{T_C < 0}, \\
-N_{i,\mathrm{eff}} &= \max\!\left(N_i,\ 4.0\times 10^4\,\max\!\left(1 - \frac{|T_C + 5.5|}{3.5},\ 0\right)\frac{\mathrm{LWC}_{\mathrm{core}}}{\mathrm{LWC}_{\mathrm{core}} + 0.10}\right)
+N_{i,\mathrm{eff}} &= \max\!\left(N_i,\ 0.65\,N_{i,\mathrm{MP}},\ 4.0\times 10^4\,\max\!\left(1 - \frac{|T_C + 5.5|}{3.5},\ 0\right)\frac{\mathrm{LWC}_{\mathrm{core}}}{\mathrm{LWC}_{\mathrm{core}} + 0.10}\right), \\
+N_{x,\mathrm{eff}} &= \max\!\left(N_x,\ 0.65\,N_{x,\mathrm{MP}}\right), \qquad x\in\{s, g\}
 \end{aligned} \tag{5.19}
 $$
 
@@ -1192,7 +1193,7 @@ Kikuzawa (1991, Eq. 5) の最適常緑葉寿命 $\tau_{\mathrm{evg}}$（葉老�
 $$
 \begin{aligned}
 \tau_{\mathrm{evg}} &= \operatorname{clamp}\!\left(\sqrt{\frac{2 b\, c_{\mathrm{evg}}}{\eta_{\mathrm{evg}} a_{\mathrm{leaf}}}},\ 1,\ 8\right), \\
-g_{\mathrm{evg}} &= \eta_{\mathrm{evg}}\!\left(1 - \frac{\tau_{\mathrm{evg}}}{2b}\right)a_{\mathrm{leaf}} - \frac{c_{\mathrm{evg}}}{\tau_{\mathrm{evg}}} - 32\,f_{\mathrm{resp,off}}(1 - f_{\mathrm{gsl}}) - \mathrm{frost}_{\mathrm{pen}}, \\
+g_{\mathrm{evg}} &= \eta_{\mathrm{evg}}\!\left(1 - \frac{\tau_{\mathrm{evg}}}{2b}\right)a_{\mathrm{leaf}} - \frac{c_{\mathrm{evg}}}{\tau_{\mathrm{evg}}} - 32\,f_{\mathrm{resp,off}}(1 - f_{\mathrm{gsl}}) - \mathrm{frost}_{\mathrm{pen}} - 18\,\sigma\!\big(25(0.20 - f_{\mathrm{gsl}})\big)\sigma\!\big(0.15(95 - A_{0,\mathrm{yr}})\big), \\
 g_{\mathrm{dec}} &= \left(1 - \frac{25}{365.2425 f_{\mathrm{gsl}}}\right)\!\left(1 - \frac{f_{\mathrm{gsl}}}{2 b_{\mathrm{dec}}}\right)a_{\mathrm{leaf}} - c_{\mathrm{dec,eff}}, \\
 f_{\mathrm{evg,tgt}} &= \sigma\!\left(\frac{4(g_{\mathrm{evg}} - g_{\mathrm{dec}})}{c_{\mathrm{dec}}}\right)
 \end{aligned} \tag{7.28}
@@ -1213,13 +1214,13 @@ S_{R,\mathrm{tgt}} &= \operatorname{clamp}\!\big(50 + 1.35\,D_{\mathrm{cum}},\ 5
 \end{aligned} \tag{7.30}
 $$
 
-**5. 利用可能水収支指数・生産指数および森林限界による潜在樹高 $h_c$（Kempes et al., 2011; Körner, 2012; Paulsen & Körner, 2014）**：樹木の最大到達樹高は、維管束水輸送の重力・摩擦損失を支える水収支余裕度（利用可能水収支指数 $\mathrm{MI}$：年降水量と年潜在蒸発散量の比で湿潤度を無次元化、$1.2$ で飽和）、幹・枝の木部建設を支える年間炭素供給量（群落生産指数 $\mathrm{PI}$：基準年生産 $180\ \mathrm{mol\ C\ m^{-2}\ yr^{-1}}$ に対する比）、および形成層木部細胞分裂の低温下限（日平均 $5^\circ\mathrm{C}$ 超の生育期間 $\ge 94$ 日すなわち $f_{\mathrm{gsl}} \approx 0.30$ での熱的森林限界ゲート）の積で決まり、1 年時定数 EMA で更新する：
+**5. 利用可能水収支指数・樹冠閉鎖度・木本割合および熱的森林限界による潜在樹高 $h_c$（Kempes et al., 2011; Körner, 2012; Paulsen & Körner, 2014）**：潜在樹高は、維管束水輸送を支える水収支余裕度（湿潤指数 $\mathrm{MI}$：$1.30$ で飽和）、樹冠葉面積閉鎖度 $\mathrm{fAPAR}_{\max}$、年間熱的炭素供給指数 $\mathrm{PI} = \operatorname{clamp}(A_{0,\mathrm{yr}}/280, 0, 1.35)$、$\mathrm{C}_4$ 草本を差し引いた木本被覆割合 $f_{\mathrm{wood}} = \operatorname{clamp}(1 - 0.85 f_{\mathrm{C4}}, 0.12, 1.0)$、および形成層木部細胞分裂の熱的森林限界（$A_{0,\mathrm{yr}} \approx 102\ \mathrm{mol\ C\ m^{-2}\ yr^{-1}}$）の積で定まり、1 年時定数 EMA で更新する：
 
 $$
 \begin{aligned}
-\mathrm{MI} &= \operatorname{clamp}\!\left(\frac{P_{\mathrm{yr}}}{\max(\mathrm{PET}_{\mathrm{yr}},\ 1.0)},\ 0,\ 1.2\right), \\
-\mathrm{PI} &= \operatorname{clamp}\!\left(\frac{\mathrm{fAPAR}_{\max}\,A_{0,\mathrm{yr}}}{180.0},\ 0,\ 2.0\right), \\
-h_{c,\mathrm{tgt}} &= \operatorname{clamp}\!\Big(34.0\,\mathrm{MI}^{0.85}\,\mathrm{PI}^{0.75}\,\sigma\big(30(f_{\mathrm{gsl}} - 0.30)\big),\ 0.05,\ 40.0\Big)\ [\mathrm{m}]
+\mathrm{MI} &= \operatorname{clamp}\!\left(\frac{P_{\mathrm{yr}}}{\max(\mathrm{PET}_{\mathrm{yr}},\ 50.0)},\ 0,\ 1.30\right), \qquad \mathrm{PI} = \operatorname{clamp}\!\left(\frac{A_{0,\mathrm{yr}}}{280.0},\ 0,\ 1.35\right), \\
+f_{\mathrm{wood}} &= \operatorname{clamp}\!\big(1 - 0.85\,f_{\mathrm{C4}},\ 0.12,\ 1.0\big), \\
+h_{c,\mathrm{tgt}} &= \operatorname{clamp}\!\Big(38.0\,\left(\frac{\mathrm{MI}}{1.25}\right)^{0.75}\,\mathrm{fAPAR}_{\max}^{0.90}\,\mathrm{PI}^{0.35}\,f_{\mathrm{wood}}\,\sigma\big(0.12(A_{0,\mathrm{yr}} - 102.0)\big),\ 0.05,\ 40.0\Big)\ [\mathrm{m}]
 \end{aligned} \tag{7.31}
 $$
 
@@ -1346,7 +1347,7 @@ $$
 \mathrm{LMA} &= 0.045 + 0.055\,f_{\mathrm{evg}} + 0.025\,f_{\mathrm{cold}} + 0.035(1 - \phi_N)\ [\mathrm{kg\ C\ m^{-2}}], \qquad \tau_{\mathrm{leaf,eff}} = \tau_{\mathrm{leaf},0}\big[1 + 0.80(1 - \phi_N)\big], \\
 N_{\mathrm{area,opt}} &= 1.76\times 10^{-5}\,V_{c\max 25} + 0.016\,\mathrm{LMA}, \\
 u_{\mathrm{mass}} &= \Big[1 - \exp\!\left(-\frac{E_{\mathrm{tr}}\Delta t}{W_{\mathrm{root,col}}}\right)\Big]N_{\min}, \\
-k_{\mathrm{diff}} &= 8.0\,f_{\mathrm{moist}}\,f_{\mathrm{freeze}}\,\frac{C_r}{C_r + 0.25}, \qquad u_{\mathrm{diff}} = \big(1 - e^{-k_{\mathrm{diff}}\Delta t_{\mathrm{yr}}}\big)(N_{\min} - u_{\mathrm{mass}})
+k_{\mathrm{diff}} &= 45.0\,f_{\mathrm{moist}}\,f_{\mathrm{freeze}}\,\frac{C_r}{C_r + 0.25}, \qquad u_{\mathrm{diff}} = \big(1 - e^{-k_{\mathrm{diff}}\Delta t_{\mathrm{yr}}}\big)(N_{\min} - u_{\mathrm{mass}})
 \end{aligned} \tag{7.43}
 $$
 

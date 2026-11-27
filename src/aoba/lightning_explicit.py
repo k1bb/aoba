@@ -498,13 +498,15 @@ def step_explicit_bulk_lightning_and_lnox(
 
     rho_fac = torch.pow(RHO_AIR_REF / rho_pos, 0.5)
 
-    # Cloud ice (with Hallett-Mossop secondary rime-splintering in -9..-2 C active riming cores)
+    # Cloud ice (with Hallett-Mossop secondary rime-splintering in -9..-2 C active riming cores
+    # and subgrid convective-core Marshall-Palmer collision-spectrum floor when 2M n_i is coarse)
     lwc_g_m3 = 1.0e3 * rho_pos * q_c_pos * lwc_scale
     t_c = temp - C.T_FREEZE
+    n_i_mp = torch.clamp(1.0e5 * torch.pow(torch.clamp(m_i * 1.0e3, min=0.0), 0.5), min=1.0)
     if n_i_prog is not None:
-        n_i_v = torch.clamp(rho_pos * n_i_prog, min=1.0)
+        n_i_v = torch.maximum(torch.clamp(rho_pos * n_i_prog, min=1.0), 0.65 * n_i_mp)
     else:
-        n_i_v = torch.clamp(1.0e5 * torch.pow(torch.clamp(m_i * 1.0e3, min=0.0), 0.5), min=1.0)
+        n_i_v = n_i_mp
     w_hm = torch.clamp(1.0 - torch.abs(t_c + 5.5) / 3.5, min=0.0)
     n_i_hm = 4.0e4 * w_hm * (lwc_g_m3 / (lwc_g_m3 + 0.10)) * ((q_g > 1.0e-6) & (q_c_pos > 0.0) & (t_c < 0.0)).to(dtype)
     n_i_v = torch.maximum(n_i_v, n_i_hm)
@@ -512,18 +514,20 @@ def step_explicit_bulk_lightning_and_lnox(
     vt_i = torch.where(q_i_pos > 1.0e-7, torch.clamp(0.45 * rho_fac, 0.05, 1.5), torch.zeros_like(q_i_pos))
 
     # Snow
+    n_s_mp = torch.clamp(3.0e6 * torch.pow(torch.clamp(m_s / (math.pi * RHO_SNOW * 3.0e6) + 1.0e-24, min=1.0e-24), 0.25), min=1.0)
     if n_s_prog is not None:
-        n_s_v = torch.clamp(rho_pos * n_s_prog, min=1.0)
+        n_s_v = torch.maximum(torch.clamp(rho_pos * n_s_prog, min=1.0), 0.65 * n_s_mp)
     else:
-        n_s_v = torch.clamp(3.0e6 * torch.pow(torch.clamp(m_s / (math.pi * RHO_SNOW * 3.0e6) + 1.0e-24, min=1.0e-24), 0.25), min=1.0)
+        n_s_v = n_s_mp
     d_s = torch.clamp(torch.pow(6.0 * m_s / (math.pi * RHO_SNOW * n_s_v) + 1.0e-20, 1.0 / 3.0), 1.0e-4, 6.0e-3)
     vt_s = torch.where(q_s > 1.0e-7, torch.clamp(4.84 * torch.pow(d_s, 0.25) * rho_fac, 0.2, 3.0), torch.zeros_like(q_s))
 
     # Graupel
+    n_g_mp = torch.clamp(4.0e6 * torch.pow(torch.clamp(m_g / (math.pi * RHO_GRAUPEL * 4.0e6) + 1.0e-24, min=1.0e-24), 0.25), min=1.0)
     if n_g_prog is not None:
-        n_g_v = torch.clamp(rho_pos * n_g_prog, min=1.0)
+        n_g_v = torch.maximum(torch.clamp(rho_pos * n_g_prog, min=1.0), 0.65 * n_g_mp)
     else:
-        n_g_v = torch.clamp(4.0e6 * torch.pow(torch.clamp(m_g / (math.pi * RHO_GRAUPEL * 4.0e6) + 1.0e-24, min=1.0e-24), 0.25), min=1.0)
+        n_g_v = n_g_mp
     d_g = torch.clamp(torch.pow(6.0 * m_g / (math.pi * RHO_GRAUPEL * n_g_v) + 1.0e-20, 1.0 / 3.0), 2.0e-4, 1.5e-2)
     vt_g = torch.where(q_g > 1.0e-7, torch.clamp(94.5 * torch.pow(d_g, 0.5) * rho_fac, 0.5, 12.0), torch.zeros_like(q_g))
 
@@ -841,8 +845,8 @@ def extract_lightning_distill_features(
     t_sfc = temp[0]
     qv_low = qv_pos[0]
     th_e_low = thm_s[0] + (C.L_V0 / C.CP_D) * qv_low
-    k_mid = min(max(nz_full // 3, 1), kt - 1)
-    k_hi = min(max((2 * nz_full) // 3, k_mid + 1), kt)
+    k_mid = min(max(kt // 3, 1), kt - 1)
+    k_hi = min(max((2 * kt) // 3, k_mid + 1), kt)
     th_mid = thm_s[k_mid:k_hi].mean(dim=0)
     cape_proxy = torch.clamp((th_e_low - th_mid) / 30.0, 0.0, 4.0)
 

@@ -362,6 +362,16 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
                 "grad_updates": int(model.lightning_distill.grad_updates),
                 "ema_loss": float(model.lightning_distill.ema_loss),
                 "ema_val_corr": float(model.lightning_distill.ema_val_corr),
+                "ema_tea_fl": (
+                    float(model.lightning_distill.ema_tea_fl_gpu.detach().cpu().item())
+                    if getattr(model.lightning_distill, "ema_tea_fl_gpu", None) is not None
+                    else 0.0
+                ),
+                "ema_stu_fl": (
+                    float(model.lightning_distill.ema_stu_fl_gpu.detach().cpu().item())
+                    if getattr(model.lightning_distill, "ema_stu_fl_gpu", None) is not None
+                    else 0.0
+                ),
             }
             if getattr(model, "lightning_distill", None) is not None
             else None
@@ -529,6 +539,16 @@ def _save_ossp_weights_snapshot(
                 "grad_updates": int(ld.grad_updates),
                 "ema_loss": float(ld.ema_loss),
                 "ema_val_corr": float(ld.ema_val_corr),
+                "ema_tea_fl": (
+                    float(ld.ema_tea_fl_gpu.detach().cpu().item())
+                    if getattr(ld, "ema_tea_fl_gpu", None) is not None
+                    else 0.0
+                ),
+                "ema_stu_fl": (
+                    float(ld.ema_stu_fl_gpu.detach().cpu().item())
+                    if getattr(ld, "ema_stu_fl_gpu", None) is not None
+                    else 0.0
+                ),
             }
             if ld is not None
             else None
@@ -1211,7 +1231,13 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             for k, v in ck_lt.items():
                 if hasattr(model.explicit_lightning, k):
                     setattr(model.explicit_lightning, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
-    if ckpt.get("lightning_distill") is not None and bool(getattr(model.cfg, "enable_lightning", False)) and bool(getattr(model.cfg, "enable_crm_self_distill", False)):
+    if (
+        ckpt.get("lightning_distill") is not None
+        and bool(getattr(model.cfg, "enable_lightning", False))
+        and bool(getattr(model.cfg, "enable_crm_self_distill", False))
+        and not needs_hremap
+        and not needs_vremap
+    ):
         from aoba.lightning_explicit import init_lightning_self_distill_state
 
         ck_ld = ckpt["lightning_distill"]
@@ -1225,6 +1251,10 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         model.lightning_distill.grad_updates = int(ck_ld.get("grad_updates", 0))
         model.lightning_distill.ema_loss = float(ck_ld.get("ema_loss", 0.0))
         model.lightning_distill.ema_val_corr = float(ck_ld.get("ema_val_corr", 0.0))
+        if "ema_tea_fl" in ck_ld and model.lightning_distill.ema_tea_fl_gpu is not None:
+            model.lightning_distill.ema_tea_fl_gpu.fill_(float(ck_ld.get("ema_tea_fl", 0.0)))
+        if "ema_stu_fl" in ck_ld and model.lightning_distill.ema_stu_fl_gpu is not None:
+            model.lightning_distill.ema_stu_fl_gpu.fill_(float(ck_ld.get("ema_stu_fl", 0.0)))
 
     # 8. Land carbon & nitrogen pools (supports both cell-level and subgrid pools)
     if ckpt.get("land_carbon") is not None and model.land_carbon is not None:

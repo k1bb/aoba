@@ -2451,8 +2451,8 @@ kernel void explicit_lightning_charge_col(
         float ng_v = 1.0f;
         if (qg_v > 1.0e-7f) {
             float mg = rho_pos * qg_v;
-            ng_v = has_ng ? max(rho_pos * n_g_opt[idx], 1.0f)
-                          : max(4.0e6f * sqrt(sqrt(max(mg / (PI_F * rho_graupel * 4.0e6f) + 1.0e-24f, 1.0e-24f))), 1.0f);
+            float ng_mp = max(4.0e6f * sqrt(sqrt(max(mg / (PI_F * rho_graupel * 4.0e6f) + 1.0e-24f, 1.0e-24f))), 1.0f);
+            ng_v = has_ng ? max(max(rho_pos * n_g_opt[idx], 1.0f), 0.65f * ng_mp) : ng_mp;
             dg = clamp(pow(6.0f * mg / (PI_F * rho_graupel * ng_v) + 1.0e-20f, 1.0f / 3.0f), 2.0e-4f, 1.5e-2f);
             vtg = clamp(94.5f * sqrt(dg) * rho_fac, 0.5f, 12.0f);
         }
@@ -2472,8 +2472,8 @@ kernel void explicit_lightning_charge_col(
             float dq_coll = DQ_MAX * pol * lwc_f * t_gate;
             if (qi_p > 1.0e-7f) {
                 float mi = rho_pos * qi_p;
-                float ni_v = has_ni ? max(rho_pos * n_i_opt[idx], 1.0f)
-                                    : max(1.0e5f * sqrt(max(mi * 1.0e3f, 0.0f)), 1.0f);
+                float ni_mp = max(1.0e5f * sqrt(max(mi * 1.0e3f, 0.0f)), 1.0f);
+                float ni_v = has_ni ? max(max(rho_pos * n_i_opt[idx], 1.0f), 0.65f * ni_mp) : ni_mp;
                 // Hallett-Mossop secondary rime-splintering ice multiplication (-9..-2 C; Mossop, 1976)
                 float w_hm = max(1.0f - fabs(t_c + 5.5f) / 3.5f, 0.0f);
                 float ni_hm = 4.0e4f * w_hm * (lwc / (lwc + 0.10f));
@@ -2486,8 +2486,8 @@ kernel void explicit_lightning_charge_col(
             }
             if (qs_v > 1.0e-6f) {
                 float ms = rho_pos * qs_v;
-                float ns_v = has_ns ? max(rho_pos * n_s_opt[idx], 1.0f)
-                                    : max(3.0e6f * sqrt(sqrt(max(ms / (PI_F * rho_snow * 3.0e6f) + 1.0e-24f, 1.0e-24f))), 1.0f);
+                float ns_mp = max(3.0e6f * sqrt(sqrt(max(ms / (PI_F * rho_snow * 3.0e6f) + 1.0e-24f, 1.0e-24f))), 1.0f);
+                float ns_v = has_ns ? max(max(rho_pos * n_s_opt[idx], 1.0f), 0.65f * ns_mp) : ns_mp;
                 float ds = clamp(pow(6.0f * ms / (PI_F * rho_snow * ns_v) + 1.0e-20f, 1.0f / 3.0f), 1.0e-4f, 6.0e-3f);
                 float vts = clamp(4.84f * sqrt(sqrt(ds)) * rho_fac, 0.2f, 3.0f);
                 float dgs = dg + ds;
@@ -2529,8 +2529,8 @@ kernel void explicit_lightning_charge_col(
                         }
                         if (qs_v > 1.0e-7f) {
                             float ms = rho_pos * qs_v;
-                            float ns_v = has_ns ? max(rho_pos * n_s_opt[idx], 1.0f)
-                                                : max(3.0e6f * sqrt(sqrt(max(ms / (PI_F * rho_snow * 3.0e6f) + 1.0e-24f, 1.0e-24f))), 1.0f);
+                            float ns_mp = max(3.0e6f * sqrt(sqrt(max(ms / (PI_F * rho_snow * 3.0e6f) + 1.0e-24f, 1.0e-24f))), 1.0f);
+                            float ns_v = has_ns ? max(max(rho_pos * n_s_opt[idx], 1.0f), 0.65f * ns_mp) : ns_mp;
                             float ds = clamp(pow(6.0f * ms / (PI_F * rho_snow * ns_v) + 1.0e-20f, 1.0f / 3.0f), 1.0e-4f, 6.0e-3f);
                             vt_k[k] = clamp(4.84f * sqrt(sqrt(ds)) * rho_fac, 0.2f, 3.0f);
                         } else {
