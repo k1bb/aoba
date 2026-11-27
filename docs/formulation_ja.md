@@ -721,16 +721,17 @@ $$
 
 #### 5.6.2 陽的バルク帯電・放電スキーム (`lightning_scheme = "explicit_bulk"`, `src/aoba/lightning_explicit.py`)
 
-`explicit_bulk` モードでは、2D/3D CRM 格子上で 5 種の凝結水物質 $s \in \{c, r, i, s_{\mathrm{nw}}, g\}$ の体積電荷密度 $\rho_{q,s}\ [\mathrm{C\ m^{-3}}]$ を陽的に予報する。霰と雲氷・雪の反発衝突に伴う 1 衝突当たりの霰側移動電荷量 $\delta q_{\mathrm{coll}}(T, \mathrm{LWC})$ は、$-40^\circ\mathrm{C} < T_C < 0^\circ\mathrm{C}$ の過冷却混合相領域でのみ活性となる平滑な Takahashi (1978) / Sato et al. (2019) 極性反転則で与える（$\delta q_{\max} = 2.5\times 10^{-14}\ \mathrm{C}$、雲水量 $\mathrm{LWC} = 10^3\rho_d q_c\ [\mathrm{g\ m^{-3}}]$）：
+`explicit_bulk` モードでは、2D/3D CRM 格子上で 5 種の凝結水物質 $s \in \{c, r, i, s_{\mathrm{nw}}, g\}$ の体積電荷密度 $\rho_{q,s}\ [\mathrm{C\ m^{-3}}]$ を陽的に予報する。対流コア基準スケール $\Delta x_{\mathrm{ref}} = 500\ \mathrm{m}$ を超える水平格子幅 $\Delta x_{\mathrm{eff}} = \max(\sqrt{\Delta x\,\Delta y}, \Delta x_{\mathrm{ref}})$ では上昇流コアの過冷却雲水が格子平均で希釈されるため、着氷衝突にはコア雲水量 $\mathrm{LWC}_{\mathrm{core}} = 10^3\rho_d q_c \sqrt{\Delta x_{\mathrm{eff}}/\Delta x_{\mathrm{ref}}}\ [\mathrm{g\ m^{-3}}]$ を用いる。霰と雲氷・雪の反発衝突に伴う 1 衝突当たりの霰側移動電荷量 $\delta q_{\mathrm{coll}}(T, \mathrm{LWC}_{\mathrm{core}})$ は、$-40^\circ\mathrm{C} < T_C < 0^\circ\mathrm{C}$ の過冷却混合相領域でのみ活性となる平滑な Takahashi (1978) / Sato et al. (2019) 極性反転則で与え（$\delta q_{\max} = 2.5\times 10^{-14}\ \mathrm{C}$）、さらに $-9^\circ\mathrm{C} < T_C < -2^\circ\mathrm{C}$ の着氷帯では Hallett–Mossop 二次氷晶破砕増殖 $N_{i,\mathrm{HM}}$ を考慮する：
 
 $$
 \begin{aligned}
-T_{\mathrm{rev}}(\mathrm{LWC}) &= -10.0 - 10.0\,\tanh\!\big(0.65(\mathrm{LWC} - 0.55)\big), \\
-\delta q_{\mathrm{coll}} &= \delta q_{\max}\,\tanh\!\left(\frac{T_C - T_{\mathrm{rev}}}{4.0}\right)\frac{\mathrm{LWC}}{\mathrm{LWC} + 0.15}\,\sigma\!\left(\frac{T_C + 40}{3.0}\right)\sigma\!\left(-\frac{T_C}{1.5}\right)\,\mathbf{1}_{T_C < 0}
+T_{\mathrm{rev}}(\mathrm{LWC}_{\mathrm{core}}) &= -10.0 - 10.0\,\tanh\!\big(0.65(\mathrm{LWC}_{\mathrm{core}} - 0.55)\big), \\
+\delta q_{\mathrm{coll}} &= \delta q_{\max}\,\tanh\!\left(\frac{T_C - T_{\mathrm{rev}}}{4.0}\right)\frac{\mathrm{LWC}_{\mathrm{core}}}{\mathrm{LWC}_{\mathrm{core}} + 0.15}\,\sigma\!\left(\frac{T_C + 40}{3.0}\right)\sigma\!\left(-\frac{T_C}{1.5}\right)\,\mathbf{1}_{T_C < 0}, \\
+N_{i,\mathrm{eff}} &= \max\!\left(N_i,\ 4.0\times 10^4\,\max\!\left(1 - \frac{|T_C + 5.5|}{3.5},\ 0\right)\frac{\mathrm{LWC}_{\mathrm{core}}}{\mathrm{LWC}_{\mathrm{core}} + 0.10}\right)
 \end{aligned} \tag{5.19}
 $$
 
-ここで $\sigma(x) = (1 + e^{-x})^{-1}$ はロジスティックゲート関数である。重力捕捉衝突頻度 $R_{gi}, R_{gs}$（反発割合 $\alpha_{\mathrm{reb}} = 0.90$）により厳密ゼロ和の電荷分離（$\Delta\rho_{q,g} = -(\Delta\rho_{q,i} + \Delta\rho_{q,s})$）を行ったのち、全 5 種の電荷密度に対し保存的周期水平ドナーセル移流、終端落下速度 $v_{t,s}$ を含む無条件安定な陰的鉛直移流・沈降、$0^\circ\mathrm{C}$ 以上での霰・雪から雨への融解電荷移行、および晴天イオン導電緩和（$\tau_{\mathrm{ion}} = 600\ \mathrm{s}$; Chiu, 1978）を積分する：
+ここで $\sigma(x) = (1 + e^{-x})^{-1}$ はロジスティックゲート関数である。重力捕捉衝突頻度 $R_{gi}, R_{gs}$（反発割合 $\alpha_{\mathrm{reb}} = 0.90$）による厳密ゼロ和の電荷分離（$\Delta\rho_{q,g} = -(\Delta\rho_{q,i} + \Delta\rho_{q,s})$）は、晴天イオン導電緩和（$\tau_{\mathrm{ion}} = 600\ \mathrm{s}$; Chiu, 1978）との厳密連続指数積分 $\Delta t_{\mathrm{chg}} = \tau_{\mathrm{ion}}(1 - e^{-\Delta t / \tau_{\mathrm{ion}}})$ で与え、全 5 種の電荷密度に対し保存的周期水平ドナーセル移流、終端落下速度 $v_{t,s}$ を含む無条件安定な陰的鉛直移流・沈降、$0^\circ\mathrm{C}$ 以上での霰・雪から雨への融解電荷移行、および無水物質層での乾燥漏洩緩和（$\tau_{\mathrm{dry}} = 300\ \mathrm{s}$）を結合する：
 
 $$
 \begin{aligned}
@@ -748,20 +749,21 @@ $$
 \end{aligned} \tag{5.21}
 $$
 
-CRM コラム内の最大電場強度 $|\mathbf{E}|$ が空気密度スケーリングされた絶縁破壊閾値 $E_{\mathrm{crit}} = E_{\mathrm{crit},0}(\rho_d/\rho_0)$（$E_{\mathrm{crit},0} = 120\ \mathrm{kV\ m^{-1}}$; Dwyer, 2003; Sato et al., 2019）を超過すると、$|\mathbf{E}| \ge 0.30\,E_{\mathrm{crit}}$ を満たす放電路（Fierro et al., 2013）内で局所電荷の割合 $f_{\mathrm{neut}} = \min(0.30\min(\max(|\mathbf{E}|/E_{\mathrm{crit}}), 3), 0.80)$ を中和する。純粋な雲内放電（IC）では放電路体積平均の電荷不均衡を $|\rho_{q,s}|$ 比例で差し引き、総空間電荷保存を厳密に保つ：
+CRM コラム内の最大電場強度 $|\mathbf{E}|$ が空気密度および格子解像度でスケーリングされた絶縁破壊閾値 $E_{\mathrm{crit}}$（$\Delta x_{\mathrm{ref}} = 500\ \mathrm{m}$ で $E_{\mathrm{crit},0} = 120\ \mathrm{kV\ m^{-1}}$; Dwyer, 2003; Sato et al., 2019）を超過すると、$|\mathbf{E}| \ge 0.30\,E_{\mathrm{crit}}$ を満たす放電路（Fierro et al., 2013）内で局所電荷の割合 $f_{\mathrm{neut}} = \min(0.30\min(\max(|\mathbf{E}|/E_{\mathrm{crit}}), 3), 0.80)$ を中和する。純粋な雲内放電（IC）では放電路体積平均の電荷不均衡を $|\rho_{q,s}|$ 比例で差し引き、総空間電荷保存を厳密に保つ：
 
 $$
 \begin{aligned}
-E_{\mathrm{crit}} &= E_{\mathrm{crit},0}\,\max\!\left(\frac{\rho_d}{\rho_0},\ 0.05\right), \\
+E_{\mathrm{crit}} &= E_{\mathrm{crit},0}\left(\frac{\Delta x_{\mathrm{ref}}}{\Delta x_{\mathrm{eff}}}\right)^{0.75}\max\!\left(\frac{\rho_d}{\rho_0},\ 0.05\right), \\
 \Delta\rho_{q,s}^{\mathrm{neut}} &= -f_{\mathrm{neut}}\,\rho_{q,s} - \mathbf{1}_{\mathrm{IC}}\,\frac{|\rho_{q,s}|}{\sum_{s'}|\rho_{q,s'}|}\,\overline{\Delta\rho_q^{\mathrm{raw}}}_{\mathrm{chan}}
 \end{aligned} \tag{5.22}
 $$
 
-放電路が対地高度 $3.5\ \mathrm{km}$ 以下に達するか地表鉛直電場が $|E_z(z_0)| \ge 0.25\,E_{\mathrm{crit}}(z_0)$ を満たす放電を対地雷（CG）と分類する。サブコラム全発雷頻度密度 $\mathcal{F}_{\mathrm{tot}}$ は中和された双極子電荷量（$Q_{\mathrm{flash}} = 15\ \mathrm{C\ flash^{-1}}$; Rakov & Uman, 2003）から診断し、診断型と同一の Schumann & Huntrieser (2007) 質量保存型 $\mathrm{LNO}_x$ 窒素沈着フラックスへ接続する：
+放電路が対地高度 $z_{\mathrm{cg,max}} = 3.5\ \mathrm{km}$ 以下に達するか地表鉛直電場が $|E_z(z_0)| \ge 0.25\,E_{\mathrm{crit}}(z_0)$ を満たす場合、対地雷割合 $f_{\mathrm{CG}}$ は下層（$z \le z_{\mathrm{cg,max}}$）と全層における正規化静電場エネルギーの比から連続的に決まる。サブコラム全発雷頻度密度 $\mathcal{F}_{\mathrm{tot}}$ は中和された双極子電荷量（$Q_{\mathrm{flash}} = 15\ \mathrm{C\ flash^{-1}}$; Rakov & Uman, 2003）から診断し、診断型と同一の Schumann & Huntrieser (2007) 質量保存型 $\mathrm{LNO}_x$ 窒素沈着フラックスへ接続する：
 
 $$
 \begin{aligned}
 \mathcal{F}_{\mathrm{tot}} &= \frac{1}{2\,Q_{\mathrm{flash}}\,\Delta t}\int_0^{z_{\mathrm{top}}} \left|\sum_s \Delta\rho_{q,s}^{\mathrm{neut}}\right|\,dz\ [\mathrm{flashes\ m^{-2}\ s^{-1}}], \\
+f_{\mathrm{CG}} &= \mathbf{1}_{\mathrm{ground\text{-}link}}\,\mathrm{clamp}\!\left(\frac{\int_0^{z_{\mathrm{cg,max}}}(|\mathbf{E}|/E_{\mathrm{crit}})^2\,dz}{\int_0^{z_{\mathrm{top}}}(|\mathbf{E}|/E_{\mathrm{crit}})^2\,dz},\ 0.05,\ 0.80\right), \\
 D_{\mathrm{N,LNOx}} &= 0.50\,Y_{\mathrm{N}}\mathcal{F}_{\mathrm{tot}} + 0.50\,\overline{Y_{\mathrm{N}}\mathcal{F}_{\mathrm{tot}}}_{\mathrm{glob}}
 \end{aligned} \tag{5.23}
 $$

@@ -721,16 +721,17 @@ $$
 
 #### 5.6.2 Explicit Bulk Cloud Electrification & Discharge Scheme (`lightning_scheme = "explicit_bulk"`, `src/aoba/lightning_explicit.py`)
 
-In `explicit_bulk` mode, volumetric electric charge densities $\rho_{q,s}\ [\mathrm{C\ m^{-3}}]$ are prognosed across five condensed hydrometeor species $s \in \{c, r, i, s_{\mathrm{nw}}, g\}$ on the 2D/3D CRM mesh. Rebounding graupel–ice and graupel–snow collisions transfer charge $\delta q_{\mathrm{coll}}(T, \mathrm{LWC})$ to graupel following a smooth Takahashi (1978) / Sato et al. (2019) polarity-reversal law active within $-40^\circ\mathrm{C} < T_C < 0^\circ\mathrm{C}$ ($\delta q_{\max} = 2.5\times 10^{-14}\ \mathrm{C}$, liquid water content $\mathrm{LWC} = 10^3\rho_d q_c\ [\mathrm{g\ m^{-3}}]$):
+In `explicit_bulk` mode, volumetric electric charge densities $\rho_{q,s}\ [\mathrm{C\ m^{-3}}]$ are prognosed across five condensed hydrometeor species $s \in \{c, r, i, s_{\mathrm{nw}}, g\}$ on the 2D/3D CRM mesh. Because horizontal grid spacing $\Delta x_{\mathrm{eff}} = \max(\sqrt{\Delta x\,\Delta y}, \Delta x_{\mathrm{ref}})$ above the convective-core reference scale $\Delta x_{\mathrm{ref}} = 500\ \mathrm{m}$ dilutes subgrid updraft liquid water, riming collisions evaluate the core liquid water content $\mathrm{LWC}_{\mathrm{core}} = 10^3\rho_d q_c \sqrt{\Delta x_{\mathrm{eff}}/\Delta x_{\mathrm{ref}}}\ [\mathrm{g\ m^{-3}}]$. Rebounding graupel–ice and graupel–snow collisions transfer charge $\delta q_{\mathrm{coll}}(T, \mathrm{LWC}_{\mathrm{core}})$ to graupel following a smooth Takahashi (1978) / Sato et al. (2019) polarity-reversal law active within $-40^\circ\mathrm{C} < T_C < 0^\circ\mathrm{C}$ ($\delta q_{\max} = 2.5\times 10^{-14}\ \mathrm{C}$), supplemented by Hallett–Mossop secondary rime-splintering ice concentration $N_{i,\mathrm{HM}}$ inside $-9^\circ\mathrm{C} < T_C < -2^\circ\mathrm{C}$ active riming zones:
 
 $$
 \begin{aligned}
-T_{\mathrm{rev}}(\mathrm{LWC}) &= -10.0 - 10.0\,\tanh\!\big(0.65(\mathrm{LWC} - 0.55)\big), \\
-\delta q_{\mathrm{coll}} &= \delta q_{\max}\,\tanh\!\left(\frac{T_C - T_{\mathrm{rev}}}{4.0}\right)\frac{\mathrm{LWC}}{\mathrm{LWC} + 0.15}\,\sigma\!\left(\frac{T_C + 40}{3.0}\right)\sigma\!\left(-\frac{T_C}{1.5}\right)\,\mathbf{1}_{T_C < 0}
+T_{\mathrm{rev}}(\mathrm{LWC}_{\mathrm{core}}) &= -10.0 - 10.0\,\tanh\!\big(0.65(\mathrm{LWC}_{\mathrm{core}} - 0.55)\big), \\
+\delta q_{\mathrm{coll}} &= \delta q_{\max}\,\tanh\!\left(\frac{T_C - T_{\mathrm{rev}}}{4.0}\right)\frac{\mathrm{LWC}_{\mathrm{core}}}{\mathrm{LWC}_{\mathrm{core}} + 0.15}\,\sigma\!\left(\frac{T_C + 40}{3.0}\right)\sigma\!\left(-\frac{T_C}{1.5}\right)\,\mathbf{1}_{T_C < 0}, \\
+N_{i,\mathrm{eff}} &= \max\!\left(N_i,\ 4.0\times 10^4\,\max\!\left(1 - \frac{|T_C + 5.5|}{3.5},\ 0\right)\frac{\mathrm{LWC}_{\mathrm{core}}}{\mathrm{LWC}_{\mathrm{core}} + 0.10}\right)
 \end{aligned} \tag{5.19}
 $$
 
-where $\sigma(x) = (1 + e^{-x})^{-1}$ is the logistic gate. Gravitational sweep-out collision rates $R_{gi}, R_{gs}$ (rebound fraction $\alpha_{\mathrm{reb}} = 0.90$) generate strict zero-sum charge separation ($\Delta\rho_{q,g} = -(\Delta\rho_{q,i} + \Delta\rho_{q,s})$), after which all five charge species undergo conservative periodic horizontal donor-cell advection, unconditionally stable implicit vertical advection–sedimentation with terminal fall speeds $v_{t,s}$, melting transfer from graupel/snow to rain above $0^\circ\mathrm{C}$, and exponential fair-weather ionic relaxation ($\tau_{\mathrm{ion}} = 600\ \mathrm{s}$; Chiu, 1978):
+where $\sigma(x) = (1 + e^{-x})^{-1}$ is the logistic gate. Gravitational sweep-out collision rates $R_{gi}, R_{gs}$ (rebound fraction $\alpha_{\mathrm{reb}} = 0.90$) generate strict zero-sum charge separation ($\Delta\rho_{q,g} = -(\Delta\rho_{q,i} + \Delta\rho_{q,s})$) integrated with exact continuous exponential source–decay duration $\Delta t_{\mathrm{chg}} = \tau_{\mathrm{ion}}(1 - e^{-\Delta t / \tau_{\mathrm{ion}}})$ ($\tau_{\mathrm{ion}} = 600\ \mathrm{s}$; Chiu, 1978), coupled to conservative periodic horizontal donor-cell advection, unconditionally stable implicit vertical advection–sedimentation with terminal fall speeds $v_{t,s}$, melting transfer from graupel/snow to rain above $0^\circ\mathrm{C}$, and dry-air leakage ($\tau_{\mathrm{dry}} = 300\ \mathrm{s}$):
 
 $$
 \begin{aligned}
@@ -748,20 +749,21 @@ $$
 \end{aligned} \tag{5.21}
 $$
 
-Whenever peak $|\mathbf{E}|$ in a CRM column exceeds the density-scaled runaway-breakdown threshold $E_{\mathrm{crit}} = E_{\mathrm{crit},0}(\rho_d/\rho_0)$ ($E_{\mathrm{crit},0} = 120\ \mathrm{kV\ m^{-1}}$; Dwyer, 2003; Sato et al., 2019), a discharge channel spans all connected grid volumes with $|\mathbf{E}| \ge 0.30\,E_{\mathrm{crit}}$ (Fierro et al., 2013), neutralizing fraction $f_{\mathrm{neut}} = \min(0.30\min(\max(|\mathbf{E}|/E_{\mathrm{crit}}), 3), 0.80)$ of local charge. Pure intracloud (IC) discharges remove the channel-mean charge imbalance proportionally to $|\rho_{q,s}|$ so net space charge is conserved identically:
+Whenever peak $|\mathbf{E}|$ in a CRM column exceeds the density- and resolution-scaled runaway-breakdown threshold $E_{\mathrm{crit}}$ ($E_{\mathrm{crit},0} = 120\ \mathrm{kV\ m^{-1}}$ at $\Delta x_{\mathrm{ref}} = 500\ \mathrm{m}$; Dwyer, 2003; Sato et al., 2019), a discharge channel spans all connected grid volumes with $|\mathbf{E}| \ge 0.30\,E_{\mathrm{crit}}$ (Fierro et al., 2013), neutralizing fraction $f_{\mathrm{neut}} = \min(0.30\min(\max(|\mathbf{E}|/E_{\mathrm{crit}}), 3), 0.80)$ of local charge. Pure intracloud (IC) discharges remove the channel-mean charge imbalance proportionally to $|\rho_{q,s}|$ so net space charge is conserved identically:
 
 $$
 \begin{aligned}
-E_{\mathrm{crit}} &= E_{\mathrm{crit},0}\,\max\!\left(\frac{\rho_d}{\rho_0},\ 0.05\right), \\
+E_{\mathrm{crit}} &= E_{\mathrm{crit},0}\left(\frac{\Delta x_{\mathrm{ref}}}{\Delta x_{\mathrm{eff}}}\right)^{0.75}\max\!\left(\frac{\rho_d}{\rho_0},\ 0.05\right), \\
 \Delta\rho_{q,s}^{\mathrm{neut}} &= -f_{\mathrm{neut}}\,\rho_{q,s} - \mathbf{1}_{\mathrm{IC}}\,\frac{|\rho_{q,s}|}{\sum_{s'}|\rho_{q,s'}|}\,\overline{\Delta\rho_q^{\mathrm{raw}}}_{\mathrm{chan}}
 \end{aligned} \tag{5.22}
 $$
 
-Discharges whose breakdown channel extends below $3.5\ \mathrm{km}$ AGL or induces surface vertical field $|E_z(z_0)| \ge 0.25\,E_{\mathrm{crit}}(z_0)$ are classified as cloud-to-ground (CG) flashes. Subcolumn total flash-rate density $\mathcal{F}_{\mathrm{tot}}$ follows from the neutralized bipolar charge magnitude ($Q_{\mathrm{flash}} = 15\ \mathrm{C\ flash^{-1}}$; Rakov & Uman, 2003), feeding the same Schumann & Huntrieser (2007) mass-conserving $\mathrm{LNO}_x$ deposition flux:
+When a triggered discharge channel extends below $z_{\mathrm{cg,max}} = 3.5\ \mathrm{km}$ AGL or induces surface vertical field $|E_z(z_0)| \ge 0.25\,E_{\mathrm{crit}}(z_0)$, its cloud-to-ground (CG) fraction $f_{\mathrm{CG}}$ is determined continuously from the ratio of lower-column ($z \le z_{\mathrm{cg,max}}$) to full-column breakdown-normalized electrostatic field energy. Subcolumn total flash-rate density $\mathcal{F}_{\mathrm{tot}}$ follows from the neutralized bipolar charge magnitude ($Q_{\mathrm{flash}} = 15\ \mathrm{C\ flash^{-1}}$; Rakov & Uman, 2003), feeding the same Schumann & Huntrieser (2007) mass-conserving $\mathrm{LNO}_x$ deposition flux:
 
 $$
 \begin{aligned}
 \mathcal{F}_{\mathrm{tot}} &= \frac{1}{2\,Q_{\mathrm{flash}}\,\Delta t}\int_0^{z_{\mathrm{top}}} \left|\sum_s \Delta\rho_{q,s}^{\mathrm{neut}}\right|\,dz\ [\mathrm{flashes\ m^{-2}\ s^{-1}}], \\
+f_{\mathrm{CG}} &= \mathbf{1}_{\mathrm{ground\text{-}link}}\,\mathrm{clamp}\!\left(\frac{\int_0^{z_{\mathrm{cg,max}}}(|\mathbf{E}|/E_{\mathrm{crit}})^2\,dz}{\int_0^{z_{\mathrm{top}}}(|\mathbf{E}|/E_{\mathrm{crit}})^2\,dz},\ 0.05,\ 0.80\right), \\
 D_{\mathrm{N,LNOx}} &= 0.50\,Y_{\mathrm{N}}\mathcal{F}_{\mathrm{tot}} + 0.50\,\overline{Y_{\mathrm{N}}\mathcal{F}_{\mathrm{tot}}}_{\mathrm{glob}}
 \end{aligned} \tag{5.23}
 $$

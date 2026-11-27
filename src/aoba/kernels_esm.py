@@ -2385,8 +2385,13 @@ kernel void explicit_lightning_charge_col(
     const float DQ_MAX = 2.5e-14f;
     const float REBOUND_GI = 0.90f;
     const float Q_CLAMP = 5.0e-8f;
-    float decay_ion = exp(-dt / 600.0f);
-    float decay_dry = exp(-dt / 60.0f);
+    const float TAU_ION = 600.0f;
+    const float DX_CORE_REF = 500.0f;
+    float dx_eff = max(sqrt(dx * dy), DX_CORE_REF);
+    float lwc_scale = sqrt(dx_eff / DX_CORE_REF);
+    float decay_ion = exp(-dt / TAU_ION);
+    float dt_chg = TAU_ION * (-esm_expm1(-dt / TAU_ION));
+    float decay_dry = exp(-dt / 300.0f);
     float melt_time_fac = 1.0f - exp(-dt / 180.0f);
     float cfl_lim = (has_u && has_v) ? 0.225f : 0.45f;
     float c_max_x = cfl_lim * dx / max(dt, 1.0e-3f);
@@ -2458,7 +2463,7 @@ kernel void explicit_lightning_charge_col(
         float dq_i = 0.0f;
         float dq_s = 0.0f;
         if (t_c < 0.0f && qg_v > 1.0e-6f && qc_p > 0.0f && (qi_p > 1.0e-7f || qs_v > 1.0e-6f)) {
-            float lwc = 1.0e3f * rho_pos * qc_p;
+            float lwc = 1.0e3f * rho_pos * qc_p * lwc_scale;
             float t_rev = -10.0f - 10.0f * tanh(0.65f * (lwc - 0.55f));
             float pol = tanh((t_c - t_rev) * 0.25f);
             float lwc_f = lwc / (lwc + 0.15f);
@@ -2468,11 +2473,15 @@ kernel void explicit_lightning_charge_col(
                 float mi = rho_pos * qi_p;
                 float ni_v = has_ni ? max(rho_pos * n_i_opt[idx], 1.0f)
                                     : max(1.0e5f * sqrt(max(mi * 1.0e3f, 0.0f)), 1.0f);
+                // Hallett-Mossop secondary rime-splintering ice multiplication (-9..-2 C; Mossop, 1976)
+                float w_hm = max(1.0f - fabs(t_c + 5.5f) / 3.5f, 0.0f);
+                float ni_hm = 4.0e4f * w_hm * (lwc / (lwc + 0.10f));
+                ni_v = max(ni_v, ni_hm);
                 float di = clamp(pow(6.0f * mi / (PI_F * RHO_CLOUD_ICE * ni_v) + 1.0e-20f, 1.0f / 3.0f), 2.0e-5f, 5.0e-4f);
                 float vti = clamp(0.45f * rho_fac, 0.05f, 1.5f);
                 float dgi = dg + di;
                 float r_gi = REBOUND_GI * (0.25f * PI_F) * (dgi * dgi) * fabs(vtg - vti) * ng_v * ni_v;
-                dq_i = clamp(-dt * r_gi * dq_coll, -Q_CLAMP, Q_CLAMP);
+                dq_i = clamp(-dt_chg * r_gi * dq_coll, -Q_CLAMP, Q_CLAMP);
             }
             if (qs_v > 1.0e-6f) {
                 float ms = rho_pos * qs_v;
@@ -2482,7 +2491,7 @@ kernel void explicit_lightning_charge_col(
                 float vts = clamp(4.84f * sqrt(sqrt(ds)) * rho_fac, 0.2f, 3.0f);
                 float dgs = dg + ds;
                 float r_gs = REBOUND_GI * (0.25f * PI_F) * (dgs * dgs) * fabs(vtg - vts) * ng_v * ns_v;
-                dq_s = clamp(-dt * r_gs * dq_coll, -Q_CLAMP, Q_CLAMP);
+                dq_s = clamp(-dt_chg * r_gs * dq_coll, -Q_CLAMP, Q_CLAMP);
             }
         }
         dq_i_arr[k] = dq_i;
@@ -2577,7 +2586,8 @@ kernel void explicit_lightning_charge_col(
                 q_val -= dt_over_dy * (fy_u - fy_d);
             }
 
-            // Add strict zero-sum non-inductive charge separation
+            // Exact exponential decay on pre-existing charge + continuous integrated non-inductive separation
+            q_val *= decay_ion;
             if (s == 2u) q_val += dq_i_arr[k];
             else if (s == 3u) q_val += dq_s_arr[k];
             else if (s == 4u) q_val -= (dq_i_arr[k] + dq_s_arr[k]);
@@ -2645,7 +2655,7 @@ kernel void explicit_lightning_charge_col(
                     qm = (s == 4u) ? (f_ice_p * qp_p * f_graup) : (f_ice_p * qp_p * (1.0f - f_graup));
                 }
             }
-            float decay = (qm > 1.0e-8f) ? decay_ion : decay_dry;
+            float decay = (qm > 1.0e-8f) ? 1.0f : decay_dry;
             q_new = clamp(q_new * decay, -Q_CLAMP, Q_CLAMP);
             q_chg_out[s_off + k * M + col] = q_new;
             rho_sum[k] += q_new;
@@ -2934,14 +2944,20 @@ kernel void explicit_lightning_discharge_grp(
         float ec0 = max(e_crit_sl * max(rho0 / RHO_AIR_REF, 0.05f), 1.0f);
         bool is_cg_sub = (fabs(e_z_out[0u * M + col]) / ec0 >= 0.25f);
         float dq_abs_col_dz = 0.0f;
+        float w_cg_e = 0.0f;
+        float w_tot_e = 0.0f;
 
         for (uint k = 0u; k < nz; ++k) {
             uint idx = k * M + col;
             float rho_pos = max(rho_d[idx], 1.0e-4f);
             float e_crit = e_crit_sl * max(rho_pos / RHO_AIR_REF, 0.05f);
+            float dz_k = max(dz_c[k * z_cols + zc_col], 1.0f);
+            float z_agl = z_c[k * z_cols + zc_col] - z0 + 0.5f * dz0;
+            float er_k = e_mag_out[idx] / max(e_crit, 1.0f);
+            float e2_dz = (er_k * er_k) * dz_k;
+            w_tot_e += e2_dz;
+            if (z_agl <= z_cg_max) w_cg_e += e2_dz;
             if (e_mag_out[idx] >= ext_frac * e_crit) {
-                float dz_k = max(dz_c[k * z_cols + zc_col], 1.0f);
-                float z_agl = z_c[k * z_cols + zc_col] - z0 + 0.5f * dz0;
                 if (z_agl <= z_cg_max) is_cg_sub = true;
 
                 float qv5[5];
@@ -2964,7 +2980,9 @@ kernel void explicit_lightning_discharge_grp(
         }
 
         float flash_tot = (0.5f * dq_abs_col_dz) / (q_per_flash * dt);
-        float f_cg = (flash_tot > 0.0f && is_cg_sub) ? 1.0f : 0.0f;
+        float f_cg = (flash_tot > 0.0f && is_cg_sub)
+            ? clamp(w_cg_e / max(w_tot_e, 1.0e-12f), 0.05f, 0.80f)
+            : 0.0f;
         flash_tot_out[col] = flash_tot;
         f_cg_out[col] = f_cg;
         flash_cg_out[col] = flash_tot * f_cg;

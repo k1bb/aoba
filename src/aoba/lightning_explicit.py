@@ -384,6 +384,12 @@ def step_explicit_bulk_lightning_and_lnox(
     dy_m = max(float(dx if dy is None else dy), 1.0)
     dt_s = max(float(dt), 1.0)
 
+    # Resolution-aware subgrid convective core peaking (DX_CORE_REF = 500 m; Fierro 2013; Sato 2019):
+    # horizontal grid spacing dx > 500 m dilutes peak convective core LWC and resolved |E| across the box.
+    dx_eff = max(math.sqrt(dx_m * dy_m), 500.0)
+    e_crit_sl_eff = E_CRIT_SEA_LEVEL * ((500.0 / dx_eff) ** 0.75)
+    lwc_scale = math.sqrt(dx_eff / 500.0)
+
     # Fast fused Metal/CUDA 3-kernel path (MPS & CUDA, float32, nz <= 128, zero mid-step sync)
     if (
         dev.type in ("mps", "cuda")
@@ -428,7 +434,7 @@ def step_explicit_bulk_lightning_and_lnox(
                     t0_graupel=T0_GRAUPEL,
                     t00_graupel=T00_GRAUPEL,
                     eps0=EPSILON_0,
-                    e_crit_sl=E_CRIT_SEA_LEVEL,
+                    e_crit_sl=e_crit_sl_eff,
                     extent_frac=E_DISCHARGE_EXTENT_FRAC,
                     neut_frac=DISCHARGE_NEUT_FRAC,
                     q_per_flash=Q_CHARGE_PER_FLASH_C,
@@ -490,11 +496,16 @@ def step_explicit_bulk_lightning_and_lnox(
 
     rho_fac = torch.pow(RHO_AIR_REF / rho_pos, 0.5)
 
-    # Cloud ice
+    # Cloud ice (with Hallett-Mossop secondary rime-splintering in -9..-2 C active riming cores)
+    lwc_g_m3 = 1.0e3 * rho_pos * q_c_pos * lwc_scale
+    t_c = temp - C.T_FREEZE
     if n_i_prog is not None:
         n_i_v = torch.clamp(rho_pos * n_i_prog, min=1.0)
     else:
         n_i_v = torch.clamp(1.0e5 * torch.pow(torch.clamp(m_i * 1.0e3, min=0.0), 0.5), min=1.0)
+    w_hm = torch.clamp(1.0 - torch.abs(t_c + 5.5) / 3.5, min=0.0)
+    n_i_hm = 4.0e4 * w_hm * (lwc_g_m3 / (lwc_g_m3 + 0.10)) * ((q_g > 1.0e-6) & (q_c_pos > 0.0) & (t_c < 0.0)).to(dtype)
+    n_i_v = torch.maximum(n_i_v, n_i_hm)
     d_i = torch.clamp(torch.pow(6.0 * m_i / (math.pi * RHO_CLOUD_ICE * n_i_v) + 1.0e-20, 1.0 / 3.0), 2.0e-5, 5.0e-4)
     vt_i = torch.where(q_i_pos > 1.0e-7, torch.clamp(0.45 * rho_fac, 0.05, 1.5), torch.zeros_like(q_i_pos))
 
@@ -521,23 +532,27 @@ def step_explicit_bulk_lightning_and_lnox(
 
     # 3. Non-inductive riming electrification (Takahashi, 1978; Sato et al., 2019, Sec. 2.1)
     #    Strict zero-sum transfer: d(rho_q_g) + d(rho_q_i) + d(rho_q_s) == 0 identically!
-    lwc_g_m3 = 1.0e3 * rho_pos * q_c_pos
     dq_coll = takahashi_charge_per_collision(temp, lwc_g_m3)  # [C per collision]
 
     active_g = (q_g > 1.0e-6).to(dtype)
     active_i = (q_i_pos > 1.0e-7).to(dtype)
     active_s = (q_s > 1.0e-6).to(dtype)
 
+    # Exact continuous exponential source-decay integration over dt (eliminates large-dt split bias)
+    decay_ion = math.exp(-dt_s / TAU_ION_RELAX_S)
+    dt_chg = TAU_ION_RELAX_S * (-math.expm1(-dt_s / TAU_ION_RELAX_S))
+    decay_dry = math.exp(-dt_s / 300.0)
+
     # Gravitational sweep-out collision kernels [collisions m^-3 s^-1]
     r_gi = REBOUND_FRAC_GI * (0.25 * math.pi) * ((d_g + d_i) ** 2) * torch.abs(vt_g - vt_i) * n_g_v * n_i_v * active_g * active_i
     r_gs = REBOUND_FRAC_GI * (0.25 * math.pi) * ((d_g + d_s) ** 2) * torch.abs(vt_g - vt_s) * n_g_v * n_s_v * active_g * active_s
 
-    dq_i_sep = torch.clamp(-dt_s * r_gi * dq_coll, -Q_CHG_CLAMP_C_M3, Q_CHG_CLAMP_C_M3)
-    dq_s_sep = torch.clamp(-dt_s * r_gs * dq_coll, -Q_CHG_CLAMP_C_M3, Q_CHG_CLAMP_C_M3)
+    dq_i_sep = torch.clamp(-dt_chg * r_gi * dq_coll, -Q_CHG_CLAMP_C_M3, Q_CHG_CLAMP_C_M3)
+    dq_s_sep = torch.clamp(-dt_chg * r_gs * dq_coll, -Q_CHG_CLAMP_C_M3, Q_CHG_CLAMP_C_M3)
     dq_g_sep = -(dq_i_sep + dq_s_sep)  # exact conservation of zero net charge creation!
 
     # 3b. Simultaneous conservative periodic horizontal donor-cell advection before charging + vertical sweep
-    q_chg = _advect_horizontal_charges(state.q_chg, u_stag, v_stag, dx_m, dy_m, dt_s)
+    q_chg = _advect_horizontal_charges(state.q_chg, u_stag, v_stag, dx_m, dy_m, dt_s) * decay_ion
     q_chg[2] = q_chg[2] + dq_i_sep
     q_chg[3] = q_chg[3] + dq_s_sep
     q_chg[4] = q_chg[4] + dq_g_sep
@@ -546,7 +561,7 @@ def step_explicit_bulk_lightning_and_lnox(
     vt_5 = torch.stack([vt_c, vt_r, vt_i, vt_s, vt_g], dim=0)
     q_chg = _sediment_vertical_charges(q_chg, w_stag, vt_5, dz_c, dt_s)
 
-    # 5. Melting / complete-evaporation transfer & exact exponential ionic relaxation (Chiu, 1978)
+    # 5. Melting / complete-evaporation transfer & dry-air ionic leakage (Chiu, 1978)
     #    Melting graupel/snow above 0 C transfers charge into rain; absent hydrometeors neutralize
     melt_frac = torch.clamp((temp - C.T_FREEZE) / 3.0, 0.0, 1.0) * (1.0 - math.exp(-dt_s / 180.0))
     q_chg[1] = q_chg[1] + melt_frac * (q_chg[3] + q_chg[4])
@@ -555,17 +570,15 @@ def step_explicit_bulk_lightning_and_lnox(
 
     q_mass_5 = torch.stack([q_c_pos, q_r, q_i_pos, q_s, q_g], dim=0)
     has_hydro = (q_mass_5 > 1.0e-8).to(dtype)
-    decay_ion = math.exp(-dt_s / TAU_ION_RELAX_S)
-    decay_dry = math.exp(-dt_s / 60.0)
-    q_chg = torch.clamp(q_chg * (has_hydro * decay_ion + (1.0 - has_hydro) * decay_dry), -Q_CHG_CLAMP_C_M3, Q_CHG_CLAMP_C_M3)
+    q_chg = torch.clamp(q_chg * (has_hydro + (1.0 - has_hydro) * decay_dry), -Q_CHG_CLAMP_C_M3, Q_CHG_CLAMP_C_M3)
 
     # 6. Solve exact 2D/3D Poisson equation for electric potential & 3D electric field
     rho_q_tot = q_chg.sum(dim=0)
     phi_e, e_x, e_y, e_z = solve_electric_potential_poisson(rho_q_tot, dz_c, dx_m, dy_m)
     e_mag = torch.sqrt(e_x * e_x + e_y * e_y + e_z * e_z + 1.0e-12)
 
-    # 7. Dielectric breakdown discharge & IC/CG classification (Fierro et al., 2013; Sato et al., 2019)
-    e_crit = E_CRIT_SEA_LEVEL * torch.clamp(rho_pos / RHO_AIR_REF, min=0.05)
+    # 7. Dielectric breakdown discharge & continuous electrostatic IC/CG partitioning (Fierro 2013; Sato 2019)
+    e_crit = e_crit_sl_eff * torch.clamp(rho_pos / RHO_AIR_REF, min=0.05)
     e_ratio = e_mag / e_crit
     # Trigger per host CRM domain [N_cells]
     domain_max_ratio = e_ratio.amax(dim=(0, 2, 3))  # [nc]
@@ -615,9 +628,15 @@ def step_explicit_bulk_lightning_and_lnox(
     dq_abs_col_c = 0.5 * (dq_neut_5.sum(dim=0).abs() * dz_4d).sum(dim=0) * (dx_m * dy_m)  # [nc, ny, nx] [C]
     n_flashes_sub = dq_abs_col_c / Q_CHARGE_PER_FLASH_C
     flash_tot_sub = n_flashes_sub / (dx_m * dy_m * dt_s)  # [flashes m^-2 s^-1]
+    # Continuous first-principles CG fraction from resolved lower-column vs total electrostatic breakdown energy
+    er_safe = e_mag / torch.clamp(e_crit, min=1.0)
+    e2_dz = (er_safe * er_safe) * torch.clamp(dz_4d, min=1.0)
+    w_tot_e = e2_dz.sum(dim=0)
+    w_cg_e = (e2_dz * (z_agl <= Z_CG_CHANNEL_MAX_M).to(dtype)).sum(dim=0)
+    f_cg_cont = torch.clamp(w_cg_e / torch.clamp(w_tot_e, min=1.0e-12), 0.05, 0.80)
     f_cg_sub = torch.where(
-        flash_tot_sub > 0.0,
-        is_cg_sub.to(dtype),
+        (flash_tot_sub > 0.0) & is_cg_sub,
+        f_cg_cont,
         torch.zeros_like(flash_tot_sub),
     )
     flash_cg_sub = flash_tot_sub * f_cg_sub
@@ -730,6 +749,9 @@ class LightningSelfDistillState:
     ema_loss: float = 0.0
     ema_val_corr: float = 0.0
     ema_teacher_flash_mean: float = 0.0
+    # Zero-sync GPU scalar EMAs for exact Jensen-inequality moment matching (E[student] == E[teacher])
+    ema_tea_fl_gpu: torch.Tensor | None = None
+    ema_stu_fl_gpu: torch.Tensor | None = None
 
 
 def init_lightning_self_distill_state(
@@ -762,6 +784,8 @@ def init_lightning_self_distill_state(
         act_y=torch.zeros((cap_act,), device=dev, dtype=torch.float32),
         act_fcg=torch.zeros((cap_act,), device=dev, dtype=torch.float32),
         act_valid=torch.zeros((cap_act,), device=dev, dtype=torch.float32),
+        ema_tea_fl_gpu=torch.zeros((), device=dev, dtype=torch.float32),
+        ema_stu_fl_gpu=torch.zeros((), device=dev, dtype=torch.float32),
     )
 
 
@@ -1115,7 +1139,42 @@ def step_ossp_distilled_lightning(
             ccd_s = 15.0 * torch.sigmoid(out_s[:, 3])
             if distill_state.grad_updates >= 10:
                 has_seen_storm = (distill_state.act_valid[: distill_state.act_size].sum() > 0.5).to(dtype)
-                flash_cell_s = has_seen_storm * gate_s * p_strike * (LIGHTNING_FLASH_LOG_SCALE * torch.expm1(log_rate))
+                raw_flash_s = has_seen_storm * gate_s * p_strike * (LIGHTNING_FLASH_LOG_SCALE * torch.expm1(log_rate))
+                # Zero-sync GPU EMA Jensen moment-matching so heavy-tailed log1p training preserves E[student] == E[teacher]
+                if distill_state.ema_tea_fl_gpu is None:
+                    distill_state.ema_tea_fl_gpu = torch.zeros((), device=dev, dtype=torch.float32)
+                    distill_state.ema_stu_fl_gpu = torch.zeros((), device=dev, dtype=torch.float32)
+                assert distill_state.ema_stu_fl_gpu is not None
+                mat_sum = torch.clamp(mature_f.sum(), min=1.0)
+                tea_mean_cur = (fl_t * mature_f).sum() / mat_sum
+                if use_contig_lt:
+                    stu_raw_on_t = raw_flash_s[t_idx]
+                else:
+                    out_t_chk = distill_state.net(feats_all[t_idx])
+                    stu_raw_on_t = (
+                        has_seen_storm
+                        * conv_gate[t_idx]
+                        * torch.sigmoid(out_t_chk[:, 0])
+                        * (LIGHTNING_FLASH_LOG_SCALE * torch.expm1(torch.clamp(F.softplus(out_t_chk[:, 1]), max=11.0)))
+                    )
+                stu_mean_cur = (stu_raw_on_t * mature_f).sum() / mat_sum
+                has_mat = (mature_f.sum() > 0.5).to(torch.float32)
+                # Fast early warmup decaying smoothly to a ~1-day diurnal-cycle EMA (alpha = 0.008)
+                alpha_base = max(1.0 / float(max(distill_state.steps_seen - 8, 1)), 0.008)
+                alpha_m = min(alpha_base, 0.20) * has_mat
+                distill_state.ema_tea_fl_gpu.mul_(1.0 - alpha_m).add_(alpha_m * tea_mean_cur)
+                distill_state.ema_stu_fl_gpu.mul_(1.0 - alpha_m).add_(alpha_m * stu_mean_cur)
+                gain_ready = (distill_state.ema_stu_fl_gpu > 1.0e-15).to(dtype)
+                jensen_gain = torch.where(
+                    gain_ready > 0.5,
+                    torch.clamp(
+                        distill_state.ema_tea_fl_gpu / torch.clamp(distill_state.ema_stu_fl_gpu, min=1.0e-18),
+                        min=0.35,
+                        max=40.0,
+                    ),
+                    torch.ones((), device=dev, dtype=dtype),
+                )
+                flash_cell_s = raw_flash_s * jensen_gain
             else:
                 flash_cell_s = torch.zeros_like(gate_s)
             cg_cell_s = flash_cell_s * f_cg_s
