@@ -3759,39 +3759,56 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
           ctx.ellipse(ex2, ey2, rMajor * 1.18, rMinor * 1.18, rotAng, 0, Math.PI * 2);
           ctx.stroke();
         }
-        // 4. Blue Jets (electric cobalt-blue narrow upward stratospheric jet cone)
+        // 4. Blue Jets (narrow vertical cobalt-blue stratospheric cone & beam rising from cloud top)
         if (bv >= 38 && ((hSeed + 173) & 255) > 145) {
           const bInt = Math.min(1.0, (bv - 38) / 150.0) * (muC < 0.12 ? 0.95 : 0.45);
-          const liftB = sc * (2.8 + 4.5 * bInt) * Math.max(0.22, limbFactor);
+          const liftB = sc * (4.5 + 5.5 * bInt) * Math.max(0.30, limbFactor);
           const bx2 = px + ux * liftB, by2 = py + uy * liftB;
-          const bg = ctx.createRadialGradient(bx2, by2, 0, bx2, by2, sc * (2.6 + 3.6 * bInt));
-          bg.addColorStop(0, `rgba(96,185,255,${(0.90 * bInt).toFixed(2)})`);
-          bg.addColorStop(0.5, `rgba(37,99,235,${(0.45 * bInt).toFixed(2)})`);
-          bg.addColorStop(1, "rgba(30,64,175,0)");
+          const txB = -uy, tyB = ux;
+          const halfW = sc * (0.85 + 0.75 * bInt);
+          // Narrow upward cobalt-blue cone (no circular blob)
+          const bg = ctx.createLinearGradient(px, py, bx2, by2);
+          bg.addColorStop(0, `rgba(147,215,255,${(0.95 * bInt).toFixed(2)})`);
+          bg.addColorStop(0.55, `rgba(59,130,246,${(0.75 * bInt).toFixed(2)})`);
+          bg.addColorStop(1, `rgba(37,99,235,0)`);
           ctx.fillStyle = bg;
-          ctx.beginPath(); ctx.arc(bx2, by2, sc * (2.6 + 3.6 * bInt), 0, Math.PI * 2); ctx.fill();
-          ctx.strokeStyle = `rgba(56,189,248,${(0.88 * bInt).toFixed(2)})`;
-          ctx.lineWidth = Math.max(1.1, sc * 1.3);
+          ctx.beginPath();
+          ctx.moveTo(px, py);
+          ctx.lineTo(bx2 + txB * halfW, by2 + tyB * halfW);
+          ctx.lineTo(bx2 - txB * halfW, by2 - tyB * halfW);
+          ctx.closePath();
+          ctx.fill();
+          ctx.strokeStyle = `rgba(125,211,252,${(0.92 * bInt).toFixed(2)})`;
+          ctx.lineWidth = Math.max(0.9, sc * 1.0);
           ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(bx2, by2); ctx.stroke();
         }
-        // 5. Gigantic Jets (rare cloud-to-ionosphere bridge: cobalt-blue base -> crimson-violet crown)
+        // 5. Gigantic Jets (tall vertical cloud-to-ionosphere bridge: blue trunk -> violet/crimson forks)
         if (gv >= 24 && ((hSeed + 221) & 255) > 160) {
           const gInt = Math.min(1.0, (gv - 24) / 140.0) * (muC < 0.10 ? 1.0 : 0.35);
-          const liftG = sc * (6.0 + 7.5 * gInt) * Math.max(0.28, limbFactor);
+          const liftG = sc * (8.5 + 8.5 * gInt) * Math.max(0.34, limbFactor);
+          const gxMid = px + ux * (liftG * 0.52), gyMid = py + uy * (liftG * 0.52);
           const gx2 = px + ux * liftG, gy2 = py + uy * liftG;
+          const txG = -uy, tyG = ux;
+          const forkW = sc * (1.2 + 1.0 * gInt);
           const lg = ctx.createLinearGradient(px, py, gx2, gy2);
           lg.addColorStop(0, `rgba(56,189,248,${(0.95 * gInt).toFixed(2)})`);
-          lg.addColorStop(0.45, `rgba(139,92,246,${(0.90 * gInt).toFixed(2)})`);
+          lg.addColorStop(0.45, `rgba(139,92,246,${(0.92 * gInt).toFixed(2)})`);
           lg.addColorStop(1, `rgba(255,45,105,${(0.95 * gInt).toFixed(2)})`);
           ctx.strokeStyle = lg;
-          ctx.lineWidth = Math.max(1.4, sc * 1.8);
+          ctx.lineWidth = Math.max(1.2, sc * 1.45);
           ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(gx2, gy2); ctx.stroke();
-          const cg = ctx.createRadialGradient(gx2, gy2, 0, gx2, gy2, sc * (4.2 + 5.0 * gInt));
-          cg.addColorStop(0, `rgba(244,63,94,${(0.85 * gInt).toFixed(2)})`);
-          cg.addColorStop(0.5, `rgba(168,85,247,${(0.45 * gInt).toFixed(2)})`);
-          cg.addColorStop(1, "rgba(168,85,247,0)");
-          ctx.fillStyle = cg;
-          ctx.beginPath(); ctx.arc(gx2, gy2, sc * (4.2 + 5.0 * gInt), 0, Math.PI * 2); ctx.fill();
+          // Vertical upward upper-mesospheric branches (carrot/tree crown, no circular blob)
+          ctx.strokeStyle = `rgba(244,63,94,${(0.75 * gInt).toFixed(2)})`;
+          ctx.lineWidth = Math.max(0.8, sc * 0.85);
+          ctx.beginPath();
+          ctx.moveTo(gxMid, gyMid); ctx.lineTo(gx2 + txG * forkW, gy2 + tyG * forkW);
+          ctx.moveTo(gxMid, gyMid); ctx.lineTo(gx2 - txG * forkW, gy2 - tyG * forkW);
+          ctx.stroke();
+          // Thin foreshortened ionospheric contact disk at tip
+          ctx.fillStyle = `rgba(255,70,115,${(0.55 * gInt).toFixed(2)})`;
+          ctx.beginPath();
+          ctx.ellipse(gx2, gy2, sc * (2.0 + 1.4 * gInt), sc * (0.75 + 0.45 * gInt) * Math.max(0.20, z), Math.atan2(uy, ux) + Math.PI * 0.5, 0, Math.PI * 2);
+          ctx.fill();
         }
       }
     }
