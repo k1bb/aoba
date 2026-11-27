@@ -476,6 +476,69 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
     os.replace(tmp, path)
 
 
+def _save_ossp_weights_snapshot(
+    model: AOBAState,
+    path: Path,
+    *,
+    sim_year: int,
+    mon_num: int,
+    sim_date: str,
+    sim_days: float,
+) -> None:
+    """Atomically save lightweight (~4 MB) OSSP neural weights for frozen cross-season retention audits."""
+    cd = getattr(model, "crm_distill", None)
+    rd = getattr(model, "rad_distill", None)
+    ld = getattr(model, "lightning_distill", None)
+    if cd is None and rd is None and ld is None:
+        return
+    payload: dict[str, Any] = {
+        "sim_year": int(sim_year),
+        "mon_num": int(mon_num),
+        "sim_date": str(sim_date),
+        "sim_days": float(sim_days),
+        "step_count": int(model.step_count),
+        "co2_ppmv": float(getattr(model.cfg, "co2_ppmv", 284.3)),
+        "crm_distill": (
+            {
+                "net_state": {k: v.detach().cpu() for k, v in cd.net.state_dict().items()},
+                "steps_seen": int(cd.steps_seen),
+                "grad_updates": int(cd.grad_updates),
+                "ema_loss": float(cd.ema_loss),
+                "ema_val_rmse_thm": float(cd.ema_val_rmse_thm),
+                "ema_val_rmse_qn": float(cd.ema_val_rmse_qn),
+            }
+            if cd is not None
+            else None
+        ),
+        "rad_distill": (
+            {
+                "net_state": {k: v.detach().cpu() for k, v in rd.net.state_dict().items()},
+                "steps_seen": int(rd.steps_seen),
+                "grad_updates": int(rd.grad_updates),
+                "ema_loss": float(rd.ema_loss),
+                "ema_val_rmse_olr": float(rd.ema_val_rmse_olr),
+                "ema_val_rmse_asr": float(rd.ema_val_rmse_asr),
+            }
+            if rd is not None
+            else None
+        ),
+        "lightning_distill": (
+            {
+                "net_state": {k: v.detach().cpu() for k, v in ld.net.state_dict().items()},
+                "steps_seen": int(ld.steps_seen),
+                "grad_updates": int(ld.grad_updates),
+                "ema_loss": float(ld.ema_loss),
+                "ema_val_corr": float(ld.ema_val_corr),
+            }
+            if ld is not None
+            else None
+        ),
+    }
+    tmp = path.with_suffix(".pt.tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
 def _interp_vertical_batch(
     z_old: torch.Tensor,
     val_old: torch.Tensor,
@@ -2849,6 +2912,15 @@ def main() -> None:
                         getattr(model, "rad_distill", None),
                         reset=True,
                     )
+                    if mon_num in (3, 6, 9, 12):
+                        _save_ossp_weights_snapshot(
+                            model,
+                            monthly_zarr.parent / f"ossp_weights_M{mon_num:02d}.pt",
+                            sim_year=year,
+                            mon_num=mon_num,
+                            sim_date=diag.date_str,
+                            sim_days=diag.sim_time_days,
+                        )
                 m_sums.clear()
                 m_cnt = 0
                 m_idx += 1
