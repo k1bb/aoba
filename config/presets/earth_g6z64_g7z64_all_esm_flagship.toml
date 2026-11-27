@@ -9,7 +9,7 @@ glevel = 6
 nz = 64
 z_top = 90000.0
 dz_min = 60.0
-z_sponge_base = 76000.0
+z_sponge_base = 72000.0
 tau_sponge_min = 300.0
 terrain_scale_exp = 1.5
 crm_nx = 32
@@ -352,15 +352,15 @@ g_wave = 0.8
 [gravity_wave]
 ngwd_front_thresh = 1.25e-15
 ngwd_front_launch_hpa = 600.0
-ngwd_front_tau0 = 0.0015
+ngwd_front_tau0 = 0.003
 ngwd_front_cw = 30.0
-ngwd_front_eff = 0.1
+ngwd_front_eff = 0.25
 ngwd_conv_tau0 = 0.002
 ngwd_conv_qref = 0.0002
 ngwd_conv_eff = 0.25
 ngwd_wavelength_m = 200000.0
 ngwd_cmax = 80.0
-ngwd_tend_max = 0.001157
+ngwd_tend_max = 0.0025
 
 # --- Glen Flow Law & Lithospheric Isostasy Physics Constants ---
 [icesheet_physics]

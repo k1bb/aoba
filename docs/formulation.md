@@ -255,10 +255,13 @@ z_{w,k} &= \max\!\Big(\zeta_{w,k} + A(\zeta_{w,k})h_s,\ z_{w,k-1} + \gamma_{\min
 \end{aligned} \tag{2.10}
 $$
 
-To damp upward-propagating internal gravity waves below the rigid lid, a $\sin^2$ Rayleigh sponge layer ($\tau_{\mathrm{sp,min}} = 300\ \mathrm{s}$) acts above $z_{\mathrm{sp}}$ (default `z_sponge_base = 36 km`):
+To damp upward-propagating internal gravity waves below the rigid lid, a $\sin^2$ Rayleigh sponge layer ($\tau_{\mathrm{sp,min}} = 300\ \mathrm{s}$) acts above $z_{\mathrm{sp}}$ (default `z_sponge_base = 36 km`). In high-top configurations ($z_{\mathrm{top}} > 32\ \mathrm{km}$), an implicit vertical-velocity wave-absorbing profile ($\tau_{w,\min} = 10\ \mathrm{s}$ above $z_{\mathrm{sp},w} = \min(z_{\mathrm{sp}}, 0.72\,z_{\mathrm{top}})$; Klemp et al., 2008, Eq. 12) additionally suppresses rigid-lid reflections without braking mean horizontal flow:
 
 $$
-\gamma_r(\zeta) = \frac{1}{\tau_{\mathrm{sp,min}}}\sin^2\!\left(\frac{\pi}{2}\,\operatorname{clamp}\!\left(\frac{\zeta - z_{\mathrm{sp}}}{\max(z_{\mathrm{top}} - z_{\mathrm{sp}}, 1)},\ 0,\ 1\right)\right) \tag{2.11}
+\begin{aligned}
+\gamma_r(\zeta) &= \frac{1}{\tau_{\mathrm{sp,min}}}\sin^2\!\left(\frac{\pi}{2}\,\operatorname{clamp}\!\left(\frac{\zeta - z_{\mathrm{sp}}}{\max(z_{\mathrm{top}} - z_{\mathrm{sp}}, 1)},\ 0,\ 1\right)\right), \\
+\gamma_{r,w}(\zeta_w) &= \max\!\left(\gamma_r(\zeta_w),\ \frac{\mathbb{I}[z_{\mathrm{top}} > 32\ \mathrm{km}]}{\tau_{w,\min}}\sin^2\!\left(\frac{\pi}{2}\,\operatorname{clamp}\!\left(\frac{\zeta_w - z_{\mathrm{sp},w}}{\max(z_{\mathrm{top}} - z_{\mathrm{sp},w}, 1)},\ 0,\ 1\right)\right)\right)
+\end{aligned} \tag{2.11}
 $$
 
 ---

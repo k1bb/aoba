@@ -1177,12 +1177,13 @@ def _step_crm_physics_and_dynamics_impl(
         n_sub = max(n_dyn_substeps, 0)
     else:
         # Split-explicit outer RK3-WS3 & donor-cell FCT obey the half-span jet + convective CFL
-        # (u_ref = 80 m/s after Galilean shift covers >150 m/s winter polar-night jet shear;
-        # Wicker & Skamarock 2002 WS3+RK3 linear stability limit is 1.61, so cfl_adv = 0.96 keeps
-        # CFL_WS3 <= 0.96 << 1.61 while dt_cfl_max <= 25 s keeps Zalesak FCT <= 1.0 across all dx).
+        # (after Galilean midpoint shift, high-top mesospheric jets can span >160 m/s so z_top >= 68 km
+        # uses u_ref_cfl = 110 m/s and dt_cfl_cap = 17.5 s, keeping Zalesak FCT <= 1.0 up to ~225 m/s span).
         cfl_adv = 0.96 if is_2d_crm else 0.45
-        u_ref_cfl = 80.0
-        dt_cfl_max = min(24.0 if is_2d_crm else 45.0, cfl_adv * min(crm.dx, crm.dy) / u_ref_cfl)
+        is_meso_top = float(vgrid.z_top) >= 68000.0
+        u_ref_cfl = 110.0 if is_meso_top else 80.0
+        dt_cfl_cap_2d = 17.5 if is_meso_top else 24.0
+        dt_cfl_max = min(dt_cfl_cap_2d if is_2d_crm else 45.0, cfl_adv * min(crm.dx, crm.dy) / u_ref_cfl)
         n_sub_min = max(n_dyn_substeps, int(math.ceil(dt_crm / max(dt_cfl_max, 0.1))))
         # Universal acoustic-aligned substep snapping: searching a small window n >= n_sub_min
         # (strictly smaller/more stable dt_sub) eliminates fractional ceil(dtau / dt_ac_max)
@@ -1204,9 +1205,10 @@ def _step_crm_physics_and_dynamics_impl(
     dt_sub = dt_crm / float(max(n_sub, 1))
     dz_fct = dz_c_col if dz_c_col is not None else vgrid.dzeta_c
 
-    # Group acoustic substeps into advective super-steps (<= 25 s in 2D; 1 substep <= 22.5 s in 3D
-    # so explicit horizontal donor-cell FCT obeys C_x + C_y + C_z <= 1 even in >120 m/s polar-night jets).
-    adv_group = max(1, min(n_sub, int(math.floor(25.0 / max(dt_sub, 1.0e-3))))) if is_2d_crm else 1
+    # Group acoustic substeps into advective super-steps (<= 17.5 s for high-top mesosphere, <= 25 s
+    # otherwise in 2D; 1 substep <= 22.5 s in 3D so explicit donor-cell FCT obeys C_x + C_y + C_z <= 1).
+    dt_adv_cap_2d = 17.5 if float(vgrid.z_top) >= 68000.0 else 25.0
+    adv_group = max(1, min(n_sub, int(math.floor(dt_adv_cap_2d / max(dt_sub, 1.0e-3))))) if is_2d_crm else 1
     sgs_stride = max(1, int(math.floor(120.0 / max(dt_sub, 1.0e-3)))) if is_2d_crm else 1
     if is_2d_crm and adv_group > 1 and sgs_stride >= adv_group:
         # Align SGS stride to an integer multiple of adv_group so fused substep groups never split

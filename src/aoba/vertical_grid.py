@@ -141,6 +141,13 @@ def build_vertical_grid(
 
     sponge_w64 = _sponge(zeta_w64)
     sponge_c64 = _sponge(zeta_c64)
+    if z_top > 32000.0:
+        # Klemp, Dudhia, & Hassiotis (2008, MWR, 136, Eq. 12) implicit vertical-velocity wave-absorbing
+        # layer (tau_w = 10 s): absorbs upward-propagating gravity/acoustic waves below the rigid lid
+        # in high-top stratospheric/mesospheric domains without distorting horizontal mean circulation.
+        z_sp_w = min(z_sponge_base, 0.72 * z_top)
+        xi_w = torch.clamp((zeta_w64 - z_sp_w) / max(z_top - z_sp_w, 1.0), 0.0, 1.0)
+        sponge_w64 = torch.maximum(sponge_w64, (1.0 / 10.0) * torch.sin(0.5 * math.pi * xi_w) ** 2)
 
     # Perturbation-only upper wave-absorbing layer for embedded periodic CRMs in high-top
     # configurations (z_top > 32 km; Klemp et al., 2008): absorbs trapped convective gravity waves

@@ -255,10 +255,13 @@ z_{w,k} &= \max\!\Big(\zeta_{w,k} + A(\zeta_{w,k})h_s,\ z_{w,k-1} + \gamma_{\min
 \end{aligned} \tag{2.10}
 $$
 
-剛体上端境界での内部重力波反射を抑えるため、スポンジ層底面 $z_{\mathrm{sp}}$（既定 `z_sponge_base = 36 km`）以高に $\sin^2$ 型レイリー減衰率 $\gamma_r(\zeta)$ を適用する（最小減衰時定数 $\tau_{\mathrm{sp,min}} = 300\ \mathrm{s}$）：
+剛体上端境界での内部重力波反射を抑えるため、スポンジ層底面 $z_{\mathrm{sp}}$（既定 `z_sponge_base = 36 km`）以高に $\sin^2$ 型レイリー減衰率 $\gamma_r(\zeta)$ を適用する（最小減衰時定数 $\tau_{\mathrm{sp,min}} = 300\ \mathrm{s}$）。さらに高上端構成（$z_{\mathrm{top}} > 32\ \mathrm{km}$）では、平均水平循環を過度に減速させずに剛体上端での波動反射を吸収するため、鉛直速度 $w$ に対してのみ $z_{\mathrm{sp},w} = \min(z_{\mathrm{sp}}, 0.72\,z_{\mathrm{top}})$ 以高に陰的鉛直波動吸収層（$\tau_{w,\min} = 10\ \mathrm{s}$; Klemp et al., 2008, Eq. 12）を重畳する：
 
 $$
-\gamma_r(\zeta) = \frac{1}{\tau_{\mathrm{sp,min}}}\sin^2\!\left(\frac{\pi}{2}\,\operatorname{clamp}\!\left(\frac{\zeta - z_{\mathrm{sp}}}{\max(z_{\mathrm{top}} - z_{\mathrm{sp}}, 1)},\ 0,\ 1\right)\right) \tag{2.11}
+\begin{aligned}
+\gamma_r(\zeta) &= \frac{1}{\tau_{\mathrm{sp,min}}}\sin^2\!\left(\frac{\pi}{2}\,\operatorname{clamp}\!\left(\frac{\zeta - z_{\mathrm{sp}}}{\max(z_{\mathrm{top}} - z_{\mathrm{sp}}, 1)},\ 0,\ 1\right)\right), \\
+\gamma_{r,w}(\zeta_w) &= \max\!\left(\gamma_r(\zeta_w),\ \frac{\mathbb{I}[z_{\mathrm{top}} > 32\ \mathrm{km}]}{\tau_{w,\min}}\sin^2\!\left(\frac{\pi}{2}\,\operatorname{clamp}\!\left(\frac{\zeta_w - z_{\mathrm{sp},w}}{\max(z_{\mathrm{top}} - z_{\mathrm{sp},w}, 1)},\ 0,\ 1\right)\right)\right)
+\end{aligned} \tag{2.11}
 $$
 
 ---
