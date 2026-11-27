@@ -802,9 +802,20 @@ $\mathrm{N}_2$ 第 1 正帯（$1\mathrm{PN}_2$、深紅 650–750 nm；$A_{1P} =
 $$
 \begin{aligned}
 Q_{1P}(z) &= \frac{A_{1P}}{A_{1P} + k_{q,1P} f_{\mathrm{N}_2} N(z)}, \qquad Q_{2P}(z) = \frac{A_{2P}}{A_{2P} + k_{q,2P} f_{\mathrm{O}_2} N(z)}, \\
-S_{\mathrm{NOx,sprite}} &= \mathcal{F}_{\mathrm{sprite}}\,Y_{\mathrm{NOx}}\,\operatorname{clamp}\!\left(\frac{z_{\mathrm{init}} - z_{\mathrm{stop}}}{25\ \mathrm{km}},\ 0.3,\ 2.0\right)
+S_{\mathrm{NOx,TLE}} &= \mathcal{F}_{\mathrm{sprite}}\,Y_{\mathrm{NOx,sp}}\,\operatorname{clamp}\!\left(\frac{z_{\mathrm{init}} - z_{\mathrm{stop}}}{25\ \mathrm{km}},\ 0.3,\ 2.0\right) + \mathcal{F}_{\mathrm{GJ}}\,Y_{\mathrm{NOx,GJ}}
 \end{aligned} \tag{5.27}
 $$
+
+さらに同一 TLE モジュール内で、夜間 D 層下端における電磁パルス（EMP）起因のエルブス（ELVES；Inan et al., 1991; Barrington-Leigh & Inan, 1999；帰還雷撃速度 $v_{\mathrm{rs}} = 1.5\times 10^8\ \mathrm{m\ s^{-1}}$、斜距離 $R = 150\ \mathrm{km}$、対数正規ピーク電流分散 $\sigma_{\ln,I} = 0.72$、閾値 $E_{\mathrm{EMP}} \ge 0.45\,E_k(z_{\mathrm{ion}})$）、オーバーシュート雲頂（$z_{\mathrm{cld}} \gtrsim 11.5\ \mathrm{km}$）から成層圏へ伸展するブルージェット（Blue Jets）、および夜間高雲頂（$z_{\mathrm{cld}} \gtrsim 14.2\ \mathrm{km}$）から電離圏下端まで直接架橋する巨大ジェット（Gigantic Jets；Pasko et al., 2002; Krehbiel et al., 2008；$Y_{\mathrm{NOx,GJ}} = 5\times 10^{23}\ \mathrm{molecules\ GJ^{-1}}$）も同時に評価する：
+
+$$
+\begin{aligned}
+E_{\mathrm{EMP}} &= \frac{\mu_0 v_{\mathrm{rs}} I_{\mathrm{peak}}}{2\pi R}\sin\theta\,\exp(-3.2\,f_{\mathrm{day}}), \\
+\mathcal{F}_{\mathrm{ELVES}} &= \mathcal{F}_{\mathrm{CG}}\,\frac{1}{2}\operatorname{erfc}\!\left(\frac{\ln(I_{\mathrm{crit}} / I_{\mathrm{med}})}{\sqrt{2}\,\sigma_{\ln,I}}\right), \qquad \mathcal{F}_{\mathrm{GJ}} = \mathcal{F}_{\mathrm{BJ}}\cdot 0.14\,\sigma\!\left(\frac{z_{\mathrm{cld}} - 14.2}{0.85}\right)(1 - 0.85\,f_{\mathrm{day}})\,\min\!\left(\frac{P_{\mathrm{halo}}}{0.05}, 1.5\right)
+\end{aligned} \tag{5.28}
+$$
+
+モデル上端 `z_top >= 70 km` のハイトップ構成では TLE 格子は AOBA が陽に解像した中間圏密度 $\rho(z)$ を直接内挿参照し、`lightning_scheme = "explicit_bulk"` が全セルの 3D 電荷を保持するときは実電荷分布から $z_Q$ と +CG 極性バイアスを診断する。
 
 ---
 
@@ -1915,6 +1926,37 @@ $$
 $$
 
 その後、境界層最下 6 層の対保存陰的鉛直混合（$h_{\mathrm{PBL}} = 1500\ \mathrm{m}$）、および成層圏火山硫酸表面積密度 $\mathrm{SAD}$（Solomon et al., 1996）と 11 年太陽 UV 倍率 $s_{\mathrm{UV}}$ の指数摂動を適用する。
+
+#### 10.2.1 ハイトップ中間圏・非 LTE 放射・予報 $\mathrm{NO}_x \leftrightarrow \mathrm{O}_3$ 双方向結合・夜光雲 (`src/aoba/mesosphere.py`)
+
+`z_top >= 68 km`（ハイトップ標準・フラグシッププリセットでは `z_top = 90 km`, $N_z = 64$ で高度 50–90 km に 10 層の中間圏を解像）のとき、非地形性重力波抵抗（第 8.5 節）と協調して夏極上昇・冬極下降の中間圏残差循環、低温夏極中間圏界面（$T < 150\ \mathrm{K}$）、および TLE–$\mathrm{NO}_x$–$\mathrm{O}_3$ 双方向結合を地理マップなしで自律再現する 4 つの物理過程が自動的に有効となる。
+
+高度約 $57\ \mathrm{km}$（$p < 0.35\ \mathrm{hPa}$）以高では $\mathrm{CO}_2$ $15\ \mathrm{\mu m}$ 帯の局所熱力学平衡（LTE）が破綻する。対数気圧重み $w_{\mathrm{nLTE}} = \sigma\big((-0.456 - \log_{10} p_{\mathrm{hPa}})/0.18\big)\,\sigma\big((2.5 - p_{\mathrm{hPa}})/0.35\big)$（$40\ \mathrm{km}$ 以下では $10^{-4}$ 未満で対流圏・成層圏放射収支を厳密保存）を用い、LTE 放射加熱率へ Fomichev et al. (1998) の非 LTE $\mathrm{CO}_2$ $15\ \mathrm{\mu m}$ 冷却（中性分子および中間圏原子状酸素 $\mathrm{O}(^3\mathrm{P})$ との衝突緩和と Einstein 係数 $A_{15} = 1.35\ \mathrm{s^{-1}}$ の競合）および Strobel (1978)・Mlynczak & Solomon (1993) の $\mathrm{O}_3$ Hartley–Huggins 帯・$\mathrm{O}_2$ Schumann–Runge 帯 UV 加熱（大気光化学加熱効率 $\varepsilon_{\mathrm{chem}}(p)$ 付き）を滑らかに接続する：
+
+$$
+\begin{aligned}
+\Lambda_{\mathrm{nLTE}} &= \frac{k_{\mathrm{CO_2\text{-}M}} M + k_{\mathrm{CO_2\text{-}O}} [\mathrm{O}]}{k_{\mathrm{CO_2\text{-}M}} M + k_{\mathrm{CO_2\text{-}O}} [\mathrm{O}] + A_{15}\phi_{\mathrm{esc}}}, \\
+Q_{\mathrm{rad,eff}} &= (1 - w_{\mathrm{nLTE}})\,Q_{\mathrm{rad,LTE}} + w_{\mathrm{nLTE}}\big(Q_{\mathrm{CO_2,nLTE}}(\Lambda_{\mathrm{nLTE}}, T, \mathrm{CO}_2) + Q_{\mathrm{UV,O_3}}(\chi_{\mathrm{O_3}}, \varepsilon_{\mathrm{chem}}) + Q_{\mathrm{UV,O_2}}\big)
+\end{aligned} \tag{10.2a}
+$$
+
+高度 $60\ \mathrm{km}$ 以高では、Sutherland 則の動粘性係数 $\nu_{\mathrm{mol}} = \mu(T)/\rho$ と熱拡散係数 $\kappa_{\mathrm{mol}} = \nu_{\mathrm{mol}}/\mathrm{Pr}$（$\mathrm{Pr} = 0.71$）を、無条件安定かつ `float32` 保存性を満たす増分形式の陰的三重対角拡散により `theta_m` および `u_edge` へ適用する：
+
+$$
+(\mathbf{I} + \mathbf{L}_{\mathrm{mol}})\,\Delta q = -\mathbf{L}_{\mathrm{mol}}\,q^n, \qquad \nu_{\mathrm{mol}} = \min\!\left(\frac{1.458\times 10^{-6}\,T^{3/2}}{\rho(T + 110.4)},\ 40\ \mathrm{m^2\ s^{-1}}\right)\sigma\!\left(\frac{z - 62\ \mathrm{km}}{4\ \mathrm{km}}\right) \tag{10.2b}
+$$
+
+`enable_red_sprites = true` または `z_top >= 68 km` のとき、予報 3D 反応性窒素トレーサ $\chi_{\mathrm{NOx}}$（`q_nox`）を既存のバッチ SCVT Zalesak FCT（`fct_advect_scvt_batch`）で全球移流し、レッドスプライト・巨大ジェット（$45$–$82\ \mathrm{km}$）・対流圏雷 $\mathrm{LNO}_x$・成層圏 $\mathrm{N}_2\mathrm{O}$ 酸化・双極子極冠高エネルギー粒子降下（$74\ \mathrm{km}$ 以高 $\propto \sin^4\phi$）の生成源と、日照中間圏 $\mathrm{NO}$ 光解離（$J_{\mathrm{NO,max}} = 4.5\times 10^{-6}\ \mathrm{s^{-1}}$；極夜では消滅が止まり極夜渦下降流で成層圏へ輸送される）および対流圏湿性洗浄を厳密指数積分したのち、背景超過分をオゾン触媒破壊へ双方向結合する：
+
+$$
+\chi_{\mathrm{NOx}}^{n+1} = \chi_{\mathrm{NOx}}^n + \left(\frac{P_{\mathrm{NOx}}}{L_{\mathrm{NOx}}} - \chi_{\mathrm{NOx}}^n\right)\big[-\operatorname{expm1}(-L_{\mathrm{NOx}}\Delta t)\big], \qquad \chi_{\mathrm{O_3}} \leftarrow \chi_{\mathrm{O_3}}\exp\!\big(-L_{\mathrm{NOx,cat}}(\chi_{\mathrm{NOx}}^{\mathrm{excess}})\,\Delta t\big) \tag{10.2c}
+$$
+
+上部中間圏（$72$–$90\ \mathrm{km}$）では昼間 $\mathrm{HO}_x$ 光解離と夜間原子状酸素再結合による二次オゾン極大を表現するとともに、解像された水蒸気と気温から Murphy & Koop (2005, Eq. 7) の氷過飽和度 $S_{\mathrm{ice}} = e_{\mathrm{H_2O}} / e_{\mathrm{sat,ice}}(T)$ により極域中間圏雲／夜光雲（NLC / PMC）を診断する：
+
+$$
+S_{\mathrm{ice}} = \frac{\chi_{\mathrm{H_2O}}\,p}{\exp\!\left(9.550426 - \frac{5723.265}{T} + 3.53068\ln T - 0.00728332\,T\right)}, \qquad f_{\mathrm{NLC}} = \mathbf{1}_{S_{\mathrm{ice,max}} > 1}\,\sigma\!\left(\frac{S_{\mathrm{ice,max}} - 1.15}{0.25}\right) \tag{10.2d}
+$$
 
 ### 10.3 地図不要の鉱物ダスト (`src/aoba/dust.py`)
 

@@ -279,6 +279,7 @@ class AOBAState:
     last_s_toa: torch.Tensor | None = None                   # Zero-copy ref for TOA incident SW (`rsdt`)
     last_lightning: object | None = None                     # Latest CRM LightningDiagnostics (CG strikes + LNOx)
     last_red_sprites: object | None = None                   # Optional mesospheric RedSpriteDiagnostics when enable_red_sprites=True
+    meso_nox: object | None = None                           # Optional PrognosticNOxState (3D NOx + NLC/mesopause) for high-top / sprites
     explicit_lightning: object | None = None                 # Optional ExplicitLightningState when lightning_scheme == "explicit_bulk"
     lightning_distill: object | None = None                  # Optional OSSP Hurdle lightning self-distillation state
     crm_distill: object | None = None                        # Optional online self-distilling 2D/3D CRM controller
@@ -2123,6 +2124,31 @@ def step_aoba_model(
             lw_dn_sub = _c2s(lwd_c)
             olr_sub = _c2s(olr_c)
             asr_sub = _c2s(asr_c)
+        if float(cfg.z_top) >= 68000.0:
+            from aoba.mesosphere import compute_mesospheric_nlte_radiation
+            from aoba.radiation import background_ozone_vmr
+
+            # Apply Fomichev (1998) non-LTE CO2 15 um cooling + Strobel (1978) O2/O3 UV heating above ~55 km
+            # on host columns (clouds vanish above 25 km -> exact on nc columns with zero subgrid cost!)
+            q_rad_cell_lte = _sub_to_cell(q_rad_sub, nc, n_sub)
+            p_rad_h, t_rad_h = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)[::2]
+            o3_meso = (
+                model.ozone.o3_vmr
+                if (str(cfg.o3_mode).strip().lower() == "prognostic" and model.ozone is not None)
+                else background_ozone_vmr(p_rad_h)
+            )
+            q_rad_cell_nlte = compute_mesospheric_nlte_radiation(
+                q_rad_lte=q_rad_cell_lte,
+                pres_c=p_rad_h,
+                temp_c=t_rad_h,
+                rho_d=atmos.rho_d,
+                dz_c=atmos.dz_c,
+                o3_vmr=o3_meso,
+                mu0=mu0,
+                co2_ppmv=co2_rad_now,
+                uv_solar_scale=uv_j_o2_scale,
+            )
+            q_rad_sub = q_rad_sub + _cell_to_sub(q_rad_cell_nlte - q_rad_cell_lte, nc, n_sub)
         model.rad_cache["q_rad_sub"] = q_rad_sub
         model.rad_cache["sw1_dir_sub"] = sw1_dir_sub
         model.rad_cache["sw1_dif_sub"] = sw1_dif_sub
@@ -2691,6 +2717,9 @@ def step_aoba_model(
     has_o3_adv = bool(str(cfg.o3_mode).strip().lower() == "prognostic" and model.ozone is not None)
     if has_o3_adv:
         adv_list.append(model.ozone.o3_vmr)
+    has_nox_adv = bool(model.meso_nox is not None)
+    if has_nox_adv:
+        adv_list.append(model.meso_nox.q_nox)
     has_co2_adv = bool(
         str(cfg.co2_mode).strip().lower() == "prognostic"
         and bool(cfg.enable_co2_3d_transport)
@@ -2709,6 +2738,21 @@ def step_aoba_model(
     atmos.q_n = q_adv[0]
     atmos.q_p = q_adv[1]
     apply_scvt_storm_smagorinsky(atmos, mesh, dt)
+    if float(cfg.z_top) >= 68000.0:
+        from aoba.mesosphere import apply_mesospheric_molecular_diffusion
+
+        _, _, t_mol_h = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        atmos.theta_m, atmos.u_edge = apply_mesospheric_molecular_diffusion(
+            rho_d=atmos.rho_d,
+            theta_m=atmos.theta_m,
+            u_edge=atmos.u_edge,
+            z_c=atmos.z_c,
+            dz_c=atmos.dz_c,
+            temp_c=t_mol_h,
+            c0=mesh.cells_on_edge[:, 0],
+            c1=mesh.cells_on_edge[:, 1],
+            dt=dt,
+        )
     qc_adv = torch.clamp(q_adv[2], min=0.0)
     qi_adv = torch.clamp(q_adv[3], min=0.0)
     qci_adv = qc_adv + qi_adv
@@ -2730,6 +2774,9 @@ def step_aoba_model(
         idx_q += 4
     if has_o3_adv:
         model.ozone.o3_vmr = torch.clamp(q_adv[idx_q], min=1.0e-10, max=4.0e-5)
+        idx_q += 1
+    if has_nox_adv:
+        model.meso_nox.q_nox = torch.clamp(q_adv[idx_q], min=1.0e-12, max=2.0e-6)
         idx_q += 1
     if has_co2_adv:
         model.prognostic_co2.co2_vmr = torch.clamp(q_adv[idx_q], min=1.0e-5, max=0.05)
@@ -2984,7 +3031,7 @@ def step_aoba_model(
                         n_i=pool.crm.n_i[:, :n_t] if pool.crm.n_i is not None else None,
                     )
                 drho_t = (atmos.rho_d[:, t_idx] - mean_2d(sub_crm_t.rho_d)).unsqueeze(-1).unsqueeze(-1)
-                sub_crm_t.rho_d = torch.clamp(sub_crm_t.rho_d + drho_t, min=1.0e-5)
+                sub_crm_t.rho_d = torch.clamp(sub_crm_t.rho_d + drho_t, min=1.0e-8)
                 sub_crm_t.f_coriolis = mesh.f_cell[t_idx]
                 # Only expand the 6 SurfaceFluxDiagnostics fields read by `step_crm_physics_and_dynamics`
                 _crm_sfc_keys = ("shf", "evap", "tau_x", "tau_y", "u_star", "buoy_flux")
@@ -3054,7 +3101,7 @@ def step_aoba_model(
                 rho_crm_t = crm.rho_d[:, t_idx]
                 drho_t = (atmos.rho_d[:, t_idx] - mean_2d(rho_crm_t)).unsqueeze(-1).unsqueeze(-1)
                 sub_crm_t = CRMState(
-                    rho_d=torch.clamp(rho_crm_t + drho_t, min=1.0e-5),
+                    rho_d=torch.clamp(rho_crm_t + drho_t, min=1.0e-8),
                     u=crm.u[:, t_idx],
                     v=crm.v[:, t_idx],
                     w=crm.w[:, t_idx],
@@ -3108,7 +3155,7 @@ def step_aoba_model(
                         dst_f.index_copy_(1, t_idx, src_f)
 
             rho_t_mean = mean_2d(sub_crm_t.rho_d)
-            inv_rho_t = 1.0 / torch.clamp(rho_t_mean, min=1.0e-5)
+            inv_rho_t = 1.0 / torch.clamp(rho_t_mean, min=1.0e-8)
             thm_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.theta_m) * inv_rho_t
             qn_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.q_n) * inv_rho_t
             qp_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.q_p) * inv_rho_t
@@ -3450,7 +3497,7 @@ def step_aoba_model(
             lt_s_idx = s_idx
         elif chunk >= nc and n_sub == n_crm:
             drho_mean = (atmos.rho_d - mean_2d(crm.rho_d)).unsqueeze(-1).unsqueeze(-1)
-            crm.rho_d = torch.clamp(crm.rho_d + drho_mean, min=1.0e-5)
+            crm.rho_d = torch.clamp(crm.rho_d + drho_mean, min=1.0e-8)
             crm.f_coriolis = mesh.f_cell
             sp = step_crm_physics_and_dynamics(
                 crm=crm,
@@ -3473,7 +3520,7 @@ def step_aoba_model(
                 q_dust_sub=q_dust_4d,
             )
             rho_crm_mean = mean_2d(crm.rho_d)
-            inv_rho_crm = 1.0 / torch.clamp(rho_crm_mean, min=1.0e-5)
+            inv_rho_crm = 1.0 / torch.clamp(rho_crm_mean, min=1.0e-8)
             atmos.rho_d = rho_crm_mean
             atmos.theta_m = mean_2d(crm.rho_d * crm.theta_m) * inv_rho_crm
             atmos.q_n = mean_2d(crm.rho_d * crm.q_n) * inv_rho_crm
@@ -3499,7 +3546,7 @@ def step_aoba_model(
                 rho_crm_sl = crm.rho_d[:, sl]
                 drho_mean = (atmos.rho_d[:, sl] - mean_2d(rho_crm_sl)).unsqueeze(-1).unsqueeze(-1)
                 sub_crm = CRMState(
-                    rho_d=torch.clamp(rho_crm_sl + drho_mean, min=1.0e-5),
+                    rho_d=torch.clamp(rho_crm_sl + drho_mean, min=1.0e-8),
                     u=crm.u[:, sl],
                     v=crm.v[:, sl],
                     w=crm.w[:, sl],
@@ -3558,7 +3605,7 @@ def step_aoba_model(
                     crm.n_i[:, sl] = sub_crm.n_i
 
                 rho_crm_mean = mean_2d(sub_crm.rho_d)
-                inv_rho_crm = 1.0 / torch.clamp(rho_crm_mean, min=1.0e-5)
+                inv_rho_crm = 1.0 / torch.clamp(rho_crm_mean, min=1.0e-8)
                 atmos.rho_d[:, sl] = rho_crm_mean
                 atmos.theta_m[:, sl] = mean_2d(sub_crm.rho_d * sub_crm.theta_m) * inv_rho_crm
                 atmos.q_n[:, sl] = mean_2d(sub_crm.rho_d * sub_crm.q_n) * inv_rho_crm
@@ -4358,6 +4405,38 @@ def step_aoba_model(
             dz_c=atmos.dz_c,
             lat_cell=mesh.lat_cell,
         )
+    # 8b-7a. Prognostic 3D Mesospheric/Stratospheric NOx (Sprites + LNOx + N2O + Polar-Cap EPP) & NLC
+    if bool(cfg.enable_red_sprites) or float(cfg.z_top) >= 68000.0:
+        from aoba.mesosphere import init_prognostic_nox_state, step_prognostic_nox
+
+        pres_host_nx, temp_host_nx = _get_host_pt_end()
+        if model.meso_nox is None:
+            model.meso_nox = init_prognostic_nox_state(pres_host_nx, n2o_ppmv=model.current_n2o_ppmv())
+        lnox_nx = None
+        if light_diag is not None:
+            from aoba.lightning import LNOX_KG_N_PER_FLASH
+
+            lnox_nx = light_diag.flash_tot_cell * LNOX_KG_N_PER_FLASH
+        sp_d = model.last_red_sprites
+        step_prognostic_nox(
+            nox=model.meso_nox,
+            pres_c=pres_host_nx,
+            temp_c=temp_host_nx,
+            rho_d=atmos.rho_d,
+            z_c=atmos.z_c,
+            dz_c=atmos.dz_c,
+            q_v=atmos.q_v,
+            mu0=mu0,
+            lat_cell=mesh.lat_cell,
+            precip_cell=precip_tot,
+            dt=dt,
+            n2o_ppmv=model.current_n2o_ppmv(),
+            lnox_cell_kgn_m2s=lnox_nx,
+            sprite_nox_mol_m2s=(sp_d.sprite_nox_mol_m2s if sp_d is not None else None),
+            sprite_z_init_km=(sp_d.z_init_km_cell if sp_d is not None else None),
+            sprite_z_stop_km=(sp_d.z_stop_km_cell if sp_d is not None else None),
+            solar_uv_scale=uv_j_o2_scale,
+        )
     if str(cfg.o3_mode).strip().lower() == "prognostic":
         from aoba.ozone_chemistry import init_prognostic_ozone_state, step_prognostic_ozone
 
@@ -4399,6 +4478,8 @@ def step_aoba_model(
             fire_c_cell_kgc_m2s=fire_c_cell,
             uv_j_o2_scale=uv_j_o2_scale,
             volc_sad_um2_cm3=volc_sad_3d,
+            nox_vmr_3d=(model.meso_nox.q_nox if model.meso_nox is not None else None),
+            z_c=(atmos.z_c if float(cfg.z_top) >= 68000.0 else None),
         )
     # 8b-8. Stable Water Isotopes (H2^18O, HDO) Fractionation & Ice-Core Archiving
     if bool(cfg.enable_water_isotopes):

@@ -3936,7 +3936,7 @@ kernel void scvt_rk3_prep_cell(
             u_dot_gradz_s[midx] = uz_sum;
 
             float rdw = 0.5f * (rho_prev + rho_v);
-            float rtw = max(0.5f * (rtot_prev + rtot_v), 1.0e-5f);
+            float rtw = max(0.5f * (rtot_prev + rtot_v), 1.0e-8f);
             float thw = 0.5f * (thm_prev + thm_v);
             float inv_dz_w = 1.0f / dz_w_int[midx];
             float rdw_ov_rtw = rdw / rtw;
@@ -4036,7 +4036,7 @@ kernel void scvt_rk3_prep_edge(
 
     float m_edge_v = 0.5f * (m_s[i0] + m_s[i1]);
     float thm_e_v = 0.5f * (th0 + th1) - 0.15f * sgn_u * (th1 - th0);
-    float inv_rtot_dc = idc / max(0.5f * (rt0 + rt1), 1.0e-5f);
+    float inv_rtot_dc = idc / max(0.5f * (rt0 + rt1), 1.0e-8f);
     // Exact symmetric-difference + expm1 PGF weights eliminate float32 cancellation on flat/sloped terrain:
     //   p1*exp(a1) - p0*exp(a0) == (1 + 0.5*(e1+e0))*(p1 - p0) + (e1 - e0)*0.5*(p1 + p0)
     float a0 = -0.5f * (rt0 * gravity / p0) * dz10;

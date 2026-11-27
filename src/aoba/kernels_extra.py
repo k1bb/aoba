@@ -128,7 +128,7 @@ kernel void crm_fct_flux_td(
         float fz_up = (k + 1u < nz) ? fz[(k + 1u) * M + tid] : 0.0f;
         float a_k = (k > 0u) ? (-dt * max(fz_dn, 0.0f)) : 0.0f;
         float c_k = (k + 1u < nz) ? (dt * min(fz_up, 0.0f)) : 0.0f;
-        float b_k = max(rho_new[loc], 1.0e-5f) * dz_k + dt * (max(fz_up, 0.0f) - min(fz_dn, 0.0f));
+        float b_k = max(rho_new[loc], 1.0e-8f) * dz_k + dt * (max(fz_up, 0.0f) - min(fz_dn, 0.0f));
 
         float den = (k == 0u) ? b_k : (b_k - a_k * c_prev);
         float inv_den = 1.0f / max(den, 1.0e-20f);
@@ -257,7 +257,7 @@ kernel void crm_fct_bounds_ratios(
     float p_plus = dt * ((max(ax_m, 0.0f) - min(ax_s, 0.0f)) * inv_dx + py_plus + (max(az_dn, 0.0f) - min(az_up, 0.0f)) * inv_dz);
     float p_minus = dt * ((max(ax_s, 0.0f) - min(ax_m, 0.0f)) * inv_dx + py_minus + (max(az_up, 0.0f) - min(az_dn, 0.0f)) * inv_dz);
 
-    float rho_safe = max(rho_new[loc], 1.0e-5f);
+    float rho_safe = max(rho_new[loc], 1.0e-8f);
     float q_plus = rho_safe * max(q_max - qtd0, 0.0f);
     float q_minus = rho_safe * max(qtd0 - q_min, 0.0f);
     float eps = 1.0e-20f;
@@ -362,7 +362,7 @@ kernel void crm_fct_limit_apply(
 
     float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
     float div_anti = (cx_s * ax_s - cx_m * ax_m) * inv_dx + div_y_anti + (az_up_lim - az_dn_lim) * inv_dz;
-    float rho_safe = max(rho_new[loc], 1.0e-5f);
+    float rho_safe = max(rho_new[loc], 1.0e-8f);
     q_out[gid] = max(q_td[gid] - (dt / rho_safe) * div_anti, 0.0f);
 }
 
@@ -1647,12 +1647,12 @@ kernel void scvt_fast_cell_hevi(
             float uz_nxt = (m < k_top) ? udotz_n[midx] : 0.0f;
             float om_old_m = rdw * (w_c[cidx] - uz_old);
             float om_new = om_old_m + dom_dn;
-            w_n[cidx] = uz_nxt + om_new / max(rdw, 1.0e-5f);
+            w_n[cidx] = uz_nxt + om_new / max(rdw, 1.0e-8f);
             if (accum != 0u) {
                 om_accum[cidx] += (1.0f - beta) * om_old_m + beta * om_new;
             }
         }
-        m_n[cidx]   = max(m_dag[k] - b_dt * (dom_up - dom_dn), 1.0e-3f);
+        m_n[cidx]   = max(m_dag[k] - b_dt * (dom_up - dom_dn), 1.0e-5f);
         float T_fin = T_dag[k] - b_dt * (thw_up * dom_up - thw_dn * dom_dn);
         Thm_n[cidx] = T_fin;
         if (write_p) {
@@ -2374,7 +2374,7 @@ kernel void crm_2d_fast_hevi_loop(
                     float dz_w_val = dz_w_int[um * dz_cols + col_dz];
                     float nh_imb = (p_blend - p_blend_prev) / dz_w_val + 0.5f * (rtot_blend + rtot_blend_prev) * gravity;
                     float rdw_m = rho_dw[idx_m];
-                    float rtw_m = max(rho_tot_w[idx_m], 1.0e-5f);
+                    float rtw_m = max(rho_tot_w[idx_m], 1.0e-8f);
                     float rhs_m = dt_ac * (
                         rdw_m * tend_w_sl[idx_m]
                         - (rdw_m / rtw_m) * nh_imb
@@ -2403,7 +2403,7 @@ kernel void crm_2d_fast_hevi_loop(
                 uint w_idx = (um + 1u) * M + tid;
                 float fz_old_m = rdw_m * w_s[w_idx];
                 float fz_new_m = fz_old_m + dfz_cur;
-                w_s[w_idx] = fz_new_m / max(rdw_m, 1.0e-5f);
+                w_s[w_idx] = fz_new_m / max(rdw_m, 1.0e-8f);
                 if (accum != 0u) {
                     fz_acc[w_idx] += (fz_old_m + beta * dfz_cur);
                 }
@@ -2412,14 +2412,14 @@ kernel void crm_2d_fast_hevi_loop(
                 uint idx_l = k_layer * M + tid;
                 float thm_w_m = thm_w[idx_m];
                 float dz_val = dz_c[k_layer * dz_cols + col_dz];
-                rho_s[idx_l] = max(rho_s[idx_l] - beta * dt_ac * (dfz_above - dfz_cur) / dz_val, 1.0e-5f);
+                rho_s[idx_l] = max(rho_s[idx_l] - beta * dt_ac * (dfz_above - dfz_cur) / dz_val, 1.0e-8f);
                 Thm_s[idx_l] = Thm_s[idx_l] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) / dz_val;
 
                 dfz_above = dfz_cur;
                 thm_w_above = thm_w_m;
             }
             float dz_0 = dz_c[col_dz];
-            rho_s[tid] = max(rho_s[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-5f);
+            rho_s[tid] = max(rho_s[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-8f);
             Thm_s[tid] = Thm_s[tid] - beta * dt_ac * (thm_w_above * dfz_above) / dz_0;
         }
     }
@@ -2580,7 +2580,7 @@ kernel void crm_2d_fast_hevi_loop_64(
                     float dz_w_val = dz_w_int[um * dz_cols + col_dz];
                     float nh_imb = (p_blend - p_blend_prev) / dz_w_val + 0.5f * (rtot_blend + rtot_blend_prev) * gravity;
                     float rdw_m = rho_dw[idx_m];
-                    float rtw_m = max(rho_tot_w[idx_m], 1.0e-5f);
+                    float rtw_m = max(rho_tot_w[idx_m], 1.0e-8f);
                     float rhs_m = dt_ac * (
                         rdw_m * tend_w_sl[idx_m]
                         - (rdw_m / rtw_m) * nh_imb
@@ -2609,7 +2609,7 @@ kernel void crm_2d_fast_hevi_loop_64(
                 uint w_idx = (um + 1u) * M + tid;
                 float fz_old_m = rdw_m * w_s[w_idx];
                 float fz_new_m = fz_old_m + dfz_cur;
-                w_s[w_idx] = fz_new_m / max(rdw_m, 1.0e-5f);
+                w_s[w_idx] = fz_new_m / max(rdw_m, 1.0e-8f);
                 if (accum != 0u) {
                     fz_acc[w_idx] += (fz_old_m + beta * dfz_cur);
                 }
@@ -2618,14 +2618,14 @@ kernel void crm_2d_fast_hevi_loop_64(
                 uint idx_l = k_layer * M + tid;
                 float thm_w_m = thm_w[idx_m];
                 float dz_val = dz_c[k_layer * dz_cols + col_dz];
-                rho_s[idx_l] = max(rho_s[idx_l] - beta * dt_ac * (dfz_above - dfz_cur) / dz_val, 1.0e-5f);
+                rho_s[idx_l] = max(rho_s[idx_l] - beta * dt_ac * (dfz_above - dfz_cur) / dz_val, 1.0e-8f);
                 Thm_s[idx_l] = Thm_s[idx_l] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) / dz_val;
 
                 dfz_above = dfz_cur;
                 thm_w_above = thm_w_m;
             }
             float dz_0 = dz_c[col_dz];
-            rho_s[tid] = max(rho_s[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-5f);
+            rho_s[tid] = max(rho_s[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-8f);
             Thm_s[tid] = Thm_s[tid] - beta * dt_ac * (thm_w_above * dfz_above) / dz_0;
         }
     }
@@ -2773,7 +2773,7 @@ kernel void crm_2d_fast_hevi_loop_tg128(
                     float dz_w_val = dz_w_int[um * dz_cols + col_dz];
                     float nh_imb = (p_blend - p_blend_prev) / dz_w_val + 0.5f * (rtot_blend + rtot_blend_prev) * gravity;
                     float rdw_m = rho_dw[idx_m];
-                    float rtw_m = max(rho_tot_w[idx_m], 1.0e-5f);
+                    float rtw_m = max(rho_tot_w[idx_m], 1.0e-8f);
                     float rhs_m = dt_ac * (
                         rdw_m * tend_w_sl[idx_m]
                         - (rdw_m / rtw_m) * nh_imb
@@ -2805,7 +2805,7 @@ kernel void crm_2d_fast_hevi_loop_tg128(
                 uint w_idx = (um + 1u) * M + tid;
                 float fz_old_m = rdw_m * w_s[w_idx];
                 float fz_new_m = fz_old_m + dfz_cur;
-                w_s[w_idx] = fz_new_m / max(rdw_m, 1.0e-5f);
+                w_s[w_idx] = fz_new_m / max(rdw_m, 1.0e-8f);
                 if (accum != 0u) {
                     fz_acc[w_idx] += (fz_old_m + beta * dfz_cur);
                 }
@@ -2814,14 +2814,14 @@ kernel void crm_2d_fast_hevi_loop_tg128(
                 uint idx_l = k_layer * M + tid;
                 float thm_w_m = thm_w[idx_m];
                 float dz_val = dz_c[k_layer * dz_cols + col_dz];
-                rho_s[idx_l] = max(rho_s[idx_l] - beta * dt_ac * (dfz_above - dfz_cur) / dz_val, 1.0e-5f);
+                rho_s[idx_l] = max(rho_s[idx_l] - beta * dt_ac * (dfz_above - dfz_cur) / dz_val, 1.0e-8f);
                 Thm_s[idx_l] = Thm_s[idx_l] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) / dz_val;
 
                 dfz_above = dfz_cur;
                 thm_w_above = thm_w_m;
             }
             float dz_0 = dz_c[col_dz];
-            rho_s[tid] = max(rho_s[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-5f);
+            rho_s[tid] = max(rho_s[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-8f);
             Thm_s[tid] = Thm_s[tid] - beta * dt_ac * (thm_w_above * dfz_above) / dz_0;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2894,7 +2894,7 @@ kernel void crm_2d_stage_prep_simd(
     float q_cur = 1.0f + q_n_in[tid] + q_p_in[tid];
     float u_cur = u_s[tid];
     float v_cur = v_s[tid];
-    float thm_cur = T_cur / max(r_cur, 1.0e-5f);
+    float thm_cur = T_cur / max(r_cur, 1.0e-8f);
     float p_cur = p_ref * pow(max((r_d * T_cur) / p_ref, 1.0e-7f), gamma_d);
     float dp_cur = gamma_d * p_cur / max(T_cur, 1.0e-3f);
     float ap_cur = p_cur - dp_cur * T_cur;
@@ -2923,7 +2923,7 @@ kernel void crm_2d_stage_prep_simd(
             q_next = 1.0f + q_n_in[idx_n] + q_p_in[idx_n];
             u_next = u_s[idx_n];
             v_next = v_s[idx_n];
-            thm_next = T_next / max(r_next, 1.0e-5f);
+            thm_next = T_next / max(r_next, 1.0e-8f);
             float p_n = p_ref * pow(max((r_d * T_next) / p_ref, 1.0e-7f), gamma_d);
             dp_next = gamma_d * p_n / max(T_next, 1.0e-3f);
             ap_next = p_n - dp_next * T_next;
@@ -2934,7 +2934,7 @@ kernel void crm_2d_stage_prep_simd(
         float r_xp1 = simd_shuffle(r_cur, l_xp1);
         float rtot_xp1 = simd_shuffle(rtot_cur, l_xp1);
         float rho_x_v = 0.5f * (r_cur + r_xp1);
-        float rtot_xi = 1.0f / max(0.5f * (rtot_cur + rtot_xp1), 1.0e-5f);
+        float rtot_xi = 1.0f / max(0.5f * (rtot_cur + rtot_xp1), 1.0e-8f);
 
         float th_xm1 = simd_shuffle(thm_cur, l_xm1);
         float th_xp1 = simd_shuffle(thm_cur, l_xp1);
@@ -3217,7 +3217,7 @@ kernel void crm_2d_fast_hevi_simd(
                 float dz_w_val = dz_w_int[um * dz_cols + col_dz];
                 float nh_imb = (p_blend - p_blend_prev) / dz_w_val + 0.5f * (rtot_blend + rtot_blend_prev) * gravity;
                 float rdw_m = w0_below.x;
-                float rtw_m = max(w0_below.y, 1.0e-5f);
+                float rtw_m = max(w0_below.y, 1.0e-8f);
                 float rhs_m = dt_ac * (
                     rdw_m * w0_below.w
                     - (rdw_m / rtw_m) * nh_imb
@@ -3255,7 +3255,7 @@ kernel void crm_2d_fast_hevi_simd(
                 uint w_idx = (um + 1u) * M + tid;
                 float fz_old_m = rdw_m * (first_ac ? w0_in[w_idx] : w_s[w_idx]);
                 float fz_new_m = fz_old_m + dfz_cur;
-                w_s[w_idx] = fz_new_m / max(rdw_m, 1.0e-5f);
+                w_s[w_idx] = fz_new_m / max(rdw_m, 1.0e-8f);
                 if (accum != 0u) {
                     float fz_val = fz_old_m + beta * dfz_cur;
                     float fz_sum = first_ac ? fz_val : (fz_acc[w_idx] + fz_val);
@@ -3266,14 +3266,14 @@ kernel void crm_2d_fast_hevi_simd(
                 uint idx_l = k_layer * M + tid;
                 float thm_w_m = w0_m.z;
                 float dz_val = dz_c[k_layer * dz_cols + col_dz];
-                rho_s[idx_l] = max(rho_s[idx_l] - beta * dt_ac * (dfz_above - dfz_cur) / dz_val, 1.0e-5f);
+                rho_s[idx_l] = max(rho_s[idx_l] - beta * dt_ac * (dfz_above - dfz_cur) / dz_val, 1.0e-8f);
                 Thm_s[idx_l] = Thm_s[idx_l] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) / dz_val;
 
                 dfz_above = dfz_cur;
                 thm_w_above = thm_w_m;
             }
             float dz_0 = dz_c[col_dz];
-            rho_s[tid] = max(rho_s[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-5f);
+            rho_s[tid] = max(rho_s[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-8f);
             Thm_s[tid] = Thm_s[tid] - beta * dt_ac * (thm_w_above * dfz_above) / dz_0;
         }
     }
@@ -3401,7 +3401,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
             float q_cur = 1.0f + q_n_in[tid] + q_p_in[tid];
             float u_cur = u_in[tid];
             float v_cur = v_in[tid];
-            float thm_cur = T_cur / max(r_cur, 1.0e-5f);
+            float thm_cur = T_cur / max(r_cur, 1.0e-8f);
             float p_cur = p_ref * exp2(gamma_d * log2(max(T_cur * inv_pref_rd, 1.0e-7f)));
             float dp_cur = gamma_d * p_cur / max(T_cur, 1.0e-3f);
             float ap_cur = p_cur - dp_cur * T_cur;
@@ -3439,7 +3439,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     q_next = 1.0f + q_n_in[idx_n] + q_p_in[idx_n];
                     u_next = u_in[idx_n];
                     v_next = v_in[idx_n];
-                    thm_next = T_next / max(r_next, 1.0e-5f);
+                    thm_next = T_next / max(r_next, 1.0e-8f);
                     float p_n = p_ref * exp2(gamma_d * log2(max(T_next * inv_pref_rd, 1.0e-7f)));
                     dp_next = gamma_d * p_n / max(T_next, 1.0e-3f);
                     ap_next = p_n - dp_next * T_next;
@@ -3450,7 +3450,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
                 float r_xp1 = simd_shuffle(r_cur, l_xp1);
                 float rtot_xp1 = simd_shuffle(rtot_cur, l_xp1);
                 float rho_x_v = 0.5f * (r_cur + r_xp1);
-                float rtot_xi = 1.0f / max(0.5f * (rtot_cur + rtot_xp1), 1.0e-5f);
+                float rtot_xi = 1.0f / max(0.5f * (rtot_cur + rtot_xp1), 1.0e-8f);
 
                 float th_xm1 = simd_shuffle(thm_cur, l_xm1);
                 float th_xp1 = simd_shuffle(thm_cur, l_xp1);
@@ -3607,7 +3607,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     float rtw = 0.5f * (rtot_prev + rtot_cur);
                     float thw = 0.5f * (thm_prev + thm_cur);
                     float inv_dz_wm = inv_dz_w[m * dz_cols + col_dz];
-                    float rdw_over_rtw = rdw / max(rtw, 1.0e-5f);
+                    float rdw_over_rtw = rdw / max(rtw, 1.0e-8f);
                     float spw_m = sponge_w[m];
 
                     float fac_p = bdt2 * (rdw_over_rtw * inv_dz_wm);
@@ -3762,11 +3762,11 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     float w_old_m = first_ac ? w_base[w_idx] : w_dst[w_idx];
                     float fz_old_m = rdw_m * w_old_m;
                     float fz_new_m = fz_old_m + dfz_cur;
-                    float w_new = fz_new_m / max(rdw_m, 1.0e-5f);
+                    float w_new = fz_new_m / max(rdw_m, 1.0e-8f);
 
                     float thm_w_m = w1_m.y;
                     float inv_dz_l = inv_dz_c[k_layer * dz_cols + col_dz];
-                    float r_nl = max(r_loc[k_layer] - beta * dt_ac * (dfz_above - dfz_cur) * inv_dz_l, 1.0e-5f);
+                    float r_nl = max(r_loc[k_layer] - beta * dt_ac * (dfz_above - dfz_cur) * inv_dz_l, 1.0e-8f);
                     float T_nl = T_loc[k_layer] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) * inv_dz_l;
                     r_loc[k_layer] = r_nl;
                     T_loc[k_layer] = T_nl;
@@ -3786,7 +3786,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     thm_w_above = thm_w_m;
                 }
                 float inv_dz_0 = inv_dz_c[col_dz];
-                float r_n0 = max(r_loc[0] - beta * dt_ac * dfz_above * inv_dz_0, 1.0e-5f);
+                float r_n0 = max(r_loc[0] - beta * dt_ac * dfz_above * inv_dz_0, 1.0e-8f);
                 float T_n0 = T_loc[0] - beta * dt_ac * (thm_w_above * dfz_above) * inv_dz_0;
                 r_loc[0] = r_n0;
                 T_loc[0] = T_n0;
@@ -4049,7 +4049,7 @@ kernel void crm_2d_fct_simd_pair(
 
         float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
         float div_fl = (fl_x_self - fl_x_xm1) * inv_dx + (fl_z_up - fl_z_dn) * inv_dz;
-        float rho_safe = max(rho_new[idx], 1.0e-5f);
+        float rho_safe = max(rho_new[idx], 1.0e-8f);
         float qt = max((rho_old[idx] * q_k - dt * div_fl) / rho_safe, 0.0f);
         q_td[k] = qt;
         r_p[k] = max(q_k, qt);
@@ -4089,7 +4089,7 @@ kernel void crm_2d_fct_simd_pair(
         float p_plus  = dt * ((max(ax_m, 0.0f) - min(ax0, 0.0f)) * inv_dx + (max(az_dn, 0.0f) - min(az_up, 0.0f)) * inv_dz);
         float p_minus = dt * ((max(ax0, 0.0f) - min(ax_m, 0.0f)) * inv_dx + (max(az_up, 0.0f) - min(az_dn, 0.0f)) * inv_dz);
 
-        float rho_safe = max(rho_new[idx], 1.0e-5f);
+        float rho_safe = max(rho_new[idx], 1.0e-8f);
         float q_plus  = rho_safe * max(q_max - q_td[k], 0.0f);
         float q_minus = rho_safe * max(q_td[k] - q_min, 0.0f);
 
@@ -4123,7 +4123,7 @@ kernel void crm_2d_fct_simd_pair(
 
         float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
         float div_anti = (ax_lim - ax_lim_m) * inv_dx + (az_lim_up - az_lim_dn) * inv_dz;
-        float rho_safe = max(rho_new[idx], 1.0e-5f);
+        float rho_safe = max(rho_new[idx], 1.0e-8f);
         if (active) {
             q_out[idx] = max(q_td[k] - (dt / rho_safe) * div_anti, 0.0f);
         }
@@ -4227,7 +4227,7 @@ kernel void crm_2d_fct_simd_quad(
 
         float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
         float div_fl = (fl_x_self - fl_x_xm1) * inv_dx + (fl_z_up - fl_z_dn) * inv_dz;
-        float rho_safe = max(rho_new[idx], 1.0e-5f);
+        float rho_safe = max(rho_new[idx], 1.0e-8f);
         float qt = max((rho_old[idx] * q_k - dt * div_fl) / rho_safe, 0.0f);
         q_td[k] = qt;
         r_p[k] = max(q_k, qt);
@@ -4266,7 +4266,7 @@ kernel void crm_2d_fct_simd_quad(
         float p_plus  = dt * ((max(ax_m, 0.0f) - min(ax0, 0.0f)) * inv_dx + (max(az_dn, 0.0f) - min(az_up, 0.0f)) * inv_dz);
         float p_minus = dt * ((max(ax0, 0.0f) - min(ax_m, 0.0f)) * inv_dx + (max(az_up, 0.0f) - min(az_dn, 0.0f)) * inv_dz);
 
-        float rho_safe = max(rho_new[idx], 1.0e-5f);
+        float rho_safe = max(rho_new[idx], 1.0e-8f);
         float q_plus  = rho_safe * max(q_max - q_td[k], 0.0f);
         float q_minus = rho_safe * max(q_td[k] - q_min, 0.0f);
 
@@ -4299,7 +4299,7 @@ kernel void crm_2d_fct_simd_quad(
 
         float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
         float div_anti = (ax_lim - ax_lim_m) * inv_dx + (az_lim_up - az_lim_dn) * inv_dz;
-        float rho_safe = max(rho_new[idx], 1.0e-5f);
+        float rho_safe = max(rho_new[idx], 1.0e-8f);
         if (active) {
             q_out[idx] = max(q_td[k] - (dt / rho_safe) * div_anti, 0.0f);
         }
@@ -4557,7 +4557,7 @@ kernel void scvt_storm_smag_cell(
     for (uint k = 0u; k < nz; ++k) {
         uint eb = k * ne;
         uint idx = k * nc + c;
-        float inv_m = 1.0f / max(rho_d[idx] * dz_c[idx], 1.0e-5f);
+        float inv_m = 1.0f / max(rho_d[idx] * dz_c[idx], 1.0e-8f);
         float dqn = w0 * flx_qn[eb + e0] + w1 * flx_qn[eb + e1] + w2 * flx_qn[eb + e2]
                   + w3 * flx_qn[eb + e3] + w4 * flx_qn[eb + e4] + w5 * flx_qn[eb + e5];
         float dth = w0 * flx_th[eb + e0] + w1 * flx_th[eb + e1] + w2 * flx_th[eb + e2]

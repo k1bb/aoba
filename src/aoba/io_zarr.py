@@ -184,6 +184,17 @@ def export_aoba_snapshot_xarray(
             data_vars["sprite_red_1pn2_kr"] = (("time", "n_cell"), _c1(model.last_red_sprites.red_1pn2_kr_cell), {"units": "kR"})
             data_vars["sprite_z_init_km"] = (("time", "n_cell"), _c1(model.last_red_sprites.z_init_km_cell), {"units": "km"})
             data_vars["sprite_z_stop_km"] = (("time", "n_cell"), _c1(model.last_red_sprites.z_stop_km_cell), {"units": "km"})
+            if getattr(model.last_red_sprites, "elves_rate_cell", None) is not None:
+                data_vars["elves_rate"] = (("time", "n_cell"), _c1(model.last_red_sprites.elves_rate_cell), {"units": "elves m-2 s-1"})
+            if getattr(model.last_red_sprites, "blue_jet_rate_cell", None) is not None:
+                data_vars["blue_jet_rate"] = (("time", "n_cell"), _c1(model.last_red_sprites.blue_jet_rate_cell), {"units": "jets m-2 s-1"})
+            if getattr(model.last_red_sprites, "gigantic_jet_rate_cell", None) is not None:
+                data_vars["gigantic_jet_rate"] = (("time", "n_cell"), _c1(model.last_red_sprites.gigantic_jet_rate_cell), {"units": "jets m-2 s-1"})
+        if getattr(model, "meso_nox", None) is not None:
+            data_vars["nox_meso_ppbv"] = (("time", "n_cell"), _c1(model.meso_nox.nox_meso_ppbv), {"units": "ppbv"})
+            data_vars["nlc_frac"] = (("time", "n_cell"), _c1(model.meso_nox.nlc_frac), {"units": "1"})
+            data_vars["nlc_iwc_mg_m3"] = (("time", "n_cell"), _c1(model.meso_nox.nlc_iwc_mg_m3), {"units": "mg m-3"})
+            data_vars["t_mesopause_k"] = (("time", "n_cell"), _c1(model.meso_nox.t_mesopause_k), {"units": "K"})
         if getattr(model, "volcanic_solar", None) is not None:
             from aoba.volcanic_solar import K_EXT_SW_M2_KG
 

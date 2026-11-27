@@ -270,7 +270,7 @@ def fct_advect_3d(
         + (fl_y - torch.roll(fl_y, shifts=1, dims=-2)) / dy
     )
     rhs_m = torch.clamp(rho_old * dz * q - dt * dz * div_fl_h, min=0.0)
-    rho_safe = torch.clamp(rho_new, min=1.0e-5)
+    rho_safe = torch.clamp(rho_new, min=1.0e-8)
     fz_int = fz[1:-1]
     fz_pos = torch.clamp(fz_int, min=0.0)
     fz_neg = torch.clamp(fz_int, max=0.0)
@@ -579,8 +579,8 @@ def _crm_fast_acoustic_hevi_torch(
     fz_acc = torch.zeros_like(w0)
     inv_dx = 1.0 / dx
     inv_dy = 1.0 / dy
-    rho_dw_safe = torch.clamp(rho_dw, min=1.0e-5)
-    rho_tot_w_safe = torch.clamp(rho_tot_w, min=1.0e-5)
+    rho_dw_safe = torch.clamp(rho_dw, min=1.0e-8)
+    rho_tot_w_safe = torch.clamp(rho_tot_w, min=1.0e-8)
     K_tri = diag.shape[0]
 
     for _ in range(n_ac):
@@ -601,7 +601,7 @@ def _crm_fast_acoustic_hevi_torch(
 
         fz_old = torch.zeros_like(w_k)
         fz_old[1:-1] = rho_dw * w_k[1:-1]
-        thm_live = Thm_k / torch.clamp(rho_k, min=1.0e-5)
+        thm_live = Thm_k / torch.clamp(rho_k, min=1.0e-8)
         w_int_live = w_k[1:-1]
         # Centered live vertical theta_m transport for all acoustic/gravity waves (CFL <= 0.25)
         # to eliminate spurious downward thermal diffusion across the sharp stratospheric d(theta)/dz,
@@ -659,7 +659,7 @@ def _crm_fast_acoustic_hevi_torch(
 
         rho_next = torch.clamp(
             rho_dag - beta_hevi * dt_ac * (fz_new[1:] - fz_old[1:] - (fz_new[:-1] - fz_old[:-1])) / dz_c,
-            min=1.0e-5,
+            min=1.0e-8,
         )
         dfTh_z = torch.zeros_like(w_k)
         dfTh_z[1:-1] = thm_w * dfz
@@ -731,7 +731,7 @@ def step_crm_rk3_hevi(
     if sgs_in is not None:
         du_sgs, dv_sgs, dw_sgs, dThm_sgs = sgs_in
     else:
-        thm_for_sgs = (Thm0 / torch.clamp(rho0, min=1.0e-5)) if (Thm_in is not None and not update_theta_m) else crm.theta_m
+        thm_for_sgs = (Thm0 / torch.clamp(rho0, min=1.0e-8)) if (Thm_in is not None and not update_theta_m) else crm.theta_m
         du_sgs, dv_sgs, dw_sgs, dThm_sgs = _compute_3d_sgs_tendencies(
             rho0, u0, v0, w0, thm_for_sgs, dx, dy, dz_c, dz_w_int
         )
@@ -791,7 +791,7 @@ def step_crm_rk3_hevi(
     f_cor = None  # Handled above via dimension-aware 1D/2D=0 or 3D perturbation-only Coriolis
 
     for stage_idx, dtau in enumerate(rk_taus):
-        thm_s = Thm_s / torch.clamp(rho_s, min=1.0e-5)
+        thm_s = Thm_s / torch.clamp(rho_s, min=1.0e-8)
         pres_s = C.P_REF * torch.pow(
             torch.clamp(C.R_D * Thm_s / C.P_REF, min=1.0e-7),
             gamma,
@@ -802,8 +802,8 @@ def step_crm_rk3_hevi(
         # Stage-frozen edge densities & effective flux-form potential temperatures
         rho_x = 0.5 * (rho_s + torch.roll(rho_s, -1, -1))
         rho_y = 0.5 * (rho_s + torch.roll(rho_s, -1, -2))
-        rtot_x_inv = 1.0 / torch.clamp(0.5 * (rho_tot_s + torch.roll(rho_tot_s, -1, -1)), min=1.0e-5)
-        rtot_y_inv = 1.0 / torch.clamp(0.5 * (rho_tot_s + torch.roll(rho_tot_s, -1, -2)), min=1.0e-5)
+        rtot_x_inv = 1.0 / torch.clamp(0.5 * (rho_tot_s + torch.roll(rho_tot_s, -1, -1)), min=1.0e-8)
+        rtot_y_inv = 1.0 / torch.clamp(0.5 * (rho_tot_s + torch.roll(rho_tot_s, -1, -2)), min=1.0e-8)
 
         thm_xm1 = torch.roll(thm_s, 1, -1)
         thm_xp1 = torch.roll(thm_s, -1, -1)
@@ -991,7 +991,7 @@ def step_crm_physics_and_dynamics(
             eta = torch.randn((k_pbl, n_col, ny, nx), device=crm.theta_m.device, dtype=crm.theta_m.dtype)
             rho_p = crm.rho_d[:k_pbl]
             rho_eta_mean = (rho_p * eta).mean(dim=(-2, -1), keepdim=True) / torch.clamp(
-                rho_p.mean(dim=(-2, -1), keepdim=True), min=1.0e-5
+                rho_p.mean(dim=(-2, -1), keepdim=True), min=1.0e-8
             )
             crm.theta_m[:k_pbl].add_((sigma_th * w_z) * (eta - rho_eta_mean))
 
@@ -1259,7 +1259,7 @@ def _step_crm_physics_and_dynamics_impl(
             rho_start = crm.rho_d if ((k_cnt == 1 or can_fuse_sub) and no_clone_pp) else crm.rho_d.clone()
             if k_cnt == 1 or can_fuse_sub:
                 if sgs_cached is None or (s_idx % sgs_stride == 0):
-                    thm_sgs = crm.theta_m if s_idx == 0 else (Thm_cur / torch.clamp(crm.rho_d, min=1.0e-5))
+                    thm_sgs = crm.theta_m if s_idx == 0 else (Thm_cur / torch.clamp(crm.rho_d, min=1.0e-8))
                     sgs_cached = _compute_3d_sgs_tendencies(
                         crm.rho_d, crm.u, crm.v, crm.w, thm_sgs, crm.dx, crm.dy, dz_c_sgs, dz_w_sgs,
                         dt_sub=dt_sub,
@@ -1278,7 +1278,7 @@ def _step_crm_physics_and_dynamics_impl(
                 for sub_i in range(k_cnt):
                     cur_s = s_idx + sub_i
                     if sgs_cached is None or (cur_s % sgs_stride == 0):
-                        thm_sgs = crm.theta_m if cur_s == 0 else (Thm_cur / torch.clamp(crm.rho_d, min=1.0e-5))
+                        thm_sgs = crm.theta_m if cur_s == 0 else (Thm_cur / torch.clamp(crm.rho_d, min=1.0e-8))
                         sgs_cached = _compute_3d_sgs_tendencies(
                             crm.rho_d, crm.u, crm.v, crm.w, thm_sgs, crm.dx, crm.dy, dz_c_sgs, dz_w_sgs,
                             dt_sub=dt_sub,

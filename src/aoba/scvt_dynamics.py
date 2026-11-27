@@ -314,7 +314,7 @@ def apply_scvt_storm_smagorinsky(
 
     m = state.rho_d * state.dz_c
     m_e = 0.5 * (m[:, c0] + m[:, c1])
-    inv_m = 1.0 / torch.clamp(m, min=1.0e-5)
+    inv_m = 1.0 / torch.clamp(m, min=1.0e-7)
 
     # 1. Monotone mass-conserving moisture mixing (preserves discrete maximum principle & q_n >= 0)
     flx_qn = -(dt * kh_sc) * m_e * ((state.q_n[:, c1] - state.q_n[:, c0]) / dc_e)
@@ -551,7 +551,7 @@ def _scvt_fast_acoustic_hevi_cpu_gpu(
 
     uh_accum = torch.zeros_like(u0)
     om_accum = torch.zeros_like(w0)
-    rho_dw_safe = torch.clamp(rho_dw, min=1.0e-5)
+    rho_dw_safe = torch.clamp(rho_dw, min=1.0e-8)
 
     for _ in range(n_ac):
         p_k = pres_s + dp_dThm_s * (Thm_k - Thm_s)
@@ -689,7 +689,7 @@ def _scvt_rk3_stage_prep_core(
 
     m_edge = 0.5 * (m_s[:, c0] + m_s[:, c1])
     thm_e = 0.5 * (thm_s[:, c0] + thm_s[:, c1]) - 0.15 * torch.sign(u_s) * (thm_s[:, c1] - thm_s[:, c0])
-    rtot_e = torch.clamp(0.5 * (rtot_s[:, c0] + rtot_s[:, c1]), min=1.0e-5)
+    rtot_e = torch.clamp(0.5 * (rtot_s[:, c0] + rtot_s[:, c1]), min=1.0e-8)
     dz_10 = z_c[:, c1] - z_c[:, c0]
     a0 = -0.5 * (rtot_s[:, c0] * C.GRAVITY / torch.clamp(pres_s[:, c0], min=0.1)) * dz_10
     a1 = +0.5 * (rtot_s[:, c1] * C.GRAVITY / torch.clamp(pres_s[:, c1], min=0.1)) * dz_10
@@ -725,7 +725,7 @@ def _scvt_rk3_stage_prep_core(
     tend_u_slow = rot_acc - grad_ke + vadv_u + visc_u + du_ext
 
     rho_dw = 0.5 * (rho_s[:-1] + rho_s[1:])
-    rtot_w = torch.clamp(0.5 * (rtot_s[:-1] + rtot_s[1:]), min=1.0e-5)
+    rtot_w = torch.clamp(0.5 * (rtot_s[:-1] + rtot_s[1:]), min=1.0e-8)
     thm_w = 0.5 * (thm_s[:-1] + thm_s[1:])
 
     fac_p = ((beta_hevi * dt_ac) ** 2) * (rho_dw / (rtot_w * dz_w_int))
@@ -1072,14 +1072,14 @@ def _step_scvt_rk3_hevi_impl(
 
                 m_next = torch.clamp(
                     m_dag - beta_hevi * dt_ac * (om_new[1:] - om_old[1:] - (om_new[:-1] - om_old[:-1])),
-                    min=1.0e-3,
+                    min=1.0e-5,
                 )
                 dfTh_z = torch.zeros_like(w_k)
                 dfTh_z[1:-1] = thm_w * dom
                 Thm_next = Thm_dag - beta_hevi * dt_ac * (dfTh_z[1:] - dfTh_z[:-1])
 
                 w_next = torch.zeros_like(w_k)
-                w_next[1:-1] = udotz_next + om_new[1:-1] / torch.clamp(rho_dw, min=1.0e-5)
+                w_next[1:-1] = udotz_next + om_new[1:-1] / torch.clamp(rho_dw, min=1.0e-8)
 
                 if stage_idx == 2:
                     uh_accum = uh_accum + uh_k
@@ -1145,7 +1145,7 @@ def compute_held_suarez_forcing(
     ks = 1.0 / (4.0 * C.SECONDS_PER_DAY)
     kt = ka + (ks - ka) * torch.clamp((sigma - 0.7) / (1.0 - 0.7), min=0.0) * cos4
 
-    p_norm = torch.clamp(pres / C.P_REF, min=1.0e-5)
+    p_norm = torch.clamp(pres / C.P_REF, min=1.0e-8)
     theta_eq_raw = 315.0 - 60.0 * sin2 - 10.0 * torch.log(p_norm) * cos2
     t_eq = torch.clamp(theta_eq_raw * exner, min=200.0)
     theta_eq = t_eq / exner

@@ -149,12 +149,20 @@ def step_prognostic_ozone(
     fire_c_cell_kgc_m2s: torch.Tensor | None = None,
     uv_j_o2_scale: float = 1.0,
     volc_sad_um2_cm3: torch.Tensor | None = None,
+    nox_vmr_3d: torch.Tensor | None = None,
+    z_c: torch.Tensor | None = None,
 ) -> None:
     """Advance 3D prognostic ozone chemistry & dry deposition by one host timestep `dt` [s].
 
     Uses exact Riccati-exponential integration (unconditionally stable, positivity-preserving,
     zero Forward Euler, zero GPU-starving Python loops).
     """
+    need_pert = (
+        volc_sad_um2_cm3 is not None
+        or abs(float(uv_j_o2_scale) - 1.0) > 1.0e-5
+        or nox_vmr_3d is not None
+        or (z_c is not None and float(z_c.shape[0]) > 0)
+    )
     if can_use_crm_metal(pres_c) and pres_c.numel() > 0:
         o3_new, tco_du, o3_sfc, drydep, chem_net = dispatch_ozone_chem_metal(
             o3_vmr=oz.o3_vmr,
@@ -177,13 +185,16 @@ def step_prognostic_ozone(
             surf_ocean_id=int(SURF_OCEAN),
         )
         oz.o3_vmr = o3_new
-        if volc_sad_um2_cm3 is not None or abs(float(uv_j_o2_scale) - 1.0) > 1.0e-5:
-            _apply_volcanic_solar_ozone_pert(oz, pres_c, temp_c, rho_d, dz_c, mu0, dt, ecl_ppbv, uv_j_o2_scale, volc_sad_um2_cm3)
+        oz.o3_drydep_kgm2s = drydep
+        oz.o3_chem_net_kgm2s = chem_net
+        if need_pert:
+            _apply_volcanic_solar_ozone_pert(
+                oz, pres_c, temp_c, rho_d, dz_c, mu0, dt, ecl_ppbv, uv_j_o2_scale, volc_sad_um2_cm3,
+                n2o_ppmv=n2o_ppmv, nox_vmr_3d=nox_vmr_3d, z_c=z_c,
+            )
         else:
             oz.tco_du = tco_du
             oz.o3_sfc_ppbv = o3_sfc
-            oz.o3_drydep_kgm2s = drydep
-            oz.o3_chem_net_kgm2s = chem_net
         return
 
     nz, nc = pres_c.shape
@@ -334,13 +345,16 @@ def step_prognostic_ozone(
     chem_net_kgm2s = ((chi_new - chi0) * M_O3_OVER_AIR * dm).sum(dim=0) / max(dt, 1.0)
 
     oz.o3_vmr = chi_new
-    if volc_sad_um2_cm3 is not None or abs(float(uv_j_o2_scale) - 1.0) > 1.0e-5:
-        _apply_volcanic_solar_ozone_pert(oz, pres_c, temp_c, rho_d, dz_c, mu0, dt, ecl_ppbv, uv_j_o2_scale, volc_sad_um2_cm3)
+    oz.o3_drydep_kgm2s = drydep_kgm2s
+    oz.o3_chem_net_kgm2s = chem_net_kgm2s
+    if need_pert:
+        _apply_volcanic_solar_ozone_pert(
+            oz, pres_c, temp_c, rho_d, dz_c, mu0, dt, ecl_ppbv, uv_j_o2_scale, volc_sad_um2_cm3,
+            n2o_ppmv=n2o_ppmv, nox_vmr_3d=nox_vmr_3d, z_c=z_c,
+        )
     else:
         oz.tco_du = tco_du
         oz.o3_sfc_ppbv = chi_new[0] * 1.0e9
-        oz.o3_drydep_kgm2s = drydep_kgm2s
-        oz.o3_chem_net_kgm2s = chem_net_kgm2s
 
 
 def _apply_volcanic_solar_ozone_pert(
@@ -354,17 +368,23 @@ def _apply_volcanic_solar_ozone_pert(
     ecl_ppbv: float,
     uv_j_o2_scale: float,
     volc_sad_um2_cm3: torch.Tensor | None,
+    *,
+    n2o_ppmv: float = N2O_PI_PPMV,
+    nox_vmr_3d: torch.Tensor | None = None,
+    z_c: torch.Tensor | None = None,
 ) -> None:
-    """Apply volcanic sulfate heterogeneous O3 depletion & 11-yr solar UV modulation (exact exponential)."""
-    p_hpa = torch.clamp(pres_c * 0.01, min=0.1)
+    """Apply volcanic sulfate, solar UV, prognostic sprite/EPP NOx catalytic loss, & mesospheric O3 (exact exp)."""
+    p_pa = torch.clamp(pres_c, min=0.05)
+    p_hpa = p_pa * 0.01
     is_day = (mu0 > 1.0e-4).to(pres_c.dtype).unsqueeze(0)
+    t_k = torch.clamp(temp_c, min=115.0, max=350.0)
     chi = oz.o3_vmr
     if volc_sad_um2_cm3 is not None:
         # Volcanic sulfate heterogeneous halogen activation (Solomon et al., 1996, JGR):
         # Accelerates ClOx/BrOx destruction on sunlit cold stratospheric sulfate surfaces (10-150 hPa).
         ecl_fac = max(float(ecl_ppbv), 0.1) / ECL_REF_PPBV
         p_win = torch.sigmoid((180.0 - p_hpa) / 20.0) * torch.sigmoid((p_hpa - 8.0) / 3.0)
-        t_cold = torch.sigmoid((215.0 - temp_c) / 6.0)
+        t_cold = torch.sigmoid((215.0 - t_k) / 6.0)
         k_volc = (1.0 / (60.0 * C.SECONDS_PER_DAY)) * (ecl_fac * ecl_fac) * torch.clamp(volc_sad_um2_cm3 / 20.0, 0.0, 6.0) * is_day * p_win * t_cold
         chi = chi * torch.exp(-torch.clamp(k_volc * float(dt), min=0.0, max=5.0))
     if abs(float(uv_j_o2_scale) - 1.0) > 1.0e-5:
@@ -372,6 +392,47 @@ def _apply_volcanic_solar_ozone_pert(
         p_uv = torch.sigmoid((40.0 - p_hpa) / 8.0) * torch.sigmoid((p_hpa - 0.5) / 0.5)
         k_uv = (float(uv_j_o2_scale) - 1.0) * (1.0 / (15.0 * C.SECONDS_PER_DAY)) * is_day * p_uv
         chi = chi * torch.exp(torch.clamp(k_uv * float(dt), min=-0.2, max=0.2))
+    if nox_vmr_3d is not None:
+        # Bidirectional Sprite-NOx & Polar-Vortex EPP-NOx catalytic O3 destruction (Sentman et al., 2008;
+        # Arnone et al., 2014; Brasseur & Solomon, 2005, Sec. 5.3):
+        # Computes excess prognostic NOx above baseline stratospheric N2O-derived NOx equilibrium and
+        # applies exact exponential catalytic loss (2 * k_{NO2+O} * [NO2] * [O]/[O3]) across 18-88 km.
+        n2o_fac = max(float(n2o_ppmv), 0.01) / N2O_PI_PPMV
+        f_strat_n = torch.sigmoid((130.0 - p_hpa) / 25.0)
+        nox_bg = (
+            5.4e-9 * n2o_fac * torch.exp(-((torch.log(torch.clamp(p_hpa, min=0.05) / 6.0)) / 1.65) ** 2) * f_strat_n
+            + 6.0e-10 * torch.sigmoid((0.5 - p_hpa) / 0.25)
+        )
+        nox_excess = torch.clamp(nox_vmr_3d - nox_bg, min=0.0, max=5.0e-7)
+        m_cm3 = (p_pa / (K_BOLTZMANN * t_k)) * 1.0e-6
+        k2 = 6.0e-34 * torch.pow(300.0 / t_k, 2.4)
+        k_no2_o = 5.1e-12 * torch.exp(210.0 / t_k)
+        # Effective atomic-O / O3 ratio (active in sunlit stratosphere/mesosphere; small twilight/night residual >65 km)
+        j_o3_eff = is_day * (J_O3_HT_0 * torch.exp(-torch.clamp(p_hpa / 2.5, max=20.0)) + J_O3_CH_0)
+        o_over_o3_n = torch.clamp(j_o3_eff / torch.clamp(k2 * (O2_VMR * m_cm3) * m_cm3, min=1.0e-30), max=50.0)
+        # Nighttime mesospheric NO + O3 -> NO2 + O2 direct titration active above 55 km even during darkness
+        k_no_o3_night = 3.0e-12 * torch.exp(-1500.0 / t_k) * (1.0 - is_day) * torch.sigmoid((0.6 - p_hpa) / 0.2)
+        l_nox_cat = f_strat_n * (
+            2.0 * k_no2_o * (0.45 * nox_excess * m_cm3) * o_over_o3_n
+            + k_no_o3_night * (nox_excess * m_cm3)
+        )
+        chi = chi * torch.exp(-torch.clamp(l_nox_cat * float(dt), min=0.0, max=3.0))
+    if z_c is not None:
+        # Mesospheric HOx diurnal suppression & nighttime secondary ozone maximum (72-88 km; Brasseur & Solomon 2005):
+        # Active strictly in the upper mesosphere (z > 65 km, zero effect on low-top runs where z_top <= 65 km).
+        z_km = z_c * 1.0e-3
+        w_sec = torch.sigmoid((z_km - 72.0) / 3.0) * torch.sigmoid((90.0 - z_km) / 3.0)
+        # Nighttime atomic-O recombination O + O2 + M -> O3 + M forms ~3.5 ppmv secondary peak at 80-86 km;
+        # daytime Hartley UV + HOx photolysis suppresses mesospheric O3 to ~0.25 ppmv.
+        nox_mod = (
+            1.0 / (1.0 + torch.clamp(nox_vmr_3d * 1.0e9 / 25.0, min=0.0, max=4.0))
+            if nox_vmr_3d is not None
+            else torch.ones_like(chi)
+        )
+        chi_meso_target = (0.25e-6 * is_day + 3.5e-6 * (1.0 - is_day) * nox_mod)
+        tau_meso_s = 1200.0 * is_day + 2400.0 * (1.0 - is_day)
+        relax_m = -torch.expm1(-torch.clamp(w_sec * float(dt) / tau_meso_s, min=0.0, max=10.0))
+        chi = chi + (chi_meso_target - chi) * relax_m
     chi = torch.clamp(chi, min=1.0e-10, max=4.0e-5)
     oz.o3_vmr = chi
     dm = torch.clamp(rho_d * dz_c, min=1.0e-5)

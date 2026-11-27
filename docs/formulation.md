@@ -802,9 +802,20 @@ Optical intensities of the crimson $\mathrm{N}_2$ 1st Positive band ($1\mathrm{P
 $$
 \begin{aligned}
 Q_{1P}(z) &= \frac{A_{1P}}{A_{1P} + k_{q,1P} f_{\mathrm{N}_2} N(z)}, \qquad Q_{2P}(z) = \frac{A_{2P}}{A_{2P} + k_{q,2P} f_{\mathrm{O}_2} N(z)}, \\
-S_{\mathrm{NOx,sprite}} &= \mathcal{F}_{\mathrm{sprite}}\,Y_{\mathrm{NOx}}\,\operatorname{clamp}\!\left(\frac{z_{\mathrm{init}} - z_{\mathrm{stop}}}{25\ \mathrm{km}},\ 0.3,\ 2.0\right)
+S_{\mathrm{NOx,TLE}} &= \mathcal{F}_{\mathrm{sprite}}\,Y_{\mathrm{NOx,sp}}\,\operatorname{clamp}\!\left(\frac{z_{\mathrm{init}} - z_{\mathrm{stop}}}{25\ \mathrm{km}},\ 0.3,\ 2.0\right) + \mathcal{F}_{\mathrm{GJ}}\,Y_{\mathrm{NOx,GJ}}
 \end{aligned} \tag{5.27}
 $$
+
+In addition to sprites and halos, the same TLE module evaluates EMP-driven ELVES at the nighttime D-region base (Inan et al., 1991; Barrington-Leigh & Inan, 1999; threshold $E_{\mathrm{EMP}} \ge 0.45\,E_k(z_{\mathrm{ion}})$ over return-stroke velocity $v_{\mathrm{rs}} = 1.5\times 10^8\ \mathrm{m\ s^{-1}}$, slant ring distance $R = 150\ \mathrm{km}$, and log-normal peak-current spread $\sigma_{\ln,I} = 0.72$), stratospheric Blue Jets escaping overshooting cloud tops ($z_{\mathrm{cld}} \gtrsim 11.5\ \mathrm{km}$) against $E_{\mathrm{st}}^+(z_{\mathrm{cld}})$, and cloud-to-ionosphere Gigantic Jets (Pasko et al., 2002; Krehbiel et al., 2008; $Y_{\mathrm{NOx,GJ}} = 5\times 10^{23}\ \mathrm{molecules\ GJ^{-1}}$) bridging tall nocturnal convective tops ($z_{\mathrm{cld}} \gtrsim 14.2\ \mathrm{km}$) to the lower ionosphere:
+
+$$
+\begin{aligned}
+E_{\mathrm{EMP}} &= \frac{\mu_0 v_{\mathrm{rs}} I_{\mathrm{peak}}}{2\pi R}\sin\theta\,\exp(-3.2\,f_{\mathrm{day}}), \\
+\mathcal{F}_{\mathrm{ELVES}} &= \mathcal{F}_{\mathrm{CG}}\,\frac{1}{2}\operatorname{erfc}\!\left(\frac{\ln(I_{\mathrm{crit}} / I_{\mathrm{med}})}{\sqrt{2}\,\sigma_{\ln,I}}\right), \qquad \mathcal{F}_{\mathrm{GJ}} = \mathcal{F}_{\mathrm{BJ}}\cdot 0.14\,\sigma\!\left(\frac{z_{\mathrm{cld}} - 14.2}{0.85}\right)(1 - 0.85\,f_{\mathrm{day}})\,\min\!\left(\frac{P_{\mathrm{halo}}}{0.05}, 1.5\right)
+\end{aligned} \tag{5.28}
+$$
+
+When `z_top >= 70 km`, the TLE grid interpolates AOBA's resolved mesospheric density $\rho(z)$ directly rather than extrapolating above the lid, and when `lightning_scheme = "explicit_bulk"` resolves 3D hydrometeor charge on all columns, $z_Q$ and positive-CG polarity bias are diagnosed from the resolved 3D charge distribution.
 
 ---
 
@@ -1915,6 +1926,37 @@ $$
 $$
 
 Pair-conservative implicit vertical PBL mixing over the lowest six layers ($h_{\mathrm{PBL}} = 1500\ \mathrm{m}$) and exponential stratospheric perturbations from volcanic sulfate surface-area density $\mathrm{SAD}$ (Solomon et al., 1996) and the 11-year solar UV multiplier $s_{\mathrm{UV}}$ follow immediately.
+
+#### 10.2.1 High-Top Mesosphere, Non-LTE Radiation, Prognostic $\mathrm{NO}_x \leftrightarrow \mathrm{O}_3$ Coupling & Noctilucent Clouds (`src/aoba/mesosphere.py`)
+
+When `z_top >= 68 km` (default `90 km` in the high-top spinup and flagship presets, resolving 10 mesospheric layers above 50 km within $N_z = 64$), four mesospheric processes activate automatically alongside non-orographic gravity-wave drag (Sec. 8.5) so the summer-to-winter mesospheric residual circulation, cold summer polar mesopause ($T < 150\ \mathrm{K}$), and bidirectional TLE–$\mathrm{NO}_x$–$\mathrm{O}_3$ coupling emerge without prescribed geographic maps.
+
+Above $\sim 57\ \mathrm{km}$ ($p < 0.35\ \mathrm{hPa}$), local thermodynamic equilibrium (LTE) breaks down in the $\mathrm{CO}_2$ $15\ \mathrm{\mu m}$ band. Using a smooth log-pressure blend $w_{\mathrm{nLTE}} = \sigma\big((-0.456 - \log_{10} p_{\mathrm{hPa}})/0.18\big)\,\sigma\big((2.5 - p_{\mathrm{hPa}})/0.35\big)$ (strictly $< 10^{-4}$ below $40\ \mathrm{km}$), AOBA blends LTE radiative heating with Fomichev et al. (1998) non-LTE $\mathrm{CO}_2$ $15\ \mathrm{\mu m}$ cooling (collisional quenching by air and atomic oxygen $\mathrm{O}(^3\mathrm{P})$ against Einstein $A_{15} = 1.35\ \mathrm{s^{-1}}$) and Strobel (1978) / Mlynczak & Solomon (1993) $\mathrm{O}_3$ Hartley–Huggins and $\mathrm{O}_2$ Schumann–Runge UV heating with chemical airglow efficiency $\varepsilon_{\mathrm{chem}}(p)$:
+
+$$
+\begin{aligned}
+\Lambda_{\mathrm{nLTE}} &= \frac{k_{\mathrm{CO_2\text{-}M}} M + k_{\mathrm{CO_2\text{-}O}} [\mathrm{O}]}{k_{\mathrm{CO_2\text{-}M}} M + k_{\mathrm{CO_2\text{-}O}} [\mathrm{O}] + A_{15}\phi_{\mathrm{esc}}}, \\
+Q_{\mathrm{rad,eff}} &= (1 - w_{\mathrm{nLTE}})\,Q_{\mathrm{rad,LTE}} + w_{\mathrm{nLTE}}\big(Q_{\mathrm{CO_2,nLTE}}(\Lambda_{\mathrm{nLTE}}, T, \mathrm{CO}_2) + Q_{\mathrm{UV,O_3}}(\chi_{\mathrm{O_3}}, \varepsilon_{\mathrm{chem}}) + Q_{\mathrm{UV,O_2}}\big)
+\end{aligned} \tag{10.2a}
+$$
+
+Above $60\ \mathrm{km}$, Sutherland-law kinematic molecular viscosity $\nu_{\mathrm{mol}} = \mu(T)/\rho$ and thermal diffusivity $\kappa_{\mathrm{mol}} = \nu_{\mathrm{mol}}/\mathrm{Pr}$ ($\mathrm{Pr} = 0.71$) are integrated on `theta_m` and `u_edge` via unconditionally stable increment-form implicit tridiagonal diffusion:
+
+$$
+(\mathbf{I} + \mathbf{L}_{\mathrm{mol}})\,\Delta q = -\mathbf{L}_{\mathrm{mol}}\,q^n, \qquad \nu_{\mathrm{mol}} = \min\!\left(\frac{1.458\times 10^{-6}\,T^{3/2}}{\rho(T + 110.4)},\ 40\ \mathrm{m^2\ s^{-1}}\right)\sigma\!\left(\frac{z - 62\ \mathrm{km}}{4\ \mathrm{km}}\right) \tag{10.2b}
+$$
+
+When `enable_red_sprites = true` or `z_top >= 68 km`, a prognostic 3D reactive nitrogen tracer $\chi_{\mathrm{NOx}}$ (`q_nox`) is advected by the batched SCVT Zalesak FCT solver (`fct_advect_scvt_batch`) with sources from mesospheric red sprites and gigantic jets ($45$–$82\ \mathrm{km}$), tropospheric lightning $\mathrm{LNO}_x$, stratospheric $\mathrm{N}_2\mathrm{O}$ oxidation, and dipole polar-cap energetic particle precipitation ($\propto \sin^4\phi$ above $74\ \mathrm{km}$), balanced via exact exponential integration against sunlit mesospheric $\mathrm{NO}$ photolysis ($J_{\mathrm{NO,max}} = 4.5\times 10^{-6}\ \mathrm{s^{-1}}$, vanishing in polar night so polar-vortex subsidence transports $\mathrm{NO}_x$ downward) and tropospheric rainout:
+
+$$
+\chi_{\mathrm{NOx}}^{n+1} = \chi_{\mathrm{NOx}}^n + \left(\frac{P_{\mathrm{NOx}}}{L_{\mathrm{NOx}}} - \chi_{\mathrm{NOx}}^n\right)\big[-\operatorname{expm1}(-L_{\mathrm{NOx}}\Delta t)\big], \qquad \chi_{\mathrm{O_3}} \leftarrow \chi_{\mathrm{O_3}}\exp\!\big(-L_{\mathrm{NOx,cat}}(\chi_{\mathrm{NOx}}^{\mathrm{excess}})\,\Delta t\big) \tag{10.2c}
+$$
+
+In the upper mesosphere ($72$–$90\ \mathrm{km}$), daytime $\mathrm{HO}_x$ photolysis and nighttime atomic-oxygen recombination form the diurnal secondary ozone maximum, and Noctilucent / Polar Mesospheric Clouds (NLC / PMC) are diagnosed from resolved mesospheric water vapor and temperature via the Murphy & Koop (2005, Eq. 7) hexagonal-ice saturation ratio $S_{\mathrm{ice}} = e_{\mathrm{H_2O}} / e_{\mathrm{sat,ice}}(T)$:
+
+$$
+S_{\mathrm{ice}} = \frac{\chi_{\mathrm{H_2O}}\,p}{\exp\!\left(9.550426 - \frac{5723.265}{T} + 3.53068\ln T - 0.00728332\,T\right)}, \qquad f_{\mathrm{NLC}} = \mathbf{1}_{S_{\mathrm{ice,max}} > 1}\,\sigma\!\left(\frac{S_{\mathrm{ice,max}} - 1.15}{0.25}\right) \tag{10.2d}
+$$
 
 ### 10.3 Map-Free Mineral Dust (`src/aoba/dust.py`)
 

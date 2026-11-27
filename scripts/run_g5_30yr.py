@@ -421,6 +421,11 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
             if model.ozone is not None
             else None
         ),
+        "meso_nox": (
+            {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in model.meso_nox.__dict__.items()}
+            if getattr(model, "meso_nox", None) is not None
+            else None
+        ),
         "trace_gas": (
             {k: v for k, v in model.trace_gas.__dict__.items()}
             if model.trace_gas is not None
@@ -1191,6 +1196,31 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             elif v.ndim == 1 and int(v.shape[0]) == nc_old:
                 vh = v.cpu().index_select(0, atm_h_idx) if atm_h_idx is not None else v.cpu()
                 setattr(model.ozone, k, vh.to(device=device))
+
+    if ckpt.get("meso_nox") is not None and (bool(model.cfg.enable_red_sprites) or float(model.cfg.z_top) >= 68000.0):
+        from aoba.mesosphere import init_prognostic_nox_state
+        from aoba.thermodynamics import diagnose_pressure_temperature
+
+        if model.meso_nox is None:
+            p_nx_r, _, _ = diagnose_pressure_temperature(model.atmos.rho_d, model.atmos.theta_m, model.atmos.q_v)
+            model.meso_nox = init_prognostic_nox_state(p_nx_r, n2o_ppmv=model.current_n2o_ppmv())
+        z_oc_n = z_old_c_h if needs_atm_remap else ck_atmos.z_c.cpu()
+        z_nc_n = model.atmos.z_c.cpu()
+        for k, v in ckpt["meso_nox"].items():
+            if not hasattr(model.meso_nox, k):
+                continue
+            if not isinstance(v, torch.Tensor):
+                setattr(model.meso_nox, k, v)
+            elif v.ndim == 2 and int(v.shape[0]) == nz_old and int(v.shape[1]) == nc_old:
+                vh = v.cpu().index_select(1, atm_h_idx) if atm_h_idx is not None else v.cpu()
+                if needs_hremap or needs_vremap:
+                    remapped = torch.clamp(_interp_vertical_batch(z_oc_n, vh, z_nc_n), min=1.0e-12, max=2.0e-6)
+                    setattr(model.meso_nox, k, remapped.to(device=device))
+                else:
+                    setattr(model.meso_nox, k, vh.to(device=device))
+            elif v.ndim == 1 and int(v.shape[0]) == nc_old:
+                vh = v.cpu().index_select(0, atm_h_idx) if atm_h_idx is not None else v.cpu()
+                setattr(model.meso_nox, k, vh.to(device=device))
 
     if ckpt.get("trace_gas") is not None and bool(model.cfg.enable_prognostic_ch4_n2o):
         from aoba.trace_gas_cycle import init_trace_gas_cycle_state
@@ -2750,6 +2780,24 @@ def main() -> None:
                         esm_parts.append(f"Aero(AOD_nat={aod_nat:.4f}, AOD_dust={aod_dust:.4f}, CCN={ccn_mean:.1f} cm^-3)")
                     else:
                         esm_parts.append(f"Aero(AOD={aod_nat:.4f}, CCN={ccn_mean:.1f} cm^-3)")
+                if getattr(model, "meso_nox", None) is not None or getattr(model, "last_red_sprites", None) is not None:
+                    a_w_m = a_host_64
+                    a_tot_m = float(a_w_m.sum().item())
+                    m_bits = []
+                    if getattr(model, "meso_nox", None) is not None:
+                        mn = model.meso_nox
+                        t_mp_min = float(mn.t_mesopause_k.detach().cpu().double().min().item())
+                        nox_m = float((mn.nox_meso_ppbv.detach().cpu().double() * a_w_m).sum().item()) / a_tot_m
+                        nlc_pct = float((mn.nlc_frac.detach().cpu().double() * a_w_m).sum().item()) / a_tot_m * 100.0
+                        m_bits.append(f"Tmp_min={t_mp_min:.1f}K, NOx={nox_m:.1f}ppbv, NLC={nlc_pct:.2f}%")
+                    if getattr(model, "last_red_sprites", None) is not None:
+                        sp_o = model.last_red_sprites
+                        sp_min = float((sp_o.sprite_rate_cell.detach().cpu().double() * a_w_m).sum().item()) * 60.0
+                        el_min = float((sp_o.elves_rate_cell.detach().cpu().double() * a_w_m).sum().item()) * 60.0 if getattr(sp_o, "elves_rate_cell", None) is not None else 0.0
+                        bj_min = float((sp_o.blue_jet_rate_cell.detach().cpu().double() * a_w_m).sum().item()) * 60.0 if getattr(sp_o, "blue_jet_rate_cell", None) is not None else 0.0
+                        gj_hr = float((sp_o.gigantic_jet_rate_cell.detach().cpu().double() * a_w_m).sum().item()) * 3600.0 if getattr(sp_o, "gigantic_jet_rate_cell", None) is not None else 0.0
+                        m_bits.append(f"TLE(Sp={sp_min:.2f}/m, Elv={el_min:.1f}/m, BJ={bj_min:.2f}/m, GJ={gj_hr:.2f}/h)")
+                    esm_parts.append(f"Meso({', '.join(m_bits)})")
                 if esm_parts:
                     print(f"[ESM Y{year:03d} M{mon_num:02d} | {diag.date_str}] " + " | ".join(esm_parts), flush=True)
                 for k in mon_accum:
