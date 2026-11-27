@@ -7654,7 +7654,7 @@ kernel void land_carbon_cn_fire_prep_tile(
     float dt_yr = dt / sec_yr;
     float inv_dt = 1.0f / max(dt, 1.0f);
 
-    // Unpack forcing [14, M]
+    // Unpack forcing [15, M]
     float gpp_umol = f_in[i];
     float rleaf_umol = f_in[M + i];
     float h_canopy = max(f_in[2u * M + i], 0.0f);
@@ -7668,6 +7668,8 @@ kernel void land_carbon_cn_fire_prep_tile(
     float transp_s = max(f_in[10u * M + i], 0.0f);
     float n_dep_s = max(f_in[11u * M + i], 0.0f);
     float cg_rate = max(f_in[12u * M + i], 0.0f);
+    float fc4_in = clamp(f_in[13u * M + i], 0.0f, 1.0f);
+    float slope_tan = clamp(f_in[14u * M + i], 0.0f, 0.75f);
 
     float c_leaf = c_1d_io[i];
     float c_root = c_1d_io[M + i];
@@ -7962,15 +7964,26 @@ kernel void land_carbon_cn_fire_prep_tile(
     aux_io[M + i] = di_new;
 
     float fdi = _aoba_neg_expm1_neg(3.0e-4f * di_new);
-    float fuel_lit = max(c_lf + c_ls, 0.0f);
-    float f_fuel = clamp((fuel_lit - 0.12f) / 0.45f, 0.0f, 1.0f);
-    float r_m = clamp(1.0f - fdi * (1.0f - 0.45f * sat_0), 0.05f, 1.0f);
+    // Multi-class fuel bed (1h fine litter + cured C4 grass vs. 100h coarse woody litter; Thonicke et al., 2010)
+    float f_cure = clamp(0.25f + 0.75f * fdi, 0.25f, 1.0f);
+    float c_fuel_1h = max(c_lf, 0.0f) + f_cure * fc4_in * max(c_leaf, 0.0f);
+    float c_fuel_100h = max(c_ls, 0.0f);
+    float w_1h = c_fuel_1h / max(c_fuel_1h + c_fuel_100h, 1.0e-6f);
+    float fuel_surf = c_fuel_1h + 0.65f * c_fuel_100h;
+    float f_fuel = clamp((fuel_surf - 0.08f) / 0.38f, 0.0f, 1.0f);
+    float r_m_1h = clamp(1.0f - fdi * (1.0f - 0.30f * sat_0), 0.04f, 1.0f);
+    float r_m_100h = clamp(1.0f - 0.72f * fdi * (1.0f - 0.55f * sat_0), 0.08f, 1.0f);
+    float r_m = w_1h * r_m_1h + (1.0f - w_1h) * r_m_100h;
     float eta_m = clamp(1.0f + r_m * (-2.59f + r_m * (5.11f - 3.52f * r_m)), 0.0f, 1.0f);
+    float eta_m_100h = clamp(1.0f + r_m_100h * (-2.59f + r_m_100h * (5.11f - 3.52f * r_m_100h)), 0.0f, 1.0f);
+    float grass_ros_w = clamp(0.65f * fc4_in + 0.35f * w_1h * (1.0f - tanh(h_canopy * 0.25f)), 0.0f, 1.0f);
+    float ros_base = 3.2f + 5.3f * grass_ros_w;
     float u_fwd = max(u10_ms, 0.0f) * (1.0f - 0.45f * tanh(h_canopy * 0.125f));
     float u_fwd_mmin = u_fwd * 60.0f;
     float u_fwd_cap = min(u_fwd_mmin, 1200.0f);
     float phi_w = (u_fwd_cap > 0.0f) ? (0.05f * pow(u_fwd_cap, 0.85f)) : 0.0f;
-    float ros_f = clamp(3.5f * eta_m * (1.0f + phi_w) * f_fuel, 0.0f, 50.0f);
+    float phi_s = 3.5f * (slope_tan * slope_tan);
+    float ros_f = clamp(ros_base * eta_m * (1.0f + phi_w + phi_s) * f_fuel, 0.0f, 60.0f);
     float ros_b = ros_f * exp(-0.012f * min(u_fwd_mmin, 500.0f));
     float e_u = 1.0f - exp(-0.03f * min(u_fwd, 30.0f));
     float l_b = (e_u > 0.0f) ? (1.0f + 8.729f * pow(e_u, 2.155f)) : 1.0f;
@@ -7978,7 +7991,7 @@ kernel void land_carbon_cn_fire_prep_tile(
     float d_major = (ros_f + ros_b) * t_fire_min;
     float a_fire = min((0.25f * 3.14159265359f / l_b) * (d_major * d_major), crm_dx * crm_dx);
 
-    float fc_dm = 2.0f * (0.70f * max(c_lf, 0.0f) + 0.35f * max(c_ls, 0.0f));
+    float fc_dm = 2.0f * (0.80f * c_fuel_1h + 0.35f * eta_m_100h * c_fuel_100h);
     float i_byram = 18000.0f * fc_dm * (ros_f / 60.0f);
     float can_s = (i_byram >= 50.0f) ? 1.0f : 0.0f;
     float sh_m = (can_s > 0.5f) ? (0.11f * pow(max(i_byram, 0.0f), 2.0f / 3.0f)) : 0.0f;
@@ -8038,8 +8051,8 @@ kernel void land_carbon_fire_commit_tile(
 
     float cl = c_1d_io[i], cw = c_1d_io[2u * M + i], clf = c_1d_io[3u * M + i], cls = c_1d_io[4u * M + i];
     float clc = c_1d_io[5u * M + i], cwc = c_1d_io[7u * M + i], clfc = c_1d_io[8u * M + i], clsc = c_1d_io[9u * M + i];
-    float b_lf = (fb * 0.70f) * max(clf, 0.0f);
-    float b_ls = (fb * 0.70f) * max(cls, 0.0f);
+    float b_lf = (fb * 0.75f) * max(clf, 0.0f);
+    float b_ls = (fb * 0.40f) * max(cls, 0.0f);
     float b_l  = (fb * l_eff) * max(cl, 0.0f);
     float b_w  = (fb * w_eff) * max(cw, 0.0f);
     { float d=-b_l+clc; float t=cl+d; clc=(fabs(cl)>=fabs(d))?((cl-t)+d):((d-t)+cl); cl=t; }
@@ -8053,8 +8066,8 @@ kernel void land_carbon_fire_commit_tile(
     if (enable_n) {
         float nl = n_1d_io[i], nw = n_1d_io[2u * M + i], nlf = n_1d_io[3u * M + i], nls = n_1d_io[4u * M + i], nmin = n_1d_io[5u * M + i];
         float nlc = n_1d_io[6u * M + i], nwc = n_1d_io[8u * M + i], nlfc = n_1d_io[9u * M + i], nlsc = n_1d_io[10u * M + i], nminc = n_1d_io[11u * M + i];
-        float bn_lf = (fb * 0.70f) * max(nlf, 0.0f);
-        float bn_ls = (fb * 0.70f) * max(nls, 0.0f);
+        float bn_lf = (fb * 0.75f) * max(nlf, 0.0f);
+        float bn_ls = (fb * 0.40f) * max(nls, 0.0f);
         float bn_l  = (fb * l_eff) * max(nl, 0.0f);
         float bn_w  = (fb * w_eff) * max(nw, 0.0f);
         { float d=-bn_l+nlc; float t=nl+d; nlc=(fabs(nl)>=fabs(d))?((nl-t)+d):((d-t)+nl); nl=t; }

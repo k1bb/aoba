@@ -1347,13 +1347,13 @@ $$
 
 3. **5 層永久凍土土壌 C/N 分解および凍土撹乱（Koven et al., 2013）**：土壌 5 層（$0.05\text{–}1.60\ \mathrm{m}$）の分解速度は深さ減衰因子 $\exp(-z_{\mathrm{mid},k}/0.50\ \mathrm{m})$、$Q_{10}=2.0$ 温度応答、水分正弦応答および完全凍結時 $0.05$ への永久凍土抑制を受け、厳密指数分解と鉛直保存凍土撹乱（拡散係数 $D_{\mathrm{cryo}} = 5.0\times 10^{-4}\ \mathrm{m^2\ yr^{-1}}$）で炭素・窒素を同時更新する。
 
-4. **プロセスベース MAML SPITFIRE 山火事（Thonicke et al., 2010; Rothermel, 1972; Byram, 1959; Van Wagner, 1973）**：Nesterov 乾燥指数 $\mathrm{DI}$ を日積算（日降水 $> 3\ \mathrm{mm}$ または $f_{\mathrm{snow}} > 0.20$ でリセット）して火災危険指数 $\mathrm{FDI}$ を算出する。Rothermel 枯死燃料水分減衰 $\eta_M(r)$ と樹冠減速風速 $u_{\mathrm{fwd}}$ から前進・後退延焼速度 $(R_f, R_b)$、風速楕円長短軸比 $L_B$、継続時間 $t_{\mathrm{fire}}$、焼失面積 $A_{\mathrm{fire}}$、Byram 火線強度 $I_B$（自己消火閾値 $50\ \mathrm{kW\ m^{-1}}$）、Van Wagner 焦げ高さ $\mathrm{SH}$ および樹高依存樹皮厚 $d_{\mathrm{bark}}$ を評価して樹冠・形成層枯死率 $p_{\mathrm{mort}}$ を求める：
+4. **プロセスベース MAML SPITFIRE 山火事（Thonicke et al., 2010; Rothermel, 1972; Byram, 1959; Van Wagner, 1973）**：Nesterov 乾燥指数 $\mathrm{DI}$ を日積算（日降水 $> 3\ \mathrm{mm}$ または $f_{\mathrm{snow}} > 0.20$ でリセット）して火災危険指数 $\mathrm{FDI}$ を算出する。地表燃料層を 1 時間細粒リター＋乾季枯化 $\mathrm{C}_4$ 草本燃料（$c_{1\mathrm{h}} = c_{\mathrm{lit,fast}} + f_{\mathrm{cure}} f_{\mathrm{C4}} c_{\mathrm{leaf}}$, $f_{\mathrm{cure}} = \operatorname{clamp}(0.25 + 0.75\,\mathrm{FDI},\ 0.25,\ 1.0)$）と 100 時間粗粒木質リター（$c_{100\mathrm{h}} = c_{\mathrm{lit,slow}}$）へ分離し、粒径別 Rothermel 水分減衰 $(\eta_M, \eta_{M,100\mathrm{h}})$、燃料層依存の基礎延焼速度 $R_{\mathrm{base}} \in [3.2, 8.5]\ \mathrm{m\ min^{-1}}$、樹冠減速風速・`Earth2014` 地形勾配加速（$\phi_w + \phi_s$, $\phi_s = 3.5\tan^2\theta$）から前進・後退延焼速度 $(R_f, R_b)$、風速楕円長短軸比 $L_B$、継続時間 $t_{\mathrm{fire}}$、焼失面積 $A_{\mathrm{fire}}$、Byram 火線強度 $I_B$（自己消火閾値 $50\ \mathrm{kW\ m^{-1}}$）、Van Wagner 焦げ高さ $\mathrm{SH}$ および樹高依存樹皮厚 $d_{\mathrm{bark}}$ を評価して樹冠・形成層枯死率 $p_{\mathrm{mort}}$ を求める：
 
 $$
 \begin{aligned}
-\mathrm{FDI} &= 1 - \exp(-3\times 10^{-4}\,\mathrm{DI}), \qquad A_{\mathrm{fire}} = \frac{\pi}{4 L_B}\big[(R_f + R_b)\,t_{\mathrm{fire}}\big]^2, \\
-I_B &= 18000\,F_c\,\frac{R_f}{60}\ [\mathrm{kW\ m^{-1}}], \\
-\mathrm{SH} &= 0.11\,I_B^{2/3}\ [\mathrm{m}], \qquad d_{\mathrm{bark}} = 0.8 + 1.8\left(\frac{h_c}{10}\right)^{0.6}\ [\mathrm{cm}]
+\mathrm{FDI} &= 1 - \exp(-3\times 10^{-4}\,\mathrm{DI}), \qquad R_f = \operatorname{clamp}\!\big(R_{\mathrm{base}}\,\eta_M\,(1 + \phi_w + \phi_s)\,f_{\mathrm{fuel}},\ 0,\ 60\big), \\
+A_{\mathrm{fire}} &= \frac{\pi}{4 L_B}\big[(R_f + R_b)\,t_{\mathrm{fire}}\big]^2, \qquad F_c = 2.0\big(0.80\,c_{1\mathrm{h}} + 0.35\,\eta_{M,100\mathrm{h}}\,c_{100\mathrm{h}}\big), \\
+I_B &= 18000\,F_c\,\frac{R_f}{60}\ [\mathrm{kW\ m^{-1}}], \qquad \mathrm{SH} = 0.11\,I_B^{2/3}\ [\mathrm{m}], \qquad d_{\mathrm{bark}} = 0.8 + 1.8\left(\frac{h_c}{10}\right)^{0.6}\ [\mathrm{cm}]
 \end{aligned} \tag{7.45}
 $$
 

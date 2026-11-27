@@ -1347,13 +1347,13 @@ The 15-day EMA nitrogen sufficiency $\phi_N$ feeds back into both Eq. (7.42) ($f
 
 3. **Five-layer permafrost soil C/N (Koven et al., 2013)**: Layer decomposition includes depth attenuation $\exp(-z_{\mathrm{mid},k}/0.50\ \mathrm{m})$, $Q_{10}=2.0$, moisture scaling, frozen-soil permafrost suppression ($0.05$), and conservative vertical cryoturbation ($D_{\mathrm{cryo}} = 5.0\times 10^{-4}\ \mathrm{m^2\ yr^{-1}}$).
 
-4. **Process-based MAML SPITFIRE wildfire (Thonicke et al., 2010; Rothermel, 1972; Byram, 1959; Van Wagner, 1973)**: Accumulates Nesterov dryness index $\mathrm{DI}$ (reset on rain $> 3\ \mathrm{mm\ d^{-1}}$ or $f_{\mathrm{snow}} > 0.20$) into fire danger index $\mathrm{FDI}$, evaluating Rothermel dead-fuel moisture damping $\eta_M$, forward/backward spread rates $(R_f, R_b)$, wind-elliptical burned area $A_{\mathrm{fire}}$, Byram fireline intensity ($I_B \ge 50\ \mathrm{kW\ m^{-1}}$ self-extinction), Van Wagner scorch height $\mathrm{SH}$, and allometric bark thickness $d_{\mathrm{bark}}$ for crown/cambial mortality $p_{\mathrm{mort}}$:
+4. **Process-based MAML SPITFIRE wildfire (Thonicke et al., 2010; Rothermel, 1972; Byram, 1959; Van Wagner, 1973)**: Accumulates Nesterov dryness index $\mathrm{DI}$ (reset on rain $> 3\ \mathrm{mm\ d^{-1}}$ or $f_{\mathrm{snow}} > 0.20$) into fire danger index $\mathrm{FDI}$, partitions the surface fuel bed into 1-hour fine litter plus dry-cured $\mathrm{C}_4$ herbaceous fuel ($c_{1\mathrm{h}} = c_{\mathrm{lit,fast}} + f_{\mathrm{cure}} f_{\mathrm{C4}} c_{\mathrm{leaf}}$, $f_{\mathrm{cure}} = \operatorname{clamp}(0.25 + 0.75\,\mathrm{FDI},\ 0.25,\ 1.0)$) versus 100-hour coarse woody litter ($c_{100\mathrm{h}} = c_{\mathrm{lit,slow}}$) with differential Rothermel moisture damping $(\eta_{M}, \eta_{M,100\mathrm{h}})$, fuel-bed-dependent baseline spread rate $R_{\mathrm{base}} \in [3.2, 8.5]\ \mathrm{m\ min^{-1}}$, wind and topographic slope acceleration ($\phi_w + \phi_s$, $\phi_s = 3.5\tan^2\theta$ from subgrid `Earth2014` roughness), wind-elliptical burned area $A_{\mathrm{fire}}$, Byram fireline intensity ($I_B \ge 50\ \mathrm{kW\ m^{-1}}$ self-extinction), Van Wagner scorch height $\mathrm{SH}$, and allometric bark thickness $d_{\mathrm{bark}}$ for crown/cambial mortality $p_{\mathrm{mort}}$:
 
 $$
 \begin{aligned}
-\mathrm{FDI} &= 1 - \exp(-3\times 10^{-4}\,\mathrm{DI}), \qquad A_{\mathrm{fire}} = \frac{\pi}{4 L_B}\big[(R_f + R_b)\,t_{\mathrm{fire}}\big]^2, \\
-I_B &= 18000\,F_c\,\frac{R_f}{60}\ [\mathrm{kW\ m^{-1}}], \\
-\mathrm{SH} &= 0.11\,I_B^{2/3}\ [\mathrm{m}], \qquad d_{\mathrm{bark}} = 0.8 + 1.8\left(\frac{h_c}{10}\right)^{0.6}\ [\mathrm{cm}]
+\mathrm{FDI} &= 1 - \exp(-3\times 10^{-4}\,\mathrm{DI}), \qquad R_f = \operatorname{clamp}\!\big(R_{\mathrm{base}}\,\eta_M\,(1 + \phi_w + \phi_s)\,f_{\mathrm{fuel}},\ 0,\ 60\big), \\
+A_{\mathrm{fire}} &= \frac{\pi}{4 L_B}\big[(R_f + R_b)\,t_{\mathrm{fire}}\big]^2, \qquad F_c = 2.0\big(0.80\,c_{1\mathrm{h}} + 0.35\,\eta_{M,100\mathrm{h}}\,c_{100\mathrm{h}}\big), \\
+I_B &= 18000\,F_c\,\frac{R_f}{60}\ [\mathrm{kW\ m^{-1}}], \qquad \mathrm{SH} = 0.11\,I_B^{2/3}\ [\mathrm{m}], \qquad d_{\mathrm{bark}} = 0.8 + 1.8\left(\frac{h_c}{10}\right)^{0.6}\ [\mathrm{cm}]
 \end{aligned} \tag{7.45}
 $$
 

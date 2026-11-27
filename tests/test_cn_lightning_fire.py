@@ -233,10 +233,64 @@ def test_3d_crm_coupled_cpu_mps_parity() -> None:
     print("[PASS] 3D CRM Full-ESM coupled step (CPU + MPS)")
 
 
+def test_spitfire_cured_grass_slope_and_gpu_parity() -> None:
+    """Verify cured C4 savanna grass fuel, Rothermel slope factor phi_s, and CPU-vs-GPU fire parity."""
+    # 3 savanna/forest land cells: 0=flat forest (f_c4=0, slope=0), 1=flat C4 savanna (f_c4=0.9, slope=0), 2=steep C4 savanna (f_c4=0.9, slope=0.5)
+    n = 3
+    st = torch.full((n,), SURF_LAND, dtype=torch.int64)
+    lai = torch.tensor([2.5, 2.5, 2.5])
+    hc = torch.tensor([10.0, 1.0, 1.0])
+    f_c4 = torch.tensor([0.0, 0.9, 0.9])
+    slope = torch.tensor([0.0, 0.0, 0.5])
+
+    def _run_case(dev: str) -> tuple[torch.Tensor, torch.Tensor]:
+        d = torch.device(dev)
+        lc = init_land_carbon_state(st.to(d), lai.to(d), hc.to(d), device=d)
+        # Thin litter (0.09 kg C/m^2) where forest barely sustains fire, while cured C4 grass burns strongly
+        lc.c_lit_fast.fill_(0.07)
+        lc.c_lit_slow.fill_(0.06)
+        lc.c_leaf.fill_(0.25)
+        lc.fire_di.fill_(2500.0)
+        t_soil = torch.full((5, n), 302.0, device=d)
+        w_liq = torch.full((5, n), 0.08, device=d)
+        w_ice = torch.zeros((5, n), device=d)
+        f_snow = torch.zeros((n,), device=d)
+        t_sfc = torch.full((n,), 306.0, device=d)
+        vpd = torch.full((n,), 3000.0, device=d)
+        u10 = torch.full((n,), 5.0, device=d)
+        precip = torch.zeros((n,), device=d)
+        gpp = torch.full((n,), 4.0, device=d)
+        rleaf = torch.full((n,), 0.5, device=d)
+        cg = torch.full((n,), 1.0e-11, device=d)
+        step_land_carbon_and_fire(
+            lc, st.to(d), gpp, rleaf, lai.to(d), hc.to(d), t_soil, w_liq, w_ice, f_snow, t_sfc, vpd, u10, precip,
+            dt=86400.0, enable_nitrogen=True, f_c4=f_c4.to(d), slope_tan=slope.to(d), flash_cg_m2s=cg,
+        )
+        return lc.fire_intensity_kw_m.detach().cpu(), lc.fire_c_kgc_m2s.detach().cpu()
+
+    ib_c, fc_c = _run_case("cpu")
+    assert ib_c[1].item() > 2.0 * ib_c[0].item(), f"Expected cured C4 grass to boost fireline intensity: {ib_c.tolist()}"
+    assert ib_c[2].item() > ib_c[1].item() * 1.10, f"Expected slope phi_s to accelerate fireline intensity: {ib_c.tolist()}"
+    assert fc_c[1].item() > fc_c[0].item() and fc_c[2].item() > fc_c[1].item()
+
+    if torch.backends.mps.is_available():
+        ib_g, fc_g = _run_case("mps")
+        rel_ib = float((ib_c - ib_g).abs().max() / ib_c.abs().max().clamp(min=1e-6))
+        rel_fc = float((fc_c - fc_g).abs().max() / fc_c.abs().max().clamp(min=1e-18))
+        assert rel_ib < 1.0e-4 and rel_fc < 1.0e-4, f"SPITFIRE CPU vs MPS mismatch: ib={rel_ib:.3e}, fc={rel_fc:.3e}"
+        print(
+            f"[PASS] SPITFIRE 1h cured-grass + 100h litter + slope phi_s (CPU vs MPS): "
+            f"I_B={[round(v, 1) for v in ib_c.tolist()]} kW/m (rel_ib={rel_ib:.2e}, rel_fc={rel_fc:.2e})"
+        )
+    else:
+        print(f"[PASS] SPITFIRE 1h cured-grass + 100h litter + slope phi_s: I_B={[round(v, 1) for v in ib_c.tolist()]} kW/m")
+
+
 if __name__ == "__main__":
     test_bnf_temperature_optimality()
     test_exact_cn_conservation_and_functional_balance()
     test_crm_lightning_and_lnox_conservation()
     test_maml_patch_wildfire_mosaic()
+    test_spitfire_cured_grass_slope_and_gpu_parity()
     test_3d_crm_coupled_cpu_mps_parity()
     print("\nALL CN-MODEL, CRM LIGHTNING, AND MAML SPITFIRE TESTS PASSED!")

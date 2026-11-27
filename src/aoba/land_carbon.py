@@ -360,6 +360,8 @@ def step_land_carbon_and_fire(
     enable_nitrogen: bool = True,
     vcmax25_eff: torch.Tensor | None = None,
     f_evg: torch.Tensor | None = None,
+    f_c4: torch.Tensor | None = None,
+    slope_tan: torch.Tensor | None = None,
     transp_kgm2s: torch.Tensor | None = None,
     n_dep_kgn_m2s: torch.Tensor | None = None,
     flash_cg_m2s: torch.Tensor | None = None,
@@ -401,6 +403,8 @@ def step_land_carbon_and_fire(
 
         vc25_in = vcmax25_eff if vcmax25_eff is not None else torch.full_like(lc.c_leaf, 45.0)
         fevg_in = f_evg if f_evg is not None else torch.full_like(lc.c_leaf, 0.5)
+        fc4_in = torch.clamp(f_c4, 0.0, 1.0) if f_c4 is not None else torch.zeros_like(lc.c_leaf)
+        slope_in = torch.clamp(slope_tan, 0.0, 0.75) if slope_tan is not None else torch.zeros_like(lc.c_leaf)
         transp_in = transp_kgm2s if transp_kgm2s is not None else torch.zeros_like(lc.c_leaf)
         n_dep_in = n_dep_kgn_m2s if n_dep_kgn_m2s is not None else torch.zeros_like(lc.c_leaf)
 
@@ -408,6 +412,7 @@ def step_land_carbon_and_fire(
             [
                 gpp_umol, resp_leaf_umol, h_canopy, f_snow, t_sfc_k, vpd_pa,
                 u10_ms, precip_kgm2s, vc25_in, fevg_in, transp_in, n_dep_in, cg_rate,
+                fc4_in, slope_in,
             ],
             dim=0,
         ).contiguous()
@@ -822,16 +827,34 @@ def step_land_carbon_and_fire(
     lc.fire_di = di_new
 
     fdi = -torch.expm1(-FIRE_DI_K * di_new)
-    fuel_lit = torch.clamp(c_lit_fast_1 + c_lit_slow_1, min=0.0)
-    f_fuel = torch.clamp((fuel_lit - FIRE_FUEL_MIN_KGC) / 0.45, 0.0, 1.0)
+    fc4_pos = torch.clamp(f_c4, 0.0, 1.0) if f_c4 is not None else torch.zeros_like(fdi)
+    slope_pos = torch.clamp(slope_tan, 0.0, 0.75) if slope_tan is not None else torch.zeros_like(fdi)
 
-    # Rothermel (1972) dead-fuel moisture damping eta_M(r) & canopy-reduced forward wind speed
-    r_moist = torch.clamp(1.0 - fdi * (1.0 - 0.45 * sat_frac[0]), 0.05, 1.0)
+    # Multi-class fuel bed (Thonicke et al., 2010): 1h fine litter + dry-cured C4 grass vs. 100h coarse woody litter
+    f_cure = torch.clamp(0.25 + 0.75 * fdi, 0.25, 1.0)
+    c_grass_cured = f_cure * fc4_pos * torch.clamp(c_leaf_1, min=0.0)
+    c_fuel_1h = torch.clamp(c_lit_fast_1, min=0.0) + c_grass_cured
+    c_fuel_100h = torch.clamp(c_lit_slow_1, min=0.0)
+    fuel_tot = c_fuel_1h + c_fuel_100h
+    w_1h = c_fuel_1h / torch.clamp(fuel_tot, min=1.0e-6)
+    fuel_surf = c_fuel_1h + 0.65 * c_fuel_100h
+    f_fuel = torch.clamp((fuel_surf - 0.08) / 0.38, 0.0, 1.0)
+
+    # Differential Rothermel (1972) fuel moisture damping (1h fine/grass dries faster than 100h woody litter)
+    r_m_1h = torch.clamp(1.0 - fdi * (1.0 - 0.30 * sat_frac[0]), 0.04, 1.0)
+    r_m_100h = torch.clamp(1.0 - 0.72 * fdi * (1.0 - 0.55 * sat_frac[0]), 0.08, 1.0)
+    r_moist = w_1h * r_m_1h + (1.0 - w_1h) * r_m_100h
     eta_m = torch.clamp(1.0 - 2.59 * r_moist + 5.11 * (r_moist ** 2) - 3.52 * (r_moist ** 3), 0.0, 1.0)
+    eta_m_100h = torch.clamp(1.0 - 2.59 * r_m_100h + 5.11 * (r_m_100h ** 2) - 3.52 * (r_m_100h ** 3), 0.0, 1.0)
+
+    # Fuel-bed baseline ROS (fast cured savanna grass ~8.5 m/min vs. forest litter ~3.2 m/min), wind & slope (Rothermel Eq. 51)
+    grass_ros_w = torch.clamp(0.65 * fc4_pos + 0.35 * w_1h * (1.0 - torch.tanh(hc_pos / 4.0)), 0.0, 1.0)
+    ros_base = 3.2 + 5.3 * grass_ros_w
     u_fwd_ms = torch.clamp(u10_ms, min=0.0) * (1.0 - 0.45 * torch.tanh(hc_pos / 8.0))
     u_fwd_mmin = u_fwd_ms * 60.0
     phi_w = 0.05 * torch.pow(torch.clamp(u_fwd_mmin, max=1200.0), 0.85)
-    ros_f = torch.clamp(FIRE_ROS_BASE_M_MIN * eta_m * (1.0 + phi_w) * f_fuel, 0.0, 50.0)
+    phi_s = 3.5 * (slope_pos * slope_pos)
+    ros_f = torch.clamp(ros_base * eta_m * (1.0 + phi_w + phi_s) * f_fuel, 0.0, 60.0)
     ros_b = ros_f * torch.exp(-0.012 * torch.clamp(u_fwd_mmin, max=500.0))
 
     # Wind-dependent ellipse length-to-breadth ratio L_B & daily fire duration t_fire (Thonicke et al., 2010)
@@ -841,8 +864,8 @@ def step_land_carbon_and_fire(
     a_fire_m2 = torch.clamp((0.25 * math.pi / l_b) * (d_major_m * d_major_m), max=crm_dx_m * crm_dx_m)
 
     # Byram (1959) fireline intensity I_B [kW m^-1] & self-extinction threshold (50 kW m^-1)
-    # Factor 2.0 converts kg C -> kg dry biomass
-    fc_dm = 2.0 * (FIRE_COMBUST_LIT * torch.clamp(c_lit_fast_1, min=0.0) + 0.5 * FIRE_COMBUST_LIT * torch.clamp(c_lit_slow_1, min=0.0))
+    # Factor 2.0 converts kg C -> kg dry biomass; includes cured 1h grass/fine litter + moisture-damped 100h coarse litter
+    fc_dm = 2.0 * (0.80 * c_fuel_1h + 0.35 * eta_m_100h * c_fuel_100h)
     i_byram = FIRE_HEAT_CONTENT_KJ * fc_dm * (ros_f / 60.0)
     can_sustain = (i_byram >= FIRE_EXTINCT_KW_M).to(dtype) * is_land
 
@@ -905,11 +928,11 @@ def step_land_carbon_and_fire(
     lc.fire_scorch_m = sh_m
     lc.fire_mort_frac = p_mort
 
-    # Combust litter, foliage, and mortality-weighted wood (exact C & N conservation!)
+    # Combust fine (1h) litter, coarse (100h) litter, foliage, and mortality-weighted wood (exact C & N conservation!)
     wood_comb_eff = FIRE_COMBUST_WOOD * (0.25 + 0.75 * p_mort)
     leaf_comb_eff = FIRE_COMBUST_LEAF * (0.30 + 0.70 * p_mort)
-    burn_lf = (f_burn * FIRE_COMBUST_LIT) * torch.clamp(c_lit_fast_1, min=0.0)
-    burn_ls = (f_burn * FIRE_COMBUST_LIT) * torch.clamp(c_lit_slow_1, min=0.0)
+    burn_lf = (f_burn * 0.75) * torch.clamp(c_lit_fast_1, min=0.0)
+    burn_ls = (f_burn * 0.40) * torch.clamp(c_lit_slow_1, min=0.0)
     burn_leaf = (f_burn * leaf_comb_eff) * torch.clamp(c_leaf_1, min=0.0)
     burn_wood = (f_burn * wood_comb_eff) * torch.clamp(c_wood_1, min=0.0)
 
@@ -941,8 +964,8 @@ def step_land_carbon_and_fire(
 
     # Pyrogenic nitrogen volatilization + post-fire ash N return to soil mineral pool
     if enable_nitrogen:
-        burn_nlf = (f_burn * FIRE_COMBUST_LIT) * torch.clamp(n_lf_1, min=0.0)
-        burn_nls = (f_burn * FIRE_COMBUST_LIT) * torch.clamp(n_ls_1, min=0.0)
+        burn_nlf = (f_burn * 0.75) * torch.clamp(n_lf_1, min=0.0)
+        burn_nls = (f_burn * 0.40) * torch.clamp(n_ls_1, min=0.0)
         burn_nleaf = (f_burn * leaf_comb_eff) * torch.clamp(n_leaf_1, min=0.0)
         burn_nwood = (f_burn * wood_comb_eff) * torch.clamp(n_wood_1, min=0.0)
 
