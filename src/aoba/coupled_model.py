@@ -2170,16 +2170,24 @@ def step_aoba_model(
     v_ocn_sub = torch.zeros_like(v_sub_0)
     if use_rel_wind:
         assert model.ogcm is not None
-        ocn_m_rw = model.ocn_mesh if has_indep_ocn else mesh
-        assert ocn_m_rw is not None
-        uo0, vo0 = reconstruct_cell_winds(ocn_m_rw, (model.ogcm.u_edge[0:1] * model.ogcm.wet_e[0:1].to(model.ogcm.u_edge.dtype)))
-        uo_c, vo_c = uo0[0], vo0[0]
-        if has_indep_ocn:
-            from aoba.ocean_coupler import ocn_to_atm_mean
+        ogcm_gen = int(model.rad_cache.get("_ogcm_step_gen", 0))
+        uv_cached = model.rad_cache.get("_ocn_uv_sfc_c")
+        if uv_cached is not None and uv_cached[0] == ogcm_gen:
+            uo_c, vo_c = uv_cached[1], uv_cached[2]
+        else:
+            ocn_m_rw = model.ocn_mesh if has_indep_ocn else mesh
+            assert ocn_m_rw is not None
+            uo0, vo0 = reconstruct_cell_winds(
+                ocn_m_rw, (model.ogcm.u_edge[0:1] * model.ogcm.wet_e[0:1].to(model.ogcm.u_edge.dtype))
+            )
+            uo_c, vo_c = uo0[0], vo0[0]
+            if has_indep_ocn:
+                from aoba.ocean_coupler import ocn_to_atm_mean_batch
 
-            z_atm = torch.zeros(nc, device=uo_c.device, dtype=uo_c.dtype)
-            uo_c = ocn_to_atm_mean(model.ocn_coupler, uo_c, fallback_atm=z_atm)
-            vo_c = ocn_to_atm_mean(model.ocn_coupler, vo_c, fallback_atm=z_atm)
+                z_atm2 = torch.zeros((2, nc), device=uo_c.device, dtype=uo_c.dtype)
+                uv_atm = ocn_to_atm_mean_batch(model.ocn_coupler, torch.stack([uo_c, vo_c], dim=0), fallback_atm=z_atm2)
+                uo_c, vo_c = uv_atm[0], uv_atm[1]
+            model.rad_cache["_ocn_uv_sfc_c"] = (ogcm_gen, uo_c, vo_c)
         is_ocn_rw = (sfc_sub.surf_type == SURF_OCEAN)
         u_ocn_sub = torch.where(is_ocn_rw, _cell_to_sub(uo_c, nc, n_sub), u_ocn_sub)
         v_ocn_sub = torch.where(is_ocn_rw, _cell_to_sub(vo_c, nc, n_sub), v_ocn_sub)
@@ -2544,11 +2552,17 @@ def step_aoba_model(
                 enable_o2_omz=bool(cfg.enable_ocean_o2_omz),
                 langmuir_fac=langmuir_use,
             )
+            model.rad_cache["_ogcm_step_gen"] = int(model.rad_cache.get("_ogcm_step_gen", 0)) + 1
             if has_indep_ocn:
-                sfc.t_ocean_ml = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.t_ocean_ml, fallback_atm=sfc.t_ocean_ml)
-                sfc.m_seaice = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.m_seaice, fallback_atm=sfc.m_seaice)
-                sfc.swe_seaice = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.swe_seaice, fallback_atm=sfc.swe_seaice)
-                sfc.h_ocean_ml = ocn_to_atm_mean(model.ocn_coupler, active_ocn_sfc.h_ocean_ml, fallback_atm=sfc.h_ocean_ml)
+                from aoba.ocean_coupler import ocn_to_atm_mean_batch
+
+                ocn_4 = torch.stack(
+                    [active_ocn_sfc.t_ocean_ml, active_ocn_sfc.m_seaice, active_ocn_sfc.swe_seaice, active_ocn_sfc.h_ocean_ml],
+                    dim=0,
+                )
+                fb_4 = torch.stack([sfc.t_ocean_ml, sfc.m_seaice, sfc.swe_seaice, sfc.h_ocean_ml], dim=0)
+                atm_4 = ocn_to_atm_mean_batch(model.ocn_coupler, ocn_4, fallback_atm=fb_4)
+                sfc.t_ocean_ml, sfc.m_seaice, sfc.swe_seaice, sfc.h_ocean_ml = atm_4[0], atm_4[1], atm_4[2], atm_4[3]
     else:
         if bool(cfg.enable_river_routing) and bool(cfg.enable_dynamic_lakes) and model.lakes is not None:
             from aoba.river_routing import init_river_routing_state, step_river_routing_voronoi
@@ -4037,9 +4051,15 @@ def step_aoba_model(
             else None
         )
         if chl_sfc is not None and has_indep_ocn:
-            from aoba.ocean_coupler import ocn_to_atm_mean
+            ogcm_gen_c = int(model.rad_cache.get("_ogcm_step_gen", 0))
+            chl_cached = model.rad_cache.get("_ocn_chl_sfc_c")
+            if chl_cached is not None and chl_cached[0] == ogcm_gen_c:
+                chl_sfc = chl_cached[1]
+            else:
+                from aoba.ocean_coupler import ocn_to_atm_mean
 
-            chl_sfc = ocn_to_atm_mean(model.ocn_coupler, chl_sfc)
+                chl_sfc = ocn_to_atm_mean(model.ocn_coupler, chl_sfc)
+                model.rad_cache["_ocn_chl_sfc_c"] = (ogcm_gen_c, chl_sfc)
         if model.land_carbon is not None:
             if int(model.land_carbon.fire_bc_kg_m2s.shape[0]) == m_sub:
                 fire_bc = _sub_to_cell(model.land_carbon.fire_bc_kg_m2s, nc, n_sub)

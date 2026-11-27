@@ -225,6 +225,26 @@ def ocn_to_atm_mean(
     return torch.where(coupler.atm_ocn_mask, ocn_agg, fallback_atm)
 
 
+def ocn_to_atm_mean_batch(
+    coupler: OceanAtmosCoupler,
+    fields_ocn: torch.Tensor,
+    fallback_atm: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Batched area-weighted conservative mean of `[K, N_ocn]` fine ocean fields onto `[K, N_atm]` in 1 launch."""
+    k_dim = int(fields_ocn.shape[0])
+    dtype = fields_ocn.dtype
+    num = torch.zeros((k_dim, coupler.n_atm), device=fields_ocn.device, dtype=dtype)
+    idx_2d = coupler.ocn_to_atm_idx.unsqueeze(0).expand(k_dim, -1)
+    num.scatter_add_(1, idx_2d, fields_ocn * coupler.ocn_wet_area.to(dtype).unsqueeze(0))
+    den = torch.clamp(coupler.atm_wet_area_sum.to(dtype), min=1.0).unsqueeze(0)
+    mean_atm = num / den
+    nearest_val = fields_ocn[:, coupler.atm_to_ocn_nearest_wet]
+    ocn_agg = torch.where(coupler.has_wet_children.unsqueeze(0), mean_atm, nearest_val)
+    if fallback_atm is None:
+        return ocn_agg
+    return torch.where(coupler.atm_ocn_mask.unsqueeze(0), ocn_agg, fallback_atm)
+
+
 def apply_atm_surface_increments_to_ocn_sfc(
     coupler: OceanAtmosCoupler,
     ocn_sfc: object,
