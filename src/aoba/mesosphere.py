@@ -173,8 +173,8 @@ def compute_mesospheric_nlte_radiation(
     )
     # Planck vibrational population exp(-960 / T) minus weak upward radiative exchange from warm stratopause
     boltz_loc = torch.exp(-T_VIB_CO2_15UM_K / t_k)
-    # Effective exchange radiative equilibrium floor near ~178 K in optically thin upper mesosphere
-    boltz_exch = 0.16 * torch.exp(torch.full_like(t_k, -T_VIB_CO2_15UM_K / 215.0)) * torch.sigmoid((-1.30 - log10_p) / 0.45)
+    # Effective exchange radiative equilibrium floor near ~172 K in optically thin upper mesosphere
+    boltz_exch = 0.25 * torch.exp(torch.full_like(t_k, -T_VIB_CO2_15UM_K / 215.0)) * torch.sigmoid((-1.30 - log10_p) / 0.45)
     q_co2_cool = -Q_CO2_NLTE_SCALE_KS * co2_fac * phi_esc * lambda_nlte * (boltz_loc - boltz_exch)
 
     # 2. Strobel (1978) & Mlynczak-Solomon (1993) Mesospheric UV Heating (O3 Hartley + O2 Schumann-Runge)

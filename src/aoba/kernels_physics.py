@@ -575,7 +575,9 @@ kernel void ngwd_propagate_col(
     uint a = tid / nc;
     uint c = tid - a * nc;
 
-    float sat_prefac = 0.5f * f_p0.x * effgw_b[a];
+    float eff_a = effgw_b[a];
+    float sat_prefac = 0.5f * f_p0.x / float(max(int(M) - 1, 1));
+    float inv_cds = 1.0f / 22.0f;
     float inv_2dt = 0.5f / max(f_p0.y, 1.0f);
     float tend_max = f_p0.z;
 
@@ -623,11 +625,12 @@ kernel void ngwd_propagate_col(
                 float tout = 0.0f;
                 if (c_hat * sg > c_min_crit) {
                     float ac_hat = fabs(c_hat);
-                    float tau_sat = sat_base * (ac_hat * ac_hat * ac_hat);
+                    float c_eff = ac_hat / (1.0f + ac_hat * inv_cds);
+                    float tau_sat = sat_base * (c_eff * c_eff * c_eff);
                     tout = min(tin, tau_sat);
                 }
                 float dtau = max(tin - tout, 0.0f);
-                float raw_acc = (sg * dtau) * inv_mass;
+                float raw_acc = eff_a * (sg * dtau) * inv_mass;
                 float max_acc = inv_2dt * fabs(cb[m] - uk);
                 acc += clamp(raw_acc, -max_acc, max_acc);
                 tau_prev[m] = tout;
@@ -7006,8 +7009,9 @@ kernel void ngwd_full_col(
 
     float fr_act = use_front ? fr_active[c] : 0.0f;
     bool do_front = use_front && (fr_act > 0.0f);
+    bool do_bg = use_front;
 
-    // Quick convective scan & early-out if column has neither frontal nor convective wave source!
+    // Quick convective scan & early-out if column has no active wave source
     float q_max = 0.0f;
     if (use_conv) {
         for (uint k = 0u; k < nz; ++k) {
@@ -7019,7 +7023,7 @@ kernel void ngwd_full_col(
     }
     bool do_conv = use_conv && (q_max > 0.05f * f_p2.y);
 
-    if (!do_front && !do_conv) {
+    if (!do_front && !do_bg && !do_conv) {
         for (uint k = 0u; k < nz; ++k) {
             uint idx = k * nc + c;
             du_out[idx] = 0.0f;
@@ -7077,7 +7081,9 @@ kernel void ngwd_full_col(
         float t_scale = (f_p1.x * fr_act) / max(norm_g, 1.0e-6f);
         for (uint m = 0u; m < M; ++m) tau_l[m] *= t_scale;
 
-        float sat_prefac = 0.5f * k_h * f_p1.z;
+        float sat_prefac = 0.5f * k_h / float(max(int(M) - 1, 1));
+        float eff_fr = f_p1.z;
+        float inv_cds = 1.0f / 22.0f;
         float u_cur = u_cell[uint(kl) * nc + c] * ux_fr + v_cell[uint(kl) * nc + c] * uy_fr;
         float r_cur = rho_d[uint(kl) * nc + c];
         for (uint k = uint(kl); k < nz; ++k) {
@@ -7097,11 +7103,12 @@ kernel void ngwd_full_col(
                 float tout = 0.0f;
                 if (c_hat * sg > c_min_crit) {
                     float ac = fabs(c_hat);
-                    tout = min(tin, sat_base * (ac * ac * ac));
+                    float c_eff = ac / (1.0f + ac * inv_cds);
+                    tout = min(tin, sat_base * (c_eff * c_eff * c_eff));
                 }
                 float dtau = max(tin - tout, 0.0f);
                 float max_acc = inv_2dt * fabs(cb[m] - u_cur);
-                acc += clamp((sg * dtau) * inv_mass, -max_acc, max_acc);
+                acc += clamp(eff_fr * (sg * dtau) * inv_mass, -max_acc, max_acc);
                 tau_p[m] = tout;
             }
             float acc_c = clamp(acc, -tend_max, tend_max);
@@ -7109,6 +7116,63 @@ kernel void ngwd_full_col(
             dv_col[k] += acc_c * uy_fr;
             r_cur = r_nxt;
             u_cur = u_nxt;
+        }
+    }
+
+    // 1b. Spatially uniform, map-free isotropic 4-azimuth background gravity-wave spectrum
+    if (do_bg) {
+        int kl_b = int(k_fr_idx[c] + 0.5f);
+        float inv_cw = 1.0f / max(f_p1.y, 5.0f);
+        float sat_prefac = 0.5f * k_h / float(max(int(M) - 1, 1));
+        float inv_cds = 1.0f / 22.0f;
+        for (uint ax = 0u; ax < 2u; ++ax) {
+            float u_src = (ax == 0u) ? u_fr_in[c] : v_fr_in[c];
+            device const float* vel = (ax == 0u) ? u_cell : v_cell;
+            float norm_g = 0.0f;
+            for (uint m = 0u; m < M; ++m) {
+                float cr = cb[m] - u_src;
+                sgn[m] = (cr >= 0.0f) ? 1.0f : -1.0f;
+                float g_v = (fabs(cr) > c_min_crit) ? exp(-(cr * inv_cw) * (cr * inv_cw)) : 0.0f;
+                tau_l[m] = g_v;
+                tau_p[m] = 0.0f;
+                norm_g += g_v;
+            }
+            float t_sc = f_p1.x / max(norm_g, 1.0e-6f);
+            for (uint m = 0u; m < M; ++m) tau_l[m] *= t_sc;
+
+            float u_cur = vel[uint(kl_b) * nc + c];
+            float r_cur = rho_d[uint(kl_b) * nc + c];
+            for (uint k = uint(kl_b); k < nz; ++k) {
+                uint cidx = k * nc + c;
+                float inv_mass = 1.0f / max(r_cur * dz_c[cidx], 1.0e-4f);
+                float r_nxt = (k + 1u < nz) ? rho_d[cidx + nc] : r_cur;
+                float u_nxt = (k + 1u < nz) ? vel[cidx + nc] : u_cur;
+                float rw = 0.5f * (r_cur + r_nxt);
+                float uw = 0.5f * (u_cur + u_nxt);
+                float sat_base = sat_prefac * (rw / max(n_int_a[k], 5.0e-3f));
+                bool is_l = (k == uint(kl_b));
+                float acc = 0.0f;
+                for (uint m = 0u; m < M; ++m) {
+                    float tin = is_l ? tau_l[m] : tau_p[m];
+                    float c_hat = cb[m] - uw;
+                    float sg = sgn[m];
+                    float tout = 0.0f;
+                    if (c_hat * sg > c_min_crit) {
+                        float ac = fabs(c_hat);
+                        float c_eff = ac / (1.0f + ac * inv_cds);
+                        tout = min(tin, sat_base * (c_eff * c_eff * c_eff));
+                    }
+                    float dtau = max(tin - tout, 0.0f);
+                    float max_acc = inv_2dt * fabs(cb[m] - u_cur);
+                    acc += clamp((sg * dtau) * inv_mass, -max_acc, max_acc);
+                    tau_p[m] = tout;
+                }
+                float acc_c = clamp(acc, -tend_max, tend_max);
+                if (ax == 0u) du_col[k] += acc_c;
+                else          dv_col[k] += acc_c;
+                r_cur = r_nxt;
+                u_cur = u_nxt;
+            }
         }
     }
 
@@ -7142,7 +7206,9 @@ kernel void ngwd_full_col(
         float inv_sig = 1.0f / sigma_c;
         float q_amp = min(q_max / max(f_p2.y, 1.0e-8f), 4.0f);
         float tau_scale = 0.5f * f_p2.x * (q_amp * q_amp) * (10.0f / max(f_p1.w, 1.0f));
-        float sat_prefac = 0.5f * k_h * f_p2.z;
+        float sat_prefac = 0.5f * k_h / float(max(int(M) - 1, 1));
+        float eff_cv = f_p2.z;
+        float inv_cds = 1.0f / 22.0f;
 
         for (uint ax = 0u; ax < 2u; ++ax) {
             float u_src = (ax == 0u) ? u_h : v_h;
@@ -7179,11 +7245,12 @@ kernel void ngwd_full_col(
                     float tout = 0.0f;
                     if (c_hat * sg > c_min_crit) {
                         float ac = fabs(c_hat);
-                        tout = min(tin, sat_base * (ac * ac * ac));
+                        float c_eff = ac / (1.0f + ac * inv_cds);
+                        tout = min(tin, sat_base * (c_eff * c_eff * c_eff));
                     }
                     float dtau = max(tin - tout, 0.0f);
                     float max_acc = inv_2dt * fabs(cb[m] - u_cur);
-                    acc += clamp((sg * dtau) * inv_mass, -max_acc, max_acc);
+                    acc += clamp(eff_cv * (sg * dtau) * inv_mass, -max_acc, max_acc);
                     tau_p[m] = tout;
                 }
                 float acc_c = clamp(acc, -tend_max, tend_max);

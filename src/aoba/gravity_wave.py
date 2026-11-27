@@ -175,8 +175,11 @@ def _propagate_spectral_batched(
     u_w_all[:, -1] = u_proj_b[:, -1]
 
     inv_mass_dz = 1.0 / torch.clamp(rho_d * dz_c, min=1.0e-4)  # [Nz, N_cells]
-    sat_prefac = (0.5 * k_h) * effgw_b.view(n_axes, 1, 1)      # [A, 1, 1]
-    sat_base_all = sat_prefac.unsqueeze(1) * (rho_w_all / n_w_all).view(1, nz, 1, n_cells)  # [A, Nz, 1, N_cells]
+    inv_nb = 1.0 / float(max(int(c_bins.numel()) - 1, 1))
+    sat_prefac = 0.5 * k_h * inv_nb
+    sat_base_all = sat_prefac * (rho_w_all / n_w_all).view(1, nz, 1, n_cells)  # [1, Nz, 1, N_cells]
+    eff_view = effgw_b.view(n_axes, 1, 1)
+    inv_cds = 1.0 / 22.0
 
     c_min_crit = 2.0
     inv_2dt = 0.5 / max(dt, 1.0)
@@ -189,12 +192,15 @@ def _propagate_spectral_batched(
 
         c_hat = c_bins_b - u_w_all[:, k].unsqueeze(1)          # [A, M, N_cells]
         crit = (c_hat * sgn_m) <= c_min_crit
-        tau_sat = sat_base_all[:, k] * (torch.abs(c_hat) ** 3)
+        ac = torch.abs(c_hat)
+        # Hines (1997) / Scinocca (2003) Doppler-spread spectral-bin saturation (c_ds = 22 m/s)
+        c_eff = ac / (1.0 + ac * inv_cds)
+        tau_sat = sat_base_all[:, k] * (c_eff * c_eff * c_eff)
         tau_out = torch.where(crit, torch.zeros_like(tau_in), torch.minimum(tau_in, tau_sat))
 
         dtau_k = torch.clamp(tau_in - tau_out, min=0.0)
         c_diff_k = c_bins_b - u_proj_b[:, k].unsqueeze(1)
-        raw_acc_m = (sgn_m * dtau_k) * inv_mass_dz[k].view(1, 1, n_cells)
+        raw_acc_m = eff_view * (sgn_m * dtau_k) * inv_mass_dz[k].view(1, 1, n_cells)
         max_acc_m = inv_2dt * torch.abs(c_diff_k)
         du_dt[:, k] = torch.clamp(raw_acc_m, min=-max_acc_m, max=max_acc_m).sum(dim=1)
 
@@ -358,6 +364,22 @@ def _compute_nonorographic_gwd_impl(
         u_src_list.append(spd_fr)
         eff_list.append(NGWD_FRONT_EFF)
 
+        # Spatially uniform, map-free isotropic 4-azimuth background gravity-wave spectrum
+        # (Scinocca, 2003; Orr et al., 2010): launched along zonal & meridional axes at 600 hPa
+        # with zero latitude/geographic tables, closing the winter mesospheric polar-night jet.
+        for axis_bg, u_bg_src in ((u_cell, u_fr), (v_cell, v_fr)):
+            c_rel_bg = c_bins.unsqueeze(1) - u_bg_src.unsqueeze(0)
+            g_bg = torch.exp(-((c_rel_bg / cw) ** 2))
+            g_bg = torch.where(torch.abs(c_rel_bg) > 2.0, g_bg, torch.zeros_like(g_bg))
+            norm_bg = torch.clamp(g_bg.sum(dim=0, keepdim=True), min=1.0e-6)
+            tau_bg_m = NGWD_FRONT_TAU0 * (g_bg / norm_bg)
+
+            u_proj_list.append(axis_bg)
+            tau_list.append(tau_bg_m)
+            k_launch_list.append(k_fr_idx)
+            u_src_list.append(u_bg_src)
+            eff_list.append(1.0)
+
     use_conv = q_conv_c is not None and NGWD_CONV_TAU0 > 0.0 and NGWD_CONV_EFF > 0.0
     if use_conv:
         assert q_conv_c is not None
@@ -426,7 +448,9 @@ def _compute_nonorographic_gwd_impl(
     if use_front:
         du_tot = du_tot + acc_all[idx_ax] * ux_fr.unsqueeze(0)
         dv_tot = dv_tot + acc_all[idx_ax] * uy_fr.unsqueeze(0)
-        idx_ax += 1
+        du_tot = du_tot + acc_all[idx_ax + 1]
+        dv_tot = dv_tot + acc_all[idx_ax + 2]
+        idx_ax += 3
     if use_conv:
         du_tot = du_tot + acc_all[idx_ax]
         dv_tot = dv_tot + acc_all[idx_ax + 1]

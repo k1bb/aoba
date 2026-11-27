@@ -1566,12 +1566,12 @@ $$
 
 `enable_nonoro_gwd = true` 時、緯度依存テーブルを一切用いず 2 種の物理波源（Charron & Manzini, 2002; Beres et al., 2004, 2005; Richter et al., 2010）から $N_{\mathrm{bins}} = 17$ 位相速度ビン（$c_m \in [-80, +80]\ \mathrm{m\ s^{-1}}$、水平波長 $\lambda_h = 200\ \mathrm{km}$）の重力波スペクトルを発射する：
 
-1. **前線起源（$600\ \mathrm{hPa}$ 付近）**：Gauss–Green 勾配から 2D 前線生成関数 $F$（Hoskins, 1982）を評価し、閾値 $F_{\mathrm{th}} = 1.25\times 10^{-15}\ \mathrm{K^2\ m^{-2}\ s^{-1}}$ の半分を超える前線域で発射強度 $A_{\mathrm{fr}}$・ガウス幅 $c_w = 30\ \mathrm{m\ s^{-1}}$ のスペクトルを発射する：
+1. **前線・等方背景起源（$600\ \mathrm{hPa}$ 付近）**：Gauss–Green 勾配から 2D 前線生成関数 $F$（Hoskins, 1982）を評価し、$F > 0.5 F_{\mathrm{th}}$（$F_{\mathrm{th}} = 1.25\times 10^{-15}\ \mathrm{K^2\ m^{-2}\ s^{-1}}$）の前線域で流向沿いのガウススペクトル（幅 $c_w = 30\ \mathrm{m\ s^{-1}}$、振幅 $A_{\mathrm{fr}}$）を発射するとともに、緯度・地理マップを一切用いない全球一様な等方 4 方位背景スペクトル（東西・南北両軸に $\tau_{0,\mathrm{bg}} = \tau_{0,\mathrm{front}}$, $\mathrm{eff}_{\mathrm{bg}} = 1.0$; Scinocca, 2003; Orr et al., 2010）を重畳する：
 
 $$
 \begin{aligned}
 F &= -\theta_x^2 u_x - \theta_y^2 v_y - \theta_x\theta_y(v_x + u_y), \\
-A_{\mathrm{fr}} &= \sigma\!\left(2.5\,\frac{F - F_{\mathrm{th}}}{F_{\mathrm{th}}}\right)
+A_{\mathrm{fr}} &= \mathbb{I}[F > 0.5 F_{\mathrm{th}}]\,\sigma\!\left(2.5\,\frac{F - F_{\mathrm{th}}}{F_{\mathrm{th}}}\right)
 \end{aligned} \tag{8.10}
 $$
 
@@ -1584,12 +1584,12 @@ x_m &= \frac{|c_m - u_{\mathrm{src}}|}{\sigma_c}, \qquad S_m = x_m\,\exp\!\left(
 \end{aligned} \tag{8.11}
 $$
 
-各ビンは上方へ伝播し、臨界層（$(c_m - u_{w,k}) s_m \le 2\ \mathrm{m\ s^{-1}}$）で全吸収、または Lindzen (1981) 飽和限界 $\tau_{\mathrm{sat},k}(c_m)$ で砕波減衰し、開放上端放射境界条件（未砕波フラックスは上端通過）のもとで運動量を付与する：
+各ビンは上方へ伝播し、臨界層（$(c_m - u_{w,k}) s_m \le 2\ \mathrm{m\ s^{-1}}$）で全吸収、またはスペクトルビン正規化・ドップラー拡がり広帯域飽和限界 $\tau_{\mathrm{sat},k}(c_m)$（$c_{\mathrm{ds}} = 22\ \mathrm{m\ s^{-1}}$; Hines, 1997; Scinocca, 2003）で砕波減衰し、開放上端放射境界条件および間欠性係数 $\mathrm{eff}_{\mathrm{gw}}$ のもとで運動量を付与する：
 
 $$
 \begin{aligned}
-\tau_{\mathrm{sat},k}(c_m) &= \frac{1}{2}\,k_h\,\mathrm{eff}_{\mathrm{gw}}\,\frac{\rho_{w,k}}{N_{w,k}}|c_m - u_{w,k}|^3, \\
-\left(\frac{\partial u}{\partial t}\right)_{\mathrm{GWD},k} &= \sum_{m=1}^{17}\frac{s_m\max(\tau_{\mathrm{in},m} - \tau_{\mathrm{out},m},\ 0)}{\rho_{d,k}\Delta z_{c,k}}
+\hat{c}_{\mathrm{eff}} &= \frac{|c_m - u_{w,k}|}{1 + |c_m - u_{w,k}| / c_{\mathrm{ds}}}, \qquad \tau_{\mathrm{sat},k}(c_m) = \frac{k_h}{2(N_{\mathrm{bins}} - 1)}\,\frac{\rho_{w,k}}{N_{w,k}}\,\hat{c}_{\mathrm{eff}}^3, \\
+\left(\frac{\partial u}{\partial t}\right)_{\mathrm{GWD},k} &= \mathrm{eff}_{\mathrm{gw}}\sum_{m=1}^{N_{\mathrm{bins}}}\frac{s_m\max(\tau_{\mathrm{in},m} - \tau_{\mathrm{out},m},\ 0)}{\rho_{d,k}\Delta z_{c,k}}
 \end{aligned} \tag{8.12}
 $$
 

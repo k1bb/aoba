@@ -1566,12 +1566,12 @@ $$
 
 When `enable_nonoro_gwd = true`, a $N_{\mathrm{bins}} = 17$ phase-speed spectrum ($c_m \in [-80, +80]\ \mathrm{m\ s^{-1}}$, horizontal wavelength $\lambda_h = 200\ \mathrm{km}$) is launched from two purely physical sources without latitude-tuned source tables (Charron & Manzini, 2002; Beres et al., 2004, 2005; Richter et al., 2010):
 
-1. **Frontal source (near $600\ \mathrm{hPa}$)**: Evaluates the 2D Hoskins (1982) frontogenesis function $F$ via Gauss–Green gradients, launching a Gaussian spectrum (width $c_w = 30\ \mathrm{m\ s^{-1}}$) with amplitude $A_{\mathrm{fr}}$ where $F > 0.5 F_{\mathrm{th}}$ ($F_{\mathrm{th}} = 1.25\times 10^{-15}\ \mathrm{K^2\ m^{-2}\ s^{-1}}$):
+1. **Frontal and isotropic background source (near $600\ \mathrm{hPa}$)**: Evaluates the 2D Hoskins (1982) frontogenesis function $F$ via Gauss–Green gradients, launching a directional frontal Gaussian spectrum (width $c_w = 30\ \mathrm{m\ s^{-1}}$) with amplitude $A_{\mathrm{fr}}$ where $F > 0.5 F_{\mathrm{th}}$ ($F_{\mathrm{th}} = 1.25\times 10^{-15}\ \mathrm{K^2\ m^{-2}\ s^{-1}}$) alongside a spatially uniform, map-free isotropic 4-azimuth background spectrum ($\tau_{0,\mathrm{bg}} = \tau_{0,\mathrm{front}}$ along zonal and meridional axes, $\mathrm{eff}_{\mathrm{bg}} = 1.0$; Scinocca, 2003; Orr et al., 2010):
 
 $$
 \begin{aligned}
 F &= -\theta_x^2 u_x - \theta_y^2 v_y - \theta_x\theta_y(v_x + u_y), \\
-A_{\mathrm{fr}} &= \sigma\!\left(2.5\,\frac{F - F_{\mathrm{th}}}{F_{\mathrm{th}}}\right)
+A_{\mathrm{fr}} &= \mathbb{I}[F > 0.5 F_{\mathrm{th}}]\,\sigma\!\left(2.5\,\frac{F - F_{\mathrm{th}}}{F_{\mathrm{th}}}\right)
 \end{aligned} \tag{8.10}
 $$
 
@@ -1584,12 +1584,12 @@ x_m &= \frac{|c_m - u_{\mathrm{src}}|}{\sigma_c}, \qquad S_m = x_m\,\exp\!\left(
 \end{aligned} \tag{8.11}
 $$
 
-Each bin propagates upward with complete absorption at critical levels ($(c_m - u_{w,k}) s_m \le 2\ \mathrm{m\ s^{-1}}$), Lindzen (1981) wave breaking saturation $\tau_{\mathrm{sat},k}(c_m)$, and an open radiating upper boundary:
+Each bin propagates upward with complete absorption at critical levels ($(c_m - u_{w,k}) s_m \le 2\ \mathrm{m\ s^{-1}}$), spectral-bin-normalized broadband Doppler-spread saturation $\tau_{\mathrm{sat},k}(c_m)$ ($c_{\mathrm{ds}} = 22\ \mathrm{m\ s^{-1}}$; Hines, 1997; Scinocca, 2003), intermittency scaling $\mathrm{eff}_{\mathrm{gw}}$, and an open radiating upper boundary:
 
 $$
 \begin{aligned}
-\tau_{\mathrm{sat},k}(c_m) &= \frac{1}{2}\,k_h\,\mathrm{eff}_{\mathrm{gw}}\,\frac{\rho_{w,k}}{N_{w,k}}|c_m - u_{w,k}|^3, \\
-\left(\frac{\partial u}{\partial t}\right)_{\mathrm{GWD},k} &= \sum_{m=1}^{17}\frac{s_m\max(\tau_{\mathrm{in},m} - \tau_{\mathrm{out},m},\ 0)}{\rho_{d,k}\Delta z_{c,k}}
+\hat{c}_{\mathrm{eff}} &= \frac{|c_m - u_{w,k}|}{1 + |c_m - u_{w,k}| / c_{\mathrm{ds}}}, \qquad \tau_{\mathrm{sat},k}(c_m) = \frac{k_h}{2(N_{\mathrm{bins}} - 1)}\,\frac{\rho_{w,k}}{N_{w,k}}\,\hat{c}_{\mathrm{eff}}^3, \\
+\left(\frac{\partial u}{\partial t}\right)_{\mathrm{GWD},k} &= \mathrm{eff}_{\mathrm{gw}}\sum_{m=1}^{N_{\mathrm{bins}}}\frac{s_m\max(\tau_{\mathrm{in},m} - \tau_{\mathrm{out},m},\ 0)}{\rho_{d,k}\Delta z_{c,k}}
 \end{aligned} \tag{8.12}
 $$
 
