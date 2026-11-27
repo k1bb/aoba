@@ -3629,16 +3629,14 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
     }
     if (spriteU8) {
       const sRaw = spriteU8[i00]*w00 + spriteU8[i10]*w10 + spriteU8[i01]*w01 + spriteU8[i11]*w11;
-      if (sRaw > 10) {
-        const sn = Math.min(1.0, (sRaw - 10) / 185.0);
-        const spH = ((((row >> 2) * 2654435761) ^ ((col >> 2) * 2246822519) ^ ((twinkleTick >> 1) * 3266489917)) >>> 0) & 255;
-        const spPulse = 0.55 + 0.85 * Math.pow(spH / 255.0, 2.6);
-        // Red sprites & TLE halos glow vividly on night/twilight hemisphere, faintly on intense day storms
-        const vis = mu0 < 0.05 ? 1.35 : (mu0 < 0.22 ? 0.70 : 0.30);
-        const sAmp = Math.min(1.0, sn * spPulse * vis);
-        r += sAmp * 255.0;
-        g += sAmp * 34.0;
-        b += sAmp * 92.0;
+      if (sRaw > 28) {
+        const sn = Math.min(1.0, (sRaw - 28) / 210.0);
+        // Subtle diffuse mesospheric halo on night/twilight side (crisp vertical filaments drawn on 2D overlay)
+        const vis = mu0 < 0.05 ? 0.35 : (mu0 < 0.20 ? 0.16 : 0.05);
+        const sAmp = sn * vis;
+        r += sAmp * 210.0;
+        g += sAmp * 22.0;
+        b += sAmp * 68.0;
       }
     }
 
@@ -3703,32 +3701,63 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
           ctx.fillStyle = gr;
           ctx.beginPath(); ctx.arc(px, py, rad, 0, Math.PI * 2); ctx.fill();
         }
-        // 2. Red Sprites & Sprite Halos (crimson-red vertical column + upper halo)
+        // 2. Red Sprites (crisp vertical crimson-red filaments standing radially upward + compact head)
         if (sv >= 42 && hSeed > 135) {
           const sInt = Math.min(1.0, (sv - 42) / 150.0) * (muC < 0.08 ? 1.0 : (muC < 0.25 ? 0.55 : 0.22));
-          const radS = sc * (4.0 + 7.0 * sInt);
-          const lift = sc * (3.0 + 5.5 * sInt) * limbFactor;
-          const sx2 = px + ux * lift, sy2 = py + uy * lift;
-          const sg = ctx.createRadialGradient(sx2, sy2, 0, sx2, sy2, radS);
-          sg.addColorStop(0, `rgba(255,70,115,${(0.88 * sInt).toFixed(2)})`);
-          sg.addColorStop(0.45, `rgba(225,29,72,${(0.45 * sInt).toFixed(2)})`);
-          sg.addColorStop(1, "rgba(190,24,93,0)");
-          ctx.fillStyle = sg;
-          ctx.beginPath(); ctx.arc(sx2, sy2, radS, 0, Math.PI * 2); ctx.fill();
-          ctx.strokeStyle = `rgba(255,110,145,${(0.75 * sInt).toFixed(2)})`;
+          const liftBase = sc * 1.4 * Math.max(0.28, limbFactor);
+          const liftTop = sc * (6.5 + 7.5 * sInt) * Math.max(0.32, limbFactor);
+          const bx0 = px + ux * liftBase, by0 = py + uy * liftBase;
+          const sx2 = px + ux * liftTop, sy2 = py + uy * liftTop;
+          // Tangent unit vector perpendicular to vertical radial direction
+          const tx = -uy, ty = ux;
+          const spW = sc * (0.9 + 0.9 * sInt);
+          // 3 delicate vertical sprite streamers (central column + two flanking carrot tendrils)
+          ctx.lineCap = "round";
+          ctx.strokeStyle = `rgba(255,48,96,${(0.92 * sInt).toFixed(2)})`;
           ctx.lineWidth = Math.max(1.0, sc * 1.15);
-          ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(sx2, sy2); ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(bx0, by0); ctx.lineTo(sx2, sy2);
+          ctx.stroke();
+          ctx.strokeStyle = `rgba(255,95,130,${(0.62 * sInt).toFixed(2)})`;
+          ctx.lineWidth = Math.max(0.75, sc * 0.72);
+          ctx.beginPath();
+          ctx.moveTo(bx0 + tx * spW * 0.65, by0 + ty * spW * 0.65);
+          ctx.lineTo(sx2 + tx * spW - ux * sc * 0.9, sy2 + ty * spW - uy * sc * 0.9);
+          ctx.moveTo(bx0 - tx * spW * 0.65, by0 - ty * spW * 0.65);
+          ctx.lineTo(sx2 - tx * spW - ux * sc * 0.9, sy2 - ty * spW - uy * sc * 0.9);
+          ctx.stroke();
+          // Subtle blue lower tendril root + compact red mesospheric cap
+          ctx.strokeStyle = `rgba(120,165,255,${(0.42 * sInt).toFixed(2)})`;
+          ctx.lineWidth = Math.max(0.75, sc * 0.8);
+          ctx.beginPath();
+          ctx.moveTo(px, py); ctx.lineTo(bx0, by0);
+          ctx.stroke();
+          ctx.fillStyle = `rgba(255,70,115,${(0.55 * sInt).toFixed(2)})`;
+          ctx.beginPath();
+          ctx.ellipse(sx2, sy2, sc * (1.8 + 1.4 * sInt), sc * (0.85 + 0.55 * sInt) * Math.max(0.25, z), Math.atan2(uy, ux) + Math.PI * 0.5, 0, Math.PI * 2);
+          ctx.fill();
         }
-        // 3. ELVES (expanding hollow crimson-orange D-region EMP ring at ~90 km)
+        // 3. ELVES (horizontally expanding foreshortened EMP ring hugging spherical ~90 km D-region shell)
         if (ev >= 45 && ((hSeed + 91) & 255) > 155) {
           const eInt = Math.min(1.0, (ev - 45) / 155.0) * (muC < 0.05 ? 0.95 : (muC < 0.20 ? 0.45 : 0.15));
-          const phase = ((twinkleTick + rr * 3 + cc) % 5) / 4.0;
-          const rRing = sc * (4.5 + 8.5 * phase) * (0.6 + 0.4 * eInt);
-          const liftE = sc * 4.8 * limbFactor;
+          const phase = ((twinkleTick + rr * 3 + cc) % 6) / 5.0;
+          const rMajor = sc * (5.5 + 10.5 * phase) * (0.65 + 0.35 * eInt);
+          const rMinor = rMajor * Math.max(0.16, z);
+          const rotAng = Math.atan2(uy, ux) + Math.PI * 0.5;
+          const liftE = sc * 5.2 * limbFactor;
           const ex2 = px + ux * liftE, ey2 = py + uy * liftE;
-          ctx.strokeStyle = `rgba(255,115,65,${(0.85 * eInt * (1.0 - 0.55 * phase)).toFixed(2)})`;
-          ctx.lineWidth = Math.max(1.0, sc * (1.4 - 0.5 * phase));
-          ctx.beginPath(); ctx.arc(ex2, ey2, rRing, 0, Math.PI * 2); ctx.stroke();
+          const alphaE = 0.88 * eInt * (1.0 - 0.55 * phase);
+          ctx.strokeStyle = `rgba(255,92,58,${alphaE.toFixed(2)})`;
+          ctx.lineWidth = Math.max(1.0, sc * (1.5 - 0.55 * phase));
+          ctx.beginPath();
+          ctx.ellipse(ex2, ey2, rMajor, rMinor, rotAng, 0, Math.PI * 2);
+          ctx.stroke();
+          // Faint outer shock-front rim
+          ctx.strokeStyle = `rgba(255,155,105,${(alphaE * 0.42).toFixed(2)})`;
+          ctx.lineWidth = Math.max(0.7, sc * 0.75);
+          ctx.beginPath();
+          ctx.ellipse(ex2, ey2, rMajor * 1.18, rMinor * 1.18, rotAng, 0, Math.PI * 2);
+          ctx.stroke();
         }
         // 4. Blue Jets (electric cobalt-blue narrow upward stratospheric jet cone)
         if (bv >= 38 && ((hSeed + 173) & 255) > 145) {
