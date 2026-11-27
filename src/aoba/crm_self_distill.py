@@ -1586,7 +1586,18 @@ def _compute_distill_loss(
     )  # [3, 2*B]
     w_scal = _cached_loss_weights("crm_scal", (1.2, 1.2, 0.8), (3, 1), tp.device, tp.dtype)
     l_scal = (F.smooth_l1_loss(scal_p2, scal_t2, reduction="none") * w_scal).mean(dim=1).sum()
-    loss = l_prof + l_scal + 2.0 * l_t_pbl + 1.2 * l_t_grad
+    # Linear batch-mean precipitation bias regularizer prevents Jensen-inequality over-draining in log1p space
+    p_tot_t_mm = torch.clamp((tgt_s[:, 0] + tgt_s[:, 1]) * 86400.0, min=0.0).mean()
+    p_tot_p_mm = torch.clamp(
+        (
+            torch.cat([pred_a["precip_rain"], pred_b["precip_rain"]], dim=0)
+            + torch.cat([pred_a["precip_snow"], pred_b["precip_snow"]], dim=0)
+        )
+        * 86400.0,
+        min=0.0,
+    ).mean()
+    l_p_bias = F.smooth_l1_loss(p_tot_p_mm, p_tot_t_mm, beta=0.5)
+    loss = l_prof + l_scal + 0.4 * l_p_bias + 2.0 * l_t_pbl + 1.2 * l_t_grad
 
     # Sharp per-step tendency & RH-normalized moisture supervision eliminates systematic PBL drying
     # and upper-tropospheric moistening/cirrus drift across 4 orders of magnitude in q_sat(z).

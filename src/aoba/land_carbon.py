@@ -65,8 +65,8 @@ TAU_SOIL_BASE_YR: float = 35.0     # Base surface soil organic C turnover timesc
 RESP_GROWTH_FRAC: float = 0.25     # Growth respiration fraction of (GPP - R_maint) [-]
 R_MAINT_WOOD_YR: float = 0.012     # Woody sapwood/stem maintenance respiration rate at 25 C [yr^-1]
 R_MAINT_ROOT_YR: float = 0.25      # Fine-root maintenance respiration rate at 25 C [yr^-1]
-HUMIF_FRAC_FAST: float = 0.30      # Fraction of decomposed fast litter entering soil C (rest -> R_h) [-]
-HUMIF_FRAC_SLOW: float = 0.45      # Fraction of decomposed slow litter entering soil C (rest -> R_h) [-]
+HUMIF_FRAC_FAST: float = 0.14      # Fraction of decomposed fast litter entering soil C (rest -> R_h & net N min) [-]
+HUMIF_FRAC_SLOW: float = 0.18      # Fraction of decomposed slow litter entering soil C (rest -> R_h & net N min) [-]
 
 # Vertically resolved soil C/N & permafrost parameters (Koven et al., 2013, Sec. 2.2)
 SOIL_Z_TAU_M: float = 0.50         # e-folding depth for intrinsic soil decay rate attenuation [m]

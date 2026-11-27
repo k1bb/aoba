@@ -7952,8 +7952,8 @@ kernel void land_carbon_cn_fire_prep_tile(
     { float d=-dec_lf+clf_cmp; float t=c_lf+d; clf_cmp=(fabs(c_lf)>=fabs(d))?((c_lf-t)+d):((d-t)+c_lf); c_lf=t; }
     { float d=-dec_ls+cls_cmp; float t=c_ls+d; cls_cmp=(fabs(c_ls)>=fabs(d))?((c_ls-t)+d):((d-t)+c_ls); c_ls=t; }
 
-    float rh_lit_kg = 0.70f * dec_lf + 0.55f * dec_ls;
-    float humif_in = 0.30f * dec_lf + 0.45f * dec_ls;
+    float rh_lit_kg = 0.86f * dec_lf + 0.82f * dec_ls;
+    float humif_in = 0.14f * dec_lf + 0.18f * dec_ls;
 
     float cs[5], csc[5], ks_arr[5];
     float rh_soil_kg = 0.0f;
