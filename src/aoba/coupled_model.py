@@ -3066,6 +3066,12 @@ def step_aoba_model(
                         f_coriolis=mesh.f_cell[t_idx],
                         n_c=pool.crm.n_c[:, :n_t] if pool.crm.n_c is not None else None,
                         n_i=pool.crm.n_i[:, :n_t] if pool.crm.n_i is not None else None,
+                        q_r=pool.crm.q_r[:, :n_t] if getattr(pool.crm, "q_r", None) is not None else None,
+                        q_s=pool.crm.q_s[:, :n_t] if getattr(pool.crm, "q_s", None) is not None else None,
+                        q_g=pool.crm.q_g[:, :n_t] if getattr(pool.crm, "q_g", None) is not None else None,
+                        n_r=pool.crm.n_r[:, :n_t] if getattr(pool.crm, "n_r", None) is not None else None,
+                        n_s=pool.crm.n_s[:, :n_t] if getattr(pool.crm, "n_s", None) is not None else None,
+                        n_g=pool.crm.n_g[:, :n_t] if getattr(pool.crm, "n_g", None) is not None else None,
                     )
                 drho_t = (atmos.rho_d[:, t_idx] - mean_2d(sub_crm_t.rho_d)).unsqueeze(-1).unsqueeze(-1)
                 sub_crm_t.rho_d = torch.clamp(sub_crm_t.rho_d + drho_t, min=1.0e-8)
@@ -3601,6 +3607,12 @@ def step_aoba_model(
                     f_coriolis=mesh.f_cell[sl],
                     n_c=crm.n_c[:, sl] if crm.n_c is not None else None,
                     n_i=crm.n_i[:, sl] if crm.n_i is not None else None,
+                    q_r=crm.q_r[:, sl] if getattr(crm, "q_r", None) is not None else None,
+                    q_s=crm.q_s[:, sl] if getattr(crm, "q_s", None) is not None else None,
+                    q_g=crm.q_g[:, sl] if getattr(crm, "q_g", None) is not None else None,
+                    n_r=crm.n_r[:, sl] if getattr(crm, "n_r", None) is not None else None,
+                    n_s=crm.n_s[:, sl] if getattr(crm, "n_s", None) is not None else None,
+                    n_g=crm.n_g[:, sl] if getattr(crm, "n_g", None) is not None else None,
                 )
                 sub_sfc = SurfaceFluxDiagnostics(**{k: _tile3d_to_crm3d(v[sl]) for k, v in sfc_diag_tile.items()})
                 sp = step_crm_physics_and_dynamics(
@@ -3634,14 +3646,14 @@ def step_aoba_model(
                 crm.q_c[:, sl] = sub_crm.q_c
                 crm.q_i[:, sl] = sub_crm.q_i
                 crm.qke[:, sl] = sub_crm.qke
-                if sub_crm.n_c is not None:
-                    if crm.n_c is None:
-                        crm.n_c = torch.zeros_like(crm.q_c)
-                    crm.n_c[:, sl] = sub_crm.n_c
-                if sub_crm.n_i is not None:
-                    if crm.n_i is None:
-                        crm.n_i = torch.zeros_like(crm.q_i)
-                    crm.n_i[:, sl] = sub_crm.n_i
+                for opt_attr in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
+                    src_f = getattr(sub_crm, opt_attr, None)
+                    if src_f is not None:
+                        dst_f = getattr(crm, opt_attr, None)
+                        if dst_f is None:
+                            dst_f = torch.zeros_like(crm.q_c)
+                            setattr(crm, opt_attr, dst_f)
+                        dst_f[:, sl] = src_f
 
                 rho_crm_mean = mean_2d(sub_crm.rho_d)
                 inv_rho_crm = 1.0 / torch.clamp(rho_crm_mean, min=1.0e-8)

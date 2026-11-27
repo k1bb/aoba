@@ -1929,19 +1929,26 @@ kernel void ozone_chem_col(
     }
 
     // Pass 4: clamp, write out o3_vmr & accumulate diagnostics
+    // Compute surface drydep scalar inside Pass 4 at k==0 to avoid an Apple Metal register-spill miscompilation
+    // when indexing chi0_arr[0]/dm_arr[0] after the full-column loop.
     float tco_sum = 0.0f;
     float chem_sum = 0.0f;
+    float chi_new_0 = 0.0f;
+    float drydep_0 = 0.0f;
     for (uint k = 0u; k < nz; ++k) {
         float cn = clamp(chi_arr[k], 1.0e-10f, 4.0e-5f);
         o3_vmr[k * nc + col] = cn;
         tco_sum += cn * dn_air_arr[k];
         chem_sum += (cn - chi0_arr[k]) * M_O3_AIR * dm_arr[k];
-        chi_arr[k] = cn;
+        if (k == 0u) {
+            chi_new_0 = cn;
+            float chi_mid_0 = 0.5f * (chi0_arr[0] + cn);
+            drydep_0 = (chi_mid_0 * M_O3_AIR * dm_arr[0]) * k_dep_0;
+        }
     }
-    float chi_mid_0 = 0.5f * (chi0_arr[0] + chi_arr[0]);
     diag_out[0u * nc + col] = tco_sum / DU_CONV;
-    diag_out[1u * nc + col] = chi_arr[0] * 1.0e9f;
-    diag_out[2u * nc + col] = (chi_mid_0 * M_O3_AIR * dm_arr[0]) * k_dep_0;
+    diag_out[1u * nc + col] = chi_new_0 * 1.0e9f;
+    diag_out[2u * nc + col] = drydep_0;
     diag_out[3u * nc + col] = chem_sum / max(dt, 1.0f);
 }
 

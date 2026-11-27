@@ -1117,6 +1117,24 @@ class GPUReplayBuffer:
         b = int(x.shape[0])
         if b == 0:
             return
+        # Resolution-invariant steady-state replay horizon: once the ring is warmed up (>= 4096),
+        # cap single-step push to 128 randomly subsampled teacher columns so Glevel-5/6 (160-640
+        # teachers/step) retain a multi-day recency ring (~4+ days across 8+ cohort rotations)
+        # instead of overwriting the ring every ~20 hours.
+        if b > 128 and self.ring_size >= 4096:
+            sub_idx = torch.randint(0, b, (128,), device=x.device)
+            x = x[sub_idx]
+            ctx_p = ctx_p[sub_idx]
+            ctx_s = ctx_s[sub_idx]
+            tgt_p = tgt_p[sub_idx]
+            tgt_s = tgt_s[sub_idx]
+            if sub_maps is not None:
+                sub_maps = sub_maps[sub_idx]
+            if tgt_maps is not None:
+                tgt_maps = tgt_maps[sub_idx]
+            if tgt_has_map is not None:
+                tgt_has_map = tgt_has_map[sub_idx]
+            b = 128
         if b > self.ring_cap:
             perm = torch.randperm(b, device=self.device)[: self.ring_cap]
             x, ctx_p, ctx_s, tgt_p, tgt_s = x[perm], ctx_p[perm], ctx_s[perm], tgt_p[perm], tgt_s[perm]
@@ -1586,18 +1604,7 @@ def _compute_distill_loss(
     )  # [3, 2*B]
     w_scal = _cached_loss_weights("crm_scal", (1.2, 1.2, 0.8), (3, 1), tp.device, tp.dtype)
     l_scal = (F.smooth_l1_loss(scal_p2, scal_t2, reduction="none") * w_scal).mean(dim=1).sum()
-    # Linear batch-mean precipitation bias regularizer prevents Jensen-inequality over-draining in log1p space
-    p_tot_t_mm = torch.clamp((tgt_s[:, 0] + tgt_s[:, 1]) * 86400.0, min=0.0).mean()
-    p_tot_p_mm = torch.clamp(
-        (
-            torch.cat([pred_a["precip_rain"], pred_b["precip_rain"]], dim=0)
-            + torch.cat([pred_a["precip_snow"], pred_b["precip_snow"]], dim=0)
-        )
-        * 86400.0,
-        min=0.0,
-    ).mean()
-    l_p_bias = F.smooth_l1_loss(p_tot_p_mm, p_tot_t_mm, beta=0.5)
-    loss = l_prof + l_scal + 0.4 * l_p_bias + 2.0 * l_t_pbl + 1.2 * l_t_grad
+    loss = l_prof + l_scal + 2.0 * l_t_pbl + 1.2 * l_t_grad
 
     # Sharp per-step tendency & RH-normalized moisture supervision eliminates systematic PBL drying
     # and upper-tropospheric moistening/cirrus drift across 4 orders of magnitude in q_sat(z).
@@ -1721,7 +1728,8 @@ def train_student_online(
         and b_fresh <= 128
     ):
         batch_size = min(int(batch_size), 256)
-    half_b = min(batch_size // 2, b_fresh)
+    fresh_cap = (batch_size // 2) if (state.steps_seen < state.warmup_steps + 24) else (batch_size // 4)
+    half_b = min(fresh_cap, b_fresh)
     use_sp = (
         state.replay.has_spatial
         and sub_maps_fresh is not None
@@ -2880,6 +2888,18 @@ class GPURadReplayBuffer:
         b = int(x.shape[0])
         if b == 0:
             return
+        # Resolution-invariant steady-state replay horizon: once the ring is warmed up (>= 4096),
+        # cap single-step push to 128 randomly subsampled teacher columns so Glevel-5/6 (160-640
+        # teachers/step) retain a multi-day recency ring (~4+ days across 8+ cohort rotations)
+        # instead of overwriting the ring every ~20 hours.
+        if b > 128 and self.ring_size >= 4096:
+            sub_idx = torch.randint(0, b, (128,), device=x.device)
+            x = x[sub_idx]
+            cp_layer = cp_layer[sub_idx]
+            ctx_s = ctx_s[sub_idx]
+            tgt_qrad = tgt_qrad[sub_idx]
+            tgt_s = tgt_s[sub_idx]
+            b = 128
         if b > self.ring_cap:
             perm = torch.randperm(b, device=self.device)[: self.ring_cap]
             x, cp_layer, ctx_s, tgt_qrad, tgt_s = x[perm], cp_layer[perm], ctx_s[perm], tgt_qrad[perm], tgt_s[perm]
