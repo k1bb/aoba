@@ -1597,7 +1597,12 @@ def step_ogcm_voronoi(
         bgc_acc_mode = 1 if phase == 0 else (3 if do_bgc_now else 2)
         acc_spec = (nzo, nc, ne, str(dev), str(dtype))
         acc_store = getattr(ogcm, "_bgc_flux_acc", None)
-        if acc_store is None or getattr(ogcm, "_bgc_flux_acc_spec", None) != acc_spec:
+        if (
+            acc_store is None
+            or getattr(ogcm, "_bgc_flux_acc_spec", None) != acc_spec
+            or not isinstance(acc_store, tuple)
+            or len(acc_store) != 9
+        ):
             acc_store = (
                 torch.zeros((nzo, nc), device=dev, dtype=dtype),      # 0: h_old_z_start
                 torch.zeros((nzo, ne), device=dev, dtype=dtype),      # 1: hu_sum
@@ -1609,6 +1614,10 @@ def step_ogcm_voronoi(
                 torch.zeros((nc,), device=dev, dtype=dtype),          # 7: fice_sum
                 torch.zeros((nc,), device=dev, dtype=dtype),          # 8: dh0_sum
             )
+            setattr(ogcm, "_bgc_flux_acc", acc_store)
+            setattr(ogcm, "_bgc_flux_acc_spec", acc_spec)
+        elif acc_store[0].device != dev or acc_store[0].dtype != dtype:
+            acc_store = tuple(t.to(device=dev, dtype=dtype) for t in acc_store)
             setattr(ogcm, "_bgc_flux_acc", acc_store)
             setattr(ogcm, "_bgc_flux_acc_spec", acc_spec)
         bgc_acc_in = acc_store if bgc_acc_mode in (2, 3) else None

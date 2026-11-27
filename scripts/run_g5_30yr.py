@@ -538,7 +538,7 @@ def _remap_thermo_columns(
     p_old, _, t_old = diagnose_pressure_temperature(
         rho_old.to(torch.float64), thm_old.to(torch.float64), qv_old.to(torch.float64)
     )
-    ln_p_interp = _interp_vertical_batch(zo, torch.log(torch.clamp(p_old, min=1.0)), zn)
+    ln_p_interp = _interp_vertical_batch(zo, torch.log(torch.clamp(p_old, min=1.0e-3)), zn)
     t_interp = _interp_vertical_batch(zo, t_old, zn)
     qv_interp = torch.clamp(_interp_vertical_batch(zo, qv_old.to(torch.float64), zn), min=1.0e-7)
     qc_interp = torch.clamp(_interp_vertical_batch(zo, qc_old.to(torch.float64), zn), min=0.0)
@@ -563,7 +563,7 @@ def _remap_thermo_columns(
             dz_k = torch.clamp(zn[k] - zn[k - 1], min=1.0)
             t_mid = 0.5 * (t_new[k - 1] + t_new[k])
             p_hyd = p_new[k - 1] * torch.exp(-C.GRAVITY * dz_k / (C.R_D * t_mid))
-            p_new[k] = torch.where(ab_k, torch.clamp(p_hyd, min=1.0), p_new[k])
+            p_new[k] = torch.where(ab_k, torch.clamp(p_hyd, min=1.0e-3), p_new[k])
 
     rho_new = p_new / (C.R_D * t_new * (1.0 + C.RV_OVER_RD * qv_new))
     thm_new = (C.P_REF / (C.R_D * rho_new)) * torch.pow(p_new / C.P_REF, 1.0 / C.GAMMA_D)
