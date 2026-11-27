@@ -695,7 +695,7 @@ def _scvt_mesh_cache_path(
     cache_dir = aoba.get_output_dir() / "_mesh_cache"
     p_key = str(planet_preset or "earth").strip().lower()
     if p_key == "pangaea":
-        e14_tag = "pangaea250ma"
+        e14_tag = f"scotese250ma_s{max(int(stride), 1)}"
     else:
         e14_tag = f"e14s{max(int(stride), 1)}" if has_earth2014 else "aqua"
     name = f"scvt_g{int(glevel)}_l{int(n_lloyd_iter)}_r{int(round(radius))}_{e14_tag}_v{_SCVT_CACHE_SCHEMA_VERSION}.zarr"
@@ -828,6 +828,7 @@ def build_scvt_mesh(
                 edges_on_cell=topo["edges_on_cell"],
                 n_edges_on_cell=topo["n_edges_on_cell"],
                 cells_on_edge=topo["cells_on_edge"],
+                stride=max(earth2014_stride, 1),
             )
         elif has_e14:
             bndry = _aggregate_earth2014_to_scvt(

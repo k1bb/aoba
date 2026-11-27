@@ -2160,7 +2160,7 @@ $$
 | `"tidally_locked"` | `enable_tidal_lock=true`, $P_{\mathrm{rot}}=10\ \mathrm{d}$, $\varepsilon=e=0$, diurnal off | 100% flat ocean | Yang et al. (2013) |
 | `"trappist1e"` | `enable_tidal_lock=true`, $S_0=900$, $P_{\mathrm{rot}}=6.101\ \mathrm{d}$, $\mathrm{CO}_2=1000\ \mathrm{ppmv}$ | 100% flat ocean | Turbet et al. (2018); Fauchez et al. (2020) |
 | `"mars_like"` | $S_0=589$, $\Omega=7.0882\times 10^{-5}$, $\varepsilon=25.19^\circ$, $e=0.0934$, $\mathrm{CO}_2=4\%$ | 100% dry bare land ($\sigma_{\mathrm{topo}}=150\ \mathrm{m}, T=218\ \mathrm{K}, w_\ell=0.005, \mathrm{LAI}=0$) | — |
-| `"pangaea"` | `use_earth2014=false`, $S_0=1333$, $\mathrm{CO}_2=1137.2\ \mathrm{ppmv}$ | Analytic 250 Ma C-shaped supercontinent (~32% land), Tethys embayment, Central Pangaean Mountains, Panthalassa bathymetry, uniform pioneer land | Kutzbach & Gallimore (1989); Parrish (1993) |
+| `"pangaea"` | `use_earth2014=false`, $S_0=1333$, $\mathrm{CO}_2=1137.2\ \mathrm{ppmv}$ | 6-arc-min 250 Ma Permo-Triassic PaleoDEM (28.6% land, Tethys & Panthalassa bathymetry, Lott–Miller subgrid orography), uniform pioneer land | Scotese & Wright (2018) |
 
 When `enable_tidal_lock = true`, the solar zenith cosine takes a stationary distribution centered at substellar longitude $\lambda_{\mathrm{sub}}$ (`substellar_lon_deg`):
 

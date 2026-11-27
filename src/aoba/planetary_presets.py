@@ -17,10 +17,11 @@ Supported Presets (`planet_preset`):
   `enable_tidal_lock = True`, `co2_ppmv = 1000.0`, aquaplanet surface; Fauchez et al., 2020).
 - `"mars_like"`: Cold arid terrestrial planet (`S_0 = 589 W m^-2`, 100% dry bare land, low
   moisture, `omega = 7.088e-5 rad s^-1`, `obliquity = 25.19 deg`).
-- `"pangaea"`: Late Permian / Early Triassic (`~250 Ma`) C-shaped supercontinent enclosing the
-  equatorial Tethys Ocean inside the global Panthalassa super-ocean (`S_0 = 1333 W m^-2`,
-  `co2_ppmv = 1137.2`, Central Pangaean Mountains, zero prescribed biome/soil/albedo maps;
-  Kutzbach & Gallimore, 1989; Parrish, 1993; Scotese, 2001).
+- `"pangaea"`: Late Permian / Permo-Triassic Boundary (`250 Ma`) supercontinent using the
+  published 6-arc-minute Scotese & Wright (2018) PALEOMAP PaleoDEM (Zenodo DOI
+  `10.5281/zenodo.5460860`, auto-downloaded on demand) with `S_0 = 1333 W m^-2` and
+  `co2_ppmv = 1137.2`, supplying only topography/bathymetry with zero prescribed biome,
+  soil, albedo, or dust maps.
 
 AOBA Formulation Reference: Sec. 11.3, Eq. (11.5) (General Planetary / Exoplanet Presets & Tidal Lock).
 """
@@ -174,6 +175,93 @@ def apply_planet_initial_surface(sfc: Any, preset: str) -> None:
         sfc.bio.f_c4 = torch.where(~is_ocn, torch.full_like(sfc.bio.f_c4, 0.2), torch.zeros_like(sfc.bio.f_c4))
 
 
+SCOTESE_2018_6MIN_ZIP_URL: str = (
+    "https://zenodo.org/api/records/5460860/files/"
+    "Scotese_Wright_2018_Maps_1-88_6minX6min_PaleoDEMS_nc.zip/content"
+)
+SCOTESE_2018_250MA_FILENAME: str = "scotese2018_250ma_6min.nc"
+
+
+def ensure_paleomap_250ma_dem(
+    paleomap_dir: str = "data/boundary/paleomap_scotese2018",
+    auto_download: bool = True,
+) -> Any:
+    """Locate or auto-download the Scotese & Wright (2018) 6-arc-min 250 Ma PaleoDEM NetCDF.
+
+    Uses HTTP Range extraction (~1.4 MB) from the official open-access Zenodo archive
+    (DOI: 10.5281/zenodo.5460860) and caches the NetCDF under `data/boundary/paleomap_scotese2018/`.
+    """
+    import os
+    from pathlib import Path
+    import struct
+    import urllib.request
+    import zlib
+
+    candidates: list[Path] = [Path(paleomap_dir) / SCOTESE_2018_250MA_FILENAME]
+    env_data = os.environ.get("AOBA_DATA_DIR", "").strip()
+    if env_data:
+        candidates.insert(0, Path(env_data) / "boundary" / "paleomap_scotese2018" / SCOTESE_2018_250MA_FILENAME)
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates.append(repo_root / "data" / "boundary" / "paleomap_scotese2018" / SCOTESE_2018_250MA_FILENAME)
+
+    for p in candidates:
+        if p.is_file() and p.stat().st_size > 100_000:
+            return p
+
+    target = candidates[0]
+    if not auto_download:
+        raise FileNotFoundError(f"Scotese & Wright (2018) 250 Ma PaleoDEM not found at {target}")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    headers = {"User-Agent": "AOBA-ESM/1.0"}
+    req_head = urllib.request.Request(SCOTESE_2018_6MIN_ZIP_URL, method="HEAD", headers=headers)
+    with urllib.request.urlopen(req_head, timeout=30) as resp:
+        total = int(resp.headers["Content-Length"])
+    tail_sz = min(262144, total)
+    req_tail = urllib.request.Request(
+        SCOTESE_2018_6MIN_ZIP_URL,
+        headers={**headers, "Range": f"bytes={total - tail_sz}-{total - 1}"},
+    )
+    with urllib.request.urlopen(req_tail, timeout=30) as resp:
+        tail = resp.read()
+    eocd = tail.rfind(b"PK\x05\x06")
+    if eocd < 0:
+        raise RuntimeError("Failed to locate ZIP central directory in Scotese 2018 Zenodo archive")
+    cd_size, cd_off = struct.unpack_from("<II", tail, eocd + 12)
+    req_cd = urllib.request.Request(
+        SCOTESE_2018_6MIN_ZIP_URL,
+        headers={**headers, "Range": f"bytes={cd_off}-{cd_off + cd_size - 1}"},
+    )
+    with urllib.request.urlopen(req_cd, timeout=30) as resp:
+        cd = resp.read()
+
+    pos = 0
+    while pos + 46 <= len(cd):
+        if cd[pos:pos + 4] != b"PK\x01\x02":
+            break
+        comp_m = struct.unpack_from("<H", cd, pos + 10)[0]
+        comp_sz, _ = struct.unpack_from("<II", cd, pos + 20)
+        fn_len, ex_len, cm_len = struct.unpack_from("<HHH", cd, pos + 28)
+        lfh_off = struct.unpack_from("<I", cd, pos + 42)[0]
+        fn = cd[pos + 46:pos + 46 + fn_len].decode("utf-8", errors="replace")
+        pos += 46 + fn_len + ex_len + cm_len
+        if "250Ma.nc" in fn and fn.endswith(".nc"):
+            req_f = urllib.request.Request(
+                SCOTESE_2018_6MIN_ZIP_URL,
+                headers={**headers, "Range": f"bytes={lfh_off}-{lfh_off + 30 + fn_len + 512 + comp_sz}"},
+            )
+            with urllib.request.urlopen(req_f, timeout=90) as resp:
+                chunk = resp.read()
+            lf_fn, lf_ex = struct.unpack_from("<HH", chunk, 26)
+            raw = chunk[30 + lf_fn + lf_ex:30 + lf_fn + lf_ex + comp_sz]
+            nc_bytes = zlib.decompress(raw, -15) if comp_m == 8 else raw
+            tmp = target.with_suffix(".nc.tmp")
+            tmp.write_bytes(nc_bytes)
+            tmp.replace(target)
+            return target
+    raise RuntimeError("250Ma.nc entry not found inside Scotese & Wright (2018) 6-min Zenodo archive")
+
+
 def build_pangaea_boundary_fields(
     xyz_cell: np.ndarray,
     lat_cell: np.ndarray,
@@ -181,73 +269,130 @@ def build_pangaea_boundary_fields(
     edges_on_cell: np.ndarray,
     n_edges_on_cell: np.ndarray,
     cells_on_edge: np.ndarray,
+    stride: int = 2,
 ) -> dict[str, np.ndarray]:
-    """Construct self-contained 250 Ma Late Permian / Early Triassic Pangaea elevation & bathymetry.
+    """Aggregate the published Scotese & Wright (2018) 6-arc-min 250 Ma PaleoDEM onto SCVT cells.
 
-    Generates a classic C-shaped pole-to-pole supercontinent (~32% land fraction) comprising Laurasia,
-    Gondwana, the equatorial Tethys Ocean embayment, Panthalassa super-ocean bathymetry, Central
-    Pangaean Mountains (Variscan/Appalachian suture), Gondwanide cordillera, and Uralian highlands
-    (Kutzbach & Gallimore, 1989; Parrish, 1993; Scotese, 2001). Supplies ONLY topography/bathymetry;
-    zero vegetation, soil, albedo, or dust maps are prescribed.
+    Computes cos(lat)-weighted spherical-area averages of surface elevation, bathymetry, ocean
+    fraction, and exact Lott & Miller (1997, Appendix A, Eqs. A1-A5) subgrid orographic gradient
+    tensor `(sigma_topo, slope_topo, aniso_topo, angle_topo)`, plus 2-pass Klemp (2011) Laplacian
+    smoothing and nearest coastal ocean indices. Supplies ONLY elevation and bathymetry; zero
+    vegetation, soil, albedo, or dust maps are prescribed.
     """
     from scipy.spatial import cKDTree
+    import xarray as xr
 
-    n_cells = int(lat_cell.shape[0])
-    lat_d = np.degrees(lat_cell).astype(np.float64)
-    lon_d = np.degrees(lon_cell).astype(np.float64)  # [-180, +180]
+    nc_path = ensure_paleomap_250ma_dem(auto_download=True)
+    with xr.open_dataset(nc_path) as ds:
+        z_var = "z" if "z" in ds.data_vars else list(ds.data_vars)[0]
+        z_raw = np.asarray(ds[z_var].values, dtype=np.float64)
+        lat_name = "latitude" if "latitude" in ds.coords else "lat"
+        lon_name = "longitude" if "longitude" in ds.coords else "lon"
+        lat_deg = np.asarray(ds[lat_name].values, dtype=np.float64)
+        lon_deg = np.asarray(ds[lon_name].values, dtype=np.float64)
 
-    # Smooth analytic coastline potential phi > 0 => land, phi <= 0 => ocean
-    # 1. Western supercontinental spine (Americas + West Africa + Gondwana backbone)
-    spine = np.exp(-((lon_d + 22.0) / 36.0) ** 2 - ((lat_d + 6.0) / 68.0) ** 2)
-    # 2. Laurasian northern arm (Euramerica + Siberia + Cathaysia north of Tethys)
-    laurasia = 1.05 * np.exp(-((lon_d - 28.0) / 56.0) ** 2 - ((lat_d - 44.0) / 21.0) ** 2)
-    # 3. Gondwanan southern arm (South America + Africa + India + Australia + Antarctica south of Tethys)
-    gondwana = 1.15 * np.exp(-((lon_d - 24.0) / 60.0) ** 2 - ((lat_d + 52.0) / 26.0) ** 2)
-    # 4. South Polar Gondwana cap
-    south_cap = 0.85 * np.exp(-((lat_d + 80.0) / 16.0) ** 2) * np.exp(-((lon_d - 10.0) / 95.0) ** 2)
-    # 5. Deep warm equatorial Tethys Ocean wedge opening eastward from lon ~ +5 deg
-    tethys_cut = 1.35 * np.exp(-((lat_d - 2.0) / 21.0) ** 2) * (1.0 / (1.0 + np.exp(-(lon_d - 12.0) / 10.0)))
-    # 6. Smooth multi-scale coastline modulation (organic coastal bays/peninsulas)
-    coast_mod = (
-        0.045 * np.sin(np.radians(4.0 * lon_d + 2.0 * lat_d))
-        + 0.030 * np.cos(np.radians(6.0 * lat_d - 3.0 * lon_d + 25.0))
-        + 0.020 * np.sin(np.radians(9.0 * lon_d - 5.0 * lat_d))
-    )
+    z_raw = np.nan_to_num(z_raw, nan=0.0)
+    # Drop duplicate periodic endpoint (lon = +180 == -180) if present
+    if lon_deg.shape[0] > 2 and abs((lon_deg[-1] - lon_deg[0]) - 360.0) < 1.0e-3:
+        lon_deg = lon_deg[:-1]
+        z_raw = z_raw[:, :-1]
 
-    phi = np.maximum.reduce([spine, laurasia, gondwana, south_cap]) - tethys_cut + coast_mod - 0.26
-    is_land = phi > 0.0
-    surf_type = np.where(is_land, 1, 0).astype(np.int64)
-    ocean_frac = np.where(is_land, 0.0, 1.0).astype(np.float64)
+    # Exact Lott & Miller (1997) finite-difference terrain gradient on the native 6-arc-min grid
+    dlat_rad = abs(float(lat_deg[1] - lat_deg[0])) * (math.pi / 180.0)
+    dlon_rad = abs(float(lon_deg[1] - lon_deg[0])) * (math.pi / 180.0)
+    dy_m = max(C.EARTH_RADIUS * dlat_rad, 100.0)
+    cos_lat_full = np.maximum(np.cos(np.radians(lat_deg)), 0.05)
+    dx_m_row = np.maximum(C.EARTH_RADIUS * cos_lat_full * dlon_rad, 100.0)[:, None]
+
+    # Central finite differences (periodic in longitude, clamped at poles)
+    dz_dx = (np.roll(z_raw, -1, axis=1) - np.roll(z_raw, 1, axis=1)) / (2.0 * dx_m_row)
+    dz_dy = np.zeros_like(z_raw)
+    sign_lat = 1.0 if lat_deg[1] > lat_deg[0] else -1.0
+    dz_dy[1:-1, :] = sign_lat * (z_raw[2:, :] - z_raw[:-2, :]) / (2.0 * dy_m)
+    dz_dy[0, :] = sign_lat * (z_raw[1, :] - z_raw[0, :]) / dy_m
+    dz_dy[-1, :] = sign_lat * (z_raw[-1, :] - z_raw[-2, :]) / dy_m
+
+    # Subsample stride for fast KD-tree aggregation while preserving full native gradients
+    st = max(int(stride), 1)
+    lat_s = lat_deg[::st]
+    lon_s = lon_deg[::st]
+    z_s = z_raw[::st, ::st]
+    hx_s = dz_dx[::st, ::st]
+    hy_s = dz_dy[::st, ::st]
+
+    n_cells = int(xyz_cell.shape[0])
+    tree = cKDTree(xyz_cell)
+    w_tot = np.zeros(n_cells, dtype=np.float64)
+    sum_ocn = np.zeros(n_cells, dtype=np.float64)
+    sum_h = np.zeros(n_cells, dtype=np.float64)
+    sum_h2 = np.zeros(n_cells, dtype=np.float64)
+    sum_bed = np.zeros(n_cells, dtype=np.float64)
+    sum_hx2 = np.zeros(n_cells, dtype=np.float64)
+    sum_hy2 = np.zeros(n_cells, dtype=np.float64)
+    sum_hxy = np.zeros(n_cells, dtype=np.float64)
+    z_min_land = np.full(n_cells, 1.0e9, dtype=np.float64)
+
+    lon_rad_s = np.radians(lon_s)
+    cos_lon = np.cos(lon_rad_s)
+    sin_lon = np.sin(lon_rad_s)
+    n_lat_s = lat_s.shape[0]
+    row_chunk = 64
+
+    for r0 in range(0, n_lat_s, row_chunk):
+        r1 = min(r0 + row_chunk, n_lat_s)
+        lat_r = np.radians(lat_s[r0:r1])
+        clat = np.cos(lat_r)[:, None]
+        slat = np.sin(lat_r)[:, None]
+        px = (clat * cos_lon[None, :]).ravel()
+        py = (clat * sin_lon[None, :]).ravel()
+        pz = np.broadcast_to(slat, (r1 - r0, lon_s.shape[0])).ravel()
+        pts = np.column_stack((px, py, pz))
+        _, cid = tree.query(pts, workers=-1)
+
+        w = np.broadcast_to(np.maximum(clat, 1.0e-4), (r1 - r0, lon_s.shape[0])).ravel()
+        zv = z_s[r0:r1].ravel()
+        is_ocn_p = (zv <= 0.0).astype(np.float64)
+        z_land_p = np.maximum(zv, 0.0)
+        hx = np.where(zv > 0.0, hx_s[r0:r1].ravel(), 0.0)
+        hy = np.where(zv > 0.0, hy_s[r0:r1].ravel(), 0.0)
+
+        np.add.at(w_tot, cid, w)
+        np.add.at(sum_ocn, cid, w * is_ocn_p)
+        np.add.at(sum_h, cid, w * z_land_p)
+        np.add.at(sum_h2, cid, w * z_land_p * z_land_p)
+        np.add.at(sum_bed, cid, w * zv)
+        np.add.at(sum_hx2, cid, w * hx * hx)
+        np.add.at(sum_hy2, cid, w * hy * hy)
+        np.add.at(sum_hxy, cid, w * hx * hy)
+
+        land_mask_p = zv > 0.0
+        if np.any(land_mask_p):
+            np.minimum.at(z_min_land, cid[land_mask_p], z_land_p[land_mask_p])
+
+    w_safe = np.maximum(w_tot, 1.0e-12)
+    ocean_frac = np.clip(sum_ocn / w_safe, 0.0, 1.0)
     icesheet_frac = np.zeros(n_cells, dtype=np.float64)
+    surf_type = np.where(ocean_frac >= 0.5, 0, 1).astype(np.int64)
 
-    # Smooth continental relief + major Permian orogenic belts (zero elevation over ocean)
-    land_depth = np.clip(phi / 0.45, 0.0, 1.0)
-    z_plain = 480.0 * np.sqrt(land_depth)
-    # Central Pangaean Mountains (Variscan-Appalachian suture across equatorial/subtropical backbone)
-    lat_cpm = 6.0 + 0.22 * (lon_d + 22.0)
-    z_cpm = 2850.0 * np.exp(-((lat_d - lat_cpm) / 7.5) ** 2 - ((lon_d + 16.0) / 32.0) ** 2)
-    # Gondwanide southwestern cordillera
-    z_gond = 2150.0 * np.exp(-((lon_d + 44.0) / 11.0) ** 2 - ((lat_d + 42.0) / 22.0) ** 2)
-    # Uralian / Angara northern highlands
-    z_ural = 1750.0 * np.exp(-((lon_d - 50.0) / 12.0) ** 2 - ((lat_d - 50.0) / 15.0) ** 2)
-    # Interior plateau relief undulation
-    z_undul = 220.0 * land_depth * (0.5 + 0.5 * np.sin(np.radians(7.0 * lon_d)) * np.cos(np.radians(7.0 * lat_d)))
+    z_topo = np.where(surf_type == 0, 0.0, np.maximum(sum_h / w_safe, 1.0))
+    z_bed_raw = sum_bed / w_safe
+    z_bed = np.where(surf_type == 0, np.minimum(z_bed_raw, -100.0), z_topo)
+    z_min_land = np.where((surf_type == 0) | (z_min_land > 1.0e8), z_topo, z_min_land)
 
-    z_topo = np.where(is_land, np.clip(z_plain + z_cpm + z_gond + z_ural + z_undul, 20.0, 4200.0), 0.0)
+    var_h = np.maximum(sum_h2 / w_safe - (sum_h / w_safe) ** 2, 0.0)
+    sigma_topo = np.where(surf_type == 0, 0.0, np.sqrt(var_h))
 
-    # Ocean bathymetry: continental shelf (-200 m) -> abyssal Panthalassa (-4300 m) + mid-Panthalassa ridge
-    ocn_dist = np.clip(-phi / 0.35, 0.0, 1.0)
-    z_abyss = -200.0 - 4100.0 * np.tanh(1.8 * ocn_dist)
-    dlon_ridge = ((lon_d + 145.0 + 180.0) % 360.0) - 180.0
-    z_ridge = 1500.0 * np.exp(-(dlon_ridge / 14.0) ** 2) * (ocn_dist > 0.4)
-    z_bed = np.where(is_land, z_topo, np.clip(z_abyss + z_ridge, -4800.0, -120.0))
-
-    # Subgrid orography statistics consistent with relief for Lott & Miller (1997) drag
-    z_orog = z_cpm + z_gond + z_ural
-    sigma_topo = np.where(is_land, np.clip(45.0 + 0.16 * z_orog + 0.04 * z_topo, 20.0, 650.0), 0.0)
-    slope_topo = np.where(is_land, np.clip(0.002 + 2.2e-5 * z_orog + 4.0e-6 * z_topo, 0.001, 0.08), 0.0)
-    aniso_topo = np.where(is_land, np.where(z_orog > 400.0, 0.35, 0.75), 1.0)
-    angle_topo = np.where(is_land, np.where(z_cpm >= np.maximum(z_gond, z_ural), 0.22, 1.35), 0.0)
+    hx2 = sum_hx2 / w_safe
+    hy2 = sum_hy2 / w_safe
+    hxy = sum_hxy / w_safe
+    k_lm = 0.5 * (hx2 + hy2)
+    m_lm = 0.5 * (hx2 - hy2)
+    amp_lm = np.sqrt(m_lm * m_lm + hxy * hxy)
+    angle_topo = 0.5 * np.arctan2(hxy, m_lm)
+    lam1 = np.maximum(k_lm + amp_lm, 1.0e-12)
+    lam2 = np.maximum(k_lm - amp_lm, 0.0)
+    aniso_topo = np.where(surf_type == 0, 1.0, np.sqrt(lam2 / lam1))
+    slope_topo = np.where(surf_type == 0, 0.0, np.sqrt(hx2 + hy2))
 
     # Klemp (2011) 2-pass conservative Laplacian terrain smoothing
     z_smooth = z_topo.copy()
@@ -285,7 +430,7 @@ def build_pangaea_boundary_fields(
         "coastal_ocean_idx": coastal_ocean_idx,
         "z_bed": z_bed,
         "h_ice_init": np.zeros(n_cells, dtype=np.float64),
-        "z_min_land": np.where(is_land, np.maximum(z_topo - 0.5 * sigma_topo, 0.0), 0.0),
+        "z_min_land": z_min_land,
         "lake_basin_frac_bed": np.zeros(n_cells, dtype=np.float64),
         "lake_basin_vol_bed": np.zeros(n_cells, dtype=np.float64),
     }

@@ -2160,7 +2160,7 @@ $$
 | `"tidally_locked"` | `enable_tidal_lock=true`, $P_{\mathrm{rot}}=10\ \mathrm{d}$, $\varepsilon=e=0$, 日周無効 | 100% 海洋・平坦 | Yang et al. (2013) |
 | `"trappist1e"` | `enable_tidal_lock=true`, $S_0=900$, $P_{\mathrm{rot}}=6.101\ \mathrm{d}$, $\mathrm{CO}_2=1000\ \mathrm{ppmv}$ | 100% 海洋・平坦 | Turbet et al. (2018); Fauchez et al. (2020) |
 | `"mars_like"` | $S_0=589$, $\Omega=7.0882\times 10^{-5}$, $\varepsilon=25.19^\circ$, $e=0.0934$, $\mathrm{CO}_2=4\%$ | 100% 乾燥裸地 ($\sigma_{\mathrm{topo}}=150\ \mathrm{m}, T=218\ \mathrm{K}, w_\ell=0.005, \mathrm{LAI}=0$) | — |
-| `"pangaea"` | `use_earth2014=false`, $S_0=1333$, $\mathrm{CO}_2=1137.2\ \mathrm{ppmv}$ | 250 Ma 解析的 C 字型超大陸（陸面積比約 32%）・テチス海湾入・中央パンゲア山脈・パンサラッサ海底地形・一様初期陸面 | Kutzbach & Gallimore (1989); Parrish (1993) |
+| `"pangaea"` | `use_earth2014=false`, $S_0=1333$, $\mathrm{CO}_2=1137.2\ \mathrm{ppmv}$ | 6分解像度 250 Ma ペルム–三畳紀境界実復元 PaleoDEM（陸面積比 28.6%・テチス/パンサラッサ海底地形・Lott–Miller サブグリッド地形統計）・一様初期陸面 | Scotese & Wright (2018) |
 
 `enable_tidal_lock = true` 時、太陽天頂角余弦は太陽直下経度 $\lambda_{\mathrm{sub}}$（`substellar_lon_deg`）に対し定常分布となる：
 
