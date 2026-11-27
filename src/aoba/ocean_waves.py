@@ -33,9 +33,11 @@ from typing import Any
 import torch
 
 from aoba import constants as C
+from aoba.runtime import maybe_cuda_compile
 
 PI: float = math.pi
 RHO_AIR_REF: float = 1.225               # Reference surface air density [kg m^-3]
+SQRT_CD_WAVE: float = math.sqrt(1.3e-3)  # Reference sqrt(C_d) for ocean-wave friction velocity [-]
 TAU_WAVE_GROW_S: float = 6.0 * 3600.0    # Wind-sea growth relaxation time [s]
 TAU_WAVE_DECAY_S: float = 18.0 * 3600.0  # Short-wave decay relaxation time [s]
 SWELL_MFP_M: float = 6.0e5               # Effective isotropic swell propagation length scale [m]
@@ -159,7 +161,7 @@ def step_ocean_waves(
 
     # 4. Ocean-side friction velocity u_*w & turbulent Langmuir number La_t = sqrt(u_*w / u_s)
     # Approximate C_d ~ 1.3e-3 -> u_*a = sqrt(C_d)*U10, u_*w = sqrt(rho_a/rho_w) * u_*a
-    u_star_a = torch.sqrt(torch.tensor(1.3e-3, device=u10.device, dtype=dtype)) * torch.clamp(u10, min=0.5)
+    u_star_a = SQRT_CD_WAVE * torch.clamp(u10, min=0.5)
     u_star_w = u_star_a * math.sqrt(RHO_AIR_REF / C.RHO_SEAWATER)
     la_t = torch.sqrt(torch.clamp(u_star_w / torch.clamp(u_s, min=1.0e-4), min=0.04, max=25.0))
     # Takaya et al. (2010) / McWilliams & Sullivan (2000) KPP Langmuir enhancement factor
@@ -189,6 +191,26 @@ def diagnose_ocean_wave_metrics(waves: OceanWaveState, is_ocean: torch.Tensor, f
     }
 
 
+def _compute_sea_spray_core(
+    u10_sub: torch.Tensor,
+    t_sst_sub: torch.Tensor,
+    t_air_sub: torch.Tensor,
+    qv_air_sub: torch.Tensor,
+    pres_sfc_sub: torch.Tensor,
+    is_open_ocean_sub: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    u_ex = torch.clamp(u10_sub - U10_SPRAY_THRESH, min=0.0, max=50.0)
+    tc_s = torch.clamp(t_sst_sub - C.T_FREEZE, min=-2.0, max=40.0)
+    e_sat = 611.2 * torch.exp(17.67 * tc_s / (tc_s + 243.5))
+    qs_sst = torch.clamp(C.EPS_WATER * e_sat / torch.clamp(pres_sfc_sub - e_sat, min=1000.0), min=1.0e-5, max=0.08)
+    dq = torch.clamp(qs_sst - torch.clamp(qv_air_sub, min=0.0), min=0.0, max=0.03)
+    dt_sa = torch.clamp(t_sst_sub - t_air_sub, min=-10.0, max=15.0)
+    spray_fac = torch.clamp((u_ex / 20.0) ** 2.6, min=0.0, max=4.0) * is_open_ocean_sub
+    d_lh = torch.clamp(120.0 * spray_fac * (dq / 0.006), min=0.0, max=450.0)
+    d_sh = torch.clamp(25.0 * spray_fac * (dt_sa / 2.0) - 0.25 * d_lh, min=-150.0, max=150.0)
+    return d_lh, d_sh
+
+
 def compute_sea_spray_enthalpy_fluxes(
     u10_sub: torch.Tensor,
     t_sst_sub: torch.Tensor,
@@ -197,25 +219,6 @@ def compute_sea_spray_enthalpy_fluxes(
     pres_sfc_sub: torch.Tensor,
     is_open_ocean_sub: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute high-wind sea-spray latent & sensible heat flux increments `(d_lh_wm2, d_sh_wm2)`.
-
-    Activates smoothly above `U_10 > 12 m s^-1` (Fairall et al., 2009; Andreas et al., 2015).
-    Positive `d_lh_wm2` adds moisture/latent heat to the atmosphere; evaporative cooling of spray
-    droplets reduces sensible heating (`d_sh_wm2` typically slightly negative or small positive when
-    SST >> T_air), conserving total enthalpy transfer cleanly.
-    """
-    u_ex = torch.clamp(u10_sub - U10_SPRAY_THRESH, min=0.0, max=50.0)
-    # Saturation specific humidity at SST (Bolton 1980)
-    tc_s = torch.clamp(t_sst_sub - C.T_FREEZE, min=-2.0, max=40.0)
-    e_sat = 611.2 * torch.exp(17.67 * tc_s / (tc_s + 243.5))
-    qs_sst = torch.clamp(C.EPS_WATER * e_sat / torch.clamp(pres_sfc_sub - e_sat, min=1000.0), min=1.0e-5, max=0.08)
-    dq = torch.clamp(qs_sst - torch.clamp(qv_air_sub, min=0.0), min=0.0, max=0.03)
-    dt_sa = torch.clamp(t_sst_sub - t_air_sub, min=-10.0, max=15.0)
-
-    # Spray volume flux scales steeply (~u_ex^2.6, capped safely for hurricane speeds)
-    spray_fac = torch.clamp((u_ex / 20.0) ** 2.6, min=0.0, max=4.0) * is_open_ocean_sub
-    # Reference hurricane spray latent heat ~150-350 W/m^2 at U10 = 35-45 m/s
-    d_lh = torch.clamp(120.0 * spray_fac * (dq / 0.006), min=0.0, max=450.0)
-    # Direct thermal exchange from warm droplets minus ~25% evaporative cooling feedback
-    d_sh = torch.clamp(25.0 * spray_fac * (dt_sa / 2.0) - 0.25 * d_lh, min=-150.0, max=150.0)
-    return d_lh, d_sh
+    """Compute high-wind sea-spray latent & sensible heat flux increments `(d_lh_wm2, d_sh_wm2)`."""
+    fn = maybe_cuda_compile(_compute_sea_spray_core, device=u10_sub.device)
+    return fn(u10_sub, t_sst_sub, t_air_sub, qv_air_sub, pres_sfc_sub, is_open_ocean_sub)

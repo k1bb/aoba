@@ -1426,17 +1426,20 @@ def step_aoba_model(
             atmos.q_dust = torch.zeros_like(atmos.q_n)
         q_dust_cell = atmos.q_dust if (cfg.enable_dust and atmos.q_dust is not None) else None
         aero_opt_cell = None
+        pres_host_rad = None
+        temp_host_rad = None
         if bool(cfg.enable_aerosol_rad_forcing) and bool(cfg.enable_natural_aerosols) and model.aerosols is not None:
             from aoba.aerosols import compute_aerosol_radiative_optics
 
-            pres_host_a, _, temp_host_a = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
-            rh_host_a = torch.clamp(atmos.q_v / torch.clamp(qsat_mixed(temp_host_a, pres_host_a)[0], min=1.0e-7), 0.0, 0.95)
+            pres_host_rad, _, temp_host_rad = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+            rh_host_a = torch.clamp(atmos.q_v / torch.clamp(qsat_mixed(temp_host_rad, pres_host_rad)[0], min=1.0e-7), 0.0, 0.95)
             aero_opt_cell = compute_aerosol_radiative_optics(model.aerosols, atmos.rho_d, atmos.dz_c, rh_3d=rh_host_a)
         if bool(cfg.enable_volcanic_aerosols) and model.volcanic_solar is not None:
             from aoba.volcanic_solar import compute_volcanic_rad_optics_and_sad
 
-            pres_host_v, _, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
-            v_cell, _ = compute_volcanic_rad_optics_and_sad(model.volcanic_solar, pres_host_v, atmos.dz_c)
+            if pres_host_rad is None:
+                pres_host_rad, _, temp_host_rad = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+            v_cell, _ = compute_volcanic_rad_optics_and_sad(model.volcanic_solar, pres_host_rad, atmos.dz_c)
             aero_opt_cell = v_cell if aero_opt_cell is None else tuple(a + b for a, b in zip(aero_opt_cell, v_cell))
 
         o3_prog_cell = None
@@ -1446,8 +1449,9 @@ def step_aoba_model(
             if model.ozone is None:
                 from aoba.ozone_chemistry import init_prognostic_ozone_state
 
-                pres_host_oz, _, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
-                model.ozone = init_prognostic_ozone_state(pres_host_oz, atmos.rho_d, atmos.dz_c)
+                if pres_host_rad is None:
+                    pres_host_rad, _, temp_host_rad = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+                model.ozone = init_prognostic_ozone_state(pres_host_rad, atmos.rho_d, atmos.dz_c)
             o3_prog_cell = model.ozone.o3_vmr
         elif model.o3_provider is not None and model.o3_provider.mode != "rcemip":
             o3_use_provider = True
@@ -2299,24 +2303,62 @@ def step_aoba_model(
         assert active_w_mesh is not None and active_w_sfc is not None
         if model.ocean_waves is None:
             model.ocean_waves = init_ocean_wave_state(active_w_mesh.n_cells, temp_sub_0.device, temp_sub_0.dtype)
+        # Align prognostic ocean-wave integration (tau = 6..72 h) with ocean_stride when independent fine OGCM is active
+        w_stride = max(int(cfg.ocean_stride), 1) if (str(cfg.ocean_mode).strip().lower() == "ogcm_3d" and has_indep_ocn) else 1
         u10_w_cell = _sub_to_cell(u10_rel_sub, nc, n_sub)
         fice_w_cell = _sub_to_cell(sfc_diag_sub.f_seaice, nc, n_sub)
-        if active_w_mesh is not mesh and model.ocn_coupler is not None:
-            from aoba.ocean_coupler import atm_to_ocn_intensive
+        if w_stride == 1:
+            if active_w_mesh is not mesh and model.ocn_coupler is not None:
+                from aoba.ocean_coupler import atm_to_ocn_intensive
 
-            u10_w_in = atm_to_ocn_intensive(model.ocn_coupler, u10_w_cell)
-            fice_w_in = atm_to_ocn_intensive(model.ocn_coupler, fice_w_cell)
+                u10_w_in = atm_to_ocn_intensive(model.ocn_coupler, u10_w_cell)
+                fice_w_in = atm_to_ocn_intensive(model.ocn_coupler, fice_w_cell)
+            else:
+                u10_w_in = u10_w_cell
+                fice_w_in = fice_w_cell
+            step_ocean_waves(model.ocean_waves, u10_w_in, fice_w_in, active_w_sfc.surf_type == SURF_OCEAN, dt, mesh=active_w_mesh)
+            drag_c = model.ocean_waves.drag_mod
+            if active_w_mesh is not mesh and model.ocn_coupler is not None:
+                from aoba.ocean_coupler import ocn_to_atm_mean
+
+                drag_c = ocn_to_atm_mean(model.ocn_coupler, drag_c, fallback_atm=torch.ones(nc, device=drag_c.device, dtype=drag_c.dtype))
         else:
-            u10_w_in = u10_w_cell
-            fice_w_in = fice_w_cell
-        step_ocean_waves(model.ocean_waves, u10_w_in, fice_w_in, active_w_sfc.surf_type == SURF_OCEAN, dt, mesh=active_w_mesh)
+            w_acc_n = int(model.rad_cache.get("_wave_acc_n", 0)) + 1
+            if w_acc_n == 1:
+                model.rad_cache["_wave_u10_sum"] = u10_w_cell
+                model.rad_cache["_wave_fice_sum"] = fice_w_cell
+            else:
+                model.rad_cache["_wave_u10_sum"] = model.rad_cache["_wave_u10_sum"] + u10_w_cell
+                model.rad_cache["_wave_fice_sum"] = model.rad_cache["_wave_fice_sum"] + fice_w_cell
+            model.rad_cache["_wave_acc_n"] = w_acc_n
+            drag_cached = model.rad_cache.get("_wave_drag_c")
+            if w_acc_n >= w_stride or drag_cached is None:
+                inv_wn = 1.0 / float(w_acc_n)
+                u10_avg = model.rad_cache["_wave_u10_sum"] * inv_wn
+                fice_avg = model.rad_cache["_wave_fice_sum"] * inv_wn
+                if active_w_mesh is not mesh and model.ocn_coupler is not None:
+                    from aoba.ocean_coupler import atm_to_ocn_intensive, ocn_to_atm_mean
+
+                    u10_w_in = atm_to_ocn_intensive(model.ocn_coupler, u10_avg)
+                    fice_w_in = atm_to_ocn_intensive(model.ocn_coupler, fice_avg)
+                else:
+                    u10_w_in = u10_avg
+                    fice_w_in = fice_avg
+                step_ocean_waves(
+                    model.ocean_waves, u10_w_in, fice_w_in, active_w_sfc.surf_type == SURF_OCEAN,
+                    dt * float(w_acc_n), mesh=active_w_mesh,
+                )
+                drag_c = model.ocean_waves.drag_mod
+                if active_w_mesh is not mesh and model.ocn_coupler is not None:
+                    drag_c = ocn_to_atm_mean(
+                        model.ocn_coupler, drag_c, fallback_atm=torch.ones(nc, device=drag_c.device, dtype=drag_c.dtype)
+                    )
+                model.rad_cache["_wave_drag_c"] = drag_c
+                model.rad_cache["_wave_acc_n"] = 0
+            else:
+                drag_c = drag_cached
         langmuir_ocn = model.ocean_waves.langmuir_fac
         # Apply wave-age sea-surface drag modulation onto open-ocean subcolumns
-        drag_c = model.ocean_waves.drag_mod
-        if active_w_mesh is not mesh and model.ocn_coupler is not None:
-            from aoba.ocean_coupler import ocn_to_atm_mean
-
-            drag_c = ocn_to_atm_mean(model.ocn_coupler, drag_c, fallback_atm=torch.ones(nc, device=drag_c.device, dtype=drag_c.dtype))
         drag_sub = 1.0 + open_ocn_sub * (_cell_to_sub(drag_c, nc, n_sub) - 1.0)
         sfc_diag_sub.tau_x = sfc_diag_sub.tau_x * drag_sub
         sfc_diag_sub.tau_y = sfc_diag_sub.tau_y * drag_sub
@@ -3117,7 +3159,12 @@ def step_aoba_model(
                     t_cell_idx=t_idx,
                     step_count=model.step_count,
                 )
-            n_cgrad = 4 if ((has_pool or sparse_warmup_crm) and model.crm_distill.steps_seen < model.crm_distill.warmup_steps) else 2
+            if (has_pool or sparse_warmup_crm) and model.crm_distill.steps_seen < model.crm_distill.warmup_steps:
+                n_cgrad = 4
+            elif model.crm_distill.steps_seen >= model.crm_distill.warmup_steps + 24 and model.crm_distill.ema_val_rmse_thm < 2.0:
+                n_cgrad = 1
+            else:
+                n_cgrad = 2
             train_student_online(
                 model.crm_distill, x_all_sd[t_idx], ctx_p_t, ctx_s_t, tgt_p_t, tgt_s_t, dt,
                 n_grad_steps=n_cgrad,
@@ -3968,6 +4015,17 @@ def step_aoba_model(
                 maml_shape=None,
                 crm_dx_m=float(cfg.crm_dx),
             )
+    # Lazily cached end-of-step host (P, T, RH) shared across aerosols, volcanics, ozone & water isotopes
+    pres_host_end: torch.Tensor | None = None
+    temp_host_end: torch.Tensor | None = None
+    rh_host_end: torch.Tensor | None = None
+
+    def _get_host_pt_end() -> tuple[torch.Tensor, torch.Tensor]:
+        nonlocal pres_host_end, temp_host_end
+        if pres_host_end is None or temp_host_end is None:
+            pres_host_end, _, temp_host_end = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        return pres_host_end, temp_host_end
+
     if bool(cfg.enable_natural_aerosols):
         from aoba.aerosols import init_natural_aerosol_state, step_natural_aerosols_column
 
@@ -4004,8 +4062,8 @@ def step_aoba_model(
                 + model.rad_cache.get("sw1_dif", torch.zeros_like(t_air))
             )
             soa_oc_cell = compute_bvoc_soa_emission(sfc.surf_type, sfc.bio.lai, sfc.t_canopy, sw_par_cell)
-        pres_host_na, _, temp_host_na = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
-        rh_host_na = torch.clamp(atmos.q_v / torch.clamp(qsat_mixed(temp_host_na, pres_host_na)[0], min=1.0e-7), 0.0, 0.95)
+        p_end, t_end = _get_host_pt_end()
+        rh_host_end = torch.clamp(atmos.q_v / torch.clamp(qsat_mixed(t_end, p_end)[0], min=1.0e-7), 0.0, 0.99)
         step_natural_aerosols_column(
             aero=model.aerosols,
             rho_d=atmos.rho_d,
@@ -4022,7 +4080,7 @@ def step_aoba_model(
             soa_oc_kg_m2s=soa_oc_cell,
             u_star_cell=_sub_to_cell(sfc_diag_sub.u_star, nc, n_sub),
             fire_intensity_kw_m=fire_ib,
-            rh_3d=rh_host_na,
+            rh_3d=torch.clamp(rh_host_end, max=0.95),
         )
     # 8b-2. SNICAR Snow/Sea-Ice BC + Dust Albedo Darkening (Flanner et al., 2007, 2009)
     if bool(cfg.enable_snow_bc_darkening):
@@ -4115,42 +4173,82 @@ def step_aoba_model(
                 t_sfc_k=t_air,
             )
 
-        if has_indep_ocn:
-            from aoba.ocean_coupler import atm_to_ocn_conservative_flux, atm_to_ocn_intensive
+        # Accumulate coarse atmospheric/river BGC deposition fluxes across ocean_stride for exact mass-conserving OG7 transfer
+        dep_stride = max(int(cfg.ocean_stride), 1) if has_indep_ocn else 1
+        dep_dt = dt
+        if dep_stride > 1:
+            dep_acc = model.rad_cache.get("_bgc_dep_acc")
+            if dep_acc is None:
+                dep_acc = {"n": 0}
+                model.rad_cache["_bgc_dep_acc"] = dep_acc
+            dep_acc["n"] = int(dep_acc["n"]) + 1
+            for _dk, _dv in (
+                ("du", du_bgc), ("bc", bc_bgc), ("ln", ln_bgc), ("fn", fire_n_bgc),
+                ("rn", riv_n_bgc), ("rc", riv_c_bgc), ("rfe", riv_fe_bgc), ("alk", alk_bgc),
+            ):
+                if _dv is not None:
+                    dep_acc[_dk] = _dv if (_dk not in dep_acc or dep_acc["n"] == 1) else (dep_acc[_dk] + _dv)
+            if dep_acc["n"] < dep_stride:
+                du_bgc = bc_bgc = ln_bgc = fire_n_bgc = riv_n_bgc = riv_c_bgc = riv_fe_bgc = alk_bgc = None
+                dep_dt = 0.0
+            else:
+                inv_dn = 1.0 / float(dep_acc["n"])
+                dep_dt = dt * float(dep_acc["n"])
+                du_bgc = dep_acc.pop("du", None)
+                bc_bgc = dep_acc.pop("bc", None)
+                ln_bgc = dep_acc.pop("ln", None)
+                fire_n_bgc = dep_acc.pop("fn", None)
+                riv_n_bgc = dep_acc.pop("rn", None)
+                riv_c_bgc = dep_acc.pop("rc", None)
+                riv_fe_bgc = dep_acc.pop("rfe", None)
+                alk_bgc = dep_acc.pop("alk", None)
+                if du_bgc is not None: du_bgc = du_bgc * inv_dn
+                if bc_bgc is not None: bc_bgc = bc_bgc * inv_dn
+                if ln_bgc is not None: ln_bgc = ln_bgc * inv_dn
+                if fire_n_bgc is not None: fire_n_bgc = fire_n_bgc * inv_dn
+                if riv_n_bgc is not None: riv_n_bgc = riv_n_bgc * inv_dn
+                if riv_c_bgc is not None: riv_c_bgc = riv_c_bgc * inv_dn
+                if riv_fe_bgc is not None: riv_fe_bgc = riv_fe_bgc * inv_dn
+                if alk_bgc is not None: alk_bgc = alk_bgc * inv_dn
+                dep_acc["n"] = 0
 
-            if du_bgc is not None:
-                du_bgc = atm_to_ocn_intensive(model.ocn_coupler, du_bgc)
-            if bc_bgc is not None:
-                bc_bgc = atm_to_ocn_intensive(model.ocn_coupler, bc_bgc)
-            if ln_bgc is not None:
-                ln_bgc = atm_to_ocn_intensive(model.ocn_coupler, ln_bgc)
-            if fire_n_bgc is not None:
-                fire_n_bgc = atm_to_ocn_intensive(model.ocn_coupler, fire_n_bgc)
-            if riv_n_bgc is not None:
-                riv_n_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_n_bgc, ocean_only_source=True)
-            if riv_c_bgc is not None:
-                riv_c_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_c_bgc, ocean_only_source=True)
-            if riv_fe_bgc is not None:
-                riv_fe_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_fe_bgc, ocean_only_source=True)
-            if alk_bgc is not None:
-                alk_bgc = atm_to_ocn_conservative_flux(
-                    model.ocn_coupler, alk_bgc, ocean_only_source=(bool(cfg.enable_river_routing) and model.river is not None)
-                )
-        elif alk_bgc is not None and not (bool(cfg.enable_river_routing) and model.river is not None):
-            # Fallback when river routing is disabled: spread land weathering alkalinity evenly onto ocean
-            w0 = model.ogcm.wet_c[0].to(alk_bgc.dtype)
-            a_ocn_sum = torch.clamp((mesh.area_cell * w0).sum(), min=1.0)
-            alk_tot = (alk_bgc * mesh.area_cell).sum()
-            alk_bgc = (alk_tot / a_ocn_sum) * w0
+        if dep_dt > 0.0:
+            if has_indep_ocn:
+                from aoba.ocean_coupler import atm_to_ocn_conservative_flux, atm_to_ocn_intensive
 
-        apply_atmospheric_bgc_deposition(
-            model.ogcm.bgc, model.ogcm, du_bgc, ln_bgc, alk_bgc, dt,
-            bc_dep_kgm2s=bc_bgc,
-            fire_n_dep_kgn_m2s=fire_n_bgc,
-            river_n_kgn_m2s=riv_n_bgc,
-            river_c_kgc_m2s=riv_c_bgc,
-            river_fe_mol_m2s=riv_fe_bgc,
-        )
+                if du_bgc is not None:
+                    du_bgc = atm_to_ocn_intensive(model.ocn_coupler, du_bgc)
+                if bc_bgc is not None:
+                    bc_bgc = atm_to_ocn_intensive(model.ocn_coupler, bc_bgc)
+                if ln_bgc is not None:
+                    ln_bgc = atm_to_ocn_intensive(model.ocn_coupler, ln_bgc)
+                if fire_n_bgc is not None:
+                    fire_n_bgc = atm_to_ocn_intensive(model.ocn_coupler, fire_n_bgc)
+                if riv_n_bgc is not None:
+                    riv_n_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_n_bgc, ocean_only_source=True)
+                if riv_c_bgc is not None:
+                    riv_c_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_c_bgc, ocean_only_source=True)
+                if riv_fe_bgc is not None:
+                    riv_fe_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_fe_bgc, ocean_only_source=True)
+                if alk_bgc is not None:
+                    alk_bgc = atm_to_ocn_conservative_flux(
+                        model.ocn_coupler, alk_bgc, ocean_only_source=(bool(cfg.enable_river_routing) and model.river is not None)
+                    )
+            elif alk_bgc is not None and not (bool(cfg.enable_river_routing) and model.river is not None):
+                # Fallback when river routing is disabled: spread land weathering alkalinity evenly onto ocean
+                w0 = model.ogcm.wet_c[0].to(alk_bgc.dtype)
+                a_ocn_sum = torch.clamp((mesh.area_cell * w0).sum(), min=1.0)
+                alk_tot = (alk_bgc * mesh.area_cell).sum()
+                alk_bgc = (alk_tot / a_ocn_sum) * w0
+
+            apply_atmospheric_bgc_deposition(
+                model.ogcm.bgc, model.ogcm, du_bgc, ln_bgc, alk_bgc, dep_dt,
+                bc_dep_kgm2s=bc_bgc,
+                fire_n_dep_kgn_m2s=fire_n_bgc,
+                river_n_kgn_m2s=riv_n_bgc,
+                river_c_kgc_m2s=riv_c_bgc,
+                river_fe_mol_m2s=riv_fe_bgc,
+            )
     # 8b-5. Prognostic Natural CH4 & N2O Cycles (Wetland/Permafrost + Fire + Denit/Marine-OMZ + OH/UV)
     if bool(cfg.enable_prognostic_ch4_n2o):
         from aoba.trace_gas_cycle import init_trace_gas_cycle_state, step_trace_gas_cycle
@@ -4192,7 +4290,7 @@ def step_aoba_model(
             sai_so2_tg_yr=cfg.sai_so2_tg_yr,
             sai_lat_band_deg=cfg.sai_lat_band_deg,
         )
-        pres_host_vs, _, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        pres_host_vs, _ = _get_host_pt_end()
         _, volc_sad_3d = compute_volcanic_rad_optics_and_sad(model.volcanic_solar, pres_host_vs, atmos.dz_c)
     # 8b-7. Emissions-Driven Interactive Prognostic Atmospheric CO2 (Closed Land+Ocean+Weath+Anthro Budget)
     if str(cfg.co2_mode).strip().lower() == "prognostic":
@@ -4234,7 +4332,7 @@ def step_aoba_model(
     if str(cfg.o3_mode).strip().lower() == "prognostic":
         from aoba.ozone_chemistry import init_prognostic_ozone_state, step_prognostic_ozone
 
-        pres_host_oz, _, temp_host_oz = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        pres_host_oz, temp_host_oz = _get_host_pt_end()
         if model.ozone is None:
             model.ozone = init_prognostic_ozone_state(pres_host_oz, atmos.rho_d, atmos.dz_c)
         lnox_prod_cell = None
@@ -4279,11 +4377,15 @@ def step_aoba_model(
 
         if model.water_isotopes is None:
             model.water_isotopes = init_water_isotope_state(atmos.q_v)
-        pres_host_iso, _, temp_host_iso = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
-        rh_sfc_iso = torch.clamp(
-            atmos.q_v[0] / torch.clamp(qsat_mixed(temp_host_iso[0], pres_host_iso[0])[0], min=1.0e-7),
-            0.15,
-            0.99,
+        pres_host_iso, temp_host_iso = _get_host_pt_end()
+        rh_sfc_iso = (
+            torch.clamp(rh_host_end[0], 0.15, 0.99)
+            if rh_host_end is not None
+            else torch.clamp(
+                atmos.q_v[0] / torch.clamp(qsat_mixed(temp_host_iso[0], pres_host_iso[0])[0], min=1.0e-7),
+                0.15,
+                0.99,
+            )
         )
         step_water_isotopes(
             iso=model.water_isotopes,

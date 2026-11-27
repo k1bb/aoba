@@ -1337,6 +1337,7 @@ def init_crm_self_distill_state(
         weight_decay=1.0e-4,
         fused=(device.type == "cuda"),
         capturable=(device.type == "cuda"),
+        foreach=(device.type == "mps"),
     )
     replay = GPUReplayBuffer(capacity=replay_size, nz=nz, device=device, ny=ny, nx=nx)
     # Quasi-uniform spatial cohort hash across all latitudes/longitudes (coprime Knuth multiplier)
@@ -1355,6 +1356,23 @@ def init_crm_self_distill_state(
     )
 
 
+def _get_cohort_members(
+    cohort_id: torch.Tensor,
+    stride: int,
+    cache_owner: object | None = None,
+) -> list[torch.Tensor]:
+    """Return cached list of per-cohort cell-index tensors (eliminates repeated `torch.nonzero` GPU syncs)."""
+    cached = getattr(cache_owner, "_cohort_members_cache", None) if cache_owner is not None else None
+    if cached is not None and cached[0] is cohort_id and cached[1] == stride:
+        return cached[2]
+    cid_cpu = cohort_id.detach().cpu()
+    dev = cohort_id.device
+    members = [torch.nonzero(cid_cpu == c, as_tuple=False).squeeze(-1).to(dev) for c in range(stride)]
+    if cache_owner is not None:
+        setattr(cache_owner, "_cohort_members_cache", (cohort_id, stride, members))
+    return members
+
+
 def _select_hybrid_teacher_indices(
     cohort_id: torch.Tensor,
     unc_vec: torch.Tensor,
@@ -1365,18 +1383,12 @@ def _select_hybrid_teacher_indices(
     dwell_steps: int,
     *,
     allow_sparse_warmup: bool = False,
+    cohort_members: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Select `(teacher_idx, student_idx)` with optional persistent RCEMIP self-aggregation anchor.
 
-    - Standard mode (`dwell_steps < 48`): 85% rotating spatially stratified cohort + 15% top-OOD.
-    - Multi-day self-aggregation mode (`dwell_steps >= 48`, e.g. `RCE_large`): 50% persistent
-      globally stratified anchor backbone (`cohort_id == 0`, uninterrupted multi-week/seasonal
-      convective self-aggregation memory) + 35% multi-day rotating cohort (`1..stride-1`) + 15%
-      top-OOD active fallback.
-    - Sparse warmup (`allow_sparse_warmup=True`): during `steps_seen < warmup_steps`, keeps
-      teacher count strictly bounded to `n_teach = ceil(n_cells / stride)` while rotating
-      faster (`dwell_w = max(warmup_steps // 4, 1)`) so the student sees diverse global regimes
-      rapidly without ever allocating dense full-3D state across all `n_cells`.
+    Uses pre-bucketed `cohort_members` and fixed-shape `topk` student extraction for zero
+    CPU–GPU synchronization (`torch.nonzero`) on teacher rotation steps.
     """
     in_warmup = steps_seen < warmup_steps
     if in_warmup and not allow_sparse_warmup:
@@ -1385,21 +1397,26 @@ def _select_hybrid_teacher_indices(
     if n_teach >= n_cells:
         return None
 
+    def _coh(c_id: int) -> torch.Tensor:
+        if cohort_members is not None and 0 <= c_id < len(cohort_members):
+            return cohort_members[c_id]
+        return torch.nonzero(cohort_id == c_id, as_tuple=False).squeeze(-1)
+
     n_ood = max(1, n_teach // 6) if (n_teach >= 12 and not in_warmup) else 0
     if in_warmup:
         # Fast stratified global sweep during sparse warmup while preserving persistent anchor slots
         dwell_w = max(warmup_steps // 4, 1)
         if dwell_steps >= 48 and stride >= 3 and n_teach >= 8:
-            anchor_all = torch.nonzero(cohort_id == 0, as_tuple=False).squeeze(-1)
+            anchor_all = _coh(0)
             n_anchor = min(int(anchor_all.numel()), max(n_teach // 2, 1))
             anchor_sel = anchor_all[:n_anchor]
             rot_cohort = 1 + ((steps_seen // dwell_w) % (stride - 1))
-            rot_all = torch.nonzero(cohort_id == rot_cohort, as_tuple=False).squeeze(-1)
+            rot_all = _coh(rot_cohort)
             n_rot_keep = min(int(rot_all.numel()), max(n_teach - n_anchor, 0))
             base_sel = torch.cat([anchor_sel, rot_all[:n_rot_keep]], dim=0) if n_rot_keep > 0 else anchor_sel
         else:
             active_cohort = (steps_seen // dwell_w) % stride
-            rot_idx = torch.nonzero(cohort_id == active_cohort, as_tuple=False).squeeze(-1)
+            rot_idx = _coh(active_cohort)
             base_sel = rot_idx[:min(int(rot_idx.numel()), n_teach)]
     elif dwell_steps >= 48 and stride >= 3 and n_teach >= 8:
         # Slowly rotating multi-day anchor backbone (8 * dwell_steps >= 480 steps = 4 days at dt=720 s)
@@ -1408,18 +1425,18 @@ def _select_hybrid_teacher_indices(
         dwell_anchor = max(8 * dwell_steps, 480)
         post_steps = steps_seen - warmup_steps
         anchor_cohort = (post_steps // dwell_anchor) % stride
-        anchor_all = torch.nonzero(cohort_id == anchor_cohort, as_tuple=False).squeeze(-1)
+        anchor_all = _coh(anchor_cohort)
         n_anchor = min(int(anchor_all.numel()), max(n_teach // 2, 1))
         anchor_sel = anchor_all[:n_anchor]
 
         rot_offset = 1 + ((post_steps // dwell_steps) % (stride - 1))
         rot_cohort = (anchor_cohort + rot_offset) % stride
-        rot_all = torch.nonzero(cohort_id == rot_cohort, as_tuple=False).squeeze(-1)
+        rot_all = _coh(rot_cohort)
         n_rot_keep = min(int(rot_all.numel()), max(n_teach - n_anchor - n_ood, 0))
         base_sel = torch.cat([anchor_sel, rot_all[:n_rot_keep]], dim=0) if n_rot_keep > 0 else anchor_sel
     else:
         active_cohort = ((steps_seen - warmup_steps) // dwell_steps) % stride
-        rot_idx = torch.nonzero(cohort_id == active_cohort, as_tuple=False).squeeze(-1)
+        rot_idx = _coh(active_cohort)
         n_rot_keep = min(int(rot_idx.numel()), max(n_teach - n_ood, 1))
         base_sel = rot_idx[:n_rot_keep]
 
@@ -1434,7 +1451,12 @@ def _select_hybrid_teacher_indices(
 
     teach_mask = torch.zeros(n_cells, device=teacher_idx.device, dtype=torch.bool)
     teach_mask[teacher_idx] = True
-    student_idx = torch.nonzero(~teach_mask, as_tuple=False).squeeze(-1)
+    n_stud = n_cells - int(teacher_idx.numel())
+    if n_stud > 0:
+        # Fixed-shape topk avoids dynamic-shape torch.nonzero CPU-GPU synchronization
+        _, student_idx = torch.topk((~teach_mask).to(torch.int8), k=n_stud, largest=True, sorted=False)
+    else:
+        student_idx = torch.empty((0,), device=teacher_idx.device, dtype=torch.int64)
     return teacher_idx, student_idx
 
 
@@ -1463,10 +1485,12 @@ def select_teacher_indices(
     cached = getattr(state, "_sel_cache", None)
     if cached is not None and cached[0] == bucket:
         return cached[1]
+    members = _get_cohort_members(state.cohort_id, state.stride, state)
     res = _select_hybrid_teacher_indices(
         state.cohort_id, state.last_uncertainty,
         state.n_cells, state.stride, state.steps_seen, state.warmup_steps, state.dwell_steps,
         allow_sparse_warmup=allow_sparse_warmup,
+        cohort_members=members,
     )
     state._sel_cache = (bucket, res)  # type: ignore[attr-defined]
     return res
@@ -2925,6 +2949,7 @@ def init_rad_self_distill_state(
         weight_decay=1.0e-4,
         fused=(device.type == "cuda"),
         capturable=(device.type == "cuda"),
+        foreach=(device.type == "mps"),
     )
     replay = GPURadReplayBuffer(capacity=replay_size, nz=nz, device=device)
     cell_ids = torch.arange(n_cells, device=device, dtype=torch.int64)
@@ -2970,11 +2995,13 @@ def select_rad_teacher_indices(
         cached = getattr(state, "_sel_cache", None)
         if cached is not None and cached[0] == bucket:
             return cached[1]
+        members = _get_cohort_members(crm_state.cohort_id, crm_state.stride, crm_state)
         res = _select_hybrid_teacher_indices(
             crm_state.cohort_id,
             state.last_uncertainty + 0.5 * crm_state.last_uncertainty,
             state.n_cells, crm_state.stride, crm_state.steps_seen, crm_state.warmup_steps, crm_state.dwell_steps,
             allow_sparse_warmup=allow_sparse_warmup,
+            cohort_members=members,
         )
         state._sel_cache = (bucket, res)  # type: ignore[attr-defined]
         return res
@@ -3085,6 +3112,8 @@ def train_rad_student_online(
     n_steps = max(int(n_grad_steps), 1)
     if state.steps_seen < state.warmup_steps or state.ema_val_rmse_olr > 12.0 or state.ema_val_rmse_asr > 18.0:
         n_steps = max(n_steps, 6)
+    elif state.steps_seen >= state.warmup_steps + 60 and state.ema_val_rmse_olr < 4.0 and state.ema_val_rmse_asr < 8.0:
+        n_steps = min(n_steps, 2)
 
     b_fresh = int(x_fresh.shape[0])
     half_b = min(batch_size // 2, b_fresh)

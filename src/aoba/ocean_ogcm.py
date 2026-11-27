@@ -1581,11 +1581,35 @@ def step_ogcm_voronoi(
     is_ocean = sfc.surf_type == SURF_OCEAN
     cache = _get_ogcm_static_cache(ogcm, mesh, is_ocean)
 
-    if can_use_cuda_graph(dev) and (ogcm.bgc is None or not step_bgc):
+    # Determine whether CO2 is constant across consecutive steps so BGC can stay inside the CUDA Graph
+    # without triggering per-step graph recapture during transient/prognostic CO2 trajectories.
+    bgc_active = (ogcm.bgc is not None) and bool(step_bgc)
+    co2_f = float(co2_ppmv)
+    prev_co2 = getattr(ogcm, "_cg_prev_co2", None)
+    co2_steady = (prev_co2 is None) or (abs(co2_f - float(prev_co2)) <= 1.0e-6)
+    setattr(ogcm, "_cg_prev_co2", co2_f)
+
+    if can_use_cuda_graph(dev) and ((not bgc_active) or co2_steady):
         has_evp = ogcm.seaice_evp is not None
+        has_bgc = bgc_active
         has_sw = sw_net_ocn is not None
+        has_par = has_bgc and (sw_par_ocn is not None)
+        has_u10 = has_bgc and (u10_ocn is not None)
         has_riv = river_mouth_flux is not None
         has_lang = langmuir_fac is not None
+
+        if has_bgc and ogcm.bgc is not None and enable_o2_omz and ogcm.bgc.o2 is None:
+            # Pre-initialize O2 tensors before CUDA Graph capture so tensor shapes are fixed
+            z_prof_o2 = torch.linspace(260.0, 175.0, nzo, device=dev, dtype=dtype).view(nzo, 1)
+            ogcm.bgc.o2 = z_prof_o2.expand(nzo, nc).contiguous() * cache["wet_cf"]
+            ogcm.bgc.o2_comp = torch.zeros((nzo, nc), device=dev, dtype=dtype)
+            ogcm.bgc.fgo2 = torch.zeros((nc,), device=dev, dtype=dtype)
+            ogcm.bgc.denit_moln_m2s = torch.zeros((nc,), device=dev, dtype=dtype)
+            ogcm.bgc.omz_col_frac = torch.zeros((nc,), device=dev, dtype=dtype)
+            ogcm.bgc.n2fix_moln_m2s = torch.zeros((nc,), device=dev, dtype=dtype)
+
+        has_bgc_fe = has_bgc and (ogcm.bgc is not None) and (ogcm.bgc.fe_sfc is not None)
+        has_bgc_o2 = has_bgc and (ogcm.bgc is not None) and bool(enable_o2_omz) and (ogcm.bgc.o2 is not None)
 
         live_in: list[torch.Tensor] = [
             ogcm.temp, ogcm.sal, ogcm.t_comp, ogcm.s_comp,
@@ -1597,6 +1621,12 @@ def step_ogcm_voronoi(
         if has_sw:
             assert sw_net_ocn is not None
             live_in.append(sw_net_ocn)
+        if has_par:
+            assert sw_par_ocn is not None
+            live_in.append(sw_par_ocn)
+        if has_u10:
+            assert u10_ocn is not None
+            live_in.append(u10_ocn)
         if has_riv:
             assert river_mouth_flux is not None
             live_in.append(river_mouth_flux)
@@ -1609,6 +1639,21 @@ def step_ogcm_voronoi(
                 evp0.a_cat, evp0.v_cat, evp0.u_ice_e,
                 evp0.sigma_1, evp0.sigma_s, evp0.m_seaice_sync,
             ])
+        if has_bgc and ogcm.bgc is not None:
+            b0 = ogcm.bgc
+            live_in.extend([
+                b0.no3, b0.phy, b0.zoo, b0.det_n, b0.det_c, b0.dic, b0.alk,
+                b0.no3_comp, b0.dic_comp, b0.alk_comp,
+                b0.chl, b0.npp_c, b0.c_to_n_phy, b0.fgco2, b0.spco2_uatm, b0.ph_sfc, b0.intpp, b0.epc100,
+            ])
+            if has_bgc_fe:
+                assert b0.fe_sfc is not None
+                live_in.append(b0.fe_sfc)
+            if has_bgc_o2:
+                assert b0.o2 is not None and b0.o2_comp is not None
+                assert b0.fgo2 is not None and b0.denit_moln_m2s is not None
+                assert b0.omz_col_frac is not None and b0.n2fix_moln_m2s is not None
+                live_in.extend([b0.o2, b0.o2_comp, b0.fgo2, b0.denit_moln_m2s, b0.omz_col_frac, b0.n2fix_moln_m2s])
 
         g_key = (
             "ogcm_voronoi",
@@ -1616,16 +1661,23 @@ def step_ogcm_voronoi(
             int(mesh.cells_on_edge.data_ptr()),
             str(dev), str(dtype),
             bool(enable_seaice_drift), bool(has_evp),
-            bool(has_sw), bool(has_riv), bool(has_lang),
+            bool(has_bgc), bool(has_bgc_fe), bool(has_bgc_o2),
+            bool(has_sw), bool(has_par), bool(has_u10), bool(has_riv), bool(has_lang),
             bool(enable_fct_zstar), bool(enable_scale_aware_gm),
-            bool(enable_submeso), bool(enable_tidal_mixing),
+            bool(enable_submeso), bool(enable_tidal_mixing), bool(enable_o2_omz),
             round(float(dt), 6), round(float(deep_tracer_accel), 4),
+            round(float(dt_bgc_scale), 4) if has_bgc else 0.0,
+            round(co2_f, 3) if has_bgc else 0.0,
         )
 
         def _cg_body(inp: list[torch.Tensor]) -> list[torch.Tensor]:
             idx = 18
             sw_i = inp[idx] if has_sw else None
             idx += int(has_sw)
+            par_i = inp[idx] if has_par else None
+            idx += int(has_par)
+            u10_i = inp[idx] if has_u10 else None
+            idx += int(has_u10)
             riv_i = inp[idx] if has_riv else None
             idx += int(has_riv)
             lang_i = inp[idx] if has_lang else None
@@ -1643,6 +1695,30 @@ def step_ogcm_voronoi(
                     sigma_s=inp[idx + 4],
                     m_seaice_sync=inp[idx + 5],
                 )
+                idx += 6
+
+            bgc_v = None
+            if has_bgc:
+                from aoba.ocean_bgc import OceanBGCState
+
+                b_sl = inp[idx : idx + 18]
+                idx += 18
+                fe_v = inp[idx] if has_bgc_fe else None
+                idx += int(has_bgc_fe)
+                if has_bgc_o2:
+                    o2_v, o2c_v, fgo2_v, den_v, omz_v, n2f_v = inp[idx : idx + 6]
+                    idx += 6
+                else:
+                    o2_v = o2c_v = fgo2_v = den_v = omz_v = n2f_v = None
+                bgc_v = OceanBGCState(
+                    no3=b_sl[0], phy=b_sl[1], zoo=b_sl[2], det_n=b_sl[3], det_c=b_sl[4],
+                    dic=b_sl[5], alk=b_sl[6], no3_comp=b_sl[7], dic_comp=b_sl[8], alk_comp=b_sl[9],
+                    chl=b_sl[10], npp_c=b_sl[11], c_to_n_phy=b_sl[12], fgco2=b_sl[13],
+                    spco2_uatm=b_sl[14], ph_sfc=b_sl[15], intpp=b_sl[16], epc100=b_sl[17],
+                    fe_sfc=fe_v, o2=o2_v, o2_comp=o2c_v, fgo2=fgo2_v,
+                    denit_moln_m2s=den_v, omz_col_frac=omz_v, n2fix_moln_m2s=n2f_v,
+                )
+
             ogcm_d = dict(ogcm.__dict__)
             ogcm_d["temp"] = inp[0]
             ogcm_d["sal"] = inp[1]
@@ -1653,6 +1729,7 @@ def step_ogcm_voronoi(
             ogcm_d["eta"] = inp[6]
             ogcm_d["m_seaice_prev"] = inp[7]
             ogcm_d["seaice_evp"] = evp_v
+            ogcm_d["bgc"] = bgc_v
             ogcm_v = OceanOGCMState(**{k: v for k, v in ogcm_d.items() if k in OceanOGCMState.__dataclass_fields__})
             ogcm_v._static_cache = getattr(ogcm, "_static_cache", None)  # type: ignore[attr-defined]
 
@@ -1666,7 +1743,7 @@ def step_ogcm_voronoi(
                 ogcm_v, sfc_v, mesh, cache, is_ocean,
                 inp[11], inp[12], inp[13], inp[14], inp[15], inp[16], inp[17], dt,
                 enable_seaice_drift=enable_seaice_drift,
-                sw_net_ocn=sw_i, sw_par_ocn=None, u10_ocn=None, co2_ppmv=co2_ppmv,
+                sw_net_ocn=sw_i, sw_par_ocn=par_i, u10_ocn=u10_i, co2_ppmv=co2_f,
                 river_mouth_flux=riv_i,
                 enable_fct_zstar=enable_fct_zstar,
                 enable_scale_aware_gm=enable_scale_aware_gm,
@@ -1675,8 +1752,8 @@ def step_ogcm_voronoi(
                 enable_o2_omz=enable_o2_omz,
                 langmuir_fac=lang_i,
                 deep_tracer_accel=deep_tracer_accel,
-                step_bgc=False,
-                dt_bgc_scale=1.0,
+                step_bgc=has_bgc,
+                dt_bgc_scale=dt_bgc_scale,
             )
             res = [
                 ogcm_v.temp, ogcm_v.sal, ogcm_v.t_comp, ogcm_v.s_comp,
@@ -1689,6 +1766,22 @@ def step_ogcm_voronoi(
                     evp_v.a_cat, evp_v.v_cat, evp_v.u_ice_e,
                     evp_v.sigma_1, evp_v.sigma_s, evp_v.m_seaice_sync,
                 ])
+            if has_bgc and bgc_v is not None:
+                res.extend([
+                    bgc_v.no3, bgc_v.phy, bgc_v.zoo, bgc_v.det_n, bgc_v.det_c,
+                    bgc_v.dic, bgc_v.alk, bgc_v.no3_comp, bgc_v.dic_comp, bgc_v.alk_comp,
+                    bgc_v.chl, bgc_v.npp_c, bgc_v.c_to_n_phy, bgc_v.fgco2,
+                    bgc_v.spco2_uatm, bgc_v.ph_sfc, bgc_v.intpp, bgc_v.epc100,
+                ])
+                if has_bgc_fe and bgc_v.fe_sfc is not None:
+                    res.append(bgc_v.fe_sfc)
+                if has_bgc_o2 and bgc_v.o2 is not None and bgc_v.o2_comp is not None:
+                    assert bgc_v.fgo2 is not None and bgc_v.denit_moln_m2s is not None
+                    assert bgc_v.omz_col_frac is not None and bgc_v.n2fix_moln_m2s is not None
+                    res.extend([
+                        bgc_v.o2, bgc_v.o2_comp, bgc_v.fgo2,
+                        bgc_v.denit_moln_m2s, bgc_v.omz_col_frac, bgc_v.n2fix_moln_m2s,
+                    ])
             return res
 
         out = run_cuda_graph_cached(g_key, live_in, _cg_body, warmup_calls=2, clone_outputs=False)
@@ -1706,13 +1799,48 @@ def step_ogcm_voronoi(
         sfc.t_ocean_ml.copy_(out[11])
         sfc.m_seaice.copy_(out[12])
         sfc.swe_seaice.copy_(out[13])
+        o_idx = 14
         if has_evp and ogcm.seaice_evp is not None:
-            ogcm.seaice_evp.a_cat.copy_(out[14])
-            ogcm.seaice_evp.v_cat.copy_(out[15])
-            ogcm.seaice_evp.u_ice_e.copy_(out[16])
-            ogcm.seaice_evp.sigma_1.copy_(out[17])
-            ogcm.seaice_evp.sigma_s.copy_(out[18])
-            ogcm.seaice_evp.m_seaice_sync.copy_(out[19])
+            ogcm.seaice_evp.a_cat.copy_(out[o_idx])
+            ogcm.seaice_evp.v_cat.copy_(out[o_idx + 1])
+            ogcm.seaice_evp.u_ice_e.copy_(out[o_idx + 2])
+            ogcm.seaice_evp.sigma_1.copy_(out[o_idx + 3])
+            ogcm.seaice_evp.sigma_s.copy_(out[o_idx + 4])
+            ogcm.seaice_evp.m_seaice_sync.copy_(out[o_idx + 5])
+            o_idx += 6
+        if has_bgc and ogcm.bgc is not None:
+            b_dst = ogcm.bgc
+            b_dst.no3.copy_(out[o_idx])
+            b_dst.phy.copy_(out[o_idx + 1])
+            b_dst.zoo.copy_(out[o_idx + 2])
+            b_dst.det_n.copy_(out[o_idx + 3])
+            b_dst.det_c.copy_(out[o_idx + 4])
+            b_dst.dic.copy_(out[o_idx + 5])
+            b_dst.alk.copy_(out[o_idx + 6])
+            b_dst.no3_comp.copy_(out[o_idx + 7])
+            b_dst.dic_comp.copy_(out[o_idx + 8])
+            b_dst.alk_comp.copy_(out[o_idx + 9])
+            b_dst.chl.copy_(out[o_idx + 10])
+            b_dst.npp_c.copy_(out[o_idx + 11])
+            b_dst.c_to_n_phy.copy_(out[o_idx + 12])
+            b_dst.fgco2.copy_(out[o_idx + 13])
+            b_dst.spco2_uatm.copy_(out[o_idx + 14])
+            b_dst.ph_sfc.copy_(out[o_idx + 15])
+            b_dst.intpp.copy_(out[o_idx + 16])
+            b_dst.epc100.copy_(out[o_idx + 17])
+            o_idx += 18
+            if has_bgc_fe and b_dst.fe_sfc is not None:
+                b_dst.fe_sfc.copy_(out[o_idx])
+                o_idx += 1
+            if has_bgc_o2 and b_dst.o2 is not None and b_dst.o2_comp is not None:
+                assert b_dst.fgo2 is not None and b_dst.denit_moln_m2s is not None
+                assert b_dst.omz_col_frac is not None and b_dst.n2fix_moln_m2s is not None
+                b_dst.o2.copy_(out[o_idx])
+                b_dst.o2_comp.copy_(out[o_idx + 1])
+                b_dst.fgo2.copy_(out[o_idx + 2])
+                b_dst.denit_moln_m2s.copy_(out[o_idx + 3])
+                b_dst.omz_col_frac.copy_(out[o_idx + 4])
+                b_dst.n2fix_moln_m2s.copy_(out[o_idx + 5])
         return
 
     _step_ogcm_voronoi_impl(

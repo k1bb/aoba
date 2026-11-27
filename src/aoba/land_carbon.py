@@ -115,6 +115,8 @@ FIRE_N_VOL_FRAC: float = 0.85      # Fraction of combusted biomass N volatilized
 FIRE_EF_BC: float = 0.0012         # Black carbon emission factor [kg BC / kg C burned] (Andreae & Merlet, 2001)
 FIRE_EF_OC: float = 0.0110         # Organic carbon aerosol emission factor [kg OC / kg C burned]
 
+_LC_SOIL_DZ_CACHE: dict[tuple[str, int, torch.dtype], torch.Tensor] = {}
+
 
 @dataclass
 class LandCarbonState:
@@ -605,7 +607,11 @@ def step_land_carbon_and_fire(
     f_turn_w = -math.expm1(-dt_yr / TAU_WOOD_YR)
 
     # Compute topsoil environment once for soil C/N decomposition and N uptake/BNF
-    dz = torch.tensor(SOIL_LAYER_DEPTHS, device=dev, dtype=dtype).unsqueeze(1)  # [5, 1]
+    dz_key = (dev.type, dev.index or 0, dtype)
+    dz = _LC_SOIL_DZ_CACHE.get(dz_key)
+    if dz is None:
+        dz = torch.tensor(SOIL_LAYER_DEPTHS, device=dev, dtype=dtype).unsqueeze(1)  # [5, 1]
+        _LC_SOIL_DZ_CACHE[dz_key] = dz
     z_mid = torch.cumsum(dz, dim=0) - 0.5 * dz                                 # [5, 1]
     t_s_c = torch.clamp(t_soil - C.T_FREEZE, min=-45.0, max=50.0)
     f_t_soil = torch.pow(torch.full_like(t_s_c, SOIL_Q10), 0.1 * (t_s_c - 25.0))

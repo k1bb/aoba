@@ -37,6 +37,8 @@ from types import SimpleNamespace
 
 from aoba import constants as C
 from aoba.runtime import can_use_cuda_graph, run_cuda_graph_cached
+
+_CRM_PBL_WZ_CACHE: dict[tuple[int, str, int, torch.dtype], torch.Tensor] = {}
 from aoba.biosphere import (
     compute_optimal_soil_water_beta,
     update_daily_acclimation_smith,
@@ -980,8 +982,12 @@ def step_crm_physics_and_dynamics(
             cur_std = crm.theta_m[0:1].std(dim=(-2, -1), keepdim=True, unbiased=False)
             sigma_th = torch.clamp(target_std - cur_std, min=0.0)
             k_pbl = min(3, nz)
-            w_z_vals = (1.0, 0.65, 0.35)[:k_pbl]
-            w_z = torch.tensor(w_z_vals, device=crm.theta_m.device, dtype=crm.theta_m.dtype).view(k_pbl, 1, 1, 1)
+            wz_key = (k_pbl, crm.theta_m.device.type, crm.theta_m.device.index or 0, crm.theta_m.dtype)
+            w_z = _CRM_PBL_WZ_CACHE.get(wz_key)
+            if w_z is None:
+                w_z_vals = (1.0, 0.65, 0.35)[:k_pbl]
+                w_z = torch.tensor(w_z_vals, device=crm.theta_m.device, dtype=crm.theta_m.dtype).view(k_pbl, 1, 1, 1)
+                _CRM_PBL_WZ_CACHE[wz_key] = w_z
             eta = torch.randn((k_pbl, n_col, ny, nx), device=crm.theta_m.device, dtype=crm.theta_m.dtype)
             rho_p = crm.rho_d[:k_pbl]
             rho_eta_mean = (rho_p * eta).mean(dim=(-2, -1), keepdim=True) / torch.clamp(

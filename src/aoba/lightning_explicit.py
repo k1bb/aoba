@@ -743,7 +743,14 @@ def init_lightning_self_distill_state(
     """Allocate Hurdle lightning self-distillation MLP, AdamW optimizer, and stratified GPU buffers."""
     dev = torch.device(device)
     net = LightningSelfDistillNet(n_feat=LIGHTNING_DISTILL_N_FEAT, hidden_dim=hidden_dim).to(dev)
-    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1.0e-4)
+    opt = torch.optim.AdamW(
+        net.parameters(),
+        lr=lr,
+        weight_decay=1.0e-4,
+        fused=(dev.type == "cuda"),
+        capturable=(dev.type == "cuda"),
+        foreach=(dev.type == "mps"),
+    )
     return LightningSelfDistillState(
         net=net,
         opt=opt,
@@ -997,43 +1004,71 @@ def step_ossp_distilled_lightning(
     _ring_push(distill_state.act_fcg, ptr_act0, sz_act0, top_fcg)
     _ring_push(distill_state.act_valid, ptr_act0, sz_act0, top_valid)
 
-    # 5. Online Hurdle MLP training (2 fast masked mini-batch AdamW updates; zero CPU-GPU sync!)
+    # 5. Online Hurdle MLP training (2 grad steps during initial fill, 1 steady-state step; CUDA Graph on GPU!)
     if distill_state.all_size >= 32:
+        from aoba.runtime import can_use_cuda_graph, run_cuda_graph_train_step
+
+        use_cg_lt = can_use_cuda_graph(dev)
+        n_lt_grad = 2 if distill_state.all_size < 512 else 1
+        b_all = min(256, distill_state.all_size)
+        b_act = min(128, distill_state.act_size)
+        has_act_batch = b_act >= 4
+
+        def _one_lt_grad_step(inp: list[torch.Tensor]) -> list[torch.Tensor]:
+            xa, ha, ca, wa = inp[0], inp[1], inp[2], inp[3]
+            pred_a = distill_state.net(xa)
+            w_m_sum = torch.clamp(wa.sum(), min=1.0)
+            loss_hit = (
+                F.binary_cross_entropy_with_logits(pred_a[:, 0], ha, reduction="none") * wa
+            ).sum() / w_m_sum
+            loss_ccd = (
+                ((torch.sigmoid(pred_a[:, 3]) - ca) ** 2) * wa
+            ).sum() / w_m_sum
+            loss = loss_hit + 0.25 * loss_ccd
+            if len(inp) == 8:
+                xp, yp, fp, wp = inp[4], inp[5], inp[6], inp[7]
+                pred_p = distill_state.net(xp)
+                w_p_sum = torch.clamp(wp.sum(), min=1.0)
+                has_p = (wp.sum() > 0.5).to(torch.float32)
+                loss_rate = (
+                    F.smooth_l1_loss(F.softplus(pred_p[:, 1]), yp, reduction="none") * wp
+                ).sum() / w_p_sum
+                loss_fcg = (
+                    F.binary_cross_entropy_with_logits(pred_p[:, 2], fp, reduction="none") * wp
+                ).sum() / w_p_sum
+                loss = loss + has_p * (loss_rate + 0.35 * loss_fcg)
+
+            distill_state.opt.zero_grad(set_to_none=False)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                distill_state.net.parameters(), 2.0, foreach=(dev.type == "cuda"),
+            )
+            distill_state.opt.step()
+            return [loss.detach()]
+
         with torch.enable_grad():
             distill_state.net.train()
-            b_all = min(256, distill_state.all_size)
-            b_act = min(128, distill_state.act_size)
-            for _ in range(2):
+            for _ in range(n_lt_grad):
                 idx_a = torch.randint(0, distill_state.all_size, (b_all,), device=dev)
-                pred_a = distill_state.net(distill_state.all_x[idx_a])
-                w_m = distill_state.all_valid[idx_a]
-                w_m_sum = torch.clamp(w_m.sum(), min=1.0)
-                loss_hit = (
-                    F.binary_cross_entropy_with_logits(pred_a[:, 0], distill_state.all_hit[idx_a], reduction="none") * w_m
-                ).sum() / w_m_sum
-                loss_ccd = (
-                    ((torch.sigmoid(pred_a[:, 3]) - distill_state.all_ccd[idx_a]) ** 2) * w_m
-                ).sum() / w_m_sum
-                loss = loss_hit + 0.25 * loss_ccd
-
-                if b_act >= 4:
+                step_in = [
+                    distill_state.all_x[idx_a],
+                    distill_state.all_hit[idx_a],
+                    distill_state.all_ccd[idx_a],
+                    distill_state.all_valid[idx_a],
+                ]
+                if has_act_batch:
                     idx_p = torch.randint(0, distill_state.act_size, (b_act,), device=dev)
-                    pred_p = distill_state.net(distill_state.act_x[idx_p])
-                    w_p = distill_state.act_valid[idx_p]
-                    w_p_sum = torch.clamp(w_p.sum(), min=1.0)
-                    has_p = (w_p.sum() > 0.5).to(torch.float32)
-                    loss_rate = (
-                        F.smooth_l1_loss(F.softplus(pred_p[:, 1]), distill_state.act_y[idx_p], reduction="none") * w_p
-                    ).sum() / w_p_sum
-                    loss_fcg = (
-                        F.binary_cross_entropy_with_logits(pred_p[:, 2], distill_state.act_fcg[idx_p], reduction="none") * w_p
-                    ).sum() / w_p_sum
-                    loss = loss + has_p * (loss_rate + 0.35 * loss_fcg)
-
-                distill_state.opt.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(distill_state.net.parameters(), 2.0)
-                distill_state.opt.step()
+                    step_in.extend([
+                        distill_state.act_x[idx_p],
+                        distill_state.act_y[idx_p],
+                        distill_state.act_fcg[idx_p],
+                        distill_state.act_valid[idx_p],
+                    ])
+                if use_cg_lt:
+                    g_key = ("lt_ml_train", id(distill_state.net), b_all, b_act if has_act_batch else 0)
+                    run_cuda_graph_train_step(g_key, step_in, _one_lt_grad_step, warmup_calls=3)
+                else:
+                    _one_lt_grad_step(step_in)
                 distill_state.grad_updates += 1
 
     # 6. Predict student cells via Hurdle MLP (with physical zero-cloud gate & subgrid precip weighting)

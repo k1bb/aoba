@@ -27,6 +27,7 @@ import torch
 
 from aoba import constants as C
 from aoba.kernels import can_use_crm_metal, dispatch_dust_column_metal
+from aoba.runtime import maybe_cuda_compile
 from aoba.surface import SOIL_POROSITY, SURF_LAND
 
 
@@ -99,7 +100,7 @@ DUST_K_ABS_LW1: float = 100.0        # LW1 mass absorption efficiency [m^2 kg^-1
 DUST_K_ABS_LW2: float = 150.0        # LW2 window mass absorption efficiency [m^2 kg^-1]
 
 
-def compute_dust_emission_sub(
+def _compute_dust_emission_sub_core(
     surf_type: torch.Tensor,
     lai: torch.Tensor,
     f_snow: torch.Tensor,
@@ -108,15 +109,9 @@ def compute_dust_emission_sub(
     u_star: torch.Tensor,
     rho_atm: torch.Tensor,
     z0m: torch.Tensor,
-    d_disp: torch.Tensor | None = None,
-    dust_emis_factor: float = 2.5e-6,
+    d_disp: torch.Tensor | None,
+    dust_emis_factor: float,
 ) -> torch.Tensor:
-    """Compute subcolumn mineral dust vertical emission flux `[kg m^-2 s^-1]` (CLM5 Eq. 31.1).
-
-    `w_liq_soil_top` / `w_ice_soil_top` are top-layer *volumetric* liquid / ice soil water `[m^3 m^-3]`,
-    `f_snow` the fractional snow cover `[-]`, `rho_atm` the near-surface air density `[kg m^-3]`, and
-    `z0m`, `d_disp` the momentum roughness length and displacement height `[m]` used for the 10-m wind.
-    """
     dtype = u_star.dtype
     is_land = (surf_type == SURF_LAND).to(dtype)
 
@@ -128,7 +123,6 @@ def compute_dust_emission_sub(
     f_m = is_land * torch.clamp(1.0 - f_snow, 0.0, 1.0) * (1.0 - f_v) * liq_frac
 
     # Moisture-dependent threshold friction speed (Eqs. 31.6-31.9; Oleson et al., 2013 Eqs. 24.6-24.9).
-    # CLM sets the tuning multiplier a = M_clay^-1 in w_t = a (0.17 M_clay + 0.14 M_clay^2) = 0.17 + 0.14 M_clay.
     rho_bulk = (1.0 - SOIL_POROSITY) * DUST_RHO_SOIL_SOLID
     w_grav = (w_liq + w_ice) * 1000.0 / rho_bulk
     w_thr = 0.17 + 0.14 * DUST_CLAY_FRAC
@@ -158,6 +152,26 @@ def compute_dust_emission_sub(
     )
 
     return float(dust_emis_factor) * f_m * _DUST_ALPHA_SALT * q_salt * DUST_TRANSPORTED_FRAC
+
+
+def compute_dust_emission_sub(
+    surf_type: torch.Tensor,
+    lai: torch.Tensor,
+    f_snow: torch.Tensor,
+    w_liq_soil_top: torch.Tensor,
+    w_ice_soil_top: torch.Tensor,
+    u_star: torch.Tensor,
+    rho_atm: torch.Tensor,
+    z0m: torch.Tensor,
+    d_disp: torch.Tensor | None = None,
+    dust_emis_factor: float = 2.5e-6,
+) -> torch.Tensor:
+    """Compute subcolumn mineral dust vertical emission flux `[kg m^-2 s^-1]` (CLM5 Eq. 31.1)."""
+    fn = maybe_cuda_compile(_compute_dust_emission_sub_core, device=u_star.device)
+    return fn(
+        surf_type, lai, f_snow, w_liq_soil_top, w_ice_soil_top,
+        u_star, rho_atm, z0m, d_disp, float(dust_emis_factor),
+    )
 
 
 def step_dust_column(
