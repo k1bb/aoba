@@ -731,11 +731,11 @@ N_{i,\mathrm{eff}} &= \max\!\left(N_i,\ 4.0\times 10^4\,\max\!\left(1 - \frac{|T
 \end{aligned} \tag{5.19}
 $$
 
-ここで $\sigma(x) = (1 + e^{-x})^{-1}$ はロジスティックゲート関数である。重力捕捉衝突頻度 $R_{gi}, R_{gs}$（反発割合 $\alpha_{\mathrm{reb}} = 0.90$）による厳密ゼロ和の電荷分離（$\Delta\rho_{q,g} = -(\Delta\rho_{q,i} + \Delta\rho_{q,s})$）は、晴天イオン導電緩和（$\tau_{\mathrm{ion}} = 600\ \mathrm{s}$; Chiu, 1978）との厳密連続指数積分 $\Delta t_{\mathrm{chg}} = \tau_{\mathrm{ion}}(1 - e^{-\Delta t / \tau_{\mathrm{ion}}})$ で与え、全 5 種の電荷密度に対し保存的周期水平ドナーセル移流、終端落下速度 $v_{t,s}$ を含む無条件安定な陰的鉛直移流・沈降、$0^\circ\mathrm{C}$ 以上での霰・雪から雨への融解電荷移行、および無水物質層での乾燥漏洩緩和（$\tau_{\mathrm{dry}} = 300\ \mathrm{s}$）を結合する：
+ここで $\sigma(x) = (1 + e^{-x})^{-1}$ はロジスティックゲート関数である。重力捕捉衝突頻度 $R_{gi}, R_{gs}$ には上昇流コア共存補正係数 $C_{\mathrm{clump}} = \Delta x_{\mathrm{eff}} / \Delta x_{\mathrm{ref}}$（$\Delta x \le 500\ \mathrm{m}$ の LES で $C_{\mathrm{clump}} = 1$ に帰着）と反発割合 $\alpha_{\mathrm{reb}} = 0.90$ を導入し、厳密ゼロ和の電荷分離（$\Delta\rho_{q,g} = -(\Delta\rho_{q,i} + \Delta\rho_{q,s})$）を晴天イオン導電緩和（$\tau_{\mathrm{ion}} = 600\ \mathrm{s}$; Chiu, 1978）との厳密連続指数積分 $\Delta t_{\mathrm{chg}} = \tau_{\mathrm{ion}}(1 - e^{-\Delta t / \tau_{\mathrm{ion}}})$ で与え、全 5 種の電荷密度に対し保存的周期水平ドナーセル移流、終端落下速度 $v_{t,s}$ を含む無条件安定な陰的鉛直移流・沈降、$0^\circ\mathrm{C}$ 以上での霰・雪から雨への融解電荷移行、および無水物質層での乾燥漏洩緩和（$\tau_{\mathrm{dry}} = 300\ \mathrm{s}$）を結合する：
 
 $$
 \begin{aligned}
-R_{gx} &= \alpha_{\mathrm{reb}}\,\frac{\pi}{4}(D_g + D_x)^2\,|v_{t,g} - v_{t,x}|\,N_g N_x, \qquad x\in\{i, s\}, \\
+R_{gx} &= C_{\mathrm{clump}}\,\alpha_{\mathrm{reb}}\,\frac{\pi}{4}(D_g + D_x)^2\,|v_{t,g} - v_{t,x}|\,N_g N_x, \qquad x\in\{i, s\}, \\
 \frac{\partial \rho_{q,s}}{\partial t} &= -\nabla_h\cdot(\mathbf{u}_h \rho_{q,s}) - \frac{\partial}{\partial z}\big[(w - v_{t,s})\rho_{q,s}\big] + S_{\mathrm{ni},s} + S_{\mathrm{melt},s} - \frac{\rho_{q,s}}{\tau_{\mathrm{rel},s}}
 \end{aligned} \tag{5.20}
 $$

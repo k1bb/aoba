@@ -72,11 +72,11 @@ EINSTEIN_A_CO2_15UM: float = 1.35        # Spontaneous emission rate of CO2 (01^
 T_VIB_CO2_15UM_K: float = 960.0          # Vibrational excitation temperature h*nu/k_B for 667 cm^-1 [K]
 K_CO2_AIR_CM3S: float = 2.5e-15          # Collisional quenching rate CO2-N2/O2 near 200 K [cm^3 s^-1]
 K_CO2_O_CM3S: float = 3.0e-12            # Fast collisional quenching rate CO2-O(3P) [cm^3 s^-1]
-Q_CO2_NLTE_SCALE_KS: float = 5.5e-4      # Calibration prefactor reproducing ~3-8 K/day at 75-85 km [K s^-1]
+Q_CO2_NLTE_SCALE_KS: float = 8.5e-3      # Calibration prefactor reproducing ~3-10 K/day at 55-85 km [K s^-1]
 
 # Strobel (1978) & Mlynczak & Solomon (1993) UV heating constants
-Q_UV_O3_HARTLEY_KS: float = 3.2e-4       # Hartley O3 UV heating scale at stratopause/mesosphere [K s^-1]
-Q_UV_O2_SR_KS: float = 6.5e-5            # O2 Schumann-Runge & Lyman-alpha UV heating near 80-90 km [K s^-1]
+Q_UV_O3_HARTLEY_KS: float = 1.3e-4       # Hartley O3 UV heating scale at stratopause (~11 K/d peak) [K s^-1]
+Q_UV_O2_SR_KS: float = 4.5e-5            # O2 Schumann-Runge & Lyman-alpha UV heating near 80-90 km [K s^-1]
 
 # Prognostic NOx chemistry constants (Brasseur & Solomon, 2005; Sentman et al., 2008)
 N2O_PI_PPMV: float = 0.273
@@ -171,10 +171,10 @@ def compute_mesospheric_nlte_radiation(
         torch.full_like(p_hpa, co2_ratio),
         0.35 + 0.55 * torch.sigmoid((-1.10 - log10_p) / 0.40),
     )
-    # Planck vibrational population exp(-960 / T) minus weak upward upwelling exchange from warm stratopause
+    # Planck vibrational population exp(-960 / T) minus weak upward radiative exchange from warm stratopause
     boltz_loc = torch.exp(-T_VIB_CO2_15UM_K / t_k)
-    # Effective exchange radiative equilibrium floor near ~165 K in optically thin upper mesosphere
-    boltz_exch = 0.22 * torch.exp(torch.full_like(t_k, -T_VIB_CO2_15UM_K / 235.0)) * torch.sigmoid((-1.30 - log10_p) / 0.45)
+    # Effective exchange radiative equilibrium floor near ~178 K in optically thin upper mesosphere
+    boltz_exch = 0.16 * torch.exp(torch.full_like(t_k, -T_VIB_CO2_15UM_K / 215.0)) * torch.sigmoid((-1.30 - log10_p) / 0.45)
     q_co2_cool = -Q_CO2_NLTE_SCALE_KS * co2_fac * phi_esc * lambda_nlte * (boltz_loc - boltz_exch)
 
     # 2. Strobel (1978) & Mlynczak-Solomon (1993) Mesospheric UV Heating (O3 Hartley + O2 Schumann-Runge)
@@ -185,19 +185,24 @@ def compute_mesospheric_nlte_radiation(
     dm = torch.clamp(rho_d * dz_c, min=1.0e-7)
     dn_air = (dm / M_AIR_KG_MOLEC) * 1.0e-4
     n_o2_above = O2_VMR * (p_pa / (M_AIR_KG_MOLEC * C.GRAVITY)) * 1.0e-4
-    dn_o3 = torch.clamp(o3_vmr, min=1.0e-10) * dn_air
+    # Daytime odd-oxygen photochemical partitioning O/O3 = J_O3 / (k2 * [O2] * [M]^2) (Brasseur & Solomon 2005, Eq. 5.10)
+    # In the sunlit upper mesosphere (>62 km), photolysis rapidly converts O3 into atomic O, sharply lowering daytime O3 heating.
+    k2_rec = 6.0e-34 * torch.pow(300.0 / t_k, 2.4)
+    o_over_o3_day = 8.5e-3 / torch.clamp(k2_rec * (O2_VMR * m_cm3) * m_cm3, min=1.0e-30)
+    o3_day = torch.clamp(o3_vmr, min=0.0, max=2.5e-5) / (1.0 + o_over_o3_day)
+    dn_o3 = torch.clamp(o3_day, min=1.0e-10) * dn_air
     dn_o3_rev = torch.flip(dn_o3, dims=[0])
-    n_o3_top = torch.clamp(o3_vmr[-1:], min=1.0e-10) * (p_pa[-1:] / (M_AIR_KG_MOLEC * C.GRAVITY)) * 1.0e-4 * 0.5
+    n_o3_top = torch.clamp(o3_day[-1:], min=1.0e-10) * (p_pa[-1:] / (M_AIR_KG_MOLEC * C.GRAVITY)) * 1.0e-4 * 0.5
     n_o3_above = torch.flip(n_o3_top + torch.cumsum(dn_o3_rev, dim=0) - 0.5 * dn_o3_rev, dims=[0])
 
     s_o2 = n_o2_above * amf
     s_o3 = n_o3_above * amf
     # Mlynczak & Solomon (1993) non-LTE chemical heating efficiency (drops from ~1.0 at 55 km to ~0.68 at 85 km)
     eps_chem = 0.68 + 0.32 * torch.sigmoid((log10_p + 1.40) / 0.45)
-    # O3 Hartley-Huggins heating proportional to prognostic O3 VMR and solar UV transmittance
+    # O3 Hartley-Huggins heating proportional to daytime O3 VMR and solar UV transmittance
     tau_o3_ht = torch.clamp(2.4e-18 * s_o3, max=50.0)
     q_uv_o3 = is_day * float(uv_solar_scale) * eps_chem * Q_UV_O3_HARTLEY_KS * (
-        torch.clamp(o3_vmr, min=0.0, max=2.5e-5) / 2.0e-6
+        o3_day / 2.0e-6
     ) * torch.exp(-tau_o3_ht)
     # O2 Schumann-Runge continuum & bands heating (dominates above ~78 km)
     tau_o2_sr = torch.clamp(2.0e-21 * s_o2, max=50.0)

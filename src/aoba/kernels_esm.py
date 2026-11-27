@@ -2389,6 +2389,7 @@ kernel void explicit_lightning_charge_col(
     const float DX_CORE_REF = 500.0f;
     float dx_eff = max(sqrt(dx * dy), DX_CORE_REF);
     float lwc_scale = sqrt(dx_eff / DX_CORE_REF);
+    float c_clump = dx_eff / DX_CORE_REF;
     float decay_ion = exp(-dt / TAU_ION);
     float dt_chg = TAU_ION * (-esm_expm1(-dt / TAU_ION));
     float decay_dry = exp(-dt / 300.0f);
@@ -2480,7 +2481,7 @@ kernel void explicit_lightning_charge_col(
                 float di = clamp(pow(6.0f * mi / (PI_F * RHO_CLOUD_ICE * ni_v) + 1.0e-20f, 1.0f / 3.0f), 2.0e-5f, 5.0e-4f);
                 float vti = clamp(0.45f * rho_fac, 0.05f, 1.5f);
                 float dgi = dg + di;
-                float r_gi = REBOUND_GI * (0.25f * PI_F) * (dgi * dgi) * fabs(vtg - vti) * ng_v * ni_v;
+                float r_gi = c_clump * REBOUND_GI * (0.25f * PI_F) * (dgi * dgi) * fabs(vtg - vti) * ng_v * ni_v;
                 dq_i = clamp(-dt_chg * r_gi * dq_coll, -Q_CLAMP, Q_CLAMP);
             }
             if (qs_v > 1.0e-6f) {
@@ -2490,7 +2491,7 @@ kernel void explicit_lightning_charge_col(
                 float ds = clamp(pow(6.0f * ms / (PI_F * rho_snow * ns_v) + 1.0e-20f, 1.0f / 3.0f), 1.0e-4f, 6.0e-3f);
                 float vts = clamp(4.84f * sqrt(sqrt(ds)) * rho_fac, 0.2f, 3.0f);
                 float dgs = dg + ds;
-                float r_gs = REBOUND_GI * (0.25f * PI_F) * (dgs * dgs) * fabs(vtg - vts) * ng_v * ns_v;
+                float r_gs = c_clump * REBOUND_GI * (0.25f * PI_F) * (dgs * dgs) * fabs(vtg - vts) * ng_v * ns_v;
                 dq_s = clamp(-dt_chg * r_gs * dq_coll, -Q_CLAMP, Q_CLAMP);
             }
         }

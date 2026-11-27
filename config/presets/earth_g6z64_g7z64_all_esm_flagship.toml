@@ -123,7 +123,7 @@ milankovitch_start_kyr = 0.0
 milankovitch_accel_factor = 1.0
 re_liq_um = 10.0
 re_ice_um = 48.0
-cloud_sw_inhomog = 0.88
+cloud_sw_inhomog = 0.84
 microphysics_scheme = "six_class_2m"
 
 # --- Dynamic Equilibrium / Accelerated SIA Ice-Sheet Options ---
@@ -312,7 +312,7 @@ z_foliage_cost = 12.227
 k_beer_lai = 0.5
 sigma_zhou = 0.771
 alpha_ema_acclim = 0.067
-evg_cost_ratio_base = 2.25
+evg_cost_ratio_base = 2.55
 evg_cost_ratio_cold = 0.55
 evg_cold_eff_penalty = 0.14
 leaf_aging_b_yr = 15.0

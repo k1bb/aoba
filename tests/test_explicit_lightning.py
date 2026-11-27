@@ -209,7 +209,7 @@ def test_cpu_vs_gpu_parity() -> None:
     z_km = z_c[:, 0] * 1.0e-3
     core = torch.zeros((1, nc, ny, nx))
     core[0, 0, 1:3, 3:5] = 1.0
-    core[0, 1, 1:3, 3:5] = 0.05
+    core[0, 1, 1:3, 3:5] = 0.015
     q_c = (2.2e-3 * torch.exp(-((z_km - 6.5) / 1.8) ** 2).view(nz, 1, 1, 1) * core).contiguous()
     q_g = (4.5e-3 * torch.exp(-((z_km - 7.5) / 2.5) ** 2).view(nz, 1, 1, 1) * core).contiguous()
     q_s = (2.0e-3 * torch.exp(-((z_km - 8.5) / 2.2) ** 2).view(nz, 1, 1, 1) * core).contiguous()

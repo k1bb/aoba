@@ -512,7 +512,11 @@ def _stratosphere_temp_extension(z_new: torch.Tensor, z_top_old: torch.Tensor, t
                     torch.where(
                         z <= 51000.0,
                         torch.full_like(z, 54.0),
-                        torch.clamp(54.0 - 0.0024 * (z - 51000.0), min=-28.0),
+                        torch.where(
+                            z <= 71000.0,
+                            54.0 - 0.0028 * (z - 51000.0),
+                            torch.clamp(-2.0 - 0.0020 * (z - 71000.0), min=-32.0),
+                        ),
                     ),
                 ),
             ),
@@ -531,8 +535,10 @@ def _remap_thermo_columns(
     qi_old: torch.Tensor,
     qp_old: torch.Tensor,
     z_new: torch.Tensor,
+    *,
+    rebalance_hydrostatic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Hydrostatically consistent vertical remap + stratospheric extension `[nz_old, N] -> [nz_new, N]`."""
+    """Hydrostatically consistent vertical remap + downward/upward extension `[nz_old, N] -> [nz_new, N]`."""
     zo = z_old.to(torch.float64)
     zn = z_new.to(torch.float64)
     p_old, _, t_old = diagnose_pressure_temperature(
@@ -545,25 +551,44 @@ def _remap_thermo_columns(
     qi_interp = torch.clamp(_interp_vertical_batch(zo, qi_old.to(torch.float64), zn), min=0.0)
     qp_interp = torch.clamp(_interp_vertical_batch(zo, qp_old.to(torch.float64), zn), min=0.0)
 
+    z_bot_old = zo[0:1].expand_as(zn)
     z_top_old = zo[-1:].expand_as(zn)
+    below = zn < z_bot_old
     above = zn > z_top_old
-    t_new = torch.where(above, _stratosphere_temp_extension(zn, z_top_old, t_old[-1:].expand_as(zn)), t_interp)
+
+    # Standard 6.5 K/km tropospheric lapse extension below coarse terrain (prevents valley shockwaves on AG4->AG6)
+    t_below = torch.clamp(t_old[0:1].expand_as(zn) + 0.0065 * (z_bot_old - zn), min=180.0, max=330.0)
+    t_new = torch.where(below, t_below, t_interp)
+    t_new = torch.where(above, _stratosphere_temp_extension(zn, z_top_old, t_old[-1:].expand_as(zn)), t_new)
+
     qv_top_dry = torch.clamp(qv_old[-1:].to(torch.float64), min=1.0e-7, max=4.0e-6).expand_as(zn)
     qv_new = torch.where(above, qv_top_dry, qv_interp)
-    qc_new = torch.where(above, torch.zeros_like(qc_interp), qc_interp)
-    qi_new = torch.where(above, torch.zeros_like(qi_interp), qi_interp)
-    qp_new = torch.where(above, torch.zeros_like(qp_interp), qp_interp)
+    qc_new = torch.where(above | below, torch.zeros_like(qc_interp), qc_interp)
+    qi_new = torch.where(above | below, torch.zeros_like(qi_interp), qi_interp)
+    qp_new = torch.where(above | below, torch.zeros_like(qp_interp), qp_interp)
     qn_new = qv_new + qc_new + qi_new
 
     p_new = torch.exp(ln_p_interp)
     nz_new = zn.shape[0]
+    tv_new = t_new * (1.0 + (C.RV_OVER_RD - 1.0) * qv_new)
+
+    # 1. Integrate hydrostatically DOWNWARD into valleys below z_bot_old (critical for AG4 -> AG6 mountain slopes!)
+    for k in range(nz_new - 2, -1, -1):
+        bl_k = below[k]
+        if bl_k.any():
+            dz_k = torch.clamp(zn[k + 1] - zn[k], min=1.0)
+            tv_mid = 0.5 * (tv_new[k] + tv_new[k + 1])
+            p_hyd_dn = p_new[k + 1] * torch.exp(C.GRAVITY * dz_k / (C.R_D * tv_mid))
+            p_new[k] = torch.where(bl_k, torch.clamp(p_hyd_dn, min=1.0e-3, max=1.15e5), p_new[k])
+
+    # 2. Integrate hydrostatically UPWARD above z_top_old (or full-column discrete balance on horizontal grid change)
     for k in range(1, nz_new):
-        ab_k = above[k]
-        if ab_k.any():
+        do_k = torch.ones_like(above[k]) if rebalance_hydrostatic else above[k]
+        if do_k.any():
             dz_k = torch.clamp(zn[k] - zn[k - 1], min=1.0)
-            t_mid = 0.5 * (t_new[k - 1] + t_new[k])
-            p_hyd = p_new[k - 1] * torch.exp(-C.GRAVITY * dz_k / (C.R_D * t_mid))
-            p_new[k] = torch.where(ab_k, torch.clamp(p_hyd, min=1.0e-3), p_new[k])
+            tv_mid = 0.5 * (tv_new[k - 1] + tv_new[k])
+            p_hyd = p_new[k - 1] * torch.exp(-C.GRAVITY * dz_k / (C.R_D * tv_mid))
+            p_new[k] = torch.where(do_k, torch.clamp(p_hyd, min=1.0e-3), p_new[k])
 
     rho_new = p_new / (C.R_D * t_new * (1.0 + C.RV_OVER_RD * qv_new))
     thm_new = (C.P_REF / (C.R_D * rho_new)) * torch.pow(p_new / C.P_REF, 1.0 / C.GAMMA_D)
@@ -754,7 +779,7 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         z_old_c_h = _h_atm(z_old_c)
         z_old_w_h = _h_atm(z_old_w)
 
-        # 1. Host thermodynamics (hydrostatic remap + stratospheric extension above z_old_top)
+        # 1. Host thermodynamics (hydrostatic remap + downward/upward extension; full rebalance on horizontal change)
         rho_n, thm_n, qn_n, qp_n, qv_n, qc_n, qi_n = _remap_thermo_columns(
             z_old_c_h,
             _h_atm(ck_atmos.rho_d),
@@ -764,6 +789,7 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             _h_atm(ck_atmos.q_i),
             _h_atm(ck_atmos.q_p),
             z_new_c,
+            rebalance_hydrostatic=bool(needs_hremap),
         )
         model.atmos.rho_d = rho_n.to(device=device)
         model.atmos.theta_m = thm_n.to(device=device)
@@ -802,8 +828,11 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             v_c_new = (_interp_vertical_batch(z_old_c_h, v_c_h, z_new_c) * taper_c).to(device=device)
             model.atmos.u_edge = project_cell_vectors_to_edges(model.mesh, u_c_new, v_c_new)
 
-        w_interp = _interp_vertical_batch(z_old_w_h, _h_atm(ck_atmos.w), z_new_w)
-        model.atmos.w = torch.where(z_new_w > z_old_w_h[-1:], torch.zeros_like(w_interp), w_interp).to(device=device)
+        if needs_hremap:
+            model.atmos.w = torch.zeros_like(model.atmos.w)
+        else:
+            w_interp = _interp_vertical_batch(z_old_w_h, _h_atm(ck_atmos.w), z_new_w)
+            model.atmos.w = torch.where(z_new_w > z_old_w_h[-1:], torch.zeros_like(w_interp), w_interp).to(device=device)
         if getattr(ck_atmos, "q_dust_fine", None) is not None and getattr(ck_atmos, "q_dust_coarse", None) is not None:
             qdf_i = torch.clamp(_interp_vertical_batch(z_old_c_h, _h_atm(ck_atmos.q_dust_fine), z_new_c), min=0.0)
             qdc_i = torch.clamp(_interp_vertical_batch(z_old_c_h, _h_atm(ck_atmos.q_dust_coarse), z_new_c), min=0.0)
@@ -846,12 +875,16 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             _hs_crm(ck_crm.q_i),
             _hs_crm(ck_crm.q_p),
             zn_sub,
+            rebalance_hydrostatic=bool(needs_hremap),
         )
         taper_sub = torch.exp(-torch.clamp(zn_sub - zo_sub[-1:], min=0.0) / 12000.0)
         c_u = _interp_vertical_batch(zo_sub, _hs_crm(ck_crm.u), zn_sub) * taper_sub
         c_v = _interp_vertical_batch(zo_sub, _hs_crm(ck_crm.v), zn_sub) * taper_sub
-        c_w_i = _interp_vertical_batch(zow_sub, _hs_crm(ck_crm.w), znw_sub)
-        c_w = torch.where(znw_sub > zow_sub[-1:], torch.zeros_like(c_w_i), c_w_i)
+        if needs_hremap:
+            c_w = torch.zeros_like(znw_sub, dtype=ck_crm.w.dtype)
+        else:
+            c_w_i = _interp_vertical_batch(zow_sub, _hs_crm(ck_crm.w), znw_sub)
+            c_w = torch.where(znw_sub > zow_sub[-1:], torch.zeros_like(c_w_i), c_w_i)
         c_qke_i = _interp_vertical_batch(zo_sub, _hs_crm(ck_crm.qke), zn_sub)
         c_qke = torch.where(zn_sub > zo_sub[-1:], torch.full_like(c_qke_i, 2.0e-4), torch.clamp(c_qke_i, min=2.0e-4))
 

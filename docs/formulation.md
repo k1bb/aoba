@@ -731,11 +731,11 @@ N_{i,\mathrm{eff}} &= \max\!\left(N_i,\ 4.0\times 10^4\,\max\!\left(1 - \frac{|T
 \end{aligned} \tag{5.19}
 $$
 
-where $\sigma(x) = (1 + e^{-x})^{-1}$ is the logistic gate. Gravitational sweep-out collision rates $R_{gi}, R_{gs}$ (rebound fraction $\alpha_{\mathrm{reb}} = 0.90$) generate strict zero-sum charge separation ($\Delta\rho_{q,g} = -(\Delta\rho_{q,i} + \Delta\rho_{q,s})$) integrated with exact continuous exponential source–decay duration $\Delta t_{\mathrm{chg}} = \tau_{\mathrm{ion}}(1 - e^{-\Delta t / \tau_{\mathrm{ion}}})$ ($\tau_{\mathrm{ion}} = 600\ \mathrm{s}$; Chiu, 1978), coupled to conservative periodic horizontal donor-cell advection, unconditionally stable implicit vertical advection–sedimentation with terminal fall speeds $v_{t,s}$, melting transfer from graupel/snow to rain above $0^\circ\mathrm{C}$, and dry-air leakage ($\tau_{\mathrm{dry}} = 300\ \mathrm{s}$):
+where $\sigma(x) = (1 + e^{-x})^{-1}$ is the logistic gate. Gravitational sweep-out collision rates $R_{gi}, R_{gs}$ incorporate the scale-aware subgrid updraft-core co-location factor $C_{\mathrm{clump}} = \Delta x_{\mathrm{eff}} / \Delta x_{\mathrm{ref}}$ (recovering $C_{\mathrm{clump}} = 1$ at $\Delta x \le 500\ \mathrm{m}$ LES) with rebound fraction $\alpha_{\mathrm{reb}} = 0.90$, generating strict zero-sum charge separation ($\Delta\rho_{q,g} = -(\Delta\rho_{q,i} + \Delta\rho_{q,s})$) integrated with exact continuous exponential source–decay duration $\Delta t_{\mathrm{chg}} = \tau_{\mathrm{ion}}(1 - e^{-\Delta t / \tau_{\mathrm{ion}}})$ ($\tau_{\mathrm{ion}} = 600\ \mathrm{s}$; Chiu, 1978), coupled to conservative periodic horizontal donor-cell advection, unconditionally stable implicit vertical advection–sedimentation with terminal fall speeds $v_{t,s}$, melting transfer from graupel/snow to rain above $0^\circ\mathrm{C}$, and dry-air leakage ($\tau_{\mathrm{dry}} = 300\ \mathrm{s}$):
 
 $$
 \begin{aligned}
-R_{gx} &= \alpha_{\mathrm{reb}}\,\frac{\pi}{4}(D_g + D_x)^2\,|v_{t,g} - v_{t,x}|\,N_g N_x, \qquad x\in\{i, s\}, \\
+R_{gx} &= C_{\mathrm{clump}}\,\alpha_{\mathrm{reb}}\,\frac{\pi}{4}(D_g + D_x)^2\,|v_{t,g} - v_{t,x}|\,N_g N_x, \qquad x\in\{i, s\}, \\
 \frac{\partial \rho_{q,s}}{\partial t} &= -\nabla_h\cdot(\mathbf{u}_h \rho_{q,s}) - \frac{\partial}{\partial z}\big[(w - v_{t,s})\rho_{q,s}\big] + S_{\mathrm{ni},s} + S_{\mathrm{melt},s} - \frac{\rho_{q,s}}{\tau_{\mathrm{rel},s}}
 \end{aligned} \tag{5.20}
 $$

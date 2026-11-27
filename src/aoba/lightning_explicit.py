@@ -385,10 +385,12 @@ def step_explicit_bulk_lightning_and_lnox(
     dt_s = max(float(dt), 1.0)
 
     # Resolution-aware subgrid convective core peaking (DX_CORE_REF = 500 m; Fierro 2013; Sato 2019):
-    # horizontal grid spacing dx > 500 m dilutes peak convective core LWC and resolved |E| across the box.
+    # horizontal grid spacing dx > 500 m dilutes peak convective core LWC, bilinear <n_g n_i> riming
+    # co-location (c_clump = dx_eff / 500 m, exact analog of subgrid KK00 variance), and resolved |E|.
     dx_eff = max(math.sqrt(dx_m * dy_m), 500.0)
     e_crit_sl_eff = E_CRIT_SEA_LEVEL * ((500.0 / dx_eff) ** 0.75)
     lwc_scale = math.sqrt(dx_eff / 500.0)
+    c_clump = dx_eff / 500.0
 
     # Fast fused Metal/CUDA 3-kernel path (MPS & CUDA, float32, nz <= 128, zero mid-step sync)
     if (
@@ -543,9 +545,9 @@ def step_explicit_bulk_lightning_and_lnox(
     dt_chg = TAU_ION_RELAX_S * (-math.expm1(-dt_s / TAU_ION_RELAX_S))
     decay_dry = math.exp(-dt_s / 300.0)
 
-    # Gravitational sweep-out collision kernels [collisions m^-3 s^-1]
-    r_gi = REBOUND_FRAC_GI * (0.25 * math.pi) * ((d_g + d_i) ** 2) * torch.abs(vt_g - vt_i) * n_g_v * n_i_v * active_g * active_i
-    r_gs = REBOUND_FRAC_GI * (0.25 * math.pi) * ((d_g + d_s) ** 2) * torch.abs(vt_g - vt_s) * n_g_v * n_s_v * active_g * active_s
+    # Gravitational sweep-out collision kernels [collisions m^-3 s^-1] with scale-aware updraft-core co-location c_clump
+    r_gi = c_clump * REBOUND_FRAC_GI * (0.25 * math.pi) * ((d_g + d_i) ** 2) * torch.abs(vt_g - vt_i) * n_g_v * n_i_v * active_g * active_i
+    r_gs = c_clump * REBOUND_FRAC_GI * (0.25 * math.pi) * ((d_g + d_s) ** 2) * torch.abs(vt_g - vt_s) * n_g_v * n_s_v * active_g * active_s
 
     dq_i_sep = torch.clamp(-dt_chg * r_gi * dq_coll, -Q_CHG_CLAMP_C_M3, Q_CHG_CLAMP_C_M3)
     dq_s_sep = torch.clamp(-dt_chg * r_gs * dq_coll, -Q_CHG_CLAMP_C_M3, Q_CHG_CLAMP_C_M3)
@@ -1047,12 +1049,12 @@ def step_ossp_distilled_lightning(
         from aoba.runtime import can_use_cuda_graph, run_cuda_graph_train_step
 
         use_cg_lt = can_use_cuda_graph(dev)
-        if distill_state.all_size < 512:
+        if distill_state.all_size < 1024:
             n_lt_grad = 2
-        elif distill_state.steps_seen >= 120:
-            n_lt_grad = 1 if (distill_state.steps_seen % 4 == 0) else 0
-        else:
+        elif distill_state.all_size < 4096 or distill_state.steps_seen < 120:
             n_lt_grad = 1
+        else:
+            n_lt_grad = 1 if (distill_state.steps_seen % 4 == 0) else 0
         if n_lt_grad > 0:
             b_all = min(256, distill_state.all_size)
             b_act = min(128, distill_state.act_size)
