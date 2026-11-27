@@ -2431,7 +2431,7 @@ def main() -> None:
     csv_stride_steps = max(int(out_cfg.daily_csv_interval_days) * steps_per_day, 1)
     preview_stride_steps = max(int(round(3600.0 / cfg.dt_host)), 1)
     hf_enabled = bool(getattr(out_cfg, "highfreq_enabled", False))
-    hf_stride_steps = max(int(round(float(getattr(out_cfg, "highfreq_interval_hours", 3.0)) * 3600.0 / cfg.dt_host)), 1)
+    hf_stride_steps = max(int(round(float(getattr(out_cfg, "highfreq_interval_hours", 1.0)) * 3600.0 / cfg.dt_host)), 1)
     hf_include_upper = bool(getattr(out_cfg, "highfreq_include_upper_air", True))
     hf_k_dev: torch.Tensor | None = None
     hf_z_km = np.array([], dtype=np.float32)
@@ -2718,6 +2718,8 @@ def main() -> None:
                     hf_precip_sum = None
                     hf_olr_sum = None
                     hf_cnt = 0
+                    if len(hf_times) >= 120:
+                        _flush_highfreq_buffers()
 
             if step_in_yr % preview_stride_steps == 0 and hr_cnt > 0:
                 wall_hr = time.perf_counter() - t_hr0

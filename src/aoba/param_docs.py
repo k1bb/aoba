@@ -603,8 +603,8 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "en": "Enable high-frequency 2D convective/wave output (`highfreq.zarr`: diurnal precipitation cycle, Wheeler–Kiladis equatorial waves, upper-air waves) and full-column zonal-mean wave/GWD diagnostics (`zonal_waves.zarr`: QBO, EP flux, CRM-lid continuity, GWD).",
     },
     "highfreq_interval_hours": {
-        "ja": "`highfreq.zarr` および `zonal_waves.zarr` の出力時間間隔 [時間]（既定 3.0 時間＝1日8回；降水日周期・半日潮汐 SW2・準2日波 Q2DW・赤道波スペクトルを解像）。",
-        "en": "Output cadence [hours] for `highfreq.zarr` and `zonal_waves.zarr` (default 3.0 h = 8x/day; resolves diurnal precipitation, SW2/DW1 tides, Q2DW, and equatorial waves).",
+        "ja": "`highfreq.zarr` および `zonal_waves.zarr` の出力時間間隔 [時間]（既定 1.0 時間＝1日24回；IMERG 対比の1時間降水日周期・極端降水・高周波重力波・熱潮汐・準2日波・赤道波スペクトルを解像）。",
+        "en": "Output cadence [hours] for `highfreq.zarr` and `zonal_waves.zarr` (default 1.0 h = 24x/day; resolves 1-hourly IMERG-comparable diurnal precipitation, extreme rain, high-frequency gravity waves, tides, Q2DW, and equatorial waves).",
     },
     "highfreq_include_upper_air": {
         "ja": "`highfreq.zarr` に指定高度スライスの瞬時上層場（気温・東西風・南北風・鉛直速度）を含める（ジェット流路・ストームトラック・重力波・中間圏ノーマルモード解析用）。",

@@ -58,7 +58,7 @@ class OutputConfig:
     cmip7_include_plev19: bool = True           # Include 3D atmospheric variables interpolated to CMIP7 plev19
     cmip7_include_ocean_3d: bool = True         # Include 3D ocean variables on model z-levels (olevel)
     highfreq_enabled: bool = False              # Enable high-frequency (e.g. 3-hourly) convective/wave Zarr streams (`highfreq.zarr`, `zonal_waves.zarr`)
-    highfreq_interval_hours: float = 3.0        # Output cadence [hours] for `highfreq.zarr` and `zonal_waves.zarr` (3.0 h = 8x/day)
+    highfreq_interval_hours: float = 1.0        # Output cadence [hours] for `highfreq.zarr` and `zonal_waves.zarr` (1.0 h = 24x/day; IMERG diurnal & high-freq GW)
     highfreq_include_upper_air: bool = True     # Include selected upper-air altitude slices (T, u, v, w) in `highfreq.zarr`
     highfreq_upper_air_km: str = "10,20,30,50,75"  # Target altitudes [km] for `highfreq.zarr` upper-air slices (jet, CRM lid, stratopause, mesosphere)
 

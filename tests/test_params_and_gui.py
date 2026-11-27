@@ -253,7 +253,7 @@ def test_runner_cli_with_custom_toml_cpu() -> None:
         cfg["output"]["snapshots_periods_per_year"] = 2
         cfg["output"]["snapshots_include_subgrid_2d"] = False
         cfg["output"]["highfreq_enabled"] = True
-        cfg["output"]["highfreq_interval_hours"] = 3.0
+        cfg["output"]["highfreq_interval_hours"] = 1.0
         cfg["output"]["highfreq_include_upper_air"] = True
         cfg["output"]["highfreq_upper_air_km"] = "5,15,25"
 
@@ -296,11 +296,11 @@ def test_runner_cli_with_custom_toml_cpu() -> None:
         assert (out_dir / "highfreq.zarr").exists()
         assert (out_dir / "zonal_waves.zarr").exists()
         ds_hf = xr.open_zarr(out_dir / "highfreq.zarr", consolidated=False)
-        assert ds_hf.sizes["time"] == 2
+        assert ds_hf.sizes["time"] == 6
         for k in ("precip_mm_day", "olr", "t2_k", "temp_hf", "u_hf", "v_hf", "w_hf"):
             assert k in ds_hf, f"Missing {k} in highfreq.zarr"
         ds_zw = xr.open_zarr(out_dir / "zonal_waves.zarr", consolidated=False)
-        assert ds_zw.sizes["time"] == 2 and ds_zw.sizes["n_lat"] == 36
+        assert ds_zw.sizes["time"] == 6 and ds_zw.sizes["n_lat"] == 36
         for k in ("u_zm", "temp_zm", "uw_eddy_zm", "vw_eddy_zm", "vt_eddy_zm", "w_rms_zm", "du_ngwd_zm", "du_ogwd_zm"):
             assert k in ds_zw, f"Missing {k} in zonal_waves.zarr"
         assert "tau_ngwd_col" in ds_m and "tau_ogwd_col" in ds_m
