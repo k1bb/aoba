@@ -809,7 +809,13 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
     z_top_new_val = float(model.atmos.z_w[-1].mean().item())
     needs_hremap = nc_old != nc_new
     needs_subremap = (ny_old != ny_new) or (nx_old != nx_new)
-    needs_vremap = (nz_old != nz_new) or (abs(z_top_old_val - z_top_new_val) > 50.0)
+    if nz_old == nz_new:
+        _h_agl_old = (ck_atmos.z_c - ck_atmos.z_w[:1]).mean(dim=1).cpu()
+        _h_agl_new = (model.atmos.z_c - model.atmos.z_w[:1]).mean(dim=1).cpu()
+        _vgrid_prof_diff = float((_h_agl_old - _h_agl_new).abs().max().item())
+    else:
+        _vgrid_prof_diff = float("inf")
+    needs_vremap = (nz_old != nz_new) or (abs(z_top_old_val - z_top_new_val) > 50.0) or (_vgrid_prof_diff > 50.0)
     needs_atm_remap = needs_hremap or needs_vremap or needs_subremap
 
     # Build spherical surface-type-aware remap index for atmosphere if horizontal mesh changed
@@ -877,7 +883,7 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         model.atmos.rho_d = rho_n.to(device=device)
         model.atmos.theta_m = thm_n.to(device=device)
         model.atmos.q_n = qn_n.to(device=device)
-        model.atmos.q_p = qp_n.to(device=device)
+        model.atmos.q_p = torch.zeros_like(qp_n, device=device) if needs_vremap else qp_n.to(device=device)
         model.atmos.q_v = qv_n.to(device=device)
         model.atmos.q_c = qc_n.to(device=device)
         model.atmos.q_i = qi_n.to(device=device)
@@ -975,7 +981,7 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
         model.crm.rho_d = c_rho.reshape(sh4).to(device=device)
         model.crm.theta_m = c_thm.reshape(sh4).to(device=device)
         model.crm.q_n = c_qn.reshape(sh4).to(device=device)
-        model.crm.q_p = c_qp.reshape(sh4).to(device=device)
+        model.crm.q_p = torch.zeros(sh4, device=device, dtype=c_qp.dtype) if needs_vremap else c_qp.reshape(sh4).to(device=device)
         model.crm.q_v = c_qv.reshape(sh4).to(device=device)
         model.crm.q_c = c_qc.reshape(sh4).to(device=device)
         model.crm.q_i = c_qi.reshape(sh4).to(device=device)
@@ -988,9 +994,15 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             {"n_c", "n_i"} if _mp_scheme == "two_moment"
             else ({"n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"} if _mp_scheme == "six_class_2m" else set())
         )
+        _precip_opt = {"q_r", "q_s", "q_g", "n_r", "n_s", "n_g"}
         for opt_field in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
             old_val = getattr(ck_crm, opt_field, None)
-            if isinstance(old_val, torch.Tensor) and (opt_field in _keep_opt or getattr(model.crm, opt_field, None) is not None):
+            if needs_vremap and opt_field in _precip_opt:
+                if opt_field in _keep_opt or getattr(model.crm, opt_field, None) is not None:
+                    setattr(model.crm, opt_field, torch.zeros(sh4, device=device, dtype=model.crm.rho_d.dtype))
+                else:
+                    setattr(model.crm, opt_field, None)
+            elif isinstance(old_val, torch.Tensor) and (opt_field in _keep_opt or getattr(model.crm, opt_field, None) is not None):
                 rm = torch.clamp(_interp_vertical_batch(zo_sub, _hs_crm(old_val), zn_sub), min=0.0)
                 rm = torch.where(zn_sub > zo_sub[-1:], torch.zeros_like(rm), rm)
                 setattr(model.crm, opt_field, rm.reshape(sh4).to(device=device))
@@ -1401,33 +1413,62 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
     if ckpt.get("mesh_dynamic") is not None and not needs_hremap:
         for k, v in ckpt["mesh_dynamic"].items():
             setattr(model.mesh, k, v.to(device=device))
-    if ckpt.get("crm_distill") is not None and getattr(model, "crm_distill", None) is not None:
-        ck_cd = ckpt["crm_distill"]
-        try:
-            model.crm_distill.net.load_state_dict(
-                {k: v.to(device=device) for k, v in ck_cd["net_state"].items()}, strict=True
-            )
-            model.crm_distill.steps_seen = int(ck_cd.get("steps_seen", model.crm_distill.warmup_steps))
-            model.crm_distill.grad_updates = int(ck_cd.get("grad_updates", 0))
-            model.crm_distill.ema_loss = float(ck_cd.get("ema_loss", 1.0))
-            model.crm_distill.ema_val_rmse_thm = float(ck_cd.get("ema_val_rmse_thm", 1.0))
-            model.crm_distill.ema_val_rmse_qn = float(ck_cd.get("ema_val_rmse_qn", 1.0e-3))
-        except Exception:
-            # Architecture width changed: start student fresh with warmup automatically
-            pass
-    if ckpt.get("rad_distill") is not None and getattr(model, "rad_distill", None) is not None:
-        ck_rd = ckpt["rad_distill"]
-        try:
-            model.rad_distill.net.load_state_dict(
-                {k: v.to(device=device) for k, v in ck_rd["net_state"].items()}, strict=True
-            )
-            model.rad_distill.steps_seen = int(ck_rd.get("steps_seen", model.rad_distill.warmup_steps))
-            model.rad_distill.grad_updates = int(ck_rd.get("grad_updates", 0))
-            model.rad_distill.ema_loss = float(ck_rd.get("ema_loss", 1.0))
-            model.rad_distill.ema_val_rmse_olr = float(ck_rd.get("ema_val_rmse_olr", 5.0))
-            model.rad_distill.ema_val_rmse_asr = float(ck_rd.get("ema_val_rmse_asr", 5.0))
-        except Exception:
-            pass
+    if needs_vremap and (
+        getattr(model, "crm_distill", None) is not None or getattr(model, "rad_distill", None) is not None
+    ):
+        # 1D-ResNet OSSP students map vertical level index `k` to tendencies; weights trained
+        # on a different `(nz, z_top, dz)` vertical coordinate are invalid and must re-train
+        # from scratch via full 100%-CRM / RRTMGP warmup on the active vertical grid.
+        print(
+            f"  [OSSP Grid Remap] Vertical grid changed "
+            f"(nz={nz_old}->{nz_new}, top={z_top_old_val/1000:.1f}->{z_top_new_val/1000:.1f} km): "
+            f"resetting CRM/Rad OSSP students & q_p for fresh warmup.",
+            flush=True,
+        )
+    else:
+        if ckpt.get("crm_distill") is not None and getattr(model, "crm_distill", None) is not None:
+            ck_cd = ckpt["crm_distill"]
+            try:
+                model.crm_distill.net.load_state_dict(
+                    {k: v.to(device=device) for k, v in ck_cd["net_state"].items()}, strict=True
+                )
+                if needs_hremap or needs_subremap:
+                    # Same vertical grid, new horizontal/CRM resolution: keep warm weights
+                    # but reset schedule & EMA RMSE so full warmup + fast adaptation runs.
+                    model.crm_distill.steps_seen = 0
+                    model.crm_distill.grad_updates = 0
+                    model.crm_distill.ema_loss = 1.0
+                    model.crm_distill.ema_val_rmse_thm = 2.0
+                    model.crm_distill.ema_val_rmse_qn = 1.0e-3
+                else:
+                    model.crm_distill.steps_seen = int(ck_cd.get("steps_seen", model.crm_distill.warmup_steps))
+                    model.crm_distill.grad_updates = int(ck_cd.get("grad_updates", 0))
+                    model.crm_distill.ema_loss = float(ck_cd.get("ema_loss", 1.0))
+                    model.crm_distill.ema_val_rmse_thm = float(ck_cd.get("ema_val_rmse_thm", 1.0))
+                    model.crm_distill.ema_val_rmse_qn = float(ck_cd.get("ema_val_rmse_qn", 1.0e-3))
+            except Exception:
+                # Architecture width changed: start student fresh with warmup automatically
+                pass
+        if ckpt.get("rad_distill") is not None and getattr(model, "rad_distill", None) is not None:
+            ck_rd = ckpt["rad_distill"]
+            try:
+                model.rad_distill.net.load_state_dict(
+                    {k: v.to(device=device) for k, v in ck_rd["net_state"].items()}, strict=True
+                )
+                if needs_hremap or needs_subremap:
+                    model.rad_distill.steps_seen = 0
+                    model.rad_distill.grad_updates = 0
+                    model.rad_distill.ema_loss = 1.0
+                    model.rad_distill.ema_val_rmse_olr = 15.0
+                    model.rad_distill.ema_val_rmse_asr = 25.0
+                else:
+                    model.rad_distill.steps_seen = int(ck_rd.get("steps_seen", model.rad_distill.warmup_steps))
+                    model.rad_distill.grad_updates = int(ck_rd.get("grad_updates", 0))
+                    model.rad_distill.ema_loss = float(ck_rd.get("ema_loss", 1.0))
+                    model.rad_distill.ema_val_rmse_olr = float(ck_rd.get("ema_val_rmse_olr", 5.0))
+                    model.rad_distill.ema_val_rmse_asr = float(ck_rd.get("ema_val_rmse_asr", 5.0))
+            except Exception:
+                pass
     if getattr(model, "sparse_crm_pool", None) is not None:
         pool_dst = model.sparse_crm_pool
         ck_sp = ckpt.get("sparse_crm_pool")

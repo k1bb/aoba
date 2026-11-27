@@ -746,6 +746,78 @@ def test_shadow_divergence_abrupt_4xco2_atmos_and_land() -> None:
     )
 
 
+def test_restart_grid_remap_ossp_reset() -> None:
+    """Verify `_load_restart_into_model` resets OSSP students & q_p on vertical-grid remap,
+    resets warmup schedule on horizontal remap, and preserves OSSP verbatim on same-grid resume."""
+    import importlib.util
+    import tempfile
+    from pathlib import Path
+
+    dev = torch.device("cpu")
+    run_script = Path(__file__).resolve().parents[1] / "scripts" / "run_g5_30yr.py"
+    spec = importlib.util.spec_from_file_location("_aoba_run_mod_remap", str(run_script))
+    assert spec is not None and spec.loader is not None
+    run_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run_mod)
+
+    base_kw = dict(
+        glevel=1, nz=16, z_top=30000.0, z_sponge_base=24000.0,
+        crm_ny=1, crm_nx=8, crm_dx=4000.0, dt_host=600.0,
+        n_host_dyn_substeps=1, n_crm_dyn_substeps=2, rad_stride=2,
+        rad_scheme="four_band", o3_mode="rcemip", microphysics_scheme="one_moment",
+        ocean_mode="ekman_sw", use_earth2014=False,
+        enable_dust=False, enable_natural_aerosols=False,
+        enable_land_carbon=False, enable_ocean_bgc=False, enable_river_routing=False,
+        enable_crm_self_distill=True, enable_rad_self_distill=True,
+        crm_distill_stride=4, crm_distill_warmup_steps=4, crm_distill_dwell_steps=4,
+        crm_distill_hidden_dim=32, crm_distill_replay_size=256,
+    )
+    m_src = init_aoba_model(AOBAConfig(**base_kw), device=dev)
+    m_src.crm_distill.steps_seen = 12345
+    m_src.crm_distill.ema_val_rmse_thm = 0.08
+    m_src.rad_distill.steps_seen = 6789
+    m_src.rad_distill.ema_val_rmse_olr = 1.5
+    m_src.atmos.q_p.fill_(5.0e-4)
+    m_src.crm.q_p.fill_(5.0e-4)
+    with torch.no_grad():
+        for p in m_src.crm_distill.net.parameters():
+            p.fill_(0.123)
+            break
+    src_first_w = next(iter(m_src.crm_distill.net.parameters())).detach().clone()
+
+    with tempfile.TemporaryDirectory() as td:
+        ckpt_path = Path(td) / "src_restart.pt"
+        run_mod._save_restart_atomic(m_src, ckpt_path)
+
+        # 1. Exact same grid -> preserves weights & steps_seen verbatim
+        m_same = init_aoba_model(AOBAConfig(**base_kw), device=dev)
+        run_mod._load_restart_into_model(m_same, ckpt_path, dev)
+        assert m_same.crm_distill.steps_seen == 12345
+        assert m_same.rad_distill.steps_seen == 6789
+        assert torch.allclose(next(iter(m_same.crm_distill.net.parameters())), src_first_w)
+        assert float(m_same.atmos.q_p.max()) > 1.0e-4
+
+        # 2. Horizontal-only remap (glevel 1 -> 2, same 30 km z_top) -> warm weights, reset warmup schedule
+        m_h = init_aoba_model(AOBAConfig(**{**base_kw, "glevel": 2}), device=dev)
+        run_mod._load_restart_into_model(m_h, ckpt_path, dev)
+        assert m_h.crm_distill.steps_seen == 0
+        assert m_h.crm_distill.ema_val_rmse_thm >= 1.9
+        assert m_h.rad_distill.steps_seen == 0
+        assert torch.allclose(next(iter(m_h.crm_distill.net.parameters())), src_first_w)
+
+        # 3. Vertical-grid remap (30 km -> 45 km) -> fresh weights, steps_seen=0, zeroed q_p
+        m_v = init_aoba_model(AOBAConfig(**{**base_kw, "z_top": 45000.0, "z_sponge_base": 36000.0}), device=dev)
+        init_v_w = next(iter(m_v.crm_distill.net.parameters())).detach().clone()
+        run_mod._load_restart_into_model(m_v, ckpt_path, dev)
+        assert m_v.crm_distill.steps_seen == 0
+        assert m_v.rad_distill.steps_seen == 0
+        assert torch.allclose(next(iter(m_v.crm_distill.net.parameters())), init_v_w)
+        assert float(m_v.atmos.q_p.abs().max()) == 0.0
+        assert float(m_v.crm.q_p.abs().max()) == 0.0
+
+    print("  [PASS] Restart grid-remap OSSP reset (same-grid preserve / h-remap re-warmup / v-remap full reset & q_p zero)")
+
+
 if __name__ == "__main__":
     test_exact_column_conservation_closure()
     print("  [PASS] Exact column conservation closure (water, enthalpy, momentum, non-negativity)")
@@ -762,4 +834,5 @@ if __name__ == "__main__":
     test_sparse_3d_crm_pool_slot_preservation_and_coupled_tica()
     test_ogcm_gpu_fused_parity_and_async_ocean_stride()
     test_shadow_divergence_abrupt_4xco2_atmos_and_land()
+    test_restart_grid_remap_ossp_reset()
     print("ALL CRM + RADIATION SELF-DISTILLATION TESTS PASSED!")
