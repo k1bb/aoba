@@ -104,6 +104,46 @@ def test_water_isotope_physics() -> None:
     assert torch.isfinite(iso.d18o_snow_permil).all()
     assert torch.isfinite(iso.dexcess_permil).all()
 
+    # Verify below-cloud raindrop re-evaporation (amount effect & d-excess drop), bare-soil vs forest ET, & wind switch
+    qv2 = torch.full((nz, 4), 0.010, dtype=torch.float32)
+    t2 = torch.full((nz, 4), 292.0, dtype=torch.float32)
+    rd2 = torch.full((nz, 4), 1.1, dtype=torch.float32)
+    dz2 = torch.full((nz, 4), 800.0, dtype=torch.float32)
+    # Col 0: light rain in dry air (RH=0.45); Col 1: heavy rain in humid air (RH=0.90)
+    # Col 2: bare soil evap (LAI=0.0); Col 3: forest transp (LAI=6.0)
+    st2 = torch.tensor([SURF_LAND, SURF_LAND, SURF_LAND, SURF_LAND], dtype=torch.int32)
+    ts2 = torch.full((4,), 295.0)
+    ev2 = torch.tensor([0.0, 0.0, 8.0e-5, 8.0e-5])
+    rn2 = torch.tensor([3.0e-5, 8.0e-4, 0.0, 0.0])
+    sn2 = torch.zeros(4)
+    rh2 = torch.tensor([0.45, 0.90, 0.55, 0.55])
+    lai2 = torch.tensor([2.0, 2.0, 0.0, 6.0])
+    iso2 = init_water_isotope_state(qv2)
+    step_water_isotopes(iso2, qv2, t2, rd2, dz2, st2, ts2, ev2, rn2, sn2, dt=1800.0, rh_sfc=rh2, lai_cell=lai2)
+    assert float(iso2.d18o_precip_permil[0]) > float(iso2.d18o_precip_permil[1]) + 1.0, (
+        "Expected Stewart/Risi amount effect: light rain in dry air must be more enriched than heavy humid rain"
+    )
+    assert float(iso2.dexcess_permil[0]) < float(iso2.dexcess_permil[1]) - 2.0, (
+        "Expected below-cloud raindrop re-evaporation to lower rain d-excess in dry air"
+    )
+    # Bare-soil evaporative fractionation produces lighter vapor than non-fractionating forest transpiration
+    assert float(iso2.q_v_18o[0, 2]) < float(iso2.q_v_18o[0, 3])
+    # Merlivat & Jouzel (1979) smooth (U10=4) vs rough (U10=12) ocean kinetic regime produces distinct vapor ratios
+    iso_sm = init_water_isotope_state(qv2[:, :1])
+    iso_rg = init_water_isotope_state(qv2[:, :1])
+    st_ocn = torch.tensor([SURF_OCEAN], dtype=torch.int32)
+    step_water_isotopes(
+        iso_sm, qv2[:, :1], t2[:, :1], rd2[:, :1], dz2[:, :1], st_ocn, ts2[:1],
+        torch.tensor([1.0e-4]), torch.zeros(1), torch.zeros(1), dt=1800.0,
+        rh_sfc=torch.tensor([0.75]), u10_cell=torch.tensor([4.0]),
+    )
+    step_water_isotopes(
+        iso_rg, qv2[:, :1], t2[:, :1], rd2[:, :1], dz2[:, :1], st_ocn, ts2[:1],
+        torch.tensor([1.0e-4]), torch.zeros(1), torch.zeros(1), dt=1800.0,
+        rh_sfc=torch.tensor([0.75]), u10_cell=torch.tensor([12.0]),
+    )
+    assert abs(float(iso_sm.q_v_18o[0, 0] - iso_rg.q_v_18o[0, 0])) > 1.0e-8
+
 
 def test_planetary_presets_and_tidal_lock() -> None:
     """Verify aquaplanet, snowball_earth, trappist1e, mars_like presets and substellar insolation."""

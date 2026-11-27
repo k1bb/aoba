@@ -83,7 +83,35 @@ def test_ocean_waves_langmuir_and_spray() -> None:
         torch.ones(n),
     )
     assert float(d_lh[0]) == 0.0 and float(d_lh[1]) == 0.0 and float(d_lh[3]) > 100.0
-    print(f"[PASS] Ocean Waves: Hs={[round(float(x),2) for x in w.hs_m]} m, La_fac={diag['wave_langmuir_mean']:.2f}, Spray LH(40m/s)={float(d_lh[3]):.1f} W/m^2")
+
+    # Voronoi horizontal swell propagation: storm belt (|lat| > 35 deg) radiates swell into calm equator (U10 = 0)
+    from aoba.scvt_mesh import build_scvt_mesh
+
+    mesh = build_scvt_mesh(2, use_earth2014=False, device=torch.device("cpu"))
+    nc = mesh.n_cells
+    lat_deg = mesh.lat_cell * (180.0 / 3.141592653589793)
+    is_eq = lat_deg.abs() < 15.0
+    is_storm = lat_deg.abs() > 35.0
+    is_ocn_m = torch.ones(nc, dtype=torch.bool)
+    fice_m = torch.zeros(nc)
+    u10_m = torch.where(is_storm, torch.full((nc,), 20.0), torch.zeros(nc))
+
+    w_prop = init_ocean_wave_state(nc, torch.device("cpu"))
+    w_prop.hs_m.zero_()
+    w_local = init_ocean_wave_state(nc, torch.device("cpu"))
+    w_local.hs_m.zero_()
+    for _ in range(96):  # 48 hours
+        step_ocean_waves(w_prop, u10_m, fice_m, is_ocn_m, 1800.0, mesh=mesh)
+        step_ocean_waves(w_local, u10_m, fice_m, is_ocn_m, 1800.0, mesh=None)
+    hs_eq_prop = float(w_prop.hs_m[is_eq].mean())
+    hs_eq_local = float(w_local.hs_m[is_eq].mean())
+    assert hs_eq_prop > 0.5 and hs_eq_local < 1.0e-5, (
+        f"Expected Voronoi swell pool in calm tropics: prop={hs_eq_prop:.2f} m vs local={hs_eq_local:.4f} m"
+    )
+    print(
+        f"[PASS] Ocean Waves: Hs={[round(float(x),2) for x in w.hs_m]} m, La_fac={diag['wave_langmuir_mean']:.2f}, "
+        f"Spray LH(40m/s)={float(d_lh[3]):.1f} W/m^2, Tropical Swell={hs_eq_prop:.2f} m"
+    )
 
 
 def test_coupled_batch2_cpu_mps() -> None:

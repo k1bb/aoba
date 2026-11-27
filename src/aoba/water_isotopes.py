@@ -34,12 +34,20 @@ import torch
 from aoba import constants as C
 from aoba.surface import SURF_OCEAN
 
-# Kinetic evaporation factors over open ocean (Merlivat & Jouzel, 1979, JGR, smooth/rough blend)
-K_KIN_18O: float = 0.0060
-K_KIN_HDO: float = 0.0053
+# Kinetic evaporation factors over open ocean (Merlivat & Jouzel, 1979, JGR, 84, 5029)
+K_KIN_18O_SMOOTH: float = 0.0060   # Smooth regime (U_10 < 7 m s^-1)
+K_KIN_18O: float = 0.0060          # Backward-compatible alias
+K_KIN_HDO: float = 0.00528         # 0.88 * K_KIN_18O_SMOOTH (Merlivat, 1978)
+U10_ROUGH_SWITCH_MS: float = 7.0   # Aerodynamic smooth-to-rough ocean transition [m s^-1]
+K_KIN_18O_SOIL: float = 0.0120     # Bare-soil diffusive boundary-layer kinetic factor (Mathieu & Bariac, 1996)
+K_KIN_D_OVER_18: float = 0.88      # Merlivat (1978) ratio k_D / k_18
 # Ratio diffusivity ratios D_light / D_heavy for snow kinetic supersaturation (Jouzel & Merlivat, 1984)
 DIFF_RATIO_18O: float = 1.0285
 DIFF_RATIO_HDO: float = 1.0251
+# Below-cloud raindrop diffusive kinetic ratios (D_light / D_heavy)^0.58 (Stewart, 1975, JGR, 80, 1133)
+KAPPA_DROP_18O: float = 1.0285 ** 0.58   # = 1.01645
+KAPPA_DROP_HDO: float = 1.0251 ** 0.58   # = 1.01449
+RAIN_REEVAP_PREF_KGM2S: float = 1.5e-4   # Reference rain intensity (~13 mm/day) for sub-cloud re-evaporation (Risi et al., 2008)
 
 
 @dataclass
@@ -105,7 +113,7 @@ def init_water_isotope_state(q_v: torch.Tensor) -> WaterIsotopeState:
     )
 
 
-# AOBA Formulation Eqs. (10.10)-(10.11)
+# AOBA Formulation Eqs. (10.10)-(10.12)
 def step_water_isotopes(
     iso: WaterIsotopeState,
     q_v: torch.Tensor,            # [Nz, N_cells] updated atmospheric vapor [kg kg^-1]
@@ -120,8 +128,10 @@ def step_water_isotopes(
     dt: float,
     *,
     rh_sfc: torch.Tensor | None = None,
+    u10_cell: torch.Tensor | None = None,
+    lai_cell: torch.Tensor | None = None,
 ) -> None:
-    """Advance isotopic fractionation (Craig-Gordon evaporation + Rayleigh rainout + ice-core archive).
+    """Advance isotopic fractionation (Craig-Gordon wind-regime + bare-soil + Rayleigh + Stewart raindrop re-evap).
 
     Zero Forward Euler, strictly ratio-bounded (`R_18 in [0.90, 1.03]`, `R_D in [0.35, 1.15]`),
     zero Python vertical loops or CPU-GPU syncs.
@@ -136,16 +146,40 @@ def step_water_isotopes(
 
     a18_eff, ad_eff, a18_l, ad_l = equilibrium_fractionation_factors(temp_c)
 
-    # 1. Surface evaporation fractionation in lowest layer k = 0 (Craig & Gordon, 1965)
+    # 1. Surface evaporation fractionation in lowest layer k = 0 (Craig & Gordon, 1965; Merlivat & Jouzel, 1979)
     is_ocn = (surf_type == SURF_OCEAN).to(dtype)
     _, _, a18_sfc, ad_sfc = equilibrium_fractionation_factors(t_sfc)
-    h_rel = torch.clamp(rh_sfc, 0.35, 0.92) if rh_sfc is not None else torch.full_like(t_sfc, 0.78)
+    h_rel = torch.clamp(rh_sfc, 0.25, 0.94) if rh_sfc is not None else torch.full_like(t_sfc, 0.78)
+
+    # Merlivat & Jouzel (1979) aerodynamic smooth (U10 < 7 m/s) vs rough (U10 >= 7 m/s) ocean kinetic factor
+    if u10_cell is not None:
+        u10_pos = torch.clamp(u10_cell, min=0.0, max=50.0)
+        k18_rough = torch.clamp(0.000285 * u10_pos + 0.00082, min=0.0028, max=0.012)
+        k18_ocn = torch.where(u10_pos < U10_ROUGH_SWITCH_MS, torch.full_like(u10_pos, K_KIN_18O_SMOOTH), k18_rough)
+    else:
+        k18_ocn = torch.full_like(t_sfc, K_KIN_18O_SMOOTH)
+    kd_ocn = K_KIN_D_OVER_18 * k18_ocn
+
     # Craig-Gordon ocean evaporative flux ratio (VSMOW ocean R_ocn = 1.0)
-    r18_evap_ocn = torch.clamp(((1.0 / a18_sfc - h_rel * r18[0]) / (1.0 - h_rel)) * (1.0 - K_KIN_18O), 0.95, 1.01)
-    rd_evap_ocn = torch.clamp(((1.0 / ad_sfc - h_rel * rd[0]) / (1.0 - h_rel)) * (1.0 - K_KIN_HDO), 0.75, 1.05)
-    # Land transpiration is non-fractionating (returns recent local precipitation/soil isotopic ratio)
-    r18_land = torch.clamp(1.0 + iso.d18o_precip_permil * 1.0e-3, 0.92, 1.02)
-    rd_land = torch.clamp(1.0 + iso.dd_precip_permil * 1.0e-3, 0.45, 1.08)
+    one_m_h = torch.clamp(1.0 - h_rel, min=0.06)
+    r18_evap_ocn = torch.clamp(((1.0 / a18_sfc - h_rel * r18[0]) / one_m_h) * (1.0 - k18_ocn), 0.94, 1.01)
+    rd_evap_ocn = torch.clamp(((1.0 / ad_sfc - h_rel * rd[0]) / one_m_h) * (1.0 - kd_ocn), 0.72, 1.05)
+
+    # Land ET partitioning: non-fractionating transpiration (1 - f_bare) + Craig-Gordon bare-soil evaporation (f_bare)
+    r18_soil = torch.clamp(1.0 + iso.d18o_precip_permil * 1.0e-3, 0.92, 1.02)
+    rd_soil = torch.clamp(1.0 + iso.dd_precip_permil * 1.0e-3, 0.45, 1.08)
+    if lai_cell is not None:
+        f_bare = torch.exp(-0.5 * torch.clamp(lai_cell, min=0.0))
+        r18_bare = torch.clamp(((r18_soil / a18_sfc - h_rel * r18[0]) / one_m_h) * (1.0 - K_KIN_18O_SOIL), 0.90, 1.02)
+        rd_bare = torch.clamp(
+            ((rd_soil / ad_sfc - h_rel * rd[0]) / one_m_h) * (1.0 - K_KIN_D_OVER_18 * K_KIN_18O_SOIL), 0.40, 1.08
+        )
+        r18_land = (1.0 - f_bare) * r18_soil + f_bare * r18_bare
+        rd_land = (1.0 - f_bare) * rd_soil + f_bare * rd_bare
+    else:
+        r18_land = r18_soil
+        rd_land = rd_soil
+
     r18_evap = is_ocn * r18_evap_ocn + (1.0 - is_ocn) * r18_land
     rd_evap = is_ocn * rd_evap_ocn + (1.0 - is_ocn) * rd_land
 
@@ -157,7 +191,9 @@ def step_water_isotopes(
     rd = torch.cat([rd_0.unsqueeze(0), rd[1:]], dim=0)
 
     # 2. Exact Rayleigh condensation distillation across precipitating columns
-    precip_tot = torch.clamp(rain_cell + snow_cell, min=0.0)
+    rain_pos = torch.clamp(rain_cell, min=0.0)
+    snow_pos = torch.clamp(snow_cell, min=0.0)
+    precip_tot = rain_pos + snow_pos
     cwv = torch.clamp((qv_pos * dm).sum(dim=0), min=1.0e-3)
     # Fraction of column vapor condensed during dt (exact Rayleigh f = exp(-P*dt/CWV))
     f_rem = torch.exp(-torch.clamp((precip_tot * float(dt)) / cwv, min=0.0, max=2.0))  # [N_cells]
@@ -172,21 +208,71 @@ def step_water_isotopes(
     r18 = torch.clamp(r18 * torch.exp((a18_eff - 1.0) * ln_f), min=0.90, max=1.03)
     rd = torch.clamp(rd * torch.exp((ad_eff - 1.0) * ln_f), min=0.35, max=1.15)
 
+    # 2b. Below-cloud raindrop partial re-evaporation & diffusive exchange (Stewart, 1975; Risi et al., 2008)
+    # Enriches falling rain in unsaturated air & suppresses enrichment in heavy humid convection (amount effect).
+    h_sub = torch.clamp(rh_sfc, 0.25, 0.98) if rh_sfc is not None else torch.full_like(t_sfc, 0.78)
+    one_m_hs = torch.clamp(1.0 - h_sub, min=0.02)
+    f_rain_share = torch.where(precip_tot > 1.0e-12, rain_pos / torch.clamp(precip_tot, min=1.0e-12), torch.zeros_like(rain_pos))
+    f_reevap = f_rain_share * torch.clamp(
+        0.35 * one_m_hs / (1.0 + rain_pos / RAIN_REEVAP_PREF_KGM2S), min=0.0, max=0.45
+    )
+    f_drop = torch.clamp(1.0 - f_reevap, min=0.55, max=1.0)
+    ln_fdrop = torch.log(f_drop)
+
+    # Exact closed-form Stewart (1975, Eq. 5): R_drop = gamma*R_v + (R_0 - gamma*R_v) * f_drop^beta
+    ak18 = a18_l[0] * KAPPA_DROP_18O
+    akd = ad_l[0] * KAPPA_DROP_HDO
+    den18 = torch.clamp(1.0 - ak18 * one_m_hs, min=0.10)
+    dend = torch.clamp(1.0 - akd * one_m_hs, min=0.10)
+    gamma18 = (a18_l[0] * h_sub) / den18
+    gammad = (ad_l[0] * h_sub) / dend
+    beta18 = den18 / (ak18 * one_m_hs)
+    betad = dend / (akd * one_m_hs)
+
+    pow18 = torch.exp(torch.clamp(beta18 * ln_fdrop, min=-10.0, max=0.0))
+    powd = torch.exp(torch.clamp(betad * ln_fdrop, min=-10.0, max=0.0))
+    r18_drop = torch.clamp(gamma18 * r18[0] + (r18_cond_col - gamma18 * r18[0]) * pow18, min=0.90, max=1.03)
+    rd_drop = torch.clamp(gammad * rd[0] + (rd_cond_col - gammad * rd[0]) * powd, min=0.35, max=1.15)
+
+    # Mass-conserving return of depleted, high-d-excess re-evaporated raindrop vapor into lowest layer k = 0
+    r18_re = torch.where(
+        f_reevap > 1.0e-5,
+        torch.clamp((r18_cond_col - f_drop * r18_drop) / torch.clamp(f_reevap, min=1.0e-5), min=0.90, max=1.03),
+        r18[0],
+    )
+    rd_re = torch.where(
+        f_reevap > 1.0e-5,
+        torch.clamp((rd_cond_col - f_drop * rd_drop) / torch.clamp(f_reevap, min=1.0e-5), min=0.35, max=1.15),
+        rd[0],
+    )
+    dq_re = (f_reevap * rain_pos * float(dt)) / dm[0]
+    f_mix_re = dq_re / (qv_pos[0] + dq_re)
+    r18_0_post = torch.clamp(r18[0] + (r18_re - r18[0]) * f_mix_re, min=0.90, max=1.03)
+    rd_0_post = torch.clamp(rd[0] + (rd_re - rd[0]) * f_mix_re, min=0.35, max=1.15)
+    r18 = torch.cat([r18_0_post.unsqueeze(0), r18[1:]], dim=0)
+    rd = torch.cat([rd_0_post.unsqueeze(0), rd[1:]], dim=0)
+
+    # Surface precipitation combines modified liquid rain and un-evaporated frozen snow
+    r18_sfc_p = f_rain_share * r18_drop + (1.0 - f_rain_share) * r18_cond_col
+    rd_sfc_p = f_rain_share * rd_drop + (1.0 - f_rain_share) * rd_cond_col
+
     # Update precipitation deltas where precipitation is active
     has_p = precip_tot > 1.0e-8
-    d18_now = (r18_cond_col - 1.0) * 1000.0
-    dd_now = (rd_cond_col - 1.0) * 1000.0
+    d18_now = (r18_sfc_p - 1.0) * 1000.0
+    dd_now = (rd_sfc_p - 1.0) * 1000.0
     iso.d18o_precip_permil = torch.where(has_p, d18_now, iso.d18o_precip_permil)
     iso.dd_precip_permil = torch.where(has_p, dd_now, iso.dd_precip_permil)
     iso.dexcess_permil = iso.dd_precip_permil - 8.0 * iso.d18o_precip_permil
 
     # 3. Archive snowfall d18O / dD into snowpack / ice-sheet proxy record (mass-weighted EMA)
-    dsnow = torch.clamp(snow_cell, min=0.0) * float(dt)
+    d18_sn_now = (r18_cond_col - 1.0) * 1000.0
+    dd_sn_now = (rd_cond_col - 1.0) * 1000.0
+    dsnow = snow_pos * float(dt)
     w_old = torch.clamp(iso.snow_iso_weight, min=0.0, max=500.0)
     w_new = w_old + dsnow
     alpha_sn = torch.where(w_new > 1.0e-9, dsnow / torch.clamp(w_new, min=1.0e-9), torch.zeros_like(dsnow))
-    iso.d18o_snow_permil = iso.d18o_snow_permil + (d18_now - iso.d18o_snow_permil) * alpha_sn
-    iso.dd_snow_permil = iso.dd_snow_permil + (dd_now - iso.dd_snow_permil) * alpha_sn
+    iso.d18o_snow_permil = iso.d18o_snow_permil + (d18_sn_now - iso.d18o_snow_permil) * alpha_sn
+    iso.dd_snow_permil = iso.dd_snow_permil + (dd_sn_now - iso.dd_snow_permil) * alpha_sn
     iso.snow_iso_weight = torch.clamp(w_new, max=500.0)
 
     # Reconstruct 3D prognostic isotopic mixing ratios for host SCVT FCT transport

@@ -791,9 +791,20 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
 
         w_interp = _interp_vertical_batch(z_old_w_h, _h_atm(ck_atmos.w), z_new_w)
         model.atmos.w = torch.where(z_new_w > z_old_w_h[-1:], torch.zeros_like(w_interp), w_interp).to(device=device)
-        if getattr(ck_atmos, "q_dust", None) is not None and model.atmos.q_dust is not None:
+        if getattr(ck_atmos, "q_dust_fine", None) is not None and getattr(ck_atmos, "q_dust_coarse", None) is not None:
+            qdf_i = torch.clamp(_interp_vertical_batch(z_old_c_h, _h_atm(ck_atmos.q_dust_fine), z_new_c), min=0.0)
+            qdc_i = torch.clamp(_interp_vertical_batch(z_old_c_h, _h_atm(ck_atmos.q_dust_coarse), z_new_c), min=0.0)
+            model.atmos.q_dust_fine = torch.where(z_new_c > z_old_c_h[-1:], torch.zeros_like(qdf_i), qdf_i).to(device=device)
+            model.atmos.q_dust_coarse = torch.where(z_new_c > z_old_c_h[-1:], torch.zeros_like(qdc_i), qdc_i).to(device=device)
+            model.atmos.q_dust = model.atmos.q_dust_fine + model.atmos.q_dust_coarse
+        elif getattr(ck_atmos, "q_dust", None) is not None:
+            from aoba.dust import DUST_LEGACY_RESTART_FINE_FRAC
+
             qd_i = torch.clamp(_interp_vertical_batch(z_old_c_h, _h_atm(ck_atmos.q_dust), z_new_c), min=0.0)
-            model.atmos.q_dust = torch.where(z_new_c > z_old_c_h[-1:], torch.zeros_like(qd_i), qd_i).to(device=device)
+            qd_m = torch.where(z_new_c > z_old_c_h[-1:], torch.zeros_like(qd_i), qd_i).to(device=device)
+            model.atmos.q_dust = qd_m
+            model.atmos.q_dust_fine = qd_m * DUST_LEGACY_RESTART_FINE_FRAC
+            model.atmos.q_dust_coarse = qd_m * (1.0 - DUST_LEGACY_RESTART_FINE_FRAC)
 
         # 2. Embedded CRM columns [nz_old, nc_old, ny_old, nx_old] -> [nz_new, nc_new, ny_new, nx_new]
         m_sub_new = nc_new * n_sub_new
@@ -2719,9 +2730,15 @@ def main() -> None:
                     aod_nat = float(((model.aerosols.aod_ss + model.aerosols.aod_so4 + model.aerosols.aod_bc + model.aerosols.aod_oc).detach().cpu().double() * a_w).sum().item()) / a_tot_m2
                     ccn_mean = float((model.aerosols.ccn_aero_m3.detach().cpu().double() * a_w).sum().item()) * 1.0e-6 / a_tot_m2
                     if model.atmos.q_dust is not None:
-                        from aoba.dust import DUST_K_EXT_SW1
-                        col_dust = (model.atmos.rho_d * model.atmos.dz_c * torch.clamp(model.atmos.q_dust, min=0.0)).sum(dim=0).detach().cpu().double()
-                        aod_dust = float((DUST_K_EXT_SW1 * col_dust * a_w).sum().item()) / a_tot_m2
+                        from aoba.dust import DUST_K_EXT_SW1, DUST_K_EXT_SW1_COARSE, DUST_K_EXT_SW1_FINE
+                        if model.atmos.q_dust_fine is not None and model.atmos.q_dust_coarse is not None:
+                            dm_d = (model.atmos.rho_d * model.atmos.dz_c).detach().cpu().double()
+                            col_f = (dm_d * torch.clamp(model.atmos.q_dust_fine, min=0.0).detach().cpu().double()).sum(dim=0)
+                            col_c = (dm_d * torch.clamp(model.atmos.q_dust_coarse, min=0.0).detach().cpu().double()).sum(dim=0)
+                            aod_dust = float(((DUST_K_EXT_SW1_FINE * col_f + DUST_K_EXT_SW1_COARSE * col_c) * a_w).sum().item()) / a_tot_m2
+                        else:
+                            col_dust = (model.atmos.rho_d * model.atmos.dz_c * torch.clamp(model.atmos.q_dust, min=0.0)).sum(dim=0).detach().cpu().double()
+                            aod_dust = float((DUST_K_EXT_SW1 * col_dust * a_w).sum().item()) / a_tot_m2
                         esm_parts.append(f"Aero(AOD_nat={aod_nat:.4f}, AOD_dust={aod_dust:.4f}, CCN={ccn_mean:.1f} cm^-3)")
                     else:
                         esm_parts.append(f"Aero(AOD={aod_nat:.4f}, CCN={ccn_mean:.1f} cm^-3)")

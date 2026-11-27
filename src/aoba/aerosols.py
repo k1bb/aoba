@@ -58,11 +58,31 @@ BC_V_DRY: float = 0.0010           # BC dry deposition velocity [m s^-1]
 BC_WET_SCAV: float = 0.30          # Hydrophobic->aged BC wet scavenging [m^2 kg^-1]
 OC_WET_SCAV: float = 0.50          # Partially hydrophilic OC wet scavenging [m^2 kg^-1]
 
-# 550 nm Mass Extinction Efficiencies [m^2 kg^-1] (Chin et al., 2002; Kinne et al., 2006)
-MEE_SS_550: float = 2500.0         # Sea salt (hygroscopic scattering, SSA ~ 0.99)
-MEE_SO4_550: float = 6000.0        # Sulfate (hygroscopic scattering, SSA ~ 0.99)
-MEE_BC_550: float = 10000.0        # Black carbon (strongly absorbing, SSA ~ 0.25)
-MEE_OC_550: float = 4000.0         # Organic carbon / SOA (SSA ~ 0.92)
+# Dry 550 nm Mass Extinction Efficiencies [m^2 kg^-1] (Chin et al., 2002 Table 2; Kinne et al., 2006)
+# At typical marine RH = 80%, hygroscopic growth f(RH) raises effective wet MEE to ~3465 (SS), ~7220 (SO4), ~4416 (OC).
+MEE_SS_550: float = 1500.0         # Dry sea salt (hygroscopic scattering, SSA_dry ~ 0.99)
+MEE_SO4_550: float = 3800.0        # Dry sulfate (hygroscopic scattering, SSA_dry ~ 0.99)
+MEE_BC_550: float = 10000.0        # Black carbon (hydrophobic, strongly absorbing, SSA ~ 0.25)
+MEE_OC_550: float = 3200.0         # Dry organic carbon / SOA (moderately hygroscopic, SSA_dry ~ 0.92)
+
+# Hygroscopic optical growth parameters f_i(RH) = min((1 - clamp(RH, 0, 0.95))^(-gamma_i), f_max_i)
+# (Kasten, 1969; Tang & Munkelwitz, 1994; Chin et al., 2002 Table 2)
+HYGRO_RH_MAX: float = 0.95
+HYGRO_GAMMA_SS: float = 0.52       # f_ss(80%) = 2.31, f_ss(90%) = 3.31, cap 4.5
+HYGRO_GAMMA_SO4: float = 0.40      # f_so4(80%) = 1.90, f_so4(90%) = 2.51, cap 3.2
+HYGRO_GAMMA_BC: float = 0.00       # Hydrophobic fresh/aged BC: f_bc = 1.0
+HYGRO_GAMMA_OC: float = 0.20       # f_oc(80%) = 1.38, f_oc(90%) = 1.58, cap 1.9
+HYGRO_MAX_SS: float = 4.5
+HYGRO_MAX_SO4: float = 3.2
+HYGRO_MAX_BC: float = 1.0
+HYGRO_MAX_OC: float = 1.9
+G_WATER_SW: float = 0.78           # Asymmetry factor of condensed hygroscopic aerosol water [-]
+
+# Wildfire buoyant smoke plume injection height (Freitas et al., 2007; Val Martin et al., 2012)
+FIRE_PLUME_IB_MIN_KW_M: float = 10.0
+FIRE_PLUME_Z_BASE_M: float = 300.0
+FIRE_PLUME_Z_SCALE_M: float = 220.0
+FIRE_PLUME_Z_MAX_M: float = 3500.0
 
 # Single-scattering albedo, asymmetry g, & LW absorption [m^2 kg^-1] (Bond & Bergstrom, 2006; Kinne et al., 2006)
 SSA_SS_SW: float = 0.99
@@ -149,30 +169,83 @@ def compute_bvoc_soa_emission(
     return is_land * BVOC_SOA_BASE_KGM2S * f_canopy * f_temp * f_light
 
 
+# AOBA Formulation Eq. (10.4a)
+def compute_hygroscopic_growth(
+    rh_3d: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute hygroscopic optical growth factors `f_i(RH)` for `(SS, SO4, BC, OC)` (Chin et al., 2002)."""
+    one_minus_rh = torch.clamp(1.0 - torch.clamp(rh_3d, min=0.0, max=HYGRO_RH_MAX), min=1.0 - HYGRO_RH_MAX)
+    f_ss = torch.clamp(torch.pow(one_minus_rh, -HYGRO_GAMMA_SS), min=1.0, max=HYGRO_MAX_SS)
+    f_so4 = torch.clamp(torch.pow(one_minus_rh, -HYGRO_GAMMA_SO4), min=1.0, max=HYGRO_MAX_SO4)
+    f_bc = torch.ones_like(one_minus_rh)
+    f_oc = torch.clamp(torch.pow(one_minus_rh, -HYGRO_GAMMA_OC), min=1.0, max=HYGRO_MAX_OC)
+    return f_ss, f_so4, f_bc, f_oc
+
+
+# AOBA Formulation Eq. (10.4b)
+def compute_fire_plume_top_m(fire_intensity_kw_m: torch.Tensor) -> torch.Tensor:
+    """Compute wildfire buoyant smoke plume injection top height [m] from Byram intensity I_B [kW m^-1].
+
+    Follows Freitas et al. (2007) and Val Martin et al. (2012): weak surface fires (`I_B <= 10 kW m^-1`)
+    inject into the surface layer (`z_plume = 0`), while vigorous savanna and crown fires loft smoke
+    across `[0, z_plume]` up to `3500 m` into the lower free troposphere.
+    """
+    ib = torch.clamp(fire_intensity_kw_m, min=0.0)
+    z_raw = FIRE_PLUME_Z_BASE_M + FIRE_PLUME_Z_SCALE_M * torch.sqrt(ib / 100.0)
+    return torch.where(
+        ib > FIRE_PLUME_IB_MIN_KW_M,
+        torch.clamp(z_raw, min=FIRE_PLUME_Z_BASE_M, max=FIRE_PLUME_Z_MAX_M),
+        torch.zeros_like(ib),
+    )
+
+
 def compute_aerosol_radiative_optics(
     aero: NaturalAerosolState,
     rho_d: torch.Tensor,
     dz_c: torch.Tensor,
+    rh_3d: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute 3D `[Nz, N_cells]` SW extinction, scattering, asymmetry*scat, & LW absorption for radiation."""
+    """Compute 3D `[Nz, N_cells]` RH-dependent SW extinction, scattering, asymmetry*scat, & LW absorption."""
     dm = torch.clamp(rho_d * dz_c, min=0.0)
-    t_ss = dm * (MEE_SS_550 * torch.clamp(aero.q_ss, min=0.0))
-    t_so4 = dm * (MEE_SO4_550 * torch.clamp(aero.q_so4, min=0.0))
-    t_bc = dm * (MEE_BC_550 * torch.clamp(aero.q_bc, min=0.0))
-    t_oc = dm * (MEE_OC_550 * torch.clamp(aero.q_oc, min=0.0))
+    q_ss = torch.clamp(aero.q_ss, min=0.0)
+    q_so4 = torch.clamp(aero.q_so4, min=0.0)
+    q_bc = torch.clamp(aero.q_bc, min=0.0)
+    q_oc = torch.clamp(aero.q_oc, min=0.0)
+
+    t_ss_dry = dm * (MEE_SS_550 * q_ss)
+    t_so4_dry = dm * (MEE_SO4_550 * q_so4)
+    t_bc = dm * (MEE_BC_550 * q_bc)
+    t_oc_dry = dm * (MEE_OC_550 * q_oc)
+
+    if rh_3d is not None:
+        f_ss, f_so4, _, f_oc = compute_hygroscopic_growth(rh_3d)
+        t_ss = t_ss_dry * f_ss
+        t_so4 = t_so4_dry * f_so4
+        t_oc = t_oc_dry * f_oc
+    else:
+        t_ss = t_ss_dry
+        t_so4 = t_so4_dry
+        t_oc = t_oc_dry
+
+    # Water uptake adds pure scattering (omega_water = 1.0, g_water = 0.78), keeping dry absorption invariant
+    scat_ss = t_ss - (1.0 - SSA_SS_SW) * t_ss_dry
+    scat_so4 = t_so4 - (1.0 - SSA_SO4_SW) * t_so4_dry
+    scat_bc = SSA_BC_SW * t_bc
+    scat_oc = t_oc - (1.0 - SSA_OC_SW) * t_oc_dry
+
     tau_sw = t_ss + t_so4 + t_bc + t_oc
-    scat_sw = SSA_SS_SW * t_ss + SSA_SO4_SW * t_so4 + SSA_BC_SW * t_bc + SSA_OC_SW * t_oc
+    scat_sw = scat_ss + scat_so4 + scat_bc + scat_oc
     asym_sw = (
-        G_SS_SW * SSA_SS_SW * t_ss
-        + G_SO4_SW * SSA_SO4_SW * t_so4
-        + G_BC_SW * SSA_BC_SW * t_bc
-        + G_OC_SW * SSA_OC_SW * t_oc
+        G_SS_SW * SSA_SS_SW * t_ss_dry + G_WATER_SW * (t_ss - t_ss_dry)
+        + G_SO4_SW * SSA_SO4_SW * t_so4_dry + G_WATER_SW * (t_so4 - t_so4_dry)
+        + G_BC_SW * scat_bc
+        + G_OC_SW * SSA_OC_SW * t_oc_dry + G_WATER_SW * (t_oc - t_oc_dry)
     )
     tau_lw = dm * (
-        LW_K_ABS_SS * torch.clamp(aero.q_ss, min=0.0)
-        + LW_K_ABS_SO4 * torch.clamp(aero.q_so4, min=0.0)
-        + LW_K_ABS_BC * torch.clamp(aero.q_bc, min=0.0)
-        + LW_K_ABS_OC * torch.clamp(aero.q_oc, min=0.0)
+        LW_K_ABS_SS * q_ss
+        + LW_K_ABS_SO4 * q_so4
+        + LW_K_ABS_BC * q_bc
+        + LW_K_ABS_OC * q_oc
     )
     return tau_sw, scat_sw, asym_sw, tau_lw
 
@@ -220,14 +293,31 @@ def _step_single_aerosol_column(
     v_dry: float,
     alpha_wet: float,
     dt: float,
+    plume_top_m: torch.Tensor | None = None,
+    fire_frac: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Strictly positive implicit emission + PBL mixing + settling + dry dep + wet scavenging."""
+    """Strictly positive implicit emission (surface + buoyant fire plume) + PBL mixing + settling + wet scavenging."""
     nz = q.shape[0]
     m_k = torch.clamp(rho_d * dz_c, min=1.0e-5)
     q_cur = torch.clamp(q, min=0.0).clone()
+    emis_pos = torch.clamp(emis_sfc, min=0.0)
 
-    # 1. Inject surface emission into lowest atmospheric layer k = 0
-    q_cur[0] = q_cur[0] + (dt * torch.clamp(emis_sfc, min=0.0)) / m_k[0]
+    # 1. Inject surface emission into k = 0 and buoyant wildfire plume uniformly across [0, z_plume]
+    if plume_top_m is not None:
+        zp = torch.clamp(plume_top_m, min=0.0)
+        f_loft = torch.clamp(fire_frac, 0.0, 1.0) if fire_frac is not None else torch.ones_like(zp)
+        has_plume = (zp > 0.0) & (f_loft > 0.0)
+        emis_loft = torch.where(has_plume, emis_pos * f_loft, torch.zeros_like(emis_pos))
+        emis_grd = emis_pos - emis_loft
+        q_cur[0] = q_cur[0] + (dt * emis_grd) / m_k[0]
+        z_top_k = torch.cumsum(dz_c, dim=0)
+        z_bot_k = z_top_k - dz_c
+        zp_2d = zp.unsqueeze(0)
+        z_cov = torch.clamp(torch.minimum(zp_2d, z_top_k[-1:]), min=1.0)
+        dz_ov = torch.clamp(torch.minimum(z_top_k, zp_2d) - z_bot_k, min=0.0)
+        q_cur = q_cur + (dt * emis_loft.unsqueeze(0) * (dz_ov / z_cov)) / m_k
+    else:
+        q_cur[0] = q_cur[0] + (dt * emis_pos) / m_k[0]
 
     # 2. Mass-conserving PBL turbulent mixing across lowest ~1.2 km (matches dust.py)
     n_mix = min(6, nz - 1)
@@ -283,18 +373,34 @@ def step_natural_aerosols_column(
     fire_oc_kg_m2s: torch.Tensor | None = None,
     soa_oc_kg_m2s: torch.Tensor | None = None,
     u_star_cell: torch.Tensor | None = None,
+    fire_intensity_kw_m: torch.Tensor | None = None,
+    rh_3d: torch.Tensor | None = None,
 ) -> None:
-    """Advance natural aerosol columns (emission, PBL mixing, settling, wet scavenging) & update AOD/CCN."""
+    """Advance natural aerosol columns (emission, buoyant fire plume, PBL mixing, settling, washout) & AOD/CCN."""
     emis_ss, emis_so4 = compute_seasalt_and_dms_emissions(
         surf_type, sst_k, u10_ms, f_seaice, chl_sfc_mg_m3=chl_sfc_mg_m3
     )
-    emis_bc = fire_bc_kg_m2s if fire_bc_kg_m2s is not None else torch.zeros_like(emis_ss)
-    emis_oc = fire_oc_kg_m2s if fire_oc_kg_m2s is not None else torch.zeros_like(emis_ss)
+    emis_bc = torch.clamp(fire_bc_kg_m2s, min=0.0) if fire_bc_kg_m2s is not None else torch.zeros_like(emis_ss)
+    emis_oc_fire = torch.clamp(fire_oc_kg_m2s, min=0.0) if fire_oc_kg_m2s is not None else torch.zeros_like(emis_ss)
     if soa_oc_kg_m2s is not None:
-        emis_oc = emis_oc + torch.clamp(soa_oc_kg_m2s, min=0.0)
-        aero.emis_soa_kgm2s = torch.clamp(soa_oc_kg_m2s, min=0.0)
+        soa_pos = torch.clamp(soa_oc_kg_m2s, min=0.0)
+        emis_oc = emis_oc_fire + soa_pos
+        aero.emis_soa_kgm2s = soa_pos
     else:
+        emis_oc = emis_oc_fire
         aero.emis_soa_kgm2s = torch.zeros_like(emis_ss)
+
+    plume_top_m = (
+        compute_fire_plume_top_m(fire_intensity_kw_m)
+        if fire_intensity_kw_m is not None
+        else torch.zeros_like(emis_ss)
+    )
+    fire_oc_frac = torch.where(
+        emis_oc > 1.0e-30,
+        torch.clamp(emis_oc_fire / torch.clamp(emis_oc, min=1.0e-30), 0.0, 1.0),
+        torch.zeros_like(emis_oc),
+    )
+
     mass_c_pre = torch.clamp(rho_d * dz_c, min=0.0)
     bc_col_before = (mass_c_pre * torch.clamp(aero.q_bc, min=0.0)).sum(dim=0)
     u_st = (
@@ -318,6 +424,11 @@ def step_natural_aerosols_column(
             alpha_wet_4=(SEASALT_WET_SCAV, SO4_WET_SCAV, BC_WET_SCAV, OC_WET_SCAV),
             mee_4=(MEE_SS_550, MEE_SO4_550, MEE_BC_550, MEE_OC_550),
             dt=float(dt),
+            plume_top_m=plume_top_m,
+            fire_oc_frac=fire_oc_frac,
+            rh_3d=rh_3d,
+            hygro_gamma_4=(HYGRO_GAMMA_SS, HYGRO_GAMMA_SO4, HYGRO_GAMMA_BC, HYGRO_GAMMA_OC),
+            hygro_max_4=(HYGRO_MAX_SS, HYGRO_MAX_SO4, HYGRO_MAX_BC, HYGRO_MAX_OC),
         )
         aero.q_ss, aero.q_so4, aero.q_bc, aero.q_oc = q_out[0], q_out[1], q_out[2], q_out[3]
         aero.aod_ss, aero.aod_so4, aero.aod_bc, aero.aod_oc = aod_out[0], aod_out[1], aod_out[2], aod_out[3]
@@ -329,17 +440,27 @@ def step_natural_aerosols_column(
             aero.q_so4, rho_d, dz_c, emis_so4, precip_rate, u_st, SO4_V_SETTLE, SO4_V_DRY, SO4_WET_SCAV, dt
         )
         aero.q_bc = _step_single_aerosol_column(
-            aero.q_bc, rho_d, dz_c, emis_bc, precip_rate, u_st, BC_V_SETTLE, BC_V_DRY, BC_WET_SCAV, dt
+            aero.q_bc, rho_d, dz_c, emis_bc, precip_rate, u_st, BC_V_SETTLE, BC_V_DRY, BC_WET_SCAV, dt,
+            plume_top_m=plume_top_m,
         )
         aero.q_oc = _step_single_aerosol_column(
-            aero.q_oc, rho_d, dz_c, emis_oc, precip_rate, u_st, BC_V_SETTLE, BC_V_DRY, OC_WET_SCAV, dt
+            aero.q_oc, rho_d, dz_c, emis_oc, precip_rate, u_st, BC_V_SETTLE, BC_V_DRY, OC_WET_SCAV, dt,
+            plume_top_m=plume_top_m,
+            fire_frac=fire_oc_frac,
         )
-        # Diagnose 550 nm column AOD [-]
+        # Diagnose 550 nm RH-dependent column AOD [-]
         mass_c = rho_d * dz_c
-        aero.aod_ss = MEE_SS_550 * (mass_c * aero.q_ss).sum(dim=0)
-        aero.aod_so4 = MEE_SO4_550 * (mass_c * aero.q_so4).sum(dim=0)
-        aero.aod_bc = MEE_BC_550 * (mass_c * aero.q_bc).sum(dim=0)
-        aero.aod_oc = MEE_OC_550 * (mass_c * aero.q_oc).sum(dim=0)
+        if rh_3d is not None:
+            f_ss, f_so4, _, f_oc = compute_hygroscopic_growth(rh_3d)
+            aero.aod_ss = MEE_SS_550 * (mass_c * aero.q_ss * f_ss).sum(dim=0)
+            aero.aod_so4 = MEE_SO4_550 * (mass_c * aero.q_so4 * f_so4).sum(dim=0)
+            aero.aod_bc = MEE_BC_550 * (mass_c * aero.q_bc).sum(dim=0)
+            aero.aod_oc = MEE_OC_550 * (mass_c * aero.q_oc * f_oc).sum(dim=0)
+        else:
+            aero.aod_ss = MEE_SS_550 * (mass_c * aero.q_ss).sum(dim=0)
+            aero.aod_so4 = MEE_SO4_550 * (mass_c * aero.q_so4).sum(dim=0)
+            aero.aod_bc = MEE_BC_550 * (mass_c * aero.q_bc).sum(dim=0)
+            aero.aod_oc = MEE_OC_550 * (mass_c * aero.q_oc).sum(dim=0)
 
     aero.emis_ss_kgm2s = emis_ss
     aero.emis_so4_kgm2s = emis_so4

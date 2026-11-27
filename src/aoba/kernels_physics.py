@@ -2352,14 +2352,19 @@ kernel void natural_aerosol_4sp_col(
     device const float* emis_4      [[buffer(3)]],  // [4, nc]
     device const float* precip      [[buffer(4)]],  // [nc]
     device const float* u_star_in   [[buffer(5)]],  // [nc]
-    device float* q_out             [[buffer(6)]],  // [4, nz, nc]
-    device float* aod_out           [[buffer(7)]],  // [4, nc]
-    constant ulong4& u_dim          [[buffer(8)]],  // [n_sp, nz, nc, dz_cols]
-    constant float4& v_settle_4     [[buffer(9)]],  // [v_ss, v_so4, v_bc, v_oc]
-    constant float4& v_dry_4        [[buffer(10)]], // [vd_ss, vd_so4, vd_bc, vd_oc]
-    constant float4& alpha_wet_4    [[buffer(11)]], // [aw_ss, aw_so4, aw_bc, aw_oc]
-    constant float4& mee_4          [[buffer(12)]], // [mee_ss, mee_so4, mee_bc, mee_oc]
-    constant float& dt              [[buffer(13)]],
+    device const float* plume_top_in [[buffer(6)]], // [nc] wildfire plume top [m]
+    device const float* fire_oc_f_in [[buffer(7)]], // [nc] wildfire fraction of OC emission [-]
+    device const float* rh_3d_in    [[buffer(8)]],  // [nz, nc] or [1] when has_rh == 0
+    device float* q_out             [[buffer(9)]],  // [4, nz, nc]
+    device float* aod_out           [[buffer(10)]], // [4, nc]
+    constant ulong4& u_dim          [[buffer(11)]], // [n_sp, nz, nc, dz_cols]
+    constant float4& v_settle_4     [[buffer(12)]], // [v_ss, v_so4, v_bc, v_oc]
+    constant float4& v_dry_4        [[buffer(13)]], // [vd_ss, vd_so4, vd_bc, vd_oc]
+    constant float4& alpha_wet_4    [[buffer(14)]], // [aw_ss, aw_so4, aw_bc, aw_oc]
+    constant float4& mee_4          [[buffer(15)]], // [mee_ss, mee_so4, mee_bc, mee_oc]
+    constant float4& hygro_gamma_4  [[buffer(16)]], // [g_ss, g_so4, g_bc, g_oc]
+    constant float4& hygro_max_4    [[buffer(17)]], // [m_ss, m_so4, m_bc, m_oc]
+    constant float4& f_ctrl         [[buffer(18)]], // [dt, has_rh, 0, 0]
     uint gid                        [[thread_position_in_grid]])
 {
     uint n_sp = uint(u_dim.x);
@@ -2376,11 +2381,33 @@ kernel void natural_aerosol_4sp_col(
     float vd = (s == 0u) ? v_dry_4.x    : ((s == 1u) ? v_dry_4.y    : ((s == 2u) ? v_dry_4.z    : v_dry_4.w));
     float aw = (s == 0u) ? alpha_wet_4.x: ((s == 1u) ? alpha_wet_4.y: ((s == 2u) ? alpha_wet_4.z: alpha_wet_4.w));
     float mee = (s == 0u)? mee_4.x      : ((s == 1u) ? mee_4.y      : ((s == 2u) ? mee_4.z      : mee_4.w));
+    float hg = (s == 0u) ? hygro_gamma_4.x : ((s == 1u) ? hygro_gamma_4.y : ((s == 2u) ? hygro_gamma_4.z : hygro_gamma_4.w));
+    float hm = (s == 0u) ? hygro_max_4.x   : ((s == 1u) ? hygro_max_4.y   : ((s == 2u) ? hygro_max_4.z   : hygro_max_4.w));
+    float dt = f_ctrl.x;
+    bool has_rh = (f_ctrl.y > 0.5f);
 
     float pr = max(precip[c], 0.0f);
     float wash = exp(-min(aw * pr * dt, 20.0f));
     float emis = max(emis_4[s * nc + c], 0.0f);
     float u_st = max(u_star_in[c], 0.05f);
+
+    // Wildfire buoyant smoke plume partitioning (BC: 100% fire; OC: fire_oc_frac; SS/SO4: 0%)
+    float f_loft = (s == 2u) ? 1.0f : ((s == 3u) ? clamp(fire_oc_f_in[c], 0.0f, 1.0f) : 0.0f);
+    float zp = (f_loft > 0.0f) ? max(plume_top_in[c], 0.0f) : 0.0f;
+    float emis_loft = (zp > 0.0f) ? (emis * f_loft) : 0.0f;
+    float emis_grd = emis - emis_loft;
+
+    float z_acc = 0.0f;
+    uint k_plume_top = 0u;
+    if (zp > 0.0f) {
+        for (uint k = 0u; k < nz; ++k) {
+            float dzk = dz_c[k * dz_cols + col_dz];
+            z_acc += dzk;
+            k_plume_top = k;
+            if (z_acc >= zp) break;
+        }
+    }
+    float z_cov = max(min(zp, z_acc), 1.0f);
 
     uint sp_base = s * nz * nc;
 
@@ -2391,6 +2418,7 @@ kernel void natural_aerosol_4sp_col(
     float dz_pbl[7];
     float rho_pbl[7];
     float z_rel[7];
+    float z_bot_up = 0.0f;
     for (uint k = 0u; k <= n_mix; ++k) {
         uint idx2 = k * nc + c;
         float rd = rho_d[idx2];
@@ -2398,10 +2426,19 @@ kernel void natural_aerosol_4sp_col(
         rho_pbl[k] = rd;
         dz_pbl[k] = dz;
         m_pbl[k] = max(rd * dz, 1.0e-5f);
-        q_pbl[k] = max(q_in[sp_base + idx2], 0.0f);
+        float qk = max(q_in[sp_base + idx2], 0.0f);
+        float z_top_up = z_bot_up + dz;
+        if (zp > 0.0f && emis_loft > 0.0f) {
+            float dz_ov = max(min(z_top_up, zp) - z_bot_up, 0.0f);
+            if (dz_ov > 0.0f) {
+                qk += (dt * emis_loft * (dz_ov / z_cov)) / m_pbl[k];
+            }
+        }
+        z_bot_up = z_top_up;
+        q_pbl[k] = qk;
         z_rel[k] = (k == 0u) ? (0.5f * dz) : (z_rel[k - 1u] + 0.5f * (dz_pbl[k - 1u] + dz));
     }
-    q_pbl[0] += (dt * emis) / m_pbl[0];
+    q_pbl[0] += (dt * emis_grd) / m_pbl[0];
     for (uint k = 0u; k < n_mix; ++k) {
         float z_int = 0.5f * (z_rel[k] + z_rel[k + 1u]);
         if (z_int < 1200.0f) {
@@ -2417,9 +2454,10 @@ kernel void natural_aerosol_4sp_col(
         }
     }
 
-    // 2. Top-down implicit gravitational settling + surface dry deposition + wet scavenging
+    // 2. Top-down implicit gravitational settling + surface dry deposition + wet scavenging + RH-aware AOD
     float flux_above = 0.0f;
     float col_mass = 0.0f;
+    float z_top_dn = z_acc;
 
     for (int ki = int(nz) - 1; ki >= 0; --ki) {
         uint k = uint(ki);
@@ -2430,13 +2468,28 @@ kernel void natural_aerosol_4sp_col(
         float mk_raw = rd * dz;
         float mk = max(mk_raw, 1.0e-5f);
         float q_cur = (k <= n_mix) ? q_pbl[k] : max(q_in[idx3], 0.0f);
+        if (zp > 0.0f && k <= k_plume_top) {
+            float z_bot_dn = z_top_dn - dz;
+            if (k > n_mix && emis_loft > 0.0f) {
+                float dz_ov = max(min(z_top_dn, zp) - z_bot_dn, 0.0f);
+                if (dz_ov > 0.0f) {
+                    q_cur += (dt * emis_loft * (dz_ov / z_cov)) / mk;
+                }
+            }
+            z_top_dn = z_bot_dn;
+        }
         float v_bot = (k == 0u) ? (vs + vd) : vs;
         float sink = dt * rd * v_bot;
         float q_k = (mk * q_cur + dt * flux_above) / (mk + sink);
         flux_above = rd * v_bot * q_k;
         float q_fin = clamp(q_k * wash, 0.0f, 1.0e-3f);
         q_out[idx3] = q_fin;
-        col_mass += mk_raw * q_fin;
+        float f_rh = 1.0f;
+        if (has_rh && hg > 0.0f) {
+            float om_rh = max(1.0f - clamp(rh_3d_in[idx2], 0.0f, 0.95f), 0.05f);
+            f_rh = clamp(pow(om_rh, -hg), 1.0f, hm);
+        }
+        col_mass += mk_raw * q_fin * f_rh;
     }
     aod_out[s * nc + c] = mee * col_mass;
 }
@@ -8746,11 +8799,20 @@ def run_natural_aerosol_4sp_metal(
     alpha_wet_4: tuple[float, float, float, float],
     mee_4: tuple[float, float, float, float],
     dt: float,
+    plume_top_m: torch.Tensor | None = None,
+    fire_oc_frac: torch.Tensor | None = None,
+    rh_3d: torch.Tensor | None = None,
+    hygro_gamma_4: tuple[float, float, float, float] = (0.52, 0.40, 0.0, 0.20),
+    hygro_max_4: tuple[float, float, float, float] = (4.5, 3.2, 1.0, 1.9),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     n_sp, nz, nc = q_in.shape
     dz_2d = dz_c.view(nz, -1).contiguous()
     q_out = torch.empty_like(q_in)
     aod_out = torch.empty((n_sp, nc), dtype=q_in.dtype, device=q_in.device)
+    plume_buf = plume_top_m.contiguous() if plume_top_m is not None else torch.zeros(nc, dtype=q_in.dtype, device=q_in.device)
+    foc_buf = fire_oc_frac.contiguous() if fire_oc_frac is not None else torch.zeros(nc, dtype=q_in.dtype, device=q_in.device)
+    has_rh = 1.0 if rh_3d is not None else 0.0
+    rh_buf = rh_3d.contiguous() if rh_3d is not None else torch.zeros(1, dtype=q_in.dtype, device=q_in.device)
     lib.natural_aerosol_4sp_col(
         q_in.contiguous(),
         rho_d.contiguous(),
@@ -8758,6 +8820,9 @@ def run_natural_aerosol_4sp_metal(
         emis_4.contiguous(),
         precip_rate.contiguous(),
         u_star_cell.contiguous(),
+        plume_buf,
+        foc_buf,
+        rh_buf,
         q_out,
         aod_out,
         [n_sp, nz, nc, dz_2d.shape[1]],
@@ -8765,7 +8830,9 @@ def run_natural_aerosol_4sp_metal(
         [float(x) for x in v_dry_4],
         [float(x) for x in alpha_wet_4],
         [float(x) for x in mee_4],
-        float(dt),
+        [float(x) for x in hygro_gamma_4],
+        [float(x) for x in hygro_max_4],
+        [float(dt), has_rh, 0.0, 0.0],
         threads=n_sp * nc,
     )
     return q_out, aod_out

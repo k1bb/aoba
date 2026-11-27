@@ -35,7 +35,12 @@ from aoba.biosphere import (
     update_daily_lai_root_height,
 )
 from aoba.crm import CRMState, SPTendencies, step_crm_physics_and_dynamics
-from aoba.dust import compute_dust_emission_sub, step_dust_column
+from aoba.dust import (
+    DUST_LEGACY_RESTART_FINE_FRAC,
+    compute_dust_emission_sub,
+    step_dust_column,
+    step_dust_two_mode_column,
+)
 from aoba.gravity_wave import compute_nonorographic_gwd
 from aoba.icesheet import (
     H_ICE_THRESHOLD_M,
@@ -80,7 +85,7 @@ from aoba.surface import (
     init_surface_state,
     step_surface,
 )
-from aoba.thermodynamics import diagnose_pressure_temperature
+from aoba.thermodynamics import diagnose_pressure_temperature, qsat_mixed
 from aoba.turbulence import TKE_MIN, step_mynn_level25
 from aoba.vertical_grid import VerticalGrid, build_vertical_grid
 
@@ -1424,7 +1429,9 @@ def step_aoba_model(
         if bool(cfg.enable_aerosol_rad_forcing) and bool(cfg.enable_natural_aerosols) and model.aerosols is not None:
             from aoba.aerosols import compute_aerosol_radiative_optics
 
-            aero_opt_cell = compute_aerosol_radiative_optics(model.aerosols, atmos.rho_d, atmos.dz_c)
+            pres_host_a, _, temp_host_a = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+            rh_host_a = torch.clamp(atmos.q_v / torch.clamp(qsat_mixed(temp_host_a, pres_host_a)[0], min=1.0e-7), 0.0, 0.95)
+            aero_opt_cell = compute_aerosol_radiative_optics(model.aerosols, atmos.rho_d, atmos.dz_c, rh_3d=rh_host_a)
         if bool(cfg.enable_volcanic_aerosols) and model.volcanic_solar is not None:
             from aoba.volcanic_solar import compute_volcanic_rad_optics_and_sad
 
@@ -2302,7 +2309,7 @@ def step_aoba_model(
         else:
             u10_w_in = u10_w_cell
             fice_w_in = fice_w_cell
-        step_ocean_waves(model.ocean_waves, u10_w_in, fice_w_in, active_w_sfc.surf_type == SURF_OCEAN, dt)
+        step_ocean_waves(model.ocean_waves, u10_w_in, fice_w_in, active_w_sfc.surf_type == SURF_OCEAN, dt, mesh=active_w_mesh)
         langmuir_ocn = model.ocean_waves.langmuir_fac
         # Apply wave-age sea-surface drag modulation onto open-ocean subcolumns
         drag_c = model.ocean_waves.drag_mod
@@ -2608,9 +2615,13 @@ def step_aoba_model(
     uh_mean = uh_acc * inv_nh
     om_mean = om_acc * inv_nh
     adv_list = [atmos.q_n, atmos.q_p, atmos.q_c, atmos.q_i]
-    has_dust_adv = bool(cfg.enable_dust and atmos.q_dust is not None)
+    has_dust_adv = bool(cfg.enable_dust and (atmos.q_dust is not None or atmos.q_dust_fine is not None))
     if has_dust_adv:
-        adv_list.append(atmos.q_dust)
+        if atmos.q_dust_fine is None or atmos.q_dust_coarse is None:
+            qd_base = torch.clamp(atmos.q_dust, min=0.0) if atmos.q_dust is not None else torch.zeros_like(atmos.q_n)
+            atmos.q_dust_fine = qd_base * DUST_LEGACY_RESTART_FINE_FRAC
+            atmos.q_dust_coarse = qd_base * (1.0 - DUST_LEGACY_RESTART_FINE_FRAC)
+        adv_list.extend([atmos.q_dust_fine, atmos.q_dust_coarse])
     has_aero_adv = bool(cfg.enable_natural_aerosols and model.aerosols is not None)
     if has_aero_adv:
         adv_list.extend([model.aerosols.q_ss, model.aerosols.q_so4, model.aerosols.q_bc, model.aerosols.q_oc])
@@ -2644,8 +2655,10 @@ def step_aoba_model(
     atmos.q_v = torch.clamp(atmos.q_n - atmos.q_c - atmos.q_i, min=0.0)
     idx_q = 4
     if has_dust_adv:
-        atmos.q_dust = q_adv[idx_q]
-        idx_q += 1
+        atmos.q_dust_fine = torch.clamp(q_adv[idx_q], min=0.0)
+        atmos.q_dust_coarse = torch.clamp(q_adv[idx_q + 1], min=0.0)
+        atmos.q_dust = atmos.q_dust_fine + atmos.q_dust_coarse
+        idx_q += 2
     if has_aero_adv:
         model.aerosols.q_ss = q_adv[idx_q]
         model.aerosols.q_so4 = q_adv[idx_q + 1]
@@ -3740,8 +3753,15 @@ def step_aoba_model(
             )
     f_dust_dep_cell = None
     if cfg.enable_dust:
-        if atmos.q_dust is None:
-            atmos.q_dust = torch.zeros_like(atmos.q_n)
+        if atmos.q_dust_fine is None or atmos.q_dust_coarse is None:
+            if atmos.q_dust is not None:
+                qd_base = torch.clamp(atmos.q_dust, min=0.0)
+                atmos.q_dust_fine = qd_base * DUST_LEGACY_RESTART_FINE_FRAC
+                atmos.q_dust_coarse = qd_base * (1.0 - DUST_LEGACY_RESTART_FINE_FRAC)
+            else:
+                atmos.q_dust_fine = torch.zeros_like(atmos.q_n)
+                atmos.q_dust_coarse = torch.zeros_like(atmos.q_n)
+                atmos.q_dust = torch.zeros_like(atmos.q_n)
         f_dust_sub = compute_dust_emission_sub(
             surf_type=sfc_sub.surf_type,
             lai=lai_exp_sub,
@@ -3759,9 +3779,10 @@ def step_aoba_model(
             f_dust_sub = f_dust_sub * torch.clamp(1.0 - _cell_to_sub(model.lakes.f_lake, nc, n_sub), 0.0, 1.0)
         f_dust_emit_c = _sub_to_cell(f_dust_sub, nc, n_sub)
         dm_dust_c = torch.clamp(atmos.rho_d * atmos.dz_c, min=0.0)
-        dust_col_pre = (dm_dust_c * torch.clamp(atmos.q_dust, min=0.0)).sum(dim=0)
-        atmos.q_dust = step_dust_column(
-            q_dust=atmos.q_dust,
+        dust_col_pre = (dm_dust_c * torch.clamp(atmos.q_dust_fine + atmos.q_dust_coarse, min=0.0)).sum(dim=0)
+        atmos.q_dust_fine, atmos.q_dust_coarse, atmos.q_dust = step_dust_two_mode_column(
+            q_dust_fine=atmos.q_dust_fine,
+            q_dust_coarse=atmos.q_dust_coarse,
             rho_d=atmos.rho_d,
             dz_c=atmos.dz_c,
             z_c=atmos.z_c,
@@ -3965,12 +3986,15 @@ def step_aoba_model(
             if int(model.land_carbon.fire_bc_kg_m2s.shape[0]) == m_sub:
                 fire_bc = _sub_to_cell(model.land_carbon.fire_bc_kg_m2s, nc, n_sub)
                 fire_oc = _sub_to_cell(model.land_carbon.fire_oc_kg_m2s, nc, n_sub)
+                fire_ib = _sub_to_cell(model.land_carbon.fire_intensity_kw_m, nc, n_sub)
             else:
                 fire_bc = model.land_carbon.fire_bc_kg_m2s
                 fire_oc = model.land_carbon.fire_oc_kg_m2s
+                fire_ib = model.land_carbon.fire_intensity_kw_m
         else:
             fire_bc = None
             fire_oc = None
+            fire_ib = None
         soa_oc_cell = None
         if bool(cfg.enable_bvoc_soa):
             from aoba.aerosols import compute_bvoc_soa_emission
@@ -3980,6 +4004,8 @@ def step_aoba_model(
                 + model.rad_cache.get("sw1_dif", torch.zeros_like(t_air))
             )
             soa_oc_cell = compute_bvoc_soa_emission(sfc.surf_type, sfc.bio.lai, sfc.t_canopy, sw_par_cell)
+        pres_host_na, _, temp_host_na = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        rh_host_na = torch.clamp(atmos.q_v / torch.clamp(qsat_mixed(temp_host_na, pres_host_na)[0], min=1.0e-7), 0.0, 0.95)
         step_natural_aerosols_column(
             aero=model.aerosols,
             rho_d=atmos.rho_d,
@@ -3995,6 +4021,8 @@ def step_aoba_model(
             fire_oc_kg_m2s=fire_oc,
             soa_oc_kg_m2s=soa_oc_cell,
             u_star_cell=_sub_to_cell(sfc_diag_sub.u_star, nc, n_sub),
+            fire_intensity_kw_m=fire_ib,
+            rh_3d=rh_host_na,
         )
     # 8b-2. SNICAR Snow/Sea-Ice BC + Dust Albedo Darkening (Flanner et al., 2007, 2009)
     if bool(cfg.enable_snow_bc_darkening):
@@ -4251,7 +4279,12 @@ def step_aoba_model(
 
         if model.water_isotopes is None:
             model.water_isotopes = init_water_isotope_state(atmos.q_v)
-        _, _, temp_host_iso = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        pres_host_iso, _, temp_host_iso = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        rh_sfc_iso = torch.clamp(
+            atmos.q_v[0] / torch.clamp(qsat_mixed(temp_host_iso[0], pres_host_iso[0])[0], min=1.0e-7),
+            0.15,
+            0.99,
+        )
         step_water_isotopes(
             iso=model.water_isotopes,
             q_v=atmos.q_v,
@@ -4264,6 +4297,9 @@ def step_aoba_model(
             rain_cell=rain_new,
             snow_cell=snow_new,
             dt=dt,
+            rh_sfc=rh_sfc_iso,
+            u10_cell=_sub_to_cell(torch.hypot(u_sub_0, v_sub_0), nc, n_sub),
+            lai_cell=sfc.bio.lai,
         )
     month_idx = model.calendar.date_at(model.sim_time_sec).month - 1
     clim.month_temp_sum_c[month_idx] += (t_air - C.T_FREEZE)

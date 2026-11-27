@@ -1778,9 +1778,18 @@ T_{\mathrm{ocn},j}^{n+1} &= T_{\mathrm{ocn},j}^n + \frac{\Delta E_{\mathrm{rem},
 \end{aligned} \tag{9.8}
 $$
 
-### 9.6 Prognostic Surface Waves, Stokes/Langmuir Mixing, Wave-Age Drag & Sea Spray (`src/aoba/ocean_waves.py`)
+### 9.6 Prognostic Surface Waves, Voronoi Swell Propagation, Stokes/Langmuir Mixing, Wave-Age Drag & Sea Spray (`src/aoba/ocean_waves.py`)
 
-When `enable_wave_coupling = true`, significant wave height $H_s$ and peak period $T_p$ relax via exact asymmetric exponential integration ($\tau_{\mathrm{grow}} = 6\ \mathrm{h}$, $\tau_{\mathrm{decay}} = 18\ \mathrm{h}$) toward Pierson–Moskowitz equilibrium $(H_{s,\mathrm{eq}}, T_{p,\mathrm{eq}})$. Surface Stokes drift $u_s$ and turbulent Langmuir number $\mathrm{La}_t$ determine KPP enhancement $E_L$ (McWilliams & Sullivan, 2000; Takaya et al., 2010) and wave-age drag multiplier $\chi_{\mathrm{drag}}$ (Janssen, 1991):
+When `enable_wave_coupling = true`, significant wave height $H_s$ and peak period $T_p$ first undergo conservative Voronoi horizontal propagation of wave energy $E_w = H_s^2$ and energy-weighted period $P_w = E_w T_p$ across open-ocean edges ($w_{\mathrm{open},e} = f_{\mathrm{open},c_0} f_{\mathrm{open},c_1}$, vanishing at coastlines and sea-ice boundaries) at deep-water group velocity $c_g = g T_p / (4\pi)$, with resolution-aware diffusivity $K_{\mathrm{swell},e}$ ($L_{\mathrm{sw}} = 6\times 10^5\ \mathrm{m}$) and a cell-wise CFL-bounded effective conductance $G_e^{\mathrm{eff}}$ ensuring positivity and energy conservation across all ocean resolutions:
+
+$$
+\begin{aligned}
+c_g &= \frac{g T_p}{4\pi}, \qquad K_{\mathrm{swell},e} = \frac{1}{2}\,c_{g,e}\,\max(d_{c,e},\ L_{\mathrm{sw}}), \\
+G_e &= w_{\mathrm{open},e}\,K_{\mathrm{swell},e}\,\frac{d_{v,e}}{d_{c,e}}, \qquad G_e^{\mathrm{eff}} = \frac{G_e}{1 + 2.2\max(S_{c_0},\ S_{c_1})}, \qquad S_i = \frac{\Delta t}{A_i}\sum_{e\ni i} G_e
+\end{aligned} \tag{9.9a}
+$$
+
+Following horizontal swell transport, $(H_s, T_p)$ relax via exact asymmetric exponential integration ($\tau_{\mathrm{grow}} = 6\ \mathrm{h}$, period-dependent swell decay $\tau_{\mathrm{decay}}(T_p) = 18\ \mathrm{h}\cdot\operatorname{clamp}((T_p/8)^{1.5}, 1, 4)$; Ardhuin et al., 2009) toward Pierson–Moskowitz equilibrium $(H_{s,\mathrm{eq}}, T_{p,\mathrm{eq}})$. Surface Stokes drift $u_s$ and turbulent Langmuir number $\mathrm{La}_t$ determine KPP enhancement $E_L$ (McWilliams & Sullivan, 2000; Takaya et al., 2010) and wave-age drag multiplier $\chi_{\mathrm{drag}}$ (Janssen, 1991):
 
 $$
 \begin{aligned}
@@ -1919,7 +1928,19 @@ F_{\mathrm{dust}} &= T_{\mathrm{emis}}\,f_m\,\alpha\,Q_s\sum M_{i,j}
 \end{aligned} \tag{10.3}
 $$
 
-In the atmospheric column, a fused GPU kernel integrates lowest-layer injection, pair-conservative implicit PBL mixing ($h_{\mathrm{PBL}} = 1200\ \mathrm{m}$), top-down implicit gravitational settling and dry deposition ($v_{\mathrm{settle}} = 4\times 10^{-3}$, $v_{\mathrm{dep}} = 6\times 10^{-3}\ \mathrm{m\ s^{-1}}$), and exact exponential wet scavenging $\exp(-0.50 P\Delta t)$.
+In the atmospheric column, total mobilized dust $F_{\mathrm{dust}}$ is partitioned using the CLM5 three-lognormal source distribution (Table 31.1) into two independently advected SCVT FCT size modes: a long-range fine mode $q_{\mathrm{dust,fine}}$ ($0.1\text{–}2.5\ \mathrm{\mu m}$, emission share $f_{\mathrm{fine}} = 0.208$) and a rapidly settling coarse mode $q_{\mathrm{dust,coarse}}$ ($2.5\text{–}10\ \mathrm{\mu m}$, emission share $f_{\mathrm{coarse}} = 0.792$), with total dust mass $q_{\mathrm{dust}} = q_{\mathrm{dust,fine}} + q_{\mathrm{dust,coarse}}$. Each mode is integrated by the fused column GPU kernel for lowest-layer injection, pair-conservative implicit PBL mixing ($h_{\mathrm{PBL}} = 1200\ \mathrm{m}$), top-down implicit gravitational settling and dry deposition, and exact exponential wet scavenging:
+
+$$
+\begin{aligned}
+F_{\mathrm{dust,fine}} &= f_{\mathrm{fine}}\,F_{\mathrm{dust}}, \qquad F_{\mathrm{dust,coarse}} = f_{\mathrm{coarse}}\,F_{\mathrm{dust}}, \\
+q_{\mathrm{dust}} &= q_{\mathrm{dust,fine}} + q_{\mathrm{dust,coarse}}, \qquad \mathrm{AOD}_{\mathrm{dust}} = \sum_k \rho_{d,k}\Delta z_k \left(1100\,q_{\mathrm{dust,fine},k} + 450\,q_{\mathrm{dust,coarse},k}\right)
+\end{aligned} \tag{10.3a}
+$$
+
+| Mode | Diameter Range | Emission Share | $v_{\mathrm{settle}}\ [\mathrm{m\ s^{-1}}]$ | $v_{\mathrm{dep}}\ [\mathrm{m\ s^{-1}}]$ | $\alpha_{\mathrm{wet}}\ [\mathrm{m^2\ kg^{-1}}]$ | $\mathrm{MEE}_{550}\ [\mathrm{m^2\ kg^{-1}}]$ |
+| :--- | :---: | ---: | ---: | ---: | ---: | ---: |
+| Fine ($q_{\mathrm{dust,fine}}$) | $0.1\text{–}2.5\ \mathrm{\mu m}$ | $0.208$ | $5.0\times 10^{-4}$ | $1.5\times 10^{-3}$ | $0.40$ | $1100$ |
+| Coarse ($q_{\mathrm{dust,coarse}}$) | $2.5\text{–}10.0\ \mathrm{\mu m}$ | $0.792$ | $8.0\times 10^{-3}$ | $1.2\times 10^{-2}$ | $0.65$ | $450$ |
 
 ### 10.4 Four Natural Aerosols: Sea Salt, DMS Sulfate, Wildfire BC/OC & BVOC SOA (`src/aoba/aerosols.py`)
 
@@ -1933,12 +1954,24 @@ F_{\mathrm{SOA}} &= \mathbb{I}_{\mathrm{land}}\cdot 3.2\times 10^{-11}\big(1 - e
 \end{aligned} \tag{10.4}
 $$
 
-| Species | $v_{\mathrm{settle}}\ [\mathrm{m\ s^{-1}}]$ | $v_{\mathrm{dry}}\ [\mathrm{m\ s^{-1}}]$ | $\alpha_{\mathrm{wet}}\ [\mathrm{m^2\ kg^{-1}}]$ | $\mathrm{MEE}_{550}\ [\mathrm{m^2\ kg^{-1}}]$ | $\omega_{\mathrm{SW}}$ | $g_{\mathrm{SW}}$ | $k_{\mathrm{abs,LW}}\ [\mathrm{m^2\ kg^{-1}}]$ |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Sea Salt (SS) | $4\times 10^{-3}$ | $5\times 10^{-3}$ | $0.80$ | $2500$ | $0.99$ | $0.76$ | $80$ |
-| Sulfate ($\mathrm{SO}_4$) | $4\times 10^{-4}$ | $1.5\times 10^{-3}$ | $0.60$ | $6000$ | $0.99$ | $0.70$ | $120$ |
-| Black Carbon (BC) | $2\times 10^{-4}$ | $1.0\times 10^{-3}$ | $0.30$ | $10000$ | $0.25$ | $0.35$ | $450$ |
-| Organic Carbon (OC/SOA) | $2\times 10^{-4}$ | $1.0\times 10^{-3}$ | $0.50$ | $4000$ | $0.92$ | $0.70$ | $180$ |
+| Species | $v_{\mathrm{settle}}\ [\mathrm{m\ s^{-1}}]$ | $v_{\mathrm{dry}}\ [\mathrm{m\ s^{-1}}]$ | $\alpha_{\mathrm{wet}}\ [\mathrm{m^2\ kg^{-1}}]$ | $\mathrm{MEE}_{550,\mathrm{dry}}\ [\mathrm{m^2\ kg^{-1}}]$ | $\gamma_{\mathrm{RH}}$ | $f_{\max}$ | $\omega_{\mathrm{SW,dry}}$ | $g_{\mathrm{SW,dry}}$ | $k_{\mathrm{abs,LW}}\ [\mathrm{m^2\ kg^{-1}}]$ |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Sea Salt (SS) | $4\times 10^{-3}$ | $5\times 10^{-3}$ | $0.80$ | $1500$ | $0.52$ | $4.5$ | $0.99$ | $0.76$ | $80$ |
+| Sulfate ($\mathrm{SO}_4$) | $4\times 10^{-4}$ | $1.5\times 10^{-3}$ | $0.60$ | $3800$ | $0.40$ | $3.2$ | $0.99$ | $0.70$ | $120$ |
+| Black Carbon (BC) | $2\times 10^{-4}$ | $1.0\times 10^{-3}$ | $0.30$ | $10000$ | $0.00$ | $1.0$ | $0.25$ | $0.35$ | $450$ |
+| Organic Carbon (OC/SOA) | $2\times 10^{-4}$ | $1.0\times 10^{-3}$ | $0.50$ | $3200$ | $0.20$ | $1.9$ | $0.92$ | $0.70$ | $180$ |
+
+Hygroscopic water uptake scales shortwave extinction for sea salt, sulfate, and organic carbon via $f_i(\mathrm{RH})$ (Chin et al., 2002; Tang & Munkelwitz, 1994), adding pure scattering ($g_w = 0.78$) while holding dry absorption constant:
+
+$$
+f_i(\mathrm{RH}) = \operatorname{clamp}\!\left(\big(1 - \operatorname{clamp}(\mathrm{RH},\ 0,\ 0.95)\big)^{-\gamma_i},\ 1.0,\ f_{\max,i}\right), \qquad \tau_{\mathrm{ext},i} = \rho_d\Delta z\,q_i\,\mathrm{MEE}_{550,\mathrm{dry},i}\,f_i(\mathrm{RH}) \tag{10.4a}
+$$
+
+Wildfire BC and OC emissions are lofted uniformly across $[0, z_{\mathrm{plume}}]$ according to Byram fireline intensity $I_B\ [\mathrm{kW\ m^{-1}}]$ (Freitas et al., 2007; Val Martin et al., 2012), while biogenic SOA enters the lowest layer:
+
+$$
+z_{\mathrm{plume}} = \begin{cases} 0, & I_B \le 10\ \mathrm{kW\ m^{-1}}, \\ \operatorname{clamp}\!\left(300 + 220\sqrt{I_B / 100},\ 300,\ 3500\right)\ \mathrm{m}, & I_B > 10\ \mathrm{kW\ m^{-1}} \end{cases} \tag{10.4b}
+$$
 
 Surface hygroscopic concentrations diagnose $N_{\mathrm{CCN}}$ for two-moment microphysics, and exact column mass-budget closure yields the BC surface deposition flux $D_{\mathrm{BC}}$ for SNICAR snow darkening.
 
@@ -2004,13 +2037,23 @@ R_{\mathrm{evap,ocn},x} &= \frac{\alpha_{\ell,\mathrm{sfc},x}^{-1} - h R_{0,x}}{
 \end{aligned} \tag{10.10}
 $$
 
-Ocean evaporation applies Craig & Gordon (1965) / Merlivat & Jouzel (1979) kinetic fractionation ($k_{18}=0.0060$, $k_{\mathrm{D}}=0.0053$), while terrestrial transpiration is non-fractionating (inheriting precipitation isotope ratios). Condensation depletion uses the exact analytic Rayleigh distillation update, and snowfall $\delta^{18}\mathrm{O}_{\mathrm{snow}}, \delta\mathrm{D}_{\mathrm{snow}}$ is accumulated mass-weighted for ice-core comparison:
+Ocean evaporation applies Craig & Gordon (1965) and Merlivat & Jouzel (1979) wind-speed-dependent kinetic fractionation switching from the smooth regime ($k_{18}=0.0060$ for $U_{10} < 7\ \mathrm{m\ s^{-1}}$) to the rough regime ($k_{18}=\operatorname{clamp}(0.000285\,U_{10}+0.00082, 0.0028, 0.012)$ for $U_{10} \ge 7\ \mathrm{m\ s^{-1}}$) with $k_{\mathrm{D}} = 0.88\,k_{18}$. Terrestrial evapotranspiration partitions into non-fractionating transpiration ($1 - f_{\mathrm{bare}}$) and Craig–Gordon fractionating bare-soil evaporation ($f_{\mathrm{bare}} = \exp(-0.5\,\mathrm{LAI})$, $k_{18,\mathrm{soil}} = 0.0120$). Condensation depletion uses the exact analytic Rayleigh distillation update, and snowfall $\delta^{18}\mathrm{O}_{\mathrm{snow}}, \delta\mathrm{D}_{\mathrm{snow}}$ is accumulated mass-weighted for ice-core comparison:
 
 $$
 \begin{aligned}
 f_{\mathrm{rem}} &= \exp\!\left(-\frac{(P_{\mathrm{rain}} + P_{\mathrm{snow}})\Delta t}{\mathrm{CWV}}\right), \\
 R_{k,x}^{n+1} &= R_{k,x}^n\,f_{\mathrm{rem}}^{\alpha_{\mathrm{eff},k,x} - 1}
 \end{aligned} \tag{10.11}
+$$
+
+Liquid rain falling through unsaturated sub-cloud air undergoes Stewart (1975) / Risi et al. (2008) partial re-evaporation ($f_{\mathrm{drop}} = 1 - f_{\mathrm{reevap}}$, $\kappa_x = (D/D')_x^{0.58}$, $P_{\mathrm{ref}} = 1.5\times 10^{-4}\ \mathrm{kg\ m^{-2}\ s^{-1}}$) and mass-conserving return of depleted vapor to the lowest layer, reproducing the tropical amount effect and sub-cloud deuterium-excess reduction:
+
+$$
+\begin{aligned}
+f_{\mathrm{reevap}} &= \frac{P_{\mathrm{rain}}}{P_{\mathrm{rain}} + P_{\mathrm{snow}}}\,\operatorname{clamp}\!\left(\frac{0.35(1 - h_{\mathrm{sub}})}{1 + P_{\mathrm{rain}}/P_{\mathrm{ref}}},\ 0,\ 0.45\right), \\
+\gamma_x &= \frac{\alpha_{\ell,0,x}\,h_{\mathrm{sub}}}{1 - \alpha_{\ell,0,x}\kappa_x(1 - h_{\mathrm{sub}})}, \qquad \beta_x = \frac{1 - \alpha_{\ell,0,x}\kappa_x(1 - h_{\mathrm{sub}})}{\alpha_{\ell,0,x}\kappa_x(1 - h_{\mathrm{sub}})}, \\
+R_{\mathrm{drop},x} &= \gamma_x R_{0,x} + (R_{\mathrm{cond},x} - \gamma_x R_{0,x})\,f_{\mathrm{drop}}^{\beta_x}
+\end{aligned} \tag{10.12}
 $$
 
 ---

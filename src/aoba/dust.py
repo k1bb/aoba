@@ -56,7 +56,10 @@ def _transported_mass_fraction(d_min: float = 0.1e-6, d_max: float = 10.0e-6) ->
     return tot
 
 
-DUST_TRANSPORTED_FRAC: float = _transported_mass_fraction()  # = 0.871
+DUST_TRANSPORTED_FRAC: float = _transported_mass_fraction(0.1e-6, 10.0e-6)  # = 0.871
+DUST_FINE_EMIS_FRAC: float = _transported_mass_fraction(0.1e-6, 2.5e-6) / DUST_TRANSPORTED_FRAC      # ~0.208 (0.1-2.5 um)
+DUST_COARSE_EMIS_FRAC: float = _transported_mass_fraction(2.5e-6, 10.0e-6) / DUST_TRANSPORTED_FRAC   # ~0.792 (2.5-10 um)
+DUST_LEGACY_RESTART_FINE_FRAC: float = 0.35   # Atmospheric burden fine-mode share for legacy 1-mode restarts
 
 
 def _dry_threshold_coefficient() -> float:
@@ -70,21 +73,30 @@ def _dry_threshold_coefficient() -> float:
     return math.sqrt(re_f * DUST_RHO_OSP * C.GRAVITY * DUST_D_OSP * icf)  # u*_t,dry = coef / sqrt(rho_atm) (~0.21 m/s)
 
 
-V_SETTLE_DUST: float = 4.0e-3       # Effective Stokes settling velocity (~1.5 um radius) [m s^-1]
-V_DEP_DUST: float = 6.0e-3          # Surface dry deposition velocity (>= v_settle, aerodynamic+settling) [m s^-1]
-ALPHA_WET_SCAV: float = 0.50        # Precipitation washout coefficient (Zender et al., 2003; Croft et al., 2010) [m^2 kg^-1]
+V_SETTLE_DUST: float = 4.0e-3        # Legacy single-mode settling velocity (~1.5 um radius) [m s^-1]
+V_DEP_DUST: float = 6.0e-3           # Legacy single-mode dry deposition velocity [m s^-1]
+ALPHA_WET_SCAV: float = 0.50         # Legacy single-mode wet scavenging coefficient [m^2 kg^-1]
+# 2-mode size-segregated removal speeds (Zender et al., 2003; Mahowald et al., 2006)
+V_SETTLE_DUST_FINE: float = 5.0e-4   # Fine mode (0.1-2.5 um): long-range intercontinental transport [m s^-1]
+V_DEP_DUST_FINE: float = 1.5e-3      # Fine mode surface dry deposition velocity [m s^-1]
+ALPHA_WET_SCAV_FINE: float = 0.40    # Fine mode precipitation washout [m^2 kg^-1]
+V_SETTLE_DUST_COARSE: float = 8.0e-3 # Coarse mode (2.5-10 um): rapid near-source settling [m s^-1]
+V_DEP_DUST_COARSE: float = 1.2e-2    # Coarse mode surface dry deposition velocity [m s^-1]
+ALPHA_WET_SCAV_COARSE: float = 0.65  # Coarse mode impaction washout [m^2 kg^-1]
 _DRY_THRESHOLD_COEF: float = _dry_threshold_coefficient()
 _DUST_ALPHA_SALT: float = 100.0 * math.exp((13.4 * min(DUST_CLAY_FRAC, 0.20) - 6.0) * math.log(10.0))
 
 # Broadband optical properties (Balkanski et al., 2007)
-DUST_K_EXT_SW1: float = 600.0       # VIS mass extinction efficiency [m^2 kg^-1]
-DUST_SSA_SW1: float = 0.92          # VIS single-scattering albedo [-]
-DUST_ASYM_SW1: float = 0.70         # VIS asymmetry factor [-]
-DUST_K_EXT_SW2: float = 400.0       # NIR mass extinction efficiency [m^2 kg^-1]
-DUST_SSA_SW2: float = 0.95          # NIR single-scattering albedo [-]
-DUST_ASYM_SW2: float = 0.65         # NIR asymmetry factor [-]
-DUST_K_ABS_LW1: float = 100.0       # LW1 mass absorption efficiency [m^2 kg^-1]
-DUST_K_ABS_LW2: float = 150.0       # LW2 window mass absorption efficiency [m^2 kg^-1]
+DUST_K_EXT_SW1: float = 600.0        # Bulk VIS mass extinction efficiency [m^2 kg^-1]
+DUST_K_EXT_SW1_FINE: float = 1100.0  # Fine-mode (0.1-2.5 um) VIS mass extinction efficiency [m^2 kg^-1]
+DUST_K_EXT_SW1_COARSE: float = 450.0 # Coarse-mode (2.5-10 um) VIS mass extinction efficiency [m^2 kg^-1]
+DUST_SSA_SW1: float = 0.92           # VIS single-scattering albedo [-]
+DUST_ASYM_SW1: float = 0.70          # VIS asymmetry factor [-]
+DUST_K_EXT_SW2: float = 400.0        # NIR mass extinction efficiency [m^2 kg^-1]
+DUST_SSA_SW2: float = 0.95           # NIR single-scattering albedo [-]
+DUST_ASYM_SW2: float = 0.65          # NIR asymmetry factor [-]
+DUST_K_ABS_LW1: float = 100.0        # LW1 mass absorption efficiency [m^2 kg^-1]
+DUST_K_ABS_LW2: float = 150.0        # LW2 window mass absorption efficiency [m^2 kg^-1]
 
 
 def compute_dust_emission_sub(
@@ -157,8 +169,12 @@ def step_dust_column(
     precip_rate: torch.Tensor,
     u_star_cell: torch.Tensor,
     dt: float,
+    *,
+    v_settle: float = V_SETTLE_DUST,
+    v_dep: float = V_DEP_DUST,
+    alpha_scav: float = ALPHA_WET_SCAV,
 ) -> torch.Tensor:
-    """Advance 3D host dust mixing ratio `[Nz, N_cells]` via emission, PBL mixing, settling & washout."""
+    """Advance one 3D mineral dust mode `[Nz, N_cells]` via emission, PBL mixing, settling & washout."""
     if can_use_crm_metal(q_dust) and q_dust.ndim == 2:
         return dispatch_dust_column_metal(
             q_dust=q_dust,
@@ -169,9 +185,9 @@ def step_dust_column(
             precip_rate=precip_rate,
             u_star_cell=u_star_cell,
             dt=dt,
-            v_dep=V_DEP_DUST,
-            v_settle=V_SETTLE_DUST,
-            alpha_scav=ALPHA_WET_SCAV,
+            v_dep=v_dep,
+            v_settle=v_settle,
+            alpha_scav=alpha_scav,
         )
     nz = q_dust.shape[0]
     m_k = torch.clamp(rho_d * dz_c, min=1.0e-3)
@@ -203,13 +219,55 @@ def step_dust_column(
     q_out = torch.empty_like(q_cur)
     flux_above = torch.zeros_like(q_cur[0])
     for k in range(nz - 1, -1, -1):
-        v_fall = V_DEP_DUST if k == 0 else V_SETTLE_DUST
+        v_fall = v_dep if k == 0 else v_settle
         sink = dt * rho_d[k] * v_fall
         q_k = (m_k[k] * q_cur[k] + dt * flux_above) / (m_k[k] + sink)
         q_out[k] = q_k
         flux_above = rho_d[k] * v_fall * q_k
 
     # 4. Precipitation wet scavenging (washout)
-    wash = torch.exp(-ALPHA_WET_SCAV * torch.clamp(precip_rate, min=0.0) * dt)
+    wash = torch.exp(-alpha_scav * torch.clamp(precip_rate, min=0.0) * dt)
     q_out = q_out * wash.unsqueeze(0)
     return torch.clamp(q_out, min=0.0, max=1.0e-3)
+
+
+# AOBA Formulation Eq. (10.3a)
+def step_dust_two_mode_column(
+    q_dust_fine: torch.Tensor,
+    q_dust_coarse: torch.Tensor,
+    rho_d: torch.Tensor,
+    dz_c: torch.Tensor,
+    z_c: torch.Tensor,
+    f_dust_emit: torch.Tensor,
+    precip_rate: torch.Tensor,
+    u_star_cell: torch.Tensor,
+    dt: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Advance fine (`0.1-2.5 um`) and coarse (`2.5-10 um`) mineral dust modes and return `(q_fine, q_coarse, q_tot)`."""
+    q_fine_new = step_dust_column(
+        q_dust=q_dust_fine,
+        rho_d=rho_d,
+        dz_c=dz_c,
+        z_c=z_c,
+        f_dust_emit=f_dust_emit * DUST_FINE_EMIS_FRAC,
+        precip_rate=precip_rate,
+        u_star_cell=u_star_cell,
+        dt=dt,
+        v_settle=V_SETTLE_DUST_FINE,
+        v_dep=V_DEP_DUST_FINE,
+        alpha_scav=ALPHA_WET_SCAV_FINE,
+    )
+    q_coarse_new = step_dust_column(
+        q_dust=q_dust_coarse,
+        rho_d=rho_d,
+        dz_c=dz_c,
+        z_c=z_c,
+        f_dust_emit=f_dust_emit * DUST_COARSE_EMIS_FRAC,
+        precip_rate=precip_rate,
+        u_star_cell=u_star_cell,
+        dt=dt,
+        v_settle=V_SETTLE_DUST_COARSE,
+        v_dep=V_DEP_DUST_COARSE,
+        alpha_scav=ALPHA_WET_SCAV_COARSE,
+    )
+    return q_fine_new, q_coarse_new, torch.clamp(q_fine_new + q_coarse_new, min=0.0, max=1.0e-3)

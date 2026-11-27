@@ -29,15 +29,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import Any
 import torch
 
 from aoba import constants as C
 
 PI: float = math.pi
-RHO_AIR_REF: float = 1.225         # Reference surface air density [kg m^-3]
+RHO_AIR_REF: float = 1.225               # Reference surface air density [kg m^-3]
 TAU_WAVE_GROW_S: float = 6.0 * 3600.0    # Wind-sea growth relaxation time [s]
-TAU_WAVE_DECAY_S: float = 18.0 * 3600.0  # Swell decay relaxation time [s]
-U10_SPRAY_THRESH: float = 12.0     # Wind threshold for spume droplet generation [m s^-1]
+TAU_WAVE_DECAY_S: float = 18.0 * 3600.0  # Short-wave decay relaxation time [s]
+SWELL_MFP_M: float = 6.0e5               # Effective isotropic swell propagation length scale [m]
+U10_SPRAY_THRESH: float = 12.0           # Wind threshold for spume droplet generation [m s^-1]
 
 
 @dataclass
@@ -77,32 +79,85 @@ def step_ocean_waves(
     f_seaice: torch.Tensor,
     is_ocean: torch.Tensor,
     dt: float,
+    mesh: Any | None = None,
 ) -> None:
-    """Advance prognostic ocean wave state `(H_s, T_p)` & diagnose Stokes drift + Langmuir enhancement."""
+    """Advance prognostic ocean wave state `(H_s, T_p)` with Voronoi swell propagation, Stokes drift & Langmuir."""
     dtype = waves.hs_m.dtype
     ocn_f = is_ocean.to(dtype)
     open_f = torch.clamp(1.0 - torch.clamp(f_seaice, 0.0, 1.0), 0.0, 1.0) * ocn_f
     u10 = torch.clamp(u10_ocn, min=0.0, max=65.0) * open_f
 
-    # 1. Pierson-Moskowitz / JONSWAP fetch-limited equilibrium wave height & period
+    # 1. Conservative Voronoi horizontal swell energy (E_w = H_s^2) & period (P_w = E_w * T_p) propagation
+    # Deep-water group velocity c_g = g * T_p / (4*pi) radiates storm-track swell into calm equatorial basins
+    # while open-ocean edge masking enforces zero flux across coastlines and sea-ice boundaries.
+    if mesh is not None and int(mesh.n_edges) > 0:
+        c0 = mesh.cells_on_edge[:, 0]
+        c1 = mesh.cells_on_edge[:, 1]
+        e_w = torch.clamp(waves.hs_m, min=0.0, max=20.0) ** 2 * open_f
+        tp_cur = torch.clamp(waves.tp_s, min=2.5, max=22.0)
+        p_w = e_w * tp_cur
+
+        # Deep-water group velocity at Voronoi edges [m s^-1]
+        cg_cell = (C.GRAVITY * tp_cur) / (4.0 * PI)
+        cg_e = 0.5 * (cg_cell[c0] + cg_cell[c1])
+        w_open_e = open_f[c0] * open_f[c1]
+        dc_e = torch.clamp(mesh.dc_edge.to(dtype), min=1.0)
+        dv_e = mesh.dv_edge.to(dtype)
+        area_c = torch.clamp(mesh.area_cell.to(dtype), min=1.0)
+
+        # Resolution-aware effective swell diffusivity K_swell = 0.5 * c_g * max(dc_e, L_sw)
+        k_sw_e = 0.5 * cg_e * torch.clamp(dc_e, min=SWELL_MFP_M)
+        g_raw = w_open_e * k_sw_e * (dv_e / dc_e)  # [m^2 s^-1]
+
+        # Strict cell-wise CFL cap (sum_e dt*G_eff/A_i <= 0.45) guarantees positivity & exact energy conservation
+        # with zero Python loops and zero CPU-GPU syncs across all ocean glevels (G1..G8).
+        s_cell = torch.zeros_like(e_w)
+        dt_f = float(dt)
+        s_cell.scatter_add_(0, c0, dt_f * g_raw / area_c[c0])
+        s_cell.scatter_add_(0, c1, dt_f * g_raw / area_c[c1])
+        s_edge_max = torch.maximum(s_cell[c0], s_cell[c1])
+        g_eff = g_raw / (1.0 + 2.2 * s_edge_max)
+
+        flux_e = dt_f * g_eff * (e_w[c0] - e_w[c1])
+        flux_p = dt_f * g_eff * (p_w[c0] - p_w[c1])
+
+        de_c = torch.zeros_like(e_w)
+        dp_c = torch.zeros_like(p_w)
+        de_c.scatter_add_(0, c0, -flux_e / area_c[c0])
+        de_c.scatter_add_(0, c1, flux_e / area_c[c1])
+        dp_c.scatter_add_(0, c0, -flux_p / area_c[c0])
+        dp_c.scatter_add_(0, c1, flux_p / area_c[c1])
+
+        e_new = torch.clamp(e_w + de_c, min=0.0, max=400.0) * open_f
+        p_new = torch.clamp(p_w + dp_c, min=0.0) * open_f
+        waves.hs_m = torch.sqrt(e_new)
+        waves.tp_s = torch.where(
+            e_new > 1.0e-4,
+            torch.clamp(p_new / torch.clamp(e_new, min=1.0e-4), min=2.5, max=22.0),
+            tp_cur,
+        )
+
+    # 2. Pierson-Moskowitz / JONSWAP fetch-limited equilibrium wave height & period
     # Cap equilibrium H_s at 18 m and T_p at 20 s for extreme hurricane winds
     hs_eq = torch.clamp(0.0246 * u10 * u10, min=0.0, max=18.0) * open_f
     tp_eq = torch.clamp(0.81 * u10, min=2.5, max=20.0) * open_f + 2.5 * (1.0 - open_f)
 
-    # Asymmetric exact exponential relaxation: faster wind-sea growth (6 h) than swell decay (18 h)
+    # Asymmetric exact exponential relaxation: faster wind-sea growth (6 h) than period-dependent swell decay
+    # Long-period ocean swell (T_p > 10 s) dissipates much more slowly (up to 72 h; Ardhuin et al., 2009).
     r_grow = -math.expm1(-float(dt) / TAU_WAVE_GROW_S)
-    r_dec = -math.expm1(-float(dt) / TAU_WAVE_DECAY_S)
-    r_hs = torch.where(hs_eq >= waves.hs_m, torch.full_like(hs_eq, r_grow), torch.full_like(hs_eq, r_dec))
-    r_tp = torch.where(tp_eq >= waves.tp_s, torch.full_like(tp_eq, r_grow), torch.full_like(tp_eq, r_dec))
+    tau_dec_cell = TAU_WAVE_DECAY_S * torch.clamp((waves.tp_s / 8.0) ** 1.5, min=1.0, max=4.0)
+    r_dec = -torch.expm1(-float(dt) / tau_dec_cell)
+    r_hs = torch.where(hs_eq >= waves.hs_m, torch.full_like(hs_eq, r_grow), r_dec)
+    r_tp = torch.where(tp_eq >= waves.tp_s, torch.full_like(tp_eq, r_grow), r_dec)
 
     waves.hs_m = torch.clamp(waves.hs_m + (hs_eq - waves.hs_m) * r_hs, min=0.0, max=20.0) * open_f
     waves.tp_s = torch.clamp(waves.tp_s + (tp_eq - waves.tp_s) * r_tp, min=2.5, max=22.0)
 
-    # 2. Deep-water surface Stokes drift: u_s = (pi^3 * H_s^2) / (g * T_p^3) [m s^-1]
+    # 3. Deep-water surface Stokes drift: u_s = (pi^3 * H_s^2) / (g * T_p^3) [m s^-1]
     u_s = torch.clamp((PI ** 3) * (waves.hs_m ** 2) / (C.GRAVITY * (waves.tp_s ** 3)), min=0.0, max=1.2) * open_f
     waves.u_stokes_ms = u_s
 
-    # 3. Ocean-side friction velocity u_*w & turbulent Langmuir number La_t = sqrt(u_*w / u_s)
+    # 4. Ocean-side friction velocity u_*w & turbulent Langmuir number La_t = sqrt(u_*w / u_s)
     # Approximate C_d ~ 1.3e-3 -> u_*a = sqrt(C_d)*U10, u_*w = sqrt(rho_a/rho_w) * u_*a
     u_star_a = torch.sqrt(torch.tensor(1.3e-3, device=u10.device, dtype=dtype)) * torch.clamp(u10, min=0.5)
     u_star_w = u_star_a * math.sqrt(RHO_AIR_REF / C.RHO_SEAWATER)
@@ -111,7 +166,7 @@ def step_ocean_waves(
     e_lang = torch.sqrt(1.0 + 0.08 / (la_t ** 4) + 0.04 / (la_t ** 2))
     waves.langmuir_fac = torch.where(open_f > 0.1, torch.clamp(e_lang, min=1.0, max=2.2), torch.ones_like(e_lang))
 
-    # 4. Wave-age-dependent drag multiplier (young wind seas c_p / u_*a < 25 -> steeper -> higher drag)
+    # 5. Wave-age-dependent drag multiplier (Janssen, 1991: young wind seas c_p / u_*a < 25 -> higher drag)
     c_p = (C.GRAVITY * waves.tp_s) / (2.0 * PI)
     wave_age = torch.clamp(c_p / torch.clamp(u_star_a, min=0.05), min=5.0, max=60.0)
     drag_m = torch.clamp((25.0 / wave_age) ** 0.25, min=0.85, max=1.35)

@@ -66,7 +66,9 @@ class GlobalAtmosState:
     z_w: torch.Tensor        # Physical interface heights [Nz+1, N_cells] [m]
     z_c: torch.Tensor        # Physical layer-center heights [Nz, N_cells] [m]
     dz_c: torch.Tensor       # Physical layer thicknesses [Nz, N_cells] [m]
-    q_dust: torch.Tensor | None = None  # Prognostic mineral dust mixing ratio [Nz, N_cells] [kg kg^-1]
+    q_dust: torch.Tensor | None = None         # Total mineral dust (fine + coarse) [Nz, N_cells] [kg kg^-1]
+    q_dust_fine: torch.Tensor | None = None    # Fine mineral dust (0.1-2.5 um) [Nz, N_cells] [kg kg^-1]
+    q_dust_coarse: torch.Tensor | None = None  # Coarse mineral dust (2.5-10 um) [Nz, N_cells] [kg kg^-1]
 
 
 # ---------------------------------------------------------------------------

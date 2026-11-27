@@ -1778,9 +1778,18 @@ T_{\mathrm{ocn},j}^{n+1} &= T_{\mathrm{ocn},j}^n + \frac{\Delta E_{\mathrm{rem},
 \end{aligned} \tag{9.8}
 $$
 
-### 9.6 予報表面波浪・Stokes/Langmuir 混合・波齢抗力・海塩飛沫 (`src/aoba/ocean_waves.py`)
+### 9.6 予報表面波浪・Voronoi うねり伝播・Stokes/Langmuir 混合・波齢抗力・海塩飛沫 (`src/aoba/ocean_waves.py`)
 
-`enable_wave_coupling = true` 時、Pierson–Moskowitz 平衡有義波高 $H_{s,\mathrm{eq}}$ およびピーク周期 $T_{p,\mathrm{eq}}$ へ発達時定数 $\tau_{\mathrm{grow}} = 6\ \mathrm{h}$・減衰時定数 $\tau_{\mathrm{decay}} = 18\ \mathrm{h}$ の非対称厳密指数緩和で $(H_s, T_p)$ を予報する。深水表層 Stokes ドリフト $u_s$ と乱流ラングミュア数 $\mathrm{La}_t$ から KPP 混合強化係数 $E_L$（McWilliams & Sullivan, 2000; Takaya et al., 2010）および波齢依存海面抗力倍率 $\chi_{\mathrm{drag}}$（Janssen, 1991）を算出する：
+`enable_wave_coupling = true` 時、有義波高 $H_s$ とピーク周期 $T_p$ はまず深水群速度 $c_g = g T_p / (4\pi)$ に従う開水域エッジ（$w_{\mathrm{open},e} = f_{\mathrm{open},c_0} f_{\mathrm{open},c_1}$、海岸線および海氷縁でゼロ）上の保存型 Voronoi 水平伝播により波浪エネルギー $E_w = H_s^2$ とエネルギー加重周期 $P_w = E_w T_p$ を輸送する。解像度対応拡散係数 $K_{\mathrm{swell},e}$（$L_{\mathrm{sw}} = 6\times 10^5\ \mathrm{m}$）およびセル CFL 制限付き有効コンダクタンス $G_e^{\mathrm{eff}}$ により、全海洋解像度で非負性とエネルギー保存を厳密に満たす：
+
+$$
+\begin{aligned}
+c_g &= \frac{g T_p}{4\pi}, \qquad K_{\mathrm{swell},e} = \frac{1}{2}\,c_{g,e}\,\max(d_{c,e},\ L_{\mathrm{sw}}), \\
+G_e &= w_{\mathrm{open},e}\,K_{\mathrm{swell},e}\,\frac{d_{v,e}}{d_{c,e}}, \qquad G_e^{\mathrm{eff}} = \frac{G_e}{1 + 2.2\max(S_{c_0},\ S_{c_1})}, \qquad S_i = \frac{\Delta t}{A_i}\sum_{e\ni i} G_e
+\end{aligned} \tag{9.9a}
+$$
+
+続いて Pierson–Moskowitz 平衡有義波高 $H_{s,\mathrm{eq}}$ およびピーク周期 $T_{p,\mathrm{eq}}$ へ発達時定数 $\tau_{\mathrm{grow}} = 6\ \mathrm{h}$・周期依存うねり減衰時定数 $\tau_{\mathrm{decay}}(T_p) = 18\ \mathrm{h}\cdot\operatorname{clamp}((T_p/8)^{1.5}, 1, 4)$（Ardhuin et al., 2009）の非対称厳密指数緩和で $(H_s, T_p)$ を更新する。深水表層 Stokes ドリフト $u_s$ と乱流ラングミュア数 $\mathrm{La}_t$ から KPP 混合強化係数 $E_L$（McWilliams & Sullivan, 2000; Takaya et al., 2010）および波齢依存海面抗力倍率 $\chi_{\mathrm{drag}}$（Janssen, 1991）を算出する：
 
 $$
 \begin{aligned}
@@ -1919,7 +1928,19 @@ F_{\mathrm{dust}} &= T_{\mathrm{emis}}\,f_m\,\alpha\,Q_s\sum M_{i,j}
 \end{aligned} \tag{10.3}
 $$
 
-大気柱内では最下層注入・対保存陰的 PBL 混合（$h_{\mathrm{PBL}} = 1200\ \mathrm{m}$）・トップダウン陰的重力沈降および乾性沈着（$v_{\mathrm{settle}} = 4\times 10^{-3}, v_{\mathrm{dep}} = 6\times 10^{-3}\ \mathrm{m\ s^{-1}}$）・指数湿性洗浄 $\exp(-0.50 P\Delta t)$ を融合 GPU カーネルで積分する。
+大気柱内では、CLM5 3 対数正規発生源分布（Table 31.1）に基づき全放出量 $F_{\mathrm{dust}}$ を独立に SCVT FCT 移流される 2 粒径モード、すなわち長距離輸送を担う微細モード $q_{\mathrm{dust,fine}}$（$0.1\text{–}2.5\ \mathrm{\mu m}$、放出比 $f_{\mathrm{fine}} = 0.208$）と発生源近傍で速やかに沈降する粗大モード $q_{\mathrm{dust,coarse}}$（$2.5\text{–}10\ \mathrm{\mu m}$、放出比 $f_{\mathrm{coarse}} = 0.792$）へ分離し、全ダスト質量比 $q_{\mathrm{dust}} = q_{\mathrm{dust,fine}} + q_{\mathrm{dust,coarse}}$ を保持する。各モードに対し最下層注入・対保存陰的 PBL 混合（$h_{\mathrm{PBL}} = 1200\ \mathrm{m}$）・トップダウン陰的重力沈降および乾性沈着・厳密指数湿性洗浄を融合 GPU カーネルで積分する：
+
+$$
+\begin{aligned}
+F_{\mathrm{dust,fine}} &= f_{\mathrm{fine}}\,F_{\mathrm{dust}}, \qquad F_{\mathrm{dust,coarse}} = f_{\mathrm{coarse}}\,F_{\mathrm{dust}}, \\
+q_{\mathrm{dust}} &= q_{\mathrm{dust,fine}} + q_{\mathrm{dust,coarse}}, \qquad \mathrm{AOD}_{\mathrm{dust}} = \sum_k \rho_{d,k}\Delta z_k \left(1100\,q_{\mathrm{dust,fine},k} + 450\,q_{\mathrm{dust,coarse},k}\right)
+\end{aligned} \tag{10.3a}
+$$
+
+| モード | 粒径範囲 | 放出比 | $v_{\mathrm{settle}}\ [\mathrm{m\ s^{-1}}]$ | $v_{\mathrm{dep}}\ [\mathrm{m\ s^{-1}}]$ | $\alpha_{\mathrm{wet}}\ [\mathrm{m^2\ kg^{-1}}]$ | $\mathrm{MEE}_{550}\ [\mathrm{m^2\ kg^{-1}}]$ |
+| :--- | :---: | ---: | ---: | ---: | ---: | ---: |
+| 微細モード ($q_{\mathrm{dust,fine}}$) | $0.1\text{–}2.5\ \mathrm{\mu m}$ | $0.208$ | $5.0\times 10^{-4}$ | $1.5\times 10^{-3}$ | $0.40$ | $1100$ |
+| 粗大モード ($q_{\mathrm{dust,coarse}}$) | $2.5\text{–}10.0\ \mathrm{\mu m}$ | $0.792$ | $8.0\times 10^{-3}$ | $1.2\times 10^{-2}$ | $0.65$ | $450$ |
 
 ### 10.4 自然起源 4 種エアロゾル（海塩・DMS 硫酸塩・山火事 BC/OC・BVOC SOA、`src/aoba/aerosols.py`）
 
@@ -1933,12 +1954,24 @@ F_{\mathrm{SOA}} &= \mathbb{I}_{\mathrm{land}}\cdot 3.2\times 10^{-11}\big(1 - e
 \end{aligned} \tag{10.4}
 $$
 
-| 種別 | $v_{\mathrm{settle}}\ [\mathrm{m\ s^{-1}}]$ | $v_{\mathrm{dry}}\ [\mathrm{m\ s^{-1}}]$ | $\alpha_{\mathrm{wet}}\ [\mathrm{m^2\ kg^{-1}}]$ | $\mathrm{MEE}_{550}\ [\mathrm{m^2\ kg^{-1}}]$ | $\omega_{\mathrm{SW}}$ | $g_{\mathrm{SW}}$ | $k_{\mathrm{abs,LW}}\ [\mathrm{m^2\ kg^{-1}}]$ |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 海塩 (SS) | $4\times 10^{-3}$ | $5\times 10^{-3}$ | $0.80$ | $2500$ | $0.99$ | $0.76$ | $80$ |
-| 硫酸塩 ($\mathrm{SO}_4$) | $4\times 10^{-4}$ | $1.5\times 10^{-3}$ | $0.60$ | $6000$ | $0.99$ | $0.70$ | $120$ |
-| 黒色炭素 (BC) | $2\times 10^{-4}$ | $1.0\times 10^{-3}$ | $0.30$ | $10000$ | $0.25$ | $0.35$ | $450$ |
-| 有機炭素 (OC/SOA) | $2\times 10^{-4}$ | $1.0\times 10^{-3}$ | $0.50$ | $4000$ | $0.92$ | $0.70$ | $180$ |
+| 種別 | $v_{\mathrm{settle}}\ [\mathrm{m\ s^{-1}}]$ | $v_{\mathrm{dry}}\ [\mathrm{m\ s^{-1}}]$ | $\alpha_{\mathrm{wet}}\ [\mathrm{m^2\ kg^{-1}}]$ | $\mathrm{MEE}_{550,\mathrm{dry}}\ [\mathrm{m^2\ kg^{-1}}]$ | $\gamma_{\mathrm{RH}}$ | $f_{\max}$ | $\omega_{\mathrm{SW,dry}}$ | $g_{\mathrm{SW,dry}}$ | $k_{\mathrm{abs,LW}}\ [\mathrm{m^2\ kg^{-1}}]$ |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 海塩 (SS) | $4\times 10^{-3}$ | $5\times 10^{-3}$ | $0.80$ | $1500$ | $0.52$ | $4.5$ | $0.99$ | $0.76$ | $80$ |
+| 硫酸塩 ($\mathrm{SO}_4$) | $4\times 10^{-4}$ | $1.5\times 10^{-3}$ | $0.60$ | $3800$ | $0.40$ | $3.2$ | $0.99$ | $0.70$ | $120$ |
+| 黒色炭素 (BC) | $2\times 10^{-4}$ | $1.0\times 10^{-3}$ | $0.30$ | $10000$ | $0.00$ | $1.0$ | $0.25$ | $0.35$ | $450$ |
+| 有機炭素 (OC/SOA) | $2\times 10^{-4}$ | $1.0\times 10^{-3}$ | $0.50$ | $3200$ | $0.20$ | $1.9$ | $0.92$ | $0.70$ | $180$ |
+
+海塩・硫酸塩・有機炭素の短波消散光学厚には吸湿成長係数 $f_i(\mathrm{RH})$（Chin et al., 2002; Tang & Munkelwitz, 1994）を乗じ、乾燥吸収を保ったまま純散乱（$g_w = 0.78$）のみを増大させる：
+
+$$
+f_i(\mathrm{RH}) = \operatorname{clamp}\!\left(\big(1 - \operatorname{clamp}(\mathrm{RH},\ 0,\ 0.95)\big)^{-\gamma_i},\ 1.0,\ f_{\max,i}\right), \qquad \tau_{\mathrm{ext},i} = \rho_d\Delta z\,q_i\,\mathrm{MEE}_{550,\mathrm{dry},i}\,f_i(\mathrm{RH}) \tag{10.4a}
+$$
+
+山火事起源の BC および OC は Byram 火災線強度 $I_B\ [\mathrm{kW\ m^{-1}}]$ に応じた浮力煙プルーム高度 $[0, z_{\mathrm{plume}}]$ へ一様に鉛直注入し（Freitas et al., 2007; Val Martin et al., 2012）、生物起源 SOA は最下層へ注入する：
+
+$$
+z_{\mathrm{plume}} = \begin{cases} 0, & I_B \le 10\ \mathrm{kW\ m^{-1}}, \\ \operatorname{clamp}\!\left(300 + 220\sqrt{I_B / 100},\ 300,\ 3500\right)\ \mathrm{m}, & I_B > 10\ \mathrm{kW\ m^{-1}} \end{cases} \tag{10.4b}
+$$
 
 最下層濃度から吸湿性 CCN 診断値 $N_{\mathrm{CCN}}$ を、柱質量収支から厳密保存 BC 沈着フラックス $D_{\mathrm{BC}}$（SNICAR 積雪暗化入力）を算出する。
 
@@ -2004,13 +2037,23 @@ R_{\mathrm{evap,ocn},x} &= \frac{\alpha_{\ell,\mathrm{sfc},x}^{-1} - h R_{0,x}}{
 \end{aligned} \tag{10.10}
 $$
 
-海面蒸発には Craig & Gordon (1965) / Merlivat & Jouzel (1979) 動的分別（$k_{18}=0.0060, k_{\mathrm{D}}=0.0053$）を、陸面蒸散には非分別（降水同位体比引継）を適用する。凝結除去による同位体枯渇は厳密 Rayleigh 蒸留解析解で更新し、降雪 $\delta^{18}\mathrm{O}_{\mathrm{snow}}, \delta\mathrm{D}_{\mathrm{snow}}$ を氷床コア比較用診断場へ質量加重積算する：
+海面蒸発には Craig & Gordon (1965) および Merlivat & Jouzel (1979) の風速依存動的分別（滑面域 $U_{10} < 7\ \mathrm{m\ s^{-1}}$ で $k_{18}=0.0060$、粗面域 $U_{10} \ge 7\ \mathrm{m\ s^{-1}}$ で $k_{18}=\operatorname{clamp}(0.000285\,U_{10}+0.00082, 0.0028, 0.012)$、$k_{\mathrm{D}} = 0.88\,k_{18}$）を適用し、陸面蒸発散は非分別蒸散（$1 - f_{\mathrm{bare}}$）と Craig–Gordon 分別を伴う裸地土壌蒸発（$f_{\mathrm{bare}} = \exp(-0.5\,\mathrm{LAI})$, $k_{18,\mathrm{soil}} = 0.0120$）に分離する。凝結除去による同位体枯渇は厳密 Rayleigh 蒸留解析解で更新し、降雪 $\delta^{18}\mathrm{O}_{\mathrm{snow}}, \delta\mathrm{D}_{\mathrm{snow}}$ を氷床コア比較用診断場へ質量加重積算する：
 
 $$
 \begin{aligned}
 f_{\mathrm{rem}} &= \exp\!\left(-\frac{(P_{\mathrm{rain}} + P_{\mathrm{snow}})\Delta t}{\mathrm{CWV}}\right), \\
 R_{k,x}^{n+1} &= R_{k,x}^n\,f_{\mathrm{rem}}^{\alpha_{\mathrm{eff},k,x} - 1}
 \end{aligned} \tag{10.11}
+$$
+
+未飽和な雲底下大気中を落下する液相雨滴には Stewart (1975) / Risi et al. (2008) の部分再蒸発・拡散交換（$f_{\mathrm{drop}} = 1 - f_{\mathrm{reevap}}$, $\kappa_x = (D/D')_x^{0.58}$, $P_{\mathrm{ref}} = 1.5\times 10^{-4}\ \mathrm{kg\ m^{-2}\ s^{-1}}$）と最下層水蒸気への質量保存還元を適用し、熱帯雨量効果および乾燥域での降水重水素過剰低下を再現する：
+
+$$
+\begin{aligned}
+f_{\mathrm{reevap}} &= \frac{P_{\mathrm{rain}}}{P_{\mathrm{rain}} + P_{\mathrm{snow}}}\,\operatorname{clamp}\!\left(\frac{0.35(1 - h_{\mathrm{sub}})}{1 + P_{\mathrm{rain}}/P_{\mathrm{ref}}},\ 0,\ 0.45\right), \\
+\gamma_x &= \frac{\alpha_{\ell,0,x}\,h_{\mathrm{sub}}}{1 - \alpha_{\ell,0,x}\kappa_x(1 - h_{\mathrm{sub}})}, \qquad \beta_x = \frac{1 - \alpha_{\ell,0,x}\kappa_x(1 - h_{\mathrm{sub}})}{\alpha_{\ell,0,x}\kappa_x(1 - h_{\mathrm{sub}})}, \\
+R_{\mathrm{drop},x} &= \gamma_x R_{0,x} + (R_{\mathrm{cond},x} - \gamma_x R_{0,x})\,f_{\mathrm{drop}}^{\beta_x}
+\end{aligned} \tag{10.12}
 $$
 
 ---
