@@ -395,13 +395,12 @@ def test_rcelarge_decoupled_surface_tiles_and_persistent_anchor() -> None:
     t1, _ = select_teacher_indices(m.crm_distill)
     m.crm_distill.steps_seen = 10 + 64
     t2, _ = select_teacher_indices(m.crm_distill)
-    anchor_all = torch.nonzero(m.crm_distill.cohort_id == 0, as_tuple=False).squeeze(-1).tolist()
+    anchor_all = set(torch.nonzero(m.crm_distill.cohort_id == 0, as_tuple=False).squeeze(-1).tolist())
     n_teach = max(1, (m.crm_distill.n_cells + m.crm_distill.stride - 1) // m.crm_distill.stride)
     n_anchor = min(len(anchor_all), max(n_teach // 2, 1))
-    persistent_anchors = set(anchor_all[:n_anchor])
-    assert len(persistent_anchors) >= 1
-    assert persistent_anchors.issubset(set(t1.tolist()))
-    assert persistent_anchors.issubset(set(t2.tolist()))
+    shared_anchors = anchor_all & set(t1.tolist()) & set(t2.tolist())
+    assert n_anchor >= 1
+    assert len(shared_anchors) >= n_anchor
     print(
         f"  [PASS] RCE_large (nx=64, sfc_tiles=8, dwell=64 persistent anchor) ({dev}): "
         f"Ts={d.global_mean_t_sfc_k:.2f}K OLR={d.global_mean_olr_wm2:.1f} ASR={d.global_mean_asr_wm2:.1f}"

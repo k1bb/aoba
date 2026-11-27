@@ -492,18 +492,23 @@ def apply_exact_conservation_closure(
         torch.ones_like(f_ice_nn),
         (1.0 - om_liq) * f_ice_nn,
     )
-    q_cond = torch.maximum(qn_new * f_cond, torch.clamp(qn_new - qsat_env, min=0.0))
-    qc_pre_fall = torch.where(in_conv, q_cond * (1.0 - f_ice), qc0)
-    qi_pre_fall = torch.where(in_conv, q_cond * f_ice, qi0)
-    qv_new = torch.where(in_conv, torch.clamp(qn_new - qc_pre_fall - qi_pre_fall, min=0.0), qv0)
+    q_cond_nn = qn_new * f_cond
+    q_ovsat = torch.clamp(qn_new - qsat_env, min=0.0)
+    q_cond_tot = torch.maximum(q_cond_nn, q_ovsat)
+    qc_pre_fall = torch.where(in_conv, q_cond_tot * (1.0 - f_ice), qc0)
+    qi_pre_fall = torch.where(in_conv, q_cond_tot * f_ice, qi0)
+    qv_new = torch.where(in_conv, torch.clamp(qn_new - q_cond_tot, min=0.0), qv0)
 
-    # Physical autoconversion & ice-sedimentation fallout: excess condensate precipitates conservatively
-    # (Clausius-Clapeyron-scaled ice ceiling prevents cold 11-15 km tropopause layers from trapping >100% ice)
-    qc_fall = torch.where(in_conv, torch.clamp(qc_pre_fall - 5.0e-4, min=0.0), torch.zeros_like(qc_pre_fall))
+    # Physical autoconversion & ice-sedimentation fallout: excess supersaturated condensate above
+    # the NN-predicted suspended cloud (`q_cond_nn`, bounded by 5e-4 liquid / min(qsat, 1e-4) ice
+    # ceilings) precipitates conservatively instead of being trapped permanently as artificial ice.
+    qc_keep = torch.clamp(q_cond_nn * (1.0 - f_ice), max=5.0e-4)
     qi_cap = torch.clamp(qsat_env, max=1.0e-4)
-    qi_fall = torch.where(in_conv, torch.clamp(qi_pre_fall - qi_cap, min=0.0), torch.zeros_like(qi_pre_fall))
-    qc_new = qc_pre_fall - qc_fall
-    qi_new = qi_pre_fall - qi_fall
+    qi_keep = torch.minimum(q_cond_nn * f_ice, qi_cap)
+    qc_new = torch.where(in_conv, qc_keep, qc0)
+    qi_new = torch.where(in_conv, qi_keep, qi0)
+    qc_fall = torch.where(in_conv, torch.clamp(qc_pre_fall - qc_new, min=0.0), torch.zeros_like(qc_pre_fall))
+    qi_fall = torch.where(in_conv, torch.clamp(qi_pre_fall - qi_new, min=0.0), torch.zeros_like(qi_pre_fall))
     qn_new = torch.where(in_conv, qv_new + qc_new + qi_new, qn0)
     p_fall_mass = (dm * (qc_fall + qi_fall)).sum(dim=0)
     p_tot_orig = p_tot_mass
@@ -1385,7 +1390,15 @@ def _get_cohort_members(
         return cached[2]
     cid_cpu = cohort_id.detach().cpu()
     dev = cohort_id.device
-    members = [torch.nonzero(cid_cpu == c, as_tuple=False).squeeze(-1).to(dev) for c in range(stride)]
+    members: list[torch.Tensor] = []
+    for c in range(stride):
+        idx_c = torch.nonzero(cid_cpu == c, as_tuple=False).squeeze(-1)
+        if int(idx_c.numel()) > 1:
+            # Deterministic per-cohort shuffle so prefix slices (`anchor_all[:n_anchor]`)
+            # sample uniformly across all latitudes/longitudes instead of low SCVT cell IDs.
+            gen = torch.Generator(device="cpu").manual_seed(104729 + c * 7919)
+            idx_c = idx_c[torch.randperm(int(idx_c.numel()), generator=gen)]
+        members.append(idx_c.to(dev))
     if cache_owner is not None:
         setattr(cache_owner, "_cohort_members_cache", (cohort_id, stride, members))
     return members
@@ -1709,7 +1722,10 @@ def train_student_online(
         x_fresh, ctx_p_fresh, ctx_s_fresh, tgt_p_fresh, tgt_s_fresh,
         sub_maps=sub_maps_fresh, tgt_maps=tgt_maps_fresh, tgt_has_map=tgt_has_map_fresh,
     )
-    if state.replay.size < 64:
+    # On restart resume (`steps_seen >= warmup_steps`), refill the empty GPU replay buffer with
+    # globally diverse teacher samples before running AdamW updates on pretrained weights.
+    min_replay = 2048 if (state.steps_seen >= state.warmup_steps and state.replay.capacity >= 4096) else 64
+    if state.replay.size < min_replay:
         return
 
     n_steps = int(n_grad_steps)
@@ -3164,7 +3180,10 @@ def train_rad_student_online(
 ) -> None:
     """Push fresh teacher ICA radiation pairs to GPU replay buffer and run online AdamW updates."""
     state.replay.push(x_fresh, cp_fresh, ctx_s_fresh, tgt_qr_fresh, tgt_s_fresh)
-    if state.replay.size < 64:
+    # On restart resume (`steps_seen >= warmup_steps`), refill the empty GPU replay buffer with
+    # globally diverse teacher samples before running AdamW updates on pretrained weights.
+    min_replay = 2048 if (state.steps_seen >= state.warmup_steps and state.replay.capacity >= 4096) else 64
+    if state.replay.size < min_replay:
         return
 
     state.net.train()

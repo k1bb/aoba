@@ -1652,68 +1652,129 @@ def step_aoba_model(
                     model.rad_distill, x_rt, cp_rt, cs_rt, tqr_rt, ts_rt, n_grad_steps=n_rgrad
                 )
 
-                # Chunked zero-gather student inference over contiguous cell slices (<=32,768 subcols/chunk):
-                # eliminates >2 GB of one-shot full-grid temporary tensors & gathers/scatters while
-                # staying bit-exact (ICA subcolumns are strictly independent; teacher cells overwritten below).
-                chunk_cells = max(1, 32768 // max(n_sub, 1))
-                # Balance chunk size slightly upward when tail is tiny (e.g. G6 40962 -> 10x4097 instead of 10x4096+2)
-                n_chunks_r = max(1, (nc + chunk_cells - 1) // chunk_cells)
-                if n_chunks_r > 1 and (nc % chunk_cells) <= max(64, chunk_cells // 16):
-                    chunk_cells = (nc + n_chunks_r - 2) // (n_chunks_r - 1)
-                for c0 in range(0, nc, chunk_cells):
-                    c1 = min(c0 + chunk_cells, nc)
-                    n_ch = c1 - c0
-                    s0 = c0 * n_sub
-                    s1 = c1 * n_sub
-                    rho_c = rho_crm_flat[:, s0:s1].contiguous()
-                    thm_c = thm_crm_flat[:, s0:s1].contiguous()
-                    qv_c = qv_crm_flat[:, s0:s1].contiguous()
-                    qc_c = qc_crm_flat[:, s0:s1].contiguous()
-                    qi_c = qi_crm_flat[:, s0:s1].contiguous()
-                    pres_c, _, temp_c = diagnose_pressure_temperature(rho_c, thm_c, qv_c)
-                    dz_c_sl = atmos.dz_c[:, c0:c1]
-                    qd_c_sl = q_dust_cell[:, c0:c1] if q_dust_cell is not None else None
-                    tau_c_sl = aero_opt_cell[0][:, c0:c1] if aero_opt_cell is not None else None
+                if model.rad_distill.steps_seen >= model.rad_distill.warmup_steps:
+                    # Chunked zero-gather student inference over contiguous cell slices (<=32,768 subcols/chunk):
+                    # eliminates >2 GB of one-shot full-grid temporary tensors & gathers/scatters while
+                    # keeping host radiation spatially smooth across all cells (no 1-cell teacher jumps).
+                    chunk_cells = max(1, 32768 // max(n_sub, 1))
+                    # Balance chunk size slightly upward when tail is tiny (e.g. G6 40962 -> 10x4097 instead of 10x4096+2)
+                    n_chunks_r = max(1, (nc + chunk_cells - 1) // chunk_cells)
+                    if n_chunks_r > 1 and (nc % chunk_cells) <= max(64, chunk_cells // 16):
+                        chunk_cells = (nc + n_chunks_r - 2) // (n_chunks_r - 1)
+                    for c0 in range(0, nc, chunk_cells):
+                        c1 = min(c0 + chunk_cells, nc)
+                        n_ch = c1 - c0
+                        s0 = c0 * n_sub
+                        s1 = c1 * n_sub
+                        rho_c = rho_crm_flat[:, s0:s1].contiguous()
+                        thm_c = thm_crm_flat[:, s0:s1].contiguous()
+                        qv_c = qv_crm_flat[:, s0:s1].contiguous()
+                        qc_c = qc_crm_flat[:, s0:s1].contiguous()
+                        qi_c = qi_crm_flat[:, s0:s1].contiguous()
+                        pres_c, _, temp_c = diagnose_pressure_temperature(rho_c, thm_c, qv_c)
+                        dz_c_sl = atmos.dz_c[:, c0:c1]
+                        qd_c_sl = q_dust_cell[:, c0:c1] if q_dust_cell is not None else None
+                        tau_c_sl = aero_opt_cell[0][:, c0:c1] if aero_opt_cell is not None else None
+                        if o3_prog_cell is not None:
+                            o3_c_sl = o3_prog_cell[:, c0:c1]
+                        elif o3_use_provider:
+                            o3_c_sl = model.o3_provider.compute_vmr(
+                                pres_c, lat_rad=_cell_to_sub(mesh.lat_cell[c0:c1], n_ch, n_sub), doy=doy_now_rad
+                            )
+                        else:
+                            o3_c_sl = None
+                        x_rc, cp_rc, s_inc_rc = extract_rad_distill_features(
+                            pres_c, temp_c, dz_c_sl, rho_c, qv_c, qc_c, qi_c,
+                            t_rad_in[s0:s1], alb_vd[s0:s1], alb_vf[s0:s1], alb_nd[s0:s1], alb_nf[s0:s1],
+                            emiss_in[s0:s1], mu0_sub[s0:s1], s_toa_sub[s0:s1],
+                            co2_ppmv=co2_rad_now, ch4_ppmv=ch4_rad_now, n2o_ppmv=n2o_rad_now,
+                            o3_vmr_c=o3_c_sl, q_dust_c=qd_c_sl, tau_aero_sw_c=tau_c_sl,
+                            cell_sub=n_sub,
+                        )
+                        rad_stu_out, rad_stu_unc = predict_rad_student_columns(
+                            model.rad_distill, x_rc, cp_rc, s_inc_rc,
+                            alb_vd[s0:s1], alb_vf[s0:s1], alb_nd[s0:s1], alb_nf[s0:s1],
+                            emiss_in[s0:s1], t_rad_in[s0:s1],
+                        )
+                        q_rad_sub[:, s0:s1] = rad_stu_out["q_rad"]
+                        sw1_dir_sub[s0:s1] = rad_stu_out["sw1_dir"]
+                        sw1_dif_sub[s0:s1] = rad_stu_out["sw1_dif"]
+                        sw2_dir_sub[s0:s1] = rad_stu_out["sw2_dir"]
+                        sw2_dif_sub[s0:s1] = rad_stu_out["sw2_dif"]
+                        lw_dn_sub[s0:s1] = rad_stu_out["lw_dn"]
+                        olr_sub[s0:s1] = rad_stu_out["olr"]
+                        asr_sub[s0:s1] = rad_stu_out["asr"]
+                        model.rad_distill.last_uncertainty[c0:c1] = rad_stu_unc.reshape(n_ch, n_sub).mean(dim=-1)
+
+                    # Overwrite active teacher cells with genuine full-3D ICA / 3D-TICA radiation outputs
+                    q_rad_sub[:, t_sfc] = _f2s(q_rad_t, n_tr)
+                    sw1_dir_sub[t_sfc] = _f2s(sw1d_t, n_tr)
+                    sw1_dif_sub[t_sfc] = _f2s(sw1f_t, n_tr)
+                    sw2_dir_sub[t_sfc] = _f2s(sw2d_t, n_tr)
+                    sw2_dif_sub[t_sfc] = _f2s(sw2f_t, n_tr)
+                    lw_dn_sub[t_sfc] = _f2s(lwd_t, n_tr)
+                    olr_sub[t_sfc] = _f2s(olr_t, n_tr)
+                    asr_sub[t_sfc] = _f2s(asr_t, n_tr)
+                else:
+                    # Clean radiation warmup: evaluate genuine tile-level RRTMGP on student cells
+                    # while `rad_distill` warms up on 32-subcolumn teachers (zero untrained-NN shock).
+                    q_rad_sub[:, t_sfc] = _f2s(q_rad_t, n_tr)
+                    sw1_dir_sub[t_sfc] = _f2s(sw1d_t, n_tr)
+                    sw1_dif_sub[t_sfc] = _f2s(sw1f_t, n_tr)
+                    sw2_dir_sub[t_sfc] = _f2s(sw2d_t, n_tr)
+                    sw2_dif_sub[t_sfc] = _f2s(sw2f_t, n_tr)
+                    lw_dn_sub[t_sfc] = _f2s(lwd_t, n_tr)
+                    olr_sub[t_sfc] = _f2s(olr_t, n_tr)
+                    asr_sub[t_sfc] = _f2s(asr_t, n_tr)
+
+                    rho_sw = rho_crm_flat[:, s_sfc]
+                    thm_sw = thm_crm_flat[:, s_sfc]
+                    qv_sw = qv_crm_flat[:, s_sfc]
+                    qc_sw = qc_crm_flat[:, s_sfc]
+                    qi_sw = qi_crm_flat[:, s_sfc]
+                    pres_sw, _, temp_sw = diagnose_pressure_temperature(rho_sw, thm_sw, qv_sw)
+                    dz_sw = _cell_to_sub(atmos.dz_c[:, s_pool_idx], n_sr, n_sub)
+                    qd_sw = _cell_to_sub(q_dust_cell[:, s_pool_idx], n_sr, n_sub) if q_dust_cell is not None else None
+                    ao_sw = tuple(_cell_to_sub(a[:, s_pool_idx], n_sr, n_sub) for a in aero_opt_cell) if aero_opt_cell is not None else None
                     if o3_prog_cell is not None:
-                        o3_c_sl = o3_prog_cell[:, c0:c1]
+                        o3_sw = _cell_to_sub(o3_prog_cell[:, s_pool_idx], n_sr, n_sub)
                     elif o3_use_provider:
-                        o3_c_sl = model.o3_provider.compute_vmr(
-                            pres_c, lat_rad=_cell_to_sub(mesh.lat_cell[c0:c1], n_ch, n_sub), doy=doy_now_rad
+                        o3_sw = model.o3_provider.compute_vmr(
+                            pres_sw, lat_rad=_cell_to_sub(mesh.lat_cell[s_pool_idx], n_sr, n_sub), doy=doy_now_rad
                         )
                     else:
-                        o3_c_sl = None
-                    x_rc, cp_rc, s_inc_rc = extract_rad_distill_features(
-                        pres_c, temp_c, dz_c_sl, rho_c, qv_c, qc_c, qi_c,
-                        t_rad_in[s0:s1], alb_vd[s0:s1], alb_vf[s0:s1], alb_nd[s0:s1], alb_nf[s0:s1],
-                        emiss_in[s0:s1], mu0_sub[s0:s1], s_toa_sub[s0:s1],
-                        co2_ppmv=co2_rad_now, ch4_ppmv=ch4_rad_now, n2o_ppmv=n2o_rad_now,
-                        o3_vmr_c=o3_c_sl, q_dust_c=qd_c_sl, tau_aero_sw_c=tau_c_sl,
-                        cell_sub=n_sub,
+                        o3_sw = None
+                    pres_sfc_sw = pres_sw[0] + C.GRAVITY * rho_sw[0] * (1.0 + qv_sw[0]) * dz_sw[0]
+                    pres_w_sw = torch.empty((nz + 1, n_sr * n_sub), device=dev_r, dtype=pres_sw.dtype)
+                    pres_w_sw[0] = pres_sfc_sw
+                    pres_w_sw[1:-1] = torch.sqrt(torch.clamp(pres_sw[:-1] * pres_sw[1:], min=1.0e-6))
+                    pres_w_sw[-1] = torch.clamp(0.5 * pres_sw[-1], min=1.0e-3)
+                    temp_w_sw = torch.empty((nz + 1, n_sr * n_sub), device=dev_r, dtype=temp_sw.dtype)
+                    temp_w_sw[0] = temp_sw[0]
+                    temp_w_sw[1:-1] = 0.5 * (temp_sw[:-1] + temp_sw[1:])
+                    temp_w_sw[-1] = temp_sw[-1]
+                    qr_sw, s1d_sw, s1f_sw, s2d_sw, s2f_sw, lwd_sw, olr_sw, asr_sw = (
+                        _compute_four_band_radiation_chunked(
+                            pres_c=pres_sw, pres_w=pres_w_sw, temp_c=temp_sw, temp_w=temp_w_sw,
+                            dz_c=dz_sw, rho_d_c=rho_sw, qv_c=qv_sw, qc_c=qc_sw, qi_c=qi_sw,
+                            t_sfc=t_rad_in[s_sfc], albedo_vis=alb_vd[s_sfc], albedo_nir=alb_nd[s_sfc],
+                            mu0=mu0_sub[s_sfc], s_toa=s_toa_sub[s_sfc], co2_ppmv=co2_rad_now, emiss_sfc=emiss_in[s_sfc],
+                            albedo_vis_dif=alb_vf[s_sfc], albedo_nir_dif=alb_nf[s_sfc], col_chunk=cfg.rad_col_chunk,
+                            re_liq_um=cfg.re_liq_um, re_ice_um=cfg.re_ice_um, cloud_sw_inhomog=cfg.cloud_sw_inhomog,
+                            q_dust_c=qd_sw, o3_vmr_c=o3_sw, o3_lw_coupling=cfg.o3_lw_coupling,
+                            rad_scheme=cfg.rad_scheme, ch4_ppmv=ch4_rad_now, n2o_ppmv=n2o_rad_now, aero_opt=ao_sw,
+                        )
                     )
-                    rad_stu_out, rad_stu_unc = predict_rad_student_columns(
-                        model.rad_distill, x_rc, cp_rc, s_inc_rc,
-                        alb_vd[s0:s1], alb_vf[s0:s1], alb_nd[s0:s1], alb_nf[s0:s1],
-                        emiss_in[s0:s1], t_rad_in[s0:s1],
-                    )
-                    q_rad_sub[:, s0:s1] = rad_stu_out["q_rad"]
-                    sw1_dir_sub[s0:s1] = rad_stu_out["sw1_dir"]
-                    sw1_dif_sub[s0:s1] = rad_stu_out["sw1_dif"]
-                    sw2_dir_sub[s0:s1] = rad_stu_out["sw2_dir"]
-                    sw2_dif_sub[s0:s1] = rad_stu_out["sw2_dif"]
-                    lw_dn_sub[s0:s1] = rad_stu_out["lw_dn"]
-                    olr_sub[s0:s1] = rad_stu_out["olr"]
-                    asr_sub[s0:s1] = rad_stu_out["asr"]
-                    model.rad_distill.last_uncertainty[c0:c1] = rad_stu_unc.reshape(n_ch, n_sub).mean(dim=-1)
+                    q_rad_sub[:, s_sfc] = qr_sw
+                    sw1_dir_sub[s_sfc] = s1d_sw
+                    sw1_dif_sub[s_sfc] = s1f_sw
+                    sw2_dir_sub[s_sfc] = s2d_sw
+                    sw2_dif_sub[s_sfc] = s2f_sw
+                    lw_dn_sub[s_sfc] = lwd_sw
+                    olr_sub[s_sfc] = olr_sw
+                    asr_sub[s_sfc] = asr_sw
+                    model.rad_distill.last_uncertainty.zero_()
 
-                # Overwrite active teacher cells with genuine full-3D ICA / 3D-TICA radiation outputs
-                q_rad_sub[:, t_sfc] = _f2s(q_rad_t, n_tr)
-                sw1_dir_sub[t_sfc] = _f2s(sw1d_t, n_tr)
-                sw1_dif_sub[t_sfc] = _f2s(sw1f_t, n_tr)
-                sw2_dir_sub[t_sfc] = _f2s(sw2d_t, n_tr)
-                sw2_dif_sub[t_sfc] = _f2s(sw2f_t, n_tr)
-                lw_dn_sub[t_sfc] = _f2s(lwd_t, n_tr)
-                olr_sub[t_sfc] = _f2s(olr_t, n_tr)
-                asr_sub[t_sfc] = _f2s(asr_t, n_tr)
                 model.rad_distill.last_uncertainty[t_pool_idx] = 0.0
                 model.rad_distill.teacher_frac_last = float(n_tr) / float(max(nc, 1))
                 model.rad_distill.steps_seen += 1
@@ -3040,10 +3101,11 @@ def step_aoba_model(
                 return_hydrometeors=True,
                 do_sat_adj=False,
             )
-            _, exner_mynn_sd, temp_mynn_sd = diagnose_pressure_temperature(rho_pre_sd, thm_mynn_sd, qv_mynn_sd)
+            pres_mynn_sd, exner_mynn_sd, temp_mynn_sd = diagnose_pressure_temperature(rho_pre_sd, thm_mynn_sd, qv_mynn_sd)
             zero_sfc_sd = torch.zeros_like(shf_cell_pre)
 
             # 7a-i. Execute genuine 2D/3D CRM strictly on the active teacher subset (`1 / stride` columns)
+            use_contig_stu = int(t_idx.numel()) * 4 < nc
             if has_pool:
                 n_t = n_pool_act
                 if n_t == pool.n_pool:
@@ -3076,6 +3138,11 @@ def step_aoba_model(
                 drho_t = (atmos.rho_d[:, t_idx] - mean_2d(sub_crm_t.rho_d)).unsqueeze(-1).unsqueeze(-1)
                 sub_crm_t.rho_d = torch.clamp(sub_crm_t.rho_d + drho_t, min=1.0e-8)
                 sub_crm_t.f_coriolis = mesh.f_cell[t_idx]
+                q_rad_t_in = (
+                    pool.q_rad[:, :n_t]
+                    if pool.q_rad_valid
+                    else _tile4d_to_crm4d(q_rad_4d[:, t_idx], to_full=True)
+                )
                 # Only expand the 6 SurfaceFluxDiagnostics fields read by `step_crm_physics_and_dynamics`
                 _crm_sfc_keys = ("shf", "evap", "tau_x", "tau_y", "u_star", "buoy_flux")
                 sub_sfc_t = SurfaceFluxDiagnostics(
@@ -3083,11 +3150,6 @@ def step_aoba_model(
                         k: (_tile3d_to_crm3d(v.index_select(0, t_idx), to_full=True) if k in _crm_sfc_keys else v.index_select(0, t_idx))
                         for k, v in sfc_diag_tile.items()
                     }
-                )
-                q_rad_t_in = (
-                    pool.q_rad[:, :n_t]
-                    if pool.q_rad_valid
-                    else _tile4d_to_crm4d(q_rad_4d[:, t_idx], to_full=True)
                 )
                 q_dust_t_in = (
                     atmos.q_dust[:, t_idx].unsqueeze(-1).unsqueeze(-1).expand(nz, n_t, ny_full, nx_full)
@@ -3289,11 +3351,50 @@ def step_aoba_model(
             )
 
             # 7a-iii. Conservation-constrained student inference & tile update.
-            # When teachers are sparse (`t_idx` << `nc`), updating all `nc` columns contiguously
-            # and overwriting only the tiny `t_idx` teacher slice eliminates ~30 full-grid fancy-index
-            # gathers/scatters while yielding mathematically identical teacher & student states.
-            use_contig_stu = int(t_idx.numel()) * 4 < nc
-            if use_contig_stu:
+            in_sparse_warmup = use_contig_stu and (model.crm_distill.steps_seen < model.crm_distill.warmup_steps)
+            if in_sparse_warmup:
+                # Sparse warmup (`steps_seen < warmup_steps`): advance host smoothly via 1D MYNN +
+                # thermodynamic saturation adjustment (no random-weight NN residuals and no uncondensed
+                # supersaturation buildup while teachers run genuine 2D/3D CRM and fill replay).
+                from aoba.thermodynamics import saturation_adjustment
+
+                t_li_w = temp_mynn_sd - (C.L_V0 * qc_mynn_sd + C.L_S0 * qi_mynn_sd) / C.CP_D
+                t_w_sat, qv_w_sat, qc_w_sat, qi_w_sat = saturation_adjustment(
+                    t_li_w, pres_mynn_sd, qn_mynn_sd
+                )
+                # Conservative warmup autoconversion fallout prevents artificial cloud pileup over 24 warmup steps
+                qc_w_fall = torch.clamp(qc_w_sat - 2.0e-4, min=0.0)
+                qi_w_fall = torch.clamp(qi_w_sat - 4.0e-5, min=0.0)
+                qc_w_sat = qc_w_sat - qc_w_fall
+                qi_w_sat = qi_w_sat - qi_w_fall
+                p_w_mass = (rho_pre_sd * atmos.dz_c * (qc_w_fall + qi_w_fall)).sum(dim=0) / dt
+                f_w_snow = torch.clamp((278.0 - t_w_sat[0]) / 6.0, min=0.0, max=1.0)
+                thm_w_sat = (t_w_sat / torch.clamp(exner_mynn_sd, min=1.0e-3)) * (1.0 + C.RV_OVER_RD * qv_w_sat)
+                atmos.theta_m = thm_w_sat
+                atmos.q_n = qv_w_sat + qc_w_sat + qi_w_sat
+                atmos.q_p = qp_pre_sd
+                atmos.q_v = qv_w_sat
+                atmos.q_c = qc_w_sat
+                atmos.q_i = qi_w_sat
+                du_crm_c = (u_mynn_sd - u_host_new) / dt
+                dv_crm_c = (v_mynn_sd - v_host_new) / dt
+                crm.rho_d.copy_(atmos.rho_d.unsqueeze(-1).unsqueeze(-1))
+                crm.theta_m = thm_w_sat.unsqueeze(-1).unsqueeze(-1) + 0.85 * (crm.theta_m - mean_2d(crm.theta_m, keepdim=True))
+                crm.q_n.copy_(atmos.q_n.unsqueeze(-1).unsqueeze(-1))
+                crm.q_p.copy_(qp_pre_sd.unsqueeze(-1).unsqueeze(-1))
+                crm.q_v.copy_(qv_w_sat.unsqueeze(-1).unsqueeze(-1))
+                crm.q_c.copy_(qc_w_sat.unsqueeze(-1).unsqueeze(-1))
+                crm.q_i.copy_(qi_w_sat.unsqueeze(-1).unsqueeze(-1))
+                crm.u = u_mynn_sd.unsqueeze(-1).unsqueeze(-1) + 0.85 * (crm.u - mean_2d(crm.u, keepdim=True))
+                crm.v = v_mynn_sd.unsqueeze(-1).unsqueeze(-1) + 0.85 * (crm.v - mean_2d(crm.v, keepdim=True))
+                crm.w.mul_(0.85)
+                crm.qke.copy_(qke_mynn_sd.unsqueeze(-1).unsqueeze(-1))
+                rain_3d.copy_((p_w_mass * (1.0 - f_w_snow)).unsqueeze(-1).unsqueeze(-1))
+                snow_3d.copy_((p_w_mass * f_w_snow).unsqueeze(-1).unsqueeze(-1))
+                rain_new_sub = rain_3d.reshape(m_sub)
+                snow_new_sub = snow_3d.reshape(m_sub)
+                model.crm_distill.last_uncertainty.zero_()
+            elif use_contig_stu:
                 stu_out, stu_unc = predict_student_columns(
                     model.crm_distill,
                     x_all_sd,
@@ -3494,10 +3595,7 @@ def step_aoba_model(
                 model.crm_distill.last_uncertainty.zero_()
                 model.crm_distill.last_uncertainty[s_idx] = stu_unc
 
-            # Commit exact genuine teacher state onto the tiny `t_idx` columns.
-            # Keep global host `atmos.rho_d` governed uniformly by `step_scvt_rk3_hevi` across
-            # teacher & student cells so sparse teacher columns do not create isolated hydrostatic
-            # density dipoles against surrounding student cells.
+            # Commit exact genuine teacher state onto the active `t_idx` columns.
             atmos.theta_m[:, t_idx] = thm_t_post
             atmos.q_n[:, t_idx] = qn_t_post
             atmos.q_p[:, t_idx] = qp_t_post

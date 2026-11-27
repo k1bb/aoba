@@ -6323,16 +6323,18 @@ kernel void crm_distill_closure_col(
             float om_liq_p = clamp((t_env - 253.15f) / 20.0f, 0.0f, 1.0f);
             float f_ice_nn = aoba_sigmoid(RP_LOAD(4u, k));
             float f_ice = (t_env <= 253.15f) ? 1.0f : ((1.0f - om_liq_p) * f_ice_nn);
-            float q_cond = max(qn_n * f_cond, max(qn_n - qsat_env, 0.0f));
-            float qc_pf = q_cond * (1.0f - f_ice);
-            float qi_pf = q_cond * f_ice;
-            qv_n = max(qn_n - qc_pf - qi_pf, 0.0f);
+            float q_cond_nn = qn_n * f_cond;
+            float q_ovsat = max(qn_n - qsat_env, 0.0f);
+            float q_cond_tot = max(q_cond_nn, q_ovsat);
+            float qc_pf = q_cond_tot * (1.0f - f_ice);
+            float qi_pf = q_cond_tot * f_ice;
+            qv_n = max(qn_n - q_cond_tot, 0.0f);
 
-            float qc_fall = max(qc_pf - 5.0e-4f, 0.0f);
             float qi_cap = min(qsat_env, 1.0e-4f);
-            float qi_fall = max(qi_pf - qi_cap, 0.0f);
-            qc_n = qc_pf - qc_fall;
-            qi_n = qi_pf - qi_fall;
+            qc_n = min(q_cond_nn * (1.0f - f_ice), 5.0e-4f);
+            qi_n = min(q_cond_nn * f_ice, qi_cap);
+            float qc_fall = max(qc_pf - qc_n, 0.0f);
+            float qi_fall = max(qi_pf - qi_n, 0.0f);
             qn_n = qv_n + qc_n + qi_n;
             p_fall_mass += dm * (qc_fall + qi_fall);
             // Accumulate qf_k into rp1_s[k] (which already holds dqps_k)
