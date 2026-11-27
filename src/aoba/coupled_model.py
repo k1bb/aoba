@@ -714,6 +714,7 @@ def init_aoba_model(
         omega=cfg.omega,
         device=dev,
         dtype=dtype,
+        planet_preset=cfg.planet_preset,
     )
     vgrid = build_vertical_grid(
         nz=cfg.nz,
@@ -791,6 +792,7 @@ def init_aoba_model(
             omega=cfg.omega,
             device=dev,
             dtype=dtype,
+            planet_preset=cfg.planet_preset,
         )
         ocn_coupler = build_ocean_atmos_coupler(mesh, ocn_mesh, device=dev)
         t_ocn_lat = 301.0 - 40.0 * (torch.sin(ocn_mesh.lat_cell) ** 2) - 0.0065 * torch.clamp(ocn_mesh.z_topo, min=0.0)
@@ -810,6 +812,10 @@ def init_aoba_model(
             torch.clamp((C.T_FREEZE_OCEAN - t_ocn_raw_f) * 450.0, min=200.0, max=1400.0),
             torch.zeros_like(t_ocn_raw_f),
         )
+        if str(cfg.planet_preset).strip().lower() != "earth":
+            from aoba.planetary_presets import apply_planet_initial_surface
+
+            apply_planet_initial_surface(ocn_sfc, cfg.planet_preset)
         ogcm = init_ogcm_state(ocn_sfc, ocn_mesh, nz_ocn=cfg.ocean_nz)
         if bool(cfg.enable_ocean_bgc):
             from aoba.ocean_bgc import init_ocean_bgc_state

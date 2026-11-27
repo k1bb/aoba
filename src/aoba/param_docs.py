@@ -435,8 +435,8 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "en": "Enable 3D prognostic stable water isotopes (H₂¹⁸O, HDO), Rayleigh/Craig–Gordon fractionation, and snow δ¹⁸O archive.",
     },
     "planet_preset": {
-        "ja": "汎用惑星プリセット: earth / aquaplanet(全球海) / snowball_earth(全球凍結) / tidally_locked / trappist1e / mars_like。",
-        "en": "Universal planetary preset: 'earth', 'aquaplanet', 'snowball_earth', 'tidally_locked', 'trappist1e', or 'mars_like'.",
+        "ja": "汎用惑星プリセット: earth / aquaplanet(全球海) / snowball_earth(全球凍結) / tidally_locked / trappist1e / mars_like / pangaea(250 Ma パンゲア超大陸)。",
+        "en": "Universal planetary preset: 'earth', 'aquaplanet', 'snowball_earth', 'tidally_locked', 'trappist1e', 'mars_like', or 'pangaea' (250 Ma supercontinent).",
     },
     "enable_tidal_lock": {
         "ja": "同期潮汐固定日射（太陽直下点を経度固定、常昼半球と常夜半球を形成する系外惑星モード）を有効化。",

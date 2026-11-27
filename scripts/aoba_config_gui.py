@@ -2200,6 +2200,7 @@ function buildFieldRow(sec, key, skipKeys = []) {
       <option value="tidally_locked" ${cur==="tidally_locked"?"selected":""}>tidally_locked (同期潮汐固定惑星)</option>
       <option value="trappist1e" ${cur==="trappist1e"?"selected":""}>trappist1e (TRAPPIST-1e 系外惑星)</option>
       <option value="mars_like" ${cur==="mars_like"?"selected":""}>mars_like (乾燥寒冷・火星型惑星)</option>
+      <option value="pangaea" ${cur==="pangaea"?"selected":""}>pangaea (250 Ma パンゲア超大陸・テチス海)</option>
     </select>`;
   } else if (key === "insolation_mode") {
     ctrl = `<select onchange="setKey('${sec}','${key}',this.value)">

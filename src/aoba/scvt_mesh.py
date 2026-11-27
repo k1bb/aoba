@@ -687,12 +687,17 @@ def _scvt_mesh_cache_path(
     radius: float,
     has_earth2014: bool,
     stride: int,
+    planet_preset: str = "earth",
 ) -> Path:
     """Return deterministic CF/UGRID Zarr v3 cache path under `aoba.get_output_dir()/_mesh_cache`."""
     import aoba
 
     cache_dir = aoba.get_output_dir() / "_mesh_cache"
-    e14_tag = f"e14s{max(int(stride), 1)}" if has_earth2014 else "aqua"
+    p_key = str(planet_preset or "earth").strip().lower()
+    if p_key == "pangaea":
+        e14_tag = "pangaea250ma"
+    else:
+        e14_tag = f"e14s{max(int(stride), 1)}" if has_earth2014 else "aqua"
     name = f"scvt_g{int(glevel)}_l{int(n_lloyd_iter)}_r{int(round(radius))}_{e14_tag}_v{_SCVT_CACHE_SCHEMA_VERSION}.zarr"
     return cache_dir / name
 
@@ -772,11 +777,14 @@ def build_scvt_mesh(
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
     use_cache: bool | None = None,
+    planet_preset: str = "earth",
 ) -> SCVTMesh:
     """Build complete SCVT Voronoi C-grid mesh (`glevel = 0..8`) on `device` with Zarr v3 disk cache."""
     import os
 
-    if use_earth2014:
+    p_key = str(planet_preset or "earth").strip().lower()
+    use_e14_eff = bool(use_earth2014 and p_key != "pangaea")
+    if use_e14_eff:
         try:
             e_dir = ensure_earth2014_data(earth2014_dir, auto_download=True)
         except Exception as exc:
@@ -784,14 +792,14 @@ def build_scvt_mesh(
             e_dir = Path(earth2014_dir)
     else:
         e_dir = Path(earth2014_dir)
-    has_e14 = bool(use_earth2014 and (e_dir / "Earth2014.SUR2014.5min.geod.bin").exists())
+    has_e14 = bool(use_e14_eff and (e_dir / "Earth2014.SUR2014.5min.geod.bin").exists())
 
     enable_cache = (glevel >= 4) if use_cache is None else bool(use_cache)
     if os.environ.get("AOBA_DISABLE_MESH_CACHE", "0") == "1":
         enable_cache = False
 
     cache_path = (
-        _scvt_mesh_cache_path(glevel, n_lloyd_iter, radius, has_e14, earth2014_stride)
+        _scvt_mesh_cache_path(glevel, n_lloyd_iter, radius, has_e14, earth2014_stride, planet_preset=p_key)
         if enable_cache
         else None
     )
@@ -810,7 +818,18 @@ def build_scvt_mesh(
         n_edges = topo["dc_edge"].shape[0]
         n_verts = topo["area_vert"].shape[0]
 
-        if has_e14:
+        if p_key == "pangaea":
+            from aoba.planetary_presets import build_pangaea_boundary_fields
+
+            bndry = build_pangaea_boundary_fields(
+                xyz_cell=xyz_cell,
+                lat_cell=topo["lat_cell"],
+                lon_cell=topo["lon_cell"],
+                edges_on_cell=topo["edges_on_cell"],
+                n_edges_on_cell=topo["n_edges_on_cell"],
+                cells_on_edge=topo["cells_on_edge"],
+            )
+        elif has_e14:
             bndry = _aggregate_earth2014_to_scvt(
                 xyz_cell,
                 topo["edges_on_cell"],
