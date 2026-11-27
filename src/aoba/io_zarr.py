@@ -182,6 +182,8 @@ def export_aoba_snapshot_xarray(
             data_vars["red_sprite_rate"] = (("time", "n_cell"), _c1(model.last_red_sprites.sprite_rate_cell), {"units": "sprites m-2 s-1"})
             data_vars["sprite_halo_rate"] = (("time", "n_cell"), _c1(model.last_red_sprites.halo_rate_cell), {"units": "halos m-2 s-1"})
             data_vars["sprite_red_1pn2_kr"] = (("time", "n_cell"), _c1(model.last_red_sprites.red_1pn2_kr_cell), {"units": "kR"})
+            data_vars["sprite_z_init_km"] = (("time", "n_cell"), _c1(model.last_red_sprites.z_init_km_cell), {"units": "km"})
+            data_vars["sprite_z_stop_km"] = (("time", "n_cell"), _c1(model.last_red_sprites.z_stop_km_cell), {"units": "km"})
         if getattr(model, "volcanic_solar", None) is not None:
             from aoba.volcanic_solar import K_EXT_SW_M2_KG
 
