@@ -1495,11 +1495,39 @@ def _build_monthly_mean_xarray(
         "clt": "%", "lwp": "kg m-2", "iwp": "kg m-2", "prw": "kg m-2",
         "siconc": "%", "sithick": "m",
         "tau_ngwd_col": "Pa", "tau_ogwd_col": "Pa",
+        # Material cycles: terrestrial C/N, aerosols/dust, isotopes, trace gases, lightning/TLEs
+        "c_veg": "kg C m-2", "c_soil": "kg C m-2",
+        "npp_land": "kg C m-2 s-1", "ra_land": "kg C m-2 s-1", "rh_land": "kg C m-2 s-1", "nbp_land": "kg C m-2 s-1",
+        "fire_c_flux": "kg C m-2 s-1", "burned_area_rate": "s-1",
+        "n_veg": "kg N m-2", "n_soil": "kg N m-2", "n_min": "kg N m-2",
+        "phi_n": "1", "f_root_alloc": "1",
+        "bnf_flux": "kg N m-2 s-1", "n_leach_flux": "kg N m-2 s-1",
+        "n_denit_flux": "kg N m-2 s-1", "n_dep_lnox": "kg N m-2 s-1",
+        "aod_ss": "1", "aod_so4": "1", "aod_bc": "1", "aod_oc": "1",
+        "ccn_aero_m3": "m-3", "dust_col_kgm2": "kg m-2",
+        "emis_ss_kgm2s": "kg m-2 s-1", "emis_so4_kgm2s": "kg m-2 s-1",
+        "o3_sfc_ppbv": "ppbv", "o3_drydep": "kg m-2 s-1",
+        "co2_sfc_ppmv": "ppmv",
+        "d18o_precip_permil": "permil", "d18o_snow_permil": "permil",
+        "f_wetland": "1", "f_lake": "1", "weath_alk_flux": "mol m-2 s-1",
+        "flash_tot_rate": "fl m-2 s-1", "flash_cg_rate": "fl m-2 s-1",
+        "sprite_rate": "sprites m-2 s-1", "elves_rate": "elves m-2 s-1", "nlc_frac": "1",
     }
     units_2d_ocn = {
         "ocn_eta": "m",
         "ocn_sss": "psu",
         "ocn_h_bl": "m",
+        "ocn_chl_sfc": "mg m-3",
+        "ocn_intpp": "mol C m-2 s-1",
+        "ocn_epc100": "mol C m-2 s-1",
+        "ocn_fgco2": "mol C m-2 s-1",
+        "ocn_spco2": "uatm",
+        "ocn_ph_sfc": "1",
+        "ocn_fe_sfc": "umol m-3",
+        "ocn_fgo2": "mol O2 m-2 s-1",
+        "ocn_omz_frac": "1",
+        "ocn_denit": "mol N m-2 s-1",
+        "ocn_n2fix": "mol N m-2 s-1",
         "tau_x_sfc": "N m-2",
         "tau_y_sfc": "N m-2",
         "runoff_total": "kg m-2 s-1",
@@ -1518,6 +1546,10 @@ def _build_monthly_mean_xarray(
         "ocn_u_zonal": "m s-1",
         "ocn_v_merid": "m s-1",
         "ocn_w_vel": "m s-1",
+        "ocn_dic": "mmol C m-3",
+        "ocn_alk": "mmol eq m-3",
+        "ocn_no3": "mmol N m-3",
+        "ocn_o2": "mmol O2 m-3",
     }
 
     if include_2d:
@@ -1533,7 +1565,7 @@ def _build_monthly_mean_xarray(
             for name, unit in units_2d_ocn.items():
                 if name in sums:
                     arr = (sums[name] * inv).detach().cpu().numpy()[None, :]
-                    c_dim = ocn_cell_dim if name in ("ocn_eta", "ocn_sss", "ocn_h_bl") else "n_cell"
+                    c_dim = ocn_cell_dim if name.startswith("ocn_") else "n_cell"
                     data_vars[name] = (("time", c_dim), arr, {"units": unit})
         if model.icesheet is not None:
             for name in ("h_ice", "z_topo_dyn"):
@@ -2633,10 +2665,18 @@ def main() -> None:
                     _esm_step["lc_bnf"] = _lc.bnf_kgn_m2s
                 if _lc.n_leach_kgn_m2s is not None:
                     _esm_step["lc_leach"] = _lc.n_leach_kgn_m2s
+                if getattr(_lc, "n_denit_kgn_m2s", None) is not None:
+                    _esm_step["lc_denit"] = _lc.n_denit_kgn_m2s
             if model.last_lightning is not None:
                 _esm_step["lgt_tot"] = model.last_lightning.flash_tot_cell
                 _esm_step["lgt_cg"] = model.last_lightning.flash_cg_cell
                 _esm_step["lgt_lnox"] = model.last_lightning.n_dep_lnox_cell
+            if getattr(model, "last_red_sprites", None) is not None:
+                _esm_step["tle_sprite"] = model.last_red_sprites.sprite_rate_cell
+                if getattr(model.last_red_sprites, "elves_rate_cell", None) is not None:
+                    _esm_step["tle_elves"] = model.last_red_sprites.elves_rate_cell
+            if getattr(model, "meso_nox", None) is not None:
+                _esm_step["meso_nlc"] = model.meso_nox.nlc_frac
             if model.ozone is not None:
                 _esm_step["oz_dep"] = model.ozone.o3_drydep_kgm2s
             if _esm_step:
@@ -2802,6 +2842,24 @@ def main() -> None:
                         sample["ocn_sss"] = og.sal[0]
                         if og.h_bl is not None:
                             sample["ocn_h_bl"] = og.h_bl
+                        if og.bgc is not None:
+                            bg = og.bgc
+                            sample["ocn_chl_sfc"] = bg.chl[0]
+                            sample["ocn_intpp"] = bg.intpp
+                            sample["ocn_epc100"] = bg.epc100
+                            sample["ocn_fgco2"] = bg.fgco2
+                            sample["ocn_spco2"] = bg.spco2_uatm
+                            sample["ocn_ph_sfc"] = bg.ph_sfc
+                            if bg.fe_sfc is not None:
+                                sample["ocn_fe_sfc"] = bg.fe_sfc
+                            if bg.fgo2 is not None:
+                                sample["ocn_fgo2"] = bg.fgo2
+                            if bg.omz_col_frac is not None:
+                                sample["ocn_omz_frac"] = bg.omz_col_frac
+                            if bg.denit_moln_m2s is not None:
+                                sample["ocn_denit"] = bg.denit_moln_m2s
+                            if bg.n2fix_moln_m2s is not None:
+                                sample["ocn_n2fix"] = bg.n2fix_moln_m2s
                         sample["precip_snow_mm_day"] = snow * C.SECONDS_PER_DAY
                         sample["sw1_dir_sfc"] = model.rad_cache.get("sw1_dir", torch.zeros_like(model.sfc.t_ocean_ml))
                         sample["sw1_dif_sfc"] = model.rad_cache.get("sw1_dif", torch.zeros_like(model.sfc.t_ocean_ml))
@@ -2820,6 +2878,50 @@ def main() -> None:
                             sample["runoff_glacier"] = sd_sub.runoff_ice.reshape(nc_c, n_sub_c).mean(dim=-1)
                     if model.ozone is not None:
                         sample["o3_tco_du"] = model.ozone.tco_du
+                        sample["o3_sfc_ppbv"] = model.ozone.o3_sfc_ppbv
+                    if model.land_carbon is not None:
+                        lc_s = model.land_carbon
+                        nc_lc = model.mesh.n_cells
+                        def _lc_cm(t: torch.Tensor) -> torch.Tensor:
+                            return t.reshape(nc_lc, -1).mean(dim=-1) if t.shape[-1] != nc_lc else t
+                        sample["c_veg"] = _lc_cm(lc_s.c_leaf + lc_s.c_wood + lc_s.c_root)
+                        sample["c_soil"] = _lc_cm(lc_s.c_lit_fast + lc_s.c_lit_slow + lc_s.c_soil.sum(dim=0))
+                        sample["npp_land"] = _lc_cm(lc_s.npp_kgc_m2s)
+                        sample["ra_land"] = _lc_cm(lc_s.ra_kgc_m2s)
+                        sample["rh_land"] = _lc_cm(lc_s.rh_kgc_m2s)
+                        sample["nbp_land"] = _lc_cm(lc_s.nbp_kgc_m2s)
+                        if lc_s.n_leaf is not None and lc_s.n_wood is not None and lc_s.n_root is not None:
+                            sample["n_veg"] = _lc_cm(lc_s.n_leaf + lc_s.n_wood + lc_s.n_root)
+                        if lc_s.n_soil is not None and lc_s.n_lit_fast is not None and lc_s.n_lit_slow is not None:
+                            sample["n_soil"] = _lc_cm(lc_s.n_lit_fast + lc_s.n_lit_slow + lc_s.n_soil.sum(dim=0))
+                        if lc_s.n_min is not None:
+                            sample["n_min"] = _lc_cm(lc_s.n_min)
+                        if lc_s.phi_n is not None:
+                            sample["phi_n"] = _lc_cm(lc_s.phi_n)
+                        if lc_s.f_root_alloc is not None:
+                            sample["f_root_alloc"] = _lc_cm(lc_s.f_root_alloc)
+                    if model.aerosols is not None:
+                        ae_s = model.aerosols
+                        sample["aod_ss"] = ae_s.aod_ss
+                        sample["aod_so4"] = ae_s.aod_so4
+                        sample["aod_bc"] = ae_s.aod_bc
+                        sample["aod_oc"] = ae_s.aod_oc
+                        sample["ccn_aero_m3"] = ae_s.ccn_aero_m3
+                        sample["emis_ss_kgm2s"] = ae_s.emis_ss_kgm2s
+                        sample["emis_so4_kgm2s"] = ae_s.emis_so4_kgm2s
+                    if getattr(model.atmos, "q_dust", None) is not None:
+                        sample["dust_col_kgm2"] = (model.atmos.rho_d * model.atmos.q_dust * model.atmos.dz_c).sum(dim=0)
+                    if getattr(model, "water_isotopes", None) is not None:
+                        sample["d18o_precip_permil"] = model.water_isotopes.d18o_precip_permil
+                        sample["d18o_snow_permil"] = model.water_isotopes.d18o_snow_permil
+                    if getattr(model, "prognostic_co2", None) is not None and model.prognostic_co2.co2_vmr is not None:
+                        sample["co2_sfc_ppmv"] = model.prognostic_co2.co2_vmr[0] * 1.0e6
+                    if getattr(model, "maml_land", None) is not None:
+                        sample["f_wetland"] = model.maml_land.f_wetland.reshape(model.mesh.n_cells, -1).mean(dim=-1)
+                    if getattr(model, "lakes", None) is not None:
+                        sample["f_lake"] = model.lakes.f_lake
+                    if getattr(model, "weathering", None) is not None and model.weathering.alk_flux_mol_m2s is not None:
+                        sample["weath_alk_flux"] = model.weathering.alk_flux_mol_m2s
                     _du_ng = model.rad_cache.get("_du_ngwd", None)
                     _dv_ng = model.rad_cache.get("_dv_ngwd", None)
                     if _du_ng is not None and _dv_ng is not None:
@@ -2859,6 +2961,12 @@ def main() -> None:
                             "ocn_v_merid": vo_c,
                             "ocn_w_vel": wo_c,
                         })
+                        if og.bgc is not None:
+                            sample["ocn_dic"] = og.bgc.dic
+                            sample["ocn_alk"] = og.bgc.alk
+                            sample["ocn_no3"] = og.bgc.no3
+                            if og.bgc.o2 is not None:
+                                sample["ocn_o2"] = og.bgc.o2
                 if out_cfg.monthly_mean_include_subgrid_2d:
                     sample.update({k: val for k, (val, _) in diagnose_subgrid_2d_fields(model).items()})
 
@@ -2957,6 +3065,28 @@ def main() -> None:
                     or out_cfg.monthly_mean_include_3d
                     or out_cfg.monthly_mean_include_subgrid_2d
                 ):
+                    if out_cfg.monthly_mean_include_2d and mon_esm_cnt > 0:
+                        _scale_esm = float(m_cnt) / float(mon_esm_cnt)
+                        _nc_h = model.mesh.n_cells
+                        def _esm_cm(t: torch.Tensor) -> torch.Tensor:
+                            return (t.reshape(_nc_h, -1).mean(dim=-1) if t.shape[-1] != _nc_h else t) * _scale_esm
+                        _esm_map = (
+                            ("lc_fire_c", "fire_c_flux"),
+                            ("lc_ba_s", "burned_area_rate"),
+                            ("lc_bnf", "bnf_flux"),
+                            ("lc_leach", "n_leach_flux"),
+                            ("lc_denit", "n_denit_flux"),
+                            ("lgt_tot", "flash_tot_rate"),
+                            ("lgt_cg", "flash_cg_rate"),
+                            ("lgt_lnox", "n_dep_lnox"),
+                            ("oz_dep", "o3_drydep"),
+                            ("tle_sprite", "sprite_rate"),
+                            ("tle_elves", "elves_rate"),
+                            ("meso_nlc", "nlc_frac"),
+                        )
+                        for _src_k, _dst_k in _esm_map:
+                            if _src_k in mon_esm_sums:
+                                m_sums[_dst_k] = _esm_cm(mon_esm_sums[_src_k])
                     append_zarr(
                         _build_monthly_mean_xarray(
                             model,
