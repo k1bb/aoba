@@ -13,7 +13,7 @@
 9. [Ocean Circulation (`ocean_mode`), Independent Fine Ocean, Surface Waves, EVP–ITD Sea Ice & FlexPFT Marine BGC](#9-ocean-circulation-ocean_mode-independent-fine-ocean-surface-waves-evpitd-sea-ice--flexpft-marine-bgc)
 10. [Atmospheric Chemistry (`o3_mode`), Natural/Volcanic Aerosols, Carbon & Trace-Gas Cycles (`co2_mode`) & Water Isotopes](#10-atmospheric-chemistry-o3_mode-naturalvolcanic-aerosols-carbon--trace-gas-cycles-co2_mode--water-isotopes)
 11. [Dynamic Ice-Sheet Model, Milankovitch Orbital Evolution & General Planetary Presets](#11-dynamic-ice-sheet-model-milankovitch-orbital-evolution--general-planetary-presets)
-12. [Centralized 323-Parameter TOML Registry, Diagnostics (Köppen–Geiger / CMIP7), Zarr v3 & AOBA Studio](#12-centralized-323-parameter-toml-registry-diagnostics-köppengeiger--cmip7-zarr-v3--aoba-studio)
+12. [Centralized 324-Parameter TOML Registry, Diagnostics (Köppen–Geiger / CMIP7), Zarr v3 & AOBA Studio](#12-centralized-324-parameter-toml-registry-diagnostics-köppengeiger--cmip7-zarr-v3--aoba-studio)
 
 ---
 
@@ -767,6 +767,44 @@ D_{\mathrm{N,LNOx}} &= 0.50\,Y_{\mathrm{N}}\mathcal{F}_{\mathrm{tot}} + 0.50\,\o
 $$
 
 When Online Self-Distilling Superparameterization (`enable_crm_self_distill = true`) is active, full-resolution 2 km CRM lightning (`explicit_bulk` or `diagnostic`) executes strictly on the active teacher subset (`1 / stride` host cells, resetting newly rotated teacher slots to neutral charge while evolving dwelling slots continuously across `crm_distill_dwell_steps`), and a compact map-free two-part Hurdle MLP (`LightningSelfDistillNet`, taking 14 universal column thermodynamic, mixed-phase hydrometeor, CAPE-proxy, surface buoyancy, and precipitation features with a zero-cloud gate) distills strike probability $P(\mathcal{F}_{\mathrm{tot}} > 0 \mid \mathbf{x})$, conditional intensity $\mathbb{E}[\ln(1 + \mathcal{F}_{\mathrm{tot}}/\mathcal{F}_0) \mid \text{strike}, \mathbf{x}]$, and CG fraction $f_{\mathrm{CG}}$ online onto all student columns.
+
+#### 5.6.3 Optional Mesospheric Red Sprites & Sprite Halos (`enable_red_sprites = true`, `src/aoba/red_sprites.py`)
+
+When `enable_red_sprites = true` (default `false`), a map-free quasi-electrostatic (QE) mesospheric Transient Luminous Event (TLE) module evaluates sprite halos, prompt downward streamers, sub-breakdown delayed sprites, $\mathrm{N}_2$ optical emissions, and mesospheric $\mathrm{NO}_x$ production across a 26-level mesospheric grid ($z \in [38, 88]\ \mathrm{km}$, $\Delta z = 2\ \mathrm{km}$) anchored hydrostatically to AOBA's upper-atmosphere $(\rho, T)$. Solar zenith angle $\mu_0$ modulates the Wait & Spies (1964) / Pasko et al. (1997) D-region ionospheric electron density $N_e(z)$ ($h'_{\mathrm{night}} = 85\ \mathrm{km}, \beta_{\mathrm{night}} = 0.50\ \mathrm{km}^{-1}$; $h'_{\mathrm{day}} = 70\ \mathrm{km}, \beta_{\mathrm{day}} = 0.30\ \mathrm{km}^{-1}$) and total conductivity $\sigma(z)$, yielding dielectric relaxation time $\tau_\sigma(z) = \varepsilon_0/\sigma(z)$:
+
+$$
+\begin{aligned}
+N_e(z) &= 1.43\times 10^{13}\exp\!\big(-0.15\,h' + (\beta - 0.15)(z - h')\big)\ [\mathrm{m^{-3}}], \\
+\sigma(z) &= q_e N_e(z)\,\mu_{e0}\frac{N_0}{N(z)} + 5\times 10^{-14}\exp\!\left(\frac{z}{6\ \mathrm{km}}\right), \qquad \tau_\sigma(z) = \frac{\varepsilon_0}{\sigma(z)}
+\end{aligned} \tag{5.24}
+$$
+
+Above a CG flash removing vertical charge moment change $\Delta M_Q = Q_{\mathrm{CG}} z_Q\ [\mathrm{C\ km}]$ over impulse timescale $\tau_f = 1\ \mathrm{ms}$, the conducting-ground image dipole QE field $E_{\mathrm{QE}}(z)$ is screened analytically by dielectric relaxation ($r = \tau_\sigma/\tau_f$, $u = \ln r$) and compared against the Townsend density-scaled conventional breakdown field $E_k(z) = E_{k0}(N/N_0)$ ($E_{k0} = 3.2\times 10^6\ \mathrm{V\ m^{-1}} \approx 120\ \mathrm{Td}$; Pasko et al., 1997):
+
+$$
+\begin{aligned}
+E_{\mathrm{QE}}(z) &= \frac{\Delta M_Q}{\pi\varepsilon_0}\frac{z}{(z^2 - z_Q^2)^2}, \\
+E_{\mathrm{peak}}(z) &= E_{\mathrm{QE}}(z)\,\exp\!\left(-\frac{u}{e^u - 1}\right), \qquad E_k(z) = E_{k0}\frac{N(z)}{N_0}
+\end{aligned} \tag{5.25}
+$$
+
+Sprite halos occur above $E_{\mathrm{peak}} \ge 0.50\,E_k$ (Qin et al., 2014), prompt downward streamers above $E_{\mathrm{peak}} \ge E_k$ (Luque & Ebert, 2009), and delayed sprites via $\mathrm{O}^- + \mathrm{N}_2 \to \mathrm{N}_2\mathrm{O} + e^-$ associative electron detachment across $0.70\,E_k \le E_{\mathrm{peak}} < E_k$ whenever $\tau_\sigma \ge 1.5\ \mathrm{ms}$ (Luque & Gordillo-Vázquez, 2012). Integrating analytically over a stratiform-anvil-conditioned log-normal CG charge-moment distribution ($\sigma_{\ln} = 1.15$) yields exact exceedance probabilities via $\operatorname{erfc}$, while downward streamer propagation halts at stopping altitude $z_{\mathrm{stop}}$ where $E_{\mathrm{peak}}(z)$ falls below Ebert et al. (2010) positive/negative stability fields ($E_{\mathrm{st},0}^+ = 4.4\times 10^5$, $E_{\mathrm{st},0}^- = 1.25\times 10^6\ \mathrm{V\ m^{-1}}$):
+
+$$
+\begin{aligned}
+P(\Delta M_Q \ge \Delta M_{Q,\mathrm{crit}}) &= \frac{1}{2}\operatorname{erfc}\!\left(\frac{\ln(\Delta M_{Q,\mathrm{crit}} / \Delta M_{Q,\mathrm{med}})}{\sqrt{2}\,\sigma_{\ln}}\right), \\
+z_{\mathrm{stop}} &= \min\!\big\{z \le z_{\mathrm{init}} : E_{\mathrm{peak}}(z) \ge E_{\mathrm{st}}^\pm(z)\big\}
+\end{aligned} \tag{5.26}
+$$
+
+Optical intensities of the crimson $\mathrm{N}_2$ 1st Positive band ($1\mathrm{PN}_2$, 650–750 nm; $A_{1P} = 1.7\times 10^5\ \mathrm{s^{-1}}$, $\mathrm{N}_2$ quenching below $\sim 53\ \mathrm{km}$) and violet/blue $\mathrm{N}_2$ 2nd Positive band ($2\mathrm{PN}_2$, 337 nm; $A_{2P} = 2.0\times 10^7\ \mathrm{s^{-1}}$, $\mathrm{O}_2$ quenching below $\sim 30\ \mathrm{km}$) reproduce the red-head to blue-tendril altitude transition (Pasko et al., 1997), and column mesospheric $\mathrm{NO}_x$ production follows Sentman et al. (2008; $Y_{\mathrm{NOx}} = 5\times 10^{22}\ \mathrm{molecules\ sprite^{-1}}$):
+
+$$
+\begin{aligned}
+Q_{1P}(z) &= \frac{A_{1P}}{A_{1P} + k_{q,1P} f_{\mathrm{N}_2} N(z)}, \qquad Q_{2P}(z) = \frac{A_{2P}}{A_{2P} + k_{q,2P} f_{\mathrm{O}_2} N(z)}, \\
+S_{\mathrm{NOx,sprite}} &= \mathcal{F}_{\mathrm{sprite}}\,Y_{\mathrm{NOx}}\,\operatorname{clamp}\!\left(\frac{z_{\mathrm{init}} - z_{\mathrm{stop}}}{25\ \mathrm{km}},\ 0.3,\ 2.0\right)
+\end{aligned} \tag{5.27}
+$$
 
 ---
 
@@ -2041,16 +2079,16 @@ $$
 
 ---
 
-## 12. Centralized 323-Parameter TOML Registry, Diagnostics (Köppen–Geiger / CMIP7), Zarr v3 & AOBA Studio
+## 12. Centralized 324-Parameter TOML Registry, Diagnostics (Köppen–Geiger / CMIP7), Zarr v3 & AOBA Studio
 
 ### 12.1 Single TOML Registry, Fused GPU Kernels & Native Zarr v3 I/O
 
-All 14 sections and 323 tunable global parameters are centralized in [`config/aoba_default.toml`](../config/aoba_default.toml) (`src/aoba/params.py`), with 100% bilingual physical documentation across all 322 unique keys maintained in [`src/aoba/param_docs.py`](../src/aoba/param_docs.py) and 11 ready-to-run experiment presets in `config/presets/`. Hardware-portable `float32` execution (`cuda` $\to$ `mps` $\to$ `cpu` via `src/aoba/runtime.py`) compiles 104 single-source fused Metal kernels (`kernels.py`, `kernels_physics.py`, `kernels_extra.py`, `kernels_esm.py`) automatically to native CUDA C++17 via `kernels_cuda.py` alongside automatic CUDA Graph capture/replay, executing vertical tridiagonal sweeps, settling/sinking, radiation, microphysics, explicit bulk lightning, CRM sub-cycles, EVP sea ice, barotropic ocean sub-cycles, and OSSP ML feature/closure/spatial-head operations with zero mid-step CPU–GPU synchronizations. All native model outputs (`src/aoba/io_zarr.py`) use CF-1.11 / UGRID-1.0 Zarr v3 (`mesh.zarr`, `monthly.zarr`, `snapshots.zarr`, and optionally `cmip7_monthly.zarr` / `cmip7_fx.zarr`), alongside `daily_global.csv` and atomic checkpoints `restart.pt` / `restart_mid.pt` (supporting universal cross-grid spherical and hydrostatic vertical remapping).
+All 14 sections and 324 tunable global parameters are centralized in [`config/aoba_default.toml`](../config/aoba_default.toml) (`src/aoba/params.py`), with 100% bilingual physical documentation across all 323 unique keys maintained in [`src/aoba/param_docs.py`](../src/aoba/param_docs.py) and 11 ready-to-run experiment presets in `config/presets/`. Hardware-portable `float32` execution (`cuda` $\to$ `mps` $\to$ `cpu` via `src/aoba/runtime.py`) compiles 104 single-source fused Metal kernels (`kernels.py`, `kernels_physics.py`, `kernels_extra.py`, `kernels_esm.py`) automatically to native CUDA C++17 via `kernels_cuda.py` alongside automatic CUDA Graph capture/replay, executing vertical tridiagonal sweeps, settling/sinking, radiation, microphysics, explicit bulk lightning, CRM sub-cycles, EVP sea ice, barotropic ocean sub-cycles, and OSSP ML feature/closure/spatial-head operations with zero mid-step CPU–GPU synchronizations. All native model outputs (`src/aoba/io_zarr.py`) use CF-1.11 / UGRID-1.0 Zarr v3 (`mesh.zarr`, `monthly.zarr`, `snapshots.zarr`, and optionally `cmip7_monthly.zarr` / `cmip7_fx.zarr`), alongside `daily_global.csv` and atomic checkpoints `restart.pt` / `restart_mid.pt` (supporting universal cross-grid spherical and hydrostatic vertical remapping).
 
 | TOML Section | Keys | Scope |
 | :--- | ---: | :--- |
 | `[grid]` | 16 | SCVT `glevel`, vertical `nz`/`z_top`, CRM `(nx, ny, dx)`, time steps, chunking |
-| `[forcing]` | 99 | All selectable schemes (`rad_scheme`, `microphysics_scheme`, `lightning_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`), OSSP distillation & shadow diagnostics, orbit, calendar, ESM switches |
+| `[forcing]` | 100 | All selectable schemes (`rad_scheme`, `microphysics_scheme`, `lightning_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`), OSSP distillation & shadow diagnostics, orbit, calendar, ESM switches (including optional `enable_red_sprites`) |
 | `[icesheet]` | 5 | Dynamic SIA ice-sheet switch, EMA timescale, acceleration factor, isostasy timescale |
 | `[output]` | 23 | Zarr v3 cadence/splitting, CSV, mid-run checkpoints, CMIP7 output |
 | `[constants]` | 26 | Planetary radius, gravity, gas constants, latent heats, ocean/ice constants |
@@ -2071,4 +2109,4 @@ All 14 sections and 323 tunable global parameters are centralized in [`config/ao
 
 ### 12.3 AOBA Studio Workbench (`scripts/aoba_config_gui.py`)
 
-The local web application (`python scripts/aoba_config_gui.py --port 8765`) provides bilingual editing and dropdown selection for all 323 parameters, experiment presets, three synchronized rotating globes (`T₂`, `Precip`, and 10 ESM diagnostics) compared against observational reference ranges (ERA5, CERES EBAF, GPCP, MODIS, NSIDC), and an embedded documentation viewer with KaTeX mathematical typesetting (automatically falling back to the built-in recursive-descent renderer offline) and inline SVG schematic diagrams.
+The local web application (`python scripts/aoba_config_gui.py --port 8765`) provides bilingual editing and dropdown selection for all 324 parameters, experiment presets, three synchronized rotating globes (`T₂`, `Precip`, and 10 ESM diagnostics) compared against observational reference ranges (ERA5, CERES EBAF, GPCP, MODIS, NSIDC), and an embedded documentation viewer with KaTeX mathematical typesetting (automatically falling back to the built-in recursive-descent renderer offline) and inline SVG schematic diagrams.

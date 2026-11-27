@@ -13,7 +13,7 @@
 9. [海洋循環 (`ocean_mode`)・独立高解像海洋・波浪・EVP–ITD 海氷・FlexPFT 海洋 BGC](#9-海洋循環-ocean_mode独立高解像海洋波浪evpitd-海氷flexpft-海洋-bgc)
 10. [大気化学 (`o3_mode`)・自然/火山エアロゾル・炭素/微量気体循環 (`co2_mode`)・水安定同位体](#10-大気化学-o3_mode自然火山エアロゾル炭素微量気体循環-co2_mode水安定同位体)
 11. [動的氷床モデル・ミランコビッチ軌道進化・汎用惑星プリセット](#11-動的氷床モデルミランコビッチ軌道進化汎用惑星プリセット)
-12. [一元 323 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio](#12-一元-323-パラメータ-toml-レジストリ診断köppengeiger--cmip7zarr-v3aoba-studio)
+12. [一元 324 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio](#12-一元-324-パラメータ-toml-レジストリ診断köppengeiger--cmip7zarr-v3aoba-studio)
 
 ---
 
@@ -767,6 +767,44 @@ D_{\mathrm{N,LNOx}} &= 0.50\,Y_{\mathrm{N}}\mathcal{F}_{\mathrm{tot}} + 0.50\,\o
 $$
 
 オンライン自己蒸留超パラメータ化（`enable_crm_self_distill = true`）有効時は、フル解像度 2 km CRM 発雷（`explicit_bulk` または `diagnostic`）を活性教師セル集合（全セルの `1 / stride`、切替スロットのみ中立初期化し `crm_distill_dwell_steps` 間連続積分）上でのみ厳密実行し、14 個の普遍的コラム物理特徴量（降水・混合相雲水/氷水・CAPE 指標・地表面浮力フラックス等、ゼロ雲ゲート付き）から発雷確率 $P(\mathcal{F}_{\mathrm{tot}} > 0 \mid \mathbf{x})$・発雷時強度 $\mathbb{E}[\ln(1 + \mathcal{F}_{\mathrm{tot}}/\mathcal{F}_0) \mid \text{strike}, \mathbf{x}]$・対地雷割合 $f_{\mathrm{CG}}$ を予測するマップ不要の 2 段階 Hurdle MLP（`LightningSelfDistillNet`）によって全生徒セルへオンライン蒸留する。
+
+#### 5.6.3 任意オプション：中間圏レッドスプライト・スプライトハローモデル (`enable_red_sprites = true`, `src/aoba/red_sprites.py`)
+
+`enable_red_sprites = true`（既定 `false`）を有効化すると、地理マップを一切用いず AOBA 上部大気 $(\rho, T)$ へ静水圧接続した 26 層の中間圏鉛直格子（$z \in [38, 88]\ \mathrm{km}$, $\Delta z = 2\ \mathrm{km}$）上で、準静電（QE）型超高層発光現象（TLE：スプライトハロー・即発下方ストリーマ・亜破壊遅延スプライト・$\mathrm{N}_2$ 光学発光・中間圏 $\mathrm{NO}_x$ 生成）を評価する。太陽天頂角 $\mu_0$ に応じて Wait & Spies (1964) / Pasko et al. (1997) の昼夜 D 層電離圏電子密度 $N_e(z)$（夜間 $h' = 85\ \mathrm{km}, \beta = 0.50\ \mathrm{km}^{-1}$、昼間 $h' = 70\ \mathrm{km}, \beta = 0.30\ \mathrm{km}^{-1}$）と全導電率 $\sigma(z)$ を与え、誘電緩和時間 $\tau_\sigma(z) = \varepsilon_0/\sigma(z)$ を求める：
+
+$$
+\begin{aligned}
+N_e(z) &= 1.43\times 10^{13}\exp\!\big(-0.15\,h' + (\beta - 0.15)(z - h')\big)\ [\mathrm{m^{-3}}], \\
+\sigma(z) &= q_e N_e(z)\,\mu_{e0}\frac{N_0}{N(z)} + 5\times 10^{-14}\exp\!\left(\frac{z}{6\ \mathrm{km}}\right), \qquad \tau_\sigma(z) = \frac{\varepsilon_0}{\sigma(z)}
+\end{aligned} \tag{5.24}
+$$
+
+放電時定数 $\tau_f = 1\ \mathrm{ms}$ で鉛直電荷モーメント変化 $\Delta M_Q = Q_{\mathrm{CG}} z_Q\ [\mathrm{C\ km}]$ を除去する対地雷（CG）上空の鏡像双極子準静電場 $E_{\mathrm{QE}}(z)$ に対し、誘電緩和遮蔽係数（$r = \tau_\sigma/\tau_f$, $u = \ln r$）を解析的に適用し、Townsend 密度相似則による通常絶縁破壊電場 $E_k(z) = E_{k0}(N/N_0)$（$E_{k0} = 3.2\times 10^6\ \mathrm{V\ m^{-1}} \approx 120\ \mathrm{Td}$; Pasko et al., 1997）と比較する：
+
+$$
+\begin{aligned}
+E_{\mathrm{QE}}(z) &= \frac{\Delta M_Q}{\pi\varepsilon_0}\frac{z}{(z^2 - z_Q^2)^2}, \\
+E_{\mathrm{peak}}(z) &= E_{\mathrm{QE}}(z)\,\exp\!\left(-\frac{u}{e^u - 1}\right), \qquad E_k(z) = E_{k0}\frac{N(z)}{N_0}
+\end{aligned} \tag{5.25}
+$$
+
+スプライトハローは $E_{\mathrm{peak}} \ge 0.50\,E_k$（Qin et al., 2014）、即発下方ストリーマは $E_{\mathrm{peak}} \ge E_k$（Luque & Ebert, 2009）、$\mathrm{O}^- + \mathrm{N}_2 \to \mathrm{N}_2\mathrm{O} + e^-$ 結合電子脱離による亜破壊遅延スプライトは $\tau_\sigma \ge 1.5\ \mathrm{ms}$ の夜間中間圏で $0.70\,E_k \le E_{\mathrm{peak}} < E_k$ を満たすときに発火する（Luque & Gordillo-Vázquez, 2012）。層状アンビル氷水量で条件付けた対数正規 CG 電荷モーメント分布（$\sigma_{\ln} = 1.15$）の超過確率を $\operatorname{erfc}$ で解析積分し、下方ストリーマの終端高度 $z_{\mathrm{stop}}$ は Ebert et al. (2010) の正・負ストリーマ安定電場（$E_{\mathrm{st},0}^+ = 4.4\times 10^5$, $E_{\mathrm{st},0}^- = 1.25\times 10^6\ \mathrm{V\ m^{-1}}$）で決定する：
+
+$$
+\begin{aligned}
+P(\Delta M_Q \ge \Delta M_{Q,\mathrm{crit}}) &= \frac{1}{2}\operatorname{erfc}\!\left(\frac{\ln(\Delta M_{Q,\mathrm{crit}} / \Delta M_{Q,\mathrm{med}})}{\sqrt{2}\,\sigma_{\ln}}\right), \\
+z_{\mathrm{stop}} &= \min\!\big\{z \le z_{\mathrm{init}} : E_{\mathrm{peak}}(z) \ge E_{\mathrm{st}}^\pm(z)\big\}
+\end{aligned} \tag{5.26}
+$$
+
+$\mathrm{N}_2$ 第 1 正帯（$1\mathrm{PN}_2$、深紅 650–750 nm；$A_{1P} = 1.7\times 10^5\ \mathrm{s^{-1}}$、約 $53\ \mathrm{km}$ 以下で $\mathrm{N}_2$ 衝突消光）および第 2 正帯（$2\mathrm{PN}_2$、青紫 337 nm；$A_{2P} = 2.0\times 10^7\ \mathrm{s^{-1}}$、約 $30\ \mathrm{km}$ 以下で $\mathrm{O}_2$ 衝突消光）の発光輝度 [kR] により上部赤・下部青いひげ（tendrils）の色遷移を再現し（Pasko et al., 1997）、中間圏 $\mathrm{NO}_x$ 生成量は Sentman et al. (2008; $Y_{\mathrm{NOx}} = 5\times 10^{22}\ \mathrm{molecules\ sprite^{-1}}$) に従う：
+
+$$
+\begin{aligned}
+Q_{1P}(z) &= \frac{A_{1P}}{A_{1P} + k_{q,1P} f_{\mathrm{N}_2} N(z)}, \qquad Q_{2P}(z) = \frac{A_{2P}}{A_{2P} + k_{q,2P} f_{\mathrm{O}_2} N(z)}, \\
+S_{\mathrm{NOx,sprite}} &= \mathcal{F}_{\mathrm{sprite}}\,Y_{\mathrm{NOx}}\,\operatorname{clamp}\!\left(\frac{z_{\mathrm{init}} - z_{\mathrm{stop}}}{25\ \mathrm{km}},\ 0.3,\ 2.0\right)
+\end{aligned} \tag{5.27}
+$$
 
 ---
 
@@ -2041,16 +2079,16 @@ $$
 
 ---
 
-## 12. 一元 323 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio
+## 12. 一元 324 パラメータ TOML レジストリ・診断（Köppen–Geiger / CMIP7）・Zarr v3・AOBA Studio
 
 ### 12.1 単一 TOML 設定管理・融合 GPU カーネル・ネイティブ Zarr v3 出力
 
-全 14 セクション・323 パラメータが [`config/aoba_default.toml`](../config/aoba_default.toml)（`src/aoba/params.py`）に集約され、全 322 ユニークキーの日英物理解説が [`src/aoba/param_docs.py`](../src/aoba/param_docs.py) で、11 本の即実行プリセットが `config/presets/` で管理されている。ハードウェア可搬 `float32` 実行（`src/aoba/runtime.py` による `cuda` $\to$ `mps` $\to$ `cpu` 自動切替）では、全 104 本の単一ソース融合 Metal カーネル（`kernels.py`, `kernels_physics.py`, `kernels_extra.py`, `kernels_esm.py`）を `kernels_cuda.py` でネイティブ CUDA C++17 へ自動変換し、自動 CUDA Graph 記録・再生と合わせて鉛直三重対角解法・沈降・放射・微物理・陽的バルク発雷・CRM サブサイクル・EVP 海氷・順圧海洋サブサイクルおよび OSSP ML 特徴抽出・保存クロージャ・空間ヘッドをステップ途中 CPU–GPU 同期ゼロで実行する。モデルコアの全履歴出力（`src/aoba/io_zarr.py`）は CF-1.11 / UGRID-1.0 準拠の Zarr v3（`mesh.zarr`, `monthly.zarr`, `snapshots.zarr`, 選択時 `cmip7_monthly.zarr` / `cmip7_fx.zarr`）、日別全球診断 `daily_global.csv` および原子的チェックポイント `restart.pt` / `restart_mid.pt`（水平・鉛直解像度間の汎用球面・静水圧再補間対応）を使用する。
+全 14 セクション・324 パラメータが [`config/aoba_default.toml`](../config/aoba_default.toml)（`src/aoba/params.py`）に集約され、全 323 ユニークキーの日英物理解説が [`src/aoba/param_docs.py`](../src/aoba/param_docs.py) で、11 本の即実行プリセットが `config/presets/` で管理されている。ハードウェア可搬 `float32` 実行（`src/aoba/runtime.py` による `cuda` $\to$ `mps` $\to$ `cpu` 自動切替）では、全 104 本の単一ソース融合 Metal カーネル（`kernels.py`, `kernels_physics.py`, `kernels_extra.py`, `kernels_esm.py`）を `kernels_cuda.py` でネイティブ CUDA C++17 へ自動変換し、自動 CUDA Graph 記録・再生と合わせて鉛直三重対角解法・沈降・放射・微物理・陽的バルク発雷・CRM サブサイクル・EVP 海氷・順圧海洋サブサイクルおよび OSSP ML 特徴抽出・保存クロージャ・空間ヘッドをステップ途中 CPU–GPU 同期ゼロで実行する。モデルコアの全履歴出力（`src/aoba/io_zarr.py`）は CF-1.11 / UGRID-1.0 準拠の Zarr v3（`mesh.zarr`, `monthly.zarr`, `snapshots.zarr`, 選択時 `cmip7_monthly.zarr` / `cmip7_fx.zarr`）、日別全球診断 `daily_global.csv` および原子的チェックポイント `restart.pt` / `restart_mid.pt`（水平・鉛直解像度間の汎用球面・静水圧再補間対応）を使用する。
 
 | TOML セクション | 項目数 | 管轄領域 |
 | :--- | ---: | :--- |
 | `[grid]` | 16 | SCVT `glevel`、鉛直層 `nz`/`z_top`、CRM `(nx, ny, dx)`、時間刻み、チャンク設定 |
-| `[forcing]` | 99 | 全選択制スキーム（`rad_scheme`, `microphysics_scheme`, `lightning_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`）、OSSP 自己蒸留・シャドウ診断、軌道・暦法、ESM スイッチ |
+| `[forcing]` | 100 | 全選択制スキーム（`rad_scheme`, `microphysics_scheme`, `lightning_scheme`, `ocean_mode`, `o3_mode`, `co2_mode`, `planet_preset`）、OSSP 自己蒸留・シャドウ診断、軌道・暦法、ESM スイッチ（任意 `enable_red_sprites` 含む） |
 | `[icesheet]` | 5 | 動的 SIA 氷床有効化、EMA 時定数、加速倍率、アイソスタシー時定数 |
 | `[output]` | 23 | Zarr v3 出力間隔・分割方式、CSV、月末リスタート、CMIP7 出力 |
 | `[constants]` | 26 | 惑星半径・重力・気体定数・潜熱・海水/海氷基礎定数 |
@@ -2071,4 +2109,4 @@ $$
 
 ### 12.3 AOBA Studio ワークベンチ (`scripts/aoba_config_gui.py`)
 
-ローカル Web アプリケーション（`python scripts/aoba_config_gui.py --port 8765`）により、全 323 パラメータの日英解説・列挙型ドロップダウン編集・実験プリセット適用、同期回転 3 地球儀（`T₂`, `Precip`, 10 種 ESM 診断場）と観測基準範囲（ERA5, CERES EBAF, GPCP, MODIS, NSIDC）対比、および KaTeX 数式組版（オフライン時は内蔵再帰下降レンダラへ自動フォールバック）＋SVG 概念図付き内蔵ドキュメントビューアを提供する。
+ローカル Web アプリケーション（`python scripts/aoba_config_gui.py --port 8765`）により、全 324 パラメータの日英解説・列挙型ドロップダウン編集・実験プリセット適用、同期回転 3 地球儀（`T₂`, `Precip`, 10 種 ESM 診断場）と観測基準範囲（ERA5, CERES EBAF, GPCP, MODIS, NSIDC）対比、および KaTeX 数式組版（オフライン時は内蔵再帰下降レンダラへ自動フォールバック）＋SVG 概念図付き内蔵ドキュメントビューアを提供する。

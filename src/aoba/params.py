@@ -282,7 +282,7 @@ _FORCING_KEYS: tuple[str, ...] = (
     "crm_distill_dwell_steps", "crm_distill_hidden_dim", "crm_distill_replay_size",
     "enable_dust", "dust_emis_factor",
     "h_ml_ocean", "ocean_mode", "ocean_glevel", "ocean_nz", "ocean_stride", "enable_seaice_drift", "enable_ocean_bgc",
-    "enable_river_routing", "enable_land_carbon", "enable_land_nitrogen", "enable_lightning", "lightning_scheme",
+    "enable_river_routing", "enable_land_carbon", "enable_land_nitrogen", "enable_lightning", "lightning_scheme", "enable_red_sprites",
     "enable_fire_veg_feedback", "enable_seaice_evp_itd", "enable_ogcm_fct_zstar",
     "enable_ogcm_scale_aware_gm", "enable_ogcm_submeso", "enable_ogcm_tidal_mixing",
     "enable_current_rel_wind", "enable_natural_aerosols", "enable_aerosol_rad_forcing",

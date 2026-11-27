@@ -274,6 +274,10 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "ja": "発雷物理スキームの選択（diagnostic: 高速 CRM 霰フラックス＋寒冷雲厚診断 McCaul 2009 / Price & Rind 1993；explicit_bulk: SCALE-LT 相当の 5 水物質電荷密度予報・Takahashi 1978 温度–LWC 極性反転非誘導帯電・2D/3D FFT＋Thomas ポアソン電場解法・Fierro 2013 絶縁破壊放電・IC/CG 分離）。",
         "en": "Lightning physics scheme selector (diagnostic: fast McCaul 2009 graupel-flux + Price & Rind 1993 cold-cloud-depth proxy; explicit_bulk: SCALE-LT-class 5-species prognostic hydrometeor charge density, Takahashi 1978 temperature–LWC polarity-reversal riming electrification, exact 2D/3D FFT+Thomas Poisson electric potential, Fierro 2013 dielectric breakdown discharge, and explicit IC/CG separation).",
     },
+    "enable_red_sprites": {
+        "ja": "対地雷 (CG) 電荷モーメント変化と昼夜 D 層電離圏遮蔽に基づく中間圏レッドスプライト・スプライトハローモデル（Pasko 1997; Luque & Ebert 2009; Ebert 2010; Luque & Gordillo-Vázquez 2012; Sentman 2008：発生率・1PN2赤/2PN2青輝度・終端高度・中間圏 NOₓ）を有効化（既定 false）。",
+        "en": "Enable first-principles mesospheric red sprite & sprite-halo TLE model driven by CG charge moment change and day/night Wait-Spies D-region screening (Pasko 1997; Luque & Ebert 2009; Ebert 2010; Luque & Gordillo-Vázquez 2012; Sentman 2008: prompt/delayed sprite & halo rates, 1PN2 red / 2PN2 blue brightness, stopping altitude, and mesospheric NOₓ; default false).",
+    },
     "enable_fire_veg_feedback": {
         "ja": "SPITFIRE 機構に基づく MAML パッチ山火事（発雷着火・乾燥度・植生燃焼・煙エアロゾル・CO₂ 放出）を有効化。",
         "en": "Enable SPITFIRE wildfire ignition/spread on MAML land patches with vegetation mortality and smoke/CO₂ emissions.",

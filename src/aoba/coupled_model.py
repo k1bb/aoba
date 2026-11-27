@@ -108,6 +108,7 @@ class AOBAConfig:
     enable_land_nitrogen: bool = True        # Stocker & Prentice (2024) CN-model & FUN/Houlton BNF nitrogen cycle
     enable_lightning: bool = True            # Map-free CRM non-inductive charging lightning & LNOx deposition
     lightning_scheme: str = "diagnostic"     # "diagnostic" (McCaul 2009 proxy) or "explicit_bulk" (SCALE-LT 5-species charge + Poisson + breakdown)
+    enable_red_sprites: bool = False         # Optional first-principles mesospheric red sprite & sprite-halo TLE model (Pasko 1997; Luque & GV 2012; Sentman 2008)
     enable_fire_veg_feedback: bool = True    # MAML burnt-patch crown-fire reset of EEO LAI & canopy height
     enable_seaice_evp_itd: bool = True       # MPAS-Seaice Voronoi EVP rheology + 5-category ITD
     enable_ogcm_fct_zstar: bool = True       # FESOM2-style 3D Zalesak FCT advection + exact z* coordinate
@@ -272,6 +273,7 @@ class AOBAState:
     last_sfc_diag_sub: SurfaceFluxDiagnostics | None = None  # Zero-copy ref for optional CMIP7 diagnostics
     last_s_toa: torch.Tensor | None = None                   # Zero-copy ref for TOA incident SW (`rsdt`)
     last_lightning: object | None = None                     # Latest CRM LightningDiagnostics (CG strikes + LNOx)
+    last_red_sprites: object | None = None                   # Optional mesospheric RedSpriteDiagnostics when enable_red_sprites=True
     explicit_lightning: object | None = None                 # Optional ExplicitLightningState when lightning_scheme == "explicit_bulk"
     lightning_distill: object | None = None                  # Optional OSSP Hurdle lightning self-distillation state
     crm_distill: object | None = None                        # Optional online self-distilling 2D/3D CRM controller
@@ -3718,6 +3720,24 @@ def step_aoba_model(
                 q_s_prog=getattr(crm, "q_s", None),
             )
         model.last_lightning = light_diag
+        if bool(getattr(cfg, "enable_red_sprites", False)) and light_diag is not None:
+            from aoba.red_sprites import compute_red_sprites
+
+            ccd_cell = light_diag.cold_cloud_km_sub.reshape(nc, -1).mean(dim=-1)
+            model.last_red_sprites = compute_red_sprites(
+                flash_cg_cell=light_diag.flash_cg_cell,
+                cold_cloud_km_cell=ccd_cell,
+                mu0_cell=mu0,
+                rho_host=atmos.rho_d,
+                theta_m_host=atmos.theta_m,
+                q_v_host=atmos.q_v,
+                q_i_host=atmos.q_i,
+                q_p_host=atmos.q_p,
+                z_c_host=atmos.z_c,
+                dz_c_host=atmos.dz_c,
+                area_cell=mesh.area_cell,
+                explicit_state=model.explicit_lightning,
+            )
     f_dust_dep_cell = None
     if cfg.enable_dust:
         if atmos.q_dust is None:

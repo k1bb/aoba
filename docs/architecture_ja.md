@@ -83,7 +83,7 @@ AOBA は以下の 2 つの地球システム科学上の基本問題を検証し
 
 ---
 
-## 8. 323 パラメータ一元管理・104 カーネル Metal/CUDA バックエンド・標準診断
+## 8. 324 パラメータ一元管理・104 カーネル Metal/CUDA バックエンド・標準診断
 
-- **統合 TOML と `AOBA Studio`（`src/aoba/params.py`, `src/aoba/param_docs.py`, `scripts/aoba_config_gui.py`）**: 全 14 セクション・**323 パラメータ**を [`config/aoba_default.toml`](../config/aoba_default.toml) に一元化し（日英 100% 物理解説）、**11 本の実験プリセット**（`config/presets/`）、任意解像度・層数間リスタート再補間（`AG4 → AG6` 等）、30 クラス Köppen–Geiger 分類（`src/aoba/koppen.py`）、および CMIP7 Data Request v1.2 準拠 Zarr v3 出力（`src/aoba/cmip7_diag.py`, `src/aoba/io_zarr.py`）を提供します。
+- **統合 TOML と `AOBA Studio`（`src/aoba/params.py`, `src/aoba/param_docs.py`, `scripts/aoba_config_gui.py`）**: 全 14 セクション・**324 パラメータ**を [`config/aoba_default.toml`](../config/aoba_default.toml) に一元化し（日英 100% 物理解説）、**11 本の実験プリセット**（`config/presets/`）、任意解像度・層数間リスタート再補間（`AG4 → AG6` 等）、任意の中間圏レッドスプライト・ハロー TLE モジュール（`src/aoba/red_sprites.py`）、30 クラス Köppen–Geiger 分類（`src/aoba/koppen.py`）、および CMIP7 Data Request v1.2 準拠 Zarr v3 出力（`src/aoba/cmip7_diag.py`, `src/aoba/io_zarr.py`）を提供します。
 - **104 カーネル単一ソース Metal/CUDA ＋ CUDA Graphs バックエンド（`src/aoba/kernels*.py`, `src/aoba/kernels_cuda.py`, `src/aoba/runtime.py`）**: SCVT RK3-HEVI 力学、2D/3D CRM、FCT 移流、1M/2M/6 クラス微物理、RRTMGP/CKD-HD/CKD/4 バンド放射、3D 予報オゾン、MYNN PBL、圧縮陸面/生態系 Newton–Raphson、MAML/湖沼/C-N/火災/診断型・陽的バルク発雷、ダスト/エアロゾル/水同位体、5 カテゴリー EVP-ITD 海氷、3D $z^*$ OGCM/KPP/GM/Redi/FlexPFT BGC、OGW/NGWD、および OSSP 特徴抽出・厳密保存クロージャ・空間ヘッド・アンサンブル計算を網羅する **全 104 個の融合 GPU カーネル**を Metal Shading Language で単一記述し、NVIDIA GPU 上では決定論的に CUDA C++17 へ自動トランスパイル・キャッシュするとともに、CUDA Graphs 自動キャプチャ/リプレイによりホスト CPU オーバーヘッドを排除します。

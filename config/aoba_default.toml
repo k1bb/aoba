@@ -74,6 +74,7 @@ enable_land_carbon = true
 enable_land_nitrogen = true
 enable_lightning = true
 lightning_scheme = "diagnostic"
+enable_red_sprites = false
 enable_fire_veg_feedback = true
 enable_seaice_evp_itd = true
 enable_ogcm_fct_zstar = true
