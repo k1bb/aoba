@@ -181,6 +181,7 @@ class CPUGlobePreviewEngine:
         esm_range: tuple[float, float] = (0.0, 7.0),
         esm_land_only: bool = True,
         *,
+        esm_mask_mode: str | None = None,
         olr: np.ndarray | None = None,
         sst_c: np.ndarray | None = None,
         seaice_frac: np.ndarray | None = None,
@@ -199,17 +200,18 @@ class CPUGlobePreviewEngine:
         ocn_u_ms: np.ndarray | None = None,
         ocn_v_ms: np.ndarray | None = None,
         ocn_depth_m: np.ndarray | None = None,
+        lightning_km2yr: np.ndarray | None = None,
+        sprite_km2yr: np.ndarray | None = None,
         solar_decl_deg: float | None = None,
         subsolar_lon_deg: float | None = None,
     ) -> dict[str, Any]:
         """Regrid irregular SCVT cell arrays onto `[180, 360]` on CPU and encode compact Uint8 rasters for 6 globes."""
         t0 = time.perf_counter()
+        mask_mode = esm_mask_mode if esm_mask_mode in ("land", "ocean", "global") else ("land" if esm_land_only else "global")
         idxs, w, nn1 = self._get_interp_weights(lat_deg, lon_deg)
 
         t2_grid = (t2_c[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
         precip_grid = (precip[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
-        lai_nn = np.where(surf_type == 1, lai, 0.0) if esm_land_only else lai
-        lai_grid = (lai_nn[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
         surf_grid = surf_type[nn1].reshape(self.GRID_H, self.GRID_W).astype(np.uint8)
         olr_arr = olr if olr is not None else np.full_like(t2_c, 240.0)
         olr_grid = (olr_arr[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
@@ -221,17 +223,17 @@ class CPUGlobePreviewEngine:
         diff_y = np.zeros_like(is_land)
         diff_y[1:, :] = is_land[1:, :] != is_land[:-1, :]
         coast[(diff_x | diff_y)] = 1
-        if esm_land_only:
-            lai_grid = np.where(surf_grid == 1, lai_grid, 0.0)
 
         # Ocean globes (SST + Sea Ice, Surface Current Speed): use native fine OGCM mesh (e.g. G7 28 km) when present!
-        if (
+        has_native_ocn = (
             ocn_lat_deg is not None
             and ocn_lon_deg is not None
-            and sst_c is not None
-            and sst_c.shape[0] == ocn_lat_deg.shape[0]
-        ):
+            and ocn_lat_deg.shape[0] > 0
+        )
+        o_idxs = o_w = o_nn1 = None
+        if has_native_ocn:
             o_idxs, o_w, o_nn1 = self._get_interp_weights(ocn_lat_deg, ocn_lon_deg)
+        if has_native_ocn and sst_c is not None and sst_c.shape[0] == ocn_lat_deg.shape[0]:
             sst_grid = (sst_c[o_idxs] * o_w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
             ice_arr = seaice_frac if (seaice_frac is not None and seaice_frac.shape[0] == ocn_lat_deg.shape[0]) else np.zeros_like(sst_c)
             ice_grid = (ice_arr[o_idxs] * o_w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
@@ -251,6 +253,17 @@ class CPUGlobePreviewEngine:
             spd_grid = (spd_arr[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
             owet_grid = (surf_grid == 0).astype(np.uint8)
             ocn_res_lbl = f"Host Grid ({lat_deg.shape[0]:,} cells)"
+
+        # Selectable 6th ESM globe field: supports both host SCVT mesh AND native fine OGCM mesh!
+        if has_native_ocn and o_idxs is not None and lai.shape[0] == ocn_lat_deg.shape[0] and lai.shape[0] != lat_deg.shape[0]:
+            lai_grid = (lai[o_idxs] * o_w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+        else:
+            lai_nn = np.where(surf_type == 1, lai, 0.0) if mask_mode == "land" else lai
+            lai_grid = (lai_nn[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+        if mask_mode == "land":
+            lai_grid = np.where(surf_grid == 1, lai_grid, 0.0)
+        elif mask_mode == "ocean":
+            lai_grid = np.where(owet_grid == 1, lai_grid, float(esm_range[0]))
 
         o_land = owet_grid == 0
         ocn_coast = np.zeros_like(owet_grid)
@@ -276,6 +289,17 @@ class CPUGlobePreviewEngine:
         if wave_hs_m is not None and wave_hs_m.shape[0] == lat_deg.shape[0]:
             wv_g = (wave_hs_m[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
             extra_b64["wave_b64"] = self._quantize_u8(wv_g, 0.0, 10.0)
+        if lightning_km2yr is not None and lightning_km2yr.shape[0] == lat_deg.shape[0]:
+            # Log-compressed lightning intensity so both light storms and intense cores glow crisply
+            lgt_pos = np.maximum(lightning_km2yr, 0.0)
+            lgt_g = (lgt_pos[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            lgt_log = np.log1p(lgt_g / 1.5) / math.log1p(250.0 / 1.5)
+            extra_b64["light_b64"] = self._quantize_u8(lgt_log, 0.0, 1.0)
+        if sprite_km2yr is not None and sprite_km2yr.shape[0] == lat_deg.shape[0]:
+            spr_pos = np.maximum(sprite_km2yr, 0.0)
+            spr_g = (spr_pos[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            spr_log = np.log1p(spr_g / 0.05) / math.log1p(12.0 / 0.05)
+            extra_b64["sprite_b64"] = self._quantize_u8(spr_log, 0.0, 1.0)
         if u10_u is not None and u10_v is not None and u10_u.shape[0] == lat_deg.shape[0]:
             wu_g = (u10_u[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
             wv_g = (u10_v[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
@@ -284,7 +308,7 @@ class CPUGlobePreviewEngine:
             extra_b64["wind_v_b64"] = self._quantize_u8(wv_g, -25.0, 25.0)
             extra_b64["wind_spd_b64"] = self._quantize_u8(wspd_g, 0.0, 25.0)
         if ocn_u_ms is not None and ocn_v_ms is not None:
-            if ocn_lat_deg is not None and ocn_u_ms.shape[0] == ocn_lat_deg.shape[0]:
+            if has_native_ocn and o_idxs is not None and ocn_u_ms.shape[0] == ocn_lat_deg.shape[0]:
                 ou_g = (ocn_u_ms[o_idxs] * o_w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
                 ov_g = (ocn_v_ms[o_idxs] * o_w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
             elif ocn_u_ms.shape[0] == lat_deg.shape[0]:
@@ -296,7 +320,7 @@ class CPUGlobePreviewEngine:
                 extra_b64["ocn_u_b64"] = self._quantize_u8(ou_g, -1.2, 1.2)
                 extra_b64["ocn_v_b64"] = self._quantize_u8(ov_g, -1.2, 1.2)
         if ocn_depth_m is not None:
-            if ocn_lat_deg is not None and ocn_depth_m.shape[0] == ocn_lat_deg.shape[0]:
+            if has_native_ocn and o_idxs is not None and ocn_depth_m.shape[0] == ocn_lat_deg.shape[0]:
                 dp_g = (ocn_depth_m[o_idxs] * o_w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
                 extra_b64["depth_b64"] = self._quantize_u8(dp_g, 0.0, 4000.0)
             elif ocn_depth_m.shape[0] == lat_deg.shape[0]:
@@ -320,7 +344,8 @@ class CPUGlobePreviewEngine:
             "ocn_is_wind": bool(ocn_is_wind),
             "ocn_res_lbl": ocn_res_lbl,
             "lai_range": [lo3, hi3],
-            "esm_land_only": bool(esm_land_only),
+            "esm_land_only": bool(mask_mode == "land"),
+            "esm_mask_mode": mask_mode,
             "t2_b64": self._quantize_u8(t2_grid, -45.0, 40.0),
             "ir_b64": self._quantize_u8(olr_grid, 110.0, 320.0),
             "precip_b64": self._quantize_u8(precip_grid, 0.0, 25.0),
@@ -337,18 +362,23 @@ class CPUGlobePreviewEngine:
         }
 
 
-_ESM_GLOBE_SPECS: dict[str, tuple[str, float, float, bool]] = {
-    "lai": ("LAI [m² m⁻²]", 0.0, 7.0, True),
-    "o3_tco_du": ("Total Ozone O₃ [DU]", 150.0, 420.0, False),
-    "lightning_flash_rate": ("Lightning [fl km⁻² yr⁻¹]", 0.0, 30.0, False),
-    "volc_aod": ("Volcanic AOD (550nm)", 0.0, 0.4, False),
-    "f_wetland": ("Wetland/Lake Frac [-]", 0.0, 0.85, True),
-    "d18o_precip_permil": ("Precip δ¹⁸O [‰]", -45.0, 2.0, False),
-    "co2_sfc_ppmv": ("Surface CO₂ [ppmv]", 260.0, 460.0, False),
-    "ocn_chl_sfc": ("Ocean Chl [mg m⁻³]", 0.0, 2.0, False),
-    "ocn_o2_sfc": ("Ocean O₂ [mmol m⁻³]", 140.0, 360.0, False),
-    "wave_hs_m": ("Wave Height H_s [m]", 0.0, 8.0, False),
+_ESM_GLOBE_SPECS: dict[str, tuple[str, float, float, str]] = {
+    "lai": ("LAI [m² m⁻²]", 0.0, 7.0, "land"),
+    "h_canopy": ("Canopy Height [m]", 0.0, 35.0, "land"),
+    "f_evg": ("Evergreen Frac [-]", 0.0, 1.0, "land"),
+    "f_c4": ("C₄ Grass Frac [-]", 0.0, 1.0, "land"),
+    "o3_tco_du": ("Total Ozone O₃ [DU]", 150.0, 420.0, "global"),
+    "lightning_flash_rate": ("Lightning [fl km⁻² yr⁻¹]", 0.0, 40.0, "global"),
+    "sprite_rate": ("Red Sprites & TLE [ev km⁻² yr⁻¹]", 0.0, 2.0, "global"),
+    "volc_aod": ("Volcanic / Aero AOD (550nm)", 0.0, 0.4, "global"),
+    "f_wetland": ("Wetland/Lake Frac [-]", 0.0, 0.85, "land"),
+    "d18o_precip_permil": ("Precip δ¹⁸O [‰]", -45.0, 2.0, "global"),
+    "co2_sfc_ppmv": ("Surface CO₂ [ppmv]", 260.0, 460.0, "global"),
+    "ocn_chl_sfc": ("Ocean Chl [mg m⁻³]", 0.0, 2.0, "ocean"),
+    "ocn_o2_sfc": ("Ocean O₂ [mmol m⁻³]", 140.0, 360.0, "ocean"),
+    "wave_hs_m": ("Wave Height H_s [m]", 0.0, 8.0, "ocean"),
 }
+_FL_M2S_TO_KM2YR = 1.0e6 * 365.2425 * 86400.0
 
 
 def _compute_obs_benchmark(csv_data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -419,8 +449,8 @@ def _load_zarr_frame_payload(
     frame_info: dict[str, Any],
     kind: str,
     esm_field: str = "lai",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str, list[str]]:
-    """Extract `(lat, lon, t2_c, precip, field3, surf_type, source_label, avail_esm_fields)` from a Zarr slice."""
+) -> dict[str, Any]:
+    """Extract 2D/surface arrays (including fine-ocean fields and TLE rates) from a Zarr slice."""
     import xarray as xr
 
     store = Path(frame_info["store"])
@@ -429,16 +459,59 @@ def _load_zarr_frame_payload(
     try:
         lat_deg = np.asarray(ds["lat_cell"].values, dtype=np.float32)
         lon_deg = np.asarray(ds["lon_cell"].values, dtype=np.float32)
-        avail_esm = [k for k in _ESM_GLOBE_SPECS if k in ds and ds[k].shape[-1] == lat_deg.shape[0]]
+        n_cell = int(lat_deg.shape[0])
+
+        # Optional fine-ocean mesh coordinates for native OGCM fields (e.g. ocn_chl_sfc, ocn_o2_sfc)
+        ocn_lat_deg: np.ndarray | None = None
+        ocn_lon_deg: np.ndarray | None = None
+        ocn_wet: np.ndarray | None = None
+        if "ocn_lat_cell" in ds and "ocn_lon_cell" in ds:
+            ocn_lat_deg = np.asarray(ds["ocn_lat_cell"].values, dtype=np.float32)
+            ocn_lon_deg = np.asarray(ds["ocn_lon_cell"].values, dtype=np.float32)
+        elif (out_root / "mesh_ocean.zarr").exists():
+            mo = xr.open_zarr(out_root / "mesh_ocean.zarr", consolidated=False)
+            if "lat_cell" in mo and "lon_cell" in mo:
+                ocn_lat_deg = np.asarray(mo["lat_cell"].values, dtype=np.float32)
+                ocn_lon_deg = np.asarray(mo["lon_cell"].values, dtype=np.float32)
+                if "wet_c" in mo:
+                    ocn_wet = np.asarray(mo["wet_c"].values[0], dtype=np.uint8)
+            mo.close()
+        elif (out_root / "live_preview.npz").exists():
+            try:
+                with np.load(out_root / "live_preview.npz") as zlp:
+                    if "ocn_lat_deg" in zlp and "ocn_lon_deg" in zlp:
+                        ocn_lat_deg = np.asarray(zlp["ocn_lat_deg"], dtype=np.float32)
+                        ocn_lon_deg = np.asarray(zlp["ocn_lon_deg"], dtype=np.float32)
+                        if "ocn_wet" in zlp:
+                            ocn_wet = np.asarray(zlp["ocn_wet"], dtype=np.uint8)
+            except Exception:
+                pass
+        n_ocn = int(ocn_lat_deg.shape[0]) if ocn_lat_deg is not None else -1
+
+        def _has_var(key: str) -> bool:
+            if key in ds and ds[key].shape[-1] in (n_cell, n_ocn):
+                return True
+            if key == "ocn_o2_sfc" and "ocn_o2" in ds and ds["ocn_o2"].shape[-1] in (n_cell, n_ocn):
+                return True
+            if key == "volc_aod" and any(a in ds for a in ("aod_so4", "aod_ss", "aod_bc", "aod_oc")):
+                return True
+            if key == "f_wetland" and "f_lake" in ds:
+                return True
+            return False
+
+        avail_esm = [k for k in _ESM_GLOBE_SPECS if _has_var(k)]
         if "lai" not in avail_esm:
             avail_esm.insert(0, "lai")
 
         surf_type = None
+        z_topo = None
         if "surf_type" in ds:
             surf_type = np.asarray(ds["surf_type"].values, dtype=np.int8)
         elif (out_root / "mesh.zarr").exists():
             m = xr.open_zarr(out_root / "mesh.zarr", consolidated=False)
             surf_type = np.asarray(m["surf_type"].values, dtype=np.int8)
+            if "z_topo" in m:
+                z_topo = np.asarray(m["z_topo"].values, dtype=np.float32)
             m.close()
         if surf_type is None:
             surf_type = np.ones_like(lat_deg, dtype=np.int8)
@@ -462,19 +535,62 @@ def _load_zarr_frame_payload(
         else:
             precip = np.zeros_like(lat_deg, dtype=np.float32)
 
-        f3_key = esm_field if (esm_field in ds and ds[esm_field].shape[-1] == lat_deg.shape[0]) else "lai"
-        if f3_key != "lai":
-            f3 = np.asarray(ds[f3_key].isel(time=idx).values, dtype=np.float32)
-            if f3_key == "lightning_flash_rate":
-                # Convert fl m^-2 s^-1 -> fl km^-2 yr^-1
-                f3 = f3 * (1.0e6 * 365.2425 * 86400.0)
-        elif "lai" in ds:
-            f3 = np.asarray(ds["lai"].isel(time=idx).values, dtype=np.float32)
-        elif "lai_sub" in ds:
-            arr = np.asarray(ds["lai_sub"].isel(time=idx).values, dtype=np.float32)
-            f3 = arr.mean(axis=tuple(range(1, arr.ndim)))
+        def _extract_esm(key: str) -> tuple[np.ndarray | None, bool]:
+            if key == "ocn_o2_sfc" and key not in ds and "ocn_o2" in ds:
+                arr = np.asarray(ds["ocn_o2"].isel(time=idx).values, dtype=np.float32)
+                return (arr[0] if arr.ndim >= 2 else arr), True
+            if key == "volc_aod" and key not in ds:
+                tot = None
+                for ak in ("aod_ss", "aod_so4", "aod_bc", "aod_oc"):
+                    if ak in ds:
+                        v = np.asarray(ds[ak].isel(time=idx).values, dtype=np.float32)
+                        tot = v if tot is None else (tot + v)
+                if tot is not None:
+                    return tot, True
+            if key == "f_wetland":
+                fw = np.asarray(ds["f_wetland"].isel(time=idx).values, dtype=np.float32) if "f_wetland" in ds else None
+                fl = np.asarray(ds["f_lake"].isel(time=idx).values, dtype=np.float32) if "f_lake" in ds else None
+                if fw is not None and fl is not None:
+                    return np.clip(fw + fl, 0.0, 1.0), True
+                if fw is not None:
+                    return fw, True
+                if fl is not None:
+                    return fl, True
+            if key == "sprite_rate":
+                sp = np.asarray(ds["sprite_rate"].isel(time=idx).values, dtype=np.float32) if "sprite_rate" in ds else None
+                el = np.asarray(ds["elves_rate"].isel(time=idx).values, dtype=np.float32) if "elves_rate" in ds else None
+                if sp is not None and el is not None:
+                    return (sp + el) * _FL_M2S_TO_KM2YR, True
+                if sp is not None:
+                    return sp * _FL_M2S_TO_KM2YR, True
+                if el is not None:
+                    return el * _FL_M2S_TO_KM2YR, True
+                return None, False
+            if key in ds and ds[key].shape[-1] in (n_cell, n_ocn):
+                val = np.asarray(ds[key].isel(time=idx).values, dtype=np.float32)
+                if val.ndim >= 2:
+                    val = val[0]
+                if key == "lightning_flash_rate":
+                    val = val * _FL_M2S_TO_KM2YR
+                return val, True
+            return None, False
+
+        esm_missing = False
+        if esm_field == "lai":
+            if "lai" in ds:
+                f3 = np.asarray(ds["lai"].isel(time=idx).values, dtype=np.float32)
+            elif "lai_sub" in ds:
+                arr = np.asarray(ds["lai_sub"].isel(time=idx).values, dtype=np.float32)
+                f3 = arr.mean(axis=tuple(range(1, arr.ndim)))
+            else:
+                f3 = np.zeros_like(lat_deg, dtype=np.float32)
         else:
-            f3 = np.zeros_like(lat_deg, dtype=np.float32)
+            f3_ext, found = _extract_esm(esm_field)
+            if found and f3_ext is not None:
+                f3 = f3_ext
+            else:
+                esm_missing = True
+                f3 = np.zeros_like(lat_deg, dtype=np.float32)
 
         olr_arr = np.asarray(ds["olr"].isel(time=idx).values, dtype=np.float32) if "olr" in ds else np.full_like(lat_deg, 240.0)
         sst_c = t_ocn - 273.15
@@ -485,7 +601,37 @@ def _load_zarr_frame_payload(
         else:
             seaice = np.zeros_like(lat_deg, dtype=np.float32)
 
-        return lat_deg, lon_deg, t2_c, precip, f3, surf_type, f"{kind} ({frame_info['label']})", avail_esm, olr_arr, sst_c, seaice
+        lwp_gm2 = np.asarray(ds["lwp"].isel(time=idx).values, dtype=np.float32) * 1.0e3 if "lwp" in ds else None
+        iwp_gm2 = np.asarray(ds["iwp"].isel(time=idx).values, dtype=np.float32) * 1.0e3 if "iwp" in ds else None
+        swe_land = np.asarray(ds["swe_land"].isel(time=idx).values, dtype=np.float32) if "swe_land" in ds else None
+        wave_hs_m = np.asarray(ds["wave_hs_m"].isel(time=idx).values, dtype=np.float32) if "wave_hs_m" in ds else None
+        lgt_km2yr, _ = _extract_esm("lightning_flash_rate")
+        spr_km2yr, _ = _extract_esm("sprite_rate")
+
+        return {
+            "lat_deg": lat_deg,
+            "lon_deg": lon_deg,
+            "t2_c": t2_c,
+            "precip": precip,
+            "f3": f3,
+            "surf_type": surf_type,
+            "src_lbl": f"{kind} ({frame_info['label']})",
+            "avail_esm": avail_esm,
+            "esm_missing": esm_missing,
+            "olr": olr_arr,
+            "sst_c": sst_c,
+            "seaice": seaice,
+            "ocn_lat_deg": ocn_lat_deg,
+            "ocn_lon_deg": ocn_lon_deg,
+            "ocn_wet": ocn_wet,
+            "lwp_gm2": lwp_gm2,
+            "iwp_gm2": iwp_gm2,
+            "swe_land": swe_land,
+            "z_topo": z_topo,
+            "wave_hs_m": wave_hs_m,
+            "lightning_km2yr": lgt_km2yr,
+            "sprite_km2yr": spr_km2yr,
+        }
     finally:
         ds.close()
 
@@ -750,7 +896,7 @@ class RunManager:
     ) -> dict[str, Any]:
         # Ultra-lightweight 304 fast-path when polling live_preview.npz at high cadence (120 ms)
         chosen_fast = out_dir_str.strip()
-        if chosen_fast and last_mtime > 0.0 and source in ("auto", "live") and esm_field == "lai" and frame_req < 0:
+        if chosen_fast and last_mtime > 0.0 and source in ("auto", "live") and frame_req < 0:
             live_fast = Path(chosen_fast).expanduser() / "live_preview.npz"
             try:
                 if live_fast.exists():
@@ -805,8 +951,20 @@ class RunManager:
 
         chosen_mode = source
         if source == "auto":
-            if live_npz.exists() and (esm_field == "lai" or (not snap_frames and not mon_frames)):
-                chosen_mode = "live"
+            if live_npz.exists():
+                use_live = True
+                if esm_field != "lai" and (snap_frames or mon_frames):
+                    try:
+                        with np.load(live_npz) as zchk:
+                            use_live = esm_field in zchk.files
+                    except Exception:
+                        use_live = False
+                if use_live:
+                    chosen_mode = "live"
+                elif snap_frames:
+                    chosen_mode = "snapshots"
+                elif mon_frames:
+                    chosen_mode = "monthly"
             elif snap_frames:
                 chosen_mode = "snapshots"
             elif mon_frames:
@@ -815,53 +973,82 @@ class RunManager:
         if chosen_mode == "live" and live_npz.exists():
             try:
                 mtime = live_npz.stat().st_mtime
-                cache_key = (str(out_root), "live", 0, mtime)
+                spec = _ESM_GLOBE_SPECS.get(esm_field, _ESM_GLOBE_SPECS["lai"])
+                cache_key = (str(out_root), "live", 0, mtime, esm_field)
                 cached = self.engine._frame_cache.get(cache_key)
                 if cached is None:
                     with np.load(live_npz) as zf:
+                        zfiles = set(zf.files)
                         lat_deg = np.asarray(zf["lat_deg"], dtype=np.float32)
                         lon_deg = np.asarray(zf["lon_deg"], dtype=np.float32)
                         t2_c = np.asarray(zf["t2_k"], dtype=np.float32) - 273.15
                         precip = (
                             np.asarray(zf["precip_mm_day"], dtype=np.float32)
-                            if "precip_mm_day" in zf
+                            if "precip_mm_day" in zfiles
                             else np.zeros_like(t2_c)
                         )
-                        olr = np.asarray(zf["olr"], dtype=np.float32) if "olr" in zf else np.full_like(t2_c, 240.0)
-                        lai = np.asarray(zf["lai"], dtype=np.float32)
+                        olr = np.asarray(zf["olr"], dtype=np.float32) if "olr" in zfiles else np.full_like(t2_c, 240.0)
+                        lai_base = np.asarray(zf["lai"], dtype=np.float32)
                         surf_type = np.asarray(zf["surf_type"], dtype=np.int8)
-                        has_ocn_mesh = "ocn_lat_deg" in zf and "ocn_sst_c" in zf
-                        lwp_gm2 = np.asarray(zf["lwp_gm2"], dtype=np.float32) if "lwp_gm2" in zf else None
-                        iwp_gm2 = np.asarray(zf["iwp_gm2"], dtype=np.float32) if "iwp_gm2" in zf else None
-                        swe_land = np.asarray(zf["swe_land"], dtype=np.float32) if "swe_land" in zf else None
-                        z_topo = np.asarray(zf["z_topo"], dtype=np.float32) if "z_topo" in zf else None
-                        wave_hs_m = np.asarray(zf["wave_hs_m"], dtype=np.float32) if "wave_hs_m" in zf else None
-                        u10_u = np.asarray(zf["u10_u"], dtype=np.float32) if "u10_u" in zf else None
-                        u10_v = np.asarray(zf["u10_v"], dtype=np.float32) if "u10_v" in zf else None
-                        solar_decl_deg = float(zf["solar_decl_deg"]) if "solar_decl_deg" in zf else None
-                        subsolar_lon_deg = float(zf["subsolar_lon_deg"]) if "subsolar_lon_deg" in zf else None
+                        has_ocn_mesh = "ocn_lat_deg" in zfiles and "ocn_sst_c" in zfiles
+                        lwp_gm2 = np.asarray(zf["lwp_gm2"], dtype=np.float32) if "lwp_gm2" in zfiles else None
+                        iwp_gm2 = np.asarray(zf["iwp_gm2"], dtype=np.float32) if "iwp_gm2" in zfiles else None
+                        swe_land = np.asarray(zf["swe_land"], dtype=np.float32) if "swe_land" in zfiles else None
+                        z_topo = np.asarray(zf["z_topo"], dtype=np.float32) if "z_topo" in zfiles else None
+                        wave_hs_m = np.asarray(zf["wave_hs_m"], dtype=np.float32) if "wave_hs_m" in zfiles else None
+                        u10_u = np.asarray(zf["u10_u"], dtype=np.float32) if "u10_u" in zfiles else None
+                        u10_v = np.asarray(zf["u10_v"], dtype=np.float32) if "u10_v" in zfiles else None
+                        lgt_km2yr = (
+                            np.asarray(zf["lightning_flash_rate"], dtype=np.float32) * _FL_M2S_TO_KM2YR
+                            if "lightning_flash_rate" in zfiles
+                            else None
+                        )
+                        spr_km2yr = (
+                            np.asarray(zf["sprite_rate"], dtype=np.float32) * _FL_M2S_TO_KM2YR
+                            if "sprite_rate" in zfiles
+                            else None
+                        )
+                        solar_decl_deg = float(zf["solar_decl_deg"]) if "solar_decl_deg" in zfiles else None
+                        subsolar_lon_deg = float(zf["subsolar_lon_deg"]) if "subsolar_lon_deg" in zfiles else None
                         if has_ocn_mesh:
                             ocn_lat_deg = np.asarray(zf["ocn_lat_deg"], dtype=np.float32)
                             ocn_lon_deg = np.asarray(zf["ocn_lon_deg"], dtype=np.float32)
-                            ocn_wet = np.asarray(zf["ocn_wet"], dtype=np.uint8) if "ocn_wet" in zf else None
-                            ocn_depth_m = np.asarray(zf["ocn_depth_m"], dtype=np.float32) if "ocn_depth_m" in zf else None
+                            ocn_wet = np.asarray(zf["ocn_wet"], dtype=np.uint8) if "ocn_wet" in zfiles else None
+                            ocn_depth_m = np.asarray(zf["ocn_depth_m"], dtype=np.float32) if "ocn_depth_m" in zfiles else None
                             sst_c = np.asarray(zf["ocn_sst_c"], dtype=np.float32)
-                            ocn_spd = np.asarray(zf["ocn_speed_ms"], dtype=np.float32) if "ocn_speed_ms" in zf else np.zeros_like(sst_c)
-                            ocn_u_ms = np.asarray(zf["ocn_u_ms"], dtype=np.float32) if "ocn_u_ms" in zf else None
-                            ocn_v_ms = np.asarray(zf["ocn_v_ms"], dtype=np.float32) if "ocn_v_ms" in zf else None
-                            seaice = np.asarray(zf["ocn_seaice_frac"], dtype=np.float32) if "ocn_seaice_frac" in zf else np.zeros_like(sst_c)
+                            ocn_spd = np.asarray(zf["ocn_speed_ms"], dtype=np.float32) if "ocn_speed_ms" in zfiles else np.zeros_like(sst_c)
+                            ocn_u_ms = np.asarray(zf["ocn_u_ms"], dtype=np.float32) if "ocn_u_ms" in zfiles else None
+                            ocn_v_ms = np.asarray(zf["ocn_v_ms"], dtype=np.float32) if "ocn_v_ms" in zfiles else None
+                            seaice = np.asarray(zf["ocn_seaice_frac"], dtype=np.float32) if "ocn_seaice_frac" in zfiles else np.zeros_like(sst_c)
                             ocn_is_wind = False
                         else:
                             ocn_lat_deg = ocn_lon_deg = ocn_wet = ocn_depth_m = ocn_u_ms = ocn_v_ms = None
-                            sst_c = np.asarray(zf["sst_c"], dtype=np.float32) if "sst_c" in zf else t2_c
-                            seaice = np.asarray(zf["seaice_frac"], dtype=np.float32) if "seaice_frac" in zf else np.zeros_like(t2_c)
-                            ocn_spd = np.asarray(zf["u10_ms"], dtype=np.float32) if "u10_ms" in zf else np.zeros_like(t2_c)
+                            sst_c = np.asarray(zf["sst_c"], dtype=np.float32) if "sst_c" in zfiles else t2_c
+                            seaice = np.asarray(zf["seaice_frac"], dtype=np.float32) if "seaice_frac" in zfiles else np.zeros_like(t2_c)
+                            ocn_spd = np.asarray(zf["u10_ms"], dtype=np.float32) if "u10_ms" in zfiles else np.zeros_like(t2_c)
                             ocn_is_wind = True
+
+                        avail_esm = [k for k in _ESM_GLOBE_SPECS if k in zfiles]
+                        if "lai" not in avail_esm:
+                            avail_esm.insert(0, "lai")
+                        esm_missing = False
+                        if esm_field == "lai":
+                            f3 = lai_base
+                        elif esm_field == "lightning_flash_rate" and lgt_km2yr is not None:
+                            f3 = lgt_km2yr
+                        elif esm_field == "sprite_rate" and spr_km2yr is not None:
+                            f3 = spr_km2yr
+                        elif esm_field in zfiles:
+                            f3 = np.asarray(zf[esm_field], dtype=np.float32)
+                        else:
+                            esm_missing = True
+                            f3 = np.full_like(t2_c, float(spec[1]))
+
                         yr = int(zf["year"])
                         day_yr = float(zf["day_in_yr"])
                         sim_days = float(zf["sim_days"])
                         wall_spd = float(zf["wall_s_per_day"])
-                        date_str = str(zf["date_str"]) if "date_str" in zf else ""
+                        date_str = str(zf["date_str"]) if "date_str" in zfiles else ""
                     if not date_str:
                         run_toml_p = out_root / "run_config.toml"
                         rc = load_aoba_toml(run_toml_p) if run_toml_p.exists() else {}
@@ -874,13 +1061,15 @@ class RunManager:
                     if solar_decl_deg is None:
                         solar_decl_deg = math.degrees(math.asin(max(-1.0, min(1.0, math.sin(math.radians(23.44)) * math.sin(2.0 * math.pi * (day_yr / 365.2425))))))
                     raster = self.engine.regrid_fields(
-                        lat_deg, lon_deg, t2_c, precip, lai, surf_type,
+                        lat_deg, lon_deg, t2_c, precip, f3, surf_type,
+                        esm_range=(spec[1], spec[2]), esm_mask_mode=spec[3],
                         olr=olr, sst_c=sst_c, seaice_frac=seaice, ocn_speed_ms=ocn_spd,
                         ocn_lat_deg=ocn_lat_deg, ocn_lon_deg=ocn_lon_deg, ocn_wet=ocn_wet,
                         ocn_is_wind=ocn_is_wind,
                         lwp_gm2=lwp_gm2, iwp_gm2=iwp_gm2, swe_land=swe_land, z_topo=z_topo,
                         wave_hs_m=wave_hs_m, u10_u=u10_u, u10_v=u10_v,
                         ocn_u_ms=ocn_u_ms, ocn_v_ms=ocn_v_ms, ocn_depth_m=ocn_depth_m,
+                        lightning_km2yr=lgt_km2yr, sprite_km2yr=spr_km2yr,
                         solar_decl_deg=solar_decl_deg, subsolar_lon_deg=subsolar_lon_deg,
                     )
                     meta = {
@@ -892,9 +1081,14 @@ class RunManager:
                         "date_str": date_str,
                         "n_cells": int(lat_deg.size),
                         "mtime": mtime,
+                        "esm_field": esm_field,
+                        "esm_label": spec[0],
+                        "esm_missing": esm_missing,
+                        "avail_esm_fields": avail_esm,
+                        "has_tle": bool(lgt_km2yr is not None or spr_km2yr is not None),
                     }
                     cached = {"raster": raster, "meta": meta}
-                    if len(self.engine._frame_cache) > 8:
+                    if len(self.engine._frame_cache) > 16:
                         self.engine._frame_cache.clear()
                     self.engine._frame_cache[cache_key] = cached
                 payload["raster"] = cached["raster"]
@@ -917,14 +1111,17 @@ class RunManager:
             cached = self.engine._frame_cache.get(cache_key)
             if cached is None:
                 try:
-                    lat_deg, lon_deg, t2_c, precip, f3, surf_type, src_lbl, avail_esm, olr_z, sst_z, ice_z = _load_zarr_frame_payload(
-                        out_root, finfo, kind_used, esm_field=esm_field
-                    )
+                    zdat = _load_zarr_frame_payload(out_root, finfo, kind_used, esm_field=esm_field)
                     spec = _ESM_GLOBE_SPECS.get(esm_field, _ESM_GLOBE_SPECS["lai"])
                     raster = self.engine.regrid_fields(
-                        lat_deg, lon_deg, t2_c, precip, f3, surf_type,
-                        esm_range=(spec[1], spec[2]), esm_land_only=spec[3],
-                        olr=olr_z, sst_c=sst_z, seaice_frac=ice_z, ocn_is_wind=True,
+                        zdat["lat_deg"], zdat["lon_deg"], zdat["t2_c"], zdat["precip"], zdat["f3"], zdat["surf_type"],
+                        esm_range=(spec[1], spec[2]), esm_mask_mode=spec[3],
+                        olr=zdat["olr"], sst_c=zdat["sst_c"], seaice_frac=zdat["seaice"],
+                        ocn_lat_deg=zdat["ocn_lat_deg"], ocn_lon_deg=zdat["ocn_lon_deg"], ocn_wet=zdat["ocn_wet"],
+                        ocn_is_wind=True,
+                        lwp_gm2=zdat["lwp_gm2"], iwp_gm2=zdat["iwp_gm2"], swe_land=zdat["swe_land"],
+                        z_topo=zdat["z_topo"], wave_hs_m=zdat["wave_hs_m"],
+                        lightning_km2yr=zdat["lightning_km2yr"], sprite_km2yr=zdat["sprite_km2yr"],
                     )
                     sim_d = float(finfo["sim_days"])
                     run_toml_p = out_root / "run_config.toml"
@@ -935,13 +1132,15 @@ class RunManager:
                         calendar_type=str(fc.get("calendar_type", "gregorian")),
                     )
                     meta = {
-                        "source": src_lbl,
+                        "source": zdat["src_lbl"],
                         "sim_days": round(sim_d, 2),
                         "date_str": cal.date_at(sim_d * 86400.0).iso_date,
-                        "n_cells": int(lat_deg.size),
+                        "n_cells": int(zdat["lat_deg"].size),
                         "esm_field": esm_field,
                         "esm_label": spec[0],
-                        "avail_esm_fields": avail_esm,
+                        "esm_missing": bool(zdat["esm_missing"]),
+                        "avail_esm_fields": zdat["avail_esm"],
+                        "has_tle": bool(zdat["lightning_km2yr"] is not None or zdat["sprite_km2yr"] is not None),
                     }
                     cached = {"raster": raster, "meta": meta}
                     self.engine._frame_cache[cache_key] = cached
@@ -1248,6 +1447,8 @@ _HTML_PAGE = r"""<!DOCTYPE html>
       <div class="card">
         <h2 data-i18n="g_ctrl_title">水平解像度 (SCVT) &amp; 子領域 CRM 設定</h2>
         <div class="preset-bar">
+          <button onclick="applyFullPreset('flagship_ag6')" style="background:linear-gradient(135deg,#0284c7,#4f46e5); color:#fff; border:none; font-weight:700;">🚀 現行フラグシップ (AG6z64+OG7z64 90km Full-ESM)</button>
+          <button onclick="applyFullPreset('spinup_ag4')" style="border-color:#38bdf8; color:#bae6fd;">🧪 軽量スピンアップ (AG4z64+OG7z64 90km)</button>
           <button onclick="applyGridPreset(3, 8, 1, 4000, 44, 720, 48000, 36000)" data-i18n="pre_g3">成層圏標準 (G3, 44層 48km)</button>
           <button onclick="applyGridPreset(4, 8, 1, 4000, 44, 720, 48000, 36000)" data-i18n="pre_g4">成層圏気候 (G4, 44層 48km)</button>
           <button onclick="applyGridPreset(5, 8, 1, 4000, 44, 720, 48000, 36000)" data-i18n="pre_g5">成層圏高解像 (G5, 44層 48km)</button>
@@ -1271,6 +1472,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
   <!-- TAB 2: FORCING & DYNAMIC ICESHEET -->
   <div id="tab-forcing" class="tab-pane">
     <div class="preset-bar">
+      <button onclick="applyFullPreset('flagship_ag6')" style="background:linear-gradient(135deg,#0284c7,#4f46e5); color:#fff; border:none; font-weight:700;">🚀 現行フラグシップ (AG6z64+OG7z64 90km Full-ESM)</button>
       <button onclick="applyForcingPreset('present')" data-i18n="pre_present">現代気候 (400 ppmv, 1×Ω)</button>
       <button onclick="applyForcingPreset('full_esm')" style="border-color:var(--accent); color:var(--accent);">🌍 Full-ESM + RRTMGP</button>
       <button onclick="applyForcingPreset('half_omega')" data-i18n="pre_half_w">自転半減実験 (0.5×Ω)</button>
@@ -1363,6 +1565,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
           <p class="sub" style="margin:2px 0 0;" data-i18n="mon_ctrl_sub">MPS GPU 上で稼働中の計算（既存の外部ジョブやこの画面から起動した実験）を邪魔せず、CPU バックグラウンド処理でリアルタイムプレビューを生成します。</p>
         </div>
         <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+          <button onclick="applyFullPreset('flagship_ag6')" style="background:linear-gradient(135deg,#0284c7,#4f46e5); color:#fff; border:none; font-weight:700; font-size:12px; padding:6px 11px;" title="AG6z64 + OG7z64 + 90km Full-ESM piControl の全設定を一括読込">🚀 フラグシップ設定読込</button>
           <select id="launch-device" style="width:120px;">
             <option value="auto">Auto (GPU)</option>
             <option value="cuda">CUDA GPU</option>
@@ -1428,6 +1631,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
             <label class="switch"><input type="checkbox" id="hima-solar" checked onchange="markHeroDirty()" /> <span>☀️ 太陽入射角 (昼夜・トワイライト)</span></label>
             <label class="switch"><input type="checkbox" id="hima-night-ir" checked onchange="markHeroDirty()" /> <span>🌙 夜間 GeoColor 赤外雲</span></label>
             <label class="switch"><input type="checkbox" id="hima-glint" checked onchange="markHeroDirty()" /> <span>✨ 海洋サングリント＆白波</span></label>
+            <label class="switch"><input type="checkbox" id="hima-tle" checked onchange="markHeroDirty()" /> <span>⚡ 雷・スプライト (TLE)</span></label>
           </div>
           <div style="display:grid; grid-template-columns:130px 1fr 48px; gap:8px; align-items:center; color:var(--muted);">
             <span>太陽経度オフセット</span>
@@ -1457,6 +1661,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
         <canvas id="globeTheater" width="760" height="760" style="width:100%; height:100%; cursor:grab; background:transparent; border:none; border-radius:50%;"></canvas>
       </div>
       <div style="position:absolute; bottom:16px; display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:center; background:rgba(7,12,24,0.78); border:1px solid rgba(56,189,248,0.3); padding:8px 16px; border-radius:12px; backdrop-filter:blur(8px); font-size:12px; color:#cbd5e1;">
+        <label style="display:flex; align-items:center; gap:5px; cursor:pointer;"><input type="checkbox" id="theater-tle" checked onchange="document.getElementById('hima-tle').checked=this.checked; markHeroDirty();" /> ⚡ 雷・スプライト (TLE)</label>
         <label style="display:flex; align-items:center; gap:5px;">太陽オフセット <input type="range" min="-180" max="180" value="0" style="width:140px;" oninput="document.getElementById('hima-sun-offset').value=this.value; document.getElementById('hima-sun-off-val').textContent=(this.value>=0?'+':'')+this.value+'°'; markHeroDirty();" /></label>
       </div>
     </div>
@@ -1536,11 +1741,15 @@ _HTML_PAGE = r"""<!DOCTYPE html>
         <div class="globe-card">
           <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:2px;">
             <h3 id="g-esm-title" data-i18n="g_lai_title" style="margin:0;">葉面積指数 LAI [m² m⁻²]</h3>
-            <select id="esm-globe-field" onchange="fetchMonitorOnce()" style="font-size:11px; padding:2px 6px; width:auto; max-width:145px;">
+            <select id="esm-globe-field" onchange="fetchMonitorOnce()" style="font-size:11px; padding:2px 6px; width:auto; max-width:155px;">
               <option value="lai">LAI (植生)</option>
+              <option value="h_canopy">樹高 H_c [m]</option>
+              <option value="f_evg">常緑率 f_evg</option>
+              <option value="f_c4">C₄草本率 f_c4</option>
               <option value="o3_tco_du">全オゾン O₃ [DU]</option>
               <option value="lightning_flash_rate">発雷頻度 [fl/km²/yr]</option>
-              <option value="volc_aod">火山エアロゾル AOD</option>
+              <option value="sprite_rate">レッドスプライト (TLE)</option>
+              <option value="volc_aod">火山・エアロゾル AOD</option>
               <option value="f_wetland">湿地・湖沼被覆率</option>
               <option value="d18o_precip_permil">降水 δ¹⁸O [‰]</option>
               <option value="co2_sfc_ppmv">地表 CO₂ [ppmv]</option>
@@ -1641,10 +1850,15 @@ let CURRENT_DOC_BASE = "formulation";
 let ACTIVE_REG_SEC = "constants";
 let MON = {
   raster: null, rawT2: null, rawOLR: null, rawLAI: null, rawSurf: null, rawCoast: null,
+  rawLight: null, rawSprite: null, esmField: "lai", esmLabel: "LAI [m² m⁻²]", esmMissing: false,
   outDir: "", lastMtime: 0, lastQuerySig: "",
   frameQueue: [], paceMs: 760, lastArrivalTs: 0, lastSwapTs: 0
 };
-let GLOBE_VIEW = { lat0: 18.0, lon0: 140.0, dragging: false, lastX: 0, lastY: 0, geoCacheLat: null, geoCache: null, manualOverride: false, subsolarLon: null };
+let GLOBE_VIEW = {
+  lat0: 18.0, lon0: 140.0, dragging: false, lastX: 0, lastY: 0,
+  geoCacheLat: null, geoCache: null, manualOverride: false,
+  subsolarLon: null, displaySubsolarLon: null, subsolarRateDegPerSec: 0.0, lastSubsolarTs: 0
+};
 let GRID_VIEW = { lon0: 138.0, lat0: 24.0, dragging: false, lastX: 0, lastY: 0, cache: {}, inflight: {} };
 
 const I18N = {
@@ -2261,6 +2475,28 @@ function applyGridPreset(g, nx, ny, dx, nz, dt, ztop = 48000, zsp = 36000) {
   showToast(`格子プリセット G${g} (${nx}×${ny}, dx=${dx}m, nz=${nz}, top=${ztop/1000}km) を適用`);
 }
 
+async function applyFullPreset(name) {
+  try {
+    const res = await fetch("/api/preset/load?name=" + encodeURIComponent(name));
+    const data = await res.json();
+    if (!data.ok || !data.config) {
+      showToast("プリセット読込失敗: " + (data.error || "unknown"));
+      return;
+    }
+    STATE.config = data.config;
+    if (data.path) {
+      STATE.toml_path = data.path;
+      const tp = document.getElementById("toml-path-input");
+      if (tp) tp.value = data.path;
+    }
+    renderAll();
+    refreshTomlPreview();
+    showToast(`🚀 プリセット適用: ${data.label || name}`);
+  } catch (e) {
+    showToast("プリセット読込通信エラー");
+  }
+}
+
 function applyForcingPreset(kind) {
   const f = STATE.config.forcing, ic = STATE.config.icesheet;
   f.co2_mode = "constant";
@@ -2694,6 +2930,8 @@ function _applyMonitorFrame(fr) {
   MON.rawLAI = fr.lai;
   MON.rawSWE = fr.swe;
   MON.rawWave = fr.wave;
+  MON.rawLight = fr.light;
+  MON.rawSprite = fr.sprite;
   MON.solarDeclDeg = fr.declDeg;
   MON.rawT2 = fr.t2;
   MON.rawIR = fr.ir;
@@ -2702,13 +2940,39 @@ function _applyMonitorFrame(fr) {
   MON.rawLWP = fr.lwp;
   MON.rawIWP = fr.iwp;
   MON.rawWindSpd = fr.windSpd;
+  if (fr.esmField !== undefined) MON.esmField = fr.esmField;
+  if (fr.esmLabel !== undefined) MON.esmLabel = fr.esmLabel;
+  MON.esmMissing = !!fr.esmMissing;
+
+  // Smooth terminator velocity tracking: estimate westward deg/s across consecutive live frames
+  const nowTs = performance.now();
+  const prevTarget = GLOBE_VIEW.subsolarLon;
+  const prevTs = GLOBE_VIEW.lastSubsolarTs;
   GLOBE_VIEW.subsolarLon = fr.subLon;
+  GLOBE_VIEW.lastSubsolarTs = nowTs;
+  if (GLOBE_VIEW.displaySubsolarLon === null || !fr.isLive) {
+    GLOBE_VIEW.displaySubsolarLon = fr.subLon;
+    GLOBE_VIEW.subsolarRateDegPerSec = 0.0;
+  } else if (prevTarget !== null && prevTs > 0) {
+    const dtSec = (nowTs - prevTs) / 1000.0;
+    const dLon = wrapLonDeg(fr.subLon - prevTarget);
+    if (dtSec >= 0.12 && dtSec <= 25.0 && Math.abs(dLon) > 0.2 && Math.abs(dLon) < 90.0) {
+      const instRate = Math.max(-60.0, Math.min(60.0, dLon / dtSec));
+      GLOBE_VIEW.subsolarRateDegPerSec = GLOBE_VIEW.subsolarRateDegPerSec === 0.0
+        ? instRate
+        : (GLOBE_VIEW.subsolarRateDegPerSec * 0.65 + instRate * 0.35);
+    } else if (Math.abs(dLon) >= 90.0) {
+      GLOBE_VIEW.displaySubsolarLon = fr.subLon;
+      GLOBE_VIEW.subsolarRateDegPerSec = 0.0;
+    }
+  }
   const syncDayNow = document.getElementById("globe-sync-day")?.checked ?? true;
-  if (!GLOBE_VIEW.manualOverride && syncDayNow && !GLOBE_VIEW.dragging) {
-    GLOBE_VIEW.lon0 = GLOBE_VIEW.subsolarLon;
+  if (!GLOBE_VIEW.manualOverride && syncDayNow && !GLOBE_VIEW.dragging && !fr.isLive) {
+    GLOBE_VIEW.lon0 = GLOBE_VIEW.displaySubsolarLon;
   }
   const timeEl = document.getElementById("mon-time");
   if (timeEl && fr.timeLabel) timeEl.textContent = fr.timeLabel;
+  _lastRenderKey = "";
   markHeroDirty();
 }
 
@@ -2748,8 +3012,9 @@ async function fetchMonitorOnce() {
   const frm = document.getElementById("watch-frame")?.value || "-1";
   const esmField = document.getElementById("esm-globe-field")?.value || "lai";
   const qSig = `${MON.outDir || ""}|${src}|${frm}|${esmField}`;
-  const isLiveAuto = (src === "auto" || src === "live") && frm === "-1" && esmField === "lai";
-  if (qSig !== MON.lastQuerySig) {
+  const isLiveAuto = (src === "auto" || src === "live") && frm === "-1";
+  const queryChanged = (qSig !== MON.lastQuerySig);
+  if (queryChanged) {
     MON.lastQuerySig = qSig;
     MON.lastMtime = 0;
     MON.lastFrameKey = "";
@@ -2770,6 +3035,7 @@ async function fetchMonitorOnce() {
     MON.outDir = data.out_dir || "";
     MON.esmField = (data.meta && data.meta.esm_field) || esmField;
     MON.esmLabel = (data.meta && data.meta.esm_label) || "LAI [m² m⁻²]";
+    MON.esmMissing = !!(data.meta && data.meta.esm_missing);
     if (data.meta && data.meta.mtime) MON.lastMtime = Number(data.meta.mtime);
 
     // Update directory picker
@@ -2844,9 +3110,14 @@ async function fetchMonitorOnce() {
           ? Number(data.raster.subsolar_lon_deg)
           : (newSimDays !== null ? wrapLonDeg(180.0 - 360.0 * (((newSimDays % 1.0) + 1.0) % 1.0)) : 140.0);
         const declDeg = (data.raster.solar_decl_deg !== undefined) ? Number(data.raster.solar_decl_deg) : 0.0;
+        const isLiveSrc = (meta.source === "live_preview.npz");
         const fr = {
           raster: data.raster,
           timeLabel,
+          isLive: isLiveSrc,
+          esmField: MON.esmField,
+          esmLabel: MON.esmLabel,
+          esmMissing: MON.esmMissing,
           t2: b64ToUint8(data.raster.t2_b64),
           ir: data.raster.ir_b64 ? b64ToUint8(data.raster.ir_b64) : null,
           olr: b64ToUint8(data.raster.precip_b64 || data.raster.olr_b64),
@@ -2858,6 +3129,8 @@ async function fetchMonitorOnce() {
           iwp: data.raster.iwp_b64 ? b64ToUint8(data.raster.iwp_b64) : null,
           swe: data.raster.swe_b64 ? b64ToUint8(data.raster.swe_b64) : null,
           wave: data.raster.wave_b64 ? b64ToUint8(data.raster.wave_b64) : null,
+          light: data.raster.light_b64 ? b64ToUint8(data.raster.light_b64) : null,
+          sprite: data.raster.sprite_b64 ? b64ToUint8(data.raster.sprite_b64) : null,
           windSpd: data.raster.wind_spd_b64 ? b64ToUint8(data.raster.wind_spd_b64) : null,
           ocnWet: data.raster.ocn_wet_b64 ? b64ToUint8(data.raster.ocn_wet_b64) : null,
           ocnCoast: data.raster.ocn_coast_b64 ? b64ToUint8(data.raster.ocn_coast_b64) : null,
@@ -2873,11 +3146,11 @@ async function fetchMonitorOnce() {
           declDeg,
         };
         const nowTs = performance.now();
-        if (isLiveAuto && MON.raster) {
+        if (isLiveAuto && isLiveSrc && MON.raster && !queryChanged) {
           // Track true model cadence EMA and enqueue raw frame for metronome-steady pacing
           if (MON.lastArrivalTs > 0) {
             const dtArr = nowTs - MON.lastArrivalTs;
-            if (dtArr >= 120 && dtArr <= 4500) {
+            if (dtArr >= 120 && dtArr <= 12000) {
               MON.paceMs = MON.paceMs * 0.80 + dtArr * 0.20;
             }
           }
@@ -2902,9 +3175,19 @@ async function fetchMonitorOnce() {
       const lEl = document.getElementById("g-esm-cbar-labels");
       const rng = data.raster.lai_range || [0, 7];
       if (tEl) tEl.textContent = MON.esmLabel || "LAI [m² m⁻²]";
-      if (sEl) sEl.textContent = MON.esmField === "lai"
-        ? (LANG === "ja" ? "自律 EEO バイオーム分布（海＝濃紺・氷床＝白）" : "Emergent EEO biome LAI (ocean=navy, ice=white)")
-        : `ESM 2D Field (${MON.esmField})`;
+      if (sEl) {
+        if (MON.esmMissing) {
+          sEl.textContent = LANG === "ja"
+            ? `⚠️ 現在のデータ (${meta.source || "-"}) には ${MON.esmField} が未出力（次回起動または Zarr 出力後に表示）`
+            : `⚠️ ${MON.esmField} not present in ${meta.source || "-"} (available on new runs / Zarr)`;
+          sEl.style.color = "#f59e0b";
+        } else {
+          sEl.style.color = "";
+          sEl.textContent = MON.esmField === "lai"
+            ? (LANG === "ja" ? "自律 EEO バイオーム分布（海＝濃紺・氷床＝白）" : "Emergent EEO biome LAI (ocean=navy, ice=white)")
+            : `ESM 2D Field (${MON.esmField}) — ${meta.source || ""}`;
+        }
+      }
       if (cEl) {
         cEl.style.background = MON.esmField === "lai"
           ? "linear-gradient(90deg, #92704a, #a3a332, #4d9e38, #15803d, #064e3b)"
@@ -3054,6 +3337,7 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
   const useSolar = document.getElementById("hima-solar")?.checked ?? true;
   const useNightIR = document.getElementById("hima-night-ir")?.checked ?? true;
   const useGlint = document.getElementById("hima-glint")?.checked ?? true;
+  const useTLE = document.getElementById("hima-tle")?.checked ?? true;
   const sunOffsetDeg = Number(document.getElementById("hima-sun-offset")?.value || 0);
   const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
 
@@ -3065,7 +3349,10 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
   const vz = Math.sin(lat0Rad);
 
   const declDeg = Number(MON.solarDeclDeg || 0.0);
-  const subLonDeg = wrapLonDeg((GLOBE_VIEW.subsolarLon !== null ? GLOBE_VIEW.subsolarLon : 140.0) + sunOffsetDeg);
+  const baseSubLon = GLOBE_VIEW.displaySubsolarLon !== null
+    ? GLOBE_VIEW.displaySubsolarLon
+    : (GLOBE_VIEW.subsolarLon !== null ? GLOBE_VIEW.subsolarLon : 140.0);
+  const subLonDeg = wrapLonDeg(baseSubLon + sunOffsetDeg);
   const declRad = declDeg * Math.PI / 180;
   const subLonRad = subLonDeg * Math.PI / 180;
   const sx = Math.cos(declRad) * Math.cos(subLonRad);
@@ -3080,8 +3367,10 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
   const sunInfo = document.getElementById("hima-sun-info");
   if (sunInfo) {
     const hasVec = (MON.rawWindU && MON.rawWindV) || (MON.rawOcnU && MON.rawOcnV);
+    const hasTLE = !!(MON.rawLight || MON.rawSprite);
+    const tleMsg = hasTLE ? "・⚡雷/スプライト実測連動" : "・⚡雷/スプライト待機(次起動/Zarr)";
     sunInfo.textContent = `太陽直下点: lat ${declDeg>=0?"+":""}${declDeg.toFixed(1)}°, lon ${subLonDeg>=0?"+":""}${subLonDeg.toFixed(1)}° | ` +
-      (hasVec ? "物理雲(LWP/IWP)・波高・風/海流ベクトル ライブ連動中" : "旧プレビュー互換モード（次ステップからLWP/風/海流ベクトルを自動反映）");
+      (hasVec ? "物理雲(LWP/IWP)・波高・風/海流" : "旧プレビュー互換") + tleMsg;
   }
 
   const rH = MON.raster.height || 360, rW = MON.raster.width || 720;
@@ -3090,6 +3379,9 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
   const seaIce = MON.rawSeaIce, ocnWet = MON.rawOcnWet;
   const lwpU8 = MON.rawLWP, iwpU8 = MON.rawIWP, irU8 = MON.rawIR;
   const sweU8 = MON.rawSWE, ztU8 = MON.rawZTopo, depthU8 = MON.rawDepth, waveU8 = MON.rawWave;
+  const lightU8 = useTLE ? MON.rawLight : null;
+  const spriteU8 = useTLE ? MON.rawSprite : null;
+  const twinkleTick = Math.floor(performance.now() / 130);
   const deg2rad = Math.PI / 180.0;
 
   for (let p = 0; p < geo.count; p++) {
@@ -3260,6 +3552,36 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
       r = nr * 255.0; g = ng * 255.0; b = nb * 255.0;
     }
 
+    if (lightU8) {
+      const lRaw = lightU8[i00]*w00 + lightU8[i10]*w10 + lightU8[i01]*w01 + lightU8[i11]*w11;
+      if (lRaw > 14) {
+        const ln = Math.min(1.0, (lRaw - 14) / 215.0);
+        // Subtle organic storm-core twinkle (deterministic hash of coarse grid cell + tick)
+        const cellH = ((((row >> 1) * 73856093) ^ ((col >> 1) * 19349663) ^ (twinkleTick * 83492791)) >>> 0) & 255;
+        const pulse = 0.62 + 0.72 * Math.pow(cellH / 255.0, 2.2);
+        const nightBoost = mu0 < 0.08 ? 1.25 : 0.72;
+        const amp = Math.min(1.0, ln * pulse * nightBoost);
+        // Electric cyan-white / warm gold lightning glow
+        r += amp * 235.0;
+        g += amp * 242.0;
+        b += amp * 255.0;
+      }
+    }
+    if (spriteU8) {
+      const sRaw = spriteU8[i00]*w00 + spriteU8[i10]*w10 + spriteU8[i01]*w01 + spriteU8[i11]*w11;
+      if (sRaw > 10) {
+        const sn = Math.min(1.0, (sRaw - 10) / 185.0);
+        const spH = ((((row >> 2) * 2654435761) ^ ((col >> 2) * 2246822519) ^ ((twinkleTick >> 1) * 3266489917)) >>> 0) & 255;
+        const spPulse = 0.55 + 0.85 * Math.pow(spH / 255.0, 2.6);
+        // Red sprites & TLE halos glow vividly on night/twilight hemisphere, faintly on intense day storms
+        const vis = mu0 < 0.05 ? 1.35 : (mu0 < 0.22 ? 0.70 : 0.30);
+        const sAmp = Math.min(1.0, sn * spPulse * vis);
+        r += sAmp * 255.0;
+        g += sAmp * 34.0;
+        b += sAmp * 92.0;
+      }
+    }
+
     if (drawGrid && (Math.abs(geo.latVal[p] % 30) < 0.65 || Math.abs((lon + 360) % 30) < 0.65)) {
       r = r * 0.88 + 24; g = g * 0.88 + 38; b = b * 0.88 + 54;
     }
@@ -3277,6 +3599,69 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
   halo.addColorStop(1, "rgba(56,189,248,0)");
   ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(geo.cx, geo.cy, geo.R*1.09, 0, Math.PI*2); ctx.fill();
   ctx.drawImage(canvas._offCv, 0, 0);
+
+  // Crisp 2D additive overlay for bright lightning cores & mesospheric red sprite tendrils
+  if (useTLE && (lightU8 || spriteU8)) {
+    const sinL0 = Math.sin(lat0Rad), cosL0 = Math.cos(lat0Rad);
+    const stepLat = Math.max(2, Math.floor(rH / 45));
+    const stepLon = Math.max(2, Math.floor(rW / 90));
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (let rr = 1; rr < rH - 1; rr += stepLat) {
+      const latD = 90.0 - (rr + 0.5) * (180.0 / rH);
+      const phi = latD * deg2rad;
+      const sinP = Math.sin(phi), cosP = Math.cos(phi);
+      for (let cc = 0; cc < rW; cc += stepLon) {
+        const gi = rr * rW + cc;
+        const lv = lightU8 ? lightU8[gi] : 0;
+        const sv = spriteU8 ? spriteU8[gi] : 0;
+        if (lv < 75 && sv < 42) continue;
+        const lonD = (cc + 0.5) * (360.0 / rW) - 180.0;
+        const dl = (lonD - lon0) * deg2rad;
+        const z = sinL0 * sinP + cosL0 * cosP * Math.cos(dl);
+        if (z <= 0.04) continue;
+        const px = geo.cx + geo.R * cosP * Math.sin(dl);
+        const py = geo.cy - geo.R * (cosL0 * sinP - sinL0 * cosP * Math.cos(dl));
+        const muC = useSolar ? (cosP * Math.cos(lonD * deg2rad) * sx + cosP * Math.sin(lonD * deg2rad) * sy + sinP * sz) : 0.78;
+        const hSeed = (((rr * 73856093) ^ (cc * 19349663) ^ (twinkleTick * 83492791)) >>> 0) & 255;
+        if (lv >= 75 && hSeed > 150) {
+          const lInt = Math.min(1.0, (lv - 75) / 160.0) * (muC < 0.1 ? 0.95 : 0.55);
+          const rad = (geo.R / 168.0) * (2.6 + 4.5 * lInt);
+          const gr = ctx.createRadialGradient(px, py, 0, px, py, rad);
+          gr.addColorStop(0, `rgba(255,253,235,${(0.95 * lInt).toFixed(2)})`);
+          gr.addColorStop(0.35, `rgba(125,211,252,${(0.55 * lInt).toFixed(2)})`);
+          gr.addColorStop(1, "rgba(56,189,248,0)");
+          ctx.fillStyle = gr;
+          ctx.beginPath(); ctx.arc(px, py, rad, 0, Math.PI * 2); ctx.fill();
+        }
+        if (sv >= 42 && hSeed > 135) {
+          const sInt = Math.min(1.0, (sv - 42) / 150.0) * (muC < 0.08 ? 1.0 : (muC < 0.25 ? 0.55 : 0.22));
+          const radS = (geo.R / 168.0) * (4.0 + 7.0 * sInt);
+          // Outward radial direction from Earth center for mesospheric vertical sprite column
+          const dxC = px - geo.cx, dyC = py - geo.cy;
+          const dNorm = Math.hypot(dxC, dyC) || 1.0;
+          const ux = dxC / dNorm, uy = dyC / dNorm;
+          const lift = (geo.R / 168.0) * (3.0 + 5.5 * sInt) * Math.sqrt(Math.max(0.05, 1.0 - z * z));
+          const sx2 = px + ux * lift, sy2 = py + uy * lift;
+          // Crimson sprite halo
+          const sg = ctx.createRadialGradient(sx2, sy2, 0, sx2, sy2, radS);
+          sg.addColorStop(0, `rgba(255,70,115,${(0.88 * sInt).toFixed(2)})`);
+          sg.addColorStop(0.45, `rgba(225,29,72,${(0.45 * sInt).toFixed(2)})`);
+          sg.addColorStop(1, "rgba(190,24,93,0)");
+          ctx.fillStyle = sg;
+          ctx.beginPath(); ctx.arc(sx2, sy2, radS, 0, Math.PI * 2); ctx.fill();
+          // Vertical crimson sprite filament
+          ctx.strokeStyle = `rgba(255,110,145,${(0.75 * sInt).toFixed(2)})`;
+          ctx.lineWidth = Math.max(1.0, (geo.R / 168.0) * 1.15);
+          ctx.beginPath();
+          ctx.moveTo(px, py);
+          ctx.lineTo(sx2, sy2);
+          ctx.stroke();
+        }
+      }
+    }
+    ctx.restore();
+  }
 }
 
 /* --- EARTH.NULLSCHOOL.NET LONG SILKY SPHERICAL RIBBON STREAMLINES --- */
@@ -3546,7 +3931,9 @@ function renderOneGlobe(canvasId, kind, geo) {
     : (kind === "ocn" ? (showWindOnOcn ? (MON.rawWindSpd || MON.rawOcnSpd || MON.rawOLR) : (MON.rawOcnSpd || MON.rawOLR))
     : MON.rawLAI))));
   const isLaiMode = (MON.esmField || "lai") === "lai";
-  const landOnly3 = MON.raster.esm_land_only !== false;
+  const maskMode3 = MON.raster.esm_mask_mode || (MON.raster.esm_land_only !== false ? "land" : "global");
+  const landOnly3 = maskMode3 === "land";
+  const oceanOnly3 = (kind === "lai") && (maskMode3 === "ocean");
   const lut = kind === "t2" ? LUT_T2
     : (kind === "ir" ? LUT_IR
     : (kind === "olr" ? LUT_OLR
@@ -3556,7 +3943,7 @@ function renderOneGlobe(canvasId, kind, geo) {
   const surf = MON.rawSurf;
   const ocnWet = MON.rawOcnWet;
   const seaIce = MON.rawSeaIce;
-  const coast = (isOcnGlobe && MON.rawOcnCoast) ? MON.rawOcnCoast : MON.rawCoast;
+  const coast = ((isOcnGlobe || oceanOnly3) && MON.rawOcnCoast) ? MON.rawOcnCoast : MON.rawCoast;
 
   const rH = (MON.raster && MON.raster.height) || 360;
   const rW = (MON.raster && MON.raster.width) || 720;
@@ -3579,11 +3966,11 @@ function renderOneGlobe(canvasId, kind, geo) {
       r = 12 * sh; g = 34 * sh; b = 74 * sh; // crisp ocean blue on land-only globe
     } else if (kind === "lai" && landOnly3 && surf[gIdx] === 2) {
       r = 228 * sh; g = 242 * sh; b = 250 * sh; // ice sheets crisp white-cyan
-    } else if (isOcnGlobe && (ocnWet ? ocnWet[gIdx] === 0 : surf[gIdx] !== 0)) {
+    } else if ((isOcnGlobe || oceanOnly3) && (ocnWet ? ocnWet[gIdx] === 0 : surf[gIdx] !== 0)) {
       if (surf[gIdx] === 2) {
         r = 185 * sh; g = 200 * sh; b = 215 * sh; // ice sheets soft silver on ocean globes
       } else {
-        r = 34 * sh; g = 42 * sh; b = 56 * sh; // crisp dark slate land mask on SST / current globes
+        r = 34 * sh; g = 42 * sh; b = 56 * sh; // crisp dark slate land mask on ocean globes
       }
     } else {
       const i00 = y0 * rW + x0, i10 = y0 * rW + x1, i01 = y1 * rW + x0, i11 = y1 * rW + x1;
@@ -3628,6 +4015,8 @@ function renderOneGlobe(canvasId, kind, geo) {
 
 let _lastAnimTs = 0;
 let _lastRenderKey = "";
+let _lastHeroKey = "";
+let _lastHeroDrawTs = 0;
 
 function animateGlobes(ts) {
   requestAnimationFrame(animateGlobes);
@@ -3649,34 +4038,72 @@ function animateGlobes(ts) {
     MON.lastSwapTs = 0;
   }
 
+  // Smooth 60 FPS continuous terminator sweep (eliminates discrete 15° hourly jumps!)
+  if (GLOBE_VIEW.subsolarLon !== null && GLOBE_VIEW.displaySubsolarLon !== null) {
+    const elapsedSec = GLOBE_VIEW.lastSubsolarTs > 0 ? Math.max(0.0, (ts - GLOBE_VIEW.lastSubsolarTs) / 1000.0) : 0.0;
+    const expectedStepSec = Math.max(0.5, Math.min(18.0, (MON.paceMs || 1500) / 1000.0));
+    // Smoothly extrapolate across the inter-frame interval, tapering gently if paused
+    const leadSec = Math.min(elapsedSec, expectedStepSec * 1.15);
+    const predLon = wrapLonDeg(GLOBE_VIEW.subsolarLon + GLOBE_VIEW.subsolarRateDegPerSec * leadSec);
+    const errLon = wrapLonDeg(predLon - GLOBE_VIEW.displaySubsolarLon);
+    if (Math.abs(errLon) > 0.005) {
+      const alpha = 1.0 - Math.exp(-dt * 4.5);
+      GLOBE_VIEW.displaySubsolarLon = wrapLonDeg(GLOBE_VIEW.displaySubsolarLon + errLon * alpha);
+    }
+  }
+
   const syncDay = document.getElementById("globe-sync-day")?.checked ?? true;
-  if (!syncDay && (document.getElementById("globe-spin")?.checked ?? true) && !GLOBE_VIEW.dragging) {
+  if (syncDay && !GLOBE_VIEW.manualOverride && !GLOBE_VIEW.dragging && GLOBE_VIEW.displaySubsolarLon !== null) {
+    const lonErr = wrapLonDeg(GLOBE_VIEW.displaySubsolarLon - GLOBE_VIEW.lon0);
+    if (Math.abs(lonErr) > 0.005) {
+      GLOBE_VIEW.lon0 = wrapLonDeg(GLOBE_VIEW.lon0 + lonErr * (1.0 - Math.exp(-dt * 5.0)));
+    }
+  } else if (!syncDay && (document.getElementById("globe-spin")?.checked ?? true) && !GLOBE_VIEW.dragging) {
     const spd = Number(document.getElementById("globe-speed")?.value ?? 12);
     GLOBE_VIEW.lon0 = wrapLonDeg(GLOBE_VIEW.lon0 + spd * dt);
   }
   const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
+  const useTLE = document.getElementById("hima-tle")?.checked ?? true;
+  const hasTLE = useTLE && !!(MON.rawLight || MON.rawSprite);
+  const subDisp = GLOBE_VIEW.displaySubsolarLon !== null ? GLOBE_VIEW.displaySubsolarLon : 140.0;
   const rKey = `${GLOBE_VIEW.lat0.toFixed(3)}|${GLOBE_VIEW.lon0.toFixed(3)}|${MON.raster?.sim_days ?? "idle"}|${MON.raster?.step ?? ""}|${MON.esmField ?? "lai"}|${drawGrid}|${LANG}`;
+  const hKey = `${rKey}|${subDisp.toFixed(2)}|${hasTLE ? Math.floor(ts / 130) : 0}`;
 
-  if (rKey !== _lastRenderKey || _heroDirty) {
-    _lastRenderKey = rKey;
+  const needAll = (rKey !== _lastRenderKey);
+  const needHero = _heroDirty || needAll || (hKey !== _lastHeroKey && (ts - _lastHeroDrawTs) >= 32);
+
+  if (needAll || needHero) {
     _heroDirty = false;
     if (_theaterOpen) {
-      renderHimawariGlobe(getTheaterGeo(), "globeTheater");
-      const tm = document.getElementById("theater-meta");
-      const tTxt = document.getElementById("mon-time")?.textContent || "";
-      if (tm) tm.textContent = `${tTxt} | Center: lat ${GLOBE_VIEW.lat0>=0?"+":""}${GLOBE_VIEW.lat0.toFixed(1)}°, lon ${GLOBE_VIEW.lon0>=0?"+":""}${GLOBE_VIEW.lon0.toFixed(1)}° | ドラッグ回転 / Esc 終了`;
+      if (needHero) {
+        _lastHeroKey = hKey;
+        _lastHeroDrawTs = ts;
+        renderHimawariGlobe(getTheaterGeo(), "globeTheater");
+        const tm = document.getElementById("theater-meta");
+        const tTxt = document.getElementById("mon-time")?.textContent || "";
+        if (tm) tm.textContent = `${tTxt} | Center: lat ${GLOBE_VIEW.lat0>=0?"+":""}${GLOBE_VIEW.lat0.toFixed(1)}°, lon ${GLOBE_VIEW.lon0>=0?"+":""}${GLOBE_VIEW.lon0.toFixed(1)}° | ドラッグ回転 / Esc 終了`;
+      }
     } else {
-      const geo = getOrthoGeo();
-      renderHimawariGlobe(getHeroGeo(), "globeHimawari");
-      renderOneGlobe("globeT2", "t2", geo);
-      renderOneGlobe("globeIR", "ir", geo);
-      renderOneGlobe("globeOLR", "olr", geo);
-      renderOneGlobe("globeSST", "sst", geo);
-      renderOneGlobe("globeOCN", "ocn", geo);
-      renderOneGlobe("globeLAI", "lai", geo);
+      if (needHero) {
+        _lastHeroKey = hKey;
+        _lastHeroDrawTs = ts;
+        renderHimawariGlobe(getHeroGeo(), "globeHimawari");
+      }
+      if (needAll) {
+        _lastRenderKey = rKey;
+        const geo = getOrthoGeo();
+        renderOneGlobe("globeT2", "t2", geo);
+        renderOneGlobe("globeIR", "ir", geo);
+        renderOneGlobe("globeOLR", "olr", geo);
+        renderOneGlobe("globeSST", "sst", geo);
+        renderOneGlobe("globeOCN", "ocn", geo);
+        renderOneGlobe("globeLAI", "lai", geo);
+      }
     }
-    document.getElementById("view-angles").textContent =
-      `Center: lat ${GLOBE_VIEW.lat0>=0?"+":""}${GLOBE_VIEW.lat0.toFixed(1)}°, lon ${GLOBE_VIEW.lon0>=0?"+":""}${GLOBE_VIEW.lon0.toFixed(1)}°`;
+    if (needAll) {
+      document.getElementById("view-angles").textContent =
+        `Center: lat ${GLOBE_VIEW.lat0>=0?"+":""}${GLOBE_VIEW.lat0.toFixed(1)}°, lon ${GLOBE_VIEW.lon0>=0?"+":""}${GLOBE_VIEW.lon0.toFixed(1)}°`;
+    }
   }
 
   // Smooth 60 FPS Nullschool particle streamline advection on Globe #5 (Ocean Current / 10m Wind)
@@ -4589,6 +5016,25 @@ _DOC_FILES: dict[str, Path] = {
     "readme_en": _REPO_ROOT / "README.md",
 }
 
+_PRESET_FILES: dict[str, tuple[str, Path]] = {
+    "flagship_ag6": (
+        "現行フラグシップ (AG6z64 + OG7z64 + 90km Full-ESM piControl)",
+        _REPO_ROOT / "config" / "presets" / "earth_g6z64_g7z64_all_esm_flagship.toml",
+    ),
+    "spinup_ag4": (
+        "軽量スピンアップ (AG4z64 + OG7z64 + 90km Full-ESM)",
+        _REPO_ROOT / "config" / "presets" / "earth_g4z64_g7z64_all_esm_spinup.toml",
+    ),
+    "mac_g5": (
+        "Mac クイックスタート (AG5 + OGCM)",
+        _REPO_ROOT / "config" / "presets" / "mac_g5_quickstart.toml",
+    ),
+    "green_sahara": (
+        "古気候 緑のサハラ (6ka)",
+        _REPO_ROOT / "config" / "presets" / "paleo_green_sahara_6ka.toml",
+    ),
+}
+
 
 class ConfigGUIHandler(BaseHTTPRequestHandler):
     """HTTP request handler serving the full AOBA Config + Run + Monitor + 3-Globe Preview UI."""
@@ -4765,6 +5211,26 @@ class ConfigGUIHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/assets/aoba_icon.json":
             self._send_json(get_othello_icon_payload())
+            return
+
+        if parsed.path == "/api/preset/load":
+            qs = parse_qs(parsed.query)
+            key = qs.get("name", ["flagship_ag6"])[0]
+            entry = _PRESET_FILES.get(key)
+            if entry is None or not entry[1].exists():
+                self._send_json({"ok": False, "error": f"Unknown or missing preset: {key}"}, status=HTTPStatus.NOT_FOUND)
+                return
+            label, preset_p = entry
+            raw_cfg = load_aoba_toml(preset_p)
+            cfg = sanitize_config_dict(raw_cfg)
+            self.server.current_config = cfg  # type: ignore[attr-defined]
+            self._send_json({
+                "ok": True,
+                "name": key,
+                "label": label,
+                "path": str(preset_p.relative_to(_REPO_ROOT)),
+                "config": cfg,
+            })
             return
 
         if parsed.path == "/api/docs":

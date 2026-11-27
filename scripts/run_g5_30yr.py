@@ -1876,6 +1876,8 @@ def _write_live_preview_atomic(
     t2_k_override: torch.Tensor | None = None,
     precip_mm_day_override: torch.Tensor | None = None,
     olr_override: torch.Tensor | None = None,
+    lightning_override: torch.Tensor | None = None,
+    sprite_override: torch.Tensor | None = None,
 ) -> None:
     """Atomically write lightweight 2D live-preview fields (`T2`, `Precip`, `LAI`, `OLR`) for the CPU GUI."""
     mesh = model.mesh
@@ -1987,6 +1989,55 @@ def _write_live_preview_atomic(
         extra_arrays["ocn_u_ms"] = ou_c.detach().cpu().numpy().astype(np.float32)
         extra_arrays["ocn_v_ms"] = ov_c.detach().cpu().numpy().astype(np.float32)
         extra_arrays["ocn_seaice_frac"] = oice
+        if model.ogcm.bgc is not None:
+            extra_arrays["ocn_chl_sfc"] = model.ogcm.bgc.chl[0].detach().cpu().numpy().astype(np.float32)
+            if model.ogcm.bgc.o2 is not None:
+                extra_arrays["ocn_o2_sfc"] = model.ogcm.bgc.o2[0].detach().cpu().numpy().astype(np.float32)
+
+    # Additional 2D ESM fields for selectable AOBA Studio globe windows & Himawari TLE overlay
+    bio_lp = model.sfc.bio
+    extra_arrays["h_canopy"] = bio_lp.h_canopy.detach().cpu().numpy().astype(np.float32)
+    extra_arrays["f_c4"] = torch.clamp(bio_lp.f_c4, 0.0, 1.0).detach().cpu().numpy().astype(np.float32)
+    if bio_lp.f_evg is not None:
+        extra_arrays["f_evg"] = torch.clamp(bio_lp.f_evg, 0.0, 1.0).detach().cpu().numpy().astype(np.float32)
+    if model.ozone is not None and getattr(model.ozone, "tco_du", None) is not None:
+        extra_arrays["o3_tco_du"] = model.ozone.tco_du.detach().cpu().numpy().astype(np.float32)
+    if lightning_override is not None:
+        extra_arrays["lightning_flash_rate"] = lightning_override.detach().cpu().numpy().astype(np.float32)
+    elif getattr(model, "last_lightning", None) is not None:
+        extra_arrays["lightning_flash_rate"] = model.last_lightning.flash_tot_cell.detach().cpu().numpy().astype(np.float32)
+    if sprite_override is not None:
+        extra_arrays["sprite_rate"] = sprite_override.detach().cpu().numpy().astype(np.float32)
+    elif getattr(model, "last_red_sprites", None) is not None:
+        _sp = model.last_red_sprites
+        _sp_tot = _sp.sprite_rate_cell
+        if getattr(_sp, "halo_rate_cell", None) is not None:
+            _sp_tot = _sp_tot + _sp.halo_rate_cell
+        if getattr(_sp, "elves_rate_cell", None) is not None:
+            _sp_tot = _sp_tot + _sp.elves_rate_cell
+        extra_arrays["sprite_rate"] = _sp_tot.detach().cpu().numpy().astype(np.float32)
+    _aod_v = None
+    if getattr(model, "volcanic_solar", None) is not None and getattr(model.volcanic_solar, "aod_550", None) is not None:
+        _aod_v = model.volcanic_solar.aod_550
+    if getattr(model, "aerosols", None) is not None:
+        _ae = model.aerosols
+        _aod_nat = _ae.aod_ss + _ae.aod_so4 + _ae.aod_bc + _ae.aod_oc
+        _aod_v = (_aod_v + _aod_nat) if _aod_v is not None else _aod_nat
+    if _aod_v is not None:
+        extra_arrays["volc_aod"] = _aod_v.detach().cpu().numpy().astype(np.float32)
+    _fw_lp = None
+    if getattr(model, "maml_land", None) is not None:
+        _fw_lp = model.maml_land.f_wetland.reshape(mesh.n_cells, -1).mean(dim=-1)
+    if getattr(model, "lakes", None) is not None:
+        _fw_lp = torch.clamp(_fw_lp + model.lakes.f_lake, 0.0, 1.0) if _fw_lp is not None else model.lakes.f_lake
+    if _fw_lp is not None:
+        extra_arrays["f_wetland"] = _fw_lp.detach().cpu().numpy().astype(np.float32)
+    if getattr(model, "water_isotopes", None) is not None:
+        extra_arrays["d18o_precip_permil"] = model.water_isotopes.d18o_precip_permil.detach().cpu().numpy().astype(np.float32)
+    if getattr(model, "prognostic_co2", None) is not None and model.prognostic_co2.co2_vmr is not None:
+        extra_arrays["co2_sfc_ppmv"] = (model.prognostic_co2.co2_vmr[0] * 1.0e6).detach().cpu().numpy().astype(np.float32)
+    else:
+        extra_arrays["co2_sfc_ppmv"] = np.full(mesh.n_cells, float(model.cfg.co2_ppmv), dtype=np.float32)
 
     tmp_path = out_path.with_name(f".{out_path.name}.tmp.npz")
     np.savez(
@@ -2588,6 +2639,8 @@ def main() -> None:
         hr_t2_sum: torch.Tensor | None = None
         hr_precip_sum: torch.Tensor | None = None
         hr_olr_sum: torch.Tensor | None = None
+        hr_lgt_sum: torch.Tensor | None = None
+        hr_spr_sum: torch.Tensor | None = None
         hr_cnt = 0
         hf_t2_sum: torch.Tensor | None = None
         hf_precip_sum: torch.Tensor | None = None
@@ -2761,6 +2814,17 @@ def main() -> None:
                 hr_t2_sum += t2_inst
                 hr_precip_sum += precip_inst
                 hr_olr_sum += olr_inst
+            if getattr(model, "last_lightning", None) is not None:
+                _lgt_inst = model.last_lightning.flash_tot_cell
+                hr_lgt_sum = _lgt_inst.clone() if hr_lgt_sum is None else (hr_lgt_sum + _lgt_inst)
+            if getattr(model, "last_red_sprites", None) is not None:
+                _sp_o = model.last_red_sprites
+                _spr_inst = _sp_o.sprite_rate_cell
+                if getattr(_sp_o, "halo_rate_cell", None) is not None:
+                    _spr_inst = _spr_inst + _sp_o.halo_rate_cell
+                if getattr(_sp_o, "elves_rate_cell", None) is not None:
+                    _spr_inst = _spr_inst + _sp_o.elves_rate_cell
+                hr_spr_sum = _spr_inst.clone() if hr_spr_sum is None else (hr_spr_sum + _spr_inst)
             hr_cnt += 1
 
             if hf_enabled:
@@ -2815,10 +2879,14 @@ def main() -> None:
                     t2_k_override=hr_t2_sum / float(hr_cnt),
                     precip_mm_day_override=hr_precip_sum / float(hr_cnt),
                     olr_override=hr_olr_sum / float(hr_cnt),
+                    lightning_override=(hr_lgt_sum / float(hr_cnt)) if hr_lgt_sum is not None else None,
+                    sprite_override=(hr_spr_sum / float(hr_cnt)) if hr_spr_sum is not None else None,
                 )
                 hr_t2_sum = None
                 hr_precip_sum = None
                 hr_olr_sum = None
+                hr_lgt_sum = None
+                hr_spr_sum = None
                 hr_cnt = 0
 
             if out_cfg.monthly_mean_enabled and (
