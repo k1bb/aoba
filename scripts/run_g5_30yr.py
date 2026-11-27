@@ -458,7 +458,11 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
                 "ocn_wet0": model.ogcm.wet_c[0].detach().cpu() if model.ogcm is not None else None,
             }
         )(*__import__("aoba.scvt_mesh", fromlist=["reconstruct_cell_winds"]).reconstruct_cell_winds(model.mesh, model.atmos.u_edge)),
-        "rad_cache": {k: v.detach().cpu() for k, v in model.rad_cache.items()},
+        "rad_cache": {
+            k: v.detach().cpu()
+            for k, v in model.rad_cache.items()
+            if isinstance(v, torch.Tensor) and not k.startswith("_")
+        },
     }
     if extra:
         payload.update(extra)
@@ -721,7 +725,11 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
             setattr(model.atmos, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
         for k, v in ck_crm.__dict__.items():
             setattr(model.crm, k, v.to(device=device) if isinstance(v, torch.Tensor) else v)
-        model.rad_cache = {k: v.to(device=device) for k, v in ckpt["rad_cache"].items()}
+        model.rad_cache = {
+            k: v.to(device=device)
+            for k, v in ckpt["rad_cache"].items()
+            if isinstance(v, torch.Tensor) and not k.startswith("_")
+        }
     else:
         print(
             f"  [Universal Grid Remap] Seamlessly connecting restart "

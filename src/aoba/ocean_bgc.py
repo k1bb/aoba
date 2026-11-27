@@ -893,18 +893,25 @@ def step_ocean_bgc_flexpft(
         and active_w_c is not None
     )
     if use_gpu_fct:
-        # Process tracers in B=2 pairs to reuse T+S's cached FCT+z* workspace with ZERO extra GPU VRAM!
-        zero_nl_2 = cache.get("bgc_zero_nl_2")
-        if zero_nl_2 is None or zero_nl_2.shape != (2, nzo - 1, nc):
-            zero_nl_2 = torch.zeros((2, nzo - 1, nc), device=dev, dtype=dtype)
-            cache["bgc_zero_nl_2"] = zero_nl_2
-        for i0 in range(0, nt, 2):
-            i1 = min(i0 + 2, nt)
+        # Process tracers in B=4 chunks when GPU VRAM allows (cuts redundant 3D velocity/geometry
+        # DRAM reads in half with bit-for-bit identical Zalesak FCT+z* results; B=8 spills L2 cache).
+        if dev.type == "cuda":
+            _vram_gb = float(torch.cuda.get_device_properties(dev).total_memory) / 1.0e9
+            bgc_batch = 4 if (_vram_gb >= 20.0 or nc * nzo <= 3_500_000) else 2
+        else:
+            bgc_batch = 4 if (nc * nzo <= 3_500_000) else 2
+        znl_k = f"bgc_zero_nl_{bgc_batch}"
+        zero_nl_b = cache.get(znl_k)
+        if zero_nl_b is None or zero_nl_b.shape != (bgc_batch, nzo - 1, nc):
+            zero_nl_b = torch.zeros((bgc_batch, nzo - 1, nc), device=dev, dtype=dtype)
+            cache[znl_k] = zero_nl_b
+        for i0 in range(0, nt, bgc_batch):
+            i1 = min(i0 + bgc_batch, nt)
             bi = i1 - i0
             dispatch_ogcm_fct_zstar_metal(
                 q=qt[i0:i1],
                 q_comp=ct[i0:i1],
-                f_nl_q=zero_nl_2[:bi],
+                f_nl_q=zero_nl_b[:bi],
                 h_u_edge=h_u_edge,
                 sx_int=sx_int,
                 w_star=w_star,

@@ -701,7 +701,7 @@ def step_crm_rk3_hevi(
 
     Slow advection, Coriolis, and 3D Smagorinsky-Lilly SGS tendencies are evaluated once per
     RK3 stage (`dt_dyn`), while horizontal sound waves and implicit vertical HEVI oscillations are
-    sub-stepped at the acoustic Courant limit (`0.70 * dx / 350` for 2D C-grid where the von Neumann
+    sub-stepped at the acoustic Courant limit (`0.85 * dx / 350` for 2D C-grid where the von Neumann
     limit is `1.0`, `0.45 * min(dx, dy) / 350` for 3D; Skamarock & Klemp, 1992). On Apple Silicon
     (`mps`), the entire fast acoustic+HEVI loop dispatches to fused Metal compute kernels.
 
@@ -749,7 +749,7 @@ def step_crm_rk3_hevi(
         dv_sgs = dv_sgs - f_col_3d * u_pert0
 
     is_2d_crm = (ny == 1) ^ (nx == 1)
-    cfl_ac = 0.70 if is_2d_crm else 0.45
+    cfl_ac = 0.85 if is_2d_crm else 0.45
     dt_ac_max = cfl_ac * min(dx, dy) / 350.0 if (ny > 1 or nx > 1) else dt_dyn
     if can_use_crm_metal(rho0):
         rho_s, Thm_s, u_s, v_s, w_s, fx_final, fy_final, fz_final = run_crm_rk3_hevi_metal(
@@ -1177,17 +1177,17 @@ def _step_crm_physics_and_dynamics_impl(
         n_sub = max(n_dyn_substeps, 0)
     else:
         # Split-explicit outer RK3-WS3 & donor-cell FCT obey the half-span jet + convective CFL
-        # (u_ref = 80 m/s after Galilean shift covers >120 m/s winter polar-night jets over easterlies),
-        # yielding dt_sub <= 24 s at dx = 4 km in both 2D and 3D while step_crm_rk3_hevi sub-steps
-        # horizontal acoustic waves automatically.
-        cfl_adv = 0.50 if is_2d_crm else 0.45
+        # (u_ref = 80 m/s after Galilean shift covers >150 m/s winter polar-night jet shear;
+        # Wicker & Skamarock 2002 WS3+RK3 linear stability limit is 1.61, so cfl_adv = 0.96 keeps
+        # CFL_WS3 <= 0.96 << 1.61 while dt_cfl_max <= 25 s keeps Zalesak FCT <= 1.0 across all dx).
+        cfl_adv = 0.96 if is_2d_crm else 0.45
         u_ref_cfl = 80.0
-        dt_cfl_max = min(25.0 if is_2d_crm else 45.0, cfl_adv * min(crm.dx, crm.dy) / u_ref_cfl)
+        dt_cfl_max = min(24.0 if is_2d_crm else 45.0, cfl_adv * min(crm.dx, crm.dy) / u_ref_cfl)
         n_sub_min = max(n_dyn_substeps, int(math.ceil(dt_crm / max(dt_cfl_max, 0.1))))
         # Universal acoustic-aligned substep snapping: searching a small window n >= n_sub_min
         # (strictly smaller/more stable dt_sub) eliminates fractional ceil(dtau / dt_ac_max)
-        # acoustic-substep jumps (e.g. dx=2 km: n=58 -> 60 drops acoustic solves 464 -> 360, -22.4%).
-        cfl_ac_snap = 0.70 if is_2d_crm else 0.45
+        # acoustic-substep jumps across all resolutions and host timesteps.
+        cfl_ac_snap = 0.85 if is_2d_crm else 0.45
         dt_ac_snap = cfl_ac_snap * min(crm.dx, crm.dy) / 350.0
         best_n = n_sub_min
         best_cost = float("inf")

@@ -2441,6 +2441,7 @@ def step_aoba_model(
                 apply_atm_surface_increments_to_ocn_sfc,
                 atm_to_ocn_conservative_flux,
                 atm_to_ocn_intensive,
+                atm_to_ocn_intensive_batch,
                 ocn_to_atm_mean,
             )
 
@@ -2512,16 +2513,22 @@ def step_aoba_model(
 
         if do_step_ogcm:
             if has_indep_ocn:
-                tau_x_ocn = atm_to_ocn_intensive(coupler, tau_x_ocn)
-                tau_y_ocn = atm_to_ocn_intensive(coupler, tau_y_ocn)
-                f_ice_ocn = atm_to_ocn_intensive(coupler, f_ice_ocn)
-                evap_ocn = atm_to_ocn_intensive(coupler, evap_ocn)
-                precip_ocn = atm_to_ocn_intensive(coupler, precip_ocn, ocean_only_source=False)
-                sw_net_ocn = atm_to_ocn_intensive(coupler, sw_net_ocn)
+                _int_list = [tau_x_ocn, tau_y_ocn, f_ice_ocn, evap_ocn, sw_net_ocn]
                 if sw_par_ocn is not None:
-                    sw_par_ocn = atm_to_ocn_intensive(coupler, sw_par_ocn)
+                    _int_list.append(sw_par_ocn)
                 if u10_ocn is not None:
-                    u10_ocn = atm_to_ocn_intensive(coupler, u10_ocn)
+                    _int_list.append(u10_ocn)
+                _int_ocn = atm_to_ocn_intensive_batch(coupler, torch.stack(_int_list, dim=0))
+                tau_x_ocn, tau_y_ocn, f_ice_ocn, evap_ocn, sw_net_ocn = (
+                    _int_ocn[0], _int_ocn[1], _int_ocn[2], _int_ocn[3], _int_ocn[4],
+                )
+                _ii = 5
+                if sw_par_ocn is not None:
+                    sw_par_ocn = _int_ocn[_ii]
+                    _ii += 1
+                if u10_ocn is not None:
+                    u10_ocn = _int_ocn[_ii]
+                precip_ocn = atm_to_ocn_intensive(coupler, precip_ocn, ocean_only_source=False)
                 runoff_tot_ocn = atm_to_ocn_conservative_flux(coupler, runoff_tot_ocn, ocean_only_source=False)
                 runoff_ice_ocn = atm_to_ocn_conservative_flux(coupler, runoff_ice_ocn, ocean_only_source=False)
                 if river_mouth_ocn is not None:
@@ -3175,6 +3182,8 @@ def step_aoba_model(
                 )
             if (has_pool or sparse_warmup_crm) and model.crm_distill.steps_seen < model.crm_distill.warmup_steps:
                 n_cgrad = 4
+            elif model.crm_distill.steps_seen >= max(model.crm_distill.warmup_steps + 120, 120) and model.crm_distill.ema_val_rmse_thm < 1.2:
+                n_cgrad = 1 if (model.step_count % 2 == 0) else 0
             elif model.crm_distill.steps_seen >= model.crm_distill.warmup_steps + 24 and model.crm_distill.ema_val_rmse_thm < 2.0:
                 n_cgrad = 1
             else:

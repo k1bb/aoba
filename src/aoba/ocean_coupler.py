@@ -172,6 +172,17 @@ def atm_to_ocn_intensive(
     return field_atm[idx]
 
 
+def atm_to_ocn_intensive_batch(
+    coupler: OceanAtmosCoupler,
+    fields_atm: torch.Tensor,
+    *,
+    ocean_only_source: bool = True,
+) -> torch.Tensor:
+    """Batched gather of `[K, N_atm]` intensive atmospheric surface fields onto `[K, N_ocn]` in 1 launch."""
+    idx = coupler.ocn_to_atm_ocn_idx if ocean_only_source else coupler.ocn_to_atm_idx
+    return fields_atm[:, idx]
+
+
 def atm_to_ocn_conservative_flux(
     coupler: OceanAtmosCoupler,
     flux_atm: torch.Tensor,

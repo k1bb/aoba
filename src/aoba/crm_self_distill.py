@@ -1694,13 +1694,22 @@ def train_student_online(
     if state.replay.size < 64:
         return
 
-    state.net.train()
-    n_steps = max(int(n_grad_steps), 1)
+    n_steps = int(n_grad_steps)
     # Use extra gradient steps during warmup or when OOD surge raises validation RMSE
     if state.steps_seen < state.warmup_steps or state.ema_val_rmse_thm > 2.5:
         n_steps = max(n_steps, 4)
+    if n_steps <= 0:
+        return
 
+    state.net.train()
     b_fresh = int(x_fresh.shape[0])
+    if (
+        n_steps == 1
+        and state.steps_seen >= max(state.warmup_steps + 120, 120)
+        and state.ema_val_rmse_thm < 1.2
+        and b_fresh <= 128
+    ):
+        batch_size = min(int(batch_size), 256)
     half_b = min(batch_size // 2, b_fresh)
     use_sp = (
         state.replay.has_spatial
@@ -1715,9 +1724,19 @@ def train_student_online(
         sm_fresh_b = None
         tm_fresh_b = None
 
+    use_cuda_bf16 = x_fresh.device.type == "cuda"
+
     def _one_grad_step(inp: list[torch.Tensor]) -> list[torch.Tensor]:
         xb_i, cpb_i, csb_i, tpb_i, tsb_i = inp[0], inp[1], inp[2], inp[3], inp[4]
-        pa_raw, sa_raw, pb_raw, sb_raw, h_lat = state.net.forward_with_latent(xb_i)
+        if use_cuda_bf16:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                pa_raw, sa_raw, pb_raw, sb_raw, h_lat = state.net.forward_with_latent(xb_i)
+            pa_raw = pa_raw.float()
+            sa_raw = sa_raw.float()
+            pb_raw = pb_raw.float()
+            sb_raw = sb_raw.float()
+        else:
+            pa_raw, sa_raw, pb_raw, sb_raw, h_lat = state.net.forward_with_latent(xb_i)
         # Unpack physics context [B, 10, nz] -> [nz, B]
         cp_t = cpb_i.permute(1, 2, 0).contiguous()
         rho_b, dz_b, ex_b = cp_t[0], cp_t[1], cp_t[2]
@@ -1769,7 +1788,16 @@ def train_student_online(
         loss_i = loss_i + loss_gauge
 
         if len(inp) == 8:
-            sc_pred, sp_pred, dt_cp_pred, dq_cp_pred, ug_pred = state.net.spatial_head(h_lat, inp[5])
+            if use_cuda_bf16:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    sc_pred, sp_pred, dt_cp_pred, dq_cp_pred, ug_pred = state.net.spatial_head(h_lat, inp[5])
+                sc_pred = sc_pred.float()
+                sp_pred = sp_pred.float()
+                dt_cp_pred = dt_cp_pred.float()
+                dq_cp_pred = dq_cp_pred.float()
+                ug_pred = ug_pred.float()
+            else:
+                sc_pred, sp_pred, dt_cp_pred, dq_cp_pred, ug_pred = state.net.spatial_head(h_lat, inp[5])
             loss_sp = _compute_spatial_placement_loss(
                 sc_pred, sp_pred, inp[6], inp[7],
                 dthm_cp=dt_cp_pred, dqv_cp=dq_cp_pred, u_gust=ug_pred,
