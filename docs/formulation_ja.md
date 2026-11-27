@@ -1942,7 +1942,7 @@ Q_{\mathrm{rad,eff}} &= (1 - w_{\mathrm{nLTE}})\,Q_{\mathrm{rad,LTE}} + w_{\math
 \end{aligned} \tag{10.2a}
 $$
 
-高度 $60\ \mathrm{km}$ 以高では、Sutherland 則の動粘性係数 $\nu_{\mathrm{mol}} = \mu(T)/\rho$ と熱拡散係数 $\kappa_{\mathrm{mol}} = \nu_{\mathrm{mol}}/\mathrm{Pr}$（$\mathrm{Pr} = 0.71$）を、無条件安定かつ `float32` 保存性を満たす増分形式の陰的三重対角拡散により `theta_m` および `u_edge` へ適用する：
+高度 $60\ \mathrm{km}$ 以高では、Sutherland 則の動粘性係数 $\nu_{\mathrm{mol}} = \mu(T)/\rho$ および Fourier 則の分子熱拡散係数 $\kappa_{\mathrm{mol}} = \nu_{\mathrm{mol}}/\mathrm{Pr}$（$\mathrm{Pr} = 0.71$; Banks & Kockarts, 1973）を、無条件安定かつ `float32` 保存性を満たす増分形式の陰的三重対角拡散により顕熱温度 $T$（$\Delta\theta_m = \Delta T\,\theta_m/T$ として温位へ変換し、等温成層中間圏での偽下向き熱輸送を厳密ゼロ化）および辺風速 `u_edge` へ適用する：
 
 $$
 (\mathbf{I} + \mathbf{L}_{\mathrm{mol}})\,\Delta q = -\mathbf{L}_{\mathrm{mol}}\,q^n, \qquad \nu_{\mathrm{mol}} = \min\!\left(\frac{1.458\times 10^{-6}\,T^{3/2}}{\rho(T + 110.4)},\ 40\ \mathrm{m^2\ s^{-1}}\right)\sigma\!\left(\frac{z - 62\ \mathrm{km}}{4\ \mathrm{km}}\right) \tag{10.2b}

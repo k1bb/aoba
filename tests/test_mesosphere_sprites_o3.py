@@ -71,20 +71,31 @@ def test_molecular_diffusion_conservation_and_stability() -> None:
         nc, ne = mesh.n_cells, mesh.n_edges
         zc = vg.zeta_c.unsqueeze(1).expand(64, nc).contiguous()
         dzc = vg.dzeta_c.unsqueeze(1).expand(64, nc).contiguous()
-        temp = torch.full((64, nc), 210.0, device=dev)
+        # Test true sensible-temperature Fourier conduction on a realistic stratified mesosphere:
+        # 1) Exact enthalpy conservation sum(rho * dz * T) under wavy T(z)
+        temp_wavy = 200.0 + 25.0 * torch.sin(zc / 5000.0)
         pres = 101325.0 * torch.exp(-zc / 7000.0)
-        rho = pres / (287.04 * temp)
-        thm = 300.0 + 40.0 * torch.sin(zc / 5000.0)
+        rho = pres / (287.04 * temp_wavy)
+        exner = torch.pow(pres / 100000.0, 287.04 / 1004.64)
+        thm = temp_wavy / exner
         u_e = 60.0 * torch.sin(zc[:, :1] / 4000.0).expand(64, ne).contiguous()
 
         dm = (rho * dzc).cpu().double()
-        e_before = (dm * thm.cpu().double()).sum(dim=0)
+        h_before = (dm * temp_wavy.cpu().double()).sum(dim=0)
         thm_new, u_new = apply_mesospheric_molecular_diffusion(
-            rho, thm, u_e, zc, dzc, temp, mesh.cells_on_edge[:, 0], mesh.cells_on_edge[:, 1], dt=720.0
+            rho, thm, u_e, zc, dzc, temp_wavy, mesh.cells_on_edge[:, 0], mesh.cells_on_edge[:, 1], dt=720.0
         )
-        e_after = (dm * thm_new.cpu().double()).sum(dim=0)
-        rel_err = float(((e_after - e_before).abs() / e_before.abs()).max().item())
-        assert rel_err < 1.0e-5, f"Molecular thermal diffusion failed column enthalpy conservation: {rel_err}"
+        t_after = thm_new * exner
+        h_after = (dm * t_after.cpu().double()).sum(dim=0)
+        rel_err = float(((h_after - h_before).abs() / h_before.abs()).max().item())
+        assert rel_err < 1.0e-5, f"Molecular thermal conduction failed column enthalpy conservation: {rel_err}"
+        # 2) Strictly zero spurious pumping in an isothermal stratified mesosphere (despite theta_m > 10,000 K!)
+        t_iso = torch.full((64, nc), 185.0, device=dev)
+        thm_iso = t_iso / exner
+        thm_iso_new, _ = apply_mesospheric_molecular_diffusion(
+            rho, thm_iso, u_e, zc, dzc, t_iso, mesh.cells_on_edge[:, 0], mesh.cells_on_edge[:, 1], dt=720.0
+        )
+        assert float((thm_iso_new - thm_iso).abs().max().item()) < 1.0e-4, "Isothermal atmosphere must have zero molecular heat flux!"
         # Global max principle + strict kinetic-energy dissipation & column momentum conservation
         rho_e = 0.5 * (rho[:, mesh.cells_on_edge[:, 0]] + rho[:, mesh.cells_on_edge[:, 1]])
         dz_e = 0.5 * (dzc[:, mesh.cells_on_edge[:, 0]] + dzc[:, mesh.cells_on_edge[:, 1]])

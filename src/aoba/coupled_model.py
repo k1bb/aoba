@@ -2694,7 +2694,8 @@ def step_aoba_model(
     if dc_min is None:
         dc_min = float(mesh.dc_edge.min().item())
         setattr(mesh, "_dc_edge_min_m", dc_min)
-    dt_adv_host = min(900.0, 0.40 * dc_min / 100.0)
+    u_cfl_ref = 160.0 if float(cfg.z_top) >= 68000.0 else 100.0
+    dt_adv_host = min(900.0, 0.40 * dc_min / u_cfl_ref)
     n_hdyn = max(cfg.n_host_dyn_substeps, int(math.ceil(dt / max(dt_adv_host, 1.0))))
     dt_hdyn = dt / float(n_hdyn)
 

@@ -1942,7 +1942,7 @@ Q_{\mathrm{rad,eff}} &= (1 - w_{\mathrm{nLTE}})\,Q_{\mathrm{rad,LTE}} + w_{\math
 \end{aligned} \tag{10.2a}
 $$
 
-Above $60\ \mathrm{km}$, Sutherland-law kinematic molecular viscosity $\nu_{\mathrm{mol}} = \mu(T)/\rho$ and thermal diffusivity $\kappa_{\mathrm{mol}} = \nu_{\mathrm{mol}}/\mathrm{Pr}$ ($\mathrm{Pr} = 0.71$) are integrated on `theta_m` and `u_edge` via unconditionally stable increment-form implicit tridiagonal diffusion:
+Above $60\ \mathrm{km}$, Sutherland-law kinematic molecular viscosity $\nu_{\mathrm{mol}} = \mu(T)/\rho$ and Fourier-law thermal diffusivity $\kappa_{\mathrm{mol}} = \nu_{\mathrm{mol}}/\mathrm{Pr}$ ($\mathrm{Pr} = 0.71$; Banks & Kockarts, 1973) are integrated on sensible temperature $T$ (mapped conservatively via $\Delta\theta_m = \Delta T\,\theta_m/T$, ensuring zero spurious downward heat pumping in an isothermal stratified mesosphere) and edge velocity `u_edge` via unconditionally stable increment-form implicit tridiagonal diffusion:
 
 $$
 (\mathbf{I} + \mathbf{L}_{\mathrm{mol}})\,\Delta q = -\mathbf{L}_{\mathrm{mol}}\,q^n, \qquad \nu_{\mathrm{mol}} = \min\!\left(\frac{1.458\times 10^{-6}\,T^{3/2}}{\rho(T + 110.4)},\ 40\ \mathrm{m^2\ s^{-1}}\right)\sigma\!\left(\frac{z - 62\ \mathrm{km}}{4\ \mathrm{km}}\right) \tag{10.2b}

@@ -72,7 +72,7 @@ EINSTEIN_A_CO2_15UM: float = 1.35        # Spontaneous emission rate of CO2 (01^
 T_VIB_CO2_15UM_K: float = 960.0          # Vibrational excitation temperature h*nu/k_B for 667 cm^-1 [K]
 K_CO2_AIR_CM3S: float = 2.5e-15          # Collisional quenching rate CO2-N2/O2 near 200 K [cm^3 s^-1]
 K_CO2_O_CM3S: float = 3.0e-12            # Fast collisional quenching rate CO2-O(3P) [cm^3 s^-1]
-Q_CO2_NLTE_SCALE_KS: float = 8.5e-3      # Calibration prefactor reproducing ~3-10 K/day at 55-85 km [K s^-1]
+Q_CO2_NLTE_SCALE_KS: float = 5.0e-3      # Calibration prefactor reproducing ~3-8 K/day at 55-85 km [K s^-1]
 
 # Strobel (1978) & Mlynczak & Solomon (1993) UV heating constants
 Q_UV_O3_HARTLEY_KS: float = 1.3e-4       # Hartley O3 UV heating scale at stratopause (~11 K/d peak) [K s^-1]
@@ -279,7 +279,12 @@ def apply_mesospheric_molecular_diffusion(
         dq = solve_tridiagonal_batched(dl, diag, du, rhs)
         return q + dq
 
-    thm_top = _implicit_vdiff_increment(thm_s, rho_s, dz_s, kappa_c)
+    # Banks & Kockarts (1973): Fourier-law molecular thermal conduction acts on sensible temperature T
+    # (conserving column enthalpy sum(rho * dz * cp * T) with zero spurious downward pumping in an
+    # isothermal stratified mesosphere where theta_m grows exponentially with height).
+    t_new = _implicit_vdiff_increment(t_safe, rho_s, dz_s, kappa_c)
+    dt_mol = t_new - t_safe
+    thm_top = torch.clamp(thm_s + dt_mol * (thm_s / t_safe), min=150.0, max=50000.0)
 
     # Edge-averaged rho, dz, and nu for horizontal momentum molecular viscosity
     rho_e = 0.5 * (rho_s[:, c0] + rho_s[:, c1])
