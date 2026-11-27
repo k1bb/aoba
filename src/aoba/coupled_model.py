@@ -106,6 +106,7 @@ class AOBAConfig:
     ocean_glevel: int = 0                    # Independent ocean SCVT glevel (0 = share host glevel; >0 = e.g. G6/G7/G8 high-res OGCM)
     ocean_nz: int = 18                       # Vertical z-levels when ocean_mode="ogcm_3d" (0..6000 m)
     ocean_stride: int = 1                    # Conservative async 3D OGCM coupling interval [host steps] (1=every step, 2-3=faster)
+    ocean_bgc_stride: int = 1                # Exact z*-conservative FlexPFT marine BGC sub-stepping stride [OGCM steps] (1=every OGCM step, 2=every 2nd)
     enable_seaice_drift: bool = True         # Enable dynamic wind/current sea-ice drift in 3D OGCM mode
     enable_ocean_bgc: bool = True            # FlexPFT marine biogeochemistry & OMIP/mocsy 2.0 carbonate chemistry
     enable_river_routing: bool = True        # Map-free Priority-Flood Voronoi river routing
@@ -1635,7 +1636,12 @@ def step_aoba_model(
                     q_rad_t[:, tr_s], sw1d_t[tr_s], sw1f_t[tr_s], sw2d_t[tr_s], sw2f_t[tr_s],
                     lwd_t[tr_s], olr_t[tr_s], asr_t[tr_s],
                 )
-                n_rgrad = 4 if model.rad_distill.steps_seen < model.rad_distill.warmup_steps else 2
+                _r_steady = (
+                    model.rad_distill.steps_seen >= max(model.rad_distill.warmup_steps + 40, 40)
+                    and model.rad_distill.ema_val_rmse_olr < 8.0
+                    and model.rad_distill.ema_val_rmse_asr < 14.0
+                )
+                n_rgrad = 4 if model.rad_distill.steps_seen < model.rad_distill.warmup_steps else (1 if _r_steady else 2)
                 train_rad_student_online(
                     model.rad_distill, x_rt, cp_rt, cs_rt, tqr_rt, ts_rt, n_grad_steps=n_rgrad
                 )
@@ -1875,7 +1881,12 @@ def step_aoba_model(
                     t_cell_idx_sub=t_cell_sub_rt,
                     step_count=model.step_count,
                 )
-            n_rgrad_d = 4 if model.rad_distill.steps_seen < model.rad_distill.warmup_steps else 2
+            _r_steady_d = (
+                model.rad_distill.steps_seen >= max(model.rad_distill.warmup_steps + 40, 40)
+                and model.rad_distill.ema_val_rmse_olr < 8.0
+                and model.rad_distill.ema_val_rmse_asr < 14.0
+            )
+            n_rgrad_d = 4 if model.rad_distill.steps_seen < model.rad_distill.warmup_steps else (1 if _r_steady_d else 2)
             train_rad_student_online(
                 model.rad_distill, x_rt, cp_rt, cs_rt, tqr_rt, ts_rt, n_grad_steps=n_rgrad_d
             )
@@ -2130,7 +2141,8 @@ def step_aoba_model(
 
             # Apply Fomichev (1998) non-LTE CO2 15 um cooling + Strobel (1978) O2/O3 UV heating above ~55 km
             # on host columns (clouds vanish above 25 km -> exact on nc columns with zero subgrid cost!)
-            q_rad_cell_lte = _sub_to_cell(q_rad_sub, nc, n_sub)
+            n_rad_sub = max(int(q_rad_sub.shape[-1]) // max(nc, 1), 1)
+            q_rad_cell_lte = _sub_to_cell(q_rad_sub, nc, n_rad_sub)
             p_rad_h, t_rad_h = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)[::2]
             o3_meso = (
                 model.ozone.o3_vmr
@@ -2148,7 +2160,7 @@ def step_aoba_model(
                 co2_ppmv=co2_rad_now,
                 uv_solar_scale=uv_j_o2_scale,
             )
-            q_rad_sub = q_rad_sub + _cell_to_sub(q_rad_cell_nlte - q_rad_cell_lte, nc, n_sub)
+            q_rad_sub = q_rad_sub + _cell_to_sub(q_rad_cell_nlte - q_rad_cell_lte, nc, n_rad_sub)
         model.rad_cache["q_rad_sub"] = q_rad_sub
         model.rad_cache["sw1_dir_sub"] = sw1_dir_sub
         model.rad_cache["sw1_dif_sub"] = sw1_dif_sub
@@ -2584,6 +2596,7 @@ def step_aoba_model(
                 enable_tidal_mixing=bool(cfg.enable_ogcm_tidal_mixing),
                 enable_o2_omz=bool(cfg.enable_ocean_o2_omz),
                 langmuir_fac=langmuir_use,
+                bgc_stride=max(int(getattr(cfg, "ocean_bgc_stride", 1)), 1),
             )
             model.rad_cache["_ogcm_step_gen"] = int(model.rad_cache.get("_ogcm_step_gen", 0)) + 1
             if has_indep_ocn:
@@ -2741,17 +2754,27 @@ def step_aoba_model(
     if float(cfg.z_top) >= 68000.0:
         from aoba.mesosphere import apply_mesospheric_molecular_diffusion
 
-        _, _, t_mol_h = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+        k_mol_s = model.rad_cache.get("_k_mol_start")
+        if k_mol_s is None:
+            zc_cpu = vgrid.zeta_c.detach().cpu()
+            idx_m = torch.nonzero(zc_cpu >= 40000.0, as_tuple=False)
+            k_mol_s = max(int(idx_m[0].item()) - 1, 0) if int(idx_m.numel()) > 0 else 0
+            model.rad_cache["_k_mol_start"] = k_mol_s
+        _, _, t_mol_h = diagnose_pressure_temperature(atmos.rho_d[k_mol_s:], atmos.theta_m[k_mol_s:], atmos.q_v[k_mol_s:])
+        # Pad only the sliced top levels so apply_mesospheric_molecular_diffusion touches only z >= 40 km
+        t_mol_full = torch.empty_like(atmos.theta_m)
+        t_mol_full[k_mol_s:] = t_mol_h
         atmos.theta_m, atmos.u_edge = apply_mesospheric_molecular_diffusion(
             rho_d=atmos.rho_d,
             theta_m=atmos.theta_m,
             u_edge=atmos.u_edge,
             z_c=atmos.z_c,
             dz_c=atmos.dz_c,
-            temp_c=t_mol_h,
+            temp_c=t_mol_full,
             c0=mesh.cells_on_edge[:, 0],
             c1=mesh.cells_on_edge[:, 1],
             dt=dt,
+            k_start=k_mol_s,
         )
     qc_adv = torch.clamp(q_adv[2], min=0.0)
     qi_adv = torch.clamp(q_adv[3], min=0.0)
@@ -3204,7 +3227,7 @@ def step_aoba_model(
                 if sub_maps_all_sd is not None
                 else (None, None)
             )
-            if bool(cfg.enable_distill_shadow_diag):
+            if bool(cfg.enable_distill_shadow_diag) and (model.step_count < 8 or (model.step_count % 4 == 0)):
                 wind0_t_tile = _crm3d_to_tile3d(
                     torch.hypot(sub_crm_t.u[0], sub_crm_t.v[0]), from_full=has_pool
                 )
@@ -3229,6 +3252,8 @@ def step_aoba_model(
                 )
             if (has_pool or sparse_warmup_crm) and model.crm_distill.steps_seen < model.crm_distill.warmup_steps:
                 n_cgrad = 4
+            elif model.crm_distill.steps_seen >= max(model.crm_distill.warmup_steps + 240, 240) and model.crm_distill.ema_val_rmse_thm < 0.8:
+                n_cgrad = 1 if (model.step_count % 4 == 0) else 0
             elif model.crm_distill.steps_seen >= max(model.crm_distill.warmup_steps + 120, 120) and model.crm_distill.ema_val_rmse_thm < 1.2:
                 n_cgrad = 1 if (model.step_count % 2 == 0) else 0
             elif model.crm_distill.steps_seen >= model.crm_distill.warmup_steps + 24 and model.crm_distill.ema_val_rmse_thm < 2.0:
@@ -3698,7 +3723,7 @@ def step_aoba_model(
                 if sub_maps_all_sd is not None
                 else (None, None)
             )
-            if bool(cfg.enable_distill_shadow_diag):
+            if bool(cfg.enable_distill_shadow_diag) and (model.step_count < 8 or (model.step_count % 4 == 0)):
                 wind0_w_tile = _crm3d_to_tile3d(torch.hypot(crm.u[0, w_idx], crm.v[0, w_idx]))
                 land_mask_w_tile = (sfc_sub.surf_type.reshape(nc, ny_t, nx_t)[w_idx] == SURF_LAND)
                 evaluate_crm_shadow_on_teachers(
@@ -3764,6 +3789,12 @@ def step_aoba_model(
 
             if model.lightning_distill is None:
                 model.lightning_distill = init_lightning_self_distill_state(device=atmos.rho_d.device)
+            k_trop_lt = model.rad_cache.get("_k_trop_lt")
+            if k_trop_lt is None:
+                zc_cpu = vgrid.zeta_c.detach().cpu()
+                idx_tr = torch.nonzero(zc_cpu <= 25000.0, as_tuple=False)
+                k_trop_lt = min(int(idx_tr[-1].item()) + 2, nz) if int(idx_tr.numel()) > 0 else nz
+                model.rad_cache["_k_trop_lt"] = k_trop_lt
             _, _, _ny_out_l, _nx_out_l = crm.rho_d.shape
             light_diag, model.explicit_lightning = step_ossp_distilled_lightning(
                 lightning_scheme=_lscheme,
@@ -3789,6 +3820,7 @@ def step_aoba_model(
                 dx_crm=float(cfg.crm_dx),
                 dt=float(dt),
                 has_pool=has_pool,
+                k_top_trop=k_trop_lt,
             )
         elif _lscheme == "explicit_bulk":
             from aoba.lightning_explicit import (
@@ -4417,6 +4449,12 @@ def step_aoba_model(
             from aoba.lightning import LNOX_KG_N_PER_FLASH
 
             lnox_nx = light_diag.flash_tot_cell * LNOX_KG_N_PER_FLASH
+        k_meso_nlc = model.rad_cache.get("_k_meso_nlc")
+        if k_meso_nlc is None:
+            zc_cpu = vgrid.zeta_c.detach().cpu()
+            idx_nl = torch.nonzero(zc_cpu >= 58000.0, as_tuple=False)
+            k_meso_nlc = max(int(idx_nl[0].item()) - 1, 0) if int(idx_nl.numel()) > 0 else 0
+            model.rad_cache["_k_meso_nlc"] = k_meso_nlc
         sp_d = model.last_red_sprites
         step_prognostic_nox(
             nox=model.meso_nox,
@@ -4436,6 +4474,7 @@ def step_aoba_model(
             sprite_z_init_km=(sp_d.z_init_km_cell if sp_d is not None else None),
             sprite_z_stop_km=(sp_d.z_stop_km_cell if sp_d is not None else None),
             solar_uv_scale=uv_j_o2_scale,
+            k_meso_start=k_meso_nlc,
         )
     if str(cfg.o3_mode).strip().lower() == "prognostic":
         from aoba.ozone_chemistry import init_prognostic_ozone_state, step_prognostic_ozone

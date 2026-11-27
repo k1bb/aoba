@@ -246,6 +246,10 @@ PARAM_DOCS: dict[str, dict[str, str]] = {
         "ja": "3D OGCM 力学・トレーサー更新の非同期結合間隔 [大気ステップ数]（既定 1＝毎ステップ、2〜3 で大気→海洋フラックスを厳密時間平均して dt_ocn = dt_host × ocean_stride で更新し海洋コストを 1/ocean_stride に削減）。",
         "en": "Conservative asynchronous 3D OGCM coupling interval [host steps] (default 1; values 2-3 strictly time-average atmosphere-to-ocean heat/water/salt/momentum fluxes and advance the 3D OGCM with dt_ocn = dt_host * ocean_stride).",
     },
+    "ocean_bgc_stride": {
+        "ja": "3D 海洋生物地球化学 (FlexPFT BGC) の厳密 z* 保存サブステップ間隔 [OGCM ステップ数]（既定 1＝毎 OGCM ステップ、2 で連続 2 OGCM ステップの体積輸送・鉛直拡散・PAR を厳密時間平均し初期層厚 h*_old から dt_bgc = 2×dt_ocn で一括更新して BGC 計算量を半減）。",
+        "en": "Exact z*-conservative FlexPFT marine BGC sub-stepping stride [OGCM steps] (default 1; value 2 time-averages 3D transports, vertical diffusivity, and surface PAR/wind across 2 consecutive OGCM steps and advances BGC over dt_bgc = 2 * dt_ocn with exact telescoping layer-thickness continuity).",
+    },
     "enable_seaice_drift": {
         "ja": "風応力・海流による海氷の水平力学移流（漂流）を有効化する。",
         "en": "Enable wind- and current-driven horizontal sea-ice dynamical drift.",

@@ -1560,6 +1560,7 @@ def step_ogcm_voronoi(
     deep_tracer_accel: float = 1.0,
     step_bgc: bool = True,
     dt_bgc_scale: float = 1.0,
+    bgc_stride: int = 1,
 ) -> None:
     """Advance 3D SCVT Voronoi OGCM (`temp`, `sal`, `u_edge`, `eta`) & dynamic sea ice by `dt` [s].
 
@@ -1571,6 +1572,11 @@ def step_ogcm_voronoi(
     applies a smooth cosine depth-dependent tracer acceleration ``alpha(z)`` rising from ``1.0``
     above 300 m to ``deep_tracer_accel`` below 1500 m while keeping upper-ocean dynamics, sea ice,
     and air-sea fluxes strictly synchronous (``1.0x``).
+
+    When ``bgc_stride > 1`` and BGC is enabled, accumulates exact time-averaged layer transport
+    fluxes (``h_u_edge``, ``w_star``/``w_vel``, ``sx_int``, ``kv``, surface PAR/wind/sea-ice)
+    and stores the initial ``h*_old`` across ``bgc_stride`` consecutive OGCM steps so the
+    telescoping ``z*`` continuity identity closes to machine precision over ``K * dt``.
     """
     dev = ogcm.temp.device
     dtype = ogcm.temp.dtype
@@ -1581,9 +1587,42 @@ def step_ogcm_voronoi(
     is_ocean = sfc.surf_type == SURF_OCEAN
     cache = _get_ogcm_static_cache(ogcm, mesh, is_ocean)
 
+    # Determine exact z*-conservative BGC sub-stepping phase (`bgc_acc_mode`: 0=stride-1,
+    # 1=phase-0 capture, 2=intermediate accumulate, 3=final phase average + BGC step).
+    bgc_active_any = (ogcm.bgc is not None) and bool(step_bgc)
+    bgc_stride_k = max(int(bgc_stride), 1)
+    if bgc_active_any and bgc_stride_k > 1:
+        phase = int(getattr(ogcm, "_bgc_stride_phase", 0)) % bgc_stride_k
+        do_bgc_now = (phase == bgc_stride_k - 1)
+        bgc_acc_mode = 1 if phase == 0 else (3 if do_bgc_now else 2)
+        acc_spec = (nzo, nc, ne, str(dev), str(dtype))
+        acc_store = getattr(ogcm, "_bgc_flux_acc", None)
+        if acc_store is None or getattr(ogcm, "_bgc_flux_acc_spec", None) != acc_spec:
+            acc_store = (
+                torch.zeros((nzo, nc), device=dev, dtype=dtype),      # 0: h_old_z_start
+                torch.zeros((nzo, ne), device=dev, dtype=dtype),      # 1: hu_sum
+                torch.zeros((nzo + 1, nc), device=dev, dtype=dtype),  # 2: w_sum (w_star or w_vel)
+                torch.zeros((nzo - 1, ne), device=dev, dtype=dtype),  # 3: sx_sum
+                torch.zeros((nzo - 1, nc), device=dev, dtype=dtype),  # 4: kv_sum
+                torch.zeros((nc,), device=dev, dtype=dtype),          # 5: par_sum
+                torch.zeros((nc,), device=dev, dtype=dtype),          # 6: u10_sum
+                torch.zeros((nc,), device=dev, dtype=dtype),          # 7: fice_sum
+                torch.zeros((nc,), device=dev, dtype=dtype),          # 8: dh0_sum
+            )
+            setattr(ogcm, "_bgc_flux_acc", acc_store)
+            setattr(ogcm, "_bgc_flux_acc_spec", acc_spec)
+        bgc_acc_in = acc_store if bgc_acc_mode in (2, 3) else None
+    else:
+        phase = 0
+        do_bgc_now = bgc_active_any
+        bgc_acc_mode = 0
+        bgc_stride_k = 1
+        acc_store = None
+        bgc_acc_in = None
+
     # Determine whether CO2 is constant across consecutive steps so BGC can stay inside the CUDA Graph
     # without triggering per-step graph recapture during transient/prognostic CO2 trajectories.
-    bgc_active = (ogcm.bgc is not None) and bool(step_bgc)
+    bgc_active = do_bgc_now
     co2_f = float(co2_ppmv)
     prev_co2 = getattr(ogcm, "_cg_prev_co2", None)
     co2_steady = (prev_co2 is None) or (abs(co2_f - float(prev_co2)) <= 1.0e-6)
@@ -1593,10 +1632,12 @@ def step_ogcm_voronoi(
         has_evp = ogcm.seaice_evp is not None
         has_bgc = bgc_active
         has_sw = sw_net_ocn is not None
-        has_par = has_bgc and (sw_par_ocn is not None)
-        has_u10 = has_bgc and (u10_ocn is not None)
+        has_par = bgc_active_any and (sw_par_ocn is not None)
+        has_u10 = bgc_active_any and (u10_ocn is not None)
         has_riv = river_mouth_flux is not None
         has_lang = langmuir_fac is not None
+        has_bgc_acc_in = bgc_acc_in is not None
+        ret_bgc_acc = bgc_acc_mode in (1, 2)
 
         if has_bgc and ogcm.bgc is not None and enable_o2_omz and ogcm.bgc.o2 is None:
             # Pre-initialize O2 tensors before CUDA Graph capture so tensor shapes are fixed
@@ -1654,6 +1695,9 @@ def step_ogcm_voronoi(
                 assert b0.fgo2 is not None and b0.denit_moln_m2s is not None
                 assert b0.omz_col_frac is not None and b0.n2fix_moln_m2s is not None
                 live_in.extend([b0.o2, b0.o2_comp, b0.fgo2, b0.denit_moln_m2s, b0.omz_col_frac, b0.n2fix_moln_m2s])
+        if has_bgc_acc_in:
+            assert bgc_acc_in is not None
+            live_in.extend(bgc_acc_in)
 
         g_key = (
             "ogcm_voronoi",
@@ -1668,6 +1712,7 @@ def step_ogcm_voronoi(
             round(float(dt), 6), round(float(deep_tracer_accel), 4),
             round(float(dt_bgc_scale), 4) if has_bgc else 0.0,
             round(co2_f, 3) if has_bgc else 0.0,
+            int(bgc_acc_mode), int(bgc_stride_k),
         )
 
         def _cg_body(inp: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -1719,6 +1764,10 @@ def step_ogcm_voronoi(
                     denit_moln_m2s=den_v, omz_col_frac=omz_v, n2fix_moln_m2s=n2f_v,
                 )
 
+            acc_i = tuple(inp[idx : idx + 9]) if has_bgc_acc_in else None
+            if has_bgc_acc_in:
+                idx += 9
+
             ogcm_d = dict(ogcm.__dict__)
             ogcm_d["temp"] = inp[0]
             ogcm_d["sal"] = inp[1]
@@ -1739,7 +1788,7 @@ def step_ogcm_voronoi(
             sfc_d["swe_seaice"] = inp[10]
             sfc_v = SurfaceState(**{k: v for k, v in sfc_d.items() if k in SurfaceState.__dataclass_fields__})
 
-            _step_ogcm_voronoi_impl(
+            acc_out_cg = _step_ogcm_voronoi_impl(
                 ogcm_v, sfc_v, mesh, cache, is_ocean,
                 inp[11], inp[12], inp[13], inp[14], inp[15], inp[16], inp[17], dt,
                 enable_seaice_drift=enable_seaice_drift,
@@ -1754,6 +1803,9 @@ def step_ogcm_voronoi(
                 deep_tracer_accel=deep_tracer_accel,
                 step_bgc=has_bgc,
                 dt_bgc_scale=dt_bgc_scale,
+                bgc_acc_in=acc_i,
+                bgc_acc_mode=bgc_acc_mode,
+                bgc_stride_k=bgc_stride_k,
             )
             res = [
                 ogcm_v.temp, ogcm_v.sal, ogcm_v.t_comp, ogcm_v.s_comp,
@@ -1782,6 +1834,8 @@ def step_ogcm_voronoi(
                         bgc_v.o2, bgc_v.o2_comp, bgc_v.fgo2,
                         bgc_v.denit_moln_m2s, bgc_v.omz_col_frac, bgc_v.n2fix_moln_m2s,
                     ])
+            if ret_bgc_acc and acc_out_cg is not None:
+                res.extend(acc_out_cg)
             return res
 
         out = run_cuda_graph_cached(g_key, live_in, _cg_body, warmup_calls=2, clone_outputs=False)
@@ -1841,9 +1895,15 @@ def step_ogcm_voronoi(
                 b_dst.denit_moln_m2s.copy_(out[o_idx + 3])
                 b_dst.omz_col_frac.copy_(out[o_idx + 4])
                 b_dst.n2fix_moln_m2s.copy_(out[o_idx + 5])
+                o_idx += 6
+        if ret_bgc_acc and acc_store is not None:
+            for _ai in range(9):
+                acc_store[_ai].copy_(out[o_idx + _ai])
+        if bgc_active_any and bgc_stride_k > 1:
+            setattr(ogcm, "_bgc_stride_phase", 0 if do_bgc_now else (phase + 1))
         return
 
-    _step_ogcm_voronoi_impl(
+    acc_out = _step_ogcm_voronoi_impl(
         ogcm, sfc, mesh, cache, is_ocean,
         tau_x_sfc, tau_y_sfc, f_seaice, evap_cell, precip_cell,
         runoff_total, runoff_glacier, dt,
@@ -1857,9 +1917,17 @@ def step_ogcm_voronoi(
         enable_o2_omz=enable_o2_omz,
         langmuir_fac=langmuir_fac,
         deep_tracer_accel=deep_tracer_accel,
-        step_bgc=step_bgc,
+        step_bgc=do_bgc_now,
         dt_bgc_scale=dt_bgc_scale,
+        bgc_acc_in=bgc_acc_in,
+        bgc_acc_mode=bgc_acc_mode,
+        bgc_stride_k=bgc_stride_k,
     )
+    if acc_out is not None and acc_store is not None:
+        for _ai in range(9):
+            acc_store[_ai].copy_(acc_out[_ai])
+    if bgc_active_any and bgc_stride_k > 1:
+        setattr(ogcm, "_bgc_stride_phase", 0 if do_bgc_now else (phase + 1))
 
 
 def _step_ogcm_voronoi_impl(
@@ -1891,7 +1959,10 @@ def _step_ogcm_voronoi_impl(
     deep_tracer_accel: float = 1.0,
     step_bgc: bool = True,
     dt_bgc_scale: float = 1.0,
-) -> None:
+    bgc_acc_in: tuple[torch.Tensor, ...] | None = None,
+    bgc_acc_mode: int = 0,
+    bgc_stride_k: int = 1,
+) -> tuple[torch.Tensor, ...] | None:
     """Core 3D Voronoi OGCM + sea-ice advancement body (shared across CUDA Graph & MPS/CPU)."""
     dev = ogcm.temp.device
     dtype = ogcm.temp.dtype
@@ -2388,24 +2459,10 @@ def _step_ogcm_voronoi_impl(
     ogcm.s_comp = s_comp
 
     # 10b. FlexPFT Marine Biogeochemistry & OMIP/mocsy 2.0 Carbonate Chemistry
-    if ogcm.bgc is not None and step_bgc:
+    bgc_acc_out: tuple[torch.Tensor, ...] | None = None
+    need_bgc_sfc = (bgc_acc_mode > 0) or (ogcm.bgc is not None and step_bgc)
+    if need_bgc_sfc:
         from aoba.ocean_bgc import PAR_FRAC_SW, step_ocean_bgc_flexpft
-
-        dt_bgc = float(dt) * float(dt_bgc_scale)
-        if c_dif is None or h_eff is None or abs(float(dt_bgc_scale) - 1.0) > 1.0e-6:
-            c_dif_bgc = (dt_bgc * kv / dz_c_int) * wet_int_cf
-            h_eff_bgc = torch.cat([h0_vdiff.unsqueeze(0), h_c_vdiff_phys[1:]], dim=0)
-        else:
-            c_dif_bgc = c_dif
-            h_eff_bgc = torch.cat([h0_vdiff.unsqueeze(0), h_c_vdiff_phys[1:]], dim=0)
-        a_t_bgc, b_t_bgc, d_t_bgc = a_t, b_t, d_t
-        if (a_t_bgc is None or abs(float(dt_bgc_scale) - 1.0) > 1.0e-6 or use_deep_accel) and not (
-            use_gpu_ogcm and 2 <= nzo <= 64 and T.dtype == torch.float32
-        ):
-            z_row = torch.zeros_like(T[0:1])
-            a_t_bgc = torch.cat([z_row, -c_dif_bgc / h_eff_bgc[1:]], dim=0)
-            d_t_bgc = torch.cat([-c_dif_bgc / h_eff_bgc[:-1], z_row], dim=0)
-            b_t_bgc = 1.0 - a_t_bgc - d_t_bgc
 
         par_in = (
             sw_par_ocn
@@ -2418,6 +2475,74 @@ def _step_ogcm_voronoi_impl(
             # Fallback 10 m wind speed estimate from surface wind stress magnitude |tau| = rho_a * C_d * u10^2
             tau_mag = torch.sqrt(tau_x_sfc * tau_x_sfc + tau_y_sfc * tau_y_sfc + 1.0e-12)
             u10_in = torch.sqrt(tau_mag / (1.225 * 1.3e-3))
+
+        w_bgc_cur = w_star if enable_fct_zstar else w_vel
+        h_old_bgc_cur = h_old_z if enable_fct_zstar else h_c_safe
+
+        if bgc_acc_mode == 1:
+            bgc_acc_out = (
+                h_old_bgc_cur, h_u_edge, w_bgc_cur, sx_int, kv, par_in, u10_in, f_seaice, dh0_eff,
+            )
+        elif bgc_acc_mode == 2:
+            assert bgc_acc_in is not None
+            bgc_acc_out = (
+                bgc_acc_in[0],
+                bgc_acc_in[1] + h_u_edge,
+                bgc_acc_in[2] + w_bgc_cur,
+                bgc_acc_in[3] + sx_int,
+                bgc_acc_in[4] + kv,
+                bgc_acc_in[5] + par_in,
+                bgc_acc_in[6] + u10_in,
+                bgc_acc_in[7] + f_seaice,
+                bgc_acc_in[8] + dh0_eff,
+            )
+
+    if ogcm.bgc is not None and step_bgc:
+        if bgc_acc_mode == 3 and bgc_acc_in is not None and bgc_stride_k > 1:
+            # Exact telescoping z* continuity over K = bgc_stride_k consecutive OGCM steps:
+            # (h*_new^(K-1) - h*_old^(0)) / (K*dt) + div_h(mean(h_u_edge)) - d(mean(w*)) == 0.
+            inv_k = 1.0 / float(bgc_stride_k)
+            h_old_z_bgc = bgc_acc_in[0] if enable_fct_zstar else None
+            hu_bgc = (bgc_acc_in[1] + h_u_edge) * inv_k
+            w_avg_bgc = (bgc_acc_in[2] + (w_star if enable_fct_zstar else w_vel)) * inv_k
+            w_star_bgc = w_avg_bgc if enable_fct_zstar else None
+            w_vel_bgc = w_vel if enable_fct_zstar else w_avg_bgc
+            sx_bgc = (bgc_acc_in[3] + sx_int) * inv_k
+            kv_bgc = (bgc_acc_in[4] + kv) * inv_k
+            par_bgc = (bgc_acc_in[5] + par_in) * inv_k
+            u10_bgc = (bgc_acc_in[6] + u10_in) * inv_k
+            fice_bgc = (bgc_acc_in[7] + f_seaice) * inv_k
+            dh0_bgc = bgc_acc_in[8] + dh0_eff
+            dt_bgc = float(dt) * float(dt_bgc_scale) * float(bgc_stride_k)
+            c_dif_bgc = (dt_bgc * kv_bgc / dz_c_int) * wet_int_cf
+            h_eff_bgc = torch.cat([h0_vdiff.unsqueeze(0), h_c_vdiff_phys[1:]], dim=0)
+            a_t_bgc = b_t_bgc = d_t_bgc = None
+        else:
+            h_old_z_bgc = h_old_z if enable_fct_zstar else None
+            hu_bgc = h_u_edge
+            w_star_bgc = w_star if enable_fct_zstar else None
+            w_vel_bgc = w_vel
+            sx_bgc = sx_int
+            par_bgc = par_in
+            u10_bgc = u10_in
+            fice_bgc = f_seaice
+            dh0_bgc = dh0_eff
+            dt_bgc = float(dt) * float(dt_bgc_scale)
+            if c_dif is None or h_eff is None or abs(float(dt_bgc_scale) - 1.0) > 1.0e-6:
+                c_dif_bgc = (dt_bgc * kv / dz_c_int) * wet_int_cf
+                h_eff_bgc = torch.cat([h0_vdiff.unsqueeze(0), h_c_vdiff_phys[1:]], dim=0)
+            else:
+                c_dif_bgc = c_dif
+                h_eff_bgc = torch.cat([h0_vdiff.unsqueeze(0), h_c_vdiff_phys[1:]], dim=0)
+            a_t_bgc, b_t_bgc, d_t_bgc = a_t, b_t, d_t
+
+        if (a_t_bgc is None or abs(float(dt_bgc_scale) - 1.0) > 1.0e-6 or bgc_stride_k > 1 or use_deep_accel) and not (
+            use_gpu_ogcm and 2 <= nzo <= 64 and T.dtype == torch.float32
+        ):
+            z_row = torch.zeros_like(T[0:1])
+            a_t_bgc = torch.cat([z_row, -c_dif_bgc / h_eff_bgc[1:]], dim=0)
+            d_t_bgc = torch.cat([-c_dif_bgc / h_eff_bgc[:-1], z_row], dim=0)
+            b_t_bgc = 1.0 - a_t_bgc - d_t_bgc
 
         bgc_pre = None
         if use_deep_accel and alpha_z is not None:
@@ -2432,27 +2557,27 @@ def _step_ogcm_voronoi_impl(
             bgc=ogcm.bgc,
             ogcm=ogcm,
             mesh=mesh,
-            h_u_edge=h_u_edge,
-            sx_int=sx_int,
-            w_vel=w_vel,
+            h_u_edge=hu_bgc,
+            sx_int=sx_bgc,
+            w_vel=w_vel_bgc,
             h0_new=h0_vdiff,
-            dh0_eff=dh0_eff,
+            dh0_eff=dh0_bgc,
             a_t=a_t_bgc,
             b_t=b_t_bgc,
             d_t=d_t_bgc,
             c_dif=c_dif_bgc,
             h_eff=h_eff_bgc,
             cache=cache,
-            sw_par_sfc=par_in,
-            u10_ocn=u10_in,
-            f_seaice=f_seaice,
+            sw_par_sfc=par_bgc,
+            u10_ocn=u10_bgc,
+            f_seaice=fice_bgc,
             co2_ppmv=co2_ppmv,
             dt=dt_bgc,
             enable_full_redi=bool(ENABLE_FULL_REDI),
             enable_o2_omz=bool(enable_o2_omz),
-            h_old_z=h_old_z if enable_fct_zstar else None,
+            h_old_z=h_old_z_bgc,
             h_new_z=h_new_z if enable_fct_zstar else None,
-            w_star=w_star if enable_fct_zstar else None,
+            w_star=w_star_bgc,
             enable_fct_zstar=bool(enable_fct_zstar),
             c0_i32=c0_i32 if use_gpu_ogcm else None,
             c1_i32=c1_i32 if use_gpu_ogcm else None,
@@ -2481,6 +2606,7 @@ def _step_ogcm_voronoi_impl(
             step_seaice_drift_voronoi(sfc, mesh, tau_x_sfc, tau_y_sfc, u_new[0], dt, cache=cache)
 
     ogcm.m_seaice_prev = sfc.m_seaice.clone()
+    return bgc_acc_out
 
 
 def diagnose_ocean_spinup_metrics(

@@ -6113,7 +6113,7 @@ kernel void crm_distill_closure_col(
         uint idx = k * N + c;
         float dm = max(rho_d[idx] * dz_c[idx], 1.0e-6f);
         float ex = exner[idx];
-        float ex_safe = max(ex, 0.05f);
+        float ex_safe = max(ex, 0.005f);
         float s_lin = clamp((ex - 0.50f) / 0.14f, 0.0f, 1.0f);
         float s_conv = s_lin * s_lin;
         float pbl_sh = clamp(1.0f - (ex0 - ex) * inv_pbl_ex, 0.0f, 1.0f) * s_conv;
@@ -6367,7 +6367,7 @@ kernel void crm_distill_closure_col(
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * N + c;
         float ex = exner[idx];
-        float ex_safe = max(ex, 0.05f);
+        float ex_safe = max(ex, 0.005f);
         float s_conv = (k < 64u) ? sconv_col[k] : 0.0f;
         float qn0 = max(qn_post_ls[idx], 0.0f);
         float qc0 = max(qc_pre[idx], 0.0f);
@@ -6399,9 +6399,9 @@ kernel void crm_distill_closure_col(
         } else if (s_conv > 0.0f) {
             float qv_n = out_prof[3u * plane + idx];
             float d_thm_exact = (d_temp_cons * (1.0f + rv_rd * qv_n) + t_post_ls * rv_rd * (qv_n - qv0)) / ex_safe;
-            out_prof[idx] = clamp(thm_post_ls[idx] + d_thm_exact, 150.0f, 10000.0f);
+            out_prof[idx] = clamp(thm_post_ls[idx] + d_thm_exact, 150.0f, 50000.0f);
         } else {
-            out_prof[idx] = clamp(thm_post_ls[idx], 150.0f, 10000.0f);
+            out_prof[idx] = clamp(thm_post_ls[idx], 150.0f, 50000.0f);
         }
         if (s_conv > 0.0f) {
             float du_r = s_conv * l_gate * tanh(RP_LOAD(5u, k) * 0.2f) * 4.0f;
@@ -6449,9 +6449,9 @@ kernel void crm_distill_closure_col(
                 float t_p = qp_p_col[k];
                 float d_temp_adj = qnb_col[k] - t_p;
                 float d_thm_exact = (d_temp_adj * (1.0f + rv_rd * qv_n) + t_p * rv_rd * (qv_n - qv0)) / qsat_col[k];
-                out_prof[idx] = clamp(thm_post_ls[idx] + d_thm_exact, 150.0f, 10000.0f);
+                out_prof[idx] = clamp(thm_post_ls[idx] + d_thm_exact, 150.0f, 50000.0f);
             } else {
-                out_prof[idx] = clamp(thm_post_ls[idx], 150.0f, 10000.0f);
+                out_prof[idx] = clamp(thm_post_ls[idx], 150.0f, 50000.0f);
             }
         }
     }

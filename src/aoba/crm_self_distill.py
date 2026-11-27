@@ -275,7 +275,7 @@ def extract_crm_distill_features(
     # Conserved moist variables (T_li, theta_l, q_n, RH_tot) eliminate autoregressive (q_c, q_i, q_p)
     # self-feedback loops so student clouds respond purely to thermodynamic state and forcing.
     t_li = torch.clamp(temp - (C.L_V0 * qc_p + C.L_S0 * qi_p) / C.CP_D, min=150.0, max=400.0)
-    th_l = t_li / torch.clamp(exner, min=0.05)
+    th_l = t_li / torch.clamp(exner, min=0.005)
     qs = torch.clamp(qsat_mixed_val(t_li, pres), min=1.0e-7, max=0.2)
     rh_tot = torch.clamp(qn_tot / qs, min=0.0, max=2.0)
     z0 = torch.zeros_like(qn_tot)
@@ -362,7 +362,7 @@ def apply_exact_conservation_closure(
     s_lin = torch.clamp((exner - 0.50) / 0.14, min=0.0, max=1.0)
     s_conv = s_lin * s_lin
     in_conv = s_conv > 0.0
-    ex_safe = torch.clamp(exner, min=0.05)
+    ex_safe = torch.clamp(exner, min=0.005)
 
     qn0 = torch.clamp(qn_post_ls, min=0.0)
     qp0 = torch.clamp(qp_pre, min=0.0)
@@ -571,7 +571,7 @@ def apply_exact_conservation_closure(
         d_temp_cons * (1.0 + C.RV_OVER_RD * qv_new)
         + t_post_ls * C.RV_OVER_RD * (qv_new - qv0)
     ) / ex_safe
-    thm_new = torch.clamp(thm_post_ls + d_thm_exact, min=150.0, max=10000.0)
+    thm_new = torch.clamp(thm_post_ls + d_thm_exact, min=150.0, max=50000.0)
 
     # --- 3. Exact Column Horizontal Momentum Conservation ---
     du_imp_raw = (dm * d_u_raw).sum(dim=0)
@@ -1762,7 +1762,7 @@ def train_student_online(
         with torch.no_grad():
             qv_in_b = torch.clamp(qn_ls_b - qc_b - qi_b, min=0.0)
             t_in_b = (thm_ls_b * ex_b) / (1.0 + C.RV_OVER_RD * qv_in_b)
-            p_in_b = C.P_REF * torch.pow(torch.clamp(ex_b, min=0.05), 3.5)
+            p_in_b = C.P_REF * torch.pow(torch.clamp(ex_b, min=0.005), 3.5)
             qsat_in_b = torch.clamp(qsat_mixed_val(torch.clamp(t_in_b, 180.0, 340.0), p_in_b), min=1.0e-7, max=0.10)
         loss_i, r_thm_i, r_qn_i = _compute_distill_loss(
             pred_a, pred_b, tpb_i, tsb_i, ex_b, dt, dm=dm_b, qn_in=qn_ls_b, t_in=t_in_b, qsat_in=qsat_in_b
@@ -3138,17 +3138,28 @@ def train_rad_student_online(
 
     state.net.train()
     n_steps = max(int(n_grad_steps), 1)
+    eff_batch = int(batch_size)
     if state.steps_seen < state.warmup_steps or state.ema_val_rmse_olr > 12.0 or state.ema_val_rmse_asr > 18.0:
         n_steps = max(n_steps, 6)
-    elif state.steps_seen >= state.warmup_steps + 60 and state.ema_val_rmse_olr < 4.0 and state.ema_val_rmse_asr < 8.0:
+    elif state.steps_seen >= max(state.warmup_steps + 40, 40) and state.ema_val_rmse_olr < 8.0 and state.ema_val_rmse_asr < 14.0:
+        n_steps = min(n_steps, 1)
+        eff_batch = min(eff_batch, 256)
+    elif state.steps_seen >= state.warmup_steps + 20 and state.ema_val_rmse_olr < 10.0 and state.ema_val_rmse_asr < 16.0:
         n_steps = min(n_steps, 2)
 
     b_fresh = int(x_fresh.shape[0])
-    half_b = min(batch_size // 2, b_fresh)
+    half_b = min(eff_batch // 2, b_fresh)
+    use_bf16_rad = (x_fresh.device.type == "cuda") and torch.cuda.is_bf16_supported()
 
     def _one_rad_grad_step(inp: list[torch.Tensor]) -> list[torch.Tensor]:
         xb_i, cpb_i, csb_i, tqb_i, tsb_i = inp[0], inp[1], inp[2], inp[3], inp[4]
-        qa_raw, sa_raw, qb_raw, sb_raw = state.net(xb_i)
+        if use_bf16_rad:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                qa_raw, sa_raw, qb_raw, sb_raw = state.net(xb_i)
+            qa_raw, sa_raw = qa_raw.float(), sa_raw.float()
+            qb_raw, sb_raw = qb_raw.float(), sb_raw.float()
+        else:
+            qa_raw, sa_raw, qb_raw, sb_raw = state.net(xb_i)
         pred_both = apply_exact_rad_conservation_closure(
             torch.cat([qa_raw, qb_raw], dim=0),
             torch.cat([sa_raw, sb_raw], dim=0),
@@ -3180,7 +3191,7 @@ def train_rad_student_online(
     last_asr = None
     for _ in range(n_steps):
         f_idx = torch.randint(0, b_fresh, (half_b,), device=x_fresh.device)
-        xr, cpr, csr, tqr, tsr = state.replay.sample(batch_size - half_b)
+        xr, cpr, csr, tqr, tsr = state.replay.sample(eff_batch - half_b)
         xb = torch.cat([x_fresh[f_idx], xr], dim=0)
         cpb = torch.cat([cp_fresh[f_idx], cpr], dim=0).transpose(0, 1).contiguous()  # [nz, B]
         csb = torch.cat([ctx_s_fresh[f_idx], csr], dim=0)

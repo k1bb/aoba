@@ -310,8 +310,10 @@ def step_microphysics_six_class_2m(
     dtemp_lat = dtemp_lat - ((C.L_V0 + C.L_F0) / C.CP_D) * (dq_sub_s + dq_sub_g)
 
     # Exact compressible moist-potential-temperature update preserving cp*T + L_v*q_v - L_f*q_ice
+    # Leave dry cloud-free stratospheric/mesospheric levels bitwise unmodified when dtemp_lat == 0.
     temp_new = torch.clamp(temp + dtemp_lat, min=120.0, max=500.0)
-    theta_new = torch.clamp((temp_new / torch.clamp(pi_ex, min=0.05)) * (1.0 + C.RV_OVER_RD * qv), min=150.0, max=15000.0)
+    theta_upd = torch.clamp((temp_new / torch.clamp(pi_ex, min=0.005)) * (1.0 + C.RV_OVER_RD * qv), min=150.0, max=50000.0)
+    theta_new = torch.where((dtemp_lat.abs() > 0.0) | ((qv - torch.clamp(q_v, min=1.0e-7)).abs() > 1.0e-12), theta_upd, theta_m)
 
     # 4. Class-specific terminal velocities [m s^-1] (air-density corrected sqrt(rho_0/rho))
     rho_fac = torch.sqrt(torch.clamp(1.2 / torch.clamp(rho_d, min=0.05), min=0.5, max=6.0))

@@ -3354,12 +3354,19 @@ kernel void crm_2d_rk3_stage_fused_simd(
     uint n_ac2 = pk & 0x3Fu;
     float inv_nac_tot = 1.0f / float(n_ac2 * n_sub_grp);
 
-    device float4* sb = stage_buf + (ulong(tg_id) * ulong(nz) * 256ul) + ulong(lid);
-    // 3x[64] (768 B) keeps rho & Thm off DRAM across all acoustic substeps and all 3 RK3 stages
-    // (flushed once on stg == 2 && last_ac), eliminating ~9.5 GB/host-step of DRAM round-trips.
+    device float4* sb = stage_buf + (ulong(tg_id) * ulong(nz) * 128ul) + ulong(lid);
+    // Keep rho, Thm, u, w, and stage-2 flux accumulators in thread-local storage across all
+    // acoustic substeps and RK3 stages (flushed once on stg == 2 && last_ac), eliminating
+    // DRAM round-trips inside the inner acoustic loop on Apple Silicon (group_size = 32).
     float d_star[64];
     float r_loc[64];
     float T_loc[64];
+    float u_loc[64];
+    float w_loc[65];
+    float fx_loc[64];
+    float fz_loc[65];
+    w_loc[0] = 0.0f;
+    w_loc[nz] = 0.0f;
 
     for (uint sub = 0u; sub < n_sub_grp; ++sub) {
         bool first_sub = (sub == 0u);
@@ -3399,7 +3406,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
             float r_cur = (stg == 0u) ? r_base[tid] : r_loc[0];
             float T_cur = (stg == 0u) ? T_base[tid] : T_loc[0];
             float q_cur = 1.0f + q_n_in[tid] + q_p_in[tid];
-            float u_cur = u_in[tid];
+            float u_cur = (stg == 0u) ? u_base[tid] : u_loc[0];
             float v_cur = v_in[tid];
             float thm_cur = T_cur / max(r_cur, 1.0e-8f);
             float p_cur = p_ref * exp2(gamma_d * log2(max(T_cur * inv_pref_rd, 1.0e-7f)));
@@ -3409,8 +3416,8 @@ kernel void crm_2d_rk3_stage_fused_simd(
             float inv_dz_cur = inv_dz_c[col_dz];
 
             float w_prev2 = 0.0f;
-            float w_below = w_in[tid];
-            float w_cur   = w_in[M + tid];
+            float w_below = (stg == 0u) ? w_base[tid] : 0.0f;
+            float w_cur   = (stg == 0u) ? w_base[M + tid] : w_loc[1];
 
             float r_prev = 0.0f, q_prev = 0.0f, u_prev = 0.0f, v_prev = 0.0f;
             float thm_prev = 0.0f, rtot_prev = 0.0f, dp_prev = 0.0f, inv_dz_prev = 1.0f;
@@ -3437,7 +3444,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     r_next = (stg == 0u) ? r_base[idx_n] : r_loc[k + 1u];
                     T_next = (stg == 0u) ? T_base[idx_n] : T_loc[k + 1u];
                     q_next = 1.0f + q_n_in[idx_n] + q_p_in[idx_n];
-                    u_next = u_in[idx_n];
+                    u_next = (stg == 0u) ? u_base[idx_n] : u_loc[k + 1u];
                     v_next = v_in[idx_n];
                     thm_next = T_next / max(r_next, 1.0e-8f);
                     float p_n = p_ref * exp2(gamma_d * log2(max(T_next * inv_pref_rd, 1.0e-7f)));
@@ -3533,8 +3540,8 @@ kernel void crm_2d_rk3_stage_fused_simd(
 
                 float t_thm_k = tend_Thm[idx];
                 if (n_ac > 1u) {
-                    sb[k * 256u + 0u]  = float4(ap_cur, dp_cur, rho_x_v, rtot_xi);
-                    sb[k * 256u + 64u] = float4(thm_xe, tu_sl, t_thm_k, q_cur);
+                    sb[k * 128u + 0u]  = float4(ap_cur, dp_cur, rho_x_v, rtot_xi);
+                    sb[k * 128u + 32u] = float4(thm_xe, tu_sl, t_thm_k, q_cur);
                 }
 
                 // ---- Fused ac == 0 Forward (direct from registers, 0 stage_buf reads!) ----
@@ -3566,15 +3573,19 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     - (thm_w_above0 * fz_old_above0 - thm_w_below0 * fz_old_below0) * inv_dz_cur
                     + t_thm_k
                 );
-                // Store provisional r_dag0/T_dag0 in thread-local r_loc/T_loc (zero DRAM traffic!)
+                // Store provisional r_dag0/T_dag0/u_n in thread-local storage (zero DRAM traffic!)
                 r_loc[k] = r_dag0;
                 T_loc[k] = T_dag0;
-                if (active) {
-                    u_dst[idx] = u_n;
-                    if (accum != 0u) {
-                        float fx_sum = first_acc0 ? fx_k : (fx_acc[idx] + fx_k);
-                        fx_acc[idx] = last_acc0 ? (fx_sum * inv_nac_tot) : fx_sum;
+                u_loc[k] = u_n;
+                if (accum != 0u) {
+                    float fx_sum = first_acc0 ? fx_k : (fx_loc[k] + fx_k);
+                    fx_loc[k] = fx_sum;
+                    if (last_acc0 && active) {
+                        fx_acc[idx] = fx_sum * inv_nac_tot;
                     }
+                }
+                if (write_out_stage && n_ac == 1u && active) {
+                    u_dst[idx] = u_n;
                 }
                 float p_blend0 = fma(dp_cur, (1.0f - beta) * T_cur_a + beta * T_dag0, ap_cur);
                 float rtot_blend0 = ((1.0f - beta) * r_cur_a + beta * r_dag0) * q_cur;
@@ -3629,9 +3640,9 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     thw_prev_m = thw;
 
                     if (n_ac > 1u) {
-                        sb[m * 256u + 128u] = float4(rdw_over_rtw, rdw * tw_sl, dl_m, inv_den);
+                        sb[m * 128u + 64u] = float4(rdw_over_rtw, rdw * tw_sl, dl_m, inv_den);
                     }
-                    sb[m * 256u + 192u] = float4(rdw, thw, c_prev, inv_dz_wm);
+                    sb[m * 128u + 96u] = float4(rdw, thw, c_prev, inv_dz_wm);
 
                     // Fused ac == 0 Thomas forward sweep (direct from registers!)
                     float nh_imb0 = (p_blend0 - p_blend_prev0) * inv_dz_wm + 0.5f * (rtot_blend0 + rtot_blend_prev0) * gravity;
@@ -3653,7 +3664,9 @@ kernel void crm_2d_rk3_stage_fused_simd(
                 thm_cur = thm_next; dp_cur = dp_next; ap_cur = ap_next; rtot_cur = rtot_next; inv_dz_cur = inv_dz_next;
                 w_prev2 = w_below;
                 w_below = w_cur;
-                w_cur = (k + 2u <= nz) ? w_in[(k + 2u) * M + tid] : 0.0f;
+                w_cur = (k + 2u <= nz)
+                    ? ((stg == 0u) ? w_base[(k + 2u) * M + tid] : ((k + 2u < nz) ? w_loc[k + 2u] : 0.0f))
+                    : 0.0f;
             }
             if (active) {
                 v_dst[(nz - 1u) * M + tid] = v_new_prev;
@@ -3677,12 +3690,12 @@ kernel void crm_2d_rk3_stage_fused_simd(
 
                     for (uint k = 0u; k < nz; ++k) {
                         uint idx = k * M + tid;
-                        float4 c0 = sb[k * 256u + 0u];
-                        float4 c1 = sb[k * 256u + 64u];
+                        float4 c0 = sb[k * 128u + 0u];
+                        float4 c1 = sb[k * 128u + 32u];
 
                         float r_cur_a = r_loc[k];
                         float T_cur_a = T_loc[k];
-                        float u_old   = u_dst[idx];
+                        float u_old   = u_loc[k];
 
                         float ap = c0.x;
                         float dp = c0.y;
@@ -3697,11 +3710,15 @@ kernel void crm_2d_rk3_stage_fused_simd(
                         float fx_m = simd_shuffle(fx_k, l_xm1);
                         float fx_thm_m = simd_shuffle(fx_thm_k, l_xm1);
 
-                        if (active) {
+                        u_loc[k] = u_n;
+                        if (flush_dram && active) {
                             u_dst[idx] = u_n;
-                            if (accum != 0u) {
-                                float fx_sum = first_acc ? fx_k : (fx_acc[idx] + fx_k);
-                                fx_acc[idx] = last_acc ? (fx_sum * inv_nac_tot) : fx_sum;
+                        }
+                        if (accum != 0u) {
+                            float fx_sum = first_acc ? fx_k : (fx_loc[k] + fx_k);
+                            fx_loc[k] = fx_sum;
+                            if (last_acc && active) {
+                                fx_acc[idx] = fx_sum * inv_nac_tot;
                             }
                         }
 
@@ -3712,8 +3729,8 @@ kernel void crm_2d_rk3_stage_fused_simd(
                         float thm_w_above = 0.0f;
                         float inv_dz_w_ab = 0.0f;
                         if (k + 1u < nz) {
-                            float4 w1_ab = sb[k * 256u + 192u];
-                            fz_old_above = w1_ab.x * w_dst[(k + 1u) * M + tid];
+                            float4 w1_ab = sb[k * 128u + 96u];
+                            fz_old_above = w1_ab.x * w_loc[k + 1u];
                             thm_w_above = w1_ab.y;
                             inv_dz_w_ab = w1_ab.w;
                         }
@@ -3733,7 +3750,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
 
                         if (k >= 1u) {
                             uint um = k - 1u;
-                            float4 w0_m = sb[um * 256u + 128u];
+                            float4 w0_m = sb[um * 128u + 64u];
                             float nh_imb = (p_blend - p_blend_prev) * inv_dz_w_below + 0.5f * (rtot_blend + rtot_blend_prev) * gravity;
                             float rhs_m = dt_ac * (w0_m.y - w0_m.x * nh_imb - sponge_w[um] * fz_old_below);
                             float inv_den = w0_m.w;
@@ -3756,10 +3773,10 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     uint k_layer = um + 1u;
                     uint w_idx = k_layer * M + tid;
                     // Single float4 read (`w1`: rdw, thw, c_prev, inv_dz_wm) -> 50% less Backward stage_buf traffic!
-                    float4 w1_m = sb[um * 256u + 192u];
+                    float4 w1_m = sb[um * 128u + 96u];
                     float dfz_cur = (m == int(nz) - 2) ? d_star[um] : (d_star[um] - w1_m.z * dfz_above);
                     float rdw_m = w1_m.x;
-                    float w_old_m = first_ac ? w_base[w_idx] : w_dst[w_idx];
+                    float w_old_m = first_ac ? w_base[w_idx] : w_loc[k_layer];
                     float fz_old_m = rdw_m * w_old_m;
                     float fz_new_m = fz_old_m + dfz_cur;
                     float w_new = fz_new_m / max(rdw_m, 1.0e-8f);
@@ -3770,16 +3787,20 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     float T_nl = T_loc[k_layer] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) * inv_dz_l;
                     r_loc[k_layer] = r_nl;
                     T_loc[k_layer] = T_nl;
+                    w_loc[k_layer] = w_new;
                     if (active) {
-                        w_dst[w_idx] = w_new;
                         if (flush_dram) {
+                            w_dst[w_idx] = w_new;
                             r_dst[w_idx] = r_nl;
                             T_dst[w_idx] = T_nl;
                         }
                         if (accum != 0u) {
                             float fz_inc = fz_old_m + beta * dfz_cur;
-                            float fz_sum = first_acc ? fz_inc : (fz_acc[w_idx] + fz_inc);
-                            fz_acc[w_idx] = last_acc ? (fz_sum * inv_nac_tot) : fz_sum;
+                            float fz_sum = first_acc ? fz_inc : (fz_loc[k_layer] + fz_inc);
+                            fz_loc[k_layer] = fz_sum;
+                            if (last_acc) {
+                                fz_acc[w_idx] = fz_sum * inv_nac_tot;
+                            }
                         }
                     }
                     dfz_above = dfz_cur;
@@ -3790,10 +3811,12 @@ kernel void crm_2d_rk3_stage_fused_simd(
                 float T_n0 = T_loc[0] - beta * dt_ac * (thm_w_above * dfz_above) * inv_dz_0;
                 r_loc[0] = r_n0;
                 T_loc[0] = T_n0;
+                w_loc[0] = 0.0f;
+                w_loc[nz] = 0.0f;
                 if (active) {
-                    w_dst[tid] = 0.0f;
-                    w_dst[nz * M + tid] = 0.0f;
                     if (flush_dram) {
+                        w_dst[tid] = 0.0f;
+                        w_dst[nz * M + tid] = 0.0f;
                         r_dst[tid] = r_n0;
                         T_dst[tid] = T_n0;
                     }
@@ -4563,7 +4586,7 @@ kernel void scvt_storm_smag_cell(
         float dth = w0 * flx_th[eb + e0] + w1 * flx_th[eb + e1] + w2 * flx_th[eb + e2]
                   + w3 * flx_th[eb + e3] + w4 * flx_th[eb + e4] + w5 * flx_th[eb + e5];
         q_n_io[idx] = max(q_n_io[idx] - dqn * inv_m, 0.0f);
-        theta_m_io[idx] = clamp(theta_m_io[idx] - dth * inv_m, 150.0f, 10000.0f);
+        theta_m_io[idx] = clamp(theta_m_io[idx] - dth * inv_m, 150.0f, 50000.0f);
         if (k + 1u < nz) {
             float dw = w0 * flx_w[eb + e0] + w1 * flx_w[eb + e1] + w2 * flx_w[eb + e2]
                      + w3 * flx_w[eb + e3] + w4 * flx_w[eb + e4] + w5 * flx_w[eb + e5];
@@ -4738,6 +4761,9 @@ def run_crm_fct_pair_metal(
     return q_np[0], q_np[1]
 
 
+_FCT_QUAD_WS_CACHE: dict[tuple, tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]] = {}
+
+
 def run_crm_fct_quad_metal(
     lib: Any,
     q0: torch.Tensor,
@@ -4753,16 +4779,32 @@ def run_crm_fct_quad_metal(
     dy: float,
     dz_c: torch.Tensor,
     dt: float,
+    *,
+    clone_out: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Zero-stack L2-coherent 4-tracer Zalesak FCT on GPU for `(q_n, q_p, n_c, n_i)`."""
     nz, n_col, ny, nx = q0.shape
     if ny == 1 and 1 < nx <= 32 and nz <= 64 and (32 % nx == 0):
         dz_2d = dz_c.view(nz, -1).contiguous()
         dz_cols = dz_2d.shape[1]
-        q0_out = torch.empty_like(q0)
-        q1_out = torch.empty_like(q1)
-        q2_out = torch.empty_like(q2)
-        q3_out = torch.empty_like(q3)
+        if clone_out:
+            q0_out = torch.empty_like(q0)
+            q1_out = torch.empty_like(q1)
+            q2_out = torch.empty_like(q2)
+            q3_out = torch.empty_like(q3)
+        else:
+            dev = q0.device
+            ws_k = (dev.type, dev.index or 0, nz, n_col, ny, nx)
+            banks = _FCT_QUAD_WS_CACHE.get(ws_k)
+            if banks is None:
+                if len(_FCT_QUAD_WS_CACHE) >= 8:
+                    _FCT_QUAD_WS_CACHE.pop(next(iter(_FCT_QUAD_WS_CACHE)))
+                b0 = tuple(torch.empty_like(q0) for _ in range(4))
+                b1 = tuple(torch.empty_like(q0) for _ in range(4))
+                banks = (b0, b1)
+                _FCT_QUAD_WS_CACHE[ws_k] = banks
+            b0, b1 = banks
+            q0_out, q1_out, q2_out, q3_out = b1 if q0.data_ptr() == b0[0].data_ptr() else b0
         c_tg = 64 // nx
         n_tg = (n_col + c_tg - 1) // c_tg
         lib.crm_2d_fct_simd_quad(

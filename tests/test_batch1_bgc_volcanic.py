@@ -116,9 +116,92 @@ def test_coupled_batch1_cpu_mps() -> None:
         )
 
 
+def test_ocean_bgc_stride_zstar_conservation() -> None:
+    """Verify exact z* telescoping mass conservation and parity for `bgc_stride=2` vs `1`."""
+    from aoba.ocean_bgc import init_ocean_bgc_state
+    from aoba.ocean_ogcm import init_ogcm_state, step_ogcm_voronoi
+    from aoba.surface import SURF_OCEAN, init_surface_state
+
+    devs = ["cpu"] + (["mps"] if torch.backends.mps.is_available() else [])
+    for dev_s in devs:
+        dev = torch.device(dev_s)
+        mesh = build_scvt_mesh(1, device=dev)
+        nc = mesh.n_cells
+        dt = 2160.0
+
+        def _run(stride_k: int) -> tuple[float, float, float, float, torch.Tensor, torch.Tensor]:
+            st_ocn = torch.full((nc,), SURF_OCEAN, device=dev, dtype=torch.int64)
+            sfc = init_surface_state(st_ocn, h_ml_ocean=50.0)
+            ogcm = init_ogcm_state(sfc, mesh, nz_ocn=12)
+            ogcm.bgc = init_ocean_bgc_state(ogcm.wet_c, ogcm.h_c, ogcm.z_c, mesh.area_cell)
+            # Non-uniform forcing to exercise 3D horizontal/vertical z* stretching & advection
+            lat = mesh.lat_cell
+            lon = mesh.lon_cell
+            tau_x = 0.08 * torch.cos(2.0 * lat)
+            tau_y = 0.03 * torch.sin(lon)
+            f_ice = torch.zeros(nc, device=dev)
+            evap = torch.zeros(nc, device=dev)
+            prec = torch.zeros(nc, device=dev)
+            runoff = torch.zeros(nc, device=dev)
+            sw_net = torch.clamp(220.0 * torch.cos(lat), min=0.0)
+            par_in = 0.43 * sw_net
+            u10 = torch.full((nc,), 7.0, device=dev)
+
+            def _inv() -> tuple[float, float]:
+                h_c64 = ogcm.h_c.detach().cpu().to(torch.float64)
+                eta64 = ogcm.eta.detach().cpu().to(torch.float64)
+                area64 = mesh.area_cell.detach().cpu().to(torch.float64)
+                h_col = torch.clamp(h_c64.sum(dim=0), min=1.0)
+                sc = torch.clamp(1.0 + eta64 / h_col, min=0.5, max=1.5)
+                vol = h_c64 * sc.unsqueeze(0) * area64.unsqueeze(0)
+                b = ogcm.bgc
+                n_tot = (
+                    (b.no3.detach().cpu().to(torch.float64) + b.no3_comp.detach().cpu().to(torch.float64))
+                    + b.phy.detach().cpu().to(torch.float64)
+                    + b.zoo.detach().cpu().to(torch.float64)
+                    + b.det_n.detach().cpu().to(torch.float64)
+                )
+                alk_tot = b.alk.detach().cpu().to(torch.float64) + b.alk_comp.detach().cpu().to(torch.float64)
+                return float((vol * n_tot).sum().item()), float((vol * alk_tot).sum().item())
+
+            n0, alk0 = _inv()
+            for step_i in range(6):
+                # Modulate wind stress each step so consecutive steps have distinct eta/h*
+                fac = 1.0 + 0.15 * math.sin(0.9 * step_i)
+                step_ogcm_voronoi(
+                    ogcm=ogcm, sfc=sfc, mesh=mesh,
+                    tau_x_sfc=tau_x * fac, tau_y_sfc=tau_y * fac, f_seaice=f_ice,
+                    evap_cell=evap, precip_cell=prec, runoff_total=runoff, runoff_glacier=runoff,
+                    dt=dt, enable_seaice_drift=False, sw_net_ocn=sw_net, sw_par_ocn=par_in,
+                    u10_ocn=u10, co2_ppmv=284.3, enable_fct_zstar=True, enable_o2_omz=False,
+                    bgc_stride=stride_k,
+                )
+            n1, alk1 = _inv()
+            if stride_k > 1:
+                assert getattr(ogcm, "_bgc_stride_phase", -1) == 0
+            assert torch.isfinite(ogcm.bgc.no3).all() and torch.isfinite(ogcm.bgc.dic).all()
+            return n0, n1, alk0, alk1, ogcm.bgc.no3.clone(), ogcm.bgc.dic.clone()
+
+        n0_1, n1_1, a0_1, a1_1, no3_1, dic_1 = _run(1)
+        n0_2, n1_2, a0_2, a1_2, no3_2, dic_2 = _run(2)
+        rel_n_2 = abs(n1_2 - n0_2) / max(abs(n0_2), 1.0)
+        rel_a_2 = abs(a1_2 - a0_2) / max(abs(a0_2), 1.0)
+        rel_dic_diff = float((dic_2 - dic_1).abs().mean().item() / max(float(dic_1.abs().mean().item()), 1.0))
+        rel_no3_diff = float((no3_2 - no3_1).abs().mean().item() / max(float(no3_1.abs().mean().item()), 1.0))
+        assert rel_n_2 < 1.0e-4, f"[{dev_s}] BGC stride=2 N conservation drift {rel_n_2:.2e}"
+        assert rel_a_2 < 1.0e-4, f"[{dev_s}] BGC stride=2 ALK conservation drift {rel_a_2:.2e}"
+        assert rel_dic_diff < 1.0e-3, f"[{dev_s}] BGC stride=2 vs 1 DIC diff {rel_dic_diff:.2e}"
+        assert rel_no3_diff < 5.0e-3, f"[{dev_s}] BGC stride=2 vs 1 NO3 diff {rel_no3_diff:.2e}"
+        print(
+            f"[PASS] Ocean BGC stride=2 z* conservation ({dev_s}): "
+            f"dN/N={rel_n_2:.2e}, dALK/ALK={rel_a_2:.2e}, DIC_diff={rel_dic_diff:.2e}, NO3_diff={rel_no3_diff:.2e}"
+        )
+
+
 if __name__ == "__main__":
     test_prognostic_co2_mass_conservation()
     test_ocean_o2_solubility_and_omz()
     test_volcanic_bateman_and_solar_cycle()
     test_coupled_batch1_cpu_mps()
+    test_ocean_bgc_stride_zstar_conservation()
     print("ALL BATCH 1 CLOSED-LOOP ESM TESTS PASSED!")

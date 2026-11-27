@@ -67,6 +67,7 @@ ocean_mode = "ogcm_3d"
 ocean_glevel = 7
 ocean_nz = 64
 ocean_stride = 3
+ocean_bgc_stride = 2
 enable_seaice_drift = true
 enable_ocean_bgc = true
 enable_river_routing = true

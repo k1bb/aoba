@@ -220,6 +220,8 @@ def apply_mesospheric_molecular_diffusion(
     c0: torch.Tensor,                # [N_edges] cell index 0 on edge
     c1: torch.Tensor,                # [N_edges] cell index 1 on edge
     dt: float,
+    *,
+    k_start: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Implicit conservation-preserving molecular viscosity & thermal diffusion in upper mesosphere (>60 km).
 
@@ -230,16 +232,21 @@ def apply_mesospheric_molecular_diffusion(
     nz, nc = rho_d.shape
     if nz < 3:
         return theta_m, u_edge
-    dev = rho_d.device
-    dtype = rho_d.dtype
+    ks = max(0, min(int(k_start), nz - 3))
+    rho_s = rho_d[ks:]
+    thm_s = theta_m[ks:]
+    ue_s = u_edge[ks:]
+    z_s = z_c[ks:]
+    dz_s = dz_c[ks:]
+    t_s = temp_c[ks:]
 
     # Sutherland dynamic viscosity [Pa s] & density-scaled kinematic viscosity nu_mol = mu / rho [m^2 s^-1]
-    t_safe = torch.clamp(temp_c, min=110.0, max=350.0)
+    t_safe = torch.clamp(t_s, min=110.0, max=350.0)
     mu_dyn = 1.458e-6 * torch.pow(t_safe, 1.5) / (t_safe + 110.4)
     # Smoothly activate above 60 km so lower atmosphere relies purely on MYNN/Smagorinsky turbulence
-    w_mol_c = torch.sigmoid((z_c * 1.0e-3 - 62.0) / 4.0)
+    w_mol_c = torch.sigmoid((z_s * 1.0e-3 - 62.0) / 4.0)
     # Cap nu_mol at 40 m^2 s^-1 (physical at ~90 km) for clean numerical conditioning
-    nu_c = torch.clamp(mu_dyn / torch.clamp(rho_d, min=1.0e-7), max=40.0) * w_mol_c
+    nu_c = torch.clamp(mu_dyn / torch.clamp(rho_s, min=1.0e-7), max=40.0) * w_mol_c
     kappa_c = nu_c / PRANDTL_MOL
 
     def _implicit_vdiff_increment(q: torch.Tensor, rho: torch.Tensor, dz: torch.Tensor, k_diff: torch.Tensor) -> torch.Tensor:
@@ -247,7 +254,7 @@ def apply_mesospheric_molecular_diffusion(
         rho_int = 0.5 * (rho[:-1] + rho[1:])
         k_int = 0.5 * (k_diff[:-1] + k_diff[1:])
         dz_int = torch.clamp(0.5 * (dz[:-1] + dz[1:]), min=10.0)
-        c_int = float(dt) * (rho_int * k_int / dz_int)  # [Nz-1, N] [kg m^-2]
+        c_int = float(dt) * (rho_int * k_int / dz_int)  # [Nz_s-1, N] [kg m^-2]
 
         # Increment form: (I + L) dq = -L q, guaranteeing zero ULP conservation drift where c_int/dm << 1e-7
         inv_dm = 1.0 / dm
@@ -256,7 +263,7 @@ def apply_mesospheric_molecular_diffusion(
         diag = torch.ones_like(q)
         rhs = torch.zeros_like(q)
 
-        flux0 = c_int * (q[1:] - q[:-1])  # [Nz-1, N]
+        flux0 = c_int * (q[1:] - q[:-1])  # [Nz_s-1, N]
         dl[1:] = -c_int * inv_dm[1:]
         du[:-1] = -c_int * inv_dm[:-1]
         diag[:-1] = diag[:-1] + c_int * inv_dm[:-1]
@@ -267,13 +274,17 @@ def apply_mesospheric_molecular_diffusion(
         dq = solve_tridiagonal_batched(dl, diag, du, rhs)
         return q + dq
 
-    thm_new = _implicit_vdiff_increment(theta_m, rho_d, dz_c, kappa_c)
+    thm_top = _implicit_vdiff_increment(thm_s, rho_s, dz_s, kappa_c)
 
     # Edge-averaged rho, dz, and nu for horizontal momentum molecular viscosity
-    rho_e = 0.5 * (rho_d[:, c0] + rho_d[:, c1])
-    dz_e = 0.5 * (dz_c[:, c0] + dz_c[:, c1])
+    rho_e = 0.5 * (rho_s[:, c0] + rho_s[:, c1])
+    dz_e = 0.5 * (dz_s[:, c0] + dz_s[:, c1])
     nu_e = 0.5 * (nu_c[:, c0] + nu_c[:, c1])
-    u_edge_new = _implicit_vdiff_increment(u_edge, rho_e, dz_e, nu_e)
+    ue_top = _implicit_vdiff_increment(ue_s, rho_e, dz_e, nu_e)
+    if ks == 0:
+        return thm_top, ue_top
+    thm_new = torch.cat([theta_m[:ks], thm_top], dim=0)
+    u_edge_new = torch.cat([u_edge[:ks], ue_top], dim=0)
     return thm_new, u_edge_new
 
 
@@ -297,6 +308,7 @@ def step_prognostic_nox(
     sprite_z_init_km: torch.Tensor | None = None,
     sprite_z_stop_km: torch.Tensor | None = None,
     solar_uv_scale: float = 1.0,
+    k_meso_start: int = 0,
 ) -> None:
     """Advance prognostic 3D `q_nox` [mol mol^-1] and diagnose Noctilucent Clouds (NLC / PMC).
 
@@ -386,7 +398,9 @@ def step_prognostic_nox(
         (nox.q_nox * meso_w).sum(dim=0) / torch.clamp(meso_den, min=1.0e-6) * 1.0e9,
         nox.q_nox[-1] * 1.0e9,
     )
-    nlc_frac, nlc_iwc, t_meso = diagnose_noctilucent_clouds(pres_c, temp_c, rho_d, z_c, q_v)
+    nlc_frac, nlc_iwc, t_meso = diagnose_noctilucent_clouds(
+        pres_c, temp_c, rho_d, z_c, q_v, k_start=k_meso_start
+    )
     nox.nlc_frac = nlc_frac
     nox.nlc_iwc_mg_m3 = nlc_iwc
     nox.t_mesopause_k = t_meso
@@ -399,6 +413,8 @@ def diagnose_noctilucent_clouds(
     rho_d: torch.Tensor,             # [Nz, N_cells] [kg m^-3]
     z_c: torch.Tensor,               # [Nz, N_cells] [m]
     q_v: torch.Tensor,               # [Nz, N_cells] [kg kg^-1]
+    *,
+    k_start: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Diagnose Polar Mesospheric / Noctilucent Clouds (NLC) via Murphy & Koop (2005) frost point.
 
@@ -406,34 +422,40 @@ def diagnose_noctilucent_clouds(
     Murphy & Koop (2005, Eq. 7) valid down to 110 K. NLCs emerge autonomously wherever
     gravity-wave-driven summer polar upwelling cools the mesopause below ~145-150 K.
     """
-    z_km = z_c * 1.0e-3
+    nz = int(pres_c.shape[0])
+    ks = max(0, min(int(k_start), max(nz - 1, 0)))
+    p_s = pres_c[ks:]
+    t_s = temp_c[ks:]
+    r_s = rho_d[ks:]
+    z_km = z_c[ks:] * 1.0e-3
+    qv_s = q_v[ks:]
     in_nlc_band = (z_km >= 72.0) & (z_km <= 92.0)
     in_meso = z_km >= 62.0
 
     # Minimum mesospheric temperature [K]
-    t_masked = torch.where(in_meso, temp_c, torch.full_like(temp_c, 350.0))
-    t_mesopause = torch.where(in_meso.any(dim=0), t_masked.amin(dim=0), temp_c[-1])
+    t_masked = torch.where(in_meso, t_s, torch.full_like(t_s, 350.0))
+    t_mesopause = torch.where(in_meso.any(dim=0), t_masked.amin(dim=0), t_s[-1])
 
     # Murphy & Koop (2005, QJRMS, Eq. 7) saturation vapor pressure over hexagonal ice [Pa] (valid 110-273 K)
-    t_k = torch.clamp(temp_c, min=110.0, max=273.15)
+    t_k = torch.clamp(t_s, min=110.0, max=273.15)
     ln_es_ice = 9.550426 - 5723.265 / t_k + 3.53068 * torch.log(t_k) - 0.00728332 * t_k
     es_ice_pa = torch.exp(torch.clamp(ln_es_ice, min=-45.0, max=10.0))
 
     # Mesospheric H2O partial pressure (with realistic 3 ppmv lower floor if upper levels are dry)
-    h2o_vmr = torch.clamp(q_v * (28.9647 / 18.01528), min=2.5e-6, max=1.0e-4)
-    e_h2o_pa = h2o_vmr * torch.clamp(pres_c, min=0.05)
+    h2o_vmr = torch.clamp(qv_s * (28.9647 / 18.01528), min=2.5e-6, max=1.0e-4)
+    e_h2o_pa = h2o_vmr * torch.clamp(p_s, min=0.05)
     s_ice = e_h2o_pa / torch.clamp(es_ice_pa, min=1.0e-20)
 
     # Excess water vapor condensed onto meteoric smoke nuclei when S_ice > 1 inside 72-92 km
     q_ice_excess = torch.clamp(h2o_vmr * (1.0 - 1.0 / torch.clamp(s_ice, min=1.0)), min=0.0) * (18.01528 / 28.9647)
-    iwc_mg_m3 = torch.where(in_nlc_band, q_ice_excess * rho_d * 1.0e6, torch.zeros_like(q_v))
+    iwc_mg_m3 = torch.where(in_nlc_band, q_ice_excess * r_s * 1.0e6, torch.zeros_like(qv_s))
     nlc_iwc_peak = iwc_mg_m3.amax(dim=0)
 
     s_ice_peak = torch.where(in_nlc_band, s_ice, torch.zeros_like(s_ice)).amax(dim=0)
     # Smooth fractional cloud cover transitioning sharply as S_ice exceeds 1.0 (visible NLC threshold)
     nlc_frac = torch.where(
         in_nlc_band.any(dim=0),
-        torch.sigmoid((s_ice_peak - 1.15) / 0.25) * (s_ice_peak > 1.0).to(pres_c.dtype),
+        torch.sigmoid((s_ice_peak - 1.15) / 0.25) * (s_ice_peak > 1.0).to(p_s.dtype),
         torch.zeros_like(t_mesopause),
     )
     return nlc_frac, nlc_iwc_peak, t_mesopause

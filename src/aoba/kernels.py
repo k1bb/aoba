@@ -1304,10 +1304,14 @@ def dispatch_crm_fct_quad_metal(
     dy: float,
     dz_c: torch.Tensor,
     dt: float,
+    *,
+    clone_out: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     lib = _get_gpu_lib(q0.device)
     assert lib is not None
-    return run_crm_fct_quad_metal(lib, q0, q1, q2, q3, rho_old, rho_new, fx, fy, fz, dx, dy, dz_c, dt)
+    return run_crm_fct_quad_metal(
+        lib, q0, q1, q2, q3, rho_old, rho_new, fx, fy, fz, dx, dy, dz_c, dt, clone_out=clone_out
+    )
 
 
 def dispatch_crm_sgs_metal(
@@ -1917,10 +1921,14 @@ def run_crm_rk3_hevi_metal(
         n_ac2 = max(1, int(_math.ceil(rk_taus[2] / max(dt_ac_max, 0.1))))
         if dev.type == "mps" and n_ac0 <= 63 and n_ac1 <= 63 and n_ac2 <= 63:
             # Full-occupancy single-launch multi-substep 3-stage WS-RK3 + HEVI kernel
-            # with direct 3-bank ping-pong, 1-float4 Backward read, and cached inv_dz_c/inv_dz_w.
-            if "stage_buf_bc" not in ws:
-                ws["stage_buf_bc"] = torch.empty((n_tg, nz, 4, 64, 4), device=dev, dtype=torch.float32)
-            stage_buf = ws["stage_buf_bc"]
+            # (group_size = 32 -> 2x threadgroups/core on Apple Silicon, compact stride-128 stage_buf,
+            # direct 3-bank ping-pong, and thread-local u/w/rho/Thm/flux accumulators).
+            c_tg32 = 32 // nx
+            n_tg32 = (n_col + c_tg32 - 1) // c_tg32
+            grid_32 = (n_tg32 * 32,)
+            if "stage_buf_bc32" not in ws:
+                ws["stage_buf_bc32"] = torch.empty((n_tg32, nz, 4, 32, 4), device=dev, dtype=torch.float32)
+            stage_buf = ws["stage_buf_bc32"]
             dz_ptr = dzc_c.data_ptr()
             if ws.get("inv_dz_ptr") != dz_ptr or ws.get("inv_dz_ver") != getattr(dzc_c, "_version", 0):
                 ws["inv_dz_c"] = (1.0 / dzc_c).contiguous()
@@ -1937,7 +1945,7 @@ def run_crm_rk3_hevi_metal(
                 ws["inv_dz_c"], ws["inv_dz_w"], spc_c, spw_c,
                 stage_buf, fx_acc, fz_acc,
                 u_fused0, f_prep0, f_fused1,
-                threads=grid_64, group_size=(64,),
+                threads=grid_32, group_size=(32,),
             )
             return rho_out, Thm_out, u_out, v_out, w_out, fx_acc, ws["fy_zero"], fz_acc
 

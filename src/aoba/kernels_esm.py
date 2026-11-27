@@ -1535,7 +1535,7 @@ kernel void microphysics_6class_col(
         float pi_ex = pow(arg, R_OVER_CV);
         float pres = P_REF * arg * pi_ex;
         float temp = pi_ex * (thm / (1.0f + RV_OVER_RD * max(qv_in, 0.0f)));
-        float pi_safe = max(pi_ex, 0.1f);
+        float pi_safe = max(pi_ex, 0.005f);
 
         // 1. Aerosol-aware droplet & ice activation
         float ccn_cm3 = ccn_col_base;
@@ -1695,8 +1695,10 @@ kernel void microphysics_6class_col(
         ns_new = (qs_new > 1.0e-10f) ? clamp(ns_new, 1.0f, 1.0e6f) : 0.0f;
         ng_new = (qg_new > 1.0e-10f) ? clamp(ng_new, 1.0f, 1.0e5f) : 0.0f;
 
-        float temp_new = clamp(temp + dtemp_lat, 120.0f, 500.0f);
-        theta_m[idx] = clamp((temp_new / max(pi_ex, 0.05f)) * (1.0f + RV_OVER_RD * qv), 150.0f, 15000.0f);
+        if (fabs(dtemp_lat) > 0.0f || fabs(qv - max(qv_in, 1.0e-7f)) > 1.0e-12f) {
+            float temp_new = clamp(temp + dtemp_lat, 120.0f, 500.0f);
+            theta_m[idx] = clamp((temp_new / max(pi_ex, 0.005f)) * (1.0f + RV_OVER_RD * qv), 150.0f, 50000.0f);
+        }
         q_v[idx] = qv;
         q_c[idx] = qc;
         q_i[idx] = qi_new;

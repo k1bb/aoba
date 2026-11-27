@@ -777,15 +777,26 @@ def extract_lightning_distill_features(
     rain_3d: torch.Tensor,        # [nc, ny_t, nx_t] [kg m^-2 s^-1]
     snow_3d: torch.Tensor,        # [nc, ny_t, nx_t] [kg m^-2 s^-1]
     buoy_sfc: torch.Tensor,       # [nc] [m^2 s^-3]
+    *,
+    k_top_trop: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build 14 universal map-free physical column features `[nc, 14]` and convective gate `[nc]`."""
-    nz, nc = rho_d.shape
-    _, _, temp = diagnose_pressure_temperature(rho_d, theta_m, q_v)
-    dm = torch.clamp(rho_d * dz_c, min=0.0)
-    qv_pos = torch.clamp(q_v, min=0.0)
-    qc_pos = torch.clamp(q_c, min=0.0)
-    qi_pos = torch.clamp(q_i, min=0.0)
-    qp_pos = torch.clamp(q_p, min=0.0)
+    nz_full, nc = rho_d.shape
+    kt = nz_full if k_top_trop is None else max(min(int(k_top_trop), nz_full), 3)
+    rho_s = rho_d[:kt]
+    thm_s = theta_m[:kt]
+    qv_s = q_v[:kt]
+    qc_s = q_c[:kt]
+    qi_s = q_i[:kt]
+    qp_s = q_p[:kt]
+    z_s = z_c[:kt]
+    dz_s = dz_c[:kt]
+    _, _, temp = diagnose_pressure_temperature(rho_s, thm_s, qv_s)
+    dm = torch.clamp(rho_s * dz_s, min=0.0)
+    qv_pos = torch.clamp(qv_s, min=0.0)
+    qc_pos = torch.clamp(qc_s, min=0.0)
+    qi_pos = torch.clamp(qi_s, min=0.0)
+    qp_pos = torch.clamp(qp_s, min=0.0)
 
     # Precipitation statistics in mm/day (cell mean & subgrid convective localization std)
     rain_mm = torch.clamp(rain_3d.reshape(nc, -1).mean(dim=-1) * C.SECONDS_PER_DAY, min=0.0)
@@ -803,14 +814,14 @@ def extract_lightning_distill_features(
     # Thermodynamic instability proxy (boundary-layer theta_e minus mid-tropospheric theta)
     t_sfc = temp[0]
     qv_low = qv_pos[0]
-    th_e_low = theta_m[0] + (C.L_V0 / C.CP_D) * qv_low
-    k_mid = min(max(nz // 3, 1), nz - 1)
-    k_hi = min(max((2 * nz) // 3, k_mid + 1), nz - 1)
-    th_mid = theta_m[k_mid:k_hi].mean(dim=0)
+    th_e_low = thm_s[0] + (C.L_V0 / C.CP_D) * qv_low
+    k_mid = min(max(nz_full // 3, 1), kt - 1)
+    k_hi = min(max((2 * nz_full) // 3, k_mid + 1), kt)
+    th_mid = thm_s[k_mid:k_hi].mean(dim=0)
     cape_proxy = torch.clamp((th_e_low - th_mid) / 30.0, 0.0, 4.0)
 
     # Freezing level and ice cloud-top heights AGL [km]
-    z_agl_km = torch.clamp((z_c - z_c[0:1] + 0.5 * dz_c[0:1]) * 1.0e-3, min=0.0)
+    z_agl_km = torch.clamp((z_s - z_s[0:1] + 0.5 * dz_s[0:1]) * 1.0e-3, min=0.0)
     z_frz_km = torch.where(temp >= C.T_FREEZE, z_agl_km, torch.zeros_like(z_agl_km)).amax(dim=0)
     has_ice = (qi_pos + qp_pos) >= 1.0e-5
     z_ctop_km = torch.where(has_ice, z_agl_km, torch.zeros_like(z_agl_km)).amax(dim=0)
@@ -886,6 +897,7 @@ def step_ossp_distilled_lightning(
     dx_crm: float,
     dt: float,
     has_pool: bool,
+    k_top_trop: int | None = None,
 ) -> tuple[LightningDiagnostics, ExplicitLightningState | None]:
     """Run genuine full-res 2 km CRM lightning on OSSP teacher cells & distill onto student cells.
 
@@ -970,6 +982,7 @@ def step_ossp_distilled_lightning(
     feats_all, conv_gate = extract_lightning_distill_features(
         rho_host, theta_m_host, q_v_host, q_c_host, q_i_host, q_p_host,
         z_c_host, dz_c_host, rain_3d, snow_3d, buoy_sfc,
+        k_top_trop=k_top_trop,
     )
 
     # 4. Zero-sync fixed-shape push of teacher samples into all-sky & top-k active-storm Hurdle buffers
@@ -1004,72 +1017,79 @@ def step_ossp_distilled_lightning(
     _ring_push(distill_state.act_fcg, ptr_act0, sz_act0, top_fcg)
     _ring_push(distill_state.act_valid, ptr_act0, sz_act0, top_valid)
 
-    # 5. Online Hurdle MLP training (2 grad steps during initial fill, 1 steady-state step; CUDA Graph on GPU!)
+    # 5. Online Hurdle MLP training (2 grad steps during initial fill, 1 step during ramp-up,
+    #    1 step every 4th step in steady state; 100% teacher data still pushed every step!)
     if distill_state.all_size >= 32:
         from aoba.runtime import can_use_cuda_graph, run_cuda_graph_train_step
 
         use_cg_lt = can_use_cuda_graph(dev)
-        n_lt_grad = 2 if distill_state.all_size < 512 else 1
-        b_all = min(256, distill_state.all_size)
-        b_act = min(128, distill_state.act_size)
-        has_act_batch = b_act >= 4
+        if distill_state.all_size < 512:
+            n_lt_grad = 2
+        elif distill_state.steps_seen >= 120:
+            n_lt_grad = 1 if (distill_state.steps_seen % 4 == 0) else 0
+        else:
+            n_lt_grad = 1
+        if n_lt_grad > 0:
+            b_all = min(256, distill_state.all_size)
+            b_act = min(128, distill_state.act_size)
+            has_act_batch = b_act >= 4
 
-        def _one_lt_grad_step(inp: list[torch.Tensor]) -> list[torch.Tensor]:
-            xa, ha, ca, wa = inp[0], inp[1], inp[2], inp[3]
-            pred_a = distill_state.net(xa)
-            w_m_sum = torch.clamp(wa.sum(), min=1.0)
-            loss_hit = (
-                F.binary_cross_entropy_with_logits(pred_a[:, 0], ha, reduction="none") * wa
-            ).sum() / w_m_sum
-            loss_ccd = (
-                ((torch.sigmoid(pred_a[:, 3]) - ca) ** 2) * wa
-            ).sum() / w_m_sum
-            loss = loss_hit + 0.25 * loss_ccd
-            if len(inp) == 8:
-                xp, yp, fp, wp = inp[4], inp[5], inp[6], inp[7]
-                pred_p = distill_state.net(xp)
-                w_p_sum = torch.clamp(wp.sum(), min=1.0)
-                has_p = (wp.sum() > 0.5).to(torch.float32)
-                loss_rate = (
-                    F.smooth_l1_loss(F.softplus(pred_p[:, 1]), yp, reduction="none") * wp
-                ).sum() / w_p_sum
-                loss_fcg = (
-                    F.binary_cross_entropy_with_logits(pred_p[:, 2], fp, reduction="none") * wp
-                ).sum() / w_p_sum
-                loss = loss + has_p * (loss_rate + 0.35 * loss_fcg)
+            def _one_lt_grad_step(inp: list[torch.Tensor]) -> list[torch.Tensor]:
+                xa, ha, ca, wa = inp[0], inp[1], inp[2], inp[3]
+                pred_a = distill_state.net(xa)
+                w_m_sum = torch.clamp(wa.sum(), min=1.0)
+                loss_hit = (
+                    F.binary_cross_entropy_with_logits(pred_a[:, 0], ha, reduction="none") * wa
+                ).sum() / w_m_sum
+                loss_ccd = (
+                    ((torch.sigmoid(pred_a[:, 3]) - ca) ** 2) * wa
+                ).sum() / w_m_sum
+                loss = loss_hit + 0.25 * loss_ccd
+                if len(inp) == 8:
+                    xp, yp, fp, wp = inp[4], inp[5], inp[6], inp[7]
+                    pred_p = distill_state.net(xp)
+                    w_p_sum = torch.clamp(wp.sum(), min=1.0)
+                    has_p = (wp.sum() > 0.5).to(torch.float32)
+                    loss_rate = (
+                        F.smooth_l1_loss(F.softplus(pred_p[:, 1]), yp, reduction="none") * wp
+                    ).sum() / w_p_sum
+                    loss_fcg = (
+                        F.binary_cross_entropy_with_logits(pred_p[:, 2], fp, reduction="none") * wp
+                    ).sum() / w_p_sum
+                    loss = loss + has_p * (loss_rate + 0.35 * loss_fcg)
 
-            distill_state.opt.zero_grad(set_to_none=False)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                distill_state.net.parameters(), 2.0, foreach=(dev.type == "cuda"),
-            )
-            distill_state.opt.step()
-            return [loss.detach()]
+                distill_state.opt.zero_grad(set_to_none=False)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    distill_state.net.parameters(), 2.0, foreach=(dev.type == "cuda"),
+                )
+                distill_state.opt.step()
+                return [loss.detach()]
 
-        with torch.enable_grad():
-            distill_state.net.train()
-            for _ in range(n_lt_grad):
-                idx_a = torch.randint(0, distill_state.all_size, (b_all,), device=dev)
-                step_in = [
-                    distill_state.all_x[idx_a],
-                    distill_state.all_hit[idx_a],
-                    distill_state.all_ccd[idx_a],
-                    distill_state.all_valid[idx_a],
-                ]
-                if has_act_batch:
-                    idx_p = torch.randint(0, distill_state.act_size, (b_act,), device=dev)
-                    step_in.extend([
-                        distill_state.act_x[idx_p],
-                        distill_state.act_y[idx_p],
-                        distill_state.act_fcg[idx_p],
-                        distill_state.act_valid[idx_p],
-                    ])
-                if use_cg_lt:
-                    g_key = ("lt_ml_train", id(distill_state.net), b_all, b_act if has_act_batch else 0)
-                    run_cuda_graph_train_step(g_key, step_in, _one_lt_grad_step, warmup_calls=3)
-                else:
-                    _one_lt_grad_step(step_in)
-                distill_state.grad_updates += 1
+            with torch.enable_grad():
+                distill_state.net.train()
+                for _ in range(n_lt_grad):
+                    idx_a = torch.randint(0, distill_state.all_size, (b_all,), device=dev)
+                    step_in = [
+                        distill_state.all_x[idx_a],
+                        distill_state.all_hit[idx_a],
+                        distill_state.all_ccd[idx_a],
+                        distill_state.all_valid[idx_a],
+                    ]
+                    if has_act_batch:
+                        idx_p = torch.randint(0, distill_state.act_size, (b_act,), device=dev)
+                        step_in.extend([
+                            distill_state.act_x[idx_p],
+                            distill_state.act_y[idx_p],
+                            distill_state.act_fcg[idx_p],
+                            distill_state.act_valid[idx_p],
+                        ])
+                    if use_cg_lt:
+                        g_key = ("lt_ml_train", id(distill_state.net), b_all, b_act if has_act_batch else 0)
+                        run_cuda_graph_train_step(g_key, step_in, _one_lt_grad_step, warmup_calls=3)
+                    else:
+                        _one_lt_grad_step(step_in)
+                    distill_state.grad_updates += 1
 
     # 6. Predict student cells via Hurdle MLP (with physical zero-cloud gate & subgrid precip weighting)
     flash_tot_sub = torch.zeros((nc, ny_out, nx_out), device=dev, dtype=dtype)
@@ -1080,12 +1100,19 @@ def step_ossp_distilled_lightning(
     if int(s_idx.numel()) > 0:
         with torch.no_grad():
             distill_state.net.eval()
-            out_s = distill_state.net(feats_all[s_idx])
+            use_contig_lt = (n_t * 4 < nc)
+            if use_contig_lt:
+                out_s = distill_state.net(feats_all)
+                gate_s = conv_gate
+                prec_s = torch.clamp(rain_3d + snow_3d, min=0.0)
+            else:
+                out_s = distill_state.net(feats_all[s_idx])
+                gate_s = conv_gate[s_idx]
+                prec_s = torch.clamp(rain_3d[s_idx] + snow_3d[s_idx], min=0.0)
             p_strike = torch.sigmoid(out_s[:, 0])
             log_rate = torch.clamp(F.softplus(out_s[:, 1]), max=11.0)
             f_cg_s = torch.sigmoid(out_s[:, 2])
             ccd_s = 15.0 * torch.sigmoid(out_s[:, 3])
-            gate_s = conv_gate[s_idx]
             if distill_state.grad_updates >= 10:
                 has_seen_storm = (distill_state.act_valid[: distill_state.act_size].sum() > 0.5).to(dtype)
                 flash_cell_s = has_seen_storm * gate_s * p_strike * (LIGHTNING_FLASH_LOG_SCALE * torch.expm1(log_rate))
@@ -1094,7 +1121,6 @@ def step_ossp_distilled_lightning(
             cg_cell_s = flash_cell_s * f_cg_s
 
             # Map cell-mean student lightning onto (ny_out, nx_out) preserving exact cell mean
-            prec_s = torch.clamp(rain_3d[s_idx] + snow_3d[s_idx], min=0.0)
             if prec_s.shape[-2] != ny_out or prec_s.shape[-1] != nx_out:
                 prec_s = F.interpolate(
                     prec_s.unsqueeze(1), size=(ny_out, nx_out), mode="nearest"
@@ -1107,10 +1133,16 @@ def step_ossp_distilled_lightning(
             )
             rel_w = rel_w / torch.clamp(rel_w.mean(dim=(-2, -1), keepdim=True), min=1.0e-6)
 
-            flash_tot_sub[s_idx] = flash_cell_s.view(-1, 1, 1) * rel_w
-            flash_cg_sub[s_idx] = cg_cell_s.view(-1, 1, 1) * rel_w
-            f_cg_sub[s_idx] = f_cg_s.view(-1, 1, 1).expand(-1, ny_out, nx_out)
-            ccd_km_sub[s_idx] = ccd_s.view(-1, 1, 1).expand(-1, ny_out, nx_out)
+            if use_contig_lt:
+                flash_tot_sub = flash_cell_s.view(-1, 1, 1) * rel_w
+                flash_cg_sub = cg_cell_s.view(-1, 1, 1) * rel_w
+                f_cg_sub = f_cg_s.view(-1, 1, 1).expand(-1, ny_out, nx_out).contiguous()
+                ccd_km_sub = ccd_s.view(-1, 1, 1).expand(-1, ny_out, nx_out).contiguous()
+            else:
+                flash_tot_sub[s_idx] = flash_cell_s.view(-1, 1, 1) * rel_w
+                flash_cg_sub[s_idx] = cg_cell_s.view(-1, 1, 1) * rel_w
+                f_cg_sub[s_idx] = f_cg_s.view(-1, 1, 1).expand(-1, ny_out, nx_out)
+                ccd_km_sub[s_idx] = ccd_s.view(-1, 1, 1).expand(-1, ny_out, nx_out)
 
     # 7. Insert exact 2 km teacher CRM fields onto t_idx (downsampling to tile grid when has_pool=True)
     def _map_teacher_3d(arr: torch.Tensor) -> torch.Tensor:

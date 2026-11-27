@@ -323,7 +323,7 @@ def apply_scvt_storm_smagorinsky(
     # 2. Monotone enthalpy-conserving Theta_m mixing
     flx_th = -(dt * kh_sc) * m_e * ((state.theta_m[:, c1] - state.theta_m[:, c0]) / dc_e)
     state.theta_m = torch.clamp(
-        state.theta_m - compute_scvt_divergence(mesh, flx_th) * inv_m, min=150.0, max=10000.0
+        state.theta_m - compute_scvt_divergence(mesh, flx_th) * inv_m, min=150.0, max=50000.0
     )
 
     # 3. Nonlinear purely-divergent momentum damping: du/dt = +K_h,div * grad(div u)

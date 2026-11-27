@@ -1317,6 +1317,7 @@ def _step_crm_physics_and_dynamics_impl(
                     crm.q_n, crm.q_p, crm.n_c, crm.n_i = dispatch_crm_fct_quad_metal(
                         crm.q_n, crm.q_p, crm.n_c, crm.n_i, rho_start, crm.rho_d,
                         fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv,
+                        clone_out=not no_clone_pp,
                     )
                 else:
                     crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
@@ -1328,6 +1329,7 @@ def _step_crm_physics_and_dynamics_impl(
                     crm.q_n, crm.q_p, crm.q_c, crm.q_i = dispatch_crm_fct_quad_metal(
                         crm.q_n, crm.q_p, crm.q_c, crm.q_i, rho_start, crm.rho_d,
                         fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv,
+                        clone_out=not no_clone_pp,
                     )
                 else:
                     crm.q_n = fct_advect_3d(crm.q_n, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
@@ -1344,13 +1346,23 @@ def _step_crm_physics_and_dynamics_impl(
                 crm.q_p = fct_advect_3d(crm.q_p, rho_start, crm.rho_d, fx_mean, fy_mean, fz_mean, crm.dx, crm.dy, dz_fct, dt_adv)
             s_idx += k_cnt
         if no_clone_pp:
-            # Detach CRM tensors from shared RK3-HEVI workspace buffers once after all substeps finish
+            # Detach CRM tensors from shared RK3-HEVI & FCT workspace buffers once after all substeps finish
             crm.rho_d = crm.rho_d.clone()
             crm.w = crm.w.clone()
             if u_gal_shift is None:
                 crm.u = crm.u.clone()
             if v_gal_shift is None:
                 crm.v = crm.v.clone()
+            if use_2m_mp and crm.n_c is not None and crm.n_i is not None:
+                crm.q_n = crm.q_n.clone()
+                crm.q_p = crm.q_p.clone()
+                crm.n_c = crm.n_c.clone()
+                crm.n_i = crm.n_i.clone()
+            elif use_6c_mp:
+                crm.q_n = crm.q_n.clone()
+                crm.q_p = crm.q_p.clone()
+                crm.q_c = crm.q_c.clone()
+                crm.q_i = crm.q_i.clone()
         if u_gal_shift is not None:
             crm.u = crm.u + u_gal_shift
         if v_gal_shift is not None:
