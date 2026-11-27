@@ -4029,8 +4029,8 @@ kernel void scvt_rk3_prep_edge(
     float th1 = thm_s[i1];
     float rt0 = rtot_s[i0];
     float rt1 = rtot_s[i1];
-    float p0 = max(pres_s[i0], 0.1f);
-    float p1 = max(pres_s[i1], 0.1f);
+    float p0 = max(pres_s[i0], 1.0e-3f);
+    float p1 = max(pres_s[i1], 1.0e-3f);
     float dz10 = z_c[i1] - z_c[i0];
     float idc = inv_dc[e];
 
@@ -5930,7 +5930,7 @@ kernel void crm_distill_extract_col(
                 float qi_p = max(q_i[idx], 0.0f);
                 float qn_tot = max(max(qv, 0.0f) + qc_p + qi_p, 0.0f);
                 float t_li = clamp(temp - (2489.449f * qc_p + 2820.911f * qi_p), 150.0f, 400.0f);
-                float th_l = t_li / max(ex, 0.05f);
+                float th_l = t_li / max(ex, 0.005f);
 
                 float omega = clamp((t_li - t_ice) * inv_t_span, 0.0f, 1.0f);
                 float tc = max(t_li, 160.0f) - t_frz;

@@ -1520,8 +1520,8 @@ def step_aoba_model(
             pres_sfc_t = pres_t[0] + C.GRAVITY * rho_t[0] * (1.0 + qv_t[0]) * dz_t[0]
             pres_w_t = torch.empty((nz + 1, m_tp), device=dev_r, dtype=pres_t.dtype)
             pres_w_t[0] = pres_sfc_t
-            pres_w_t[1:-1] = torch.sqrt(torch.clamp(pres_t[:-1] * pres_t[1:], min=1.0))
-            pres_w_t[-1] = torch.clamp(0.5 * pres_t[-1], min=0.1)
+            pres_w_t[1:-1] = torch.sqrt(torch.clamp(pres_t[:-1] * pres_t[1:], min=1.0e-6))
+            pres_w_t[-1] = torch.clamp(0.5 * pres_t[-1], min=1.0e-3)
             temp_w_t = torch.empty((nz + 1, m_tp), device=dev_r, dtype=temp_t.dtype)
             temp_w_t[0] = temp_t[0]
             temp_w_t[1:-1] = 0.5 * (temp_t[:-1] + temp_t[1:])
@@ -1741,8 +1741,8 @@ def step_aoba_model(
                 pres_sfc_s = pres_s[0] + C.GRAVITY * rho_s[0] * (1.0 + qv_s[0]) * dz_s[0]
                 pres_w_s = torch.empty((nz + 1, n_sr * n_sub), device=dev_r, dtype=pres_s.dtype)
                 pres_w_s[0] = pres_sfc_s
-                pres_w_s[1:-1] = torch.sqrt(torch.clamp(pres_s[:-1] * pres_s[1:], min=1.0))
-                pres_w_s[-1] = torch.clamp(0.5 * pres_s[-1], min=0.1)
+                pres_w_s[1:-1] = torch.sqrt(torch.clamp(pres_s[:-1] * pres_s[1:], min=1.0e-6))
+                pres_w_s[-1] = torch.clamp(0.5 * pres_s[-1], min=1.0e-3)
                 temp_w_s = torch.empty((nz + 1, n_sr * n_sub), device=dev_r, dtype=temp_s.dtype)
                 temp_w_s[0] = temp_s[0]
                 temp_w_s[1:-1] = 0.5 * (temp_s[:-1] + temp_s[1:])
@@ -1790,8 +1790,8 @@ def step_aoba_model(
             pres_sfc_t = pres_t[0] + C.GRAVITY * rho_t[0] * (1.0 + qv_t[0]) * dz_t[0]
             pres_w_t = torch.empty((nz + 1, n_tr * n_crm), device=dev_r, dtype=pres_t.dtype)
             pres_w_t[0] = pres_sfc_t
-            pres_w_t[1:-1] = torch.sqrt(torch.clamp(pres_t[:-1] * pres_t[1:], min=1.0))
-            pres_w_t[-1] = torch.clamp(0.5 * pres_t[-1], min=0.1)
+            pres_w_t[1:-1] = torch.sqrt(torch.clamp(pres_t[:-1] * pres_t[1:], min=1.0e-6))
+            pres_w_t[-1] = torch.clamp(0.5 * pres_t[-1], min=1.0e-3)
             temp_w_t = torch.empty((nz + 1, n_tr * n_crm), device=dev_r, dtype=temp_t.dtype)
             temp_w_t[0] = temp_t[0]
             temp_w_t[1:-1] = 0.5 * (temp_t[:-1] + temp_t[1:])
@@ -2032,8 +2032,8 @@ def step_aoba_model(
             pres_sfc_crm = pres_crm[0] + C.GRAVITY * rho_crm_flat[0] * (1.0 + qv_crm_flat[0]) * dz_rad_crm[0]
             pres_w_crm = torch.empty((nz + 1, m_crm), device=pres_crm.device, dtype=pres_crm.dtype)
             pres_w_crm[0] = pres_sfc_crm
-            pres_w_crm[1:-1] = torch.sqrt(torch.clamp(pres_crm[:-1] * pres_crm[1:], min=1.0))
-            pres_w_crm[-1] = torch.clamp(0.5 * pres_crm[-1], min=0.1)
+            pres_w_crm[1:-1] = torch.sqrt(torch.clamp(pres_crm[:-1] * pres_crm[1:], min=1.0e-6))
+            pres_w_crm[-1] = torch.clamp(0.5 * pres_crm[-1], min=1.0e-3)
             temp_w_crm = torch.empty((nz + 1, m_crm), device=temp_crm.device, dtype=temp_crm.dtype)
             temp_w_crm[0] = temp_crm[0]
             temp_w_crm[1:-1] = 0.5 * (temp_crm[:-1] + temp_crm[1:])

@@ -2896,7 +2896,7 @@ kernel void crm_2d_stage_prep_simd(
     float v_cur = v_s[tid];
     float thm_cur = T_cur / max(r_cur, 1.0e-8f);
     float p_cur = p_ref * pow(max((r_d * T_cur) / p_ref, 1.0e-7f), gamma_d);
-    float dp_cur = gamma_d * p_cur / max(T_cur, 1.0e-3f);
+    float dp_cur = gamma_d * p_cur / max(T_cur, 1.0e-6f);
     float ap_cur = p_cur - dp_cur * T_cur;
     float rtot_cur = r_cur * q_cur;
     float dz_cur = dz_c[col_dz];
@@ -2925,7 +2925,7 @@ kernel void crm_2d_stage_prep_simd(
             v_next = v_s[idx_n];
             thm_next = T_next / max(r_next, 1.0e-8f);
             float p_n = p_ref * pow(max((r_d * T_next) / p_ref, 1.0e-7f), gamma_d);
-            dp_next = gamma_d * p_n / max(T_next, 1.0e-3f);
+            dp_next = gamma_d * p_n / max(T_next, 1.0e-6f);
             ap_next = p_n - dp_next * T_next;
             rtot_next = r_next * q_next;
             dz_next = dz_c[(k + 1u) * dz_cols + col_dz];
@@ -3410,7 +3410,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
             float v_cur = v_in[tid];
             float thm_cur = T_cur / max(r_cur, 1.0e-8f);
             float p_cur = p_ref * exp2(gamma_d * log2(max(T_cur * inv_pref_rd, 1.0e-7f)));
-            float dp_cur = gamma_d * p_cur / max(T_cur, 1.0e-3f);
+            float dp_cur = gamma_d * p_cur / max(T_cur, 1.0e-6f);
             float ap_cur = p_cur - dp_cur * T_cur;
             float rtot_cur = r_cur * q_cur;
             float inv_dz_cur = inv_dz_c[col_dz];
@@ -3448,7 +3448,7 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     v_next = v_in[idx_n];
                     thm_next = T_next / max(r_next, 1.0e-8f);
                     float p_n = p_ref * exp2(gamma_d * log2(max(T_next * inv_pref_rd, 1.0e-7f)));
-                    dp_next = gamma_d * p_n / max(T_next, 1.0e-3f);
+                    dp_next = gamma_d * p_n / max(T_next, 1.0e-6f);
                     ap_next = p_n - dp_next * T_next;
                     rtot_next = r_next * q_next;
                     inv_dz_next = inv_dz_c[(k + 1u) * dz_cols + col_dz];

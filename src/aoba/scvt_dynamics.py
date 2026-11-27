@@ -681,18 +681,18 @@ def _scvt_rk3_stage_prep_core(
     """Pure-tensor SCVT RK3 stage preparation (EOS, PGF factors, KE, vertical adv, HEVI tridiag)."""
     gamma = C.GAMMA_D
     rho_s = m_s / dz_c
-    thm_s = Thm_s / torch.clamp(m_s, min=1.0e-4)
+    thm_s = Thm_s / torch.clamp(m_s, min=1.0e-6)
     rho_thm_vol = Thm_s / dz_c
     pres_s = C.P_REF * torch.pow(torch.clamp(C.R_D * rho_thm_vol / C.P_REF, min=1.0e-7), gamma)
-    dp_dThm_s = gamma * pres_s / torch.clamp(Thm_s, min=1.0e-3)
+    dp_dThm_s = gamma * pres_s / torch.clamp(Thm_s, min=1.0e-6)
     rtot_s = rho_s * q_load
 
     m_edge = 0.5 * (m_s[:, c0] + m_s[:, c1])
     thm_e = 0.5 * (thm_s[:, c0] + thm_s[:, c1]) - 0.15 * torch.sign(u_s) * (thm_s[:, c1] - thm_s[:, c0])
     rtot_e = torch.clamp(0.5 * (rtot_s[:, c0] + rtot_s[:, c1]), min=1.0e-8)
     dz_10 = z_c[:, c1] - z_c[:, c0]
-    a0 = -0.5 * (rtot_s[:, c0] * C.GRAVITY / torch.clamp(pres_s[:, c0], min=0.1)) * dz_10
-    a1 = +0.5 * (rtot_s[:, c1] * C.GRAVITY / torch.clamp(pres_s[:, c1], min=0.1)) * dz_10
+    a0 = -0.5 * (rtot_s[:, c0] * C.GRAVITY / torch.clamp(pres_s[:, c0], min=1.0e-3)) * dz_10
+    a1 = +0.5 * (rtot_s[:, c1] * C.GRAVITY / torch.clamp(pres_s[:, c1], min=1.0e-3)) * dz_10
     e0 = torch.expm1(a0)
     e1 = torch.expm1(a1)
     # Symmetric-difference PGF coefficients (fac_z0 = fz_avg, fac_z1 = fz_dif) eliminate cancellation

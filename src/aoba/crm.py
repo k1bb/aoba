@@ -1626,8 +1626,8 @@ def step_coupled_crm_rce(
 
         pres_w = torch.empty((nz + 1, m_sub), device=rho_sub.device, dtype=rho_sub.dtype)
         pres_w[0] = pres_sfc_sub
-        pres_w[1:-1] = torch.sqrt(torch.clamp(pres_sub[:-1] * pres_sub[1:], min=1.0))
-        pres_w[-1] = torch.clamp(0.5 * pres_sub[-1], min=0.1)
+        pres_w[1:-1] = torch.sqrt(torch.clamp(pres_sub[:-1] * pres_sub[1:], min=1.0e-6))
+        pres_w[-1] = torch.clamp(0.5 * pres_sub[-1], min=1.0e-3)
 
         temp_w = torch.empty((nz + 1, m_sub), device=rho_sub.device, dtype=rho_sub.dtype)
         temp_w[0] = temp_sub[0]

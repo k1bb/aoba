@@ -320,12 +320,12 @@ kernel void crm_fast_hevi_col(
         float thm_w_above = 0.0f;
         float r_cur = rho_cur[idx];
         float T_cur = Thm_cur[idx];
-        float thm_k = T_cur / max(r_cur, 1.0e-5f);
+        float thm_k = T_cur / max(r_cur, 1.0e-8f);
         if (k < K - 1u) {
             float w_up = w_cur[(k + 1u) * M + tid];
             fz_old_above = rho_dw[idx] * w_up;
             uint idx_p = (k + 1u) * M + tid;
-            float thm_kp = Thm_cur[idx_p] / max(rho_cur[idx_p], 1.0e-5f);
+            float thm_kp = Thm_cur[idx_p] / max(rho_cur[idx_p], 1.0e-8f);
             float sgn_up = (w_up > 0.0f) ? 1.0f : ((w_up < 0.0f) ? -1.0f : 0.0f);
             float dz_wu = dz_w_int[k * dz_cols + col_dz];
             float cfl_up = fabs(w_up) * (dt_ac / max(dz_wu, 1.0f));
@@ -355,7 +355,7 @@ kernel void crm_fast_hevi_col(
             float dz_w_val = dz_w_int[um * dz_cols + col_dz];
             float nh_imb = (p_blend - p_blend_prev) / dz_w_val + 0.5f * (rtot_blend + rtot_blend_prev) * gravity;
             float rdw_m = rho_dw[idx_m];
-            float rtw_m = max(rho_tot_w[idx_m], 1.0e-5f);
+            float rtw_m = max(rho_tot_w[idx_m], 1.0e-8f);
             float rhs_m = dt_ac * (
                 rdw_m * tend_w_slow[idx_m]
                 - (rdw_m / rtw_m) * nh_imb
@@ -387,7 +387,7 @@ kernel void crm_fast_hevi_col(
         float rdw_m = rho_dw[idx_m];
         float fz_old_m = rdw_m * w_cur[(um + 1u) * M + tid];
         float fz_new_m = fz_old_m + dfz_cur;
-        w_nxt[(um + 1u) * M + tid] = fz_new_m / max(rdw_m, 1.0e-5f);
+        w_nxt[(um + 1u) * M + tid] = fz_new_m / max(rdw_m, 1.0e-8f);
         if (accum == 1u) {
             fz_acc[(um + 1u) * M + tid] = (fz_old_m + beta * dfz_cur) * inv_nac;
         } else if (accum == 2u) {
@@ -398,7 +398,7 @@ kernel void crm_fast_hevi_col(
         uint idx_l = k_layer * M + tid;
         float thm_w_m = thm_w[idx_m];
         float dz_val = dz_c[k_layer * dz_cols + col_dz];
-        rho_nxt[idx_l] = max(rho_nxt[idx_l] - beta * dt_ac * (dfz_above - dfz_cur) / dz_val, 1.0e-5f);
+        rho_nxt[idx_l] = max(rho_nxt[idx_l] - beta * dt_ac * (dfz_above - dfz_cur) / dz_val, 1.0e-8f);
         Thm_nxt[idx_l] = Thm_nxt[idx_l] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_m * dfz_cur) / dz_val;
 
         dfz_above = dfz_cur;
@@ -406,7 +406,7 @@ kernel void crm_fast_hevi_col(
     }
 
     float dz_0 = dz_c[col_dz];
-    rho_nxt[tid] = max(rho_nxt[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-5f);
+    rho_nxt[tid] = max(rho_nxt[tid] - beta * dt_ac * dfz_above / dz_0, 1.0e-8f);
     Thm_nxt[tid] = Thm_nxt[tid] - beta * dt_ac * (thm_w_above * dfz_above) / dz_0;
 }
 
@@ -543,7 +543,7 @@ kernel void crm_3d_fast_hevi_loop(
                 }
             }
             // Cache live theta_m in idle sm_dstar for race-free conservative upwind vertical Thm flux in Step B-1
-            sm_dstar[k * stride_c + rem] = Thm_a[idx] / max(rho_a[idx], 1.0e-5f);
+            sm_dstar[k * stride_c + rem] = Thm_a[idx] / max(rho_a[idx], 1.0e-8f);
         }
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
@@ -617,7 +617,7 @@ kernel void crm_3d_fast_hevi_loop(
             float dz_w_val = dz_w_int[um * dz_cols + col_dz];
             float nh_imb = (p_cur - p_prev) / dz_w_val + 0.5f * (rt_cur + rt_prev) * gravity;
             float rdw_m = rho_dw[idx_m];
-            float rtw_m = max(rho_tot_w[idx_m], 1.0e-5f);
+            float rtw_m = max(rho_tot_w[idx_m], 1.0e-8f);
             float fz_old_m = rdw_m * w_a[idx_p];
             sm_dstar[um * stride_c + rem] = dt_ac * (
                 rdw_m * tend_w_slow[idx_m]
@@ -663,14 +663,14 @@ kernel void crm_3d_fast_hevi_loop(
             float thm_w_below = (k > 0u) ? thm_w[(k - 1u) * M + tid] : 0.0f;
             float thm_w_above = (k < K - 1u) ? thm_w[k * M + tid] : 0.0f;
             float dz_val = dz_c[k * dz_cols + col_dz];
-            rho_a[idx] = max(rho_a[idx] - beta * dt_ac * (dfz_above - dfz_below) / dz_val, 1.0e-5f);
+            rho_a[idx] = max(rho_a[idx] - beta * dt_ac * (dfz_above - dfz_below) / dz_val, 1.0e-8f);
             Thm_a[idx] = Thm_a[idx] - beta * dt_ac * (thm_w_above * dfz_above - thm_w_below * dfz_below) / dz_val;
             if (k > 0u) {
                 uint um = k - 1u;
                 uint idx_m = um * M + tid;
                 float rdw_m = rho_dw[idx_m];
                 float fz_old_m = rdw_m * w_a[idx];
-                w_a[idx] = (fz_old_m + dfz_below) / max(rdw_m, 1.0e-5f);
+                w_a[idx] = (fz_old_m + dfz_below) / max(rdw_m, 1.0e-8f);
                 if (accum != 0u) {
                     float fz_bar = (fz_old_m + beta * dfz_below) * inv_nac;
                     if (ac == 0u) {
@@ -752,10 +752,10 @@ kernel void crm_stage_thermo(
 
     float r = rho_s[gid];
     float T = Thm_s[gid];
-    thm_s[gid] = T / max(r, 1.0e-5f);
+    thm_s[gid] = T / max(r, 1.0e-8f);
     float arg = max((r_d * T) / p_ref, 1.0e-7f);
     float p = p_ref * pow(arg, gamma_d);
-    float dp = gamma_d * p / max(T, 1.0e-3f);
+    float dp = gamma_d * p / max(T, 1.0e-6f);
     dp_dThm_s[gid] = dp;
     a_p_s[gid] = p - dp * T;
     rho_tot_s[gid] = r * q_load[gid];
@@ -834,8 +834,8 @@ kernel void crm_stage_uv_flux(
 
     rho_x[gid] = 0.5f * (rho_s[gid] + rho_s[idx_xp1]);
     rho_y[gid] = 0.5f * (rho_s[gid] + rho_s[idx_yp1]);
-    rtot_x_inv[gid] = 1.0f / max(0.5f * (rho_tot_s[gid] + rho_tot_s[idx_xp1]), 1.0e-5f);
-    rtot_y_inv[gid] = 1.0f / max(0.5f * (rho_tot_s[gid] + rho_tot_s[idx_yp1]), 1.0e-5f);
+    rtot_x_inv[gid] = 1.0f / max(0.5f * (rho_tot_s[gid] + rho_tot_s[idx_xp1]), 1.0e-8f);
+    rtot_y_inv[gid] = 1.0f / max(0.5f * (rho_tot_s[gid] + rho_tot_s[idx_yp1]), 1.0e-8f);
 
     float th0 = thm_s[gid];
     float th_xm1 = thm_s[idx_xm1];
