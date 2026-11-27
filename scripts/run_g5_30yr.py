@@ -1878,6 +1878,9 @@ def _write_live_preview_atomic(
     olr_override: torch.Tensor | None = None,
     lightning_override: torch.Tensor | None = None,
     sprite_override: torch.Tensor | None = None,
+    elves_override: torch.Tensor | None = None,
+    blue_jet_override: torch.Tensor | None = None,
+    gigantic_jet_override: torch.Tensor | None = None,
 ) -> None:
     """Atomically write lightweight 2D live-preview fields (`T2`, `Precip`, `LAI`, `OLR`) for the CPU GUI."""
     mesh = model.mesh
@@ -2013,9 +2016,19 @@ def _write_live_preview_atomic(
         _sp_tot = _sp.sprite_rate_cell
         if getattr(_sp, "halo_rate_cell", None) is not None:
             _sp_tot = _sp_tot + _sp.halo_rate_cell
-        if getattr(_sp, "elves_rate_cell", None) is not None:
-            _sp_tot = _sp_tot + _sp.elves_rate_cell
         extra_arrays["sprite_rate"] = _sp_tot.detach().cpu().numpy().astype(np.float32)
+    if elves_override is not None:
+        extra_arrays["elves_rate"] = elves_override.detach().cpu().numpy().astype(np.float32)
+    elif getattr(model, "last_red_sprites", None) is not None and getattr(model.last_red_sprites, "elves_rate_cell", None) is not None:
+        extra_arrays["elves_rate"] = model.last_red_sprites.elves_rate_cell.detach().cpu().numpy().astype(np.float32)
+    if blue_jet_override is not None:
+        extra_arrays["blue_jet_rate"] = blue_jet_override.detach().cpu().numpy().astype(np.float32)
+    elif getattr(model, "last_red_sprites", None) is not None and getattr(model.last_red_sprites, "blue_jet_rate_cell", None) is not None:
+        extra_arrays["blue_jet_rate"] = model.last_red_sprites.blue_jet_rate_cell.detach().cpu().numpy().astype(np.float32)
+    if gigantic_jet_override is not None:
+        extra_arrays["gigantic_jet_rate"] = gigantic_jet_override.detach().cpu().numpy().astype(np.float32)
+    elif getattr(model, "last_red_sprites", None) is not None and getattr(model.last_red_sprites, "gigantic_jet_rate_cell", None) is not None:
+        extra_arrays["gigantic_jet_rate"] = model.last_red_sprites.gigantic_jet_rate_cell.detach().cpu().numpy().astype(np.float32)
     _aod_v = None
     if getattr(model, "volcanic_solar", None) is not None and getattr(model.volcanic_solar, "aod_550", None) is not None:
         _aod_v = model.volcanic_solar.aod_550
@@ -2641,6 +2654,9 @@ def main() -> None:
         hr_olr_sum: torch.Tensor | None = None
         hr_lgt_sum: torch.Tensor | None = None
         hr_spr_sum: torch.Tensor | None = None
+        hr_elv_sum: torch.Tensor | None = None
+        hr_bjet_sum: torch.Tensor | None = None
+        hr_gjet_sum: torch.Tensor | None = None
         hr_cnt = 0
         hf_t2_sum: torch.Tensor | None = None
         hf_precip_sum: torch.Tensor | None = None
@@ -2822,9 +2838,16 @@ def main() -> None:
                 _spr_inst = _sp_o.sprite_rate_cell
                 if getattr(_sp_o, "halo_rate_cell", None) is not None:
                     _spr_inst = _spr_inst + _sp_o.halo_rate_cell
-                if getattr(_sp_o, "elves_rate_cell", None) is not None:
-                    _spr_inst = _spr_inst + _sp_o.elves_rate_cell
                 hr_spr_sum = _spr_inst.clone() if hr_spr_sum is None else (hr_spr_sum + _spr_inst)
+                if getattr(_sp_o, "elves_rate_cell", None) is not None:
+                    _e_inst = _sp_o.elves_rate_cell
+                    hr_elv_sum = _e_inst.clone() if hr_elv_sum is None else (hr_elv_sum + _e_inst)
+                if getattr(_sp_o, "blue_jet_rate_cell", None) is not None:
+                    _bj_inst = _sp_o.blue_jet_rate_cell
+                    hr_bjet_sum = _bj_inst.clone() if hr_bjet_sum is None else (hr_bjet_sum + _bj_inst)
+                if getattr(_sp_o, "gigantic_jet_rate_cell", None) is not None:
+                    _gj_inst = _sp_o.gigantic_jet_rate_cell
+                    hr_gjet_sum = _gj_inst.clone() if hr_gjet_sum is None else (hr_gjet_sum + _gj_inst)
             hr_cnt += 1
 
             if hf_enabled:
@@ -2881,12 +2904,18 @@ def main() -> None:
                     olr_override=hr_olr_sum / float(hr_cnt),
                     lightning_override=(hr_lgt_sum / float(hr_cnt)) if hr_lgt_sum is not None else None,
                     sprite_override=(hr_spr_sum / float(hr_cnt)) if hr_spr_sum is not None else None,
+                    elves_override=(hr_elv_sum / float(hr_cnt)) if hr_elv_sum is not None else None,
+                    blue_jet_override=(hr_bjet_sum / float(hr_cnt)) if hr_bjet_sum is not None else None,
+                    gigantic_jet_override=(hr_gjet_sum / float(hr_cnt)) if hr_gjet_sum is not None else None,
                 )
                 hr_t2_sum = None
                 hr_precip_sum = None
                 hr_olr_sum = None
                 hr_lgt_sum = None
                 hr_spr_sum = None
+                hr_elv_sum = None
+                hr_bjet_sum = None
+                hr_gjet_sum = None
                 hr_cnt = 0
 
             if out_cfg.monthly_mean_enabled and (

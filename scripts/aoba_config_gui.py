@@ -202,6 +202,9 @@ class CPUGlobePreviewEngine:
         ocn_depth_m: np.ndarray | None = None,
         lightning_km2yr: np.ndarray | None = None,
         sprite_km2yr: np.ndarray | None = None,
+        elves_km2yr: np.ndarray | None = None,
+        blue_jet_km2yr: np.ndarray | None = None,
+        gigantic_jet_km2yr: np.ndarray | None = None,
         solar_decl_deg: float | None = None,
         subsolar_lon_deg: float | None = None,
     ) -> dict[str, Any]:
@@ -300,6 +303,21 @@ class CPUGlobePreviewEngine:
             spr_g = (spr_pos[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
             spr_log = np.log1p(spr_g / 0.05) / math.log1p(12.0 / 0.05)
             extra_b64["sprite_b64"] = self._quantize_u8(spr_log, 0.0, 1.0)
+        if elves_km2yr is not None and elves_km2yr.shape[0] == lat_deg.shape[0]:
+            elv_pos = np.maximum(elves_km2yr, 0.0)
+            elv_g = (elv_pos[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            elv_log = np.log1p(elv_g / 0.05) / math.log1p(15.0 / 0.05)
+            extra_b64["elves_b64"] = self._quantize_u8(elv_log, 0.0, 1.0)
+        if blue_jet_km2yr is not None and blue_jet_km2yr.shape[0] == lat_deg.shape[0]:
+            bj_pos = np.maximum(blue_jet_km2yr, 0.0)
+            bj_g = (bj_pos[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            bj_log = np.log1p(bj_g / 0.03) / math.log1p(8.0 / 0.03)
+            extra_b64["bjet_b64"] = self._quantize_u8(bj_log, 0.0, 1.0)
+        if gigantic_jet_km2yr is not None and gigantic_jet_km2yr.shape[0] == lat_deg.shape[0]:
+            gj_pos = np.maximum(gigantic_jet_km2yr, 0.0)
+            gj_g = (gj_pos[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
+            gj_log = np.log1p(gj_g / 0.005) / math.log1p(2.0 / 0.005)
+            extra_b64["gjet_b64"] = self._quantize_u8(gj_log, 0.0, 1.0)
         if u10_u is not None and u10_v is not None and u10_u.shape[0] == lat_deg.shape[0]:
             wu_g = (u10_u[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
             wv_g = (u10_v[idxs] * w).sum(axis=1).reshape(self.GRID_H, self.GRID_W)
@@ -369,7 +387,10 @@ _ESM_GLOBE_SPECS: dict[str, tuple[str, float, float, str]] = {
     "f_c4": ("C₄ Grass Frac [-]", 0.0, 1.0, "land"),
     "o3_tco_du": ("Total Ozone O₃ [DU]", 150.0, 420.0, "global"),
     "lightning_flash_rate": ("Lightning [fl km⁻² yr⁻¹]", 0.0, 40.0, "global"),
-    "sprite_rate": ("Red Sprites & TLE [ev km⁻² yr⁻¹]", 0.0, 2.0, "global"),
+    "sprite_rate": ("Red Sprites & Halos [ev km⁻² yr⁻¹]", 0.0, 2.0, "global"),
+    "elves_rate": ("ELVES (EMP Rings) [ev km⁻² yr⁻¹]", 0.0, 4.0, "global"),
+    "blue_jet_rate": ("Blue Jets [ev km⁻² yr⁻¹]", 0.0, 1.5, "global"),
+    "gigantic_jet_rate": ("Gigantic Jets [ev km⁻² yr⁻¹]", 0.0, 0.3, "global"),
     "volc_aod": ("Volcanic / Aero AOD (550nm)", 0.0, 0.4, "global"),
     "f_wetland": ("Wetland/Lake Frac [-]", 0.0, 0.85, "land"),
     "d18o_precip_permil": ("Precip δ¹⁸O [‰]", -45.0, 2.0, "global"),
@@ -556,15 +577,12 @@ def _load_zarr_frame_payload(
                     return fw, True
                 if fl is not None:
                     return fl, True
-            if key == "sprite_rate":
-                sp = np.asarray(ds["sprite_rate"].isel(time=idx).values, dtype=np.float32) if "sprite_rate" in ds else None
-                el = np.asarray(ds["elves_rate"].isel(time=idx).values, dtype=np.float32) if "elves_rate" in ds else None
-                if sp is not None and el is not None:
-                    return (sp + el) * _FL_M2S_TO_KM2YR, True
-                if sp is not None:
-                    return sp * _FL_M2S_TO_KM2YR, True
-                if el is not None:
-                    return el * _FL_M2S_TO_KM2YR, True
+            if key in ("sprite_rate", "elves_rate", "blue_jet_rate", "gigantic_jet_rate"):
+                if key in ds and ds[key].shape[-1] in (n_cell, n_ocn):
+                    val = np.asarray(ds[key].isel(time=idx).values, dtype=np.float32)
+                    if val.ndim >= 2:
+                        val = val[0]
+                    return val * _FL_M2S_TO_KM2YR, True
                 return None, False
             if key in ds and ds[key].shape[-1] in (n_cell, n_ocn):
                 val = np.asarray(ds[key].isel(time=idx).values, dtype=np.float32)
@@ -607,6 +625,9 @@ def _load_zarr_frame_payload(
         wave_hs_m = np.asarray(ds["wave_hs_m"].isel(time=idx).values, dtype=np.float32) if "wave_hs_m" in ds else None
         lgt_km2yr, _ = _extract_esm("lightning_flash_rate")
         spr_km2yr, _ = _extract_esm("sprite_rate")
+        elv_km2yr, _ = _extract_esm("elves_rate")
+        bj_km2yr, _ = _extract_esm("blue_jet_rate")
+        gj_km2yr, _ = _extract_esm("gigantic_jet_rate")
 
         return {
             "lat_deg": lat_deg,
@@ -631,6 +652,9 @@ def _load_zarr_frame_payload(
             "wave_hs_m": wave_hs_m,
             "lightning_km2yr": lgt_km2yr,
             "sprite_km2yr": spr_km2yr,
+            "elves_km2yr": elv_km2yr,
+            "blue_jet_km2yr": bj_km2yr,
+            "gigantic_jet_km2yr": gj_km2yr,
         }
     finally:
         ds.close()
@@ -1008,6 +1032,21 @@ class RunManager:
                             if "sprite_rate" in zfiles
                             else None
                         )
+                        elv_km2yr = (
+                            np.asarray(zf["elves_rate"], dtype=np.float32) * _FL_M2S_TO_KM2YR
+                            if "elves_rate" in zfiles
+                            else None
+                        )
+                        bj_km2yr = (
+                            np.asarray(zf["blue_jet_rate"], dtype=np.float32) * _FL_M2S_TO_KM2YR
+                            if "blue_jet_rate" in zfiles
+                            else None
+                        )
+                        gj_km2yr = (
+                            np.asarray(zf["gigantic_jet_rate"], dtype=np.float32) * _FL_M2S_TO_KM2YR
+                            if "gigantic_jet_rate" in zfiles
+                            else None
+                        )
                         solar_decl_deg = float(zf["solar_decl_deg"]) if "solar_decl_deg" in zfiles else None
                         subsolar_lon_deg = float(zf["subsolar_lon_deg"]) if "subsolar_lon_deg" in zfiles else None
                         if has_ocn_mesh:
@@ -1038,6 +1077,12 @@ class RunManager:
                             f3 = lgt_km2yr
                         elif esm_field == "sprite_rate" and spr_km2yr is not None:
                             f3 = spr_km2yr
+                        elif esm_field == "elves_rate" and elv_km2yr is not None:
+                            f3 = elv_km2yr
+                        elif esm_field == "blue_jet_rate" and bj_km2yr is not None:
+                            f3 = bj_km2yr
+                        elif esm_field == "gigantic_jet_rate" and gj_km2yr is not None:
+                            f3 = gj_km2yr
                         elif esm_field in zfiles:
                             f3 = np.asarray(zf[esm_field], dtype=np.float32)
                         else:
@@ -1070,6 +1115,7 @@ class RunManager:
                         wave_hs_m=wave_hs_m, u10_u=u10_u, u10_v=u10_v,
                         ocn_u_ms=ocn_u_ms, ocn_v_ms=ocn_v_ms, ocn_depth_m=ocn_depth_m,
                         lightning_km2yr=lgt_km2yr, sprite_km2yr=spr_km2yr,
+                        elves_km2yr=elv_km2yr, blue_jet_km2yr=bj_km2yr, gigantic_jet_km2yr=gj_km2yr,
                         solar_decl_deg=solar_decl_deg, subsolar_lon_deg=subsolar_lon_deg,
                     )
                     meta = {
@@ -1122,6 +1168,8 @@ class RunManager:
                         lwp_gm2=zdat["lwp_gm2"], iwp_gm2=zdat["iwp_gm2"], swe_land=zdat["swe_land"],
                         z_topo=zdat["z_topo"], wave_hs_m=zdat["wave_hs_m"],
                         lightning_km2yr=zdat["lightning_km2yr"], sprite_km2yr=zdat["sprite_km2yr"],
+                        elves_km2yr=zdat["elves_km2yr"], blue_jet_km2yr=zdat["blue_jet_km2yr"],
+                        gigantic_jet_km2yr=zdat["gigantic_jet_km2yr"],
                     )
                     sim_d = float(finfo["sim_days"])
                     run_toml_p = out_root / "run_config.toml"
@@ -1748,7 +1796,10 @@ _HTML_PAGE = r"""<!DOCTYPE html>
               <option value="f_c4">C₄草本率 f_c4</option>
               <option value="o3_tco_du">全オゾン O₃ [DU]</option>
               <option value="lightning_flash_rate">発雷頻度 [fl/km²/yr]</option>
-              <option value="sprite_rate">レッドスプライト (TLE)</option>
+              <option value="sprite_rate">レッドスプライト・ハロー</option>
+              <option value="elves_rate">エルブス ELVES (EMPリング)</option>
+              <option value="blue_jet_rate">ブルージェット (成層圏)</option>
+              <option value="gigantic_jet_rate">巨大ジェット (電離圏橋)</option>
               <option value="volc_aod">火山・エアロゾル AOD</option>
               <option value="f_wetland">湿地・湖沼被覆率</option>
               <option value="d18o_precip_permil">降水 δ¹⁸O [‰]</option>
@@ -2932,6 +2983,9 @@ function _applyMonitorFrame(fr) {
   MON.rawWave = fr.wave;
   MON.rawLight = fr.light;
   MON.rawSprite = fr.sprite;
+  MON.rawElves = fr.elves;
+  MON.rawBJet = fr.bjet;
+  MON.rawGJet = fr.gjet;
   MON.solarDeclDeg = fr.declDeg;
   MON.rawT2 = fr.t2;
   MON.rawIR = fr.ir;
@@ -3131,6 +3185,9 @@ async function fetchMonitorOnce() {
           wave: data.raster.wave_b64 ? b64ToUint8(data.raster.wave_b64) : null,
           light: data.raster.light_b64 ? b64ToUint8(data.raster.light_b64) : null,
           sprite: data.raster.sprite_b64 ? b64ToUint8(data.raster.sprite_b64) : null,
+          elves: data.raster.elves_b64 ? b64ToUint8(data.raster.elves_b64) : null,
+          bjet: data.raster.bjet_b64 ? b64ToUint8(data.raster.bjet_b64) : null,
+          gjet: data.raster.gjet_b64 ? b64ToUint8(data.raster.gjet_b64) : null,
           windSpd: data.raster.wind_spd_b64 ? b64ToUint8(data.raster.wind_spd_b64) : null,
           ocnWet: data.raster.ocn_wet_b64 ? b64ToUint8(data.raster.ocn_wet_b64) : null,
           ocnCoast: data.raster.ocn_coast_b64 ? b64ToUint8(data.raster.ocn_coast_b64) : null,
@@ -3381,6 +3438,9 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
   const sweU8 = MON.rawSWE, ztU8 = MON.rawZTopo, depthU8 = MON.rawDepth, waveU8 = MON.rawWave;
   const lightU8 = useTLE ? MON.rawLight : null;
   const spriteU8 = useTLE ? MON.rawSprite : null;
+  const elvesU8 = useTLE ? MON.rawElves : null;
+  const bjetU8 = useTLE ? MON.rawBJet : null;
+  const gjetU8 = useTLE ? MON.rawGJet : null;
   const twinkleTick = Math.floor(performance.now() / 130);
   const deg2rad = Math.PI / 180.0;
 
@@ -3600,11 +3660,12 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
   ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(geo.cx, geo.cy, geo.R*1.09, 0, Math.PI*2); ctx.fill();
   ctx.drawImage(canvas._offCv, 0, 0);
 
-  // Crisp 2D additive overlay for bright lightning cores & mesospheric red sprite tendrils
-  if (useTLE && (lightU8 || spriteU8)) {
+  // Crisp 2D additive overlay for bright lightning cores, red sprites, ELVES EMP rings, Blue Jets & Gigantic Jets
+  if (useTLE && (lightU8 || spriteU8 || elvesU8 || bjetU8 || gjetU8)) {
     const sinL0 = Math.sin(lat0Rad), cosL0 = Math.cos(lat0Rad);
     const stepLat = Math.max(2, Math.floor(rH / 45));
     const stepLon = Math.max(2, Math.floor(rW / 90));
+    const sc = geo.R / 168.0;
     ctx.save();
     ctx.globalCompositeOperation = "lighter";
     for (let rr = 1; rr < rH - 1; rr += stepLat) {
@@ -3615,7 +3676,10 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
         const gi = rr * rW + cc;
         const lv = lightU8 ? lightU8[gi] : 0;
         const sv = spriteU8 ? spriteU8[gi] : 0;
-        if (lv < 75 && sv < 42) continue;
+        const ev = elvesU8 ? elvesU8[gi] : 0;
+        const bv = bjetU8 ? bjetU8[gi] : 0;
+        const gv = gjetU8 ? gjetU8[gi] : 0;
+        if (lv < 75 && sv < 42 && ev < 45 && bv < 38 && gv < 24) continue;
         const lonD = (cc + 0.5) * (360.0 / rW) - 180.0;
         const dl = (lonD - lon0) * deg2rad;
         const z = sinL0 * sinP + cosL0 * cosP * Math.cos(dl);
@@ -3624,9 +3688,14 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
         const py = geo.cy - geo.R * (cosL0 * sinP - sinL0 * cosP * Math.cos(dl));
         const muC = useSolar ? (cosP * Math.cos(lonD * deg2rad) * sx + cosP * Math.sin(lonD * deg2rad) * sy + sinP * sz) : 0.78;
         const hSeed = (((rr * 73856093) ^ (cc * 19349663) ^ (twinkleTick * 83492791)) >>> 0) & 255;
+        const dxC = px - geo.cx, dyC = py - geo.cy;
+        const dNorm = Math.hypot(dxC, dyC) || 1.0;
+        const ux = dxC / dNorm, uy = dyC / dNorm;
+        const limbFactor = Math.sqrt(Math.max(0.05, 1.0 - z * z));
+        // 1. Lightning (electric cyan-white / warm-gold)
         if (lv >= 75 && hSeed > 150) {
           const lInt = Math.min(1.0, (lv - 75) / 160.0) * (muC < 0.1 ? 0.95 : 0.55);
-          const rad = (geo.R / 168.0) * (2.6 + 4.5 * lInt);
+          const rad = sc * (2.6 + 4.5 * lInt);
           const gr = ctx.createRadialGradient(px, py, 0, px, py, rad);
           gr.addColorStop(0, `rgba(255,253,235,${(0.95 * lInt).toFixed(2)})`);
           gr.addColorStop(0.35, `rgba(125,211,252,${(0.55 * lInt).toFixed(2)})`);
@@ -3634,29 +3703,66 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
           ctx.fillStyle = gr;
           ctx.beginPath(); ctx.arc(px, py, rad, 0, Math.PI * 2); ctx.fill();
         }
+        // 2. Red Sprites & Sprite Halos (crimson-red vertical column + upper halo)
         if (sv >= 42 && hSeed > 135) {
           const sInt = Math.min(1.0, (sv - 42) / 150.0) * (muC < 0.08 ? 1.0 : (muC < 0.25 ? 0.55 : 0.22));
-          const radS = (geo.R / 168.0) * (4.0 + 7.0 * sInt);
-          // Outward radial direction from Earth center for mesospheric vertical sprite column
-          const dxC = px - geo.cx, dyC = py - geo.cy;
-          const dNorm = Math.hypot(dxC, dyC) || 1.0;
-          const ux = dxC / dNorm, uy = dyC / dNorm;
-          const lift = (geo.R / 168.0) * (3.0 + 5.5 * sInt) * Math.sqrt(Math.max(0.05, 1.0 - z * z));
+          const radS = sc * (4.0 + 7.0 * sInt);
+          const lift = sc * (3.0 + 5.5 * sInt) * limbFactor;
           const sx2 = px + ux * lift, sy2 = py + uy * lift;
-          // Crimson sprite halo
           const sg = ctx.createRadialGradient(sx2, sy2, 0, sx2, sy2, radS);
           sg.addColorStop(0, `rgba(255,70,115,${(0.88 * sInt).toFixed(2)})`);
           sg.addColorStop(0.45, `rgba(225,29,72,${(0.45 * sInt).toFixed(2)})`);
           sg.addColorStop(1, "rgba(190,24,93,0)");
           ctx.fillStyle = sg;
           ctx.beginPath(); ctx.arc(sx2, sy2, radS, 0, Math.PI * 2); ctx.fill();
-          // Vertical crimson sprite filament
           ctx.strokeStyle = `rgba(255,110,145,${(0.75 * sInt).toFixed(2)})`;
-          ctx.lineWidth = Math.max(1.0, (geo.R / 168.0) * 1.15);
-          ctx.beginPath();
-          ctx.moveTo(px, py);
-          ctx.lineTo(sx2, sy2);
-          ctx.stroke();
+          ctx.lineWidth = Math.max(1.0, sc * 1.15);
+          ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(sx2, sy2); ctx.stroke();
+        }
+        // 3. ELVES (expanding hollow crimson-orange D-region EMP ring at ~90 km)
+        if (ev >= 45 && ((hSeed + 91) & 255) > 155) {
+          const eInt = Math.min(1.0, (ev - 45) / 155.0) * (muC < 0.05 ? 0.95 : (muC < 0.20 ? 0.45 : 0.15));
+          const phase = ((twinkleTick + rr * 3 + cc) % 5) / 4.0;
+          const rRing = sc * (4.5 + 8.5 * phase) * (0.6 + 0.4 * eInt);
+          const liftE = sc * 4.8 * limbFactor;
+          const ex2 = px + ux * liftE, ey2 = py + uy * liftE;
+          ctx.strokeStyle = `rgba(255,115,65,${(0.85 * eInt * (1.0 - 0.55 * phase)).toFixed(2)})`;
+          ctx.lineWidth = Math.max(1.0, sc * (1.4 - 0.5 * phase));
+          ctx.beginPath(); ctx.arc(ex2, ey2, rRing, 0, Math.PI * 2); ctx.stroke();
+        }
+        // 4. Blue Jets (electric cobalt-blue narrow upward stratospheric jet cone)
+        if (bv >= 38 && ((hSeed + 173) & 255) > 145) {
+          const bInt = Math.min(1.0, (bv - 38) / 150.0) * (muC < 0.12 ? 0.95 : 0.45);
+          const liftB = sc * (2.8 + 4.5 * bInt) * Math.max(0.22, limbFactor);
+          const bx2 = px + ux * liftB, by2 = py + uy * liftB;
+          const bg = ctx.createRadialGradient(bx2, by2, 0, bx2, by2, sc * (2.6 + 3.6 * bInt));
+          bg.addColorStop(0, `rgba(96,185,255,${(0.90 * bInt).toFixed(2)})`);
+          bg.addColorStop(0.5, `rgba(37,99,235,${(0.45 * bInt).toFixed(2)})`);
+          bg.addColorStop(1, "rgba(30,64,175,0)");
+          ctx.fillStyle = bg;
+          ctx.beginPath(); ctx.arc(bx2, by2, sc * (2.6 + 3.6 * bInt), 0, Math.PI * 2); ctx.fill();
+          ctx.strokeStyle = `rgba(56,189,248,${(0.88 * bInt).toFixed(2)})`;
+          ctx.lineWidth = Math.max(1.1, sc * 1.3);
+          ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(bx2, by2); ctx.stroke();
+        }
+        // 5. Gigantic Jets (rare cloud-to-ionosphere bridge: cobalt-blue base -> crimson-violet crown)
+        if (gv >= 24 && ((hSeed + 221) & 255) > 160) {
+          const gInt = Math.min(1.0, (gv - 24) / 140.0) * (muC < 0.10 ? 1.0 : 0.35);
+          const liftG = sc * (6.0 + 7.5 * gInt) * Math.max(0.28, limbFactor);
+          const gx2 = px + ux * liftG, gy2 = py + uy * liftG;
+          const lg = ctx.createLinearGradient(px, py, gx2, gy2);
+          lg.addColorStop(0, `rgba(56,189,248,${(0.95 * gInt).toFixed(2)})`);
+          lg.addColorStop(0.45, `rgba(139,92,246,${(0.90 * gInt).toFixed(2)})`);
+          lg.addColorStop(1, `rgba(255,45,105,${(0.95 * gInt).toFixed(2)})`);
+          ctx.strokeStyle = lg;
+          ctx.lineWidth = Math.max(1.4, sc * 1.8);
+          ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(gx2, gy2); ctx.stroke();
+          const cg = ctx.createRadialGradient(gx2, gy2, 0, gx2, gy2, sc * (4.2 + 5.0 * gInt));
+          cg.addColorStop(0, `rgba(244,63,94,${(0.85 * gInt).toFixed(2)})`);
+          cg.addColorStop(0.5, `rgba(168,85,247,${(0.45 * gInt).toFixed(2)})`);
+          cg.addColorStop(1, "rgba(168,85,247,0)");
+          ctx.fillStyle = cg;
+          ctx.beginPath(); ctx.arc(gx2, gy2, sc * (4.2 + 5.0 * gInt), 0, Math.PI * 2); ctx.fill();
         }
       }
     }
@@ -4064,7 +4170,7 @@ function animateGlobes(ts) {
   }
   const drawGrid = document.getElementById("globe-grid")?.checked ?? true;
   const useTLE = document.getElementById("hima-tle")?.checked ?? true;
-  const hasTLE = useTLE && !!(MON.rawLight || MON.rawSprite);
+  const hasTLE = useTLE && !!(MON.rawLight || MON.rawSprite || MON.rawElves || MON.rawBJet || MON.rawGJet);
   const subDisp = GLOBE_VIEW.displaySubsolarLon !== null ? GLOBE_VIEW.displaySubsolarLon : 140.0;
   const rKey = `${GLOBE_VIEW.lat0.toFixed(3)}|${GLOBE_VIEW.lon0.toFixed(3)}|${MON.raster?.sim_days ?? "idle"}|${MON.raster?.step ?? ""}|${MON.esmField ?? "lai"}|${drawGrid}|${LANG}`;
   const hKey = `${rKey}|${subDisp.toFixed(2)}|${hasTLE ? Math.floor(ts / 130) : 0}`;
