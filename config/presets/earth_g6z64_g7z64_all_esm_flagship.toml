@@ -61,7 +61,7 @@ crm_distill_hidden_dim = 256
 crm_distill_replay_size = 65536
 enable_distill_shadow_diag = true
 enable_dust = true
-dust_emis_factor = 2.5e-06
+dust_emis_factor = 8.5e-06
 h_ml_ocean = 2.0
 ocean_mode = "ogcm_3d"
 ocean_glevel = 7
@@ -123,7 +123,7 @@ milankovitch_start_kyr = 0.0
 milankovitch_accel_factor = 1.0
 re_liq_um = 10.0
 re_ice_um = 48.0
-cloud_sw_inhomog = 0.72
+cloud_sw_inhomog = 0.88
 microphysics_scheme = "six_class_2m"
 
 # --- Dynamic Equilibrium / Accelerated SIA Ice-Sheet Options ---
@@ -274,8 +274,8 @@ alb_snow_nir_old = 0.35
 emissivity_land = 0.98
 emissivity_ocean = 0.985
 mc_seaice_crit = 450.0
-alb_seaice_vis = 0.72
-alb_seaice_nir = 0.42
+alb_seaice_vis = 0.48
+alb_seaice_nir = 0.24
 
 # --- Two-Leaf Non-Rectangular-Hyperbola EEO Biosphere Parameters ---
 [biosphere]
@@ -312,7 +312,7 @@ z_foliage_cost = 12.227
 k_beer_lai = 0.5
 sigma_zhou = 0.771
 alpha_ema_acclim = 0.067
-evg_cost_ratio_base = 1.35
+evg_cost_ratio_base = 2.25
 evg_cost_ratio_cold = 0.55
 evg_cold_eff_penalty = 0.14
 leaf_aging_b_yr = 15.0
