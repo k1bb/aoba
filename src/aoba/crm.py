@@ -921,6 +921,53 @@ def step_crm_rk3_hevi(
     return fx_final, fy_final, fz_final
 
 
+_CRM_LID_VGRID_CACHE: dict[tuple[int, int, str, int], VerticalGrid] = {}
+
+
+def _get_crm_lid_vgrid(vgrid: VerticalGrid, k_lid: int) -> VerticalGrid:
+    """Build and cache a lower-atmosphere VerticalGrid `[0 : k_lid]` with smooth upper sponge."""
+    dev = vgrid.zeta_c.device
+    key = (id(vgrid), int(k_lid), dev.type, dev.index or 0)
+    cached = _CRM_LID_VGRID_CACHE.get(key)
+    if cached is not None:
+        return cached
+    import dataclasses
+    zc = vgrid.zeta_c[:k_lid].contiguous()
+    zw = vgrid.zeta_w[: k_lid + 1].contiguous()
+    dzc = vgrid.dzeta_c[:k_lid].contiguous()
+    dzw = vgrid.dzeta_w[: k_lid + 1].contiguous()
+    tatt = vgrid.terrain_atten_w[: k_lid + 1].contiguous()
+    z_lid = float(zw[-1].item())
+    # Smooth 7 km upper Rayleigh sponge below the CRM lid (e.g. 21-28 km for a 28 km lid)
+    z_sb = max(z_lid - 7000.0, 0.72 * z_lid)
+    inv_d = 1.0 / max(z_lid - z_sb, 1000.0)
+    tau_lid = 600.0
+    sc_lid = torch.clamp((zc - z_sb) * inv_d, min=0.0, max=1.0).square() / tau_lid
+    sw_lid = torch.clamp((zw - z_sb) * inv_d, min=0.0, max=1.0).square() / tau_lid
+    sc = torch.maximum(sc_lid, vgrid.sponge_c[:k_lid]).contiguous()
+    sw = torch.maximum(sw_lid, vgrid.sponge_w[: k_lid + 1]).contiguous()
+    csc = torch.maximum(sc_lid, vgrid.crm_sponge_c[:k_lid]).contiguous()
+    csw = torch.maximum(sw_lid, vgrid.crm_sponge_w[: k_lid + 1]).contiguous()
+    vg_lid = dataclasses.replace(
+        vgrid,
+        nz=int(k_lid),
+        z_top=z_lid,
+        zeta_c=zc,
+        zeta_w=zw,
+        dzeta_c=dzc,
+        dzeta_w=dzw,
+        terrain_atten_w=tatt,
+        sponge_c=sc,
+        sponge_w=sw,
+        crm_sponge_c=csc,
+        crm_sponge_w=csw,
+    )
+    if len(_CRM_LID_VGRID_CACHE) >= 16:
+        _CRM_LID_VGRID_CACHE.pop(next(iter(_CRM_LID_VGRID_CACHE)))
+    _CRM_LID_VGRID_CACHE[key] = vg_lid
+    return vg_lid
+
+
 def step_crm_physics_and_dynamics(
     crm: CRMState,
     vgrid: VerticalGrid,
@@ -940,6 +987,7 @@ def step_crm_physics_and_dynamics(
     is_ocean_sub: torch.Tensor | None = None,
     u_sfc_sub: torch.Tensor | None = None,
     q_dust_sub: torch.Tensor | None = None,
+    k_top_crm: int | None = None,
 ) -> SPTendencies:
     """Advance 3D CRM by `dt_crm` [s] (RK3-HEVI + Zalesak FCT + MYNN 2.5 + SAM Microphysics).
 
@@ -947,6 +995,128 @@ def step_crm_physics_and_dynamics(
     for the host SCVT grid (`Khairoutdinov et al., 2005`; `Yamazaki & Miura, 2024`).
     """
     nz, n_col, ny, nx = crm.rho_d.shape
+    # High-top Superparameterization CRM lid (SP-CAM / SP-E3SM standard): when the host model
+    # extends into the upper stratosphere/mesosphere (z_top > 36 km), restrict explicit 2 km CRM
+    # dynamics & microphysics to the active troposphere + lower stratosphere (0..k_top_crm, ~28 km)
+    # while advancing quiescent upper levels (k_top_crm..nz) via exact radiative + host forcing.
+    if k_top_crm is not None and 24 <= int(k_top_crm) < nz:
+        kl = int(k_top_crm)
+        vg_lid = _get_crm_lid_vgrid(vgrid, kl)
+        thm_up0 = mean_2d(crm.theta_m[kl:])
+        qn_up0 = mean_2d(crm.q_n[kl:])
+        qp_up0 = mean_2d(crm.q_p[kl:])
+        u_up0 = mean_2d(crm.u[kl:])
+        v_up0 = mean_2d(crm.v[kl:])
+
+        w_low = crm.w[: kl + 1].contiguous()
+        w_low[-1].zero_()
+        sub_crm = CRMState(
+            rho_d=crm.rho_d[:kl].contiguous(),
+            u=crm.u[:kl].contiguous(),
+            v=crm.v[:kl].contiguous(),
+            w=w_low,
+            theta_m=crm.theta_m[:kl].contiguous(),
+            q_n=crm.q_n[:kl].contiguous(),
+            q_p=crm.q_p[:kl].contiguous(),
+            q_v=crm.q_v[:kl].contiguous(),
+            q_c=crm.q_c[:kl].contiguous(),
+            q_i=crm.q_i[:kl].contiguous(),
+            qke=crm.qke[:kl].contiguous(),
+            dx=crm.dx,
+            dy=crm.dy,
+            f_coriolis=crm.f_coriolis,
+            n_c=crm.n_c[:kl].contiguous() if crm.n_c is not None else None,
+            n_i=crm.n_i[:kl].contiguous() if crm.n_i is not None else None,
+            q_r=crm.q_r[:kl].contiguous() if crm.q_r is not None else None,
+            q_s=crm.q_s[:kl].contiguous() if crm.q_s is not None else None,
+            q_g=crm.q_g[:kl].contiguous() if crm.q_g is not None else None,
+            n_r=crm.n_r[:kl].contiguous() if crm.n_r is not None else None,
+            n_s=crm.n_s[:kl].contiguous() if crm.n_s is not None else None,
+            n_g=crm.n_g[:kl].contiguous() if crm.n_g is not None else None,
+        )
+        sp_low = step_crm_physics_and_dynamics(
+            crm=sub_crm,
+            vgrid=vg_lid,
+            dt_crm=dt_crm,
+            n_dyn_substeps=n_dyn_substeps,
+            u_host_target=u_host_target[:kl].contiguous() if u_host_target is not None else None,
+            v_host_target=v_host_target[:kl].contiguous() if v_host_target is not None else None,
+            tau_sp_mom=tau_sp_mom,
+            dtheta_m_ls_dt=dtheta_m_ls_dt[:kl].contiguous() if dtheta_m_ls_dt is not None else None,
+            dq_n_ls_dt=dq_n_ls_dt[:kl].contiguous() if dq_n_ls_dt is not None else None,
+            sfc_fluxes=sfc_fluxes,
+            rad_heating_k_s=rad_heating_k_s[:kl].contiguous() if rad_heating_k_s is not None else None,
+            z_c_col=z_c_col[:kl].contiguous() if z_c_col is not None else None,
+            z_w_col=z_w_col[: kl + 1].contiguous() if z_w_col is not None else None,
+            dz_c_col=dz_c_col[:kl].contiguous() if dz_c_col is not None else None,
+            microphysics_scheme=microphysics_scheme,
+            is_ocean_sub=is_ocean_sub,
+            u_sfc_sub=u_sfc_sub,
+            q_dust_sub=q_dust_sub[:kl].contiguous() if q_dust_sub is not None else None,
+            k_top_crm=None,
+        )
+        # Advance quiescent upper stratosphere/mesosphere [kl:nz] with exact radiative & host forcing
+        thm_up = crm.theta_m[kl:]
+        qn_up = crm.q_n[kl:]
+        qv_up = crm.q_v[kl:]
+        qc_up = crm.q_c[kl:]
+        qi_up = crm.q_i[kl:]
+        u_up = crm.u[kl:]
+        v_up = crm.v[kl:]
+        if dtheta_m_ls_dt is not None:
+            thm_up = thm_up + dt_crm * dtheta_m_ls_dt[kl:].view(nz - kl, n_col, 1, 1)
+        if dq_n_ls_dt is not None:
+            qn_up = torch.clamp(qn_up + dt_crm * dq_n_ls_dt[kl:].view(nz - kl, n_col, 1, 1), min=0.0)
+            q_cond_up = torch.minimum(qc_up + qi_up, qn_up)
+            qv_up = torch.clamp(qn_up - q_cond_up, min=0.0)
+        if rad_heating_k_s is not None:
+            _, exner_up, _ = diagnose_pressure_temperature(crm.rho_d[kl:], thm_up, qv_up)
+            rad_up = rad_heating_k_s[kl:].view(nz - kl, n_col, 1, 1) if rad_heating_k_s.ndim == 2 else rad_heating_k_s[kl:]
+            thm_up = thm_up + dt_crm * rad_up * (1.0 + C.RV_OVER_RD * qv_up) / exner_up
+        if u_host_target is not None and v_host_target is not None:
+            alpha_m = -math.expm1(-dt_crm / max(tau_sp_mom, 1.0e-6))
+            u_up = u_up + alpha_m * (u_host_target[kl:].view(nz - kl, n_col, 1, 1) - mean_2d(u_up, keepdim=True))
+            v_up = v_up + alpha_m * (v_host_target[kl:].view(nz - kl, n_col, 1, 1) - mean_2d(v_up, keepdim=True))
+
+        # Write updated lower CRM + upper quiescent lid back onto crm in-place
+        crm.rho_d[:kl].copy_(sub_crm.rho_d)
+        crm.u[:kl].copy_(sub_crm.u)
+        crm.u[kl:].copy_(u_up)
+        crm.v[:kl].copy_(sub_crm.v)
+        crm.v[kl:].copy_(v_up)
+        crm.w[: kl + 1].copy_(sub_crm.w)
+        crm.w[kl + 1 :].zero_()
+        crm.theta_m[:kl].copy_(sub_crm.theta_m)
+        crm.theta_m[kl:].copy_(thm_up)
+        crm.q_n[:kl].copy_(sub_crm.q_n)
+        crm.q_n[kl:].copy_(qn_up)
+        crm.q_p[:kl].copy_(sub_crm.q_p)
+        crm.q_v[:kl].copy_(sub_crm.q_v)
+        crm.q_v[kl:].copy_(qv_up)
+        crm.q_c[:kl].copy_(sub_crm.q_c)
+        crm.q_i[:kl].copy_(sub_crm.q_i)
+        crm.qke[:kl].copy_(sub_crm.qke)
+        for _oa in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
+            _sf = getattr(sub_crm, _oa, None)
+            if _sf is not None:
+                _df = getattr(crm, _oa, None)
+                if _df is None:
+                    _df = torch.zeros_like(crm.q_c)
+                    setattr(crm, _oa, _df)
+                _df[:kl].copy_(_sf)
+
+        inv_dt = 1.0 / max(dt_crm, 1.0e-6)
+        return SPTendencies(
+            dtheta_m_dt=torch.cat([sp_low.dtheta_m_dt, (mean_2d(thm_up) - thm_up0) * inv_dt], dim=0),
+            dq_n_dt=torch.cat([sp_low.dq_n_dt, (mean_2d(qn_up) - qn_up0) * inv_dt], dim=0),
+            dq_p_dt=torch.cat([sp_low.dq_p_dt, (mean_2d(crm.q_p[kl:]) - qp_up0) * inv_dt], dim=0),
+            du_dt=torch.cat([sp_low.du_dt, (mean_2d(u_up) - u_up0) * inv_dt], dim=0),
+            dv_dt=torch.cat([sp_low.dv_dt, (mean_2d(v_up) - v_up0) * inv_dt], dim=0),
+            precip_rain=sp_low.precip_rain,
+            precip_snow=sp_low.precip_snow,
+            precip_rain_sub=sp_low.precip_rain_sub,
+            precip_snow_sub=sp_low.precip_snow_sub,
+        )
     m_sub = n_col * ny * nx
     mp_key = str(microphysics_scheme).strip().lower()
     use_6c_mp = mp_key == "six_class_2m"

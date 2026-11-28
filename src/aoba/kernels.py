@@ -45,6 +45,7 @@ from aoba.kernels_extra import (
     run_crm_microphysics_metal,
     run_crm_mynn_metal,
     run_crm_sgs_metal,
+    run_scvt_biharmonic_visc_metal,
     run_scvt_div_metal,
     run_scvt_fast_acoustic_metal,
     run_scvt_scalar_lap_metal,
@@ -1408,10 +1409,32 @@ def dispatch_scvt_vorticity_metal(mesh: Any, u_edge: torch.Tensor) -> torch.Tens
     return run_scvt_vorticity_metal(lib, mesh, u_edge)
 
 
-def dispatch_scvt_vec_lap_metal(mesh: Any, u_edge: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def dispatch_scvt_vec_lap_metal(
+    mesh: Any, u_edge: torch.Tensor, *, return_div: bool = False,
+) -> tuple[torch.Tensor, ...]:
     lib = _get_gpu_lib(u_edge.device)
     assert lib is not None
-    return run_scvt_vec_lap_metal(lib, mesh, u_edge)
+    return run_scvt_vec_lap_metal(lib, mesh, u_edge, return_div=return_div)
+
+
+def dispatch_scvt_biharmonic_visc_metal(
+    mesh: Any,
+    grad_div_u0: torch.Tensor,
+    lap4_u_nd: torch.Tensor,
+    lap2_div_nd: torch.Tensor,
+    m0: torch.Tensor,
+    lap2_th_nd: torch.Tensor,
+    c_div_dx2: float,
+    c4_u: float,
+    c4_div_dx2: float,
+    c4_s_dx2: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(grad_div_u0.device)
+    assert lib is not None
+    return run_scvt_biharmonic_visc_metal(
+        lib, mesh, grad_div_u0, lap4_u_nd, lap2_div_nd, m0, lap2_th_nd,
+        c_div_dx2, c4_u, c4_div_dx2, c4_s_dx2,
+    )
 
 
 def dispatch_scvt_scalar_lap_metal(mesh: Any, phi_cell: torch.Tensor) -> torch.Tensor:

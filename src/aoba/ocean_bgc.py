@@ -898,6 +898,9 @@ def step_ocean_bgc_flexpft(
         if dev.type == "cuda":
             _vram_gb = float(torch.cuda.get_device_properties(dev).total_memory) / 1.0e9
             bgc_batch = 4 if (_vram_gb >= 20.0 or nc * nzo <= 3_500_000) else 2
+        elif dev.type == "mps":
+            _mps_gb = float(torch.mps.recommended_max_working_set_size()) / 1.0e9 if hasattr(torch.mps, "recommended_max_working_set_size") else 0.0
+            bgc_batch = 4 if (_mps_gb >= 20.0 or nc * nzo <= 3_500_000) else 2
         else:
             bgc_batch = 4 if (nc * nzo <= 3_500_000) else 2
         znl_k = f"bgc_zero_nl_{bgc_batch}"

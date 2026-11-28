@@ -447,17 +447,40 @@ def _sync_host_surface_from_subgrid(
     nc: int,
     n_sub: int,
 ) -> None:
-    """Mirror subcolumn MAML means (`sfc_sub`) back to host `[nc]` summary state (`sfc_host`)."""
-    for attr in sfc_host.__dataclass_fields__:
-        if attr == "bio":
-            continue
-        val = getattr(sfc_sub, attr)
-        if isinstance(val, torch.Tensor) and val.is_floating_point():
-            setattr(sfc_host, attr, _sub_to_cell(val, nc, n_sub))
-    for attr in sfc_host.bio.__dataclass_fields__:
-        val = getattr(sfc_sub.bio, attr)
-        if isinstance(val, torch.Tensor) and val.is_floating_point():
-            setattr(sfc_host.bio, attr, _sub_to_cell(val, nc, n_sub))
+    """Mirror subcolumn MAML means (`sfc_sub`) back to host `[nc]` summary state (`sfc_host`).
+
+    Batches all 1D `[nc*n_sub]` and 2D `[k, nc*n_sub]` float32 fields into at most 2 GPU reductions
+    instead of ~85 per-field Python kernel launches.
+    """
+    m_sub = nc * n_sub
+    t1_list: list[torch.Tensor] = []
+    t1_dst: list[tuple[object, str]] = []
+    t2_list: list[torch.Tensor] = []
+    t2_meta: list[tuple[object, str, int]] = []
+    for dst_obj, src_obj in ((sfc_host, sfc_sub), (sfc_host.bio, sfc_sub.bio)):
+        for attr in dst_obj.__dataclass_fields__:
+            if dst_obj is sfc_host and attr == "bio":
+                continue
+            val = getattr(src_obj, attr)
+            if isinstance(val, torch.Tensor) and val.is_floating_point():
+                if val.ndim == 1 and val.shape[0] == m_sub and val.dtype == torch.float32:
+                    t1_list.append(val)
+                    t1_dst.append((dst_obj, attr))
+                elif val.ndim == 2 and val.shape[1] == m_sub and val.dtype == torch.float32:
+                    t2_list.append(val)
+                    t2_meta.append((dst_obj, attr, int(val.shape[0])))
+                else:
+                    setattr(dst_obj, attr, _sub_to_cell(val, nc, n_sub))
+    if t1_list:
+        m1 = torch.stack(t1_list, dim=0).view(len(t1_list), nc, n_sub).mean(dim=-1)
+        for i, (dst_obj, attr) in enumerate(t1_dst):
+            setattr(dst_obj, attr, m1[i])
+    if t2_list:
+        m2 = torch.cat(t2_list, dim=0).view(-1, nc, n_sub).mean(dim=-1)
+        off = 0
+        for dst_obj, attr, rows in t2_meta:
+            setattr(dst_obj, attr, m2[off : off + rows])
+            off += rows
 
 
 def broadcast_host_surface_to_subgrid(model: AOBAState) -> None:
@@ -2769,7 +2792,9 @@ def step_aoba_model(
         dc_min = float(mesh.dc_edge.min().item())
         setattr(mesh, "_dc_edge_min_m", dc_min)
     u_cfl_ref = 160.0 if float(cfg.z_top) >= 68000.0 else 100.0
-    dt_adv_host = min(900.0, 0.40 * dc_min / u_cfl_ref)
+    # WS-RK3 advective CFL limit on Voronoi C-grids is ~0.85; 0.60 keeps ample safety margin
+    # even at peak 160 m/s mesospheric jets while internal HEVI acoustic n_ac preserves dt_ac <= 45 s.
+    dt_adv_host = min(900.0, 0.60 * dc_min / u_cfl_ref)
     n_hdyn = max(cfg.n_host_dyn_substeps, int(math.ceil(dt / max(dt_adv_host, 1.0))))
     dt_hdyn = dt / float(n_hdyn)
 
@@ -2901,6 +2926,20 @@ def step_aoba_model(
     rain_new_sub = torch.zeros_like(pres_sfc_sub)
     snow_new_sub = torch.zeros_like(pres_sfc_sub)
     q_rad_4d = q_rad_sub.reshape(nz, nc, ny, nx)
+
+    # High-top Superparameterization CRM lid (~28 km): when host atmosphere reaches >36 km
+    # (stratopause/mesosphere), restrict embedded 2 km CRM dynamics/microphysics to 0..~28 km
+    # (~10 km above deepest tropical overshooting tops) so mesospheric jets do not inflate CRM CFL.
+    k_top_crm_sp: int | None = model.rad_cache.get("_k_top_crm_sp")
+    if k_top_crm_sp is None and "_k_top_crm_sp" not in model.rad_cache:
+        if bool(cfg.enable_superparam) and float(vgrid.z_top) > 36000.0:
+            zw_cpu = vgrid.zeta_w.detach().cpu()
+            idx_lid = torch.nonzero(zw_cpu >= 28000.0, as_tuple=False)
+            k_cand = int(idx_lid[0].item()) if int(idx_lid.numel()) > 0 else nz
+            k_top_crm_sp = k_cand if 24 <= k_cand < nz else None
+        else:
+            k_top_crm_sp = None
+        model.rad_cache["_k_top_crm_sp"] = k_top_crm_sp
 
     by_full = ny_full // max(ny_t, 1)
     bx_full = nx_full // max(nx_t, 1)
@@ -3175,6 +3214,7 @@ def step_aoba_model(
                     is_ocean_sub=_tile3d_to_crm3d(is_ocn_tile[t_idx], to_full=True),
                     u_sfc_sub=_tile3d_to_crm3d(u_sfc_tile[t_idx], to_full=True),
                     q_dust_sub=q_dust_t_in,
+                    k_top_crm=k_top_crm_sp,
                 )
                 if n_t < pool.n_pool:
                     pool.crm.rho_d[:, :n_t] = sub_crm_t.rho_d
@@ -3249,6 +3289,7 @@ def step_aoba_model(
                     is_ocean_sub=_tile3d_to_crm3d(is_ocn_tile[t_idx]),
                     u_sfc_sub=_tile3d_to_crm3d(u_sfc_tile[t_idx]),
                     q_dust_sub=q_dust_4d[:, t_idx] if q_dust_4d is not None else None,
+                    k_top_crm=k_top_crm_sp,
                 )
                 for opt_attr in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
                     src_f = getattr(sub_crm_t, opt_attr, None)
@@ -3661,6 +3702,7 @@ def step_aoba_model(
                 is_ocean_sub=is_ocn_tile,
                 u_sfc_sub=u_sfc_tile,
                 q_dust_sub=q_dust_4d,
+                k_top_crm=k_top_crm_sp,
             )
             rho_crm_mean = mean_2d(crm.rho_d)
             inv_rho_crm = 1.0 / torch.clamp(rho_crm_mean, min=1.0e-8)
@@ -3732,6 +3774,7 @@ def step_aoba_model(
                     is_ocean_sub=_tile3d_to_crm3d(is_ocn_tile[sl]),
                     u_sfc_sub=_tile3d_to_crm3d(u_sfc_tile[sl]),
                     q_dust_sub=q_dust_4d[:, sl] if q_dust_4d is not None else None,
+                    k_top_crm=k_top_crm_sp,
                 )
                 crm.rho_d[:, sl] = sub_crm.rho_d
                 crm.u[:, sl] = sub_crm.u

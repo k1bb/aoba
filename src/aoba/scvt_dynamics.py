@@ -33,6 +33,7 @@ from aoba import constants as C
 from aoba.kernels import (
     can_use_crm_metal,
     can_use_elem_metal,
+    dispatch_scvt_biharmonic_visc_metal,
     dispatch_scvt_div_metal,
     dispatch_scvt_fast_acoustic_metal,
     dispatch_scvt_fct_advect_metal,
@@ -822,10 +823,18 @@ def _step_scvt_rk3_hevi_impl(
     area_c = mesh.area_cell.unsqueeze(0)      # [1, N_cells]
 
     dz_c = state.dz_c                         # [Nz, N_cells]
-    dz_c_e = 0.5 * (dz_c[:, c0] + dz_c[:, c1])
-    dz_w_int = state.z_c[1:] - state.z_c[:-1] # [Nz-1, N_cells]
-    dz_w_e = 0.5 * (dz_w_int[:, c0] + dz_w_int[:, c1])
-    slope_z_e = (state.z_c[:, c1] - state.z_c[:, c0]) / dc_e  # Terrain coordinate slope (dz/dx)_zeta
+    # Cache static terrain-following edge metrics on mesh (eliminates ~350 MB/step of repeated gathers,
+    # and persists across CUDA-Graph wrapper GlobalAtmosState instances!)
+    _st_key = (state.z_c.data_ptr(), state.z_w.data_ptr(), mesh.cells_on_edge.data_ptr(), u0_dtype := state.u_edge.dtype)
+    _st_cache = getattr(mesh, "_scvt_metric_cache", None)
+    if _st_cache is None or _st_cache[0] != _st_key:
+        _dz_w_int = (state.z_c[1:] - state.z_c[:-1]).contiguous()
+        _dz_w_e = (0.5 * (_dz_w_int[:, c0] + _dz_w_int[:, c1])).contiguous()
+        _zw_slope_e = ((state.z_w[1:-1, c1] - state.z_w[1:-1, c0]) / dc_e).contiguous()
+        _valid_ce = (mesh.edge_sign_on_cell != 0.0).to(u0_dtype).contiguous()
+        _st_cache = (_st_key, _dz_w_int, _dz_w_e, _zw_slope_e, _valid_ce)
+        setattr(mesh, "_scvt_metric_cache", _st_cache)
+    _, dz_w_int, dz_w_e, zw_slope_e, valid_ce = _st_cache
 
     sponge_w = vgrid.sponge_w[1:-1].unsqueeze(1)
     sponge_c = vgrid.sponge_c.unsqueeze(1)
@@ -849,19 +858,30 @@ def _step_scvt_rk3_hevi_impl(
 
     # Scale-normalized O(1) biharmonic operators (dx2 * del^2) prevent float32 underflow/overflow
     # across arbitrary planetary radii and mesh resolutions (Glevel-2 .. Glevel-11).
-    lap2_u0, grad_div_u0 = compute_vector_laplacian_edge(mesh, state.u_edge)
-    lap2_u_nd = dx2 * lap2_u0
-    lap4_u_nd = dx2 * compute_vector_laplacian_edge(mesh, lap2_u_nd)[0]
-    div_u0 = compute_scvt_divergence(mesh, state.u_edge)
-    lap2_div_nd = dx2 * compute_scalar_laplacian_cell(mesh, div_u0)
-    grad_lap2_div_nd = dx2 * ((lap2_div_nd[:, c1] - lap2_div_nd[:, c0]) / dc_e)
-    visc_u = (c_div * dx2) * grad_div_u0 - c4_u * lap4_u_nd - c4_div * grad_lap2_div_nd
-
     m0 = state.rho_d * dz_c                   # Coupled dry mass [Nz, N_cells] [kg m^-2]
-    m0_e = 0.5 * (m0[:, c0] + m0[:, c1])
-    lap2_th_nd = dx2 * compute_scalar_laplacian_cell(mesh, state.theta_m)
-    flx_th4 = (c4_s * dx2) * m0_e * ((lap2_th_nd[:, c1] - lap2_th_nd[:, c0]) / dc_e)
-    visc_Thm = -compute_scvt_divergence(mesh, flx_th4)
+    if _can_use_scvt_metal(state.u_edge):
+        lap2_u0, grad_div_u0, div_u0 = dispatch_scvt_vec_lap_metal(mesh, state.u_edge, return_div=True)
+        lap2_u_nd = dx2 * lap2_u0
+        lap4_u_nd = dx2 * dispatch_scvt_vec_lap_metal(mesh, lap2_u_nd)[0]
+        lap2_div_nd = dx2 * dispatch_scvt_scalar_lap_metal(mesh, div_u0)
+        lap2_th_nd = dx2 * dispatch_scvt_scalar_lap_metal(mesh, state.theta_m)
+        visc_u, flx_th4 = dispatch_scvt_biharmonic_visc_metal(
+            mesh, grad_div_u0, lap4_u_nd, lap2_div_nd, m0, lap2_th_nd,
+            c_div * dx2, c4_u, c4_div * dx2, c4_s * dx2,
+        )
+        visc_Thm = -dispatch_scvt_div_metal(mesh, flx_th4)
+    else:
+        lap2_u0, grad_div_u0 = compute_vector_laplacian_edge(mesh, state.u_edge)
+        lap2_u_nd = dx2 * lap2_u0
+        lap4_u_nd = dx2 * compute_vector_laplacian_edge(mesh, lap2_u_nd)[0]
+        div_u0 = compute_scvt_divergence(mesh, state.u_edge)
+        lap2_div_nd = dx2 * compute_scalar_laplacian_cell(mesh, div_u0)
+        grad_lap2_div_nd = dx2 * ((lap2_div_nd[:, c1] - lap2_div_nd[:, c0]) / dc_e)
+        visc_u = (c_div * dx2) * grad_div_u0 - c4_u * lap4_u_nd - c4_div * grad_lap2_div_nd
+        m0_e = 0.5 * (m0[:, c0] + m0[:, c1])
+        lap2_th_nd = dx2 * compute_scalar_laplacian_cell(mesh, state.theta_m)
+        flx_th4 = (c4_s * dx2) * m0_e * ((lap2_th_nd[:, c1] - lap2_th_nd[:, c0]) / dc_e)
+        visc_Thm = -compute_scvt_divergence(mesh, flx_th4)
 
     Thm0 = m0 * state.theta_m                 # Coupled Theta_m [Nz, N_cells] [kg K m^-2]
     u0 = state.u_edge
@@ -873,16 +893,14 @@ def _step_scvt_rk3_hevi_impl(
     u_s = u0
     w_s = w0
 
-    uh_final = torch.zeros_like(u0)
-    om_final = torch.zeros_like(w0)
+    uh_final = u0
+    om_final = w0
     gamma = C.GAMMA_D
 
     du_ext = du_phys_edge if du_phys_edge is not None else torch.zeros_like(u0)
     dThm_ext = (m0 * dtheta_m_phys) if dtheta_m_phys is not None else torch.zeros_like(Thm0)
 
     # Precompute stage-invariant edge/cell stencil views
-    zw_slope_e = (state.z_w[1:-1, c1] - state.z_w[1:-1, c0]) / dc_e
-    valid_ce = (mesh.edge_sign_on_cell != 0.0).to(u0.dtype)
     v0_e = mesh.verts_on_edge[:, 0]
     v1_e = mesh.verts_on_edge[:, 1]
     ep_idx = mesh.trisk_edges

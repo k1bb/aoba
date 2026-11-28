@@ -4427,6 +4427,38 @@ kernel void scvt_scalar_grad_edge(
     grad_out[gid] = (phi_c[cbase + uint(c1_arr[e])] - phi_c[cbase + uint(c0_arr[e])]) * inv_dc[e];
 }
 
+kernel void scvt_biharmonic_visc_edge(
+    device const int* c0_arr       [[buffer(0)]],   // [N_edges]
+    device const int* c1_arr       [[buffer(1)]],   // [N_edges]
+    device const float* inv_dc     [[buffer(2)]],   // [N_edges]
+    device const float* grad_div   [[buffer(3)]],   // [nz, N_edges]
+    device const float* lap4_u_nd  [[buffer(4)]],   // [nz, N_edges]
+    device const float* lap2_div   [[buffer(5)]],   // [nz, N_cells] (dx2 * del^2 div_u)
+    device const float* m0         [[buffer(6)]],   // [nz, N_cells]
+    device const float* lap2_th    [[buffer(7)]],   // [nz, N_cells] (dx2 * del^2 theta_m)
+    device float* visc_u_out       [[buffer(8)]],   // [nz, N_edges]
+    device float* flx_th4_out      [[buffer(9)]],   // [nz, N_edges]
+    device const uint* u_params    [[buffer(10)]],  // [nz, N_cells, N_edges]
+    constant float4& f_p           [[buffer(11)]],  // [c_div*dx2, c4_u, c4_div*dx2, c4_s*dx2]
+    uint gid [[thread_position_in_grid]])
+{
+    uint nz = u_params[0];
+    uint n_cells = u_params[1];
+    uint n_edges = u_params[2];
+    if (gid >= nz * n_edges) return;
+    uint k = gid / n_edges;
+    uint e = gid - k * n_edges;
+    uint c0 = uint(c0_arr[e]);
+    uint c1 = uint(c1_arr[e]);
+    uint cb = k * n_cells;
+    float idc = inv_dc[e];
+    float g_l2div = (lap2_div[cb + c1] - lap2_div[cb + c0]) * idc;
+    visc_u_out[gid] = f_p.x * grad_div[gid] - f_p.y * lap4_u_nd[gid] - f_p.z * g_l2div;
+    float m0_e = 0.5f * (m0[cb + c0] + m0[cb + c1]);
+    float g_l2th = (lap2_th[cb + c1] - lap2_th[cb + c0]) * idc;
+    flx_th4_out[gid] = f_p.w * m0_e * g_l2th;
+}
+
 kernel void scvt_eta_edge(
     device const int* v0_arr       [[buffer(0)]],   // [N_edges]
     device const int* v1_arr       [[buffer(1)]],   // [N_edges]
@@ -5328,7 +5360,9 @@ def run_scvt_vorticity_metal(lib: Any, mesh: Any, u_edge: torch.Tensor) -> torch
     return out
 
 
-def run_scvt_vec_lap_metal(lib: Any, mesh: Any, u_edge: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def run_scvt_vec_lap_metal(
+    lib: Any, mesh: Any, u_edge: torch.Tensor, *, return_div: bool = False,
+) -> tuple[torch.Tensor, ...]:
     mc = _get_scvt_mesh_cache(mesh)
     nz = u_edge.shape[0]
     ne = mc["n_edges"]
@@ -5341,7 +5375,40 @@ def run_scvt_vec_lap_metal(lib: Any, mesh: Any, u_edge: torch.Tensor) -> tuple[t
         mc["c0"], mc["c1"], mc["v0"], mc["v1"], mc["inv_dc"], mc["inv_dv"],
         div_c, zeta_v, lap, gd, up, threads=nz * ne,
     )
+    if return_div:
+        return lap, gd, div_c
     return lap, gd
+
+
+def run_scvt_biharmonic_visc_metal(
+    lib: Any,
+    mesh: Any,
+    grad_div_u0: torch.Tensor,
+    lap4_u_nd: torch.Tensor,
+    lap2_div_nd: torch.Tensor,
+    m0: torch.Tensor,
+    lap2_th_nd: torch.Tensor,
+    c_div_dx2: float,
+    c4_u: float,
+    c4_div_dx2: float,
+    c4_s_dx2: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused edge-gather hyperviscosity (`visc_u`, `flx_th4`) eliminating 6 eager `[nz, N_edges]` tensors."""
+    mc = _get_scvt_mesh_cache(mesh)
+    nz = grad_div_u0.shape[0]
+    ne = mc["n_edges"]
+    dev = grad_div_u0.device
+    visc_u = torch.empty((nz, ne), device=dev, dtype=torch.float32)
+    flx_th4 = torch.empty((nz, ne), device=dev, dtype=torch.float32)
+    up = _scvt_u_param(mc, ("sgrad", nz), [nz, mc["n_cells"], ne], dev)
+    lib.scvt_biharmonic_visc_edge(
+        mc["c0"], mc["c1"], mc["inv_dc"],
+        grad_div_u0.contiguous(), lap4_u_nd.contiguous(),
+        lap2_div_nd.contiguous(), m0.contiguous(), lap2_th_nd.contiguous(),
+        visc_u, flx_th4, up, [float(c_div_dx2), float(c4_u), float(c4_div_dx2), float(c4_s_dx2)],
+        threads=nz * ne,
+    )
+    return visc_u, flx_th4
 
 
 def run_scvt_scalar_lap_metal(lib: Any, mesh: Any, phi_cell: torch.Tensor) -> torch.Tensor:
