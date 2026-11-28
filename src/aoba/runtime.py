@@ -305,6 +305,19 @@ _CUDA_COMPILED_FN_CACHE: dict[int, object] = {}
 _CUDA_GRAPH_CACHE: dict[tuple, dict[str, object]] = {}
 _CUDA_GRAPH_POOL: object | None = None
 _CUDA_GRAPH_TRAIN_POOL: object | None = None
+_OUTER_CUDA_GRAPH_DEPTH: int = 0
+
+
+class outer_cuda_graph_region:
+    """Suppress nested inner CUDA Graph capture/replay while capturing a parent super-graph."""
+
+    def __enter__(self) -> None:
+        global _OUTER_CUDA_GRAPH_DEPTH
+        _OUTER_CUDA_GRAPH_DEPTH += 1
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        global _OUTER_CUDA_GRAPH_DEPTH
+        _OUTER_CUDA_GRAPH_DEPTH = max(_OUTER_CUDA_GRAPH_DEPTH - 1, 0)
 
 
 def clear_cuda_graph_cache() -> None:
@@ -317,12 +330,16 @@ def clear_cuda_graph_cache() -> None:
         torch.cuda.synchronize()
 
 
-def can_use_cuda_graph(device: torch.device | str | None) -> bool:
+def can_use_cuda_graph(device: torch.device | torch.Tensor | str | None) -> bool:
     """Return True when PyTorch CUDA Graph capture/replay is safe and enabled."""
+    if _OUTER_CUDA_GRAPH_DEPTH > 0:
+        return False
     if os.environ.get("AOBA_DISABLE_CUDA_GRAPH", "0").strip().lower() in ("1", "true", "yes"):
         return False
     if device is None:
         return False
+    if isinstance(device, torch.Tensor):
+        device = device.device
     dev_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
     return dev_type == "cuda" and torch.cuda.is_available()
 
@@ -334,12 +351,15 @@ def run_cuda_graph_cached(
     *,
     warmup_calls: int = 2,
     clone_outputs: bool = True,
+    suppress_inner_graphs: bool = False,
 ) -> list[torch.Tensor]:
     """Execute `body_fn(inputs) -> list[Tensor]` via a lazily captured static CUDA Graph.
 
     Runs `warmup_calls` eager invocations first so all `torch.compile` Inductor kernels,
     workspace caches, and cuBLAS handles are fully populated prior to stream capture.
-    Falls back transparently to eager execution if capture is unsupported for the inputs.
+    When `suppress_inner_graphs=True`, nested `can_use_cuda_graph()` calls inside `body_fn`
+    are flattened directly into this outer super-graph. Falls back transparently to eager
+    execution if capture is unsupported for the inputs.
     """
     global _CUDA_GRAPH_POOL
     if any(t.requires_grad for t in live_inputs):
@@ -356,6 +376,9 @@ def run_cuda_graph_cached(
         seen = int(slot["seen"])
         if seen < warmup_calls:
             slot["seen"] = seen + 1
+            if suppress_inner_graphs:
+                with outer_cuda_graph_region():
+                    return body_fn(live_inputs)
             return body_fn(live_inputs)
         # Capture on a dedicated side stream using static cloned input buffers
         try:
@@ -367,13 +390,22 @@ def run_cuda_graph_cached(
                 cap_stream = torch.cuda.Stream()
                 cap_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(cap_stream):
-                    # One stream-local warmup on cloned tensors so static_in stays pristine
-                    _tmp_in = [t.clone() for t in static_in]
-                    _ = body_fn(_tmp_in)
-                    del _tmp_in
-                    g = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g, pool=_CUDA_GRAPH_POOL):
-                        static_out = body_fn(static_in)
+                    if suppress_inner_graphs:
+                        with outer_cuda_graph_region():
+                            # One stream-local warmup on cloned tensors so static_in stays pristine
+                            _tmp_in = [t.clone() for t in static_in]
+                            _ = body_fn(_tmp_in)
+                            del _tmp_in
+                            g = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(g, pool=_CUDA_GRAPH_POOL):
+                                static_out = body_fn(static_in)
+                    else:
+                        _tmp_in = [t.clone() for t in static_in]
+                        _ = body_fn(_tmp_in)
+                        del _tmp_in
+                        g = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g, pool=_CUDA_GRAPH_POOL):
+                            static_out = body_fn(static_in)
                 torch.cuda.current_stream().wait_stream(cap_stream)
                 slot["graph"] = g
                 slot["static_in"] = static_in
@@ -390,7 +422,8 @@ def run_cuda_graph_cached(
     static_out = slot["static_out"]
     with torch.no_grad():
         for dst, src in zip(static_in, live_inputs):
-            dst.copy_(src)
+            if dst.data_ptr() != src.data_ptr():
+                dst.copy_(src)
         slot["graph"].replay()
         return [t.clone() for t in static_out] if clone_outputs else list(static_out)
 

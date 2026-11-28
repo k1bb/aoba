@@ -40,6 +40,7 @@ import math
 import torch
 
 from aoba import constants as C
+from aoba.runtime import maybe_cuda_compile
 
 
 # Fundamental physical constants for mesospheric electrodynamics & optical emission
@@ -263,6 +264,170 @@ def compute_sprite_vertical_profile(
     }
 
 
+def _compute_red_sprites_core(
+    flash_cg_cell: torch.Tensor,
+    cold_cloud_km_cell: torch.Tensor,
+    mu0_cell: torch.Tensor,
+    rho_host: torch.Tensor,
+    temp_top: torch.Tensor,
+    q_i_host: torch.Tensor,
+    q_p_host: torch.Tensor,
+    z_c_host: torch.Tensor,
+    dz_c_host: torch.Tensor,
+    z_q_km_in: torch.Tensor,
+    f_pos_cg_explicit: torch.Tensor,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+]:
+    dev = rho_host.device
+    dtype = rho_host.dtype
+    nz = int(rho_host.shape[0])
+    z_meso_km = (
+        Z_MESO_MIN_KM + Z_MESO_DZ_KM * torch.arange(N_MESO_LEVELS, device=dev, dtype=dtype)
+    ).unsqueeze(1)  # [26, 1]
+    z_c_km = z_c_host * 1.0e-3  # [Nz, nc]
+    rho_top = rho_host[-1]
+    z_top_km = z_c_km[-1]
+
+    n_air_ext, _, _ = compute_mesospheric_conductivity_and_density(
+        z_meso_km, mu0_cell, rho_top, z_top_km, temp_top
+    )
+    z_ref_1d = z_c_km[:, 0].contiguous()
+    idx_hi = torch.clamp(torch.searchsorted(z_ref_1d, z_meso_km[:, 0]), min=1, max=max(nz - 1, 1))
+    idx_lo = idx_hi - 1
+    z_lo = z_c_km[idx_lo]
+    z_hi = z_c_km[idx_hi]
+    w_lin = torch.clamp((z_meso_km - z_lo) / torch.clamp(z_hi - z_lo, min=1.0e-3), 0.0, 1.0)
+    log_rho_res = (1.0 - w_lin) * torch.log(torch.clamp(rho_host[idx_lo], min=1.0e-9)) + w_lin * torch.log(
+        torch.clamp(rho_host[idx_hi], min=1.0e-9)
+    )
+    n_air_res = torch.clamp(torch.exp(log_rho_res) / M_AIR_KG, min=1.0e17, max=N_AIR_STP)
+    inside_model = z_meso_km <= z_top_km.unsqueeze(0)
+    n_air = torch.where(inside_model, n_air_res, n_air_ext)
+
+    day_fac = torch.clamp((mu0_cell + 0.10) / 0.20, 0.0, 1.0).unsqueeze(0)
+    h_prime = H_PRIME_NIGHT_KM * (1.0 - day_fac) + H_PRIME_DAY_KM * day_fac
+    beta = BETA_NIGHT_KM1 * (1.0 - day_fac) + BETA_DAY_KM1 * day_fac
+    n_e = torch.clamp(
+        1.43e13 * torch.exp(-0.15 * h_prime + torch.clamp((beta - 0.15) * (z_meso_km - h_prime), min=-40.0, max=25.0)),
+        min=1.0e3,
+        max=1.0e11,
+    )
+    mu_e = MU_E_STP * (N_AIR_STP / n_air)
+    z_ion_eff = torch.clamp(z_meso_km, max=55.0) / 6.0 + torch.clamp(z_meso_km - 55.0, min=0.0) / 16.0
+    sigma_tot = Q_ELECTRON * n_e * mu_e + 5.0e-14 * torch.exp(z_ion_eff)
+    tau_sigma = EPSILON_0 / torch.clamp(sigma_tot, min=1.0e-16)
+    n_ratio = n_air / N_AIR_STP
+    e_k = E_K_STP * n_ratio
+
+    dm = torch.clamp(rho_host * dz_c_host, min=0.0)
+    iwp_cell = (dm * torch.clamp(q_i_host + q_p_host, min=0.0)).sum(dim=0)
+    z_q_km = z_q_km_in
+
+    z_m = z_meso_km * 1.0e3
+    zq_m = (z_q_km * 1.0e3).unsqueeze(0)
+    e_qe_unit = (1.0e3 / (math.pi * EPSILON_0)) * (z_m / torch.clamp(z_m * z_m - zq_m * zq_m, min=1.0e6) ** 2)
+    screen = _dielectric_screening_factor(tau_sigma / TAU_DISCHARGE_S)
+    e_peak_unit = torch.clamp(e_qe_unit * screen, min=1.0e-12)
+
+    cmc_req_prompt_z = e_k / e_peak_unit
+    cmc_req_halo_z = (E_HALO_FRAC * e_k) / e_peak_unit
+    can_detach = tau_sigma >= TAU_DETACH_MIN_S
+    cmc_req_delay_z = torch.where(can_detach, (E_DELAY_FRAC * e_k) / e_peak_unit, cmc_req_prompt_z)
+
+    cmc_crit_prompt, _ = cmc_req_prompt_z.min(dim=0)
+    cmc_crit_delay, k_init_delay = cmc_req_delay_z.min(dim=0)
+    cmc_crit_halo, _ = cmc_req_halo_z.min(dim=0)
+
+    anvil_fac = torch.clamp(iwp_cell / (iwp_cell + 1.5), 0.0, 1.0)
+    cmc_med = 22.0 + 48.0 * anvil_fac
+    sigma_ln = 1.15
+    inv_s2 = 1.0 / (sigma_ln * math.sqrt(2.0))
+
+    f_pos_cg = 0.10 + 0.15 * anvil_fac
+    f_pos_cg = torch.where(f_pos_cg_explicit >= 0.0, 0.5 * f_pos_cg + 0.5 * f_pos_cg_explicit, f_pos_cg)
+    p_prompt = 0.5 * torch.erfc(torch.log(torch.clamp(cmc_crit_prompt / cmc_med, min=1.0e-4)) * inv_s2)
+    p_any_sprite = 0.5 * torch.erfc(torch.log(torch.clamp(cmc_crit_delay / cmc_med, min=1.0e-4)) * inv_s2)
+    p_delay = torch.clamp(p_any_sprite - p_prompt, min=0.0)
+    p_halo = 0.5 * torch.erfc(torch.log(torch.clamp(cmc_crit_halo / cmc_med, min=1.0e-4)) * inv_s2)
+
+    eff_pol_wt = f_pos_cg + 0.12 * (1.0 - f_pos_cg)
+    cg_pos = torch.clamp(flash_cg_cell, min=0.0)
+    sprite_prompt_rate = cg_pos * eff_pol_wt * p_prompt
+    sprite_delayed_rate = cg_pos * eff_pol_wt * p_delay
+    sprite_rate = sprite_prompt_rate + sprite_delayed_rate
+    halo_rate = cg_pos * p_halo
+
+    cmc_99 = cmc_med * math.exp(2.3263 * sigma_ln)
+    e_over_ek_99 = (e_peak_unit * cmc_99.unsqueeze(0)) / torch.clamp(e_k, min=1.0e-6)
+    e_over_ek_max = e_over_ek_99.amax(dim=0)
+
+    has_active = sprite_rate > 1.0e-18
+    z_init_km = torch.where(has_active, z_meso_km[k_init_delay, 0], torch.zeros_like(cmc_med))
+
+    e_peak_99 = e_peak_unit * cmc_99.unsqueeze(0)
+    e_st_pos = E_ST_POS_STP * n_ratio
+    below_init = z_meso_km <= z_init_km.unsqueeze(0)
+    in_streamer = has_active.unsqueeze(0) & below_init & (e_peak_99 >= e_st_pos)
+    z_stop_km = torch.where(
+        in_streamer.any(dim=0),
+        torch.where(in_streamer, z_meso_km, torch.full_like(e_peak_99, 100.0)).amin(dim=0),
+        z_init_km,
+    )
+
+    q_fac_1p = A_EINSTEIN_1PN2 / (A_EINSTEIN_1PN2 + KQ_N2_1PN2 * F_N2_AIR * n_air)
+    q_fac_2p = A_EINSTEIN_2PN2 / (A_EINSTEIN_2PN2 + KQ_O2_2PN2 * F_O2_AIR * n_air)
+    x_exc = torch.clamp(e_over_ek_99, min=0.0, max=4.0)
+    exc_1p = torch.where(x_exc > 0.20, torch.exp(-2.8 / torch.clamp(x_exc, min=0.20)), torch.zeros_like(x_exc))
+    exc_2p = torch.where(x_exc > 0.25, torch.exp(-4.2 / torch.clamp(x_exc, min=0.25)), torch.zeros_like(x_exc))
+    boost = torch.where(in_streamer, torch.full_like(x_exc, 12.0), torch.ones_like(x_exc))
+    red_1pn2_kr = torch.where(has_active, (4.5e3 * boost * exc_1p * q_fac_1p).amax(dim=0), torch.zeros_like(cmc_med))
+    blue_2pn2_kr = torch.where(has_active, (1.8e3 * boost * exc_2p * q_fac_2p).amax(dim=0), torch.zeros_like(cmc_med))
+
+    e_k_ion = e_k[-1]
+    e_emp_thresh = E_ELVES_FRAC * e_k_ion
+    emp_day_atten = torch.exp(-3.2 * day_fac[0])
+    e_emp_per_a = (MU_0_VAC * V_RETURN_STROKE_MS / (2.0 * math.pi * ELVES_RING_RANGE_M)) * ELVES_SIN_THETA * emp_day_atten
+    i_crit_ka = (e_emp_thresh / torch.clamp(e_emp_per_a, min=1.0e-12)) * 1.0e-3
+    i_med_ka = 24.0 + 18.0 * anvil_fac
+    inv_si2 = 1.0 / (I_PEAK_SIGMA_LN * math.sqrt(2.0))
+    p_elves = 0.5 * torch.erfc(torch.log(torch.clamp(i_crit_ka / i_med_ka, min=1.0e-4)) * inv_si2)
+    elves_rate = cg_pos * p_elves
+
+    z_cld_km = torch.clamp(4.0 + 0.85 * torch.clamp(cold_cloud_km_cell, min=0.0, max=16.0), 4.0, 17.5)
+    n_ratio_cld = torch.exp(-z_cld_km / 7.2)
+    overshoot_gate = torch.sigmoid((z_cld_km - 11.5) / 1.2) * anvil_fac
+    e_cld_eff = (cmc_med * 1.0e3 / (2.0 * math.pi * EPSILON_0 * (3.5e3 ** 3))) * overshoot_gate
+    e_st_cld = E_ST_POS_STP * n_ratio_cld
+    bj_ratio = e_cld_eff / torch.clamp(e_st_cld, min=1.0)
+    p_blue_jet = 0.008 * overshoot_gate * 0.5 * torch.erfc(
+        torch.log(torch.clamp(1.8 / torch.clamp(bj_ratio, min=1.0e-4), min=1.0e-4)) * inv_s2
+    )
+    blue_jet_rate = cg_pos * p_blue_jet
+    blue_jet_top_km = torch.where(
+        blue_jet_rate > 1.0e-20,
+        torch.clamp(z_cld_km + 14.0 + 10.0 * torch.tanh(bj_ratio), 24.0, 44.0),
+        torch.zeros_like(z_cld_km),
+    )
+
+    gj_cloud_gate = torch.sigmoid((z_cld_km - 14.2) / 0.85) * (1.0 - 0.85 * day_fac[0])
+    p_gigantic_jet = p_blue_jet * 0.14 * gj_cloud_gate * torch.clamp(p_halo / 0.05, 0.0, 1.5)
+    gigantic_jet_rate = cg_pos * p_gigantic_jet
+
+    len_scale = torch.clamp((z_init_km - z_stop_km) / 25.0, min=0.3, max=2.0)
+    sprite_nox_mol_m2s = (
+        sprite_rate * NOX_MOLECULES_PER_SPRITE * len_scale
+        + gigantic_jet_rate * NOX_MOLECULES_PER_GIGANTIC_JET
+    )
+    return (
+        sprite_rate, sprite_prompt_rate, sprite_delayed_rate, halo_rate, cmc_med,
+        e_over_ek_max, red_1pn2_kr, blue_2pn2_kr, z_init_km, z_stop_km,
+        sprite_nox_mol_m2s, elves_rate, blue_jet_rate, gigantic_jet_rate, blue_jet_top_km,
+    )
+
+
 # AOBA Formulation Eqs. (5.24)-(5.27)
 def compute_red_sprites(
     *,
@@ -279,217 +444,38 @@ def compute_red_sprites(
     area_cell: torch.Tensor,              # [N_cells] Voronoi cell area [m^2]
     explicit_state: object | None = None, # Optional ExplicitLightningState for direct charge-height diagnostics
 ) -> RedSpriteDiagnostics:
-    """Compute global map-free mesospheric red sprite, sprite-halo, optical, & NOx diagnostics.
-
-    Integrates analytically over the heavy-tailed log-normal CG Charge Moment Change (CMC)
-    distribution conditioned on stratiform-anvil ice path and cold-cloud depth, evaluated against
-    the exact Wait-Spies day/night D-region screened QE breakdown, delayed detachment (Luque &
-    Gordillo-Vázquez, 2012), and Ebert et al. (2010) streamer stability thresholds.
-    """
+    """Compute global map-free mesospheric red sprite, sprite-halo, optical, & NOx diagnostics."""
     from aoba.thermodynamics import diagnose_pressure_temperature
 
-    dev = rho_host.device
-    dtype = rho_host.dtype
     nz, nc = rho_host.shape
+    # Only top-level temperature is needed for above-model hydrostatic continuation (64x less work than full 3D!)
+    _, _, temp_top_2d = diagnose_pressure_temperature(rho_host[-1:], theta_m_host[-1:], q_v_host[-1:])
+    temp_top = temp_top_2d[0]
 
-    _, _, temp_host = diagnose_pressure_temperature(rho_host, theta_m_host, q_v_host)
-
-    # 1. Build 26-level mesospheric grid (38..88 km) anchored to AOBA's resolved upper atmosphere.
-    #    In high-top mode (z_top >= 70 km), directly sample AOBA's resolved mesospheric rho(z), T(z)
-    #    so cold summer mesopause vs warm winter mesopause air-density variations couple directly to
-    #    sprite breakdown altitude and downward stopping height (hydrostatic continuation only above z_top).
-    z_meso_km = (
-        Z_MESO_MIN_KM + Z_MESO_DZ_KM * torch.arange(N_MESO_LEVELS, device=dev, dtype=dtype)
-    ).unsqueeze(1)  # [26, 1]
-    z_c_km = z_c_host * 1.0e-3  # [Nz, nc]
-    rho_top = rho_host[-1]
-    z_top_km = z_c_km[-1]
-    temp_top = temp_host[-1]
-
-    n_air_ext, _, tau_sigma = compute_mesospheric_conductivity_and_density(
-        z_meso_km, mu0_cell, rho_top, z_top_km, temp_top
-    )
-    # Vectorized 1D log-density vertical interpolation inside [z_c_km[0], z_c_km[-1]] (zero Python loops!)
-    z_ref_1d = z_c_km[:, 0].contiguous()  # monotone upper-level coordinates (strictly flat above 24 km)
-    idx_hi = torch.clamp(torch.searchsorted(z_ref_1d, z_meso_km[:, 0]), min=1, max=max(nz - 1, 1))
-    idx_lo = idx_hi - 1
-    z_lo = z_c_km[idx_lo]  # [26, nc]
-    z_hi = z_c_km[idx_hi]  # [26, nc]
-    w_lin = torch.clamp((z_meso_km - z_lo) / torch.clamp(z_hi - z_lo, min=1.0e-3), 0.0, 1.0)
-    log_rho_res = (1.0 - w_lin) * torch.log(torch.clamp(rho_host[idx_lo], min=1.0e-9)) + w_lin * torch.log(
-        torch.clamp(rho_host[idx_hi], min=1.0e-9)
-    )
-    n_air_res = torch.clamp(torch.exp(log_rho_res) / M_AIR_KG, min=1.0e17, max=N_AIR_STP)
-    inside_model = z_meso_km <= z_top_km.unsqueeze(0)
-    n_air = torch.where(inside_model, n_air_res, n_air_ext)
-    # Recompute electron mobility & dielectric relaxation time consistently with resolved n_air (zero GPU sync!)
-    day_fac = torch.clamp((mu0_cell + 0.10) / 0.20, 0.0, 1.0).unsqueeze(0)
-    h_prime = H_PRIME_NIGHT_KM * (1.0 - day_fac) + H_PRIME_DAY_KM * day_fac
-    beta = BETA_NIGHT_KM1 * (1.0 - day_fac) + BETA_DAY_KM1 * day_fac
-    n_e = torch.clamp(
-        1.43e13 * torch.exp(-0.15 * h_prime + torch.clamp((beta - 0.15) * (z_meso_km - h_prime), min=-40.0, max=25.0)),
-        min=1.0e3,
-        max=1.0e11,
-    )
-    mu_e = MU_E_STP * (N_AIR_STP / n_air)
-    z_ion_eff = torch.clamp(z_meso_km, max=55.0) / 6.0 + torch.clamp(z_meso_km - 55.0, min=0.0) / 16.0
-    sigma_tot = Q_ELECTRON * n_e * mu_e + 5.0e-14 * torch.exp(z_ion_eff)
-    tau_sigma = EPSILON_0 / torch.clamp(sigma_tot, min=1.0e-16)
-    n_ratio = n_air / N_AIR_STP
-    e_k = E_K_STP * n_ratio  # [26, nc]
-
-    # 2. Compute effective CG charge altitude z_Q [km] and conditional CMC distribution
-    #    Larger stratiform ice anvils (high IWP) produce larger continuing-current +CG charge reservoirs;
-    #    when SCALE-LT explicit_bulk 3D charge state covers all host columns, diagnose charge-center
-    #    altitude z_Q and positive-charge polarity bias directly from resolved 3D hydrometeor charge!
-    dm = torch.clamp(rho_host * dz_c_host, min=0.0)
-    iwp_cell = (dm * torch.clamp(q_i_host + q_p_host, min=0.0)).sum(dim=0)  # [nc] [kg m^-2]
     z_q_km = torch.clamp(5.0 + 0.45 * torch.clamp(cold_cloud_km_cell, min=0.0, max=14.0), 5.5, 11.5)
-    f_pos_cg_explicit: torch.Tensor | None = None
+    f_pos_cg_explicit = torch.full_like(z_q_km, -1.0)
     if explicit_state is not None and hasattr(explicit_state, "q_chg"):
         q_chg_t = explicit_state.q_chg  # [5, Nz, N_cols_lt, Ny, Nx]
         if int(q_chg_t.shape[2]) == nc and int(q_chg_t.shape[1]) == nz:
-            rho_q_col = q_chg_t.sum(dim=0).mean(dim=(-2, -1))  # [Nz, nc] [C m^-3]
+            rho_q_col = q_chg_t.sum(dim=0).mean(dim=(-2, -1))
             q_abs = rho_q_col.abs() * dz_c_host
             q_abs_sum = q_abs.sum(dim=0)
             has_chg = q_abs_sum > 1.0e-8
-            z_q_exp = (q_abs * z_c_km).sum(dim=0) / torch.clamp(q_abs_sum, min=1.0e-12)
+            z_q_exp = (q_abs * (z_c_host * 1.0e-3)).sum(dim=0) / torch.clamp(q_abs_sum, min=1.0e-12)
             z_q_km = torch.where(has_chg, torch.clamp(z_q_exp, 4.5, 12.5), z_q_km)
-            # Positive charge fraction in the active mixed-phase / upper anvil column
             q_pos_sum = (torch.clamp(rho_q_col, min=0.0) * dz_c_host).sum(dim=0)
             pos_frac_3d = torch.clamp(q_pos_sum / torch.clamp(q_abs_sum, min=1.0e-12), 0.05, 0.50)
-            f_pos_cg_explicit = torch.where(has_chg, 0.5 * pos_frac_3d, torch.full_like(pos_frac_3d, -1.0))
+            f_pos_cg_explicit = torch.where(has_chg, 0.5 * pos_frac_3d, f_pos_cg_explicit)
 
-    # Unit-CMC (1 C km = 1e3 C m) screened mesospheric field E_unit(z) [V m^-1 per (C km)]
-    z_m = z_meso_km * 1.0e3
-    zq_m = (z_q_km * 1.0e3).unsqueeze(0)  # [1, nc]
-    e_qe_unit = (1.0e3 / (math.pi * EPSILON_0)) * (z_m / torch.clamp(z_m * z_m - zq_m * zq_m, min=1.0e6) ** 2)
-    screen = _dielectric_screening_factor(tau_sigma / TAU_DISCHARGE_S)
-    e_peak_unit = torch.clamp(e_qe_unit * screen, min=1.0e-12)  # [26, nc]
-
-    # Critical CMC [C km] required at each altitude for prompt breakdown, delayed detachment, & halo
-    cmc_req_prompt_z = e_k / e_peak_unit  # [26, nc]
-    cmc_req_halo_z = (E_HALO_FRAC * e_k) / e_peak_unit
-    can_detach = tau_sigma >= TAU_DETACH_MIN_S
-    cmc_req_delay_z = torch.where(
-        can_detach,
-        (E_DELAY_FRAC * e_k) / e_peak_unit,
-        cmc_req_prompt_z,
-    )
-
-    # Minimum critical CMC across all mesospheric altitudes (optimal ignition height ~70-82 km)
-    cmc_crit_prompt, k_init_prompt = cmc_req_prompt_z.min(dim=0)  # [nc]
-    cmc_crit_delay, k_init_delay = cmc_req_delay_z.min(dim=0)     # [nc]
-    cmc_crit_halo, _ = cmc_req_halo_z.min(dim=0)                  # [nc]
-
-    # Log-normal CG impulse CMC distribution conditioned on convective/stratiform anvil IWP
-    # Observed CG median ~ 25-65 C km with heavy tail sigma_ln ~ 1.15 (Cummer & Lyons 2005; Qin 2014)
-    anvil_fac = torch.clamp(iwp_cell / (iwp_cell + 1.5), 0.0, 1.0)
-    cmc_med = 22.0 + 48.0 * anvil_fac  # [22..70 C km]
-    sigma_ln = 1.15
-    inv_s2 = 1.0 / (sigma_ln * math.sqrt(2.0))
-
-    # Exact closed-form log-normal exceedance probabilities P(CMC >= CMC_crit) via erfc
-    # Positive CG fraction (~10% in deep convection, rising to ~25% in extensive cold stratiform anvils;
-    # blended with direct 3D hydrometeor charge polarity when explicit_bulk state covers all columns)
-    f_pos_cg = 0.10 + 0.15 * anvil_fac
-    if f_pos_cg_explicit is not None:
-        f_pos_cg = torch.where(f_pos_cg_explicit >= 0.0, 0.5 * f_pos_cg + 0.5 * f_pos_cg_explicit, f_pos_cg)
-    p_prompt = 0.5 * torch.erfc(torch.log(torch.clamp(cmc_crit_prompt / cmc_med, min=1.0e-4)) * inv_s2)
-    p_any_sprite = 0.5 * torch.erfc(torch.log(torch.clamp(cmc_crit_delay / cmc_med, min=1.0e-4)) * inv_s2)
-    p_delay = torch.clamp(p_any_sprite - p_prompt, min=0.0)
-    p_halo = 0.5 * torch.erfc(torch.log(torch.clamp(cmc_crit_halo / cmc_med, min=1.0e-4)) * inv_s2)
-
-    # Include polarity asymmetry: +CG triggers downward positive streamers cleanly; -CG requires higher stability field
-    eff_pol_wt = f_pos_cg + 0.12 * (1.0 - f_pos_cg)
-    cg_pos = torch.clamp(flash_cg_cell, min=0.0)
-    sprite_prompt_rate = cg_pos * eff_pol_wt * p_prompt
-    sprite_delayed_rate = cg_pos * eff_pol_wt * p_delay
-    sprite_rate = sprite_prompt_rate + sprite_delayed_rate
-    halo_rate = cg_pos * p_halo
-
-    # 3. Evaluate representative 99th-percentile CG flash optical & altitude structure
-    cmc_99 = cmc_med * math.exp(2.3263 * sigma_ln)  # [nc]
-    e_over_ek_99 = (e_peak_unit * cmc_99.unsqueeze(0)) / torch.clamp(e_k, min=1.0e-6)  # [26, nc]
-    e_over_ek_max = e_over_ek_99.amax(dim=0)
-
-    has_active = sprite_rate > 1.0e-18
-    z_init_km = torch.where(has_active, z_meso_km[k_init_delay, 0], torch.zeros_like(cmc_med))
-
-    # Downward positive streamer stopping altitude (Ebert et al., 2010: E_peak >= E_st^+)
-    e_peak_99 = e_peak_unit * cmc_99.unsqueeze(0)
-    e_st_pos = E_ST_POS_STP * n_ratio
-    below_init = z_meso_km <= z_init_km.unsqueeze(0)
-    in_streamer = has_active.unsqueeze(0) & below_init & (e_peak_99 >= e_st_pos)
-    z_stop_km = torch.where(
-        in_streamer.any(dim=0),
-        torch.where(in_streamer, z_meso_km, torch.full_like(e_peak_99, 100.0)).amin(dim=0),
-        z_init_km,
-    )
-
-    # Pasko et al. (1997) N2 1PN2 (red) & 2PN2 (blue) peak optical brightness [kR] with quenching
-    q_fac_1p = A_EINSTEIN_1PN2 / (A_EINSTEIN_1PN2 + KQ_N2_1PN2 * F_N2_AIR * n_air)
-    q_fac_2p = A_EINSTEIN_2PN2 / (A_EINSTEIN_2PN2 + KQ_O2_2PN2 * F_O2_AIR * n_air)
-    x_exc = torch.clamp(e_over_ek_99, min=0.0, max=4.0)
-    exc_1p = torch.where(x_exc > 0.20, torch.exp(-2.8 / torch.clamp(x_exc, min=0.20)), torch.zeros_like(x_exc))
-    exc_2p = torch.where(x_exc > 0.25, torch.exp(-4.2 / torch.clamp(x_exc, min=0.25)), torch.zeros_like(x_exc))
-    boost = torch.where(in_streamer, torch.full_like(x_exc, 12.0), torch.ones_like(x_exc))
-    red_1pn2_kr = torch.where(has_active, (4.5e3 * boost * exc_1p * q_fac_1p).amax(dim=0), torch.zeros_like(cmc_med))
-    blue_2pn2_kr = torch.where(has_active, (1.8e3 * boost * exc_2p * q_fac_2p).amax(dim=0), torch.zeros_like(cmc_med))
-
-    # 4. EMP ELVES (Inan et al., 1991; Barrington-Leigh & Inan, 1999; Kuo et al., 2007)
-    #    Peak radiation-zone horizontal EMP field at the D-region reflection base (~86-88 km):
-    #        E_emp = (mu_0 * v_rs * I_peak / (2*pi*R)) * sin(theta) * exp(-alpha_day)
-    #    Daytime lower D-region free electrons absorb the VLF/ELF EMP wave before reaching 85 km.
-    e_k_ion = e_k[-1]  # Breakdown field at upper mesosphere (~88 km) [V m^-1]
-    e_emp_thresh = E_ELVES_FRAC * e_k_ion
-    emp_day_atten = torch.exp(-3.2 * day_fac[0])
-    e_emp_per_a = (MU_0_VAC * V_RETURN_STROKE_MS / (2.0 * math.pi * ELVES_RING_RANGE_M)) * ELVES_SIN_THETA * emp_day_atten
-    i_crit_ka = (e_emp_thresh / torch.clamp(e_emp_per_a, min=1.0e-12)) * 1.0e-3  # [kA]
-    # Conditional CG peak-current median rises with deep convective anvil IWP (24..42 kA; Orville & Huffines 2001)
-    i_med_ka = 24.0 + 18.0 * anvil_fac
-    inv_si2 = 1.0 / (I_PEAK_SIGMA_LN * math.sqrt(2.0))
-    p_elves = 0.5 * torch.erfc(torch.log(torch.clamp(i_crit_ka / i_med_ka, min=1.0e-4)) * inv_si2)
-    elves_rate = cg_pos * p_elves
-
-    # 5. Blue Jets & Gigantic Jets (Pasko et al., 2002; Su et al., 2003; Krehbiel et al., 2008)
-    #    Upward positive leaders escape cloud tops (z_cld ~ 11-17 km) into the stratosphere (Blue Jets:
-    #    25-42 km) when deep overshooting updrafts create large charge imbalance above the upper dipole.
-    #    When cloud top is sufficiently high (low air density N(z_cld)) and upper-level leader potential
-    #    overcomes the stratospheric streamer stability integral to the nighttime ionosphere, the upward
-    #    discharge escapes all the way to 70-90 km as a Gigantic Jet!
-    z_cld_km = torch.clamp(4.0 + 0.85 * torch.clamp(cold_cloud_km_cell, min=0.0, max=16.0), 4.0, 17.5)
-    # Cloud-top air density ratio N(z_cld)/N_0 (exponential scale height ~7.2 km -> ~0.12 at 15 km)
-    n_ratio_cld = torch.exp(-z_cld_km / 7.2)
-    # Upward escape probability scales steeply with deep overshooting cloud top (>11 km) & anvil ice mass
-    overshoot_gate = torch.sigmoid((z_cld_km - 11.5) / 1.2) * anvil_fac
-    # Effective charge-imbalance ratio relative to stratospheric positive streamer stability field E_st^+(z_cld)
-    e_cld_eff = (cmc_med * 1.0e3 / (2.0 * math.pi * EPSILON_0 * (3.5e3 ** 3))) * overshoot_gate
-    e_st_cld = E_ST_POS_STP * n_ratio_cld
-    bj_ratio = e_cld_eff / torch.clamp(e_st_cld, min=1.0)
-    # Closed-form exceedance probability for Blue Jet upward leader breakout (rare: ~0.05-0.5% of deep CG)
-    p_blue_jet = 0.008 * overshoot_gate * 0.5 * torch.erfc(
-        torch.log(torch.clamp(1.8 / torch.clamp(bj_ratio, min=1.0e-4), min=1.0e-4)) * inv_s2
-    )
-    blue_jet_rate = cg_pos * p_blue_jet
-    # Blue Jet terminal altitude rises with cloud top & charge imbalance (typically 28-42 km)
-    blue_jet_top_km = torch.where(
-        blue_jet_rate > 1.0e-20,
-        torch.clamp(z_cld_km + 14.0 + 10.0 * torch.tanh(bj_ratio), 24.0, 44.0),
-        torch.zeros_like(z_cld_km),
-    )
-
-    # Gigantic Jet breakthrough: requires very tall overshooting tropical/subtropical cloud top (z_cld > 14 km)
-    # AND nighttime low-conductivity mesosphere so the upward leader bridges all the way to the D-region (70-90 km)
-    gj_cloud_gate = torch.sigmoid((z_cld_km - 14.2) / 0.85) * (1.0 - 0.85 * day_fac[0])
-    p_gigantic_jet = p_blue_jet * 0.14 * gj_cloud_gate * torch.clamp(p_halo / 0.05, 0.0, 1.5)
-    gigantic_jet_rate = cg_pos * p_gigantic_jet
-
-    # 6. Mesospheric NOx production (Sentman et al., 2008; Winkler & Notholt, 2015) from Sprites + Gigantic Jets
-    len_scale = torch.clamp((z_init_km - z_stop_km) / 25.0, min=0.3, max=2.0)
-    sprite_nox_mol_m2s = (
-        sprite_rate * NOX_MOLECULES_PER_SPRITE * len_scale
-        + gigantic_jet_rate * NOX_MOLECULES_PER_GIGANTIC_JET
+    core_fn = maybe_cuda_compile(_compute_red_sprites_core, device=rho_host.device)
+    (
+        sprite_rate, sprite_prompt_rate, sprite_delayed_rate, halo_rate, cmc_med,
+        e_over_ek_max, red_1pn2_kr, blue_2pn2_kr, z_init_km, z_stop_km,
+        sprite_nox_mol_m2s, elves_rate, blue_jet_rate, gigantic_jet_rate, blue_jet_top_km,
+    ) = core_fn(
+        flash_cg_cell, cold_cloud_km_cell, mu0_cell,
+        rho_host, temp_top, q_i_host, q_p_host, z_c_host, dz_c_host,
+        z_q_km, f_pos_cg_explicit,
     )
 
     return RedSpriteDiagnostics(

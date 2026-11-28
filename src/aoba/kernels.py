@@ -1970,15 +1970,26 @@ def run_crm_rk3_hevi_metal(
         n_ac0 = max(1, int(_math.ceil(rk_taus[0] / max(dt_ac_max, 0.1))))
         n_ac1 = max(1, int(_math.ceil(rk_taus[1] / max(dt_ac_max, 0.1))))
         n_ac2 = max(1, int(_math.ceil(rk_taus[2] / max(dt_ac_max, 0.1))))
-        if dev.type == "mps" and n_ac0 <= 63 and n_ac1 <= 63 and n_ac2 <= 63:
+        use_smem_48 = (nz <= 48 and n_ac0 <= 63 and n_ac1 <= 63 and n_ac2 <= 63)
+        use_fused_rk3 = (
+            (dev.type == "mps" or use_smem_48)
+            and n_ac0 <= 63 and n_ac1 <= 63 and n_ac2 <= 63
+        )
+        if use_fused_rk3:
             # Persistent-worker L2-resident single-launch 3-stage WS-RK3 + HEVI kernel:
-            # caps concurrent threadgroups so `stage_buf` fits inside GPU L2/SLC (~14-18 MB)
-            # instead of spilling 58+ MB to DRAM across acoustic substeps.
+            # caps concurrent threadgroups so `stage_buf` fits inside GPU L2/SLC (~18 MB on MPS,
+            # ~36 MB on A100/H100) while `crm_2d_rk3_smem_simd` (nz <= 48) places all 5 dynamic
+            # state arrays in bank-conflict-free on-chip shared memory (30.1 KB/warp, zero spills).
             c_tg32 = 32 // nx
             n_tg32 = (n_col + c_tg32 - 1) // c_tg32
-            max_w_l2 = max(64, int(18_000_000 // max(nz * 128 * 16, 1)))
-            n_workers = min(n_tg32, max_w_l2)
-            # Snap n_workers to a balanced wave divisor when n_tg32 > n_workers (e.g. 640 -> 160 or 214)
+            if dev.type == "cuda":
+                # Launch all warps in a single full-GPU wave on A100/H100 (e.g. 641 warps across 108 SMs
+                # = 5.9 warps/SM -> 1.9x faster than 2 serial waves!)
+                n_workers = min(n_tg32, 1024)
+            else:
+                max_w_l2 = max(64, int(18_000_000 // max(nz * 128 * 16, 1)))
+                n_workers = min(n_tg32, max_w_l2)
+            # Snap n_workers to a balanced wave divisor when n_tg32 > n_workers (e.g. 640 -> 320 or 214)
             if n_tg32 > n_workers:
                 n_waves = (n_tg32 + n_workers - 1) // n_workers
                 n_workers = (n_tg32 + n_waves - 1) // n_waves
@@ -1994,7 +2005,8 @@ def run_crm_rk3_hevi_metal(
                 ws["inv_dz_ver"] = getattr(dzc_c, "_version", 0)
             u_fused0 = [nz, n_col, (int(n_workers) << 16) | int(nx), (int(dz_cols) << 18) | (n_ac0 << 12) | (n_ac1 << 6) | n_ac2]
             f_fused1 = [float(dt_dyn), float(beta_hevi), float(gravity), float(max(int(n_sub_grp), 1))]
-            lib.crm_2d_rk3_stage_fused_simd(
+            k_fn = lib.crm_2d_rk3_smem_simd if use_smem_48 else lib.crm_2d_rk3_stage_fused_simd
+            k_fn(
                 rho0_c, Thm0_c, u0_c, v0_c, w0_c,
                 rho_out, Thm_out, u_out, v_out, w_out,
                 rho_b2, Thm_b2, u_b2, v_b2, w_b2,

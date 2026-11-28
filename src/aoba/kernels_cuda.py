@@ -497,7 +497,16 @@ def build_cuda_extension_sources(msl_src: str) -> tuple[str, str, list[KernelSpe
 
         default_block = 128 if spec.name in _HEAVY_COL_KERNELS else 256
         call_args = ",\n        ".join(_cuda_call_arg(p) for p in spec.params)
-        launch_body = f"""
+        carveout_code = ""
+        if spec.uses_shared:
+            carveout_code = (
+                f"\n    static bool _smem_cfg_{spec.name} = false;"
+                f"\n    if (!_smem_cfg_{spec.name}) {{"
+                f"\n        cudaFuncSetAttribute(aoba_k::{spec.name}, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);"
+                f"\n        _smem_cfg_{spec.name} = true;"
+                f"\n    }}"
+            )
+        launch_body = f"""{carveout_code}
     aoba_k::{spec.name}<<<static_cast<unsigned int>(grid), static_cast<unsigned int>(block), 0, stream>>>(
         {call_args}
     );"""

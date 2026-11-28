@@ -19,6 +19,7 @@ AOBA Formulation Reference: Sec. 1.1 Eqs. (1.1)-(1.4), Sec. 8.6 Eq. (8.13) & Sec
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
@@ -57,7 +58,7 @@ from aoba.ocean_ogcm import OceanOGCMState, init_ogcm_state, step_ogcm_voronoi
 from aoba.orography import compute_orographic_drag_lott_miller
 from aoba.radiation import compute_four_band_radiation
 from aoba.radiation_ckd import CH4_PREIND_PPMV, N2O_PREIND_PPMV, compute_ckd_radiation
-from aoba.runtime import maybe_cuda_compile
+from aoba.runtime import can_use_cuda_graph, maybe_cuda_compile, run_cuda_graph_cached
 from aoba.scvt_dynamics import (
     GlobalAtmosState,
     apply_scvt_storm_smagorinsky,
@@ -1221,7 +1222,12 @@ def _coupled_post_crm_accum_core(
     torch.Tensor, torch.Tensor, torch.Tensor,
 ]:
     """Pure-tensor post-CRM lowest-level meteorology, Priestley-Taylor PET & daily accumulators."""
-    pres_post_0, _, t_air_sub = diagnose_pressure_temperature(rho_post_0, thm_post_0, qv_post_0)
+    # Pure-PyTorch EOS (identical to `diagnose_pressure_temperature`) so Inductor fuses this
+    # entire post-CRM block into a single Triton kernel with zero Dynamo graph breaks.
+    arg_p = torch.clamp(C.R_D * rho_post_0 * thm_post_0 / C.P_REF, min=1.0e-8)
+    exner_0 = torch.pow(arg_p, C.R_D / C.CV_D)
+    pres_post_0 = C.P_REF * arg_p * exner_0
+    t_air_sub = exner_0 * (thm_post_0 / (1.0 + C.RV_OVER_RD * torch.clamp(qv_post_0, min=0.0)))
     pres_sfc_post_sub = pres_post_0 + C.GRAVITY * rho_post_0 * (1.0 + qv_post_0) * dz0_sub
     t_denom = torch.clamp(t_air_sub - 29.65, min=10.0)
     es_sub = 611.2 * torch.exp(17.67 * (t_air_sub - C.T_FREEZE) / t_denom)
@@ -1254,11 +1260,62 @@ def _coupled_post_crm_accum_core(
     )
 
 
+def _pack_all_obj_tensors(obj: object | None) -> tuple[tuple[str, ...], list[torch.Tensor]]:
+    """Collect all tensor attributes on a state dataclass for CUDA Graph capture."""
+    if obj is None:
+        return (), []
+    keys: list[str] = []
+    vals: list[torch.Tensor] = []
+    for k, v in obj.__dict__.items():
+        if isinstance(v, torch.Tensor):
+            keys.append(k)
+            vals.append(v)
+    return tuple(keys), vals
+
+
+def _pack_obj_tensors(obj: object | None, attr_names: tuple[str, ...]) -> tuple[tuple[str, ...], list[torch.Tensor]]:
+    """Collect present `(name, tensor)` attributes from a state dataclass for CUDA Graph capture."""
+    if obj is None:
+        return (), []
+    keys: list[str] = []
+    vals: list[torch.Tensor] = []
+    for name in attr_names:
+        v = getattr(obj, name, None)
+        if isinstance(v, torch.Tensor):
+            keys.append(name)
+            vals.append(v)
+    return tuple(keys), vals
+
+
+def _clone_obj_with_tensors(
+    obj: object | None,
+    keys: tuple[str, ...],
+    vals: list[torch.Tensor],
+    *,
+    clone_tensors: bool = False,
+):
+    """Return a shallow copy of `obj` with tensor attributes bound to `vals`."""
+    if obj is None:
+        return None
+    cp = copy.copy(obj)
+    for k, v in zip(keys, vals):
+        setattr(cp, k, v.clone() if clone_tensors else v)
+    return cp
+
+
+def _write_back_obj_tensors(obj: object | None, keys: tuple[str, ...], vals: list[torch.Tensor]) -> None:
+    if obj is None:
+        return
+    for k, v in zip(keys, vals):
+        setattr(obj, k, v)
+
+
 # AOBA Formulation Eqs. (8.13), (9.8)
 def step_aoba_model(
     model: AOBAState,
     compute_diagnostics: bool = True,
     sync_host_surface: bool = True,
+    accum_diag_gpu: torch.Tensor | None = None,
 ) -> GlobalStepDiagnostics:
     """Advance the global 1:1 Superparameterized AOBA Earth System Model by `cfg.dt_host` [s]."""
     assert model.sfc_sub is not None and model.clim_sub is not None
@@ -1334,21 +1391,17 @@ def step_aoba_model(
             tile_q_rad_4d=prev_qrad_4d, step_seed=model.step_count,
         )
 
-    # 1. Orbital solar geometry & zero-sync CPU local solar noon detection
+    # 1. Orbital solar geometry & zero-sync GPU local solar noon detection
     yr_sec_trop = C.DAYS_PER_YEAR * C.SECONDS_PER_DAY
     _, t_diur_prev = model.calendar.orbital_times_sec(model.sim_time_sec, yr_sec_trop)
     t_seas_next, t_diur_next = model.calendar.orbital_times_sec(model.sim_time_sec + dt, yr_sec_trop)
-    lon_cpu = getattr(mesh, "_lon_cell_cpu", None)
-    if lon_cpu is None:
-        lon_cpu = mesh.lon_cell.detach().cpu()
-        setattr(mesh, "_lon_cell_cpu", lon_cpu)
     frac_prev = (t_diur_prev % C.SECONDS_PER_DAY) / C.SECONDS_PER_DAY
     frac_next = (t_diur_next % C.SECONDS_PER_DAY) / C.SECONDS_PER_DAY
-    h_raw_prev = 2.0 * math.pi * frac_prev + lon_cpu - math.pi
-    h_raw_next = 2.0 * math.pi * frac_next + lon_cpu - math.pi
-    h_prev_cpu = torch.atan2(torch.sin(h_raw_prev), torch.cos(h_raw_prev))
-    h_next_cpu = torch.atan2(torch.sin(h_raw_next), torch.cos(h_raw_next))
-    crossed_noon_cpu = (h_prev_cpu < 0.0) & (h_next_cpu >= 0.0) & ((h_next_cpu - h_prev_cpu) < math.pi)
+    h_raw_prev = 2.0 * math.pi * frac_prev + mesh.lon_cell - math.pi
+    h_raw_next = 2.0 * math.pi * frac_next + mesh.lon_cell - math.pi
+    h_prev_gpu = torch.atan2(torch.sin(h_raw_prev), torch.cos(h_raw_prev))
+    h_next_gpu = torch.atan2(torch.sin(h_raw_next), torch.cos(h_raw_next))
+    crossed_noon_gpu = (h_prev_gpu < 0.0) & (h_next_gpu >= 0.0) & ((h_next_gpu - h_prev_gpu) < math.pi)
     # Optional analytical Milankovitch orbital evolution (Berger, 1978; Laskar et al., 2004)
     obl_now, ecc_now, peri_now = cfg.obliquity_deg, cfg.eccentricity, cfg.perihelion_deg
     if bool(cfg.enable_milankovitch_orbit):
@@ -1792,7 +1845,7 @@ def step_aoba_model(
                     asr_sub[s_sfc] = asr_sw
                     model.rad_distill.last_uncertainty.zero_()
 
-                model.rad_distill.last_uncertainty[t_pool_idx] = 0.0
+                model.rad_distill.last_uncertainty.index_fill_(0, t_pool_idx, 0.0)
                 model.rad_distill.teacher_frac_last = float(n_tr) / float(max(nc, 1))
                 model.rad_distill.steps_seen += 1
             else:
@@ -2045,7 +2098,7 @@ def step_aoba_model(
                 olr_sub.index_copy_(0, t_crm, olr_t)
                 asr_sub.index_copy_(0, t_crm, asr_t)
 
-                model.rad_distill.last_uncertainty[t_ridx] = 0.0
+                model.rad_distill.last_uncertainty.index_fill_(0, t_ridx, 0.0)
                 model.rad_distill.teacher_frac_last = float(n_tr) / float(max(nc, 1))
                 model.rad_distill.steps_seen += 1
             else:
@@ -2736,185 +2789,226 @@ def step_aoba_model(
         sfc_sub.swe_seaice,
     )
 
-    # 5. Subgrid Orographic Drag (Lott & Miller, 1997) + Map-Free Non-Orographic GWD
-    #    (Convective: Beres et al., 2004, 2005; Frontal: Charron & Manzini, 2002; Richter et al., 2010)
-    u_cell, v_cell = reconstruct_cell_winds(mesh, atmos.u_edge)
-    du_oro_c, dv_oro_c = compute_orographic_drag_lott_miller(
-        rho_d=atmos.rho_d,
-        u_cell=u_cell,
-        v_cell=v_cell,
-        theta_m=atmos.theta_m,
-        z_rel_c=z_rel_c,
-        dz_c=atmos.dz_c,
-        sigma_topo=mesh.sigma_topo,
-        slope_topo=mesh.slope_topo,
-        aniso_topo=mesh.aniso_topo,
-        angle_topo=mesh.angle_topo,
-        dt=dt,
-    )
-    model.rad_cache["_du_ogwd"] = du_oro_c.detach()
-    model.rad_cache["_dv_ogwd"] = dv_oro_c.detach()
-    if cfg.enable_nonoro_gwd:
-        pres_host_gwd, _, _ = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
-        du_ngwd_c, dv_ngwd_c = compute_nonorographic_gwd(
-            mesh=mesh,
-            rho_d=atmos.rho_d,
-            pres_c=pres_host_gwd,
-            u_cell=u_cell,
-            v_cell=v_cell,
-            theta_m=atmos.theta_m,
-            z_rel_c=z_rel_c,
-            dz_c=atmos.dz_c,
-            q_conv_c=model.q_conv_diag,
-            dt=dt,
-        )
-        model.rad_cache["_du_ngwd"] = du_ngwd_c.detach()
-        model.rad_cache["_dv_ngwd"] = dv_ngwd_c.detach()
-        du_oro_c = du_oro_c + du_ngwd_c
-        dv_oro_c = dv_oro_c + dv_ngwd_c
-    else:
-        model.rad_cache.pop("_du_ngwd", None)
-        model.rad_cache.pop("_dv_ngwd", None)
-    du_oro_edge = project_cell_vectors_to_edges(mesh, du_oro_c, dv_oro_c)
-
-    # 6. Host SCVT Nonhydrostatic RK3-HEVI Dynamical Core & Voronoi FCT
-    thm_before_dyn = atmos.theta_m.clone()
-    qn_before_dyn = atmos.q_n.clone()
-
+    # 5 & 6. Subgrid Orographic + Non-Orographic GWD, Host SCVT RK3-HEVI, Voronoi FCT,
+    #        Smagorinsky, Mesospheric Molecular Diffusion, & Post-Dynamics Surface Stress
     dc_min = getattr(mesh, "_dc_edge_min_m", None)
     if dc_min is None:
         dc_min = float(mesh.dc_edge.min().item())
         setattr(mesh, "_dc_edge_min_m", dc_min)
     u_cfl_ref = 160.0 if float(cfg.z_top) >= 68000.0 else 100.0
-    # WS-RK3 advective CFL limit on Voronoi C-grids is ~0.85; 0.60 keeps ample safety margin
-    # even at peak 160 m/s mesospheric jets while internal HEVI acoustic n_ac preserves dt_ac <= 45 s.
     dt_adv_host = min(900.0, 0.60 * dc_min / u_cfl_ref)
     n_hdyn = max(cfg.n_host_dyn_substeps, int(math.ceil(dt / max(dt_adv_host, 1.0))))
     dt_hdyn = dt / float(n_hdyn)
 
-    m_old_host = (atmos.rho_d * atmos.dz_c).clone()
-    uh_acc = torch.zeros_like(atmos.u_edge)
-    om_acc = torch.zeros_like(atmos.w)
-    for _ in range(n_hdyn):
-        uh_e, om_z = step_scvt_rk3_hevi(
-            state=atmos,
-            mesh=mesh,
-            vgrid=vgrid,
-            dt_dyn=dt_hdyn,
-            du_phys_edge=du_oro_edge,
-        )
-        uh_acc = uh_acc + uh_e
-        om_acc = om_acc + om_z
-
-    inv_nh = 1.0 / float(n_hdyn)
-    m_new_host = atmos.rho_d * atmos.dz_c
-    uh_mean = uh_acc * inv_nh
-    om_mean = om_acc * inv_nh
-    adv_list = [atmos.q_n, atmos.q_p, atmos.q_c, atmos.q_i]
     has_dust_adv = bool(cfg.enable_dust and (atmos.q_dust is not None or atmos.q_dust_fine is not None))
-    if has_dust_adv:
-        if atmos.q_dust_fine is None or atmos.q_dust_coarse is None:
-            qd_base = torch.clamp(atmos.q_dust, min=0.0) if atmos.q_dust is not None else torch.zeros_like(atmos.q_n)
-            atmos.q_dust_fine = qd_base * DUST_LEGACY_RESTART_FINE_FRAC
-            atmos.q_dust_coarse = qd_base * (1.0 - DUST_LEGACY_RESTART_FINE_FRAC)
-        adv_list.extend([atmos.q_dust_fine, atmos.q_dust_coarse])
+    if has_dust_adv and (atmos.q_dust_fine is None or atmos.q_dust_coarse is None):
+        qd_base = torch.clamp(atmos.q_dust, min=0.0) if atmos.q_dust is not None else torch.zeros_like(atmos.q_n)
+        atmos.q_dust_fine = qd_base * DUST_LEGACY_RESTART_FINE_FRAC
+        atmos.q_dust_coarse = qd_base * (1.0 - DUST_LEGACY_RESTART_FINE_FRAC)
     has_aero_adv = bool(cfg.enable_natural_aerosols and model.aerosols is not None)
-    if has_aero_adv:
-        adv_list.extend([model.aerosols.q_ss, model.aerosols.q_so4, model.aerosols.q_bc, model.aerosols.q_oc])
     has_o3_adv = bool(str(cfg.o3_mode).strip().lower() == "prognostic" and model.ozone is not None)
-    if has_o3_adv:
-        adv_list.append(model.ozone.o3_vmr)
     has_nox_adv = bool(model.meso_nox is not None)
-    if has_nox_adv:
-        adv_list.append(model.meso_nox.q_nox)
     has_co2_adv = bool(
         str(cfg.co2_mode).strip().lower() == "prognostic"
         and bool(cfg.enable_co2_3d_transport)
         and model.prognostic_co2 is not None
         and model.prognostic_co2.co2_vmr is not None
     )
-    if has_co2_adv:
-        adv_list.append(model.prognostic_co2.co2_vmr)
     has_iso_adv = bool(bool(cfg.enable_water_isotopes) and model.water_isotopes is not None)
-    if has_iso_adv:
-        adv_list.extend([model.water_isotopes.q_v_18o, model.water_isotopes.q_v_hdo])
-    q_adv = fct_advect_scvt_batch(
-        mesh, torch.stack(adv_list, dim=0),
-        m_old_host, m_new_host, uh_mean, om_mean, dt,
-    )
-    atmos.q_n = q_adv[0]
-    atmos.q_p = q_adv[1]
-    apply_scvt_storm_smagorinsky(atmos, mesh, dt)
-    if float(cfg.z_top) >= 68000.0:
-        from aoba.mesosphere import apply_mesospheric_molecular_diffusion
-
-        k_mol_s = model.rad_cache.get("_k_mol_start")
-        if k_mol_s is None:
+    do_mol_diff = float(cfg.z_top) >= 68000.0
+    k_mol_s = 0
+    if do_mol_diff:
+        k_mol_s_c = model.rad_cache.get("_k_mol_start")
+        if k_mol_s_c is None:
             zc_cpu = vgrid.zeta_c.detach().cpu()
             idx_m = torch.nonzero(zc_cpu >= 40000.0, as_tuple=False)
-            k_mol_s = max(int(idx_m[0].item()) - 1, 0) if int(idx_m.numel()) > 0 else 0
-            model.rad_cache["_k_mol_start"] = k_mol_s
-        _, _, t_mol_h = diagnose_pressure_temperature(atmos.rho_d[k_mol_s:], atmos.theta_m[k_mol_s:], atmos.q_v[k_mol_s:])
-        # Pad only the sliced top levels so apply_mesospheric_molecular_diffusion touches only z >= 40 km
-        t_mol_full = torch.empty_like(atmos.theta_m)
-        t_mol_full[k_mol_s:] = t_mol_h
-        atmos.theta_m, atmos.u_edge = apply_mesospheric_molecular_diffusion(
-            rho_d=atmos.rho_d,
-            theta_m=atmos.theta_m,
-            u_edge=atmos.u_edge,
-            z_c=atmos.z_c,
-            dz_c=atmos.dz_c,
-            temp_c=t_mol_full,
-            c0=mesh.cells_on_edge[:, 0],
-            c1=mesh.cells_on_edge[:, 1],
-            dt=dt,
-            k_start=k_mol_s,
+            k_mol_s_c = max(int(idx_m[0].item()) - 1, 0) if int(idx_m.numel()) > 0 else 0
+            model.rad_cache["_k_mol_start"] = k_mol_s_c
+        k_mol_s = int(k_mol_s_c)
+
+    def _run_host_dyn_gwd_fct_block(inp: list[torch.Tensor]) -> list[torch.Tensor]:
+        at_s = copy.copy(atmos)
+        at_s.rho_d = inp[0].clone()
+        at_s.theta_m = inp[1].clone()
+        at_s.u_edge = inp[2].clone()
+        at_s.w = inp[3].clone()
+        at_s.q_n = inp[4]
+        at_s.q_p = inp[5]
+        at_s.q_c = inp[6]
+        at_s.q_i = inp[7]
+        at_s.q_v = inp[8]
+        q_conv_i = inp[9]
+        u_s0_i, v_s0_i, u_o_i, v_o_i, tx_i, ty_i = inp[10], inp[11], inp[12], inp[13], inp[14], inp[15]
+        opt_in = inp[16:]
+
+        z_rel_cg = at_s.z_c - at_s.z_w[0:1]
+        u_c, v_c = reconstruct_cell_winds(mesh, at_s.u_edge)
+        du_og, dv_og = compute_orographic_drag_lott_miller(
+            rho_d=at_s.rho_d, u_cell=u_c, v_cell=v_c, theta_m=at_s.theta_m,
+            z_rel_c=z_rel_cg, dz_c=at_s.dz_c, sigma_topo=mesh.sigma_topo,
+            slope_topo=mesh.slope_topo, aniso_topo=mesh.aniso_topo, angle_topo=mesh.angle_topo, dt=dt,
         )
-    qc_adv = torch.clamp(q_adv[2], min=0.0)
-    qi_adv = torch.clamp(q_adv[3], min=0.0)
-    qci_adv = qc_adv + qi_adv
-    sc_adv = torch.where(qci_adv > atmos.q_n, atmos.q_n / torch.clamp(qci_adv, min=1.0e-12), torch.ones_like(qci_adv))
-    atmos.q_c = qc_adv * sc_adv
-    atmos.q_i = qi_adv * sc_adv
-    atmos.q_v = torch.clamp(atmos.q_n - atmos.q_c - atmos.q_i, min=0.0)
-    idx_q = 4
+        if cfg.enable_nonoro_gwd:
+            p_gwd, _, _ = diagnose_pressure_temperature(at_s.rho_d, at_s.theta_m, at_s.q_v)
+            du_ng, dv_ng = compute_nonorographic_gwd(
+                mesh=mesh, rho_d=at_s.rho_d, pres_c=p_gwd, u_cell=u_c, v_cell=v_c,
+                theta_m=at_s.theta_m, z_rel_c=z_rel_cg, dz_c=at_s.dz_c, q_conv_c=q_conv_i, dt=dt,
+            )
+            du_tot = du_og + du_ng
+            dv_tot = dv_og + dv_ng
+        else:
+            du_ng = torch.zeros_like(du_og)
+            dv_ng = torch.zeros_like(dv_og)
+            du_tot, dv_tot = du_og, dv_og
+        du_edge_g = project_cell_vectors_to_edges(mesh, du_tot, dv_tot)
+
+        thm_pre = at_s.theta_m.clone()
+        qn_pre = at_s.q_n.clone()
+        m_old_h = (at_s.rho_d * at_s.dz_c).clone()
+        uh_acc = torch.zeros_like(at_s.u_edge)
+        om_acc = torch.zeros_like(at_s.w)
+        for _ in range(n_hdyn):
+            uh_e, om_z = step_scvt_rk3_hevi(
+                state=at_s, mesh=mesh, vgrid=vgrid, dt_dyn=dt_hdyn, du_phys_edge=du_edge_g,
+            )
+            uh_acc = uh_acc + uh_e
+            om_acc = om_acc + om_z
+
+        inv_nh = 1.0 / float(n_hdyn)
+        m_new_h = at_s.rho_d * at_s.dz_c
+        adv_l = [at_s.q_n, at_s.q_p, at_s.q_c, at_s.q_i] + list(opt_in)
+        q_adv = fct_advect_scvt_batch(mesh, torch.stack(adv_l, dim=0), m_old_h, m_new_h, uh_acc * inv_nh, om_acc * inv_nh, dt)
+        at_s.q_n = q_adv[0]
+        at_s.q_p = q_adv[1]
+        apply_scvt_storm_smagorinsky(at_s, mesh, dt)
+        if do_mol_diff:
+            from aoba.mesosphere import apply_mesospheric_molecular_diffusion
+
+            _, _, t_mol_h = diagnose_pressure_temperature(at_s.rho_d[k_mol_s:], at_s.theta_m[k_mol_s:], at_s.q_v[k_mol_s:])
+            t_mol_full = torch.zeros_like(at_s.theta_m)
+            t_mol_full[k_mol_s:] = t_mol_h
+            at_s.theta_m, at_s.u_edge = apply_mesospheric_molecular_diffusion(
+                rho_d=at_s.rho_d, theta_m=at_s.theta_m, u_edge=at_s.u_edge,
+                z_c=at_s.z_c, dz_c=at_s.dz_c, temp_c=t_mol_full,
+                c0=mesh.cells_on_edge[:, 0], c1=mesh.cells_on_edge[:, 1], dt=dt, k_start=k_mol_s,
+            )
+        qc_a = torch.clamp(q_adv[2], min=0.0)
+        qi_a = torch.clamp(q_adv[3], min=0.0)
+        qci_a = qc_a + qi_a
+        sc_a = torch.where(qci_a > at_s.q_n, at_s.q_n / torch.clamp(qci_a, min=1.0e-12), torch.ones_like(qci_a))
+        at_s.q_c = qc_a * sc_a
+        at_s.q_i = qi_a * sc_a
+        at_s.q_v = torch.clamp(at_s.q_n - at_s.q_c - at_s.q_i, min=0.0)
+
+        opt_out: list[torch.Tensor] = []
+        iq = 4
+        if has_dust_adv:
+            qf = torch.clamp(q_adv[iq], min=0.0)
+            qc_d = torch.clamp(q_adv[iq + 1], min=0.0)
+            opt_out.extend([qf, qc_d, qf + qc_d])
+            iq += 2
+        if has_aero_adv:
+            opt_out.extend([q_adv[iq], q_adv[iq + 1], q_adv[iq + 2], q_adv[iq + 3]])
+            iq += 4
+        if has_o3_adv:
+            opt_out.append(torch.clamp(q_adv[iq], min=1.0e-10, max=4.0e-5))
+            iq += 1
+        if has_nox_adv:
+            opt_out.append(torch.clamp(q_adv[iq], min=1.0e-12, max=2.0e-6))
+            iq += 1
+        if has_co2_adv:
+            opt_out.append(torch.clamp(q_adv[iq], min=1.0e-5, max=0.05))
+            iq += 1
+        if has_iso_adv:
+            opt_out.extend([torch.clamp(q_adv[iq], min=0.0), torch.clamp(q_adv[iq + 1], min=0.0)])
+            iq += 2
+
+        dthm_o = (at_s.theta_m - thm_pre) / dt
+        dqn_o = (at_s.q_n - qn_pre) / dt
+        u_hn, v_hn = reconstruct_cell_winds(mesh, at_s.u_edge)
+
+        u_sp = (u_s0_i - u_o_i) + _cell_to_sub(u_hn[0] - u_c[0], nc, n_sub)
+        v_sp = (v_s0_i - v_o_i) + _cell_to_sub(v_hn[0] - v_c[0], nc, n_sub)
+        old_spd = torch.sqrt((u_s0_i - u_o_i) ** 2 + (v_s0_i - v_o_i) ** 2 + 1.0e-4)
+        tau_mag = torch.sqrt(tx_i * tx_i + ty_i * ty_i)
+        drag_c = tau_mag / old_spd
+        tx_n = -drag_c * u_sp
+        ty_n = -drag_c * v_sp
+        return [
+            at_s.rho_d, at_s.theta_m, at_s.u_edge, at_s.w,
+            at_s.q_n, at_s.q_p, at_s.q_c, at_s.q_i, at_s.q_v,
+            du_og, dv_og, du_ng, dv_ng,
+            dthm_o, dqn_o, u_hn, v_hn, u_c, v_c, u_sp, v_sp, tx_n, ty_n,
+        ] + opt_out
+
+    _q_conv_in = model.q_conv_diag if model.q_conv_diag is not None else torch.zeros_like(atmos.theta_m)
+    hdyn_in = [
+        atmos.rho_d, atmos.theta_m, atmos.u_edge, atmos.w,
+        atmos.q_n, atmos.q_p, atmos.q_c, atmos.q_i, atmos.q_v,
+        _q_conv_in, u_sub_0, v_sub_0, u_ocn_sub, v_ocn_sub,
+        sfc_diag_sub.tau_x, sfc_diag_sub.tau_y,
+    ]
     if has_dust_adv:
-        atmos.q_dust_fine = torch.clamp(q_adv[idx_q], min=0.0)
-        atmos.q_dust_coarse = torch.clamp(q_adv[idx_q + 1], min=0.0)
-        atmos.q_dust = atmos.q_dust_fine + atmos.q_dust_coarse
-        idx_q += 2
+        hdyn_in.extend([atmos.q_dust_fine, atmos.q_dust_coarse])
     if has_aero_adv:
-        model.aerosols.q_ss = q_adv[idx_q]
-        model.aerosols.q_so4 = q_adv[idx_q + 1]
-        model.aerosols.q_bc = q_adv[idx_q + 2]
-        model.aerosols.q_oc = q_adv[idx_q + 3]
-        idx_q += 4
+        hdyn_in.extend([model.aerosols.q_ss, model.aerosols.q_so4, model.aerosols.q_bc, model.aerosols.q_oc])
     if has_o3_adv:
-        model.ozone.o3_vmr = torch.clamp(q_adv[idx_q], min=1.0e-10, max=4.0e-5)
-        idx_q += 1
+        hdyn_in.append(model.ozone.o3_vmr)
     if has_nox_adv:
-        model.meso_nox.q_nox = torch.clamp(q_adv[idx_q], min=1.0e-12, max=2.0e-6)
-        idx_q += 1
+        hdyn_in.append(model.meso_nox.q_nox)
     if has_co2_adv:
-        model.prognostic_co2.co2_vmr = torch.clamp(q_adv[idx_q], min=1.0e-5, max=0.05)
-        idx_q += 1
+        hdyn_in.append(model.prognostic_co2.co2_vmr)
     if has_iso_adv:
-        model.water_isotopes.q_v_18o = torch.clamp(q_adv[idx_q], min=0.0)
-        model.water_isotopes.q_v_hdo = torch.clamp(q_adv[idx_q + 1], min=0.0)
-        idx_q += 2
+        hdyn_in.extend([model.water_isotopes.q_v_18o, model.water_isotopes.q_v_hdo])
 
-    dthm_ls = (atmos.theta_m - thm_before_dyn) / dt
-    dqn_ls = (atmos.q_n - qn_before_dyn) / dt
-    u_host_new, v_host_new = reconstruct_cell_winds(mesh, atmos.u_edge)
+    if can_use_cuda_graph(atmos.rho_d.device):
+        hdyn_key = (
+            "super_host_dyn_gwd_fct",
+            id(mesh), id(vgrid), int(atmos.z_c.data_ptr()), nz, nc, n_sub, n_hdyn, round(float(dt), 6),
+            bool(cfg.enable_nonoro_gwd), do_mol_diff, k_mol_s,
+            has_dust_adv, has_aero_adv, has_o3_adv, has_nox_adv, has_co2_adv, has_iso_adv,
+        )
+        hdyn_out = run_cuda_graph_cached(
+            hdyn_key, hdyn_in, _run_host_dyn_gwd_fct_block,
+            warmup_calls=2, clone_outputs=True, suppress_inner_graphs=True,
+        )
+    else:
+        hdyn_out = _run_host_dyn_gwd_fct_block(hdyn_in)
 
-    # Align subcolumn drag with post-dynamics lowest-layer flow shift while retaining subgrid gusts & current feedback
-    u_sub_post = (u_sub_0 - u_ocn_sub) + _cell_to_sub(u_host_new[0] - u_cell[0], nc, n_sub)
-    v_sub_post = (v_sub_0 - v_ocn_sub) + _cell_to_sub(v_host_new[0] - v_cell[0], nc, n_sub)
-    old_spd_sub = torch.sqrt((u_sub_0 - u_ocn_sub) ** 2 + (v_sub_0 - v_ocn_sub) ** 2 + 1.0e-4)
-    tau_mag_sub = torch.sqrt(sfc_diag_sub.tau_x * sfc_diag_sub.tau_x + sfc_diag_sub.tau_y * sfc_diag_sub.tau_y)
-    drag_c_sub = tau_mag_sub / old_spd_sub
-    sfc_diag_sub.tau_x = -drag_c_sub * u_sub_post
-    sfc_diag_sub.tau_y = -drag_c_sub * v_sub_post
+    (
+        atmos.rho_d, atmos.theta_m, atmos.u_edge, atmos.w,
+        atmos.q_n, atmos.q_p, atmos.q_c, atmos.q_i, atmos.q_v,
+        du_oro_c, dv_oro_c, du_ngwd_c, dv_ngwd_c,
+        dthm_ls, dqn_ls, u_host_new, v_host_new, u_cell, v_cell,
+        u_sub_post, v_sub_post, sfc_diag_sub.tau_x, sfc_diag_sub.tau_y,
+    ) = hdyn_out[:23]
+    model.rad_cache["_du_ogwd"] = du_oro_c.detach()
+    model.rad_cache["_dv_ogwd"] = dv_oro_c.detach()
+    if cfg.enable_nonoro_gwd:
+        model.rad_cache["_du_ngwd"] = du_ngwd_c.detach()
+        model.rad_cache["_dv_ngwd"] = dv_ngwd_c.detach()
+    else:
+        model.rad_cache.pop("_du_ngwd", None)
+        model.rad_cache.pop("_dv_ngwd", None)
+    oi = 23
+    if has_dust_adv:
+        atmos.q_dust_fine, atmos.q_dust_coarse, atmos.q_dust = hdyn_out[oi], hdyn_out[oi + 1], hdyn_out[oi + 2]
+        oi += 3
+    if has_aero_adv:
+        model.aerosols.q_ss, model.aerosols.q_so4, model.aerosols.q_bc, model.aerosols.q_oc = hdyn_out[oi : oi + 4]
+        oi += 4
+    if has_o3_adv:
+        model.ozone.o3_vmr = hdyn_out[oi]
+        oi += 1
+    if has_nox_adv:
+        model.meso_nox.q_nox = hdyn_out[oi]
+        oi += 1
+    if has_co2_adv:
+        model.prognostic_co2.co2_vmr = hdyn_out[oi]
+        oi += 1
+    if has_iso_adv:
+        model.water_isotopes.q_v_18o, model.water_isotopes.q_v_hdo = hdyn_out[oi], hdyn_out[oi + 1]
+        oi += 2
 
     # 7. Embedded 2D/3D CRM Physics & Convective Transport with Subgrid Surface Tiles & ICA Radiation
     rain_new_sub = torch.zeros_like(pres_sfc_sub)
@@ -3028,71 +3122,352 @@ def step_aoba_model(
                 update_convective_memory,
             )
 
-            q_rad_cell_pre = _sub_to_cell(q_rad_sub, nc, n_crm)
-            shf_cell_pre = _sub_to_cell(sfc_diag_sub.shf, nc, n_sub)
-            lhf_cell_pre = _sub_to_cell(sfc_diag_sub.lhf, nc, n_sub)
-            evap_cell_pre = _sub_to_cell(sfc_diag_sub.evap, nc, n_sub)
-            buoy_cell_pre_sd = _sub_to_cell(sfc_diag_sub.buoy_flux, nc, n_sub)
-            ustar_cell_pre = _sub_to_cell(sfc_diag_sub.u_star, nc, n_sub)
-            tx_cell_pre = _sub_to_cell(sfc_diag_sub.tau_x, nc, n_sub)
-            ty_cell_pre = _sub_to_cell(sfc_diag_sub.tau_y, nc, n_sub)
-            is_ocn_cell_pre = (sfc.surf_type == SURF_OCEAN)
-            rho_pre_sd = atmos.rho_d.clone()
-            thm_pre_sd = atmos.theta_m.clone()
-            qn_pre_sd = atmos.q_n.clone()
-            qp_pre_sd = atmos.q_p.clone()
-            qv_pre_sd = atmos.q_v.clone()
-            qc_pre_sd = atmos.q_c.clone()
-            qi_pre_sd = atmos.q_i.clone()
-            qke_pre_sd = mean_2d(crm.qke).clone()
-            dx_sfc_eff = float(cfg.crm_dx) * float(bx_full)
-            dy_sfc_eff = float(cfg.crm_dx) * float(by_full)
-            subgrid_struct_sd = compute_subgrid_structure_features(
-                sfc_diag_tile["shf"],
-                sfc_diag_tile["lhf"],
-                sfc_diag_tile["t_rad_sfc"],
-                sfc_diag_tile["alb_vis_dir"],
-                crm.q_n,
-                crm.w,
-                dx=(dx_sfc_eff if has_pool else float(cfg.crm_dx)),
-                dy=(dy_sfc_eff if has_pool else float(cfg.crm_dx)),
-                dx_sfc=dx_sfc_eff,
-                dy_sfc=dy_sfc_eff,
+            _can_super_ossp_t = (
+                can_use_cuda_graph(atmos.rho_d.device)
+                and has_pool
+                and t_pool_idx is not None
+                and s_pool_idx is not None
+                and n_pool_act == pool.n_pool
+                and n_sub > 1
+                and pool.q_rad_valid
             )
-            if has_pool and t_pool_idx is not None:
-                # Overwrite active teacher atmospheric organization invariants with true full-3D `(ny_full, nx_full)` stats
-                subgrid_struct_sd[t_pool_idx, 12:16] = compute_pool_org_invariants(
-                    pool.crm.q_n[:, :n_pool_act],
-                    pool.crm.w[:, :n_pool_act],
-                    dx=float(cfg.crm_dx),
-                    dy=float(cfg.crm_dx),
+            if _can_super_ossp_t:
+                t_idx, s_idx = t_pool_idx, s_pool_idx
+                distill_sel = (t_idx, s_idx)
+                shadow_pool = True
+                use_contig_stu = True
+                sparse_warmup_crm = False
+                rain_3d = rain_new_sub.reshape(nc, ny_t, nx_t)
+                snow_3d = snow_new_sub.reshape(nc, ny_t, nx_t)
+                dx_sfc_eff = float(cfg.crm_dx) * float(bx_full)
+                dy_sfc_eff = float(cfg.crm_dx) * float(by_full)
+                _opt_crm_attrs = ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g")
+                _opt_crm_keys, _opt_crm_vals = _pack_obj_tensors(pool.crm, _opt_crm_attrs)
+                _has_dust_t = bool(cfg.enable_dust and atmos.q_dust is not None)
+                _conv_mem_in = get_convective_memory_features(model.crm_distill, _sub_to_cell(sfc_diag_sub.buoy_flux, nc, n_sub))
+
+                def _super_ossp_pre_teacher_body(inp: list[torch.Tensor]) -> list[torch.Tensor]:
+                    (
+                        q_rad_s_i, shf_s_i, lhf_s_i, evap_s_i, buoy_s_i, ust_s_i,
+                        tx_s_i, ty_s_i, trad_s_i, albv_s_i,
+                        arho_i, athm_i, aqn_i, aqp_i, aqv_i, aqc_i, aqi_i,
+                        cqn_i, cw_i, cthm_i, cqv_i, cqke_i,
+                        uhn_i, vhn_i, dthm_i, dqn_i, usfc_t_i,
+                        t_idx_i, conv_m_i, qrad_pool_i,
+                    ) = inp[:30]
+                    p_core_i = inp[30:41]
+                    p_opt_i = inp[41 : 41 + len(_opt_crm_keys)]
+                    q_dust_i = inp[41 + len(_opt_crm_keys)] if _has_dust_t else None
+
+                    qr_cp = _sub_to_cell(q_rad_s_i, nc, n_crm)
+                    shf_cp = _sub_to_cell(shf_s_i, nc, n_sub)
+                    lhf_cp = _sub_to_cell(lhf_s_i, nc, n_sub)
+                    evap_cp = _sub_to_cell(evap_s_i, nc, n_sub)
+                    buoy_cp = _sub_to_cell(buoy_s_i, nc, n_sub)
+                    ust_cp = _sub_to_cell(ust_s_i, nc, n_sub)
+                    tx_cp = _sub_to_cell(tx_s_i, nc, n_sub)
+                    ty_cp = _sub_to_cell(ty_s_i, nc, n_sub)
+                    is_ocn_cp = (sfc.surf_type == SURF_OCEAN)
+
+                    shf_tl = shf_s_i.reshape(nc, ny_t, nx_t)
+                    lhf_tl = lhf_s_i.reshape(nc, ny_t, nx_t)
+                    evap_tl = evap_s_i.reshape(nc, ny_t, nx_t)
+                    tx_tl = tx_s_i.reshape(nc, ny_t, nx_t)
+                    ty_tl = ty_s_i.reshape(nc, ny_t, nx_t)
+                    ust_tl = ust_s_i.reshape(nc, ny_t, nx_t)
+                    buoy_tl = buoy_s_i.reshape(nc, ny_t, nx_t)
+                    trad_tl = trad_s_i.reshape(nc, ny_t, nx_t)
+                    albv_tl = albv_s_i.reshape(nc, ny_t, nx_t)
+
+                    sstruct = compute_subgrid_structure_features(
+                        shf_tl, lhf_tl, trad_tl, albv_tl, cqn_i, cw_i,
+                        dx=dx_sfc_eff, dy=dy_sfc_eff, dx_sfc=dx_sfc_eff, dy_sfc=dy_sfc_eff,
+                    )
+                    sstruct = sstruct.clone()
+                    sstruct[t_idx_i, 12:16] = compute_pool_org_invariants(
+                        p_core_i[5], p_core_i[3], dx=float(cfg.crm_dx), dy=float(cfg.crm_dx),
+                    )
+                    smaps = extract_subgrid_spatial_maps(
+                        shf_tl, lhf_tl, trad_tl, albv_tl,
+                        _crm4d_to_tile4d(cqn_i), _crm4d_to_tile4d(cw_i),
+                        thm0_3d=_crm3d_to_tile3d(cthm_i[0]), qv0_3d=_crm3d_to_tile3d(cqv_i[0]),
+                    )
+                    x_all, ex_all, _ = extract_crm_distill_features(
+                        arho_i, athm_i, aqv_i, aqc_i, aqi_i, aqp_i,
+                        uhn_i, vhn_i, atmos.dz_c, dthm_i, dqn_i, qr_cp,
+                        shf_cp, lhf_cp, ust_cp, tx_cp, ty_cp,
+                        is_ocn_cp, mesh.f_cell, dt,
+                        subgrid_struct=sstruct, conv_memory=conv_m_i,
+                    )
+                    thm_pls = athm_i + dt * qr_cp * (1.0 + C.RV_OVER_RD * aqv_i) / torch.clamp(ex_all, min=1.0e-3)
+                    qke_hi = mean_2d(cqke_i)
+                    u_m, v_m, thm_m, qn_m, qke_m, _, _, qv_m, qc_m, qi_m = step_mynn_level25(
+                        rho_d=arho_i, u=uhn_i, v=vhn_i, theta_m_c=thm_pls,
+                        q_n=aqn_i, q_v=aqv_i, q_c=aqc_i, q_i=aqi_i, qke=qke_hi,
+                        z_c=atmos.z_c, z_w=atmos.z_w, dz_c=atmos.dz_c,
+                        u_star=ust_cp, sfc_buoy_flux=buoy_cp, tau_x_sfc=tx_cp, tau_y_sfc=ty_cp,
+                        shf_sfc=shf_cp, evap_sfc=evap_cp, dt=dt,
+                        return_hydrometeors=True, do_sat_adj=False,
+                    )
+                    pres_m, ex_m, temp_m = diagnose_pressure_temperature(arho_i, thm_m, qv_m)
+                    z_sfc = torch.zeros_like(shf_cp)
+
+                    sub_c = copy.copy(pool.crm)
+                    sub_c.rho_d = p_core_i[0].clone()
+                    sub_c.u = p_core_i[1].clone()
+                    sub_c.v = p_core_i[2].clone()
+                    sub_c.w = p_core_i[3].clone()
+                    sub_c.theta_m = p_core_i[4].clone()
+                    sub_c.q_n = p_core_i[5].clone()
+                    sub_c.q_p = p_core_i[6].clone()
+                    sub_c.q_v = p_core_i[7].clone()
+                    sub_c.q_c = p_core_i[8].clone()
+                    sub_c.q_i = p_core_i[9].clone()
+                    sub_c.qke = p_core_i[10].clone()
+                    for ak, av in zip(_opt_crm_keys, p_opt_i):
+                        setattr(sub_c, ak, av.clone())
+                    drho_t = (arho_i[:, t_idx_i] - mean_2d(sub_c.rho_d)).unsqueeze(-1).unsqueeze(-1)
+                    sub_c.rho_d = torch.clamp(sub_c.rho_d + drho_t, min=1.0e-8)
+                    sub_c.f_coriolis = mesh.f_cell[t_idx_i]
+
+                    rho_tp = mean_2d(sub_c.rho_d)
+                    inv_rtp = 1.0 / torch.clamp(rho_tp, min=1.0e-8)
+                    thm_tp = mean_2d(sub_c.rho_d * sub_c.theta_m) * inv_rtp + dt * dthm_i[:, t_idx_i]
+                    qn_tp = torch.clamp(mean_2d(sub_c.rho_d * sub_c.q_n) * inv_rtp + dt * dqn_i[:, t_idx_i], min=0.0)
+                    qp_tp = torch.clamp(mean_2d(sub_c.rho_d * sub_c.q_p) * inv_rtp, min=0.0)
+                    qc_tp = torch.clamp(mean_2d(sub_c.rho_d * sub_c.q_c) * inv_rtp, min=0.0)
+                    qi_tp = torch.clamp(mean_2d(sub_c.rho_d * sub_c.q_i) * inv_rtp, min=0.0)
+                    qci_tp = qc_tp + qi_tp
+                    sc_tp = torch.where(qci_tp > qn_tp, qn_tp / torch.clamp(qci_tp, min=1.0e-12), torch.ones_like(qn_tp))
+                    qc_tp = qc_tp * sc_tp
+                    qi_tp = qi_tp * sc_tp
+                    qv_tp = torch.clamp(qn_tp - qc_tp - qi_tp, min=0.0)
+                    qke_tp = mean_2d(sub_c.qke)
+                    qrad_tc = mean_2d(qrad_pool_i)
+
+                    x_t, ex_tp, _ = extract_crm_distill_features(
+                        rho_tp, thm_tp, qv_tp, qc_tp, qi_tp, qp_tp,
+                        uhn_i[:, t_idx_i], vhn_i[:, t_idx_i], atmos.dz_c[:, t_idx_i],
+                        dthm_i[:, t_idx_i], dqn_i[:, t_idx_i], qrad_tc,
+                        shf_cp[t_idx_i], lhf_cp[t_idx_i], ust_cp[t_idx_i],
+                        tx_cp[t_idx_i], ty_cp[t_idx_i], is_ocn_cp[t_idx_i],
+                        mesh.f_cell[t_idx_i], dt,
+                        subgrid_struct=sstruct[t_idx_i], conv_memory=conv_m_i[t_idx_i],
+                    )
+                    thm_plst = thm_tp + dt * qrad_tc * (1.0 + C.RV_OVER_RD * qv_tp) / torch.clamp(ex_tp, min=1.0e-3)
+                    u_mt, v_mt, thm_mt, qn_mt, _, _, _, qv_mt, qc_mt, qi_mt = step_mynn_level25(
+                        rho_d=rho_tp, u=uhn_i[:, t_idx_i], v=vhn_i[:, t_idx_i], theta_m_c=thm_plst,
+                        q_n=qn_tp, q_v=qv_tp, q_c=qc_tp, q_i=qi_tp, qke=qke_tp,
+                        z_c=atmos.z_c[:, t_idx_i], z_w=atmos.z_w[:, t_idx_i], dz_c=atmos.dz_c[:, t_idx_i],
+                        u_star=ust_cp[t_idx_i], sfc_buoy_flux=buoy_cp[t_idx_i],
+                        tau_x_sfc=tx_cp[t_idx_i], tau_y_sfc=ty_cp[t_idx_i],
+                        shf_sfc=shf_cp[t_idx_i], evap_sfc=evap_cp[t_idx_i], dt=dt,
+                        return_hydrometeors=True, do_sat_adj=False,
+                    )
+                    _, ex_mt, temp_mt = diagnose_pressure_temperature(rho_tp, thm_mt, qv_mt)
+
+                    _sfc_d_map = {
+                        "shf": _tile3d_to_crm3d(shf_tl.index_select(0, t_idx_i), to_full=True),
+                        "evap": _tile3d_to_crm3d(evap_tl.index_select(0, t_idx_i), to_full=True),
+                        "tau_x": _tile3d_to_crm3d(tx_tl.index_select(0, t_idx_i), to_full=True),
+                        "tau_y": _tile3d_to_crm3d(ty_tl.index_select(0, t_idx_i), to_full=True),
+                        "u_star": _tile3d_to_crm3d(ust_tl.index_select(0, t_idx_i), to_full=True),
+                        "buoy_flux": _tile3d_to_crm3d(buoy_tl.index_select(0, t_idx_i), to_full=True),
+                    }
+                    _z_dum = _sfc_d_map["shf"]
+                    sub_sfc_t_cg = SurfaceFluxDiagnostics(
+                        shf=_sfc_d_map["shf"],
+                        lhf=_z_dum,
+                        evap=_sfc_d_map["evap"],
+                        tau_x=_sfc_d_map["tau_x"],
+                        tau_y=_sfc_d_map["tau_y"],
+                        u_star=_sfc_d_map["u_star"],
+                        buoy_flux=_sfc_d_map["buoy_flux"],
+                        alb_vis_dir=_z_dum,
+                        alb_vis_dif=_z_dum,
+                        alb_nir_dir=_z_dum,
+                        alb_nir_dif=_z_dum,
+                        t_rad_sfc=_z_dum,
+                        emiss_sfc=_z_dum,
+                        d_disp=_z_dum,
+                        z0m=_z_dum,
+                        runoff_total=_z_dum,
+                        runoff_ice=_z_dum,
+                        gpp=_z_dum,
+                        f_seaice=_z_dum,
+                        f_snow_land=_z_dum,
+                    )
+                    is_ocn_t_cg = (sfc_sub.surf_type == SURF_OCEAN).reshape(nc, ny_t, nx_t)
+                    qd_tin = (
+                        q_dust_i[:, t_idx_i].unsqueeze(-1).unsqueeze(-1).expand(nz, n_pool_act, ny_full, nx_full)
+                        if q_dust_i is not None
+                        else None
+                    )
+                    sp_t_cg = step_crm_physics_and_dynamics(
+                        crm=sub_c, vgrid=vgrid, dt_crm=dt, n_dyn_substeps=cfg.n_crm_dyn_substeps,
+                        u_host_target=uhn_i[:, t_idx_i], v_host_target=vhn_i[:, t_idx_i], tau_sp_mom=dt,
+                        dtheta_m_ls_dt=dthm_i[:, t_idx_i], dq_n_ls_dt=dqn_i[:, t_idx_i],
+                        sfc_fluxes=sub_sfc_t_cg, rad_heating_k_s=qrad_pool_i,
+                        z_c_col=atmos.z_c[:, t_idx_i], z_w_col=atmos.z_w[:, t_idx_i], dz_c_col=atmos.dz_c[:, t_idx_i],
+                        microphysics_scheme=cfg.microphysics_scheme,
+                        is_ocean_sub=_tile3d_to_crm3d(is_ocn_t_cg.index_select(0, t_idx_i), to_full=True),
+                        u_sfc_sub=_tile3d_to_crm3d(usfc_t_i.index_select(0, t_idx_i), to_full=True),
+                        q_dust_sub=qd_tin, k_top_crm=k_top_crm_sp,
+                    )
+
+                    rt_m = mean_2d(sub_c.rho_d)
+                    irt = 1.0 / torch.clamp(rt_m, min=1.0e-8)
+                    thm_po = mean_2d(sub_c.rho_d * sub_c.theta_m) * irt
+                    qn_po = mean_2d(sub_c.rho_d * sub_c.q_n) * irt
+                    qp_po = mean_2d(sub_c.rho_d * sub_c.q_p) * irt
+                    qc_po = mean_2d(sub_c.rho_d * sub_c.q_c) * irt
+                    qi_po = mean_2d(sub_c.rho_d * sub_c.q_i) * irt
+                    u_po = mean_2d(sub_c.u)
+                    v_po = mean_2d(sub_c.v)
+                    if sp_t_cg.precip_rain_sub is not None and sp_t_cg.precip_snow_sub is not None:
+                        rn_tl = _crm3d_to_tile3d(sp_t_cg.precip_rain_sub, from_full=True)
+                        sn_tl = _crm3d_to_tile3d(sp_t_cg.precip_snow_sub, from_full=True)
+                        f_pr_t = mean_2d(((sp_t_cg.precip_rain_sub + sp_t_cg.precip_snow_sub) > 1.0e-7).to(aqn_i.dtype))
+                    else:
+                        rn_tl = sp_t_cg.precip_rain.unsqueeze(-1).unsqueeze(-1).expand(-1, ny_t, nx_t)
+                        sn_tl = sp_t_cg.precip_snow.unsqueeze(-1).unsqueeze(-1).expand(-1, ny_t, nx_t)
+                        f_pr_t = ((sp_t_cg.precip_rain + sp_t_cg.precip_snow) > 1.0e-7).to(aqn_i.dtype)
+                    f_cl_t = mean_2d(((sub_c.q_c + sub_c.q_i) > 1.0e-6).to(aqn_i.dtype))
+                    cp_t, cs_t, tp_t, ts_t = pack_teacher_context_and_targets(
+                        rho_tp, atmos.dz_c[:, t_idx_i], ex_mt, temp_mt[0],
+                        thm_mt, qn_mt, qp_tp, qc_mt, qi_mt, u_mt, v_mt,
+                        z_sfc[t_idx_i], z_sfc[t_idx_i], z_sfc[t_idx_i], z_sfc[t_idx_i],
+                        thm_po, qn_po, qp_po, qc_po, qi_po, u_po, v_po,
+                        sp_t_cg.precip_rain, sp_t_cg.precip_snow, f_cl_t, f_pr_t,
+                    )
+                    th0_tl = _crm3d_to_tile3d(sub_c.theta_m[0], from_full=True)
+                    qv0_tl = _crm3d_to_tile3d(sub_c.q_v[0], from_full=True)
+                    u0_tl = _crm3d_to_tile3d(sub_c.u[0], from_full=True)
+                    v0_tl = _crm3d_to_tile3d(sub_c.v[0], from_full=True)
+                    tmaps_t, hmap_t = extract_spatial_targets(
+                        _crm4d_to_tile4d(sub_c.q_c, from_full=True),
+                        _crm4d_to_tile4d(sub_c.q_i, from_full=True),
+                        rn_tl, sn_tl, rho_tp * atmos.dz_c[:, t_idx_i],
+                        thm0_3d=th0_tl, qv0_3d=qv0_tl, u0_3d=u0_tl, v0_3d=v0_tl,
+                    )
+                    p_core_out = [
+                        sub_c.rho_d, sub_c.u, sub_c.v, sub_c.w, sub_c.theta_m,
+                        sub_c.q_n, sub_c.q_p, sub_c.q_v, sub_c.q_c, sub_c.q_i, sub_c.qke,
+                    ]
+                    p_opt_out = [getattr(sub_c, ak) for ak in _opt_crm_keys]
+                    return [
+                        buoy_cp, x_all, smaps, ex_all,
+                        u_m, v_m, thm_m, qn_m, qke_m, qv_m, qc_m, qi_m, pres_m, ex_m, temp_m, z_sfc,
+                        x_t, cp_t, cs_t, tp_t, ts_t, tmaps_t, hmap_t,
+                        rn_tl, sn_tl, th0_tl, qv0_tl,
+                        thm_po, qn_po, qc_po, qi_po, u_po, v_po, sp_t_cg.precip_rain, sp_t_cg.precip_snow, f_cl_t,
+                        rho_tp, ex_mt, temp_mt[0], thm_mt, qn_mt, qp_tp, qc_mt, qi_mt, u_mt, v_mt,
+                    ] + p_core_out + p_opt_out
+
+                ossp_t_in = [
+                    q_rad_sub, sfc_diag_sub.shf, sfc_diag_sub.lhf, sfc_diag_sub.evap, sfc_diag_sub.buoy_flux, sfc_diag_sub.u_star,
+                    sfc_diag_sub.tau_x, sfc_diag_sub.tau_y, sfc_diag_sub.t_rad_sfc, sfc_diag_sub.alb_vis_dir,
+                    atmos.rho_d, atmos.theta_m, atmos.q_n, atmos.q_p, atmos.q_v, atmos.q_c, atmos.q_i,
+                    crm.q_n, crm.w, crm.theta_m, crm.q_v, crm.qke,
+                    u_host_new, v_host_new, dthm_ls, dqn_ls, u_sfc_tile,
+                    t_idx, _conv_mem_in, pool.q_rad[:, :n_pool_act],
+                    pool.crm.rho_d, pool.crm.u, pool.crm.v, pool.crm.w, pool.crm.theta_m,
+                    pool.crm.q_n, pool.crm.q_p, pool.crm.q_v, pool.crm.q_c, pool.crm.q_i, pool.crm.qke,
+                ] + _opt_crm_vals + ([atmos.q_dust] if _has_dust_t else [])
+                ossp_t_key = (
+                    "super_ossp_pre_teacher",
+                    id(mesh), id(vgrid), int(atmos.z_c.data_ptr()), nz, nc, n_sub, n_pool_act, ny_full, nx_full, ny_t, nx_t,
+                    round(float(dt), 6), str(cfg.microphysics_scheme), k_top_crm_sp,
+                    _has_dust_t, _opt_crm_keys,
                 )
-            if n_sub > 1:
-                sub_maps_all_sd = extract_subgrid_spatial_maps(
+                ossp_t_out = run_cuda_graph_cached(
+                    ossp_t_key, ossp_t_in, _super_ossp_pre_teacher_body,
+                    warmup_calls=2, clone_outputs=True, suppress_inner_graphs=True,
+                )
+                (
+                    buoy_cell_pre_sd, x_all_sd, sub_maps_all_sd, exner_all_sd,
+                    u_mynn_sd, v_mynn_sd, thm_mynn_sd, qn_mynn_sd, qke_mynn_sd,
+                    qv_mynn_sd, qc_mynn_sd, qi_mynn_sd, pres_mynn_sd, exner_mynn_sd, temp_mynn_sd, zero_sfc_sd,
+                    x_train_t, ctx_p_t, ctx_s_t, tgt_p_t, tgt_s_t, tgt_maps_t, has_map_t,
+                    rain_t_tile, snow_t_tile, thm0_t_tile, qv0_t_tile,
+                    thm_t_post, qn_t_post, qc_t_post, qi_t_post, u_t_post, v_t_post, sp_t_rain, sp_t_snow, f_cld_t,
+                    rho_ctx_t, ex_ctx_t, t0_ctx_t, thm_ctx_t, qn_ctx_t, qp_ctx_t, qc_ctx_t, qi_ctx_t, u_ctx_t, v_ctx_t,
+                ) = ossp_t_out[:46]
+                (
+                    pool.crm.rho_d, pool.crm.u, pool.crm.v, pool.crm.w, pool.crm.theta_m,
+                    pool.crm.q_n, pool.crm.q_p, pool.crm.q_v, pool.crm.q_c, pool.crm.q_i, pool.crm.qke,
+                ) = ossp_t_out[46:57]
+                _write_back_obj_tensors(pool.crm, _opt_crm_keys, ossp_t_out[57 : 57 + len(_opt_crm_keys)])
+                sub_crm_t = pool.crm
+                rho_pre_sd = atmos.rho_d
+                qp_pre_sd = atmos.q_p
+                sp_t = type("_SpT", (), {"precip_rain": sp_t_rain, "precip_snow": sp_t_snow})()
+            else:
+                q_rad_cell_pre = _sub_to_cell(q_rad_sub, nc, n_crm)
+                shf_cell_pre = _sub_to_cell(sfc_diag_sub.shf, nc, n_sub)
+                lhf_cell_pre = _sub_to_cell(sfc_diag_sub.lhf, nc, n_sub)
+                evap_cell_pre = _sub_to_cell(sfc_diag_sub.evap, nc, n_sub)
+                buoy_cell_pre_sd = _sub_to_cell(sfc_diag_sub.buoy_flux, nc, n_sub)
+                ustar_cell_pre = _sub_to_cell(sfc_diag_sub.u_star, nc, n_sub)
+                tx_cell_pre = _sub_to_cell(sfc_diag_sub.tau_x, nc, n_sub)
+                ty_cell_pre = _sub_to_cell(sfc_diag_sub.tau_y, nc, n_sub)
+                is_ocn_cell_pre = (sfc.surf_type == SURF_OCEAN)
+                rho_pre_sd = atmos.rho_d.clone()
+                thm_pre_sd = atmos.theta_m.clone()
+                qn_pre_sd = atmos.q_n.clone()
+                qp_pre_sd = atmos.q_p.clone()
+                qv_pre_sd = atmos.q_v.clone()
+                qc_pre_sd = atmos.q_c.clone()
+                qi_pre_sd = atmos.q_i.clone()
+                qke_pre_sd = mean_2d(crm.qke).clone()
+                dx_sfc_eff = float(cfg.crm_dx) * float(bx_full)
+                dy_sfc_eff = float(cfg.crm_dx) * float(by_full)
+                subgrid_struct_sd = compute_subgrid_structure_features(
                     sfc_diag_tile["shf"],
                     sfc_diag_tile["lhf"],
                     sfc_diag_tile["t_rad_sfc"],
                     sfc_diag_tile["alb_vis_dir"],
-                    _crm4d_to_tile4d(crm.q_n),
-                    _crm4d_to_tile4d(crm.w),
-                    thm0_3d=_crm3d_to_tile3d(crm.theta_m[0]),
-                    qv0_3d=_crm3d_to_tile3d(crm.q_v[0]),
+                    crm.q_n,
+                    crm.w,
+                    dx=(dx_sfc_eff if has_pool else float(cfg.crm_dx)),
+                    dy=(dy_sfc_eff if has_pool else float(cfg.crm_dx)),
+                    dx_sfc=dx_sfc_eff,
+                    dy_sfc=dy_sfc_eff,
                 )
-            conv_mem_sd = get_convective_memory_features(model.crm_distill, buoy_cell_pre_sd)
-            x_all_sd, exner_all_sd, temp_all_sd = extract_crm_distill_features(
-                rho_pre_sd, thm_pre_sd, qv_pre_sd, qc_pre_sd, qi_pre_sd, qp_pre_sd,
-                u_host_new, v_host_new, atmos.dz_c, dthm_ls, dqn_ls, q_rad_cell_pre,
-                shf_cell_pre, lhf_cell_pre, ustar_cell_pre, tx_cell_pre, ty_cell_pre,
-                is_ocn_cell_pre, mesh.f_cell, dt,
-                subgrid_struct=subgrid_struct_sd,
-                conv_memory=conv_mem_sd,
-            )
-            thm_post_ls_sd = thm_pre_sd + dt * q_rad_cell_pre * (1.0 + C.RV_OVER_RD * qv_pre_sd) / torch.clamp(exner_all_sd, min=1.0e-3)
-            sparse_warmup_crm = (ny > 1 and nx > 1 and m_crm > 100_000)
-            if has_pool and t_pool_idx is not None and s_pool_idx is not None:
-                distill_sel = (t_pool_idx, s_pool_idx)
-            else:
-                distill_sel = select_teacher_indices(model.crm_distill, allow_sparse_warmup=sparse_warmup_crm)
+                if has_pool and t_pool_idx is not None:
+                    # Overwrite active teacher atmospheric organization invariants with true full-3D `(ny_full, nx_full)` stats
+                    subgrid_struct_sd[t_pool_idx, 12:16] = compute_pool_org_invariants(
+                        pool.crm.q_n[:, :n_pool_act],
+                        pool.crm.w[:, :n_pool_act],
+                        dx=float(cfg.crm_dx),
+                        dy=float(cfg.crm_dx),
+                    )
+                if n_sub > 1:
+                    sub_maps_all_sd = extract_subgrid_spatial_maps(
+                        sfc_diag_tile["shf"],
+                        sfc_diag_tile["lhf"],
+                        sfc_diag_tile["t_rad_sfc"],
+                        sfc_diag_tile["alb_vis_dir"],
+                        _crm4d_to_tile4d(crm.q_n),
+                        _crm4d_to_tile4d(crm.w),
+                        thm0_3d=_crm3d_to_tile3d(crm.theta_m[0]),
+                        qv0_3d=_crm3d_to_tile3d(crm.q_v[0]),
+                    )
+                conv_mem_sd = get_convective_memory_features(model.crm_distill, buoy_cell_pre_sd)
+                x_all_sd, exner_all_sd, temp_all_sd = extract_crm_distill_features(
+                    rho_pre_sd, thm_pre_sd, qv_pre_sd, qc_pre_sd, qi_pre_sd, qp_pre_sd,
+                    u_host_new, v_host_new, atmos.dz_c, dthm_ls, dqn_ls, q_rad_cell_pre,
+                    shf_cell_pre, lhf_cell_pre, ustar_cell_pre, tx_cell_pre, ty_cell_pre,
+                    is_ocn_cell_pre, mesh.f_cell, dt,
+                    subgrid_struct=subgrid_struct_sd,
+                    conv_memory=conv_mem_sd,
+                )
+                thm_post_ls_sd = thm_pre_sd + dt * q_rad_cell_pre * (1.0 + C.RV_OVER_RD * qv_pre_sd) / torch.clamp(exner_all_sd, min=1.0e-3)
+                sparse_warmup_crm = (ny > 1 and nx > 1 and m_crm > 100_000)
+                if has_pool and t_pool_idx is not None and s_pool_idx is not None:
+                    distill_sel = (t_pool_idx, s_pool_idx)
+                else:
+                    distill_sel = select_teacher_indices(model.crm_distill, allow_sparse_warmup=sparse_warmup_crm)
 
         lt_teacher_crm = None
         lt_t_idx = None
@@ -3100,333 +3475,327 @@ def step_aoba_model(
         lt_rain_t = None
         lt_snow_t = None
         if distill_sel is not None and model.crm_distill is not None:
-            t_idx, s_idx = distill_sel
-            rain_3d = rain_new_sub.reshape(nc, ny_t, nx_t)
-            snow_3d = snow_new_sub.reshape(nc, ny_t, nx_t)
+            if not _can_super_ossp_t:
+                t_idx, s_idx = distill_sel
+                rain_3d = rain_new_sub.reshape(nc, ny_t, nx_t)
+                snow_3d = snow_new_sub.reshape(nc, ny_t, nx_t)
 
-            # Operator-split OSSP baseline: advance stiff 1D vertical MYNN Level 2.5 PBL mixing and
-            # surface flux injection analytically on all host columns (`[nz, nc]`, single fused tridiagonal
-            # kernel) so surrogate columns preserve exact boundary-layer physics and unconditional vertical
-            # stability while the neural surrogate emulates purely 3D convective transport and microphysics.
-            buoy_cell_pre = _sub_to_cell(sfc_diag_sub.buoy_flux, nc, n_sub)
-            qke_host_in = mean_2d(crm.qke)
-            (
-                u_mynn_sd, v_mynn_sd, thm_mynn_sd, qn_mynn_sd, qke_mynn_sd,
-                _, _, qv_mynn_sd, qc_mynn_sd, qi_mynn_sd,
-            ) = step_mynn_level25(
-                rho_d=rho_pre_sd,
-                u=u_host_new,
-                v=v_host_new,
-                theta_m_c=thm_post_ls_sd,
-                q_n=qn_pre_sd,
-                q_v=qv_pre_sd,
-                q_c=qc_pre_sd,
-                q_i=qi_pre_sd,
-                qke=qke_host_in,
-                z_c=atmos.z_c,
-                z_w=atmos.z_w,
-                dz_c=atmos.dz_c,
-                u_star=ustar_cell_pre,
-                sfc_buoy_flux=buoy_cell_pre,
-                tau_x_sfc=tx_cell_pre,
-                tau_y_sfc=ty_cell_pre,
-                shf_sfc=shf_cell_pre,
-                evap_sfc=evap_cell_pre,
-                dt=dt,
-                return_hydrometeors=True,
-                do_sat_adj=False,
-            )
-            pres_mynn_sd, exner_mynn_sd, temp_mynn_sd = diagnose_pressure_temperature(rho_pre_sd, thm_mynn_sd, qv_mynn_sd)
-            zero_sfc_sd = torch.zeros_like(shf_cell_pre)
+                # Operator-split OSSP baseline: advance stiff 1D vertical MYNN Level 2.5 PBL mixing and
+                # surface flux injection analytically on all host columns (`[nz, nc]`, single fused tridiagonal
+                # kernel) so surrogate columns preserve exact boundary-layer physics and unconditional vertical
+                # stability while the neural surrogate emulates purely 3D convective transport and microphysics.
+                buoy_cell_pre = _sub_to_cell(sfc_diag_sub.buoy_flux, nc, n_sub)
+                qke_host_in = mean_2d(crm.qke)
+                (
+                    u_mynn_sd, v_mynn_sd, thm_mynn_sd, qn_mynn_sd, qke_mynn_sd,
+                    _, _, qv_mynn_sd, qc_mynn_sd, qi_mynn_sd,
+                ) = step_mynn_level25(
+                    rho_d=rho_pre_sd,
+                    u=u_host_new,
+                    v=v_host_new,
+                    theta_m_c=thm_post_ls_sd,
+                    q_n=qn_pre_sd,
+                    q_v=qv_pre_sd,
+                    q_c=qc_pre_sd,
+                    q_i=qi_pre_sd,
+                    qke=qke_host_in,
+                    z_c=atmos.z_c,
+                    z_w=atmos.z_w,
+                    dz_c=atmos.dz_c,
+                    u_star=ustar_cell_pre,
+                    sfc_buoy_flux=buoy_cell_pre,
+                    tau_x_sfc=tx_cell_pre,
+                    tau_y_sfc=ty_cell_pre,
+                    shf_sfc=shf_cell_pre,
+                    evap_sfc=evap_cell_pre,
+                    dt=dt,
+                    return_hydrometeors=True,
+                    do_sat_adj=False,
+                )
+                pres_mynn_sd, exner_mynn_sd, temp_mynn_sd = diagnose_pressure_temperature(rho_pre_sd, thm_mynn_sd, qv_mynn_sd)
+                zero_sfc_sd = torch.zeros_like(shf_cell_pre)
 
-            # 7a-i. Execute genuine 2D/3D CRM strictly on the active teacher subset (`1 / stride` columns).
-            # In SparseCRMPool mode (`shadow_pool = True`), teachers run shadow-coupled to the live host
-            # column mean (preserving 100% of their 2D/3D subgrid convective plumes & cold pools) without
-            # overwriting isolated single host cells, eliminating single-cell CISK chimneys & donut halos.
-            shadow_pool = bool(has_pool)
-            use_contig_stu = shadow_pool or (int(t_idx.numel()) * 4 < nc)
-            if has_pool:
-                n_t = n_pool_act
-                if n_t == pool.n_pool:
-                    sub_crm_t = pool.crm
+                # 7a-i. Execute genuine 2D/3D CRM strictly on the active teacher subset (`1 / stride` columns).
+                # In SparseCRMPool mode (`shadow_pool = True`), teachers run shadow-coupled to the live host
+                # column mean (preserving 100% of their 2D/3D subgrid convective plumes & cold pools) without
+                # overwriting isolated single host cells, eliminating single-cell CISK chimneys & donut halos.
+                shadow_pool = bool(has_pool)
+                use_contig_stu = shadow_pool or (int(t_idx.numel()) * 4 < nc)
+                if has_pool:
+                    n_t = n_pool_act
+                    if n_t == pool.n_pool:
+                        sub_crm_t = pool.crm
+                    else:
+                        sub_crm_t = CRMState(
+                            rho_d=pool.crm.rho_d[:, :n_t],
+                            u=pool.crm.u[:, :n_t],
+                            v=pool.crm.v[:, :n_t],
+                            w=pool.crm.w[:, :n_t],
+                            theta_m=pool.crm.theta_m[:, :n_t],
+                            q_n=pool.crm.q_n[:, :n_t],
+                            q_p=pool.crm.q_p[:, :n_t],
+                            q_v=pool.crm.q_v[:, :n_t],
+                            q_c=pool.crm.q_c[:, :n_t],
+                            q_i=pool.crm.q_i[:, :n_t],
+                            qke=pool.crm.qke[:, :n_t],
+                            dx=float(cfg.crm_dx),
+                            dy=float(cfg.crm_dx),
+                            f_coriolis=mesh.f_cell[t_idx],
+                            n_c=pool.crm.n_c[:, :n_t] if pool.crm.n_c is not None else None,
+                            n_i=pool.crm.n_i[:, :n_t] if pool.crm.n_i is not None else None,
+                            q_r=pool.crm.q_r[:, :n_t] if getattr(pool.crm, "q_r", None) is not None else None,
+                            q_s=pool.crm.q_s[:, :n_t] if getattr(pool.crm, "q_s", None) is not None else None,
+                            q_g=pool.crm.q_g[:, :n_t] if getattr(pool.crm, "q_g", None) is not None else None,
+                            n_r=pool.crm.n_r[:, :n_t] if getattr(pool.crm, "n_r", None) is not None else None,
+                            n_s=pool.crm.n_s[:, :n_t] if getattr(pool.crm, "n_s", None) is not None else None,
+                            n_g=pool.crm.n_g[:, :n_t] if getattr(pool.crm, "n_g", None) is not None else None,
+                        )
+                    drho_t = (atmos.rho_d[:, t_idx] - mean_2d(sub_crm_t.rho_d)).unsqueeze(-1).unsqueeze(-1)
+                    sub_crm_t.rho_d = torch.clamp(sub_crm_t.rho_d + drho_t, min=1.0e-8)
+                    sub_crm_t.f_coriolis = mesh.f_cell[t_idx]
+                    q_rad_t_in = (
+                        pool.q_rad[:, :n_t]
+                        if pool.q_rad_valid
+                        else _tile4d_to_crm4d(q_rad_4d[:, t_idx], to_full=True)
+                    )
+                    if shadow_pool:
+                        rho_t_pre = mean_2d(sub_crm_t.rho_d)
+                        inv_rt_pre = 1.0 / torch.clamp(rho_t_pre, min=1.0e-8)
+                        thm_t_pre = mean_2d(sub_crm_t.rho_d * sub_crm_t.theta_m) * inv_rt_pre + dt * dthm_ls[:, t_idx]
+                        qn_t_pre = torch.clamp(
+                            mean_2d(sub_crm_t.rho_d * sub_crm_t.q_n) * inv_rt_pre + dt * dqn_ls[:, t_idx],
+                            min=0.0,
+                        )
+                        qp_t_pre = torch.clamp(mean_2d(sub_crm_t.rho_d * sub_crm_t.q_p) * inv_rt_pre, min=0.0)
+                        qc_t_pre = torch.clamp(mean_2d(sub_crm_t.rho_d * sub_crm_t.q_c) * inv_rt_pre, min=0.0)
+                        qi_t_pre = torch.clamp(mean_2d(sub_crm_t.rho_d * sub_crm_t.q_i) * inv_rt_pre, min=0.0)
+                        qci_t_pre = qc_t_pre + qi_t_pre
+                        sc_t_pre = torch.where(
+                            qci_t_pre > qn_t_pre,
+                            qn_t_pre / torch.clamp(qci_t_pre, min=1.0e-12),
+                            torch.ones_like(qn_t_pre),
+                        )
+                        qc_t_pre = qc_t_pre * sc_t_pre
+                        qi_t_pre = qi_t_pre * sc_t_pre
+                        qv_t_pre = torch.clamp(qn_t_pre - qc_t_pre - qi_t_pre, min=0.0)
+                        qke_t_pre = mean_2d(sub_crm_t.qke)
+                        q_rad_t_cell = mean_2d(q_rad_t_in)
+                        x_t_sd, exner_t_pre, _ = extract_crm_distill_features(
+                            rho_t_pre, thm_t_pre, qv_t_pre, qc_t_pre, qi_t_pre, qp_t_pre,
+                            u_host_new[:, t_idx], v_host_new[:, t_idx], atmos.dz_c[:, t_idx],
+                            dthm_ls[:, t_idx], dqn_ls[:, t_idx], q_rad_t_cell,
+                            shf_cell_pre[t_idx], lhf_cell_pre[t_idx], ustar_cell_pre[t_idx],
+                            tx_cell_pre[t_idx], ty_cell_pre[t_idx], is_ocn_cell_pre[t_idx],
+                            mesh.f_cell[t_idx], dt,
+                            subgrid_struct=subgrid_struct_sd[t_idx],
+                            conv_memory=conv_mem_sd[t_idx],
+                        )
+                        thm_post_ls_t = thm_t_pre + dt * q_rad_t_cell * (1.0 + C.RV_OVER_RD * qv_t_pre) / torch.clamp(exner_t_pre, min=1.0e-3)
+                        (
+                            u_mynn_t, v_mynn_t, thm_mynn_t, qn_mynn_t, _,
+                            _, _, qv_mynn_t, qc_mynn_t, qi_mynn_t,
+                        ) = step_mynn_level25(
+                            rho_d=rho_t_pre,
+                            u=u_host_new[:, t_idx],
+                            v=v_host_new[:, t_idx],
+                            theta_m_c=thm_post_ls_t,
+                            q_n=qn_t_pre,
+                            q_v=qv_t_pre,
+                            q_c=qc_t_pre,
+                            q_i=qi_t_pre,
+                            qke=qke_t_pre,
+                            z_c=atmos.z_c[:, t_idx],
+                            z_w=atmos.z_w[:, t_idx],
+                            dz_c=atmos.dz_c[:, t_idx],
+                            u_star=ustar_cell_pre[t_idx],
+                            sfc_buoy_flux=buoy_cell_pre[t_idx],
+                            tau_x_sfc=tx_cell_pre[t_idx],
+                            tau_y_sfc=ty_cell_pre[t_idx],
+                            shf_sfc=shf_cell_pre[t_idx],
+                            evap_sfc=evap_cell_pre[t_idx],
+                            dt=dt,
+                            return_hydrometeors=True,
+                            do_sat_adj=False,
+                        )
+                        _, exner_mynn_t, temp_mynn_t = diagnose_pressure_temperature(rho_t_pre, thm_mynn_t, qv_mynn_t)
+                    _crm_sfc_keys = ("shf", "evap", "tau_x", "tau_y", "u_star", "buoy_flux")
+                    sub_sfc_t = SurfaceFluxDiagnostics(
+                        **{
+                            k: (_tile3d_to_crm3d(v.index_select(0, t_idx), to_full=True) if k in _crm_sfc_keys else v.index_select(0, t_idx))
+                            for k, v in sfc_diag_tile.items()
+                        }
+                    )
+                    q_dust_t_in = (
+                        atmos.q_dust[:, t_idx].unsqueeze(-1).unsqueeze(-1).expand(nz, n_t, ny_full, nx_full)
+                        if (cfg.enable_dust and atmos.q_dust is not None)
+                        else None
+                    )
+                    sp_t = step_crm_physics_and_dynamics(
+                        crm=sub_crm_t,
+                        vgrid=vgrid,
+                        dt_crm=dt,
+                        n_dyn_substeps=cfg.n_crm_dyn_substeps,
+                        u_host_target=u_host_new[:, t_idx],
+                        v_host_target=v_host_new[:, t_idx],
+                        tau_sp_mom=dt,
+                        dtheta_m_ls_dt=dthm_ls[:, t_idx],
+                        dq_n_ls_dt=dqn_ls[:, t_idx],
+                        sfc_fluxes=sub_sfc_t,
+                        rad_heating_k_s=q_rad_t_in,
+                        z_c_col=atmos.z_c[:, t_idx],
+                        z_w_col=atmos.z_w[:, t_idx],
+                        dz_c_col=atmos.dz_c[:, t_idx],
+                        microphysics_scheme=cfg.microphysics_scheme,
+                        is_ocean_sub=_tile3d_to_crm3d(is_ocn_tile[t_idx], to_full=True),
+                        u_sfc_sub=_tile3d_to_crm3d(u_sfc_tile[t_idx], to_full=True),
+                        q_dust_sub=q_dust_t_in,
+                        k_top_crm=k_top_crm_sp,
+                    )
+                    if n_t < pool.n_pool:
+                        pool.crm.rho_d[:, :n_t] = sub_crm_t.rho_d
+                        pool.crm.u[:, :n_t] = sub_crm_t.u
+                        pool.crm.v[:, :n_t] = sub_crm_t.v
+                        pool.crm.w[:, :n_t] = sub_crm_t.w
+                        pool.crm.theta_m[:, :n_t] = sub_crm_t.theta_m
+                        pool.crm.q_n[:, :n_t] = sub_crm_t.q_n
+                        pool.crm.q_p[:, :n_t] = sub_crm_t.q_p
+                        pool.crm.q_v[:, :n_t] = sub_crm_t.q_v
+                        pool.crm.q_c[:, :n_t] = sub_crm_t.q_c
+                        pool.crm.q_i[:, :n_t] = sub_crm_t.q_i
+                        pool.crm.qke[:, :n_t] = sub_crm_t.qke
+                    for opt_attr in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
+                        src_f = getattr(sub_crm_t, opt_attr, None)
+                        if src_f is not None:
+                            if not shadow_pool:
+                                dst_f = getattr(crm, opt_attr, None)
+                                if dst_f is None:
+                                    dst_f = torch.zeros_like(crm.q_c)
+                                    setattr(crm, opt_attr, dst_f)
+                                dst_f.index_copy_(1, t_idx, _crm4d_to_tile4d(src_f, from_full=True))
+                            if n_t < pool.n_pool:
+                                p_dst = getattr(pool.crm, opt_attr, None)
+                                if p_dst is None:
+                                    p_dst = torch.zeros_like(pool.crm.q_c)
+                                    setattr(pool.crm, opt_attr, p_dst)
+                                p_dst[:, :n_t] = src_f
                 else:
+                    rho_crm_t = crm.rho_d[:, t_idx]
+                    drho_t = (atmos.rho_d[:, t_idx] - mean_2d(rho_crm_t)).unsqueeze(-1).unsqueeze(-1)
                     sub_crm_t = CRMState(
-                        rho_d=pool.crm.rho_d[:, :n_t],
-                        u=pool.crm.u[:, :n_t],
-                        v=pool.crm.v[:, :n_t],
-                        w=pool.crm.w[:, :n_t],
-                        theta_m=pool.crm.theta_m[:, :n_t],
-                        q_n=pool.crm.q_n[:, :n_t],
-                        q_p=pool.crm.q_p[:, :n_t],
-                        q_v=pool.crm.q_v[:, :n_t],
-                        q_c=pool.crm.q_c[:, :n_t],
-                        q_i=pool.crm.q_i[:, :n_t],
-                        qke=pool.crm.qke[:, :n_t],
-                        dx=float(cfg.crm_dx),
-                        dy=float(cfg.crm_dx),
+                        rho_d=torch.clamp(rho_crm_t + drho_t, min=1.0e-8),
+                        u=crm.u[:, t_idx],
+                        v=crm.v[:, t_idx],
+                        w=crm.w[:, t_idx],
+                        theta_m=crm.theta_m[:, t_idx],
+                        q_n=crm.q_n[:, t_idx],
+                        q_p=crm.q_p[:, t_idx],
+                        q_v=crm.q_v[:, t_idx],
+                        q_c=crm.q_c[:, t_idx],
+                        q_i=crm.q_i[:, t_idx],
+                        qke=crm.qke[:, t_idx],
+                        dx=cfg.crm_dx,
+                        dy=cfg.crm_dx,
                         f_coriolis=mesh.f_cell[t_idx],
-                        n_c=pool.crm.n_c[:, :n_t] if pool.crm.n_c is not None else None,
-                        n_i=pool.crm.n_i[:, :n_t] if pool.crm.n_i is not None else None,
-                        q_r=pool.crm.q_r[:, :n_t] if getattr(pool.crm, "q_r", None) is not None else None,
-                        q_s=pool.crm.q_s[:, :n_t] if getattr(pool.crm, "q_s", None) is not None else None,
-                        q_g=pool.crm.q_g[:, :n_t] if getattr(pool.crm, "q_g", None) is not None else None,
-                        n_r=pool.crm.n_r[:, :n_t] if getattr(pool.crm, "n_r", None) is not None else None,
-                        n_s=pool.crm.n_s[:, :n_t] if getattr(pool.crm, "n_s", None) is not None else None,
-                        n_g=pool.crm.n_g[:, :n_t] if getattr(pool.crm, "n_g", None) is not None else None,
+                        n_c=crm.n_c[:, t_idx] if crm.n_c is not None else None,
+                        n_i=crm.n_i[:, t_idx] if crm.n_i is not None else None,
+                        q_r=crm.q_r[:, t_idx] if getattr(crm, "q_r", None) is not None else None,
+                        q_s=crm.q_s[:, t_idx] if getattr(crm, "q_s", None) is not None else None,
+                        q_g=crm.q_g[:, t_idx] if getattr(crm, "q_g", None) is not None else None,
+                        n_r=crm.n_r[:, t_idx] if getattr(crm, "n_r", None) is not None else None,
+                        n_s=crm.n_s[:, t_idx] if getattr(crm, "n_s", None) is not None else None,
+                        n_g=crm.n_g[:, t_idx] if getattr(crm, "n_g", None) is not None else None,
                     )
-                drho_t = (atmos.rho_d[:, t_idx] - mean_2d(sub_crm_t.rho_d)).unsqueeze(-1).unsqueeze(-1)
-                sub_crm_t.rho_d = torch.clamp(sub_crm_t.rho_d + drho_t, min=1.0e-8)
-                sub_crm_t.f_coriolis = mesh.f_cell[t_idx]
-                q_rad_t_in = (
-                    pool.q_rad[:, :n_t]
-                    if pool.q_rad_valid
-                    else _tile4d_to_crm4d(q_rad_4d[:, t_idx], to_full=True)
-                )
-                if shadow_pool:
-                    # Detached-dwell shadow teacher: `sub_crm_t` evolves freely under host advective
-                    # tendencies (`dthm_ls`, `dqn_ls`), surface fluxes, and 32-col radiation without
-                    # per-step mean overwrites (which would re-inject infinite CAPE into active plumes).
-                    # Build exact self-consistent pre-step teacher features & MYNN baseline directly
-                    # from `sub_crm_t`'s own pre-step column mean so training pairs satisfy exact
-                    # column conservation while host columns stay 100% spatially homogeneous.
-                    rho_t_pre = mean_2d(sub_crm_t.rho_d)
-                    inv_rt_pre = 1.0 / torch.clamp(rho_t_pre, min=1.0e-8)
-                    thm_t_pre = mean_2d(sub_crm_t.rho_d * sub_crm_t.theta_m) * inv_rt_pre + dt * dthm_ls[:, t_idx]
-                    qn_t_pre = torch.clamp(
-                        mean_2d(sub_crm_t.rho_d * sub_crm_t.q_n) * inv_rt_pre + dt * dqn_ls[:, t_idx],
-                        min=0.0,
+                    sub_sfc_t = SurfaceFluxDiagnostics(**{k: _tile3d_to_crm3d(v[t_idx]) for k, v in sfc_diag_tile.items()})
+                    sp_t = step_crm_physics_and_dynamics(
+                        crm=sub_crm_t,
+                        vgrid=vgrid,
+                        dt_crm=dt,
+                        n_dyn_substeps=cfg.n_crm_dyn_substeps,
+                        u_host_target=u_host_new[:, t_idx],
+                        v_host_target=v_host_new[:, t_idx],
+                        tau_sp_mom=dt,
+                        dtheta_m_ls_dt=dthm_ls[:, t_idx],
+                        dq_n_ls_dt=dqn_ls[:, t_idx],
+                        sfc_fluxes=sub_sfc_t,
+                        rad_heating_k_s=q_rad_4d[:, t_idx],
+                        z_c_col=atmos.z_c[:, t_idx],
+                        z_w_col=atmos.z_w[:, t_idx],
+                        dz_c_col=atmos.dz_c[:, t_idx],
+                        microphysics_scheme=cfg.microphysics_scheme,
+                        is_ocean_sub=_tile3d_to_crm3d(is_ocn_tile[t_idx]),
+                        u_sfc_sub=_tile3d_to_crm3d(u_sfc_tile[t_idx]),
+                        q_dust_sub=q_dust_4d[:, t_idx] if q_dust_4d is not None else None,
+                        k_top_crm=k_top_crm_sp,
                     )
-                    qp_t_pre = torch.clamp(mean_2d(sub_crm_t.rho_d * sub_crm_t.q_p) * inv_rt_pre, min=0.0)
-                    qc_t_pre = torch.clamp(mean_2d(sub_crm_t.rho_d * sub_crm_t.q_c) * inv_rt_pre, min=0.0)
-                    qi_t_pre = torch.clamp(mean_2d(sub_crm_t.rho_d * sub_crm_t.q_i) * inv_rt_pre, min=0.0)
-                    qci_t_pre = qc_t_pre + qi_t_pre
-                    sc_t_pre = torch.where(
-                        qci_t_pre > qn_t_pre,
-                        qn_t_pre / torch.clamp(qci_t_pre, min=1.0e-12),
-                        torch.ones_like(qn_t_pre),
-                    )
-                    qc_t_pre = qc_t_pre * sc_t_pre
-                    qi_t_pre = qi_t_pre * sc_t_pre
-                    qv_t_pre = torch.clamp(qn_t_pre - qc_t_pre - qi_t_pre, min=0.0)
-                    qke_t_pre = mean_2d(sub_crm_t.qke)
-                    q_rad_t_cell = mean_2d(q_rad_t_in)
-                    x_t_sd, exner_t_pre, _ = extract_crm_distill_features(
-                        rho_t_pre, thm_t_pre, qv_t_pre, qc_t_pre, qi_t_pre, qp_t_pre,
-                        u_host_new[:, t_idx], v_host_new[:, t_idx], atmos.dz_c[:, t_idx],
-                        dthm_ls[:, t_idx], dqn_ls[:, t_idx], q_rad_t_cell,
-                        shf_cell_pre[t_idx], lhf_cell_pre[t_idx], ustar_cell_pre[t_idx],
-                        tx_cell_pre[t_idx], ty_cell_pre[t_idx], is_ocn_cell_pre[t_idx],
-                        mesh.f_cell[t_idx], dt,
-                        subgrid_struct=subgrid_struct_sd[t_idx],
-                        conv_memory=conv_mem_sd[t_idx],
-                    )
-                    thm_post_ls_t = thm_t_pre + dt * q_rad_t_cell * (1.0 + C.RV_OVER_RD * qv_t_pre) / torch.clamp(exner_t_pre, min=1.0e-3)
-                    (
-                        u_mynn_t, v_mynn_t, thm_mynn_t, qn_mynn_t, _,
-                        _, _, qv_mynn_t, qc_mynn_t, qi_mynn_t,
-                    ) = step_mynn_level25(
-                        rho_d=rho_t_pre,
-                        u=u_host_new[:, t_idx],
-                        v=v_host_new[:, t_idx],
-                        theta_m_c=thm_post_ls_t,
-                        q_n=qn_t_pre,
-                        q_v=qv_t_pre,
-                        q_c=qc_t_pre,
-                        q_i=qi_t_pre,
-                        qke=qke_t_pre,
-                        z_c=atmos.z_c[:, t_idx],
-                        z_w=atmos.z_w[:, t_idx],
-                        dz_c=atmos.dz_c[:, t_idx],
-                        u_star=ustar_cell_pre[t_idx],
-                        sfc_buoy_flux=buoy_cell_pre[t_idx],
-                        tau_x_sfc=tx_cell_pre[t_idx],
-                        tau_y_sfc=ty_cell_pre[t_idx],
-                        shf_sfc=shf_cell_pre[t_idx],
-                        evap_sfc=evap_cell_pre[t_idx],
-                        dt=dt,
-                        return_hydrometeors=True,
-                        do_sat_adj=False,
-                    )
-                    _, exner_mynn_t, temp_mynn_t = diagnose_pressure_temperature(rho_t_pre, thm_mynn_t, qv_mynn_t)
-                # Only expand the 6 SurfaceFluxDiagnostics fields read by `step_crm_physics_and_dynamics`
-                _crm_sfc_keys = ("shf", "evap", "tau_x", "tau_y", "u_star", "buoy_flux")
-                sub_sfc_t = SurfaceFluxDiagnostics(
-                    **{
-                        k: (_tile3d_to_crm3d(v.index_select(0, t_idx), to_full=True) if k in _crm_sfc_keys else v.index_select(0, t_idx))
-                        for k, v in sfc_diag_tile.items()
-                    }
-                )
-                q_dust_t_in = (
-                    atmos.q_dust[:, t_idx].unsqueeze(-1).unsqueeze(-1).expand(nz, n_t, ny_full, nx_full)
-                    if (cfg.enable_dust and atmos.q_dust is not None)
-                    else None
-                )
-                sp_t = step_crm_physics_and_dynamics(
-                    crm=sub_crm_t,
-                    vgrid=vgrid,
-                    dt_crm=dt,
-                    n_dyn_substeps=cfg.n_crm_dyn_substeps,
-                    u_host_target=u_host_new[:, t_idx],
-                    v_host_target=v_host_new[:, t_idx],
-                    tau_sp_mom=dt,
-                    dtheta_m_ls_dt=dthm_ls[:, t_idx],
-                    dq_n_ls_dt=dqn_ls[:, t_idx],
-                    sfc_fluxes=sub_sfc_t,
-                    rad_heating_k_s=q_rad_t_in,
-                    z_c_col=atmos.z_c[:, t_idx],
-                    z_w_col=atmos.z_w[:, t_idx],
-                    dz_c_col=atmos.dz_c[:, t_idx],
-                    microphysics_scheme=cfg.microphysics_scheme,
-                    is_ocean_sub=_tile3d_to_crm3d(is_ocn_tile[t_idx], to_full=True),
-                    u_sfc_sub=_tile3d_to_crm3d(u_sfc_tile[t_idx], to_full=True),
-                    q_dust_sub=q_dust_t_in,
-                    k_top_crm=k_top_crm_sp,
-                )
-                if n_t < pool.n_pool:
-                    pool.crm.rho_d[:, :n_t] = sub_crm_t.rho_d
-                    pool.crm.u[:, :n_t] = sub_crm_t.u
-                    pool.crm.v[:, :n_t] = sub_crm_t.v
-                    pool.crm.w[:, :n_t] = sub_crm_t.w
-                    pool.crm.theta_m[:, :n_t] = sub_crm_t.theta_m
-                    pool.crm.q_n[:, :n_t] = sub_crm_t.q_n
-                    pool.crm.q_p[:, :n_t] = sub_crm_t.q_p
-                    pool.crm.q_v[:, :n_t] = sub_crm_t.q_v
-                    pool.crm.q_c[:, :n_t] = sub_crm_t.q_c
-                    pool.crm.q_i[:, :n_t] = sub_crm_t.q_i
-                    pool.crm.qke[:, :n_t] = sub_crm_t.qke
-                for opt_attr in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
-                    src_f = getattr(sub_crm_t, opt_attr, None)
-                    if src_f is not None:
-                        if not shadow_pool:
+                    for opt_attr in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
+                        src_f = getattr(sub_crm_t, opt_attr, None)
+                        if src_f is not None:
                             dst_f = getattr(crm, opt_attr, None)
                             if dst_f is None:
                                 dst_f = torch.zeros_like(crm.q_c)
                                 setattr(crm, opt_attr, dst_f)
-                            dst_f.index_copy_(1, t_idx, _crm4d_to_tile4d(src_f, from_full=True))
-                        if n_t < pool.n_pool:
-                            p_dst = getattr(pool.crm, opt_attr, None)
-                            if p_dst is None:
-                                p_dst = torch.zeros_like(pool.crm.q_c)
-                                setattr(pool.crm, opt_attr, p_dst)
-                            p_dst[:, :n_t] = src_f
-            else:
-                rho_crm_t = crm.rho_d[:, t_idx]
-                drho_t = (atmos.rho_d[:, t_idx] - mean_2d(rho_crm_t)).unsqueeze(-1).unsqueeze(-1)
-                sub_crm_t = CRMState(
-                    rho_d=torch.clamp(rho_crm_t + drho_t, min=1.0e-8),
-                    u=crm.u[:, t_idx],
-                    v=crm.v[:, t_idx],
-                    w=crm.w[:, t_idx],
-                    theta_m=crm.theta_m[:, t_idx],
-                    q_n=crm.q_n[:, t_idx],
-                    q_p=crm.q_p[:, t_idx],
-                    q_v=crm.q_v[:, t_idx],
-                    q_c=crm.q_c[:, t_idx],
-                    q_i=crm.q_i[:, t_idx],
-                    qke=crm.qke[:, t_idx],
-                    dx=cfg.crm_dx,
-                    dy=cfg.crm_dx,
-                    f_coriolis=mesh.f_cell[t_idx],
-                    n_c=crm.n_c[:, t_idx] if crm.n_c is not None else None,
-                    n_i=crm.n_i[:, t_idx] if crm.n_i is not None else None,
-                    q_r=crm.q_r[:, t_idx] if getattr(crm, "q_r", None) is not None else None,
-                    q_s=crm.q_s[:, t_idx] if getattr(crm, "q_s", None) is not None else None,
-                    q_g=crm.q_g[:, t_idx] if getattr(crm, "q_g", None) is not None else None,
-                    n_r=crm.n_r[:, t_idx] if getattr(crm, "n_r", None) is not None else None,
-                    n_s=crm.n_s[:, t_idx] if getattr(crm, "n_s", None) is not None else None,
-                    n_g=crm.n_g[:, t_idx] if getattr(crm, "n_g", None) is not None else None,
-                )
-                sub_sfc_t = SurfaceFluxDiagnostics(**{k: _tile3d_to_crm3d(v[t_idx]) for k, v in sfc_diag_tile.items()})
-                sp_t = step_crm_physics_and_dynamics(
-                    crm=sub_crm_t,
-                    vgrid=vgrid,
-                    dt_crm=dt,
-                    n_dyn_substeps=cfg.n_crm_dyn_substeps,
-                    u_host_target=u_host_new[:, t_idx],
-                    v_host_target=v_host_new[:, t_idx],
-                    tau_sp_mom=dt,
-                    dtheta_m_ls_dt=dthm_ls[:, t_idx],
-                    dq_n_ls_dt=dqn_ls[:, t_idx],
-                    sfc_fluxes=sub_sfc_t,
-                    rad_heating_k_s=q_rad_4d[:, t_idx],
-                    z_c_col=atmos.z_c[:, t_idx],
-                    z_w_col=atmos.z_w[:, t_idx],
-                    dz_c_col=atmos.dz_c[:, t_idx],
-                    microphysics_scheme=cfg.microphysics_scheme,
-                    is_ocean_sub=_tile3d_to_crm3d(is_ocn_tile[t_idx]),
-                    u_sfc_sub=_tile3d_to_crm3d(u_sfc_tile[t_idx]),
-                    q_dust_sub=q_dust_4d[:, t_idx] if q_dust_4d is not None else None,
-                    k_top_crm=k_top_crm_sp,
-                )
-                for opt_attr in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
-                    src_f = getattr(sub_crm_t, opt_attr, None)
-                    if src_f is not None:
-                        dst_f = getattr(crm, opt_attr, None)
-                        if dst_f is None:
-                            dst_f = torch.zeros_like(crm.q_c)
-                            setattr(crm, opt_attr, dst_f)
-                        dst_f.index_copy_(1, t_idx, src_f)
+                            dst_f.index_copy_(1, t_idx, src_f)
 
-            rho_t_mean = mean_2d(sub_crm_t.rho_d)
-            inv_rho_t = 1.0 / torch.clamp(rho_t_mean, min=1.0e-8)
-            thm_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.theta_m) * inv_rho_t
-            qn_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.q_n) * inv_rho_t
-            qp_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.q_p) * inv_rho_t
-            qv_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.q_v) * inv_rho_t
-            qc_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.q_c) * inv_rho_t
-            qi_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.q_i) * inv_rho_t
-            u_t_post = mean_2d(sub_crm_t.u)
-            v_t_post = mean_2d(sub_crm_t.v)
+                rho_t_mean = mean_2d(sub_crm_t.rho_d)
+                inv_rho_t = 1.0 / torch.clamp(rho_t_mean, min=1.0e-8)
+                thm_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.theta_m) * inv_rho_t
+                qn_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.q_n) * inv_rho_t
+                qp_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.q_p) * inv_rho_t
+                qv_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.q_v) * inv_rho_t
+                qc_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.q_c) * inv_rho_t
+                qi_t_post = mean_2d(sub_crm_t.rho_d * sub_crm_t.q_i) * inv_rho_t
+                u_t_post = mean_2d(sub_crm_t.u)
+                v_t_post = mean_2d(sub_crm_t.v)
 
-            if sp_t.precip_rain_sub is not None and sp_t.precip_snow_sub is not None:
-                rain_t_tile = _crm3d_to_tile3d(sp_t.precip_rain_sub, from_full=has_pool)
-                snow_t_tile = _crm3d_to_tile3d(sp_t.precip_snow_sub, from_full=has_pool)
-            else:
-                rain_t_tile = sp_t.precip_rain.unsqueeze(-1).unsqueeze(-1).expand(-1, ny_t, nx_t)
-                snow_t_tile = sp_t.precip_snow.unsqueeze(-1).unsqueeze(-1).expand(-1, ny_t, nx_t)
+                if sp_t.precip_rain_sub is not None and sp_t.precip_snow_sub is not None:
+                    rain_t_tile = _crm3d_to_tile3d(sp_t.precip_rain_sub, from_full=has_pool)
+                    snow_t_tile = _crm3d_to_tile3d(sp_t.precip_snow_sub, from_full=has_pool)
+                else:
+                    rain_t_tile = sp_t.precip_rain.unsqueeze(-1).unsqueeze(-1).expand(-1, ny_t, nx_t)
+                    snow_t_tile = sp_t.precip_snow.unsqueeze(-1).unsqueeze(-1).expand(-1, ny_t, nx_t)
 
-            # 7a-ii. Online self-distillation update from fresh teacher CRM + GPU replay buffer
-            f_cld_t = mean_2d(((sub_crm_t.q_c + sub_crm_t.q_i) > 1.0e-6).to(atmos.q_n.dtype))
-            if sp_t.precip_rain_sub is not None and sp_t.precip_snow_sub is not None:
-                f_prec_t = mean_2d(((sp_t.precip_rain_sub + sp_t.precip_snow_sub) > 1.0e-7).to(atmos.q_n.dtype))
-            else:
-                f_prec_t = ((sp_t.precip_rain + sp_t.precip_snow) > 1.0e-7).to(atmos.q_n.dtype)
-            if shadow_pool:
-                x_train_t = x_t_sd
-                rho_ctx_t, ex_ctx_t, t0_ctx_t = rho_t_pre, exner_mynn_t, temp_mynn_t[0]
-                thm_ctx_t, qn_ctx_t, qp_ctx_t = thm_mynn_t, qn_mynn_t, qp_t_pre
-                qc_ctx_t, qi_ctx_t, u_ctx_t, v_ctx_t = qc_mynn_t, qi_mynn_t, u_mynn_t, v_mynn_t
-            else:
-                x_train_t = x_all_sd[t_idx]
-                rho_ctx_t, ex_ctx_t, t0_ctx_t = rho_pre_sd[:, t_idx], exner_mynn_sd[:, t_idx], temp_mynn_sd[0, t_idx]
-                thm_ctx_t, qn_ctx_t, qp_ctx_t = thm_mynn_sd[:, t_idx], qn_mynn_sd[:, t_idx], qp_pre_sd[:, t_idx]
-                qc_ctx_t, qi_ctx_t, u_ctx_t, v_ctx_t = qc_mynn_sd[:, t_idx], qi_mynn_sd[:, t_idx], u_mynn_sd[:, t_idx], v_mynn_sd[:, t_idx]
-            ctx_p_t, ctx_s_t, tgt_p_t, tgt_s_t = pack_teacher_context_and_targets(
-                rho_ctx_t, atmos.dz_c[:, t_idx], ex_ctx_t, t0_ctx_t,
-                thm_ctx_t, qn_ctx_t, qp_ctx_t,
-                qc_ctx_t, qi_ctx_t, u_ctx_t, v_ctx_t,
-                zero_sfc_sd[t_idx], zero_sfc_sd[t_idx], zero_sfc_sd[t_idx], zero_sfc_sd[t_idx],
-                thm_t_post, qn_t_post, qp_t_post, qc_t_post, qi_t_post, u_t_post, v_t_post,
-                sp_t.precip_rain, sp_t.precip_snow, f_cld_t, f_prec_t,
-            )
-            thm0_t_tile = _crm3d_to_tile3d(sub_crm_t.theta_m[0], from_full=has_pool)
-            qv0_t_tile = _crm3d_to_tile3d(sub_crm_t.q_v[0], from_full=has_pool)
-            u0_t_tile = _crm3d_to_tile3d(sub_crm_t.u[0], from_full=has_pool)
-            v0_t_tile = _crm3d_to_tile3d(sub_crm_t.v[0], from_full=has_pool)
-            tgt_maps_t, has_map_t = (
-                extract_spatial_targets(
-                    _crm4d_to_tile4d(sub_crm_t.q_c, from_full=has_pool),
-                    _crm4d_to_tile4d(sub_crm_t.q_i, from_full=has_pool),
-                    rain_t_tile, snow_t_tile,
-                    rho_ctx_t * atmos.dz_c[:, t_idx],
-                    thm0_3d=thm0_t_tile,
-                    qv0_3d=qv0_t_tile,
-                    u0_3d=u0_t_tile,
-                    v0_3d=v0_t_tile,
+                # 7a-ii. Online self-distillation update from fresh teacher CRM + GPU replay buffer
+                f_cld_t = mean_2d(((sub_crm_t.q_c + sub_crm_t.q_i) > 1.0e-6).to(atmos.q_n.dtype))
+                if sp_t.precip_rain_sub is not None and sp_t.precip_snow_sub is not None:
+                    f_prec_t = mean_2d(((sp_t.precip_rain_sub + sp_t.precip_snow_sub) > 1.0e-7).to(atmos.q_n.dtype))
+                else:
+                    f_prec_t = ((sp_t.precip_rain + sp_t.precip_snow) > 1.0e-7).to(atmos.q_n.dtype)
+                if shadow_pool:
+                    x_train_t = x_t_sd
+                    rho_ctx_t, ex_ctx_t, t0_ctx_t = rho_t_pre, exner_mynn_t, temp_mynn_t[0]
+                    thm_ctx_t, qn_ctx_t, qp_ctx_t = thm_mynn_t, qn_mynn_t, qp_t_pre
+                    qc_ctx_t, qi_ctx_t, u_ctx_t, v_ctx_t = qc_mynn_t, qi_mynn_t, u_mynn_t, v_mynn_t
+                else:
+                    x_train_t = x_all_sd[t_idx]
+                    rho_ctx_t, ex_ctx_t, t0_ctx_t = rho_pre_sd[:, t_idx], exner_mynn_sd[:, t_idx], temp_mynn_sd[0, t_idx]
+                    thm_ctx_t, qn_ctx_t, qp_ctx_t = thm_mynn_sd[:, t_idx], qn_mynn_sd[:, t_idx], qp_pre_sd[:, t_idx]
+                    qc_ctx_t, qi_ctx_t, u_ctx_t, v_ctx_t = qc_mynn_sd[:, t_idx], qi_mynn_sd[:, t_idx], u_mynn_sd[:, t_idx], v_mynn_sd[:, t_idx]
+                ctx_p_t, ctx_s_t, tgt_p_t, tgt_s_t = pack_teacher_context_and_targets(
+                    rho_ctx_t, atmos.dz_c[:, t_idx], ex_ctx_t, t0_ctx_t,
+                    thm_ctx_t, qn_ctx_t, qp_ctx_t,
+                    qc_ctx_t, qi_ctx_t, u_ctx_t, v_ctx_t,
+                    zero_sfc_sd[t_idx], zero_sfc_sd[t_idx], zero_sfc_sd[t_idx], zero_sfc_sd[t_idx],
+                    thm_t_post, qn_t_post, qp_t_post, qc_t_post, qi_t_post, u_t_post, v_t_post,
+                    sp_t.precip_rain, sp_t.precip_snow, f_cld_t, f_prec_t,
                 )
-                if sub_maps_all_sd is not None
-                else (None, None)
-            )
+                thm0_t_tile = _crm3d_to_tile3d(sub_crm_t.theta_m[0], from_full=has_pool)
+                qv0_t_tile = _crm3d_to_tile3d(sub_crm_t.q_v[0], from_full=has_pool)
+                u0_t_tile = _crm3d_to_tile3d(sub_crm_t.u[0], from_full=has_pool)
+                v0_t_tile = _crm3d_to_tile3d(sub_crm_t.v[0], from_full=has_pool)
+                tgt_maps_t, has_map_t = (
+                    extract_spatial_targets(
+                        _crm4d_to_tile4d(sub_crm_t.q_c, from_full=has_pool),
+                        _crm4d_to_tile4d(sub_crm_t.q_i, from_full=has_pool),
+                        rain_t_tile, snow_t_tile,
+                        rho_ctx_t * atmos.dz_c[:, t_idx],
+                        thm0_3d=thm0_t_tile,
+                        qv0_3d=qv0_t_tile,
+                        u0_3d=u0_t_tile,
+                        v0_3d=v0_t_tile,
+                    )
+                    if sub_maps_all_sd is not None
+                    else (None, None)
+                )
             if bool(cfg.enable_distill_shadow_diag) and (model.step_count < 8 or (model.step_count % 4 == 0)):
                 wind0_t_tile = _crm3d_to_tile3d(
                     torch.hypot(sub_crm_t.u[0], sub_crm_t.v[0]), from_full=has_pool
@@ -3642,7 +4011,7 @@ def step_aoba_model(
                     crm.qke.copy_(qke_mynn_sd.unsqueeze(-1).unsqueeze(-1))
 
                 model.crm_distill.last_uncertainty = stu_unc
-                model.crm_distill.last_uncertainty[t_idx] = 0.0
+                model.crm_distill.last_uncertainty.index_fill_(0, t_idx, 0.0)
             else:
                 stu_out, stu_unc = predict_student_columns(
                     model.crm_distill,
@@ -4133,7 +4502,568 @@ def step_aoba_model(
                 q_s_prog=getattr(crm, "q_s", None),
             )
         model.last_lightning = light_diag
-        if bool(getattr(cfg, "enable_red_sprites", False)) and light_diag is not None:
+    _do_sprites = bool(cfg.enable_lightning) and bool(cfg.enable_superparam) and bool(getattr(cfg, "enable_red_sprites", False)) and (light_diag is not None)
+    _do_dust = bool(cfg.enable_dust)
+    _do_lc = bool(cfg.enable_land_carbon)
+    _do_aero = bool(cfg.enable_natural_aerosols)
+    _do_snow_bc = bool(cfg.enable_snow_bc_darkening)
+    _do_nox = bool(cfg.enable_red_sprites) or float(cfg.z_top) >= 68000.0
+    _do_o3 = str(cfg.o3_mode).strip().lower() == "prognostic"
+    _do_iso = bool(cfg.enable_water_isotopes)
+    _noon_buf_pre = getattr(clim_sub, "_noon_buf", None)
+    _noon_seen_pre = getattr(clim_sub, "_noon_seen", None)
+    _can_super_post_esm = (
+        can_use_cuda_graph(atmos.rho_d.device)
+        and model.step_count >= 1
+        and (not bool(cfg.enable_silicate_weathering))
+        and (not bool(cfg.enable_volcanic_aerosols))
+        and (str(cfg.co2_mode).strip().lower() != "prognostic")
+        and (_noon_buf_pre is not None and _noon_seen_pre is not None)
+        and ((not _do_dust) or (atmos.q_dust_fine is not None and atmos.q_dust_coarse is not None))
+        and ((not _do_lc) or (model.land_carbon is not None and int(model.land_carbon.c_leaf.shape[0]) == m_sub))
+        and ((not _do_aero) or (model.aerosols is not None))
+        and ((not _do_snow_bc) or (sfc_sub.bc_snow is not None and sfc_sub.dust_snow is not None))
+        and ((not _do_nox) or (model.meso_nox is not None and "_k_meso_nlc" in model.rad_cache))
+        and ((not _do_o3) or (model.ozone is not None))
+        and ((not _do_iso) or (model.water_isotopes is not None))
+    )
+    if _can_super_post_esm:
+        from aoba.aerosols import compute_bvoc_soa_emission, step_natural_aerosols_column
+        from aoba.land_carbon import step_land_carbon_and_fire
+        from aoba.lightning import LNOX_KG_N_PER_FLASH
+        from aoba.mesosphere import step_prognostic_nox
+        from aoba.ozone_chemistry import step_prognostic_ozone
+        from aoba.red_sprites import RedSpriteDiagnostics, compute_red_sprites
+        from aoba.surface import step_snow_impurity_darkening
+        from aoba.water_isotopes import step_water_isotopes
+
+        _chl_sfc_in: torch.Tensor | None = None
+        if _do_aero and model.ogcm is not None and model.ogcm.bgc is not None:
+            _chl_sfc_in = model.ogcm.bgc.chl[0]
+            if has_indep_ocn:
+                ogcm_gen_c = int(model.rad_cache.get("_ogcm_step_gen", 0))
+                chl_cached = model.rad_cache.get("_ocn_chl_sfc_c")
+                if chl_cached is not None and chl_cached[0] == ogcm_gen_c:
+                    _chl_sfc_in = chl_cached[1]
+                else:
+                    from aoba.ocean_coupler import ocn_to_atm_mean
+
+                    _chl_sfc_in = ocn_to_atm_mean(model.ocn_coupler, _chl_sfc_in)
+                    model.rad_cache["_ocn_chl_sfc_c"] = (ogcm_gen_c, _chl_sfc_in)
+        _has_chl = _chl_sfc_in is not None
+        _has_lakes = bool(cfg.enable_dynamic_lakes) and (model.lakes is not None)
+        _has_lgt = light_diag is not None
+        _has_exp_lgt = bool(
+            _do_sprites
+            and model.explicit_lightning is not None
+            and hasattr(model.explicit_lightning, "q_chg")
+            and int(model.explicit_lightning.q_chg.shape[2]) == nc
+            and int(model.explicit_lightning.q_chg.shape[1]) == nz
+        )
+        _has_resp_leaf = sfc_diag_sub.resp_leaf is not None
+        _k_meso_nlc_cg = int(model.rad_cache.get("_k_meso_nlc", 0))
+        _n2o_cg = float(model.current_n2o_ppmv())
+        _ch4_cg = float(model.current_ch4_ppmv())
+        _uv_cg = float(uv_j_o2_scale)
+
+        _lc_keys, _lc_vals = _pack_all_obj_tensors(model.land_carbon) if _do_lc else ((), [])
+        _bio_attrs = ("lai", "h_canopy", "lai_evg", "lai_dec", "n_avail_fac", "f_c4", "f_evg", "vcmax25_c3", "vcmax25_c4")
+        _bio_keys, _bio_vals = _pack_obj_tensors(sfc_sub.bio, _bio_attrs)
+        _aero_keys, _aero_vals = _pack_all_obj_tensors(model.aerosols) if _do_aero else ((), [])
+        _nox_keys, _nox_vals = _pack_all_obj_tensors(model.meso_nox) if _do_nox else ((), [])
+        _oz_keys, _oz_vals = _pack_all_obj_tensors(model.ozone) if _do_o3 else ((), [])
+        _iso_keys, _iso_vals = _pack_all_obj_tensors(model.water_isotopes) if _do_iso else ((), [])
+        _sw1_d_c = model.rad_cache.get("sw1_dir", torch.zeros(nc, device=atmos.rho_d.device, dtype=atmos.rho_d.dtype))
+        _sw1_f_c = model.rad_cache.get("sw1_dif", torch.zeros(nc, device=atmos.rho_d.device, dtype=atmos.rho_d.dtype))
+
+        def _super_post_esm_body(inp: list[torch.Tensor]) -> list[torch.Tensor]:
+            p = 0
+            arho_i, athm_i, aqv_i, aqi_i, aqp_i = inp[p : p + 5]; p += 5
+            mu0_i, mu0s_i, cn_gpu_i = inp[p : p + 3]; p += 3
+            rn_s_i, sn_s_i, rn_c_i, sn_c_i = inp[p : p + 4]; p += 4
+            u0_s_i, v0_s_i, r0_s_i, qv0_s_i, lai_e_i = inp[p : p + 5]; p += 5
+            ust_s_i, fsnow_s_i, z0m_s_i, ddisp_s_i = inp[p : p + 4]; p += 4
+            evap_s_i, shf_s_i, gpp_s_i, trad_s_i, fice_s_i = inp[p : p + 5]; p += 5
+            albvd_i, albvf_i, albnd_i, albnf_i, emiss_i = inp[p : p + 5]; p += 5
+            sw1d_s_i, sw1f_s_i, sw2d_s_i, sw2f_s_i, lwd_s_i = inp[p : p + 5]; p += 5
+            sw1d_c_i, sw1f_c_i = inp[p : p + 2]; p += 2
+            crho0_i, cthm0_i, cqv0_i = inp[p : p + 3]; p += 3
+            tsoil_s_i, wliq_s_i, wice_s_i, swel_s_i, swei_s_i, mice_s_i = inp[p : p + 6]; p += 6
+            tcan_c_i, toc_c_i = inp[p : p + 2]; p += 2
+            d_pr_i, d_pet_i, d_ppfd_i, d_t_i, d_vpd_i, d_tmin_i = inp[p : p + 6]; p += 6
+            nb_i = inp[p].clone(); ns_i = inp[p + 1].clone(); p += 2
+            if _do_dust:
+                qdf_i, qdc_i = inp[p], inp[p + 1]; p += 2
+            else:
+                qdf_i = qdc_i = arho_i
+            if _do_snow_bc:
+                bc_sn_i, du_sn_i = inp[p], inp[p + 1]; p += 2
+            else:
+                bc_sn_i = du_sn_i = swel_s_i
+            flake_i = inp[p] if _has_lakes else None
+            if _has_lakes: p += 1
+            chl_i = inp[p] if _has_chl else None
+            if _has_chl: p += 1
+            resp_s_i = inp[p] if _has_resp_leaf else None
+            if _has_resp_leaf: p += 1
+            if _has_lgt:
+                lgt_ft_c, lgt_fcg_c, lgt_ccd_s, lgt_ndep_s, lgt_fcg_s = inp[p : p + 5]; p += 5
+            else:
+                lgt_ft_c = lgt_fcg_c = lgt_ccd_s = lgt_ndep_s = lgt_fcg_s = None
+            exp_lgt_i = type("_ExpLgt", (), {"q_chg": inp[p]})() if _has_exp_lgt else None
+            if _has_exp_lgt: p += 1
+            lc_in = inp[p : p + len(_lc_keys)]; p += len(_lc_keys)
+            bio_in = inp[p : p + len(_bio_keys)]; p += len(_bio_keys)
+            aero_in = inp[p : p + len(_aero_keys)]; p += len(_aero_keys)
+            nox_in = inp[p : p + len(_nox_keys)]; p += len(_nox_keys)
+            oz_in = inp[p : p + len(_oz_keys)]; p += len(_oz_keys)
+            iso_in = inp[p : p + len(_iso_keys)]; p += len(_iso_keys)
+
+            # 1) Red Sprites / TLE
+            sp_out: list[torch.Tensor] = []
+            sp_diag_cg = None
+            if _do_sprites and lgt_fcg_c is not None and lgt_ccd_s is not None:
+                ccd_c = lgt_ccd_s.reshape(nc, -1).mean(dim=-1)
+                sp_diag_cg = compute_red_sprites(
+                    flash_cg_cell=lgt_fcg_c, cold_cloud_km_cell=ccd_c, mu0_cell=mu0_i,
+                    rho_host=arho_i, theta_m_host=athm_i, q_v_host=aqv_i,
+                    q_i_host=aqi_i, q_p_host=aqp_i, z_c_host=atmos.z_c, dz_c_host=atmos.dz_c,
+                    area_cell=mesh.area_cell, explicit_state=exp_lgt_i,
+                )
+                sp_out = [
+                    sp_diag_cg.sprite_rate_cell, sp_diag_cg.sprite_prompt_rate_cell, sp_diag_cg.sprite_delayed_rate_cell,
+                    sp_diag_cg.halo_rate_cell, sp_diag_cg.cmc_median_ckm_cell, sp_diag_cg.e_over_ek_max_cell,
+                    sp_diag_cg.red_1pn2_kr_cell, sp_diag_cg.blue_2pn2_kr_cell, sp_diag_cg.z_init_km_cell,
+                    sp_diag_cg.z_stop_km_cell, sp_diag_cg.sprite_nox_mol_m2s,
+                    sp_diag_cg.elves_rate_cell, sp_diag_cg.blue_jet_rate_cell, sp_diag_cg.gigantic_jet_rate_cell,
+                    sp_diag_cg.blue_jet_top_km_cell,
+                ]
+
+            # 2) Dust 2-mode emission & column transport
+            ust_c = _sub_to_cell(ust_s_i, nc, n_sub)
+            fsnow_c = _sub_to_cell(fsnow_s_i, nc, n_sub)
+            u10_sm = torch.hypot(u0_s_i, v0_s_i)
+            u10_c = _sub_to_cell(u10_sm, nc, n_sub)
+            f_dust_dep_o = torch.zeros(nc, device=arho_i.device, dtype=arho_i.dtype)
+            qdf_o, qdc_o, qdt_o = qdf_i, qdc_i, qdf_i
+            if _do_dust:
+                f_du_s = compute_dust_emission_sub(
+                    surf_type=sfc_sub.surf_type, lai=lai_e_i, f_snow=fsnow_s_i,
+                    w_liq_soil_top=wliq_s_i[0], w_ice_soil_top=wice_s_i[0],
+                    u_star=ust_s_i, rho_atm=r0_s_i * (1.0 + qv0_s_i),
+                    z0m=z0m_s_i, d_disp=ddisp_s_i, dust_emis_factor=cfg.dust_emis_factor,
+                )
+                if flake_i is not None:
+                    f_du_s = f_du_s * torch.clamp(1.0 - _cell_to_sub(flake_i, nc, n_sub), 0.0, 1.0)
+                f_du_ec = _sub_to_cell(f_du_s, nc, n_sub)
+                dm_du = torch.clamp(arho_i * atmos.dz_c, min=0.0)
+                du_pre = (dm_du * torch.clamp(qdf_i + qdc_i, min=0.0)).sum(dim=0)
+                qdf_o, qdc_o, qdt_o = step_dust_two_mode_column(
+                    q_dust_fine=qdf_i, q_dust_coarse=qdc_i, rho_d=arho_i, dz_c=atmos.dz_c, z_c=atmos.z_c,
+                    f_dust_emit=f_du_ec, precip_rate=rn_c_i + sn_c_i, u_star_cell=ust_c, dt=dt,
+                )
+                du_post = (dm_du * torch.clamp(qdt_o, min=0.0)).sum(dim=0)
+                f_dust_dep_o = torch.clamp((du_pre + dt * f_du_ec - du_post) / max(dt, 1.0), min=0.0)
+
+            _sc5 = torch.stack([evap_s_i, shf_s_i, gpp_s_i, trad_s_i, fice_s_i], dim=0).reshape(5, nc, n_sub).mean(dim=-1)
+            evap_c, shf_c, gpp_c, trad_c, fice_c = _sc5.unbind(dim=0)
+
+            # 3) Post-CRM meteorology & daily accumulators + branchless solar noon
+            rp0 = _c2s(crho0_i.reshape(m_crm))
+            tp0 = _c2s(cthm0_i.reshape(m_crm))
+            qp0 = _c2s(cqv0_i.reshape(m_crm))
+            dz0_sub_cg = _cell_to_sub(atmos.z_c[0] - atmos.z_w[0], nc, n_sub)
+            post_fn = maybe_cuda_compile(_coupled_post_crm_accum_core, device=rp0.device)
+            t_air_s, pres_ps, vpd_s, dp_n, dpet_n, dppfd_n, dt_n, dvpd_n, dtmin_n = post_fn(
+                rp0, tp0, qp0, dz0_sub_cg, rn_s_i, sn_s_i,
+                sw1d_s_i, sw1f_s_i, sw2d_s_i, sw2f_s_i, lwd_s_i,
+                albvd_i, albvf_i, albnd_i, albnf_i, emiss_i, trad_s_i,
+                d_pr_i, d_pet_i, d_ppfd_i, d_t_i, d_vpd_i, d_tmin_i, dt,
+            )
+            noon_l = _cell_to_sub(cn_gpu_i, nc, n_sub) & (sfc_sub.surf_type == SURF_LAND)
+            snap8 = torch.stack([
+                sw1d_s_i, sw1f_s_i, torch.clamp(mu0s_i, min=0.05), t_air_s, vpd_s,
+                torch.minimum(d_tmin_i, t_air_s - 2.0), pres_ps, lai_e_i,
+            ], dim=0)
+            nb_i.copy_(torch.where(noon_l.unsqueeze(0), snap8, nb_i))
+            ns_i.logical_or_(noon_l)
+
+            ptot_c = rn_c_i + sn_c_i
+            t_air_c = _sub_to_cell(t_air_s, nc, n_sub)
+
+            # 4) Land carbon & MAML fire-veg feedback
+            bio_cp = _clone_obj_with_tensors(sfc_sub.bio, _bio_keys, bio_in)
+            lc_cp = _clone_obj_with_tensors(model.land_carbon, _lc_keys, lc_in) if _do_lc else None
+            if _do_lc and lc_cp is not None:
+                rl_s = resp_s_i if resp_s_i is not None else torch.zeros_like(gpp_s_i)
+                f4_s = torch.clamp(bio_cp.f_c4, 0.0, 1.0)
+                vc25_s = (1.0 - f4_s) * bio_cp.vcmax25_c3 + f4_s * bio_cp.vcmax25_c4
+                step_land_carbon_and_fire(
+                    lc=lc_cp, surf_type=sfc_sub.surf_type, gpp_umol=gpp_s_i, resp_leaf_umol=rl_s,
+                    lai=bio_cp.lai, h_canopy=bio_cp.h_canopy, t_soil=tsoil_s_i,
+                    w_liq_soil=wliq_s_i, w_ice_soil=wice_s_i, f_snow=fsnow_s_i,
+                    t_sfc_k=t_air_s, vpd_pa=vpd_s, u10_ms=u10_sm, precip_kgm2s=rn_s_i + sn_s_i, dt=dt,
+                    enable_nitrogen=bool(cfg.enable_land_nitrogen), vcmax25_eff=vc25_s,
+                    f_evg=bio_cp.f_evg, f_c4=f4_s,
+                    slope_tan=torch.clamp(_cell_to_sub(mesh.sigma_topo, nc, n_sub) / 2000.0, 0.0, 0.75),
+                    transp_kgm2s=torch.clamp(evap_s_i, min=0.0),
+                    n_dep_kgn_m2s=_c2s(lgt_ndep_s.reshape(m_crm)) if lgt_ndep_s is not None else None,
+                    flash_cg_m2s=_c2s(lgt_fcg_s.reshape(m_crm)) if lgt_fcg_s is not None else None,
+                    bio=bio_cp, enable_fire_veg_feedback=bool(cfg.enable_fire_veg_feedback),
+                    maml_shape=(nc, ny_t, nx_t), crm_dx_m=float(cfg.crm_dx) * math.sqrt(float(by_full * bx_full)),
+                )
+                lai_h = _sub_to_cell(bio_cp.lai, nc, n_sub)
+                hc_h = _sub_to_cell(bio_cp.h_canopy, nc, n_sub)
+                laie_h = _sub_to_cell(bio_cp.lai_evg, nc, n_sub) if bio_cp.lai_evg is not None else lai_h
+                laid_h = _sub_to_cell(bio_cp.lai_dec, nc, n_sub) if bio_cp.lai_dec is not None else lai_h
+                nav_h = _sub_to_cell(bio_cp.n_avail_fac, nc, n_sub) if bio_cp.n_avail_fac is not None else lai_h
+            else:
+                lai_h = _sub_to_cell(bio_cp.lai, nc, n_sub)
+                hc_h = _sub_to_cell(bio_cp.h_canopy, nc, n_sub)
+                laie_h = laid_h = nav_h = lai_h
+
+            # 5) Natural aerosols + SNICAR snow/sea-ice BC & dust darkening
+            p_end, _, t_end = diagnose_pressure_temperature(arho_i, athm_i, aqv_i)
+            rh_end = torch.clamp(aqv_i / torch.clamp(qsat_mixed(t_end, p_end)[0], min=1.0e-7), 0.0, 0.99)
+            aero_cp = _clone_obj_with_tensors(model.aerosols, _aero_keys, aero_in) if _do_aero else None
+            if _do_aero and aero_cp is not None:
+                f_bc = _sub_to_cell(lc_cp.fire_bc_kg_m2s, nc, n_sub) if lc_cp is not None else None
+                f_oc = _sub_to_cell(lc_cp.fire_oc_kg_m2s, nc, n_sub) if lc_cp is not None else None
+                f_ib = _sub_to_cell(lc_cp.fire_intensity_kw_m, nc, n_sub) if lc_cp is not None else None
+                soa_c = None
+                if bool(cfg.enable_bvoc_soa):
+                    sw_par_c = C.PAR_FRAC_OF_SW1 * (sw1d_c_i + sw1f_c_i)
+                    soa_c = compute_bvoc_soa_emission(sfc.surf_type, lai_h, tcan_c_i, sw_par_c)
+                step_natural_aerosols_column(
+                    aero=aero_cp, rho_d=arho_i, dz_c=atmos.dz_c, surf_type=sfc.surf_type,
+                    sst_k=toc_c_i, u10_ms=u10_c, f_seaice=fice_c, precip_rate=ptot_c, dt=dt,
+                    chl_sfc_mg_m3=chl_i, fire_bc_kg_m2s=f_bc, fire_oc_kg_m2s=f_oc,
+                    soa_oc_kg_m2s=soa_c, u_star_cell=ust_c, fire_intensity_kw_m=f_ib,
+                    rh_3d=torch.clamp(rh_end, max=0.95),
+                )
+            if _do_snow_bc:
+                sfc_cp = copy.copy(sfc_sub)
+                sfc_cp.swe_land = swel_s_i
+                sfc_cp.swe_seaice = swei_s_i
+                sfc_cp.m_seaice = mice_s_i
+                sfc_cp.bc_snow = bc_sn_i
+                sfc_cp.dust_snow = du_sn_i
+                bc_dc = aero_cp.dep_bc_kgm2s if (aero_cp is not None and getattr(aero_cp, "dep_bc_kgm2s", None) is not None) else None
+                step_snow_impurity_darkening(
+                    sfc_cp,
+                    bc_dep_kgm2s=_cell_to_sub(bc_dc, nc, n_sub) if bc_dc is not None else None,
+                    dust_dep_kgm2s=_cell_to_sub(f_dust_dep_o, nc, n_sub) if _do_dust else None,
+                    snow_fall_kgm2s=sn_s_i, dt=dt,
+                )
+                bc_sn_o, du_sn_o = sfc_cp.bc_snow, sfc_cp.dust_snow
+            else:
+                bc_sn_o, du_sn_o = bc_sn_i, du_sn_i
+
+            # 6) Prognostic Mesospheric/Stratospheric NOx & NLC
+            nox_cp = _clone_obj_with_tensors(model.meso_nox, _nox_keys, nox_in) if _do_nox else None
+            if _do_nox and nox_cp is not None:
+                lnox_nx = (lgt_ft_c * LNOX_KG_N_PER_FLASH) if lgt_ft_c is not None else None
+                step_prognostic_nox(
+                    nox=nox_cp, pres_c=p_end, temp_c=t_end, rho_d=arho_i, z_c=atmos.z_c, dz_c=atmos.dz_c,
+                    q_v=aqv_i, mu0=mu0_i, lat_cell=mesh.lat_cell, precip_cell=ptot_c, dt=dt,
+                    n2o_ppmv=_n2o_cg, lnox_cell_kgn_m2s=lnox_nx,
+                    sprite_nox_mol_m2s=(sp_diag_cg.sprite_nox_mol_m2s if sp_diag_cg is not None else None),
+                    sprite_z_init_km=(sp_diag_cg.z_init_km_cell if sp_diag_cg is not None else None),
+                    sprite_z_stop_km=(sp_diag_cg.z_stop_km_cell if sp_diag_cg is not None else None),
+                    solar_uv_scale=_uv_cg, k_meso_start=_k_meso_nlc_cg,
+                )
+
+            # 7) Prognostic 3D Ozone Chemistry
+            oz_cp = _clone_obj_with_tensors(model.ozone, _oz_keys, oz_in) if _do_o3 else None
+            if _do_o3 and oz_cp is not None:
+                lnox_oz = (lgt_ft_c * LNOX_KG_N_PER_FLASH) if lgt_ft_c is not None else None
+                fc_oz = _sub_to_cell(lc_cp.fire_c_kgc_m2s, nc, n_sub) if lc_cp is not None else None
+                if bool(cfg.enable_bvoc_soa) and aero_cp is not None and getattr(aero_cp, "emis_soa_kgm2s", None) is not None:
+                    bvoc_o3 = 0.50 * torch.clamp(aero_cp.emis_soa_kgm2s, min=0.0)
+                    fc_oz = bvoc_o3 if fc_oz is None else (fc_oz + bvoc_o3)
+                step_prognostic_ozone(
+                    oz=oz_cp, pres_c=p_end, temp_c=t_end, rho_d=arho_i, dz_c=atmos.dz_c, q_v=aqv_i,
+                    mu0=mu0_i, surf_type=sfc.surf_type, lai_cell=lai_h, f_snow_cell=fsnow_c,
+                    f_seaice_cell=fice_c, dt=dt, n2o_ppmv=_n2o_cg, ch4_ppmv=_ch4_cg,
+                    ecl_ppbv=cfg.o3_ecl_ppbv, lnox_cell_kgn_m2s=lnox_oz, fire_c_cell_kgc_m2s=fc_oz,
+                    uv_j_o2_scale=_uv_cg, volc_sad_um2_cm3=None,
+                    nox_vmr_3d=(nox_cp.q_nox if nox_cp is not None else None),
+                    z_c=(atmos.z_c if float(cfg.z_top) >= 68000.0 else None),
+                )
+
+            # 8) Stable Water Isotopes
+            iso_cp = _clone_obj_with_tensors(model.water_isotopes, _iso_keys, iso_in) if _do_iso else None
+            if _do_iso and iso_cp is not None:
+                step_water_isotopes(
+                    iso=iso_cp, q_v=aqv_i, temp_c=t_end, rho_d=arho_i, dz_c=atmos.dz_c,
+                    surf_type=sfc.surf_type, t_sfc=trad_c, evap_cell=evap_c,
+                    rain_cell=rn_c_i, snow_cell=sn_c_i, dt=dt,
+                    rh_sfc=torch.clamp(rh_end[0], 0.15, 0.99), u10_cell=u10_c, lai_cell=lai_h,
+                )
+
+            out_l: list[torch.Tensor] = [
+                f_dust_dep_o, qdf_o, qdc_o, qdt_o,
+                evap_c, shf_c, gpp_c, trad_c, fice_c, fsnow_c, ust_c, u10_c, u10_sm,
+                t_air_c, t_air_s, pres_ps, vpd_s, ptot_c,
+                dp_n, dpet_n, dppfd_n, dt_n, dvpd_n, dtmin_n, nb_i, ns_i,
+                bc_sn_o, du_sn_o, lai_h, hc_h, laie_h, laid_h, nav_h,
+            ]
+            out_l.extend(sp_out)
+            if _do_lc and lc_cp is not None:
+                out_l.extend([getattr(lc_cp, k) for k in _lc_keys])
+            out_l.extend([getattr(bio_cp, k) for k in _bio_keys])
+            if _do_aero and aero_cp is not None:
+                out_l.extend([getattr(aero_cp, k) for k in _aero_keys])
+            if _do_nox and nox_cp is not None:
+                out_l.extend([getattr(nox_cp, k) for k in _nox_keys])
+            if _do_o3 and oz_cp is not None:
+                out_l.extend([getattr(oz_cp, k) for k in _oz_keys])
+            if _do_iso and iso_cp is not None:
+                out_l.extend([getattr(iso_cp, k) for k in _iso_keys])
+            return out_l
+
+        post_in: list[torch.Tensor] = [
+            atmos.rho_d, atmos.theta_m, atmos.q_v, atmos.q_i, atmos.q_p,
+            mu0, mu0_sub, crossed_noon_gpu,
+            rain_new_sub, snow_new_sub, rain_new, snow_new,
+            u_sub_0, v_sub_0, rho_sub_0, qv_sub_0, lai_exp_sub,
+            sfc_diag_sub.u_star, sfc_diag_sub.f_snow_land, sfc_diag_sub.z0m, sfc_diag_sub.d_disp,
+            sfc_diag_sub.evap, sfc_diag_sub.shf, sfc_diag_sub.gpp, sfc_diag_sub.t_rad_sfc, sfc_diag_sub.f_seaice,
+            sfc_diag_sub.alb_vis_dir, sfc_diag_sub.alb_vis_dif, sfc_diag_sub.alb_nir_dir, sfc_diag_sub.alb_nir_dif, sfc_diag_sub.emiss_sfc,
+            sw1_dir_sub, sw1_dif_sub, sw2_dir_sub, sw2_dif_sub, lw_dn_sub,
+            _sw1_d_c, _sw1_f_c,
+            crm.rho_d[0], crm.theta_m[0], crm.q_v[0],
+            sfc_sub.t_soil, sfc_sub.w_liq_soil, sfc_sub.w_ice_soil, sfc_sub.swe_land, sfc_sub.swe_seaice, sfc_sub.m_seaice,
+            sfc.t_canopy, sfc.t_ocean_ml,
+            clim_sub.day_precip_mm, clim_sub.day_pet_mm, clim_sub.day_ppfd_mol, clim_sub.day_temp_sum, clim_sub.day_vpd_sum, clim_sub.day_t_min,
+            _noon_buf_pre, _noon_seen_pre,
+        ]
+        if _do_dust:
+            post_in.extend([atmos.q_dust_fine, atmos.q_dust_coarse])
+        if _do_snow_bc:
+            post_in.extend([sfc_sub.bc_snow, sfc_sub.dust_snow])
+        if _has_lakes:
+            post_in.append(model.lakes.f_lake)
+        if _has_chl:
+            post_in.append(_chl_sfc_in)
+        if _has_resp_leaf:
+            post_in.append(sfc_diag_sub.resp_leaf)
+        if _has_lgt:
+            post_in.extend([
+                light_diag.flash_tot_cell, light_diag.flash_cg_cell, light_diag.cold_cloud_km_sub,
+                light_diag.n_dep_lnox_sub, light_diag.flash_cg_sub,
+            ])
+        if _has_exp_lgt:
+            post_in.append(model.explicit_lightning.q_chg)
+        post_in.extend(_lc_vals)
+        post_in.extend(_bio_vals)
+        post_in.extend(_aero_vals)
+        post_in.extend(_nox_vals)
+        post_in.extend(_oz_vals)
+        post_in.extend(_iso_vals)
+
+        post_key = (
+            "super_post_lightning_esm",
+            id(mesh), int(atmos.z_c.data_ptr()), nz, nc, n_sub, m_crm, round(float(dt), 6),
+            _do_sprites, _do_dust, _do_lc, _do_aero, _do_snow_bc, _do_nox, _do_o3, _do_iso,
+            _has_lakes, _has_chl, _has_resp_leaf, _has_lgt, _has_exp_lgt, _k_meso_nlc_cg,
+            round(_n2o_cg, 4), round(_ch4_cg, 4), round(_uv_cg, 4),
+            _lc_keys, _bio_keys, _aero_keys, _nox_keys, _oz_keys, _iso_keys,
+        )
+        post_out = run_cuda_graph_cached(
+            post_key, post_in, _super_post_esm_body,
+            warmup_calls=2, clone_outputs=True, suppress_inner_graphs=True,
+        )
+        (
+            _f_du_dep, _qdf, _qdc, _qdt,
+            evap_cell, shf_cell, gpp_cell, t_rad_cell, f_seaice_cell, f_snow_cell, u_star_cell, u10_cell, u10_sub_mag,
+            t_air, t_air_sub, pres_sfc_post_sub, vpd_sub, precip_tot,
+            clim_sub.day_precip_mm, clim_sub.day_pet_mm, clim_sub.day_ppfd_mol,
+            clim_sub.day_temp_sum, clim_sub.day_vpd_sum, clim_sub.day_t_min,
+            _nb_out, _ns_out, _bcsn_o, _dusn_o,
+            _lai_h, _hc_h, _laie_h, _laid_h, _nav_h,
+        ) = post_out[:33]
+        f_dust_dep_cell = _f_du_dep if _do_dust else None
+        if _do_dust:
+            atmos.q_dust_fine, atmos.q_dust_coarse, atmos.q_dust = _qdf, _qdc, _qdt
+        _noon_buf_pre.copy_(_nb_out)
+        _noon_seen_pre.copy_(_ns_out)
+        if _do_snow_bc:
+            sfc_sub.bc_snow, sfc_sub.dust_snow = _bcsn_o, _dusn_o
+        if _do_lc:
+            sfc.bio.lai = _lai_h
+            sfc.bio.h_canopy = _hc_h
+            if sfc_sub.bio.lai_evg is not None:
+                sfc.bio.lai_evg = _laie_h
+            if sfc_sub.bio.lai_dec is not None:
+                sfc.bio.lai_dec = _laid_h
+            if sfc_sub.bio.n_avail_fac is not None:
+                sfc.bio.n_avail_fac = _nav_h
+        q = 33
+        if _do_sprites:
+            model.last_red_sprites = RedSpriteDiagnostics(
+                sprite_rate_cell=post_out[q], sprite_prompt_rate_cell=post_out[q + 1],
+                sprite_delayed_rate_cell=post_out[q + 2], halo_rate_cell=post_out[q + 3],
+                cmc_median_ckm_cell=post_out[q + 4], e_over_ek_max_cell=post_out[q + 5],
+                red_1pn2_kr_cell=post_out[q + 6], blue_2pn2_kr_cell=post_out[q + 7],
+                z_init_km_cell=post_out[q + 8], z_stop_km_cell=post_out[q + 9],
+                sprite_nox_mol_m2s=post_out[q + 10], elves_rate_cell=post_out[q + 11],
+                blue_jet_rate_cell=post_out[q + 12], gigantic_jet_rate_cell=post_out[q + 13],
+                blue_jet_top_km_cell=post_out[q + 14],
+            )
+            q += 15
+        if _do_lc:
+            _write_back_obj_tensors(model.land_carbon, _lc_keys, post_out[q : q + len(_lc_keys)]); q += len(_lc_keys)
+        _write_back_obj_tensors(sfc_sub.bio, _bio_keys, post_out[q : q + len(_bio_keys)]); q += len(_bio_keys)
+        if _do_aero:
+            _write_back_obj_tensors(model.aerosols, _aero_keys, post_out[q : q + len(_aero_keys)]); q += len(_aero_keys)
+        if _do_nox:
+            _write_back_obj_tensors(model.meso_nox, _nox_keys, post_out[q : q + len(_nox_keys)]); q += len(_nox_keys)
+        if _do_o3:
+            _write_back_obj_tensors(model.ozone, _oz_keys, post_out[q : q + len(_oz_keys)]); q += len(_oz_keys)
+        if _do_iso:
+            _write_back_obj_tensors(model.water_isotopes, _iso_keys, post_out[q : q + len(_iso_keys)]); q += len(_iso_keys)
+
+        model.rad_cache["rain_sub"] = rain_new_sub
+        model.rad_cache["snow_sub"] = snow_new_sub
+        model.rad_cache["evap_sub"] = sfc_diag_sub.evap
+        model.rad_cache["shf_sub"] = sfc_diag_sub.shf
+        model.rad_cache["gpp_sub"] = sfc_diag_sub.gpp
+        model.rad_cache["rain"] = rain_new
+        model.rad_cache["snow"] = snow_new
+        model.rad_cache["evap"] = evap_cell
+        model.rad_cache["shf"] = shf_cell
+        model.rad_cache["gpp"] = gpp_cell
+        model.last_sfc_diag_sub = sfc_diag_sub
+        model.last_s_toa = s_toa
+        clim_sub.day_steps += 1
+        alk_weath_cell = None
+        # 8b-4. Land-River-Atmosphere-Ocean BGC Nutrient Coupling (runs cleanly after Super-Graph 4)
+        if (
+            (bool(cfg.enable_bgc_fe_lnox_coupling) or bool(cfg.enable_river_routing))
+            and model.ogcm is not None
+            and model.ogcm.bgc is not None
+        ):
+            from aoba.ocean_bgc import apply_atmospheric_bgc_deposition
+
+            du_bgc = f_dust_dep_cell if bool(cfg.enable_bgc_fe_lnox_coupling) else None
+            bc_bgc = (
+                model.aerosols.dep_bc_kgm2s
+                if (bool(cfg.enable_bgc_fe_lnox_coupling) and model.aerosols is not None and getattr(model.aerosols, "dep_bc_kgm2s", None) is not None)
+                else None
+            )
+            ln_bgc = (light_diag.n_dep_lnox_cell if light_diag is not None else None) if bool(cfg.enable_bgc_fe_lnox_coupling) else None
+            fire_n_bgc = None
+            if bool(cfg.enable_bgc_fe_lnox_coupling) and model.land_carbon is not None and getattr(model.land_carbon, "n_fire_kgn_m2s", None) is not None:
+                nf_raw = model.land_carbon.n_fire_kgn_m2s
+                nf_cell = _sub_to_cell(nf_raw, nc, n_sub) if int(nf_raw.shape[0]) == m_sub else nf_raw
+                a_tot_n = torch.clamp(mesh.area_cell.sum(), min=1.0)
+                nf_glob = (torch.clamp(nf_cell, min=0.0) * mesh.area_cell).sum() / a_tot_n
+                fire_n_bgc = 0.50 * torch.clamp(nf_cell, min=0.0) + 0.50 * nf_glob
+            riv_n_bgc = riv_c_bgc = riv_fe_bgc = alk_bgc = None
+            if bool(cfg.enable_river_routing) and model.river is not None:
+                from aoba.river_routing import step_river_solute_routing
+
+                n_leach_c = c_exp_c = None
+                if model.land_carbon is not None:
+                    if getattr(model.land_carbon, "n_leach_kgn_m2s", None) is not None:
+                        nl_r = model.land_carbon.n_leach_kgn_m2s
+                        n_leach_c = _sub_to_cell(nl_r, nc, n_sub) if int(nl_r.shape[0]) == m_sub else nl_r
+                    rh_r = model.land_carbon.rh_kgc_m2s
+                    rh_c = _sub_to_cell(rh_r, nc, n_sub) if int(rh_r.shape[0]) == m_sub else rh_r
+                    c_exp_c = 0.02 * torch.clamp(rh_c, min=0.0)
+                runoff_liq_alk = torch.clamp(_sub_to_cell(sfc_diag_sub.runoff_total - sfc_diag_sub.runoff_ice, nc, n_sub), min=0.0)
+                alk_src_riv = runoff_liq_alk * 1.0e-3
+                riv_n_bgc, riv_c_bgc, alk_bgc, riv_fe_bgc = step_river_solute_routing(
+                    model.river, mesh.area_cell, dt,
+                    n_leach_kgn_m2s=n_leach_c, c_export_kgc_m2s=c_exp_c, alk_src_mol_m2s=alk_src_riv, t_sfc_k=t_air,
+                )
+            dep_stride = max(int(cfg.ocean_stride), 1) if has_indep_ocn else 1
+            dep_dt = dt
+            if dep_stride > 1:
+                dep_acc = model.rad_cache.get("_bgc_dep_acc")
+                if dep_acc is None:
+                    dep_acc = {"n": 0}
+                    model.rad_cache["_bgc_dep_acc"] = dep_acc
+                dep_acc["n"] = int(dep_acc["n"]) + 1
+                for _dk, _dv in (
+                    ("du", du_bgc), ("bc", bc_bgc), ("ln", ln_bgc), ("fn", fire_n_bgc),
+                    ("rn", riv_n_bgc), ("rc", riv_c_bgc), ("rfe", riv_fe_bgc), ("alk", alk_bgc),
+                ):
+                    if _dv is not None:
+                        dep_acc[_dk] = _dv if (_dk not in dep_acc or dep_acc["n"] == 1) else (dep_acc[_dk] + _dv)
+                if dep_acc["n"] < dep_stride:
+                    du_bgc = bc_bgc = ln_bgc = fire_n_bgc = riv_n_bgc = riv_c_bgc = riv_fe_bgc = alk_bgc = None
+                    dep_dt = 0.0
+                else:
+                    inv_dn = 1.0 / float(dep_acc["n"])
+                    dep_dt = dt * float(dep_acc["n"])
+                    du_bgc = dep_acc.pop("du", None)
+                    bc_bgc = dep_acc.pop("bc", None)
+                    ln_bgc = dep_acc.pop("ln", None)
+                    fire_n_bgc = dep_acc.pop("fn", None)
+                    riv_n_bgc = dep_acc.pop("rn", None)
+                    riv_c_bgc = dep_acc.pop("rc", None)
+                    riv_fe_bgc = dep_acc.pop("rfe", None)
+                    alk_bgc = dep_acc.pop("alk", None)
+                    if du_bgc is not None: du_bgc = du_bgc * inv_dn
+                    if bc_bgc is not None: bc_bgc = bc_bgc * inv_dn
+                    if ln_bgc is not None: ln_bgc = ln_bgc * inv_dn
+                    if fire_n_bgc is not None: fire_n_bgc = fire_n_bgc * inv_dn
+                    if riv_n_bgc is not None: riv_n_bgc = riv_n_bgc * inv_dn
+                    if riv_c_bgc is not None: riv_c_bgc = riv_c_bgc * inv_dn
+                    if riv_fe_bgc is not None: riv_fe_bgc = riv_fe_bgc * inv_dn
+                    if alk_bgc is not None: alk_bgc = alk_bgc * inv_dn
+                    dep_acc["n"] = 0
+            if dep_dt > 0.0:
+                if has_indep_ocn:
+                    from aoba.ocean_coupler import atm_to_ocn_conservative_flux, atm_to_ocn_intensive
+
+                    if du_bgc is not None: du_bgc = atm_to_ocn_intensive(model.ocn_coupler, du_bgc)
+                    if bc_bgc is not None: bc_bgc = atm_to_ocn_intensive(model.ocn_coupler, bc_bgc)
+                    if ln_bgc is not None: ln_bgc = atm_to_ocn_intensive(model.ocn_coupler, ln_bgc)
+                    if fire_n_bgc is not None: fire_n_bgc = atm_to_ocn_intensive(model.ocn_coupler, fire_n_bgc)
+                    if riv_n_bgc is not None: riv_n_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_n_bgc, ocean_only_source=True)
+                    if riv_c_bgc is not None: riv_c_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_c_bgc, ocean_only_source=True)
+                    if riv_fe_bgc is not None: riv_fe_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_fe_bgc, ocean_only_source=True)
+                    if alk_bgc is not None:
+                        alk_bgc = atm_to_ocn_conservative_flux(
+                            model.ocn_coupler, alk_bgc, ocean_only_source=(bool(cfg.enable_river_routing) and model.river is not None)
+                        )
+                elif alk_bgc is not None and not (bool(cfg.enable_river_routing) and model.river is not None):
+                    w0 = model.ogcm.wet_c[0].to(alk_bgc.dtype)
+                    a_ocn_sum = torch.clamp((mesh.area_cell * w0).sum(), min=1.0)
+                    alk_tot = (alk_bgc * mesh.area_cell).sum()
+                    alk_bgc = (alk_tot / a_ocn_sum) * w0
+                apply_atmospheric_bgc_deposition(
+                    model.ogcm.bgc, model.ogcm, du_bgc, ln_bgc, alk_bgc, dep_dt,
+                    bc_dep_kgm2s=bc_bgc, fire_n_dep_kgn_m2s=fire_n_bgc,
+                    river_n_kgn_m2s=riv_n_bgc, river_c_kgc_m2s=riv_c_bgc, river_fe_mol_m2s=riv_fe_bgc,
+                )
+        if bool(cfg.enable_prognostic_ch4_n2o):
+            from aoba.trace_gas_cycle import init_trace_gas_cycle_state, step_trace_gas_cycle
+
+            if model.trace_gas is None:
+                model.trace_gas = init_trace_gas_cycle_state(cfg.ch4_ppmv, cfg.n2o_ppmv)
+            _tg_steps_per_day = max(int(round(C.SECONDS_PER_DAY / dt)), 1)
+            if (clim_sub.day_steps >= _tg_steps_per_day) or (model.step_count == 0):
+                _tg_dt = dt if model.step_count == 0 else (dt * float(clim_sub.day_steps))
+                mean_tco_now = float(model.ozone.tco_du.mean().item()) if model.ozone is not None else 300.0
+                ocn_m_tg = model.ocn_mesh if has_indep_ocn else mesh
+                step_trace_gas_cycle(
+                    tg=model.trace_gas, area_cell=mesh.area_cell, surf_type=sfc.surf_type,
+                    t_sfc_k=t_air, w_liq_soil_top=sfc_sub.w_liq_soil[0], dt=_tg_dt,
+                    rh_kgc_m2s=model.land_carbon.rh_kgc_m2s if model.land_carbon is not None else None,
+                    fire_c_kgc_m2s=model.land_carbon.fire_c_kgc_m2s if model.land_carbon is not None else None,
+                    n_denit_kgn_m2s=getattr(model.land_carbon, "n_denit_kgn_m2s", None) if model.land_carbon is not None else None,
+                    ocean_epc100_molc_m2s=model.ogcm.bgc.epc100 if (model.ogcm is not None and model.ogcm.bgc is not None) else None,
+                    ocean_denit_moln_m2s=getattr(model.ogcm.bgc, "denit_moln_m2s", None) if (model.ogcm is not None and model.ogcm.bgc is not None) else None,
+                    ocean_area_cell=ocn_m_tg.area_cell if ocn_m_tg is not None else None,
+                    f_wetland_sub=model.maml_land.f_wetland if (bool(cfg.enable_maml_wetlands_lakes) and model.maml_land is not None) else None,
+                    mean_tco_du=mean_tco_now,
+                )
+    if not _can_super_post_esm:
+        if _do_sprites:
             from aoba.red_sprites import compute_red_sprites
 
             ccd_cell = light_diag.cold_cloud_km_sub.reshape(nc, -1).mean(dim=-1)
@@ -4151,98 +5081,92 @@ def step_aoba_model(
                 area_cell=mesh.area_cell,
                 explicit_state=model.explicit_lightning,
             )
-    f_dust_dep_cell = None
-    u_star_cell = _sub_to_cell(sfc_diag_sub.u_star, nc, n_sub)
-    f_snow_cell = _sub_to_cell(sfc_diag_sub.f_snow_land, nc, n_sub)
-    u10_sub_mag = torch.hypot(u_sub_0, v_sub_0)
-    u10_cell = _sub_to_cell(u10_sub_mag, nc, n_sub)
-    if cfg.enable_dust:
-        if atmos.q_dust_fine is None or atmos.q_dust_coarse is None:
-            if atmos.q_dust is not None:
-                qd_base = torch.clamp(atmos.q_dust, min=0.0)
-                atmos.q_dust_fine = qd_base * DUST_LEGACY_RESTART_FINE_FRAC
-                atmos.q_dust_coarse = qd_base * (1.0 - DUST_LEGACY_RESTART_FINE_FRAC)
-            else:
-                atmos.q_dust_fine = torch.zeros_like(atmos.q_n)
-                atmos.q_dust_coarse = torch.zeros_like(atmos.q_n)
-                atmos.q_dust = torch.zeros_like(atmos.q_n)
-        f_dust_sub = compute_dust_emission_sub(
-            surf_type=sfc_sub.surf_type,
-            lai=lai_exp_sub,
-            f_snow=sfc_diag_sub.f_snow_land,
-            w_liq_soil_top=sfc_sub.w_liq_soil[0],
-            w_ice_soil_top=sfc_sub.w_ice_soil[0],
-            u_star=sfc_diag_sub.u_star,
-            rho_atm=rho_sub_0 * (1.0 + qv_sub_0),
-            z0m=sfc_diag_sub.z0m,
-            d_disp=sfc_diag_sub.d_disp,
-            dust_emis_factor=cfg.dust_emis_factor,
+        f_dust_dep_cell = None
+        u_star_cell = _sub_to_cell(sfc_diag_sub.u_star, nc, n_sub)
+        f_snow_cell = _sub_to_cell(sfc_diag_sub.f_snow_land, nc, n_sub)
+        u10_sub_mag = torch.hypot(u_sub_0, v_sub_0)
+        u10_cell = _sub_to_cell(u10_sub_mag, nc, n_sub)
+        if cfg.enable_dust:
+            if atmos.q_dust_fine is None or atmos.q_dust_coarse is None:
+                if atmos.q_dust is not None:
+                    qd_base = torch.clamp(atmos.q_dust, min=0.0)
+                    atmos.q_dust_fine = qd_base * DUST_LEGACY_RESTART_FINE_FRAC
+                    atmos.q_dust_coarse = qd_base * (1.0 - DUST_LEGACY_RESTART_FINE_FRAC)
+                else:
+                    atmos.q_dust_fine = torch.zeros_like(atmos.q_n)
+                    atmos.q_dust_coarse = torch.zeros_like(atmos.q_n)
+                    atmos.q_dust = torch.zeros_like(atmos.q_n)
+            f_dust_sub = compute_dust_emission_sub(
+                surf_type=sfc_sub.surf_type,
+                lai=lai_exp_sub,
+                f_snow=sfc_diag_sub.f_snow_land,
+                w_liq_soil_top=sfc_sub.w_liq_soil[0],
+                w_ice_soil_top=sfc_sub.w_ice_soil[0],
+                u_star=sfc_diag_sub.u_star,
+                rho_atm=rho_sub_0 * (1.0 + qv_sub_0),
+                z0m=sfc_diag_sub.z0m,
+                d_disp=sfc_diag_sub.d_disp,
+                dust_emis_factor=cfg.dust_emis_factor,
+            )
+            if bool(cfg.enable_dynamic_lakes) and model.lakes is not None:
+                # Active lakes suppress mineral dust; desiccated basins (f_lake -> 0) naturally expose dust sources
+                f_dust_sub = f_dust_sub * torch.clamp(1.0 - _cell_to_sub(model.lakes.f_lake, nc, n_sub), 0.0, 1.0)
+            f_dust_emit_c = _sub_to_cell(f_dust_sub, nc, n_sub)
+            dm_dust_c = torch.clamp(atmos.rho_d * atmos.dz_c, min=0.0)
+            dust_col_pre = (dm_dust_c * torch.clamp(atmos.q_dust_fine + atmos.q_dust_coarse, min=0.0)).sum(dim=0)
+            atmos.q_dust_fine, atmos.q_dust_coarse, atmos.q_dust = step_dust_two_mode_column(
+                q_dust_fine=atmos.q_dust_fine,
+                q_dust_coarse=atmos.q_dust_coarse,
+                rho_d=atmos.rho_d,
+                dz_c=atmos.dz_c,
+                z_c=atmos.z_c,
+                f_dust_emit=f_dust_emit_c,
+                precip_rate=rain_new + snow_new,
+                u_star_cell=u_star_cell,
+                dt=dt,
+            )
+            dust_col_post = (dm_dust_c * torch.clamp(atmos.q_dust, min=0.0)).sum(dim=0)
+            f_dust_dep_cell = torch.clamp((dust_col_pre + dt * f_dust_emit_c - dust_col_post) / max(dt, 1.0), min=0.0)
+        _sfc_cell_5 = torch.stack(
+            [sfc_diag_sub.evap, sfc_diag_sub.shf, sfc_diag_sub.gpp, sfc_diag_sub.t_rad_sfc, sfc_diag_sub.f_seaice],
+            dim=0,
+        ).reshape(5, nc, n_sub).mean(dim=-1)
+        evap_cell, shf_cell, gpp_cell, t_rad_cell, f_seaice_cell = _sfc_cell_5.unbind(dim=0)
+
+        model.rad_cache["rain_sub"] = rain_new_sub
+        model.rad_cache["snow_sub"] = snow_new_sub
+        model.rad_cache["evap_sub"] = sfc_diag_sub.evap
+        model.rad_cache["shf_sub"] = sfc_diag_sub.shf
+        model.rad_cache["gpp_sub"] = sfc_diag_sub.gpp
+        model.rad_cache["rain"] = rain_new
+        model.rad_cache["snow"] = snow_new
+        model.rad_cache["evap"] = evap_cell
+        model.rad_cache["shf"] = shf_cell
+        model.rad_cache["gpp"] = gpp_cell
+        model.last_sfc_diag_sub = sfc_diag_sub
+        model.last_s_toa = s_toa
+
+        # 8. Subgrid Solar Noon EEO Acclimation, Daily LAI/Root Phenology, Host Sync, & Monthly Köppen
+        rho_post_0 = _c2s(crm.rho_d[0].reshape(m_crm))
+        thm_post_0 = _c2s(crm.theta_m[0].reshape(m_crm))
+        qv_post_0 = _c2s(crm.q_v[0].reshape(m_crm))
+        post_accum_fn = maybe_cuda_compile(_coupled_post_crm_accum_core, device=rho_post_0.device)
+        (
+            t_air_sub, pres_sfc_post_sub, vpd_sub,
+            day_precip_new, day_pet_new, day_ppfd_new,
+            day_temp_new, day_vpd_new, day_t_min_new,
+        ) = post_accum_fn(
+            rho_post_0, thm_post_0, qv_post_0, dz0_sub,
+            rain_new_sub, snow_new_sub,
+            sw1_dir_sub, sw1_dif_sub, sw2_dir_sub, sw2_dif_sub, lw_dn_sub,
+            sfc_diag_sub.alb_vis_dir, sfc_diag_sub.alb_vis_dif,
+            sfc_diag_sub.alb_nir_dir, sfc_diag_sub.alb_nir_dif,
+            sfc_diag_sub.emiss_sfc, sfc_diag_sub.t_rad_sfc,
+            clim_sub.day_precip_mm, clim_sub.day_pet_mm, clim_sub.day_ppfd_mol,
+            clim_sub.day_temp_sum, clim_sub.day_vpd_sum, clim_sub.day_t_min, dt,
         )
-        if bool(cfg.enable_dynamic_lakes) and model.lakes is not None:
-            # Active lakes suppress mineral dust; desiccated basins (f_lake -> 0) naturally expose dust sources
-            f_dust_sub = f_dust_sub * torch.clamp(1.0 - _cell_to_sub(model.lakes.f_lake, nc, n_sub), 0.0, 1.0)
-        f_dust_emit_c = _sub_to_cell(f_dust_sub, nc, n_sub)
-        dm_dust_c = torch.clamp(atmos.rho_d * atmos.dz_c, min=0.0)
-        dust_col_pre = (dm_dust_c * torch.clamp(atmos.q_dust_fine + atmos.q_dust_coarse, min=0.0)).sum(dim=0)
-        atmos.q_dust_fine, atmos.q_dust_coarse, atmos.q_dust = step_dust_two_mode_column(
-            q_dust_fine=atmos.q_dust_fine,
-            q_dust_coarse=atmos.q_dust_coarse,
-            rho_d=atmos.rho_d,
-            dz_c=atmos.dz_c,
-            z_c=atmos.z_c,
-            f_dust_emit=f_dust_emit_c,
-            precip_rate=rain_new + snow_new,
-            u_star_cell=u_star_cell,
-            dt=dt,
-        )
-        dust_col_post = (dm_dust_c * torch.clamp(atmos.q_dust, min=0.0)).sum(dim=0)
-        f_dust_dep_cell = torch.clamp((dust_col_pre + dt * f_dust_emit_c - dust_col_post) / max(dt, 1.0), min=0.0)
-    _sfc_cell_5 = torch.stack(
-        [sfc_diag_sub.evap, sfc_diag_sub.shf, sfc_diag_sub.gpp, sfc_diag_sub.t_rad_sfc, sfc_diag_sub.f_seaice],
-        dim=0,
-    ).reshape(5, nc, n_sub).mean(dim=-1)
-    evap_cell, shf_cell, gpp_cell, t_rad_cell, f_seaice_cell = _sfc_cell_5.unbind(dim=0)
 
-    model.rad_cache["rain_sub"] = rain_new_sub
-    model.rad_cache["snow_sub"] = snow_new_sub
-    model.rad_cache["evap_sub"] = sfc_diag_sub.evap
-    model.rad_cache["shf_sub"] = sfc_diag_sub.shf
-    model.rad_cache["gpp_sub"] = sfc_diag_sub.gpp
-    model.rad_cache["rain"] = rain_new
-    model.rad_cache["snow"] = snow_new
-    model.rad_cache["evap"] = evap_cell
-    model.rad_cache["shf"] = shf_cell
-    model.rad_cache["gpp"] = gpp_cell
-    model.last_sfc_diag_sub = sfc_diag_sub
-    model.last_s_toa = s_toa
-
-    # 8. Subgrid Solar Noon EEO Acclimation, Daily LAI/Root Phenology, Host Sync, & Monthly Köppen
-    rho_post_0 = _c2s(crm.rho_d[0].reshape(m_crm))
-    thm_post_0 = _c2s(crm.theta_m[0].reshape(m_crm))
-    qv_post_0 = _c2s(crm.q_v[0].reshape(m_crm))
-    post_accum_fn = maybe_cuda_compile(_coupled_post_crm_accum_core, device=rho_post_0.device)
-    (
-        t_air_sub, pres_sfc_post_sub, vpd_sub,
-        day_precip_new, day_pet_new, day_ppfd_new,
-        day_temp_new, day_vpd_new, day_t_min_new,
-    ) = post_accum_fn(
-        rho_post_0, thm_post_0, qv_post_0, dz0_sub,
-        rain_new_sub, snow_new_sub,
-        sw1_dir_sub, sw1_dif_sub, sw2_dir_sub, sw2_dif_sub, lw_dn_sub,
-        sfc_diag_sub.alb_vis_dir, sfc_diag_sub.alb_vis_dif,
-        sfc_diag_sub.alb_nir_dir, sfc_diag_sub.alb_nir_dif,
-        sfc_diag_sub.emiss_sfc, sfc_diag_sub.t_rad_sfc,
-        clim_sub.day_precip_mm, clim_sub.day_pet_mm, clim_sub.day_ppfd_mol,
-        clim_sub.day_temp_sum, clim_sub.day_vpd_sum, clim_sub.day_t_min, dt,
-    )
-
-    # Cache CPU land-cell mask once so ocean-only longitude bands skip solar-noon snapshots cleanly
-    land_cell_cpu = getattr(model, "_land_cell_cpu_cache", None)
-    if land_cell_cpu is None or int(land_cell_cpu.numel()) != nc:
-        land_cell_cpu = (sfc_sub.surf_type.reshape(nc, n_sub) == SURF_LAND).any(dim=-1).cpu()
-        model._land_cell_cpu_cache = land_cell_cpu  # type: ignore[attr-defined]
-    crossed_noon_land_cpu = crossed_noon_cpu & land_cell_cpu
-    if bool(crossed_noon_land_cpu.any()):
+        # Zero-sync GPU branchless solar-noon snapshot (eliminates pageable CPU->GPU copy & cudaStreamSynchronize!)
         noon_buf = getattr(clim_sub, "_noon_buf", None)
         noon_seen = getattr(clim_sub, "_noon_seen", None)
         if noon_buf is None or int(noon_buf.shape[1]) != m_sub or noon_buf.device != rho_post_0.device:
@@ -4250,563 +5174,565 @@ def step_aoba_model(
             noon_seen = torch.zeros(m_sub, device=rho_post_0.device, dtype=torch.bool)
             clim_sub._noon_buf = noon_buf    # type: ignore[attr-defined]
             clim_sub._noon_seen = noon_seen  # type: ignore[attr-defined]
-        noon_cells = torch.nonzero(crossed_noon_land_cpu, as_tuple=False).squeeze(-1).to(device=rho_post_0.device)
-        noon_sub_idx = (
-            noon_cells.unsqueeze(-1) * n_sub + torch.arange(n_sub, device=rho_post_0.device)
-        ).reshape(-1)
-        t_air_n = t_air_sub.index_select(0, noon_sub_idx)
-        snap = torch.stack([
-            sw1_dir_sub.index_select(0, noon_sub_idx),
-            sw1_dif_sub.index_select(0, noon_sub_idx),
-            torch.clamp(mu0_sub.index_select(0, noon_sub_idx), min=0.05),
-            t_air_n,
-            vpd_sub.index_select(0, noon_sub_idx),
-            torch.minimum(clim_sub.day_t_min.index_select(0, noon_sub_idx), t_air_n - 2.0),
-            pres_sfc_post_sub.index_select(0, noon_sub_idx),
-            lai_exp_sub.index_select(0, noon_sub_idx),
+        noon_land_sub = _cell_to_sub(crossed_noon_gpu, nc, n_sub) & (sfc_sub.surf_type == SURF_LAND)
+        noon_mask_8 = noon_land_sub.unsqueeze(0)
+        snap_all = torch.stack([
+            sw1_dir_sub,
+            sw1_dif_sub,
+            torch.clamp(mu0_sub, min=0.05),
+            t_air_sub,
+            vpd_sub,
+            torch.minimum(clim_sub.day_t_min, t_air_sub - 2.0),
+            pres_sfc_post_sub,
+            lai_exp_sub,
         ], dim=0)
-        noon_buf.index_copy_(1, noon_sub_idx, snap)
-        noon_seen.index_fill_(0, noon_sub_idx, True)
+        noon_buf.copy_(torch.where(noon_mask_8, snap_all, noon_buf))
+        noon_seen.logical_or_(noon_land_sub)
 
-    clim_sub.day_precip_mm = day_precip_new
-    clim_sub.day_pet_mm = day_pet_new
-    clim_sub.day_ppfd_mol = day_ppfd_new
-    clim_sub.day_temp_sum = day_temp_new
-    clim_sub.day_vpd_sum = day_vpd_new
-    clim_sub.day_t_min = day_t_min_new
-    clim_sub.day_steps += 1
+        clim_sub.day_precip_mm = day_precip_new
+        clim_sub.day_pet_mm = day_pet_new
+        clim_sub.day_ppfd_mol = day_ppfd_new
+        clim_sub.day_temp_sum = day_temp_new
+        clim_sub.day_vpd_sum = day_vpd_new
+        clim_sub.day_t_min = day_t_min_new
+        clim_sub.day_steps += 1
 
-    # Host monthly Köppen-Geiger accumulators (calendar month index 0..11)
-    precip_tot = rain_new + snow_new
-    t_air = _sub_to_cell(t_air_sub, nc, n_sub)
-    if bool(cfg.enable_land_carbon):
-        from aoba.land_carbon import init_land_carbon_state, step_land_carbon_and_fire
+        # Host monthly Köppen-Geiger accumulators (calendar month index 0..11)
+        precip_tot = rain_new + snow_new
+        t_air = _sub_to_cell(t_air_sub, nc, n_sub)
+        if bool(cfg.enable_land_carbon):
+            from aoba.land_carbon import init_land_carbon_state, step_land_carbon_and_fire
 
-        if model.land_carbon is None:
-            model.land_carbon = init_land_carbon_state(
-                sfc_sub.surf_type, sfc_sub.bio.lai, sfc_sub.bio.h_canopy, device=t_air.device, maml_n_sub=n_sub
-            )
-        is_maml_lc = int(model.land_carbon.c_leaf.shape[0]) == m_sub
-        if is_maml_lc:
-            resp_leaf_sub = (
-                sfc_diag_sub.resp_leaf
-                if sfc_diag_sub.resp_leaf is not None
-                else torch.zeros_like(sfc_diag_sub.gpp)
-            )
-            f4_sub = torch.clamp(sfc_sub.bio.f_c4, 0.0, 1.0)
-            vc25_eff_sub = (1.0 - f4_sub) * sfc_sub.bio.vcmax25_c3 + f4_sub * sfc_sub.bio.vcmax25_c4
-            step_land_carbon_and_fire(
-                lc=model.land_carbon,
-                surf_type=sfc_sub.surf_type,
-                gpp_umol=sfc_diag_sub.gpp,
-                resp_leaf_umol=resp_leaf_sub,
-                lai=sfc_sub.bio.lai,
-                h_canopy=sfc_sub.bio.h_canopy,
-                t_soil=sfc_sub.t_soil,
-                w_liq_soil=sfc_sub.w_liq_soil,
-                w_ice_soil=sfc_sub.w_ice_soil,
-                f_snow=sfc_diag_sub.f_snow_land,
-                t_sfc_k=t_air_sub,
-                vpd_pa=vpd_sub,
-                u10_ms=u10_sub_mag,
-                precip_kgm2s=rain_new_sub + snow_new_sub,
-                dt=dt,
-                enable_nitrogen=bool(cfg.enable_land_nitrogen),
-                vcmax25_eff=vc25_eff_sub,
-                f_evg=sfc_sub.bio.f_evg,
-                f_c4=f4_sub,
-                slope_tan=torch.clamp(_cell_to_sub(mesh.sigma_topo, nc, n_sub) / 2000.0, 0.0, 0.75),
-                transp_kgm2s=torch.clamp(sfc_diag_sub.evap, min=0.0),
-                n_dep_kgn_m2s=_c2s(light_diag.n_dep_lnox_sub.reshape(m_crm)) if light_diag is not None else None,
-                flash_cg_m2s=_c2s(light_diag.flash_cg_sub.reshape(m_crm)) if light_diag is not None else None,
-                bio=sfc_sub.bio,
-                enable_fire_veg_feedback=bool(cfg.enable_fire_veg_feedback),
-                maml_shape=(nc, ny_t, nx_t),
-                crm_dx_m=float(cfg.crm_dx) * math.sqrt(float(by_full * bx_full)),
-            )
-            # Mirror updated MAML LAI / canopy height / N availability back to host summary
-            sfc.bio.lai = _sub_to_cell(sfc_sub.bio.lai, nc, n_sub)
-            sfc.bio.h_canopy = _sub_to_cell(sfc_sub.bio.h_canopy, nc, n_sub)
-            if sfc_sub.bio.lai_evg is not None:
-                sfc.bio.lai_evg = _sub_to_cell(sfc_sub.bio.lai_evg, nc, n_sub)
-            if sfc_sub.bio.lai_dec is not None:
-                sfc.bio.lai_dec = _sub_to_cell(sfc_sub.bio.lai_dec, nc, n_sub)
-            if sfc_sub.bio.n_avail_fac is not None:
-                sfc.bio.n_avail_fac = _sub_to_cell(sfc_sub.bio.n_avail_fac, nc, n_sub)
-        else:
-            lai_c = _sub_to_cell(sfc_sub.bio.lai, nc, n_sub)
-            hc_c = _sub_to_cell(sfc_sub.bio.h_canopy, nc, n_sub)
-            resp_leaf_c = (
-                _sub_to_cell(sfc_diag_sub.resp_leaf, nc, n_sub)
-                if sfc_diag_sub.resp_leaf is not None
-                else torch.zeros_like(gpp_cell)
-            )
-            f4_c = torch.clamp(_sub_to_cell(sfc_sub.bio.f_c4, nc, n_sub), 0.0, 1.0)
-            vc25_eff_c = (1.0 - f4_c) * _sub_to_cell(sfc_sub.bio.vcmax25_c3, nc, n_sub) + f4_c * _sub_to_cell(sfc_sub.bio.vcmax25_c4, nc, n_sub)
-            step_land_carbon_and_fire(
-                lc=model.land_carbon,
-                surf_type=sfc.surf_type,
-                gpp_umol=gpp_cell,
-                resp_leaf_umol=resp_leaf_c,
-                lai=lai_c,
-                h_canopy=hc_c,
-                t_soil=_sub_to_cell(sfc_sub.t_soil, nc, n_sub),
-                w_liq_soil=_sub_to_cell(sfc_sub.w_liq_soil, nc, n_sub),
-                w_ice_soil=_sub_to_cell(sfc_sub.w_ice_soil, nc, n_sub),
-                f_snow=f_snow_cell,
-                t_sfc_k=t_air,
-                vpd_pa=_sub_to_cell(vpd_sub, nc, n_sub),
-                u10_ms=u10_cell,
-                precip_kgm2s=precip_tot,
-                dt=dt,
-                enable_nitrogen=bool(cfg.enable_land_nitrogen),
-                vcmax25_eff=vc25_eff_c,
-                f_evg=_sub_to_cell(sfc_sub.bio.f_evg, nc, n_sub) if sfc_sub.bio.f_evg is not None else None,
-                f_c4=f4_c,
-                slope_tan=torch.clamp(mesh.sigma_topo / 2000.0, 0.0, 0.75),
-                transp_kgm2s=torch.clamp(evap_cell, min=0.0),
-                n_dep_kgn_m2s=light_diag.n_dep_lnox_cell if light_diag is not None else None,
-                flash_cg_m2s=light_diag.flash_cg_cell if light_diag is not None else None,
-                bio=None,
-                enable_fire_veg_feedback=False,
-                maml_shape=None,
-                crm_dx_m=float(cfg.crm_dx),
-            )
-    # Lazily cached end-of-step host (P, T, RH) shared across aerosols, volcanics, ozone & water isotopes
-    pres_host_end: torch.Tensor | None = None
-    temp_host_end: torch.Tensor | None = None
-    rh_host_end: torch.Tensor | None = None
-
-    def _get_host_pt_end() -> tuple[torch.Tensor, torch.Tensor]:
-        nonlocal pres_host_end, temp_host_end
-        if pres_host_end is None or temp_host_end is None:
-            pres_host_end, _, temp_host_end = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
-        return pres_host_end, temp_host_end
-
-    if bool(cfg.enable_natural_aerosols):
-        from aoba.aerosols import init_natural_aerosol_state, step_natural_aerosols_column
-
-        if model.aerosols is None:
-            model.aerosols = init_natural_aerosol_state(nz, nc, device=atmos.q_n.device, dtype=atmos.q_n.dtype)
-        chl_sfc = (
-            model.ogcm.bgc.chl[0]
-            if (model.ogcm is not None and model.ogcm.bgc is not None)
-            else None
-        )
-        if chl_sfc is not None and has_indep_ocn:
-            ogcm_gen_c = int(model.rad_cache.get("_ogcm_step_gen", 0))
-            chl_cached = model.rad_cache.get("_ocn_chl_sfc_c")
-            if chl_cached is not None and chl_cached[0] == ogcm_gen_c:
-                chl_sfc = chl_cached[1]
+            if model.land_carbon is None:
+                model.land_carbon = init_land_carbon_state(
+                    sfc_sub.surf_type, sfc_sub.bio.lai, sfc_sub.bio.h_canopy, device=t_air.device, maml_n_sub=n_sub
+                )
+            is_maml_lc = int(model.land_carbon.c_leaf.shape[0]) == m_sub
+            if is_maml_lc:
+                resp_leaf_sub = (
+                    sfc_diag_sub.resp_leaf
+                    if sfc_diag_sub.resp_leaf is not None
+                    else torch.zeros_like(sfc_diag_sub.gpp)
+                )
+                f4_sub = torch.clamp(sfc_sub.bio.f_c4, 0.0, 1.0)
+                vc25_eff_sub = (1.0 - f4_sub) * sfc_sub.bio.vcmax25_c3 + f4_sub * sfc_sub.bio.vcmax25_c4
+                step_land_carbon_and_fire(
+                    lc=model.land_carbon,
+                    surf_type=sfc_sub.surf_type,
+                    gpp_umol=sfc_diag_sub.gpp,
+                    resp_leaf_umol=resp_leaf_sub,
+                    lai=sfc_sub.bio.lai,
+                    h_canopy=sfc_sub.bio.h_canopy,
+                    t_soil=sfc_sub.t_soil,
+                    w_liq_soil=sfc_sub.w_liq_soil,
+                    w_ice_soil=sfc_sub.w_ice_soil,
+                    f_snow=sfc_diag_sub.f_snow_land,
+                    t_sfc_k=t_air_sub,
+                    vpd_pa=vpd_sub,
+                    u10_ms=u10_sub_mag,
+                    precip_kgm2s=rain_new_sub + snow_new_sub,
+                    dt=dt,
+                    enable_nitrogen=bool(cfg.enable_land_nitrogen),
+                    vcmax25_eff=vc25_eff_sub,
+                    f_evg=sfc_sub.bio.f_evg,
+                    f_c4=f4_sub,
+                    slope_tan=torch.clamp(_cell_to_sub(mesh.sigma_topo, nc, n_sub) / 2000.0, 0.0, 0.75),
+                    transp_kgm2s=torch.clamp(sfc_diag_sub.evap, min=0.0),
+                    n_dep_kgn_m2s=_c2s(light_diag.n_dep_lnox_sub.reshape(m_crm)) if light_diag is not None else None,
+                    flash_cg_m2s=_c2s(light_diag.flash_cg_sub.reshape(m_crm)) if light_diag is not None else None,
+                    bio=sfc_sub.bio,
+                    enable_fire_veg_feedback=bool(cfg.enable_fire_veg_feedback),
+                    maml_shape=(nc, ny_t, nx_t),
+                    crm_dx_m=float(cfg.crm_dx) * math.sqrt(float(by_full * bx_full)),
+                )
+                # Mirror updated MAML LAI / canopy height / N availability back to host summary
+                sfc.bio.lai = _sub_to_cell(sfc_sub.bio.lai, nc, n_sub)
+                sfc.bio.h_canopy = _sub_to_cell(sfc_sub.bio.h_canopy, nc, n_sub)
+                if sfc_sub.bio.lai_evg is not None:
+                    sfc.bio.lai_evg = _sub_to_cell(sfc_sub.bio.lai_evg, nc, n_sub)
+                if sfc_sub.bio.lai_dec is not None:
+                    sfc.bio.lai_dec = _sub_to_cell(sfc_sub.bio.lai_dec, nc, n_sub)
+                if sfc_sub.bio.n_avail_fac is not None:
+                    sfc.bio.n_avail_fac = _sub_to_cell(sfc_sub.bio.n_avail_fac, nc, n_sub)
             else:
+                lai_c = _sub_to_cell(sfc_sub.bio.lai, nc, n_sub)
+                hc_c = _sub_to_cell(sfc_sub.bio.h_canopy, nc, n_sub)
+                resp_leaf_c = (
+                    _sub_to_cell(sfc_diag_sub.resp_leaf, nc, n_sub)
+                    if sfc_diag_sub.resp_leaf is not None
+                    else torch.zeros_like(gpp_cell)
+                )
+                f4_c = torch.clamp(_sub_to_cell(sfc_sub.bio.f_c4, nc, n_sub), 0.0, 1.0)
+                vc25_eff_c = (1.0 - f4_c) * _sub_to_cell(sfc_sub.bio.vcmax25_c3, nc, n_sub) + f4_c * _sub_to_cell(sfc_sub.bio.vcmax25_c4, nc, n_sub)
+                step_land_carbon_and_fire(
+                    lc=model.land_carbon,
+                    surf_type=sfc.surf_type,
+                    gpp_umol=gpp_cell,
+                    resp_leaf_umol=resp_leaf_c,
+                    lai=lai_c,
+                    h_canopy=hc_c,
+                    t_soil=_sub_to_cell(sfc_sub.t_soil, nc, n_sub),
+                    w_liq_soil=_sub_to_cell(sfc_sub.w_liq_soil, nc, n_sub),
+                    w_ice_soil=_sub_to_cell(sfc_sub.w_ice_soil, nc, n_sub),
+                    f_snow=f_snow_cell,
+                    t_sfc_k=t_air,
+                    vpd_pa=_sub_to_cell(vpd_sub, nc, n_sub),
+                    u10_ms=u10_cell,
+                    precip_kgm2s=precip_tot,
+                    dt=dt,
+                    enable_nitrogen=bool(cfg.enable_land_nitrogen),
+                    vcmax25_eff=vc25_eff_c,
+                    f_evg=_sub_to_cell(sfc_sub.bio.f_evg, nc, n_sub) if sfc_sub.bio.f_evg is not None else None,
+                    f_c4=f4_c,
+                    slope_tan=torch.clamp(mesh.sigma_topo / 2000.0, 0.0, 0.75),
+                    transp_kgm2s=torch.clamp(evap_cell, min=0.0),
+                    n_dep_kgn_m2s=light_diag.n_dep_lnox_cell if light_diag is not None else None,
+                    flash_cg_m2s=light_diag.flash_cg_cell if light_diag is not None else None,
+                    bio=None,
+                    enable_fire_veg_feedback=False,
+                    maml_shape=None,
+                    crm_dx_m=float(cfg.crm_dx),
+                )
+        # Lazily cached end-of-step host (P, T, RH) shared across aerosols, volcanics, ozone & water isotopes
+        pres_host_end: torch.Tensor | None = None
+        temp_host_end: torch.Tensor | None = None
+        rh_host_end: torch.Tensor | None = None
+
+        def _get_host_pt_end() -> tuple[torch.Tensor, torch.Tensor]:
+            nonlocal pres_host_end, temp_host_end
+            if pres_host_end is None or temp_host_end is None:
+                pres_host_end, _, temp_host_end = diagnose_pressure_temperature(atmos.rho_d, atmos.theta_m, atmos.q_v)
+            return pres_host_end, temp_host_end
+
+        if bool(cfg.enable_natural_aerosols):
+            from aoba.aerosols import init_natural_aerosol_state, step_natural_aerosols_column
+
+            if model.aerosols is None:
+                model.aerosols = init_natural_aerosol_state(nz, nc, device=atmos.q_n.device, dtype=atmos.q_n.dtype)
+            chl_sfc = (
+                model.ogcm.bgc.chl[0]
+                if (model.ogcm is not None and model.ogcm.bgc is not None)
+                else None
+            )
+            if chl_sfc is not None and has_indep_ocn:
+                ogcm_gen_c = int(model.rad_cache.get("_ogcm_step_gen", 0))
+                chl_cached = model.rad_cache.get("_ocn_chl_sfc_c")
+                if chl_cached is not None and chl_cached[0] == ogcm_gen_c:
+                    chl_sfc = chl_cached[1]
+                else:
+                    from aoba.ocean_coupler import ocn_to_atm_mean
+
+                    chl_sfc = ocn_to_atm_mean(model.ocn_coupler, chl_sfc)
+                    model.rad_cache["_ocn_chl_sfc_c"] = (ogcm_gen_c, chl_sfc)
+            if model.land_carbon is not None:
+                if int(model.land_carbon.fire_bc_kg_m2s.shape[0]) == m_sub:
+                    fire_bc = _sub_to_cell(model.land_carbon.fire_bc_kg_m2s, nc, n_sub)
+                    fire_oc = _sub_to_cell(model.land_carbon.fire_oc_kg_m2s, nc, n_sub)
+                    fire_ib = _sub_to_cell(model.land_carbon.fire_intensity_kw_m, nc, n_sub)
+                else:
+                    fire_bc = model.land_carbon.fire_bc_kg_m2s
+                    fire_oc = model.land_carbon.fire_oc_kg_m2s
+                    fire_ib = model.land_carbon.fire_intensity_kw_m
+            else:
+                fire_bc = None
+                fire_oc = None
+                fire_ib = None
+            soa_oc_cell = None
+            if bool(cfg.enable_bvoc_soa):
+                from aoba.aerosols import compute_bvoc_soa_emission
+
+                sw_par_cell = C.PAR_FRAC_OF_SW1 * (
+                    model.rad_cache.get("sw1_dir", torch.zeros_like(t_air))
+                    + model.rad_cache.get("sw1_dif", torch.zeros_like(t_air))
+                )
+                soa_oc_cell = compute_bvoc_soa_emission(sfc.surf_type, sfc.bio.lai, sfc.t_canopy, sw_par_cell)
+            p_end, t_end = _get_host_pt_end()
+            rh_host_end = torch.clamp(atmos.q_v / torch.clamp(qsat_mixed(t_end, p_end)[0], min=1.0e-7), 0.0, 0.99)
+            step_natural_aerosols_column(
+                aero=model.aerosols,
+                rho_d=atmos.rho_d,
+                dz_c=atmos.dz_c,
+                surf_type=sfc.surf_type,
+                sst_k=sfc.t_ocean_ml,
+                u10_ms=u10_cell,
+                f_seaice=f_seaice_cell,
+                precip_rate=precip_tot,
+                dt=dt,
+                chl_sfc_mg_m3=chl_sfc,
+                fire_bc_kg_m2s=fire_bc,
+                fire_oc_kg_m2s=fire_oc,
+                soa_oc_kg_m2s=soa_oc_cell,
+                u_star_cell=u_star_cell,
+                fire_intensity_kw_m=fire_ib,
+                rh_3d=torch.clamp(rh_host_end, max=0.95),
+            )
+        # 8b-2. SNICAR Snow/Sea-Ice BC + Dust Albedo Darkening (Flanner et al., 2007, 2009)
+        if bool(cfg.enable_snow_bc_darkening):
+            from aoba.surface import step_snow_impurity_darkening
+
+            bc_dep_c = model.aerosols.dep_bc_kgm2s if (model.aerosols is not None and getattr(model.aerosols, "dep_bc_kgm2s", None) is not None) else None
+            step_snow_impurity_darkening(
+                sfc_sub,
+                bc_dep_kgm2s=_cell_to_sub(bc_dep_c, nc, n_sub) if bc_dep_c is not None else None,
+                dust_dep_kgm2s=_cell_to_sub(f_dust_dep_cell, nc, n_sub) if f_dust_dep_cell is not None else None,
+                snow_fall_kgm2s=snow_new_sub,
+                dt=dt,
+            )
+        # 8b-3. Silicate Weathering Thermostat (Walker et al., 1981) -> Prognostic CO2 & Riverine Alkalinity
+        alk_weath_cell = None
+        if bool(cfg.enable_silicate_weathering):
+            from aoba.planetary_geochem import init_weathering_state, step_silicate_weathering
+
+            if model.weathering is None:
+                model.weathering = init_weathering_state(model.current_co2_ppmv(), cfg.volcanic_co2_pgc_yr)
+            runoff_liq_w = torch.clamp(_sub_to_cell(sfc_diag_sub.runoff_total - sfc_diag_sub.runoff_ice, nc, n_sub), min=0.0)
+            step_silicate_weathering(
+                ws=model.weathering,
+                area_cell=mesh.area_cell,
+                surf_type=sfc.surf_type,
+                t_sfc_k=t_air,
+                runoff_liq_kgm2s=runoff_liq_w,
+                f_snow_land=f_snow_cell,
+                dt=dt,
+                volcanic_co2_pgc_yr=cfg.volcanic_co2_pgc_yr,
+                accel_factor=cfg.weathering_accel_factor,
+            )
+            alk_weath_cell = model.weathering.alk_flux_mol_m2s
+        # 8b-4. Land-River-Atmosphere-Ocean BGC Nutrient Coupling
+        #       (Atmospheric Dust+Pyrogenic BC Fe, Lightning LNOx + Wildfire N, & Riverine N, C, Alk, Fe -> FlexPFT)
+        if (
+            (bool(cfg.enable_bgc_fe_lnox_coupling) or alk_weath_cell is not None or bool(cfg.enable_river_routing))
+            and model.ogcm is not None
+            and model.ogcm.bgc is not None
+        ):
+            from aoba.ocean_bgc import apply_atmospheric_bgc_deposition
+
+            du_bgc = f_dust_dep_cell if bool(cfg.enable_bgc_fe_lnox_coupling) else None
+            bc_bgc = (
+                model.aerosols.dep_bc_kgm2s
+                if (bool(cfg.enable_bgc_fe_lnox_coupling) and model.aerosols is not None and getattr(model.aerosols, "dep_bc_kgm2s", None) is not None)
+                else None
+            )
+            ln_bgc = (light_diag.n_dep_lnox_cell if light_diag is not None else None) if bool(cfg.enable_bgc_fe_lnox_coupling) else None
+            # Wildfire volatilized N -> 50% local + 50% global well-mixed atmospheric N deposition
+            fire_n_bgc = None
+            if bool(cfg.enable_bgc_fe_lnox_coupling) and model.land_carbon is not None and getattr(model.land_carbon, "n_fire_kgn_m2s", None) is not None:
+                nf_raw = model.land_carbon.n_fire_kgn_m2s
+                nf_cell = _sub_to_cell(nf_raw, nc, n_sub) if int(nf_raw.shape[0]) == m_sub else nf_raw
+                a_tot_n = torch.clamp(mesh.area_cell.sum(), min=1.0)
+                nf_glob = (torch.clamp(nf_cell, min=0.0) * mesh.area_cell).sum() / a_tot_n
+                fire_n_bgc = 0.50 * torch.clamp(nf_cell, min=0.0) + 0.50 * nf_glob
+
+            # Voronoi Riverine Solute Transport: Land N leaching + fluvial C + weathering Alk + estuarine Fe -> Coastal Ocean
+            riv_n_bgc = None
+            riv_c_bgc = None
+            riv_fe_bgc = None
+            alk_bgc = alk_weath_cell
+            if bool(cfg.enable_river_routing) and model.river is not None:
+                from aoba.river_routing import step_river_solute_routing
+
+                n_leach_c = None
+                c_exp_c = None
+                if model.land_carbon is not None:
+                    if getattr(model.land_carbon, "n_leach_kgn_m2s", None) is not None:
+                        nl_r = model.land_carbon.n_leach_kgn_m2s
+                        n_leach_c = _sub_to_cell(nl_r, nc, n_sub) if int(nl_r.shape[0]) == m_sub else nl_r
+                    rh_r = model.land_carbon.rh_kgc_m2s
+                    rh_c = _sub_to_cell(rh_r, nc, n_sub) if int(rh_r.shape[0]) == m_sub else rh_r
+                    # ~2.0% of terrestrial heterotrophic respiration exported as fluvial DIC+DOC (~1.0 PgC/yr; Regnier et al., 2013)
+                    c_exp_c = 0.02 * torch.clamp(rh_c, min=0.0)
+                if alk_weath_cell is not None:
+                    alk_src_riv = alk_weath_cell
+                else:
+                    # Map-free baseline chemical weathering alkalinity (~1.0 mol eq m^-3 of terrestrial liquid runoff)
+                    runoff_liq_alk = torch.clamp(_sub_to_cell(sfc_diag_sub.runoff_total - sfc_diag_sub.runoff_ice, nc, n_sub), min=0.0)
+                    alk_src_riv = runoff_liq_alk * 1.0e-3  # [kg m^-2 s^-1] * 1e-3 [m^3 kg^-1] * 1.0 [mol m^-3]
+                riv_n_bgc, riv_c_bgc, alk_bgc, riv_fe_bgc = step_river_solute_routing(
+                    model.river,
+                    mesh.area_cell,
+                    dt,
+                    n_leach_kgn_m2s=n_leach_c,
+                    c_export_kgc_m2s=c_exp_c,
+                    alk_src_mol_m2s=alk_src_riv,
+                    t_sfc_k=t_air,
+                )
+
+            # Accumulate coarse atmospheric/river BGC deposition fluxes across ocean_stride for exact mass-conserving OG7 transfer
+            dep_stride = max(int(cfg.ocean_stride), 1) if has_indep_ocn else 1
+            dep_dt = dt
+            if dep_stride > 1:
+                dep_acc = model.rad_cache.get("_bgc_dep_acc")
+                if dep_acc is None:
+                    dep_acc = {"n": 0}
+                    model.rad_cache["_bgc_dep_acc"] = dep_acc
+                dep_acc["n"] = int(dep_acc["n"]) + 1
+                for _dk, _dv in (
+                    ("du", du_bgc), ("bc", bc_bgc), ("ln", ln_bgc), ("fn", fire_n_bgc),
+                    ("rn", riv_n_bgc), ("rc", riv_c_bgc), ("rfe", riv_fe_bgc), ("alk", alk_bgc),
+                ):
+                    if _dv is not None:
+                        dep_acc[_dk] = _dv if (_dk not in dep_acc or dep_acc["n"] == 1) else (dep_acc[_dk] + _dv)
+                if dep_acc["n"] < dep_stride:
+                    du_bgc = bc_bgc = ln_bgc = fire_n_bgc = riv_n_bgc = riv_c_bgc = riv_fe_bgc = alk_bgc = None
+                    dep_dt = 0.0
+                else:
+                    inv_dn = 1.0 / float(dep_acc["n"])
+                    dep_dt = dt * float(dep_acc["n"])
+                    du_bgc = dep_acc.pop("du", None)
+                    bc_bgc = dep_acc.pop("bc", None)
+                    ln_bgc = dep_acc.pop("ln", None)
+                    fire_n_bgc = dep_acc.pop("fn", None)
+                    riv_n_bgc = dep_acc.pop("rn", None)
+                    riv_c_bgc = dep_acc.pop("rc", None)
+                    riv_fe_bgc = dep_acc.pop("rfe", None)
+                    alk_bgc = dep_acc.pop("alk", None)
+                    if du_bgc is not None: du_bgc = du_bgc * inv_dn
+                    if bc_bgc is not None: bc_bgc = bc_bgc * inv_dn
+                    if ln_bgc is not None: ln_bgc = ln_bgc * inv_dn
+                    if fire_n_bgc is not None: fire_n_bgc = fire_n_bgc * inv_dn
+                    if riv_n_bgc is not None: riv_n_bgc = riv_n_bgc * inv_dn
+                    if riv_c_bgc is not None: riv_c_bgc = riv_c_bgc * inv_dn
+                    if riv_fe_bgc is not None: riv_fe_bgc = riv_fe_bgc * inv_dn
+                    if alk_bgc is not None: alk_bgc = alk_bgc * inv_dn
+                    dep_acc["n"] = 0
+
+            if dep_dt > 0.0:
+                if has_indep_ocn:
+                    from aoba.ocean_coupler import atm_to_ocn_conservative_flux, atm_to_ocn_intensive
+
+                    if du_bgc is not None:
+                        du_bgc = atm_to_ocn_intensive(model.ocn_coupler, du_bgc)
+                    if bc_bgc is not None:
+                        bc_bgc = atm_to_ocn_intensive(model.ocn_coupler, bc_bgc)
+                    if ln_bgc is not None:
+                        ln_bgc = atm_to_ocn_intensive(model.ocn_coupler, ln_bgc)
+                    if fire_n_bgc is not None:
+                        fire_n_bgc = atm_to_ocn_intensive(model.ocn_coupler, fire_n_bgc)
+                    if riv_n_bgc is not None:
+                        riv_n_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_n_bgc, ocean_only_source=True)
+                    if riv_c_bgc is not None:
+                        riv_c_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_c_bgc, ocean_only_source=True)
+                    if riv_fe_bgc is not None:
+                        riv_fe_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_fe_bgc, ocean_only_source=True)
+                    if alk_bgc is not None:
+                        alk_bgc = atm_to_ocn_conservative_flux(
+                            model.ocn_coupler, alk_bgc, ocean_only_source=(bool(cfg.enable_river_routing) and model.river is not None)
+                        )
+                elif alk_bgc is not None and not (bool(cfg.enable_river_routing) and model.river is not None):
+                    # Fallback when river routing is disabled: spread land weathering alkalinity evenly onto ocean
+                    w0 = model.ogcm.wet_c[0].to(alk_bgc.dtype)
+                    a_ocn_sum = torch.clamp((mesh.area_cell * w0).sum(), min=1.0)
+                    alk_tot = (alk_bgc * mesh.area_cell).sum()
+                    alk_bgc = (alk_tot / a_ocn_sum) * w0
+
+                apply_atmospheric_bgc_deposition(
+                    model.ogcm.bgc, model.ogcm, du_bgc, ln_bgc, alk_bgc, dep_dt,
+                    bc_dep_kgm2s=bc_bgc,
+                    fire_n_dep_kgn_m2s=fire_n_bgc,
+                    river_n_kgn_m2s=riv_n_bgc,
+                    river_c_kgc_m2s=riv_c_bgc,
+                    river_fe_mol_m2s=riv_fe_bgc,
+                )
+        # 8b-5. Prognostic Natural CH4 & N2O Cycles (Wetland/Permafrost + Fire + Denit/Marine-OMZ + OH/UV).
+        # Stepped daily (exact exponential ODE over dt_day; CH4 lifetime ~9 yr, N2O ~120 yr) to eliminate
+        # 11 mid-step GPU->CPU synchronizations per 12-min atmospheric step with zero physical accuracy loss.
+        if bool(cfg.enable_prognostic_ch4_n2o):
+            from aoba.trace_gas_cycle import init_trace_gas_cycle_state, step_trace_gas_cycle
+
+            if model.trace_gas is None:
+                model.trace_gas = init_trace_gas_cycle_state(cfg.ch4_ppmv, cfg.n2o_ppmv)
+            _tg_steps_per_day = max(int(round(C.SECONDS_PER_DAY / dt)), 1)
+            if (clim_sub.day_steps >= _tg_steps_per_day) or (model.step_count == 0):
+                _tg_dt = dt if model.step_count == 0 else (dt * float(clim_sub.day_steps))
+                mean_tco_now = float(model.ozone.tco_du.mean().item()) if model.ozone is not None else 300.0
+                ocn_m_tg = model.ocn_mesh if has_indep_ocn else mesh
+                step_trace_gas_cycle(
+                    tg=model.trace_gas,
+                    area_cell=mesh.area_cell,
+                    surf_type=sfc.surf_type,
+                    t_sfc_k=t_air,
+                    w_liq_soil_top=sfc_sub.w_liq_soil[0],
+                    dt=_tg_dt,
+                    rh_kgc_m2s=model.land_carbon.rh_kgc_m2s if model.land_carbon is not None else None,
+                    fire_c_kgc_m2s=model.land_carbon.fire_c_kgc_m2s if model.land_carbon is not None else None,
+                    n_denit_kgn_m2s=getattr(model.land_carbon, "n_denit_kgn_m2s", None) if model.land_carbon is not None else None,
+                    ocean_epc100_molc_m2s=model.ogcm.bgc.epc100 if (model.ogcm is not None and model.ogcm.bgc is not None) else None,
+                    ocean_denit_moln_m2s=getattr(model.ogcm.bgc, "denit_moln_m2s", None) if (model.ogcm is not None and model.ogcm.bgc is not None) else None,
+                    ocean_area_cell=ocn_m_tg.area_cell if ocn_m_tg is not None else None,
+                    f_wetland_sub=model.maml_land.f_wetland if (bool(cfg.enable_maml_wetlands_lakes) and model.maml_land is not None) else None,
+                    mean_tco_du=mean_tco_now,
+                )
+        # 8b-6. Stratospheric Volcanic / SAI Aerosols (SO2 -> H2SO4)
+        volc_sad_3d = None
+        if bool(cfg.enable_volcanic_aerosols) and model.volcanic_solar is not None:
+            from aoba.volcanic_solar import compute_volcanic_rad_optics_and_sad, step_volcanic_aerosols
+
+            step_volcanic_aerosols(
+                vs=model.volcanic_solar,
+                mesh=mesh,
+                sim_time_days=model.sim_time_sec / C.SECONDS_PER_DAY,
+                dt=dt,
+                eruption_year=cfg.volcanic_eruption_year,
+                eruption_so2_tg=cfg.volcanic_so2_tg,
+                eruption_lat_deg=cfg.volcanic_eruption_lat_deg,
+                eruption_width_deg=cfg.volcanic_eruption_width_deg,
+                sai_so2_tg_yr=cfg.sai_so2_tg_yr,
+                sai_lat_band_deg=cfg.sai_lat_band_deg,
+            )
+            pres_host_vs, _ = _get_host_pt_end()
+            _, volc_sad_3d = compute_volcanic_rad_optics_and_sad(model.volcanic_solar, pres_host_vs, atmos.dz_c)
+        # 8b-7. Emissions-Driven Interactive Prognostic Atmospheric CO2 (Closed Land+Ocean+Weath+Anthro Budget)
+        if str(cfg.co2_mode).strip().lower() == "prognostic":
+            from aoba.prognostic_co2 import init_prognostic_co2_state, step_prognostic_co2
+
+            if model.prognostic_co2 is None:
+                model.prognostic_co2 = init_prognostic_co2_state(
+                    co2_ppmv_init=cfg.co2_ppmv,
+                    nz=nz,
+                    n_cells=nc,
+                    enable_3d=bool(cfg.enable_co2_3d_transport),
+                    device=atmos.rho_d.device,
+                    dtype=atmos.rho_d.dtype,
+                )
+            ocn_m_c = model.ocn_mesh if has_indep_ocn else mesh
+            fg_ocn_c = model.ogcm.bgc.fgco2 if (model.ogcm is not None and model.ogcm.bgc is not None) else None
+            fg_host_c = None
+            if fg_ocn_c is not None and has_indep_ocn and model.ocn_coupler is not None:
                 from aoba.ocean_coupler import ocn_to_atm_mean
 
-                chl_sfc = ocn_to_atm_mean(model.ocn_coupler, chl_sfc)
-                model.rad_cache["_ocn_chl_sfc_c"] = (ogcm_gen_c, chl_sfc)
-        if model.land_carbon is not None:
-            if int(model.land_carbon.fire_bc_kg_m2s.shape[0]) == m_sub:
-                fire_bc = _sub_to_cell(model.land_carbon.fire_bc_kg_m2s, nc, n_sub)
-                fire_oc = _sub_to_cell(model.land_carbon.fire_oc_kg_m2s, nc, n_sub)
-                fire_ib = _sub_to_cell(model.land_carbon.fire_intensity_kw_m, nc, n_sub)
-            else:
-                fire_bc = model.land_carbon.fire_bc_kg_m2s
-                fire_oc = model.land_carbon.fire_oc_kg_m2s
-                fire_ib = model.land_carbon.fire_intensity_kw_m
-        else:
-            fire_bc = None
-            fire_oc = None
-            fire_ib = None
-        soa_oc_cell = None
-        if bool(cfg.enable_bvoc_soa):
-            from aoba.aerosols import compute_bvoc_soa_emission
-
-            sw_par_cell = C.PAR_FRAC_OF_SW1 * (
-                model.rad_cache.get("sw1_dir", torch.zeros_like(t_air))
-                + model.rad_cache.get("sw1_dif", torch.zeros_like(t_air))
+                fg_host_c = ocn_to_atm_mean(model.ocn_coupler, fg_ocn_c)
+            weath_sink = float(model.weathering.weathering_pgc_yr) if (bool(cfg.enable_silicate_weathering) and model.weathering is not None) else 0.0
+            volc_src = float(cfg.volcanic_co2_pgc_yr) if bool(cfg.enable_silicate_weathering) else 0.0
+            step_prognostic_co2(
+                state=model.prognostic_co2,
+                area_cell=mesh.area_cell,
+                dt=dt,
+                land_nbp_kgc_m2s=model.land_carbon.nbp_kgc_m2s if model.land_carbon is not None else None,
+                ocean_fgco2_molc_m2s=fg_ocn_c,
+                ocean_area_cell=ocn_m_c.area_cell if ocn_m_c is not None else None,
+                ocean_fgco2_host_molc_m2s=fg_host_c,
+                anthro_pgc_yr=float(cfg.co2_anthro_pgc_yr),
+                volcanic_pgc_yr=volc_src,
+                weathering_pgc_yr=weath_sink,
+                rho_d=atmos.rho_d,
+                dz_c=atmos.dz_c,
+                lat_cell=mesh.lat_cell,
             )
-            soa_oc_cell = compute_bvoc_soa_emission(sfc.surf_type, sfc.bio.lai, sfc.t_canopy, sw_par_cell)
-        p_end, t_end = _get_host_pt_end()
-        rh_host_end = torch.clamp(atmos.q_v / torch.clamp(qsat_mixed(t_end, p_end)[0], min=1.0e-7), 0.0, 0.99)
-        step_natural_aerosols_column(
-            aero=model.aerosols,
-            rho_d=atmos.rho_d,
-            dz_c=atmos.dz_c,
-            surf_type=sfc.surf_type,
-            sst_k=sfc.t_ocean_ml,
-            u10_ms=u10_cell,
-            f_seaice=f_seaice_cell,
-            precip_rate=precip_tot,
-            dt=dt,
-            chl_sfc_mg_m3=chl_sfc,
-            fire_bc_kg_m2s=fire_bc,
-            fire_oc_kg_m2s=fire_oc,
-            soa_oc_kg_m2s=soa_oc_cell,
-            u_star_cell=u_star_cell,
-            fire_intensity_kw_m=fire_ib,
-            rh_3d=torch.clamp(rh_host_end, max=0.95),
-        )
-    # 8b-2. SNICAR Snow/Sea-Ice BC + Dust Albedo Darkening (Flanner et al., 2007, 2009)
-    if bool(cfg.enable_snow_bc_darkening):
-        from aoba.surface import step_snow_impurity_darkening
+        # 8b-7a. Prognostic 3D Mesospheric/Stratospheric NOx (Sprites + LNOx + N2O + Polar-Cap EPP) & NLC
+        if bool(cfg.enable_red_sprites) or float(cfg.z_top) >= 68000.0:
+            from aoba.mesosphere import init_prognostic_nox_state, step_prognostic_nox
 
-        bc_dep_c = model.aerosols.dep_bc_kgm2s if (model.aerosols is not None and getattr(model.aerosols, "dep_bc_kgm2s", None) is not None) else None
-        step_snow_impurity_darkening(
-            sfc_sub,
-            bc_dep_kgm2s=_cell_to_sub(bc_dep_c, nc, n_sub) if bc_dep_c is not None else None,
-            dust_dep_kgm2s=_cell_to_sub(f_dust_dep_cell, nc, n_sub) if f_dust_dep_cell is not None else None,
-            snow_fall_kgm2s=snow_new_sub,
-            dt=dt,
-        )
-    # 8b-3. Silicate Weathering Thermostat (Walker et al., 1981) -> Prognostic CO2 & Riverine Alkalinity
-    alk_weath_cell = None
-    if bool(cfg.enable_silicate_weathering):
-        from aoba.planetary_geochem import init_weathering_state, step_silicate_weathering
+            pres_host_nx, temp_host_nx = _get_host_pt_end()
+            if model.meso_nox is None:
+                model.meso_nox = init_prognostic_nox_state(pres_host_nx, n2o_ppmv=model.current_n2o_ppmv())
+            lnox_nx = None
+            if light_diag is not None:
+                from aoba.lightning import LNOX_KG_N_PER_FLASH
 
-        if model.weathering is None:
-            model.weathering = init_weathering_state(model.current_co2_ppmv(), cfg.volcanic_co2_pgc_yr)
-        runoff_liq_w = torch.clamp(_sub_to_cell(sfc_diag_sub.runoff_total - sfc_diag_sub.runoff_ice, nc, n_sub), min=0.0)
-        step_silicate_weathering(
-            ws=model.weathering,
-            area_cell=mesh.area_cell,
-            surf_type=sfc.surf_type,
-            t_sfc_k=t_air,
-            runoff_liq_kgm2s=runoff_liq_w,
-            f_snow_land=f_snow_cell,
-            dt=dt,
-            volcanic_co2_pgc_yr=cfg.volcanic_co2_pgc_yr,
-            accel_factor=cfg.weathering_accel_factor,
-        )
-        alk_weath_cell = model.weathering.alk_flux_mol_m2s
-    # 8b-4. Land-River-Atmosphere-Ocean BGC Nutrient Coupling
-    #       (Atmospheric Dust+Pyrogenic BC Fe, Lightning LNOx + Wildfire N, & Riverine N, C, Alk, Fe -> FlexPFT)
-    if (
-        (bool(cfg.enable_bgc_fe_lnox_coupling) or alk_weath_cell is not None or bool(cfg.enable_river_routing))
-        and model.ogcm is not None
-        and model.ogcm.bgc is not None
-    ):
-        from aoba.ocean_bgc import apply_atmospheric_bgc_deposition
+                lnox_nx = light_diag.flash_tot_cell * LNOX_KG_N_PER_FLASH
+            k_meso_nlc = model.rad_cache.get("_k_meso_nlc")
+            if k_meso_nlc is None:
+                zc_cpu = vgrid.zeta_c.detach().cpu()
+                idx_nl = torch.nonzero(zc_cpu >= 58000.0, as_tuple=False)
+                k_meso_nlc = max(int(idx_nl[0].item()) - 1, 0) if int(idx_nl.numel()) > 0 else 0
+                model.rad_cache["_k_meso_nlc"] = k_meso_nlc
+            sp_d = model.last_red_sprites
+            step_prognostic_nox(
+                nox=model.meso_nox,
+                pres_c=pres_host_nx,
+                temp_c=temp_host_nx,
+                rho_d=atmos.rho_d,
+                z_c=atmos.z_c,
+                dz_c=atmos.dz_c,
+                q_v=atmos.q_v,
+                mu0=mu0,
+                lat_cell=mesh.lat_cell,
+                precip_cell=precip_tot,
+                dt=dt,
+                n2o_ppmv=model.current_n2o_ppmv(),
+                lnox_cell_kgn_m2s=lnox_nx,
+                sprite_nox_mol_m2s=(sp_d.sprite_nox_mol_m2s if sp_d is not None else None),
+                sprite_z_init_km=(sp_d.z_init_km_cell if sp_d is not None else None),
+                sprite_z_stop_km=(sp_d.z_stop_km_cell if sp_d is not None else None),
+                solar_uv_scale=uv_j_o2_scale,
+                k_meso_start=k_meso_nlc,
+            )
+        if str(cfg.o3_mode).strip().lower() == "prognostic":
+            from aoba.ozone_chemistry import init_prognostic_ozone_state, step_prognostic_ozone
 
-        du_bgc = f_dust_dep_cell if bool(cfg.enable_bgc_fe_lnox_coupling) else None
-        bc_bgc = (
-            model.aerosols.dep_bc_kgm2s
-            if (bool(cfg.enable_bgc_fe_lnox_coupling) and model.aerosols is not None and getattr(model.aerosols, "dep_bc_kgm2s", None) is not None)
-            else None
-        )
-        ln_bgc = (light_diag.n_dep_lnox_cell if light_diag is not None else None) if bool(cfg.enable_bgc_fe_lnox_coupling) else None
-        # Wildfire volatilized N -> 50% local + 50% global well-mixed atmospheric N deposition
-        fire_n_bgc = None
-        if bool(cfg.enable_bgc_fe_lnox_coupling) and model.land_carbon is not None and getattr(model.land_carbon, "n_fire_kgn_m2s", None) is not None:
-            nf_raw = model.land_carbon.n_fire_kgn_m2s
-            nf_cell = _sub_to_cell(nf_raw, nc, n_sub) if int(nf_raw.shape[0]) == m_sub else nf_raw
-            a_tot_n = torch.clamp(mesh.area_cell.sum(), min=1.0)
-            nf_glob = (torch.clamp(nf_cell, min=0.0) * mesh.area_cell).sum() / a_tot_n
-            fire_n_bgc = 0.50 * torch.clamp(nf_cell, min=0.0) + 0.50 * nf_glob
+            pres_host_oz, temp_host_oz = _get_host_pt_end()
+            if model.ozone is None:
+                model.ozone = init_prognostic_ozone_state(pres_host_oz, atmos.rho_d, atmos.dz_c)
+            lnox_prod_cell = None
+            if light_diag is not None:
+                from aoba.lightning import LNOX_KG_N_PER_FLASH
 
-        # Voronoi Riverine Solute Transport: Land N leaching + fluvial C + weathering Alk + estuarine Fe -> Coastal Ocean
-        riv_n_bgc = None
-        riv_c_bgc = None
-        riv_fe_bgc = None
-        alk_bgc = alk_weath_cell
-        if bool(cfg.enable_river_routing) and model.river is not None:
-            from aoba.river_routing import step_river_solute_routing
-
-            n_leach_c = None
-            c_exp_c = None
+                lnox_prod_cell = light_diag.flash_tot_cell * LNOX_KG_N_PER_FLASH
+            fire_c_cell = None
             if model.land_carbon is not None:
-                if getattr(model.land_carbon, "n_leach_kgn_m2s", None) is not None:
-                    nl_r = model.land_carbon.n_leach_kgn_m2s
-                    n_leach_c = _sub_to_cell(nl_r, nc, n_sub) if int(nl_r.shape[0]) == m_sub else nl_r
-                rh_r = model.land_carbon.rh_kgc_m2s
-                rh_c = _sub_to_cell(rh_r, nc, n_sub) if int(rh_r.shape[0]) == m_sub else rh_r
-                # ~2.0% of terrestrial heterotrophic respiration exported as fluvial DIC+DOC (~1.0 PgC/yr; Regnier et al., 2013)
-                c_exp_c = 0.02 * torch.clamp(rh_c, min=0.0)
-            if alk_weath_cell is not None:
-                alk_src_riv = alk_weath_cell
-            else:
-                # Map-free baseline chemical weathering alkalinity (~1.0 mol eq m^-3 of terrestrial liquid runoff)
-                runoff_liq_alk = torch.clamp(_sub_to_cell(sfc_diag_sub.runoff_total - sfc_diag_sub.runoff_ice, nc, n_sub), min=0.0)
-                alk_src_riv = runoff_liq_alk * 1.0e-3  # [kg m^-2 s^-1] * 1e-3 [m^3 kg^-1] * 1.0 [mol m^-3]
-            riv_n_bgc, riv_c_bgc, alk_bgc, riv_fe_bgc = step_river_solute_routing(
-                model.river,
-                mesh.area_cell,
-                dt,
-                n_leach_kgn_m2s=n_leach_c,
-                c_export_kgc_m2s=c_exp_c,
-                alk_src_mol_m2s=alk_src_riv,
-                t_sfc_k=t_air,
+                if int(model.land_carbon.fire_c_kgc_m2s.shape[0]) == m_sub:
+                    fire_c_cell = _sub_to_cell(model.land_carbon.fire_c_kgc_m2s, nc, n_sub)
+                else:
+                    fire_c_cell = model.land_carbon.fire_c_kgc_m2s
+            if bool(cfg.enable_bvoc_soa) and model.aerosols is not None and getattr(model.aerosols, "emis_soa_kgm2s", None) is not None:
+                # Biogenic VOC (isoprene/monoterpene) photochemical contribution to tropospheric O3 precursors
+                bvoc_o3_eq = 0.50 * torch.clamp(model.aerosols.emis_soa_kgm2s, min=0.0)
+                fire_c_cell = bvoc_o3_eq if fire_c_cell is None else (fire_c_cell + bvoc_o3_eq)
+            step_prognostic_ozone(
+                oz=model.ozone,
+                pres_c=pres_host_oz,
+                temp_c=temp_host_oz,
+                rho_d=atmos.rho_d,
+                dz_c=atmos.dz_c,
+                q_v=atmos.q_v,
+                mu0=mu0,
+                surf_type=sfc.surf_type,
+                lai_cell=sfc.bio.lai,
+                f_snow_cell=f_snow_cell,
+                f_seaice_cell=f_seaice_cell,
+                dt=dt,
+                n2o_ppmv=model.current_n2o_ppmv(),
+                ch4_ppmv=model.current_ch4_ppmv(),
+                ecl_ppbv=cfg.o3_ecl_ppbv,
+                lnox_cell_kgn_m2s=lnox_prod_cell,
+                fire_c_cell_kgc_m2s=fire_c_cell,
+                uv_j_o2_scale=uv_j_o2_scale,
+                volc_sad_um2_cm3=volc_sad_3d,
+                nox_vmr_3d=(model.meso_nox.q_nox if model.meso_nox is not None else None),
+                z_c=(atmos.z_c if float(cfg.z_top) >= 68000.0 else None),
             )
+        # 8b-8. Stable Water Isotopes (H2^18O, HDO) Fractionation & Ice-Core Archiving
+        if bool(cfg.enable_water_isotopes):
+            from aoba.water_isotopes import init_water_isotope_state, step_water_isotopes
 
-        # Accumulate coarse atmospheric/river BGC deposition fluxes across ocean_stride for exact mass-conserving OG7 transfer
-        dep_stride = max(int(cfg.ocean_stride), 1) if has_indep_ocn else 1
-        dep_dt = dt
-        if dep_stride > 1:
-            dep_acc = model.rad_cache.get("_bgc_dep_acc")
-            if dep_acc is None:
-                dep_acc = {"n": 0}
-                model.rad_cache["_bgc_dep_acc"] = dep_acc
-            dep_acc["n"] = int(dep_acc["n"]) + 1
-            for _dk, _dv in (
-                ("du", du_bgc), ("bc", bc_bgc), ("ln", ln_bgc), ("fn", fire_n_bgc),
-                ("rn", riv_n_bgc), ("rc", riv_c_bgc), ("rfe", riv_fe_bgc), ("alk", alk_bgc),
-            ):
-                if _dv is not None:
-                    dep_acc[_dk] = _dv if (_dk not in dep_acc or dep_acc["n"] == 1) else (dep_acc[_dk] + _dv)
-            if dep_acc["n"] < dep_stride:
-                du_bgc = bc_bgc = ln_bgc = fire_n_bgc = riv_n_bgc = riv_c_bgc = riv_fe_bgc = alk_bgc = None
-                dep_dt = 0.0
-            else:
-                inv_dn = 1.0 / float(dep_acc["n"])
-                dep_dt = dt * float(dep_acc["n"])
-                du_bgc = dep_acc.pop("du", None)
-                bc_bgc = dep_acc.pop("bc", None)
-                ln_bgc = dep_acc.pop("ln", None)
-                fire_n_bgc = dep_acc.pop("fn", None)
-                riv_n_bgc = dep_acc.pop("rn", None)
-                riv_c_bgc = dep_acc.pop("rc", None)
-                riv_fe_bgc = dep_acc.pop("rfe", None)
-                alk_bgc = dep_acc.pop("alk", None)
-                if du_bgc is not None: du_bgc = du_bgc * inv_dn
-                if bc_bgc is not None: bc_bgc = bc_bgc * inv_dn
-                if ln_bgc is not None: ln_bgc = ln_bgc * inv_dn
-                if fire_n_bgc is not None: fire_n_bgc = fire_n_bgc * inv_dn
-                if riv_n_bgc is not None: riv_n_bgc = riv_n_bgc * inv_dn
-                if riv_c_bgc is not None: riv_c_bgc = riv_c_bgc * inv_dn
-                if riv_fe_bgc is not None: riv_fe_bgc = riv_fe_bgc * inv_dn
-                if alk_bgc is not None: alk_bgc = alk_bgc * inv_dn
-                dep_acc["n"] = 0
-
-        if dep_dt > 0.0:
-            if has_indep_ocn:
-                from aoba.ocean_coupler import atm_to_ocn_conservative_flux, atm_to_ocn_intensive
-
-                if du_bgc is not None:
-                    du_bgc = atm_to_ocn_intensive(model.ocn_coupler, du_bgc)
-                if bc_bgc is not None:
-                    bc_bgc = atm_to_ocn_intensive(model.ocn_coupler, bc_bgc)
-                if ln_bgc is not None:
-                    ln_bgc = atm_to_ocn_intensive(model.ocn_coupler, ln_bgc)
-                if fire_n_bgc is not None:
-                    fire_n_bgc = atm_to_ocn_intensive(model.ocn_coupler, fire_n_bgc)
-                if riv_n_bgc is not None:
-                    riv_n_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_n_bgc, ocean_only_source=True)
-                if riv_c_bgc is not None:
-                    riv_c_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_c_bgc, ocean_only_source=True)
-                if riv_fe_bgc is not None:
-                    riv_fe_bgc = atm_to_ocn_conservative_flux(model.ocn_coupler, riv_fe_bgc, ocean_only_source=True)
-                if alk_bgc is not None:
-                    alk_bgc = atm_to_ocn_conservative_flux(
-                        model.ocn_coupler, alk_bgc, ocean_only_source=(bool(cfg.enable_river_routing) and model.river is not None)
-                    )
-            elif alk_bgc is not None and not (bool(cfg.enable_river_routing) and model.river is not None):
-                # Fallback when river routing is disabled: spread land weathering alkalinity evenly onto ocean
-                w0 = model.ogcm.wet_c[0].to(alk_bgc.dtype)
-                a_ocn_sum = torch.clamp((mesh.area_cell * w0).sum(), min=1.0)
-                alk_tot = (alk_bgc * mesh.area_cell).sum()
-                alk_bgc = (alk_tot / a_ocn_sum) * w0
-
-            apply_atmospheric_bgc_deposition(
-                model.ogcm.bgc, model.ogcm, du_bgc, ln_bgc, alk_bgc, dep_dt,
-                bc_dep_kgm2s=bc_bgc,
-                fire_n_dep_kgn_m2s=fire_n_bgc,
-                river_n_kgn_m2s=riv_n_bgc,
-                river_c_kgc_m2s=riv_c_bgc,
-                river_fe_mol_m2s=riv_fe_bgc,
+            if model.water_isotopes is None:
+                model.water_isotopes = init_water_isotope_state(atmos.q_v)
+            pres_host_iso, temp_host_iso = _get_host_pt_end()
+            rh_sfc_iso = (
+                torch.clamp(rh_host_end[0], 0.15, 0.99)
+                if rh_host_end is not None
+                else torch.clamp(
+                    atmos.q_v[0] / torch.clamp(qsat_mixed(temp_host_iso[0], pres_host_iso[0])[0], min=1.0e-7),
+                    0.15,
+                    0.99,
+                )
             )
-    # 8b-5. Prognostic Natural CH4 & N2O Cycles (Wetland/Permafrost + Fire + Denit/Marine-OMZ + OH/UV)
-    if bool(cfg.enable_prognostic_ch4_n2o):
-        from aoba.trace_gas_cycle import init_trace_gas_cycle_state, step_trace_gas_cycle
-
-        if model.trace_gas is None:
-            model.trace_gas = init_trace_gas_cycle_state(cfg.ch4_ppmv, cfg.n2o_ppmv)
-        mean_tco_now = float(model.ozone.tco_du.mean().item()) if model.ozone is not None else 300.0
-        ocn_m_tg = model.ocn_mesh if has_indep_ocn else mesh
-        step_trace_gas_cycle(
-            tg=model.trace_gas,
-            area_cell=mesh.area_cell,
-            surf_type=sfc.surf_type,
-            t_sfc_k=t_air,
-            w_liq_soil_top=sfc_sub.w_liq_soil[0],
-            dt=dt,
-            rh_kgc_m2s=model.land_carbon.rh_kgc_m2s if model.land_carbon is not None else None,
-            fire_c_kgc_m2s=model.land_carbon.fire_c_kgc_m2s if model.land_carbon is not None else None,
-            n_denit_kgn_m2s=getattr(model.land_carbon, "n_denit_kgn_m2s", None) if model.land_carbon is not None else None,
-            ocean_epc100_molc_m2s=model.ogcm.bgc.epc100 if (model.ogcm is not None and model.ogcm.bgc is not None) else None,
-            ocean_denit_moln_m2s=getattr(model.ogcm.bgc, "denit_moln_m2s", None) if (model.ogcm is not None and model.ogcm.bgc is not None) else None,
-            ocean_area_cell=ocn_m_tg.area_cell if ocn_m_tg is not None else None,
-            f_wetland_sub=model.maml_land.f_wetland if (bool(cfg.enable_maml_wetlands_lakes) and model.maml_land is not None) else None,
-            mean_tco_du=mean_tco_now,
-        )
-    # 8b-6. Stratospheric Volcanic / SAI Aerosols (SO2 -> H2SO4)
-    volc_sad_3d = None
-    if bool(cfg.enable_volcanic_aerosols) and model.volcanic_solar is not None:
-        from aoba.volcanic_solar import compute_volcanic_rad_optics_and_sad, step_volcanic_aerosols
-
-        step_volcanic_aerosols(
-            vs=model.volcanic_solar,
-            mesh=mesh,
-            sim_time_days=model.sim_time_sec / C.SECONDS_PER_DAY,
-            dt=dt,
-            eruption_year=cfg.volcanic_eruption_year,
-            eruption_so2_tg=cfg.volcanic_so2_tg,
-            eruption_lat_deg=cfg.volcanic_eruption_lat_deg,
-            eruption_width_deg=cfg.volcanic_eruption_width_deg,
-            sai_so2_tg_yr=cfg.sai_so2_tg_yr,
-            sai_lat_band_deg=cfg.sai_lat_band_deg,
-        )
-        pres_host_vs, _ = _get_host_pt_end()
-        _, volc_sad_3d = compute_volcanic_rad_optics_and_sad(model.volcanic_solar, pres_host_vs, atmos.dz_c)
-    # 8b-7. Emissions-Driven Interactive Prognostic Atmospheric CO2 (Closed Land+Ocean+Weath+Anthro Budget)
-    if str(cfg.co2_mode).strip().lower() == "prognostic":
-        from aoba.prognostic_co2 import init_prognostic_co2_state, step_prognostic_co2
-
-        if model.prognostic_co2 is None:
-            model.prognostic_co2 = init_prognostic_co2_state(
-                co2_ppmv_init=cfg.co2_ppmv,
-                nz=nz,
-                n_cells=nc,
-                enable_3d=bool(cfg.enable_co2_3d_transport),
-                device=atmos.rho_d.device,
-                dtype=atmos.rho_d.dtype,
+            step_water_isotopes(
+                iso=model.water_isotopes,
+                q_v=atmos.q_v,
+                temp_c=temp_host_iso,
+                rho_d=atmos.rho_d,
+                dz_c=atmos.dz_c,
+                surf_type=sfc.surf_type,
+                t_sfc=t_rad_cell,
+                evap_cell=evap_cell,
+                rain_cell=rain_new,
+                snow_cell=snow_new,
+                dt=dt,
+                rh_sfc=rh_sfc_iso,
+                u10_cell=u10_cell,
+                lai_cell=sfc.bio.lai,
             )
-        ocn_m_c = model.ocn_mesh if has_indep_ocn else mesh
-        fg_ocn_c = model.ogcm.bgc.fgco2 if (model.ogcm is not None and model.ogcm.bgc is not None) else None
-        fg_host_c = None
-        if fg_ocn_c is not None and has_indep_ocn and model.ocn_coupler is not None:
-            from aoba.ocean_coupler import ocn_to_atm_mean
-
-            fg_host_c = ocn_to_atm_mean(model.ocn_coupler, fg_ocn_c)
-        weath_sink = float(model.weathering.weathering_pgc_yr) if (bool(cfg.enable_silicate_weathering) and model.weathering is not None) else 0.0
-        volc_src = float(cfg.volcanic_co2_pgc_yr) if bool(cfg.enable_silicate_weathering) else 0.0
-        step_prognostic_co2(
-            state=model.prognostic_co2,
-            area_cell=mesh.area_cell,
-            dt=dt,
-            land_nbp_kgc_m2s=model.land_carbon.nbp_kgc_m2s if model.land_carbon is not None else None,
-            ocean_fgco2_molc_m2s=fg_ocn_c,
-            ocean_area_cell=ocn_m_c.area_cell if ocn_m_c is not None else None,
-            ocean_fgco2_host_molc_m2s=fg_host_c,
-            anthro_pgc_yr=float(cfg.co2_anthro_pgc_yr),
-            volcanic_pgc_yr=volc_src,
-            weathering_pgc_yr=weath_sink,
-            rho_d=atmos.rho_d,
-            dz_c=atmos.dz_c,
-            lat_cell=mesh.lat_cell,
-        )
-    # 8b-7a. Prognostic 3D Mesospheric/Stratospheric NOx (Sprites + LNOx + N2O + Polar-Cap EPP) & NLC
-    if bool(cfg.enable_red_sprites) or float(cfg.z_top) >= 68000.0:
-        from aoba.mesosphere import init_prognostic_nox_state, step_prognostic_nox
-
-        pres_host_nx, temp_host_nx = _get_host_pt_end()
-        if model.meso_nox is None:
-            model.meso_nox = init_prognostic_nox_state(pres_host_nx, n2o_ppmv=model.current_n2o_ppmv())
-        lnox_nx = None
-        if light_diag is not None:
-            from aoba.lightning import LNOX_KG_N_PER_FLASH
-
-            lnox_nx = light_diag.flash_tot_cell * LNOX_KG_N_PER_FLASH
-        k_meso_nlc = model.rad_cache.get("_k_meso_nlc")
-        if k_meso_nlc is None:
-            zc_cpu = vgrid.zeta_c.detach().cpu()
-            idx_nl = torch.nonzero(zc_cpu >= 58000.0, as_tuple=False)
-            k_meso_nlc = max(int(idx_nl[0].item()) - 1, 0) if int(idx_nl.numel()) > 0 else 0
-            model.rad_cache["_k_meso_nlc"] = k_meso_nlc
-        sp_d = model.last_red_sprites
-        step_prognostic_nox(
-            nox=model.meso_nox,
-            pres_c=pres_host_nx,
-            temp_c=temp_host_nx,
-            rho_d=atmos.rho_d,
-            z_c=atmos.z_c,
-            dz_c=atmos.dz_c,
-            q_v=atmos.q_v,
-            mu0=mu0,
-            lat_cell=mesh.lat_cell,
-            precip_cell=precip_tot,
-            dt=dt,
-            n2o_ppmv=model.current_n2o_ppmv(),
-            lnox_cell_kgn_m2s=lnox_nx,
-            sprite_nox_mol_m2s=(sp_d.sprite_nox_mol_m2s if sp_d is not None else None),
-            sprite_z_init_km=(sp_d.z_init_km_cell if sp_d is not None else None),
-            sprite_z_stop_km=(sp_d.z_stop_km_cell if sp_d is not None else None),
-            solar_uv_scale=uv_j_o2_scale,
-            k_meso_start=k_meso_nlc,
-        )
-    if str(cfg.o3_mode).strip().lower() == "prognostic":
-        from aoba.ozone_chemistry import init_prognostic_ozone_state, step_prognostic_ozone
-
-        pres_host_oz, temp_host_oz = _get_host_pt_end()
-        if model.ozone is None:
-            model.ozone = init_prognostic_ozone_state(pres_host_oz, atmos.rho_d, atmos.dz_c)
-        lnox_prod_cell = None
-        if light_diag is not None:
-            from aoba.lightning import LNOX_KG_N_PER_FLASH
-
-            lnox_prod_cell = light_diag.flash_tot_cell * LNOX_KG_N_PER_FLASH
-        fire_c_cell = None
-        if model.land_carbon is not None:
-            if int(model.land_carbon.fire_c_kgc_m2s.shape[0]) == m_sub:
-                fire_c_cell = _sub_to_cell(model.land_carbon.fire_c_kgc_m2s, nc, n_sub)
-            else:
-                fire_c_cell = model.land_carbon.fire_c_kgc_m2s
-        if bool(cfg.enable_bvoc_soa) and model.aerosols is not None and getattr(model.aerosols, "emis_soa_kgm2s", None) is not None:
-            # Biogenic VOC (isoprene/monoterpene) photochemical contribution to tropospheric O3 precursors
-            bvoc_o3_eq = 0.50 * torch.clamp(model.aerosols.emis_soa_kgm2s, min=0.0)
-            fire_c_cell = bvoc_o3_eq if fire_c_cell is None else (fire_c_cell + bvoc_o3_eq)
-        step_prognostic_ozone(
-            oz=model.ozone,
-            pres_c=pres_host_oz,
-            temp_c=temp_host_oz,
-            rho_d=atmos.rho_d,
-            dz_c=atmos.dz_c,
-            q_v=atmos.q_v,
-            mu0=mu0,
-            surf_type=sfc.surf_type,
-            lai_cell=sfc.bio.lai,
-            f_snow_cell=f_snow_cell,
-            f_seaice_cell=f_seaice_cell,
-            dt=dt,
-            n2o_ppmv=model.current_n2o_ppmv(),
-            ch4_ppmv=model.current_ch4_ppmv(),
-            ecl_ppbv=cfg.o3_ecl_ppbv,
-            lnox_cell_kgn_m2s=lnox_prod_cell,
-            fire_c_cell_kgc_m2s=fire_c_cell,
-            uv_j_o2_scale=uv_j_o2_scale,
-            volc_sad_um2_cm3=volc_sad_3d,
-            nox_vmr_3d=(model.meso_nox.q_nox if model.meso_nox is not None else None),
-            z_c=(atmos.z_c if float(cfg.z_top) >= 68000.0 else None),
-        )
-    # 8b-8. Stable Water Isotopes (H2^18O, HDO) Fractionation & Ice-Core Archiving
-    if bool(cfg.enable_water_isotopes):
-        from aoba.water_isotopes import init_water_isotope_state, step_water_isotopes
-
-        if model.water_isotopes is None:
-            model.water_isotopes = init_water_isotope_state(atmos.q_v)
-        pres_host_iso, temp_host_iso = _get_host_pt_end()
-        rh_sfc_iso = (
-            torch.clamp(rh_host_end[0], 0.15, 0.99)
-            if rh_host_end is not None
-            else torch.clamp(
-                atmos.q_v[0] / torch.clamp(qsat_mixed(temp_host_iso[0], pres_host_iso[0])[0], min=1.0e-7),
-                0.15,
-                0.99,
-            )
-        )
-        step_water_isotopes(
-            iso=model.water_isotopes,
-            q_v=atmos.q_v,
-            temp_c=temp_host_iso,
-            rho_d=atmos.rho_d,
-            dz_c=atmos.dz_c,
-            surf_type=sfc.surf_type,
-            t_sfc=t_rad_cell,
-            evap_cell=evap_cell,
-            rain_cell=rain_new,
-            snow_cell=snow_new,
-            dt=dt,
-            rh_sfc=rh_sfc_iso,
-            u10_cell=u10_cell,
-            lai_cell=sfc.bio.lai,
-        )
     month_idx = model.calendar.date_at(model.sim_time_sec).month - 1
     clim.month_temp_sum_c[month_idx] += (t_air - C.T_FREEZE)
     clim.month_precip_mm[month_idx] += precip_tot * dt
@@ -4890,6 +5816,22 @@ def step_aoba_model(
             _sync_host_surface_from_subgrid(sfc, sfc_sub, nc, n_sub)
 
     if not compute_diagnostics:
+        if accum_diag_gpu is not None:
+            area = mesh.area_cell
+            area_tot = area.sum()
+            land_mask = (sfc.surf_type == SURF_LAND).to(area.dtype)
+            land_area = torch.clamp((area * land_mask).sum(), min=1.0)
+            lai_cell = sfc.bio.lai if sync_host_surface else _sub_to_cell(sfc_sub.bio.lai, nc, n_sub)
+            diag_gpu = torch.stack([
+                (area * t_rad_cell).sum() / area_tot,
+                (area * olr).sum() / area_tot,
+                (area * asr).sum() / area_tot,
+                (area * precip_tot * C.SECONDS_PER_DAY).sum() / area_tot,
+                (area * land_mask * gpp_cell).sum() / land_area,
+                (area * land_mask * lai_cell).sum() / land_area,
+                (area * f_seaice_cell).sum() * 1.0e-12,
+            ])
+            accum_diag_gpu.add_(diag_gpu.to(dtype=accum_diag_gpu.dtype))
         return GlobalStepDiagnostics(
             sim_time_days=model.sim_time_sec / C.SECONDS_PER_DAY,
             global_mean_t_sfc_k=0.0,

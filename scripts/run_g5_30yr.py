@@ -2724,6 +2724,7 @@ def main() -> None:
         t_day0 = time.perf_counter()
         prev_cal_month = model.calendar.date_at(model.sim_time_sec).month
 
+        day_accum_gpu = torch.zeros(7, device=dev, dtype=torch.float64 if dev.type == "cuda" else torch.float32) if bool(out_cfg.daily_csv_enabled) else None
         for step_in_yr in range(step_start, steps_per_year + 1):
             is_preview_step = (step_in_yr % preview_stride_steps == 0)
             is_monthly_end = (
@@ -2744,49 +2745,66 @@ def main() -> None:
             is_year_end = (step_in_yr == steps_per_year) or (
                 max_total_steps is not None and (model.step_count + 1) >= max_total_steps
             )
+            is_daily_flush = (step_in_yr % csv_stride_steps == 0) or is_monthly_end or is_month_restart or is_year_end
+            is_nan_check = (step_in_yr % 12 == 0) or is_daily_flush
             is_sync_step = is_preview_step or is_monthly_sample or is_snap_step or is_month_restart or is_year_end
 
             diag = step_aoba_model(
                 model,
-                compute_diagnostics=bool(out_cfg.daily_csv_enabled),
+                compute_diagnostics=False if day_accum_gpu is not None else bool(out_cfg.daily_csv_enabled),
                 sync_host_surface=is_sync_step,
+                accum_diag_gpu=day_accum_gpu,
             )
 
-            # Zero-overhead immediate NaN/Inf guard on already-synced scalar diagnostics
-            if bool(out_cfg.daily_csv_enabled):
-                _dvals = (
-                    ("Ts", diag.global_mean_t_sfc_k),
-                    ("OLR", diag.global_mean_olr_wm2),
-                    ("ASR", diag.global_mean_asr_wm2),
-                    ("P", diag.global_mean_precip_mm_day),
-                    ("GPP", diag.land_mean_gpp_umol),
-                    ("LAI", diag.land_mean_lai),
-                    ("Ice", diag.seaice_area_million_km2),
-                )
-                _bad_d = [f"{k}={v}" for k, v in _dvals if not math.isfinite(v)]
-                if _bad_d:
-                    _abort_if_nonfinite(
-                        model, year, step_in_yr, diag.date_str,
-                        reason="non-finite step diagnostics: " + ", ".join(_bad_d),
+            if day_accum_gpu is not None:
+                day_cnt += 1
+                mon_cnt += 1
+                if is_nan_check or is_monthly_end:
+                    _dg_vals = day_accum_gpu.detach().cpu().tolist()
+                    _dvals = (
+                        ("Ts", _dg_vals[0]), ("OLR", _dg_vals[1]), ("ASR", _dg_vals[2]),
+                        ("P", _dg_vals[3]), ("GPP", _dg_vals[4]), ("LAI", _dg_vals[5]), ("Ice", _dg_vals[6]),
                     )
+                    _bad_d = [f"{k}={v}" for k, v in _dvals if not math.isfinite(v)]
+                    if _bad_d:
+                        _abort_if_nonfinite(
+                            model, year, step_in_yr, diag.date_str,
+                            reason="non-finite step diagnostics: " + ", ".join(_bad_d),
+                        )
+                    if is_daily_flush or is_monthly_end:
+                        day_accum["ts"] += _dg_vals[0]
+                        day_accum["olr"] += _dg_vals[1]
+                        day_accum["asr"] += _dg_vals[2]
+                        day_accum["p"] += _dg_vals[3]
+                        day_accum["gpp"] += _dg_vals[4]
+                        day_accum["lai"] += _dg_vals[5]
+                        day_accum["ice"] += _dg_vals[6]
+                        mon_accum["ts"] += _dg_vals[0]
+                        mon_accum["olr"] += _dg_vals[1]
+                        mon_accum["asr"] += _dg_vals[2]
+                        mon_accum["p"] += _dg_vals[3]
+                        mon_accum["gpp"] += _dg_vals[4]
+                        mon_accum["lai"] += _dg_vals[5]
+                        mon_accum["ice"] += _dg_vals[6]
+                        day_accum_gpu.zero_()
+            else:
+                day_accum["ts"] += diag.global_mean_t_sfc_k
+                day_accum["olr"] += diag.global_mean_olr_wm2
+                day_accum["asr"] += diag.global_mean_asr_wm2
+                day_accum["p"] += diag.global_mean_precip_mm_day
+                day_accum["gpp"] += diag.land_mean_gpp_umol
+                day_accum["lai"] += diag.land_mean_lai
+                day_accum["ice"] += diag.seaice_area_million_km2
+                day_cnt += 1
 
-            day_accum["ts"] += diag.global_mean_t_sfc_k
-            day_accum["olr"] += diag.global_mean_olr_wm2
-            day_accum["asr"] += diag.global_mean_asr_wm2
-            day_accum["p"] += diag.global_mean_precip_mm_day
-            day_accum["gpp"] += diag.land_mean_gpp_umol
-            day_accum["lai"] += diag.land_mean_lai
-            day_accum["ice"] += diag.seaice_area_million_km2
-            day_cnt += 1
-
-            mon_accum["ts"] += diag.global_mean_t_sfc_k
-            mon_accum["olr"] += diag.global_mean_olr_wm2
-            mon_accum["asr"] += diag.global_mean_asr_wm2
-            mon_accum["p"] += diag.global_mean_precip_mm_day
-            mon_accum["gpp"] += diag.land_mean_gpp_umol
-            mon_accum["lai"] += diag.land_mean_lai
-            mon_accum["ice"] += diag.seaice_area_million_km2
-            mon_cnt += 1
+                mon_accum["ts"] += diag.global_mean_t_sfc_k
+                mon_accum["olr"] += diag.global_mean_olr_wm2
+                mon_accum["asr"] += diag.global_mean_asr_wm2
+                mon_accum["p"] += diag.global_mean_precip_mm_day
+                mon_accum["gpp"] += diag.land_mean_gpp_umol
+                mon_accum["lai"] += diag.land_mean_lai
+                mon_accum["ice"] += diag.seaice_area_million_km2
+                mon_cnt += 1
             # Zero-sync on-device monthly accumulators for intermittent ESM fluxes (MAML fires, lightning, BNF, O3 dep)
             _esm_step: dict[str, torch.Tensor] = {}
             if model.land_carbon is not None:

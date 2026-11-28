@@ -99,6 +99,19 @@ def init_maml_subgrid_land_state(
     )
 
 
+def _downscale_maml_microclimate_core(
+    dz_sub_m: torch.Tensor,
+    slope_sw_fac: torch.Tensor,
+    t_air_sub: torch.Tensor,
+    pres_sfc_sub: torch.Tensor,
+    sw_dir_sub: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    t_down = torch.clamp(t_air_sub - LAPSE_RATE_K_M * dz_sub_m, min=180.0, max=340.0)
+    p_down = pres_sfc_sub * torch.exp(torch.clamp(-C.GRAVITY * dz_sub_m / (C.R_D * torch.clamp(t_air_sub, min=200.0)), min=-0.5, max=0.5))
+    sw_down = torch.clamp(sw_dir_sub * slope_sw_fac, min=0.0)
+    return t_down, p_down, sw_down
+
+
 def downscale_maml_microclimate(
     ml: MAMLSubgridLandState,
     t_air_sub: torch.Tensor,
@@ -106,10 +119,32 @@ def downscale_maml_microclimate(
     sw_dir_sub: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Apply environmental lapse-rate & barometric microclimate downscaling across MAML land tiles."""
-    t_down = torch.clamp(t_air_sub - LAPSE_RATE_K_M * ml.dz_sub_m, min=180.0, max=340.0)
-    p_down = pres_sfc_sub * torch.exp(torch.clamp(-C.GRAVITY * ml.dz_sub_m / (C.R_D * torch.clamp(t_air_sub, min=200.0)), min=-0.5, max=0.5))
-    sw_down = torch.clamp(sw_dir_sub * ml.slope_sw_fac, min=0.0)
-    return t_down, p_down, sw_down
+    from aoba.runtime import maybe_cuda_compile
+
+    fn = maybe_cuda_compile(_downscale_maml_microclimate_core, device=t_air_sub.device)
+    return fn(ml.dz_sub_m, ml.slope_sw_fac, t_air_sub, pres_sfc_sub, sw_dir_sub)
+
+
+def _step_maml_wetlands_core(
+    f_wetland: torch.Tensor,
+    valley_weight: torch.Tensor,
+    surf_type_sub: torch.Tensor,
+    sigma_topo_sub: torch.Tensor,
+    w_liq_soil_top: torch.Tensor,
+    t_soil_top: torch.Tensor,
+    river_q_sub: torch.Tensor,
+    relax: float,
+) -> torch.Tensor:
+    dtype = w_liq_soil_top.dtype
+    is_land = (surf_type_sub == SURF_LAND).to(dtype)
+    flatness = 1.0 / (1.0 + torch.clamp(sigma_topo_sub, min=0.0) / WETLAND_SIGMA0_M)
+    sat = torch.clamp(w_liq_soil_top / SOIL_POROSITY, 0.0, 1.0)
+    wet_soil = torch.clamp((sat - 0.58) / 0.42, 0.0, 1.0) ** 1.6
+    q_pos = torch.clamp(river_q_sub, min=0.0)
+    river_boost = 0.35 * (q_pos / (q_pos + 4000.0))
+    thaw_fac = torch.clamp((t_soil_top - 270.15) / 5.0, 0.15, 1.0)
+    f_target = torch.clamp((wet_soil + river_boost) * flatness * valley_weight * thaw_fac, 0.0, WETLAND_MAX_FRAC) * is_land
+    return torch.clamp(f_wetland + (f_target - f_wetland) * relax, 0.0, WETLAND_MAX_FRAC) * is_land
 
 
 def step_maml_wetlands_lakes(
@@ -126,31 +161,19 @@ def step_maml_wetlands_lakes(
     river_discharge_cell: torch.Tensor | None = None,
 ) -> None:
     """Update dynamic MAML wetland / floodplain / lake inundation fraction (exact exponential relaxation)."""
-    dtype = w_liq_soil_top.dtype
-    is_land = (surf_type_sub == SURF_LAND).to(dtype)
+    from aoba.runtime import maybe_cuda_compile
 
-    # 1. Topographic flatness factor: flat alluvial basins flood readily, steep mountains drain
-    flatness = 1.0 / (1.0 + torch.clamp(sigma_topo_sub, min=0.0) / WETLAND_SIGMA0_M)
-
-    # 2. Soil moisture saturation excess (TOPMODEL principle; Beven & Kirkby, 1979)
-    sat = torch.clamp(w_liq_soil_top / SOIL_POROSITY, 0.0, 1.0)
-    wet_soil = torch.clamp((sat - 0.58) / 0.42, 0.0, 1.0) ** 1.6
-
-    # 3. Optional Priority-Flood river floodplain overbank contribution
-    river_boost = torch.zeros_like(wet_soil)
-    if river_discharge_cell is not None:
-        q_sub = river_discharge_cell.unsqueeze(1).expand(nc, n_sub).reshape(-1)
-        # Smooth Michaelis-Menten flooding above ~1500 m^3/s discharge in flat valley tiles
-        river_boost = 0.35 * (torch.clamp(q_sub, min=0.0) / (torch.clamp(q_sub, min=0.0) + 4000.0))
-
-    # Frozen tundra stays solid until thawed (reduces open-water evaporation / wetland methane in deep winter)
-    thaw_fac = torch.clamp((t_soil_top - 270.15) / 5.0, 0.15, 1.0)
-    f_target = torch.clamp((wet_soil + river_boost) * flatness * ml.valley_weight * thaw_fac, 0.0, WETLAND_MAX_FRAC) * is_land
-
-    # Exact exponential wetland drainage/inundation adjustment (tau ~ 10 days)
     tau_wet = 10.0 * C.SECONDS_PER_DAY
     relax = -math.expm1(-float(dt) / tau_wet)
-    ml.f_wetland = torch.clamp(ml.f_wetland + (f_target - ml.f_wetland) * relax, 0.0, WETLAND_MAX_FRAC) * is_land
+    if river_discharge_cell is not None:
+        river_q_sub = river_discharge_cell.unsqueeze(1).expand(nc, n_sub).reshape(-1)
+    else:
+        river_q_sub = torch.zeros_like(w_liq_soil_top)
+    fn = maybe_cuda_compile(_step_maml_wetlands_core, device=w_liq_soil_top.device)
+    ml.f_wetland = fn(
+        ml.f_wetland, ml.valley_weight, surf_type_sub, sigma_topo_sub,
+        w_liq_soil_top, t_soil_top, river_q_sub, relax,
+    )
 
 
 def diagnose_maml_wetland_area_mkm2(ml: MAMLSubgridLandState, area_cell: torch.Tensor, nc: int, n_sub: int) -> float:

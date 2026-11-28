@@ -1285,6 +1285,9 @@ def step_crm_physics_and_dynamics(
     )
 
 
+_ZETA_W_CPU_CACHE: dict[tuple[int, int], list[float]] = {}
+
+
 def _step_crm_physics_and_dynamics_impl(
     crm: CRMState,
     vgrid: VerticalGrid,
@@ -1350,7 +1353,13 @@ def _step_crm_physics_and_dynamics_impl(
         # (after Galilean midpoint shift, high-top mesospheric jets can span >160 m/s so z_top >= 68 km
         # uses u_ref_cfl = 110 m/s and dt_cfl_cap = 17.5 s, keeping Zalesak FCT <= 1.0 up to ~225 m/s span).
         cfl_adv = 0.96 if is_2d_crm else 0.45
-        is_meso_top = float(vgrid.z_top) >= 68000.0
+        _zw_key = (id(vgrid.zeta_w), int(vgrid.zeta_w.numel()))
+        _zw_cpu = _ZETA_W_CPU_CACHE.get(_zw_key)
+        if _zw_cpu is None:
+            _zw_cpu = vgrid.zeta_w.detach().cpu().tolist()
+            _ZETA_W_CPU_CACHE[_zw_key] = _zw_cpu
+        z_crm_top = float(_zw_cpu[nz]) if nz < len(_zw_cpu) else float(vgrid.z_top)
+        is_meso_top = z_crm_top >= 68000.0
         u_ref_cfl = 110.0 if is_meso_top else 80.0
         dt_cfl_cap_2d = 17.5 if is_meso_top else 24.0
         dt_cfl_max = min(dt_cfl_cap_2d if is_2d_crm else 45.0, cfl_adv * min(crm.dx, crm.dy) / u_ref_cfl)
@@ -1377,7 +1386,13 @@ def _step_crm_physics_and_dynamics_impl(
 
     # Group acoustic substeps into advective super-steps (<= 17.5 s for high-top mesosphere, <= 25 s
     # otherwise in 2D; 1 substep <= 22.5 s in 3D so explicit donor-cell FCT obeys C_x + C_y + C_z <= 1).
-    dt_adv_cap_2d = 17.5 if float(vgrid.z_top) >= 68000.0 else 25.0
+    _zw_key_adv = (id(vgrid.zeta_w), int(vgrid.zeta_w.numel()))
+    _zw_cpu_adv = _ZETA_W_CPU_CACHE.get(_zw_key_adv)
+    if _zw_cpu_adv is None:
+        _zw_cpu_adv = vgrid.zeta_w.detach().cpu().tolist()
+        _ZETA_W_CPU_CACHE[_zw_key_adv] = _zw_cpu_adv
+    z_crm_top_adv = float(_zw_cpu_adv[nz]) if nz < len(_zw_cpu_adv) else float(vgrid.z_top)
+    dt_adv_cap_2d = 17.5 if z_crm_top_adv >= 68000.0 else 25.0
     adv_group = max(1, min(n_sub, int(math.floor(dt_adv_cap_2d / max(dt_sub, 1.0e-3))))) if is_2d_crm else 1
     sgs_stride = max(1, int(math.floor(120.0 / max(dt_sub, 1.0e-3)))) if is_2d_crm else 1
     if is_2d_crm and adv_group > 1 and sgs_stride >= adv_group:
@@ -1421,7 +1436,7 @@ def _step_crm_physics_and_dynamics_impl(
             can_fuse_sub = (
                 k_cnt > 1
                 and no_clone_pp
-                and crm.rho_d.device.type == "mps"
+                and crm.rho_d.device.type in ("mps", "cuda")
                 and ny == 1
                 and 1 < nx <= 32
                 and nz <= 64
