@@ -3193,30 +3193,36 @@ def main() -> None:
                             f"dLWdn={sm_p.get('sfc_rad_rmse_lwd_wm2', float('nan')):.2f}({sm_p.get('sfc_rad_bias_lwd_wm2', float('nan')):+.2f}) W/m2",
                             flush=True,
                         )
-                    # Live Teacher-vs-Student host parity canary (never masked: exposes any T/S divergence immediately)
-                    if model.crm_distill is not None and getattr(model.crm_distill, "_cached_t_idx", None) is not None:
+                    # Live unbiased Teacher-cohort vs Student-cohort parity canary (excludes OOD storm selection
+                    # so true Teacher-Student physics bias is never confounded with OOD thunderstorm targeting!)
+                    if model.crm_distill is not None:
                         with torch.no_grad():
-                            _t_i = model.crm_distill._cached_t_idx
-                            _s_i = model.crm_distill._cached_s_idx
-                            if _t_i is not None and _s_i is not None and int(_t_i.numel()) > 0 and int(_s_i.numel()) > 0:
+                            _cd = model.crm_distill
+                            _st = int(_cd.stride)
+                            _cid = _cd.cohort_id
+                            _rot_c = ((_cd.steps_seen - _cd.warmup_steps) // max(_cd.dwell_steps, 1)) % max(_st, 1)
+                            _anc_c = ((_cd.steps_seen - _cd.warmup_steps) // max(_cd.dwell_steps * 8, 1)) % max(_st, 1)
+                            _m_tea = (_cid == _rot_c) | (_cid == _anc_c)
+                            _m_stu = ~_m_tea
+                            if bool(_m_tea.any()) and bool(_m_stu.any()):
                                 _p_c = (model.rad_cache["rain"] + model.rad_cache["snow"]) * 86400.0
                                 _dm_c = torch.clamp(model.atmos.rho_d * model.atmos.dz_c, min=0.0)
                                 _lwp_c = (_dm_c * torch.clamp(model.atmos.q_c, min=0.0)).sum(dim=0) * 1.0e3
                                 _iwp_c = (_dm_c * torch.clamp(model.atmos.q_i + model.atmos.q_p, min=0.0)).sum(dim=0) * 1.0e3
-                                _p_r = float(_p_c[_t_i].mean().item()) / max(float(_p_c[_s_i].mean().item()), 1.0e-4)
-                                _lwp_r = float(_lwp_c[_t_i].mean().item()) / max(float(_lwp_c[_s_i].mean().item()), 1.0e-4)
-                                _iwp_r = float(_iwp_c[_t_i].mean().item()) / max(float(_iwp_c[_s_i].mean().item()), 1.0e-4)
+                                _p_r = float(_p_c[_m_tea].mean().item()) / max(float(_p_c[_m_stu].mean().item()), 1.0e-4)
+                                _lwp_r = float(_lwp_c[_m_tea].mean().item()) / max(float(_lwp_c[_m_stu].mean().item()), 1.0e-4)
+                                _iwp_r = float(_iwp_c[_m_tea].mean().item()) / max(float(_iwp_c[_m_stu].mean().item()), 1.0e-4)
                                 _lt_str = ""
                                 if model.last_lightning is not None:
                                     _fl_c = model.last_lightning.flash_tot_cell
-                                    _fl_r = float(_fl_c[_t_i].mean().item()) / max(float(_fl_c[_s_i].mean().item()), 1.0e-20)
+                                    _fl_r = float(_fl_c[_m_tea].mean().item()) / max(float(_fl_c[_m_stu].mean().item()), 1.0e-20)
                                     _lt_str += f" Light={_fl_r:.2f}x"
                                 if getattr(model, "last_red_sprites", None) is not None:
                                     _sp_c = model.last_red_sprites.sprite_rate_cell
-                                    _sp_r = float(_sp_c[_t_i].mean().item()) / max(float(_sp_c[_s_i].mean().item()), 1.0e-25)
+                                    _sp_r = float(_sp_c[_m_tea].mean().item()) / max(float(_sp_c[_m_stu].mean().item()), 1.0e-25)
                                     _lt_str += f" Sprite={_sp_r:.2f}x"
                                 print(
-                                    f"  [OSSP PARITY  | T/S ratio] P={_p_r:.2f}x LWP={_lwp_r:.2f}x IWP={_iwp_r:.2f}x{_lt_str}",
+                                    f"  [OSSP PARITY  | cohort T/S] P={_p_r:.2f}x LWP={_lwp_r:.2f}x IWP={_iwp_r:.2f}x{_lt_str}",
                                     flush=True,
                                 )
                 for k in day_accum:
