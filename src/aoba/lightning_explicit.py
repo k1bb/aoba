@@ -742,6 +742,7 @@ class LightningSelfDistillState:
     act_y: torch.Tensor        # [cap_act] log1p(flash_tot / F_SCALE)
     act_fcg: torch.Tensor      # [cap_act] f_cg in [0, 1]
     act_valid: torch.Tensor    # [cap_act] float active-storm mask in {0, 1}
+    act_ccd: torch.Tensor | None = None  # [cap_act] normalized cold-cloud depth in [0, 1] for active storms
     all_ptr: int = 0
     all_size: int = 0
     act_ptr: int = 0
@@ -790,6 +791,7 @@ def init_lightning_self_distill_state(
         act_y=torch.zeros((cap_act,), device=dev, dtype=torch.float32),
         act_fcg=torch.zeros((cap_act,), device=dev, dtype=torch.float32),
         act_valid=torch.zeros((cap_act,), device=dev, dtype=torch.float32),
+        act_ccd=torch.zeros((cap_act,), device=dev, dtype=torch.float32),
         ema_tea_fl_gpu=torch.zeros((), device=dev, dtype=torch.float32),
         ema_stu_fl_gpu=torch.zeros((), device=dev, dtype=torch.float32),
     )
@@ -828,11 +830,10 @@ def extract_lightning_distill_features(
     qi_pos = torch.clamp(qi_s, min=0.0)
     qp_pos = torch.clamp(qp_s, min=0.0)
 
-    # Precipitation statistics in mm/day (cell mean & subgrid convective localization std)
+    # Precipitation statistics in mm/day (cell-mean only: never use subgrid tile std, which differs
+    # structurally between 2D CRM Teacher tiles and Student f_prec tiles and causes Teacher/Student bias!)
     rain_mm = torch.clamp(rain_3d.reshape(nc, -1).mean(dim=-1) * C.SECONDS_PER_DAY, min=0.0)
     snow_mm = torch.clamp(snow_3d.reshape(nc, -1).mean(dim=-1) * C.SECONDS_PER_DAY, min=0.0)
-    prec_sub_mm = torch.clamp((rain_3d + snow_3d).reshape(nc, -1) * C.SECONDS_PER_DAY, min=0.0)
-    prec_std_mm = prec_sub_mm.std(dim=-1, unbiased=False) if prec_sub_mm.shape[-1] > 1 else torch.zeros_like(rain_mm)
 
     # Column & mixed-phase (-40 C < T < 0 C) hydrometeor paths [kg m^-2]
     cwp = (dm * qc_pos).sum(dim=0)
@@ -872,7 +873,9 @@ def extract_lightning_distill_features(
             torch.clamp(z_ctop_km / 16.0, 0.0, 2.0),
             torch.clamp(ccd_proxy_km / 12.0, 0.0, 2.0),
             torch.clamp(buoy_sfc / 0.05, -2.0, 4.0),
-            torch.log1p(prec_std_mm),
+            # Symmetric riming-intensity proxy (total precip * mixed-phase ice path): identically defined
+            # on both Teacher and Student host columns with zero subgrid-tiling feature leakage.
+            torch.log1p(torch.clamp((rain_mm + snow_mm) * mix_iwp * 10.0, min=0.0)),
         ],
         dim=-1,
     )
@@ -1039,13 +1042,17 @@ def step_ossp_distilled_lightning(
     top_x = x_t[top_idx]
     top_y = torch.log1p(torch.clamp(top_fl, min=0.0) / LIGHTNING_FLASH_LOG_SCALE)
     top_fcg = torch.clamp(cg_t[top_idx] / torch.clamp(top_fl, min=1.0e-18), 0.0, 1.0)
+    top_ccd = ccd_norm_t[top_idx]
 
+    if distill_state.act_ccd is None:
+        distill_state.act_ccd = torch.zeros_like(distill_state.act_y)
     ptr_act0 = distill_state.act_ptr
     sz_act0 = distill_state.act_size
     distill_state.act_ptr, distill_state.act_size = _ring_push(distill_state.act_x, ptr_act0, sz_act0, top_x)
     _ring_push(distill_state.act_y, ptr_act0, sz_act0, top_y)
     _ring_push(distill_state.act_fcg, ptr_act0, sz_act0, top_fcg)
     _ring_push(distill_state.act_valid, ptr_act0, sz_act0, top_valid)
+    _ring_push(distill_state.act_ccd, ptr_act0, sz_act0, top_ccd)
 
     # 5. Online Hurdle MLP training (2 grad steps during initial fill, 1 step during ramp-up,
     #    1 step every 4th step in steady state; 100% teacher data still pushed every step!)
@@ -1075,8 +1082,8 @@ def step_ossp_distilled_lightning(
                     ((torch.sigmoid(pred_a[:, 3]) - ca) ** 2) * wa
                 ).sum() / w_m_sum
                 loss = loss_hit + 0.25 * loss_ccd
-                if len(inp) == 8:
-                    xp, yp, fp, wp = inp[4], inp[5], inp[6], inp[7]
+                if len(inp) == 9:
+                    xp, yp, fp, wp, cp = inp[4], inp[5], inp[6], inp[7], inp[8]
                     pred_p = distill_state.net(xp)
                     w_p_sum = torch.clamp(wp.sum(), min=1.0)
                     has_p = (wp.sum() > 0.5).to(torch.float32)
@@ -1086,7 +1093,10 @@ def step_ossp_distilled_lightning(
                     loss_fcg = (
                         F.binary_cross_entropy_with_logits(pred_p[:, 2], fp, reduction="none") * wp
                     ).sum() / w_p_sum
-                    loss = loss + has_p * (loss_rate + 0.35 * loss_fcg)
+                    loss_ccd_act = (
+                        ((torch.sigmoid(pred_p[:, 3]) - cp) ** 2) * wp
+                    ).sum() / w_p_sum
+                    loss = loss + has_p * (loss_rate + 0.35 * loss_fcg + 0.75 * loss_ccd_act)
 
                 distill_state.opt.zero_grad(set_to_none=False)
                 loss.backward()
@@ -1113,6 +1123,7 @@ def step_ossp_distilled_lightning(
                             distill_state.act_y[idx_p],
                             distill_state.act_fcg[idx_p],
                             distill_state.act_valid[idx_p],
+                            distill_state.act_ccd[idx_p],
                         ])
                     if use_cg_lt:
                         g_key = ("lt_ml_train", id(distill_state.net), b_all, b_act if has_act_batch else 0)

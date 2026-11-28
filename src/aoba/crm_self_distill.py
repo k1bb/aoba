@@ -408,8 +408,9 @@ def apply_exact_conservation_closure(
             rp1_mid = 0.25 * rp1_s[:-2] + 0.50 * rp1_s[1:-1] + 0.25 * rp1_s[2:]
             rp1_s = torch.cat([0.75 * rp1_s[:1] + 0.25 * rp1_s[1:2], rp1_mid, 0.25 * rp1_s[-2:-1] + 0.75 * rp1_s[-1:]], dim=0)
 
-    # Predict physically bounded convective/PBL temperature & momentum residuals
-    d_temp_raw = s_conv * layer_gate * torch.tanh(rp0_s * 0.2) * 0.15
+    # Predict physically bounded convective/PBL temperature & momentum residuals (wide enough to
+    # capture full 2 km deep-convective Q1 overturning up to +-2.5 K / 12-min step).
+    d_temp_raw = s_conv * layer_gate * torch.tanh(rp0_s * 0.2) * 2.5
     f_qp_logit = rp[2]
     f_cond_logit = rp[3]
     f_ice_logit = rp[4]
@@ -434,7 +435,10 @@ def apply_exact_conservation_closure(
     # offset lies strictly in the zero-tendency nullspace and never pumps lower-tropospheric residuals aloft.
     qn_base = qn0.clone()
     qn_base[0] = torch.clamp(qn_base[0] + (evap * dt) / torch.clamp(dm[0], min=1.0e-4), min=0.0)
-    dq_lim = layer_gate * torch.clamp(0.015 * qn_base, max=1.0e-4)
+    dq_lim = layer_gate * torch.clamp(
+        (0.02 + 0.16 * col_rh_gate.unsqueeze(0)) * qn_base + 1.5e-4 * col_rh_gate.unsqueeze(0),
+        max=1.5e-3,
+    )
     d_qn_raw = s_conv * torch.tanh(rp1_s * 0.2) * dq_lim
     w_bal = conv_f * dq_lim
     dm_dqn_sum = (dm * conv_f * d_qn_raw).sum(dim=0)
@@ -479,9 +483,11 @@ def apply_exact_conservation_closure(
 
     # Partition convective q_n into (q_v, q_c, q_i) strictly preserving q_v + q_c + q_i == q_n
     # and thermodynamic saturation consistency (q_v <= qsat_env, homogeneous freezing T <= 253.15 K,
-    # liquid-only T >= 273.15 K), with a smooth C^1 quadratic RH gate starting at RH = 0.55 so clear
-    # dry skies stay cloud-free while anvil/cirrus edges transition continuously without binary OLR holes.
-    rh_lin = torch.clamp((qn_new / torch.clamp(qsat_env, min=1.0e-7) - 0.55) / 0.40, min=0.0, max=1.0)
+    # liquid-only T >= 273.15 K). Cold mixed-phase/ice layers use a lower subgrid RH threshold
+    # (`rh_base = 0.35 + 0.20 * om_liq`) so partial-domain deep convective anvils form realistic
+    # upper-tropospheric cloud ice without being suppressed by clear-sky subsidence surrounding turrets.
+    rh_base = 0.35 + 0.20 * om_liq
+    rh_lin = torch.clamp((qn_new / torch.clamp(qsat_env, min=1.0e-7) - rh_base) / 0.45, min=0.0, max=1.0)
     rh_gate = rh_lin * rh_lin
     fc_sig = torch.sigmoid(f_cond_logit - 2.2)
     f_cond = s_conv * rh_gate * 0.95 * (fc_sig * fc_sig)
@@ -500,10 +506,10 @@ def apply_exact_conservation_closure(
     qv_new = torch.where(in_conv, torch.clamp(qn_new - q_cond_tot, min=0.0), qv0)
 
     # Physical autoconversion & ice-sedimentation fallout: excess supersaturated condensate above
-    # the NN-predicted suspended cloud (`q_cond_nn`, bounded by 5e-4 liquid / min(qsat, 1e-4) ice
+    # the NN-predicted suspended cloud (`q_cond_nn`, bounded by 5e-4 liquid / min(qsat, 4e-4) ice
     # ceilings) precipitates conservatively instead of being trapped permanently as artificial ice.
     qc_keep = torch.clamp(q_cond_nn * (1.0 - f_ice), max=5.0e-4)
-    qi_cap = torch.clamp(qsat_env, max=1.0e-4)
+    qi_cap = torch.clamp(qsat_env, max=4.0e-4)
     qi_keep = torch.minimum(q_cond_nn * f_ice, qi_cap)
     qc_new = torch.where(in_conv, qc_keep, qc0)
     qi_new = torch.where(in_conv, qi_keep, qi0)
@@ -527,18 +533,17 @@ def apply_exact_conservation_closure(
     dm_pbl_sum = torch.clamp((dm * pbl_shape).sum(dim=0), min=1.0e-3)
     d_temp_shf = ((shf * dt) / (C.CP_D * dm_pbl_sum)).unsqueeze(0) * pbl_shape
 
-    # Local in-situ phase-change latent heating (cloud formation + in-situ precipitation condensation)
-    # deposits latent heat directly in the cloudy layers where condensation occurs instead of dumping
-    # dh_precip uniformly into the cold dry upper troposphere via h_corr.
+    # Local in-situ cloud phase-change latent heating (cloud formation + supersaturation fallout);
+    # precipitation latent heat from `p_tot_orig` is separated from lower-tropospheric Q2 extraction
+    # (`dq_psink`) so Yanai Q1 heating peaks aloft via `d_temp_raw` instead of overheating the PBL.
     d_temp_lat = conv_f * (
-        C.L_V0 * ((qc_pre_fall + qi_pre_fall) - (qc0 + qi0) + dq_psink)
+        C.L_V0 * ((qc_pre_fall + qi_pre_fall) - (qc0 + qi0))
         + C.L_F0 * (qi_new - qi0)
     ) / C.CP_D
-    # Remaining column enthalpy budget is purely residual precipitation/snow-melt difference [J m^-2]
+    # Remaining column enthalpy budget is total precipitation + suspended q_p latent release [J m^-2]
     d_m_qp = (dm * conv_f * (qp_new - qp0)).sum(dim=0)
-    p_sink_mass = (dm * conv_f * dq_psink).sum(dim=0)
     dh_precip = (
-        C.L_V0 * (p_tot_orig - p_sink_mass + d_m_qp)
+        C.L_V0 * (p_tot_orig + d_m_qp)
         + C.L_F0 * (p_tot_mass * f_snow)
     )
     dh_raw = C.CP_D * (dm * d_temp_raw).sum(dim=0)
@@ -1621,14 +1626,52 @@ def _compute_distill_loss(
 
     # Sharp per-step tendency & RH-normalized moisture supervision eliminates systematic PBL drying
     # and upper-tropospheric moistening/cirrus drift across 4 orders of magnitude in q_sat(z).
+    # Unbiased linear precipitation mean & MSE loss eliminates log1p/L1 median downward bias
+    p_tot_t_mmd = torch.clamp((tgt_s[:, 0] + tgt_s[:, 1]) * 86400.0, min=0.0)
+    p_tot_t2 = torch.cat([p_tot_t_mmd, p_tot_t_mmd], dim=0)
+    p_tot_p2 = torch.clamp(
+        (torch.cat([pred_a["precip_rain"], pred_b["precip_rain"]], dim=0)
+         + torch.cat([pred_a["precip_snow"], pred_b["precip_snow"]], dim=0)) * 86400.0,
+        min=0.0,
+    )
+    loss = loss + 0.35 * F.smooth_l1_loss(p_tot_p2 * 0.1, p_tot_t2 * 0.1, beta=2.0) + 0.6 * ((p_tot_p2.mean() - p_tot_t2.mean()) * 0.2).square()
+
+    # Convective-weighted MSE & conditional-mean profile matching ensure the ~4% deep-convective
+    # columns are not drowned out by 96% clear-sky/stratospheric columns (preserves Yanai Q1/Q2 aloft).
+    w_conv_col = (1.0 + 0.15 * torch.clamp(p_tot_t2, max=40.0)).unsqueeze(0)  # [1, 2*B]
+    wet_mask = (p_tot_t2 > 5.0).to(t_p2.dtype)                               # [2*B]
+    wet_cnt = torch.clamp(wet_mask.sum(), min=1.0)
+    has_wet = (wet_mask.sum() > 0.5).to(t_p2.dtype)
     if qn_in is not None:
         qn_in2 = torch.cat([qn_in, qn_in], dim=1)
-        l_dqn = F.smooth_l1_loss((qn_p2 - qn_in2) * 1.0e3, (qn_t2 - qn_in2) * 1.0e3, beta=0.015)
-        loss = loss + 3.0 * l_dqn
+        dqn_p = (qn_p2 - qn_in2) * 1.0e3
+        dqn_t = (qn_t2 - qn_in2) * 1.0e3
+        l_dqn = F.smooth_l1_loss(dqn_p, dqn_t, beta=0.05) + 0.6 * (w_conv_col * (dqn_p - dqn_t).square()).mean()
+        l_dqn_mean = (dqn_p.mean(dim=1) - dqn_t.mean(dim=1)).square().mean()
+        dqn_wm = ((dqn_p - dqn_t) * wet_mask.unsqueeze(0)).sum(dim=1) / wet_cnt
+        loss = loss + 3.0 * l_dqn + 4.0 * l_dqn_mean + has_wet * 4.0 * dqn_wm.square().mean()
     if t_in is not None:
         t_in2 = torch.cat([t_in, t_in], dim=1)
-        l_dt = F.smooth_l1_loss(t_p2 - t_in2, t_t2 - t_in2, beta=0.03)
-        loss = loss + 2.0 * l_dt
+        dt_p = t_p2 - t_in2
+        dt_t = t_t2 - t_in2
+        l_dt = F.smooth_l1_loss(dt_p, dt_t, beta=0.10) + 0.8 * (w_conv_col * (dt_p - dt_t).square()).mean()
+        l_dt_mean = (dt_p.mean(dim=1) - dt_t.mean(dim=1)).square().mean()
+        dt_wm = ((dt_p - dt_t) * wet_mask.unsqueeze(0)).sum(dim=1) / wet_cnt
+        loss = loss + 2.0 * l_dt + 4.0 * l_dt_mean + has_wet * 6.0 * dt_wm.square().mean()
+    # Convective-weighted vertical cloud-water & anvil-ice profile matching (prevents placing excess
+    # liquid qc in the lower troposphere while starving mid/upper-tropospheric anvil ice qi).
+    qc_p2_g = torch.cat([pred_a["q_c"], pred_b["q_c"]], dim=1) * 1.0e3
+    qc_t2_g = torch.cat([tp[3], tp[3]], dim=1) * 1.0e3
+    qi_p2_g = torch.cat([pred_a["q_i"], pred_b["q_i"]], dim=1) * 1.0e3
+    qi_t2_g = torch.cat([tp[4], tp[4]], dim=1) * 1.0e3
+    qc_wm = ((qc_p2_g - qc_t2_g) * wet_mask.unsqueeze(0)).sum(dim=1) / wet_cnt
+    qi_wm = ((qi_p2_g - qi_t2_g) * wet_mask.unsqueeze(0)).sum(dim=1) / wet_cnt
+    loss = (
+        loss
+        + 1.5 * (w_conv_col * (qc_p2_g - qc_t2_g).square()).mean()
+        + 3.0 * (w_conv_col * (qi_p2_g - qi_t2_g).square()).mean()
+        + has_wet * (6.0 * qc_wm.square().mean() + 12.0 * qi_wm.square().mean())
+    )
     if qsat_in is not None:
         qsat2 = torch.clamp(torch.cat([qsat_in, qsat_in], dim=1), min=1.0e-5)
         s_conv2 = torch.clamp((ex2 - 0.50) / 0.14, min=0.0, max=1.0).square()
@@ -1636,19 +1679,29 @@ def _compute_distill_loss(
         l_rh = (s_conv2 * F.smooth_l1_loss(rh_err, torch.zeros_like(rh_err), beta=0.003, reduction="none")).mean()
         loss = loss + 10.0 * l_rh
 
-    # Column-integrated LWP, IWP, & RWP [g m^-2] loss prevents clear-sky stratospheric levels from diluting cloud/precip paths
+    # Column-integrated LWP, IWP, & RWP [g m^-2] loss (log + linear batch-mean calibration)
     if dm is not None:
         dm2 = torch.cat([dm, dm], dim=1)  # [nz, 2*B]
-        lwp_t = torch.log1p(torch.clamp((dm * tp[3]).sum(dim=0) * 1.0e3, min=0.0))
-        iwp_t = torch.log1p(torch.clamp((dm * tp[4]).sum(dim=0) * 1.0e3, min=0.0))
-        rwp_t = torch.log1p(torch.clamp((dm * tp[2]).sum(dim=0) * 1.0e3, min=0.0))
-        lwp_p2 = torch.log1p(torch.clamp((dm2 * torch.cat([pred_a["q_c"], pred_b["q_c"]], dim=1)).sum(dim=0) * 1.0e3, min=0.0))
-        iwp_p2 = torch.log1p(torch.clamp((dm2 * torch.cat([pred_a["q_i"], pred_b["q_i"]], dim=1)).sum(dim=0) * 1.0e3, min=0.0))
-        rwp_p2 = torch.log1p(torch.clamp((dm2 * torch.cat([pred_a["q_p"], pred_b["q_p"]], dim=1)).sum(dim=0) * 1.0e3, min=0.0))
+        lwp_lin_t = torch.clamp((dm * tp[3]).sum(dim=0) * 1.0e3, min=0.0)
+        iwp_lin_t = torch.clamp((dm * tp[4]).sum(dim=0) * 1.0e3, min=0.0)
+        rwp_lin_t = torch.clamp((dm * tp[2]).sum(dim=0) * 1.0e3, min=0.0)
+        lwp_lin_p2 = torch.clamp((dm2 * torch.cat([pred_a["q_c"], pred_b["q_c"]], dim=1)).sum(dim=0) * 1.0e3, min=0.0)
+        iwp_lin_p2 = torch.clamp((dm2 * torch.cat([pred_a["q_i"], pred_b["q_i"]], dim=1)).sum(dim=0) * 1.0e3, min=0.0)
+        rwp_lin_p2 = torch.clamp((dm2 * torch.cat([pred_a["q_p"], pred_b["q_p"]], dim=1)).sum(dim=0) * 1.0e3, min=0.0)
+        lwp_t = torch.log1p(lwp_lin_t)
+        iwp_t = torch.log1p(iwp_lin_t)
+        rwp_t = torch.log1p(rwp_lin_t)
+        lwp_p2 = torch.log1p(lwp_lin_p2)
+        iwp_p2 = torch.log1p(iwp_lin_p2)
+        rwp_p2 = torch.log1p(rwp_lin_p2)
+        l_path_mean = (
+            ((lwp_lin_p2.mean() - lwp_lin_t.mean()) / 30.0).square()
+            + ((iwp_lin_p2.mean() - iwp_lin_t.mean()) / 20.0).square()
+        )
         loss = loss + 0.8 * (
             F.smooth_l1_loss(lwp_p2, torch.cat([lwp_t, lwp_t], dim=0))
             + F.smooth_l1_loss(iwp_p2, torch.cat([iwp_t, iwp_t], dim=0))
-        ) + 0.5 * F.smooth_l1_loss(rwp_p2, torch.cat([rwp_t, rwp_t], dim=0))
+        ) + 0.5 * F.smooth_l1_loss(rwp_p2, torch.cat([rwp_t, rwp_t], dim=0)) + 0.6 * l_path_mean
     # Log-scale total water loss ensures accurate thin-cirrus & cold upper-troposphere moisture (1e-5..1e-2 kg/kg)
     qn_log_t2 = torch.log1p(torch.clamp(qn_t2, min=0.0) * 1.0e4)
     qn_log_p2 = torch.log1p(torch.clamp(qn_p2, min=0.0) * 1.0e4)
@@ -1817,7 +1870,7 @@ def train_student_online(
         m6 = (rp6_b * s_conv_b).sum(dim=1) / s_conv_den
         loss_gauge = (
             0.05 * (m0.square().mean() + m5.square().mean() + m6.square().mean())
-            + 0.002 * (rp0_b * s_conv_b).square().mean()
+            + 2.0e-4 * (rp0_b * s_conv_b).square().mean()
             + 1.0e-4 * (rp1_b * s_conv_b).square().mean()
         )
         loss_i = loss_i + loss_gauge
