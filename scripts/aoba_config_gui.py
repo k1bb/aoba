@@ -3565,9 +3565,12 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
       const lwp = (lwpRaw / 255.0) * 400.0;
       const iwp = (iwpRaw / 255.0) * 200.0;
       const tauL = 0.085 * lwp;
-      const tauI = 0.032 * iwp;
+      const tauI = 0.038 * iwp;
       const tau = tauL + tauI;
-      alphaCld = Math.min(0.96, tau / (tau + 6.5));
+      // Two-stream reflectance with mild Himawari TrueColor sRGB gamma response so thin cirrus
+      // and marine cumulus (tau ~ 1-5) read realistically instead of overly transparent linear albedo.
+      const reflLin = tau / (tau + 6.0);
+      alphaCld = Math.min(0.96, Math.pow(reflLin, 0.72));
       cirrusFrac = tau > 0.05 ? (tauI / tau) : 0.0;
     } else if (irRaw !== null) {
       const olrV = 110.0 + (irRaw / 255.0) * 210.0;
