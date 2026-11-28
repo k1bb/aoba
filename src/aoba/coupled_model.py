@@ -4068,6 +4068,10 @@ def step_aoba_model(
                 explicit_state=model.explicit_lightning,
             )
     f_dust_dep_cell = None
+    u_star_cell = _sub_to_cell(sfc_diag_sub.u_star, nc, n_sub)
+    f_snow_cell = _sub_to_cell(sfc_diag_sub.f_snow_land, nc, n_sub)
+    u10_sub_mag = torch.hypot(u_sub_0, v_sub_0)
+    u10_cell = _sub_to_cell(u10_sub_mag, nc, n_sub)
     if cfg.enable_dust:
         if atmos.q_dust_fine is None or atmos.q_dust_coarse is None:
             if atmos.q_dust is not None:
@@ -4104,16 +4108,16 @@ def step_aoba_model(
             z_c=atmos.z_c,
             f_dust_emit=f_dust_emit_c,
             precip_rate=rain_new + snow_new,
-            u_star_cell=_sub_to_cell(sfc_diag_sub.u_star, nc, n_sub),
+            u_star_cell=u_star_cell,
             dt=dt,
         )
         dust_col_post = (dm_dust_c * torch.clamp(atmos.q_dust, min=0.0)).sum(dim=0)
         f_dust_dep_cell = torch.clamp((dust_col_pre + dt * f_dust_emit_c - dust_col_post) / max(dt, 1.0), min=0.0)
-    evap_cell = _sub_to_cell(sfc_diag_sub.evap, nc, n_sub)
-    shf_cell = _sub_to_cell(sfc_diag_sub.shf, nc, n_sub)
-    gpp_cell = _sub_to_cell(sfc_diag_sub.gpp, nc, n_sub)
-    t_rad_cell = _sub_to_cell(sfc_diag_sub.t_rad_sfc, nc, n_sub)
-    f_seaice_cell = _sub_to_cell(sfc_diag_sub.f_seaice, nc, n_sub)
+    _sfc_cell_5 = torch.stack(
+        [sfc_diag_sub.evap, sfc_diag_sub.shf, sfc_diag_sub.gpp, sfc_diag_sub.t_rad_sfc, sfc_diag_sub.f_seaice],
+        dim=0,
+    ).reshape(5, nc, n_sub).mean(dim=-1)
+    evap_cell, shf_cell, gpp_cell, t_rad_cell, f_seaice_cell = _sfc_cell_5.unbind(dim=0)
 
     model.rad_cache["rain_sub"] = rain_new_sub
     model.rad_cache["snow_sub"] = snow_new_sub
@@ -4220,7 +4224,7 @@ def step_aoba_model(
                 f_snow=sfc_diag_sub.f_snow_land,
                 t_sfc_k=t_air_sub,
                 vpd_pa=vpd_sub,
-                u10_ms=torch.hypot(u_sub_0, v_sub_0),
+                u10_ms=u10_sub_mag,
                 precip_kgm2s=rain_new_sub + snow_new_sub,
                 dt=dt,
                 enable_nitrogen=bool(cfg.enable_land_nitrogen),
@@ -4265,10 +4269,10 @@ def step_aoba_model(
                 t_soil=_sub_to_cell(sfc_sub.t_soil, nc, n_sub),
                 w_liq_soil=_sub_to_cell(sfc_sub.w_liq_soil, nc, n_sub),
                 w_ice_soil=_sub_to_cell(sfc_sub.w_ice_soil, nc, n_sub),
-                f_snow=_sub_to_cell(sfc_diag_sub.f_snow_land, nc, n_sub),
+                f_snow=f_snow_cell,
                 t_sfc_k=t_air,
                 vpd_pa=_sub_to_cell(vpd_sub, nc, n_sub),
-                u10_ms=_sub_to_cell(torch.hypot(u_sub_0, v_sub_0), nc, n_sub),
+                u10_ms=u10_cell,
                 precip_kgm2s=precip_tot,
                 dt=dt,
                 enable_nitrogen=bool(cfg.enable_land_nitrogen),
@@ -4345,7 +4349,7 @@ def step_aoba_model(
             dz_c=atmos.dz_c,
             surf_type=sfc.surf_type,
             sst_k=sfc.t_ocean_ml,
-            u10_ms=_sub_to_cell(torch.hypot(u_sub_0, v_sub_0), nc, n_sub),
+            u10_ms=u10_cell,
             f_seaice=f_seaice_cell,
             precip_rate=precip_tot,
             dt=dt,
@@ -4353,7 +4357,7 @@ def step_aoba_model(
             fire_bc_kg_m2s=fire_bc,
             fire_oc_kg_m2s=fire_oc,
             soa_oc_kg_m2s=soa_oc_cell,
-            u_star_cell=_sub_to_cell(sfc_diag_sub.u_star, nc, n_sub),
+            u_star_cell=u_star_cell,
             fire_intensity_kw_m=fire_ib,
             rh_3d=torch.clamp(rh_host_end, max=0.95),
         )
@@ -4383,7 +4387,7 @@ def step_aoba_model(
             surf_type=sfc.surf_type,
             t_sfc_k=t_air,
             runoff_liq_kgm2s=runoff_liq_w,
-            f_snow_land=_sub_to_cell(sfc_diag_sub.f_snow_land, nc, n_sub),
+            f_snow_land=f_snow_cell,
             dt=dt,
             volcanic_co2_pgc_yr=cfg.volcanic_co2_pgc_yr,
             accel_factor=cfg.weathering_accel_factor,
@@ -4674,7 +4678,7 @@ def step_aoba_model(
             mu0=mu0,
             surf_type=sfc.surf_type,
             lai_cell=sfc.bio.lai,
-            f_snow_cell=_sub_to_cell(sfc_diag_sub.f_snow_land, nc, n_sub),
+            f_snow_cell=f_snow_cell,
             f_seaice_cell=f_seaice_cell,
             dt=dt,
             n2o_ppmv=model.current_n2o_ppmv(),
@@ -4716,7 +4720,7 @@ def step_aoba_model(
             snow_cell=snow_new,
             dt=dt,
             rh_sfc=rh_sfc_iso,
-            u10_cell=_sub_to_cell(torch.hypot(u_sub_0, v_sub_0), nc, n_sub),
+            u10_cell=u10_cell,
             lai_cell=sfc.bio.lai,
         )
     month_idx = model.calendar.date_at(model.sim_time_sec).month - 1

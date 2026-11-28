@@ -1971,14 +1971,20 @@ def run_crm_rk3_hevi_metal(
         n_ac1 = max(1, int(_math.ceil(rk_taus[1] / max(dt_ac_max, 0.1))))
         n_ac2 = max(1, int(_math.ceil(rk_taus[2] / max(dt_ac_max, 0.1))))
         if dev.type == "mps" and n_ac0 <= 63 and n_ac1 <= 63 and n_ac2 <= 63:
-            # Full-occupancy single-launch multi-substep 3-stage WS-RK3 + HEVI kernel
-            # (group_size = 32 -> 2x threadgroups/core on Apple Silicon, compact stride-128 stage_buf,
-            # direct 3-bank ping-pong, and thread-local u/w/rho/Thm/flux accumulators).
+            # Persistent-worker L2-resident single-launch 3-stage WS-RK3 + HEVI kernel:
+            # caps concurrent threadgroups so `stage_buf` fits inside GPU L2/SLC (~14-18 MB)
+            # instead of spilling 58+ MB to DRAM across acoustic substeps.
             c_tg32 = 32 // nx
             n_tg32 = (n_col + c_tg32 - 1) // c_tg32
-            grid_32 = (n_tg32 * 32,)
-            if "stage_buf_bc32" not in ws:
-                ws["stage_buf_bc32"] = torch.empty((n_tg32, nz, 4, 32, 4), device=dev, dtype=torch.float32)
+            max_w_l2 = max(64, int(18_000_000 // max(nz * 128 * 16, 1)))
+            n_workers = min(n_tg32, max_w_l2)
+            # Snap n_workers to a balanced wave divisor when n_tg32 > n_workers (e.g. 640 -> 160 or 214)
+            if n_tg32 > n_workers:
+                n_waves = (n_tg32 + n_workers - 1) // n_workers
+                n_workers = (n_tg32 + n_waves - 1) // n_waves
+            grid_32 = (n_workers * 32,)
+            if "stage_buf_bc32" not in ws or ws["stage_buf_bc32"].shape[0] != n_workers:
+                ws["stage_buf_bc32"] = torch.empty((n_workers, nz, 4, 32, 4), device=dev, dtype=torch.float32)
             stage_buf = ws["stage_buf_bc32"]
             dz_ptr = dzc_c.data_ptr()
             if ws.get("inv_dz_ptr") != dz_ptr or ws.get("inv_dz_ver") != getattr(dzc_c, "_version", 0):
@@ -1986,7 +1992,7 @@ def run_crm_rk3_hevi_metal(
                 ws["inv_dz_w"] = (1.0 / dzw_c).contiguous()
                 ws["inv_dz_ptr"] = dz_ptr
                 ws["inv_dz_ver"] = getattr(dzc_c, "_version", 0)
-            u_fused0 = [nz, n_col, nx, (int(dz_cols) << 18) | (n_ac0 << 12) | (n_ac1 << 6) | n_ac2]
+            u_fused0 = [nz, n_col, (int(n_workers) << 16) | int(nx), (int(dz_cols) << 18) | (n_ac0 << 12) | (n_ac1 << 6) | n_ac2]
             f_fused1 = [float(dt_dyn), float(beta_hevi), float(gravity), float(max(int(n_sub_grp), 1))]
             lib.crm_2d_rk3_stage_fused_simd(
                 rho0_c, Thm0_c, u0_c, v0_c, w0_c,

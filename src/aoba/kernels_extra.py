@@ -1409,37 +1409,35 @@ kernel void scvt_fast_edge(
     device float* uh_accum         [[buffer(9)]],   // [nz, N_edges]
     constant ulong4& u_p           [[buffer(10)]],  // [nz, N_cells, N_edges, accum]
     constant float4& f_p           [[buffer(11)]],  // [dt_ac, beta_hevi, gravity, 0]
-    uint e [[thread_position_in_grid]])
+    uint gid [[thread_position_in_grid]])
 {
     uint nz = uint(u_p.x);
     uint n_cells = uint(u_p.y);
     uint n_edges = uint(u_p.z);
     uint accum = uint(u_p.w);
-    if (e >= n_edges) return;
+    if (gid >= nz * n_edges) return;
 
+    uint k = gid / n_edges;
+    uint e = gid - k * n_edges;
     uint c0 = uint(c0_arr[e]);
     uint c1 = uint(c1_arr[e]);
+    uint cbase = k * n_cells;
+    float p0 = p_cell[cbase + c0];
+    float p1 = p_cell[cbase + c1];
+    float4 ec = edge_c4[gid];
+    // Symmetric-difference PGF: -(fz_avg*(p1 - p0) + fz_dif*0.5*(p1 + p0)) / (rtot_e * dc_e)
+    float pgf = -fma(ec.x, (p1 - p0), ec.y * (0.5f * (p1 + p0)));
+
     float dt_ac = f_p.x;
+    float u0 = u_c[gid];
+    float inv_sp = 1.0f / (1.0f + dt_ac * sponge_c[k]);
+    float un = (u0 + dt_ac * (tend_u_sl[gid] + pgf)) * inv_sp;
+    float uh = ec.z * (1.10f * un - 0.10f * u0);
 
-    for (uint k = 0u; k < nz; ++k) {
-        uint eidx = k * n_edges + e;
-        uint cbase = k * n_cells;
-        float p0 = p_cell[cbase + c0];
-        float p1 = p_cell[cbase + c1];
-        float4 ec = edge_c4[eidx];
-        // Symmetric-difference PGF: -(fz_avg*(p1 - p0) + fz_dif*0.5*(p1 + p0)) / (rtot_e * dc_e)
-        float pgf = -fma(ec.x, (p1 - p0), ec.y * (0.5f * (p1 + p0)));
-
-        float u0 = u_c[eidx];
-        float inv_sp = 1.0f / (1.0f + dt_ac * sponge_c[k]);
-        float un = (u0 + dt_ac * (tend_u_sl[eidx] + pgf)) * inv_sp;
-        float uh = ec.z * (1.10f * un - 0.10f * u0);
-
-        u_n[eidx] = un;
-        uh_fTh[eidx] = float2(uh, uh * ec.w);
-        if (accum != 0u) {
-            uh_accum[eidx] += uh;
-        }
+    u_n[gid] = un;
+    uh_fTh[gid] = float2(uh, uh * ec.w);
+    if (accum != 0u) {
+        uh_accum[gid] += uh;
     }
 }
 
@@ -1518,10 +1516,16 @@ kernel void scvt_fast_cell_hevi(
     float thw_dn = 0.0f;
     float uz_next_dn = 0.0f;
     float uz_old_dn = 0.0f;
-    float rdw_dn = 0.0f;
+    float4 ha_dn = float4(0.0f);
     float p_blend_prev = 0.0f;
     float rtot_blend_prev = 0.0f;
     float d_prev = 0.0f;
+    float u_prev_e[6];
+    if (k_top > 0u) {
+        for (uint d = 0u; d < 6u; ++d) {
+            u_prev_e[d] = (uz_w[d] != 0.0f) ? u_n[e_id[d]] : 0.0f;
+        }
+    }
 
     // Pass 1 (forward k = 0..nz-1): horizontal div + vertical adv + fused Thomas forward sweep
     for (uint k = 0u; k < nz; ++k) {
@@ -1532,7 +1536,7 @@ kernel void scvt_fast_cell_hevi(
         float thw_up = 0.0f;
         float uz_next_up = 0.0f;
         float uz_old_up = 0.0f;
-        float rdw_up = 0.0f;
+        float4 ha_up = float4(0.0f);
         if (k < n_int) {
             if (k < k_top) {
                 float uz_sum = 0.0f;
@@ -1540,7 +1544,9 @@ kernel void scvt_fast_cell_hevi(
                 for (uint d = 0u; d < 6u; ++d) {
                     if (uz_w[d] != 0.0f) {
                         uint eid = e_id[d];
-                        float u_int = 0.5f * (u_n[ebase + eid] + u_n[eb1 + eid]);
+                        float u_hi = u_n[eb1 + eid];
+                        float u_int = 0.5f * (u_prev_e[d] + u_hi);
+                        u_prev_e[d] = u_hi;
                         uz_sum = fma(uz_w[d], u_int * zw_slope_e[ebase + eid], uz_sum);
                     }
                 }
@@ -1548,8 +1554,8 @@ kernel void scvt_fast_cell_hevi(
                 udotz_n[cidx] = uz_sum;
                 uz_old_up = udotz_c[cidx];
             }
-            rdw_up = hevi_a4[cidx].x;
-            om_up = rdw_up * (w_c[(k + 1u) * n_cells + c] - uz_old_up);
+            ha_up = hevi_a4[cidx];
+            om_up = ha_up.x * (w_c[(k + 1u) * n_cells + c] - uz_old_up);
             if (k >= 1u && k + 2u < nz) {
                 float sgn = (om_up > 0.0f) ? 1.0f : ((om_up < 0.0f) ? -1.0f : 0.0f);
                 float th_c4 = (7.0f * (th_0 + th_p1) - (th_m1 + th_p2)) * (1.0f / 12.0f);
@@ -1586,13 +1592,13 @@ kernel void scvt_fast_cell_hevi(
         if (k >= 1u) {
             uint m = k - 1u;
             uint midx = m * n_cells + c;
-            float4 ha = hevi_a4[midx];
             float inv_piv = hevi_b4[midx].x;
+            float rdw_dn = ha_dn.x;
             float rhs = -rdw_dn * (uz_next_dn - uz_old_dn)
-                        - ha.y * (p_blend_k - p_blend_prev)
-                        - ha.z * (rtot_blend_prev + rtot_blend_k)
+                        - ha_dn.y * (p_blend_k - p_blend_prev)
+                        - ha_dn.z * (rtot_blend_prev + rtot_blend_k)
                         - (dt_ac * sponge_w[m]) * (rdw_dn * w_c[cidx]);
-            d_prev = (m == 0u) ? (rhs * inv_piv) : ((rhs - ha.w * d_prev) * inv_piv);
+            d_prev = (m == 0u) ? (rhs * inv_piv) : ((rhs - ha_dn.w * d_prev) * inv_piv);
             dp[m] = d_prev;
         }
 
@@ -1600,7 +1606,7 @@ kernel void scvt_fast_cell_hevi(
         thw_dn = thw_up;
         uz_next_dn = uz_next_up;
         uz_old_dn = uz_old_up;
-        rdw_dn = rdw_up;
+        ha_dn = ha_up;
         p_blend_prev = p_blend_k;
         rtot_blend_prev = rtot_blend_k;
 
@@ -1617,7 +1623,7 @@ kernel void scvt_fast_cell_hevi(
         }
     }
 
-    // Pass 2 (backward k = nz-1..0): fused Thomas back-substitution + w/m/Thm update (100% coalesced float4)
+    // Pass 2 (backward k = nz-1..0): fused Thomas back-substitution + w/m/Thm update (zero hevi_a4 read when accum==0!)
     w_n[c] = 0.0f;
     w_n[nz * n_cells + c] = 0.0f;
     float dom_up = 0.0f;
@@ -1633,16 +1639,15 @@ kernel void scvt_fast_cell_hevi(
             uint m = k - 1u;
             uint midx = m * n_cells + c;
             float4 hb = hevi_b4[midx]; // (inv_piv, cp, thw, inv_rdw)
-            float rdw = hevi_a4[midx].x;
             dom_dn = dp[m] - hb.y * dom_up;
             thw_dn = hb.z;
             float uz_old = (m < k_top) ? udotz_c[midx] : 0.0f;
             float uz_nxt = (m < k_top) ? udotz_n[midx] : 0.0f;
-            float om_old_m = rdw * (w_c[cidx] - uz_old);
-            float om_new = om_old_m + dom_dn;
-            w_n[cidx] = uz_nxt + om_new * hb.w;
+            float w_rel = w_c[cidx] - uz_old;
+            w_n[cidx] = uz_nxt + fma(dom_dn, hb.w, w_rel);
             if (accum != 0u) {
-                om_accum[cidx] += (1.0f - beta) * om_old_m + beta * om_new;
+                float om_old_m = hevi_a4[midx].x * w_rel;
+                om_accum[cidx] += om_old_m + beta * dom_dn;
             }
         }
         m_n[cidx]   = max(m_dag[k] - b_dt * (dom_up - dom_dn), 1.0e-5f);
@@ -3316,18 +3321,19 @@ kernel void crm_2d_rk3_stage_fused_simd(
 {
     uint nz = uint(u_p0.x);
     uint n_col = uint(u_p0.y);
-    uint nx = uint(u_p0.z);
+    uint nx_pk = uint(u_p0.z);
+    uint nx = nx_pk & 0xFFFFu;
+    uint n_workers_in = nx_pk >> 16u;
     uint pk = uint(u_p0.w);
     uint dz_cols = pk >> 18u;
     uint n_sub_grp = uint(f_p1.w + 0.5f);
 
-    uint col = gid / nx;
-    uint ix = gid - col * nx;
-    bool active = (col < n_col);
-    uint col_s = active ? col : 0u;
     uint M = n_col * nx;
-    uint tid = col_s * nx + ix;
-    uint col_dz = (dz_cols > 1u) ? col_s : 0u;
+    uint c_tg = 32u / nx;
+    uint n_tg_tot = (n_col + c_tg - 1u) / c_tg;
+    uint n_workers = (n_workers_in > 0u) ? n_workers_in : n_tg_tot;
+    uint col_in_tg = lid / nx;
+    uint ix = lid - col_in_tg * nx;
 
     uint mask = nx - 1u;
     uint lane_base = simd_lane & (~mask);
@@ -3348,10 +3354,10 @@ kernel void crm_2d_rk3_stage_fused_simd(
     uint n_ac2 = pk & 0x3Fu;
     float inv_nac_tot = 1.0f / float(n_ac2 * n_sub_grp);
 
+    // Persistent-worker L2-resident stage_buf: each of the `n_workers` threadgroups reuses its
+    // own private `nz * 128 * 16 B` slice across strided column chunks so total `stage_buf` fits
+    // inside GPU L2/SLC (~14-18 MB instead of 58+ MB) with zero DRAM spills across acoustic substeps.
     device float4* sb = stage_buf + (ulong(tg_id) * ulong(nz) * 128ul) + ulong(lid);
-    // Keep rho, Thm, u, w, and stage-2 flux accumulators in thread-local storage across all
-    // acoustic substeps and RK3 stages (flushed once on stg == 2 && last_ac), eliminating
-    // DRAM round-trips inside the inner acoustic loop on Apple Silicon (group_size = 32).
     float d_star[64];
     float r_loc[64];
     float T_loc[64];
@@ -3359,8 +3365,15 @@ kernel void crm_2d_rk3_stage_fused_simd(
     float w_loc[65];
     float fx_loc[64];
     float fz_loc[65];
-    w_loc[0] = 0.0f;
-    w_loc[nz] = 0.0f;
+
+    for (uint work_tg = tg_id; work_tg < n_tg_tot; work_tg += n_workers) {
+        uint col = work_tg * c_tg + col_in_tg;
+        bool active = (col < n_col);
+        uint col_s = active ? col : 0u;
+        uint tid = col_s * nx + ix;
+        uint col_dz = (dz_cols > 1u) ? col_s : 0u;
+        w_loc[0] = 0.0f;
+        w_loc[nz] = 0.0f;
 
     for (uint sub = 0u; sub < n_sub_grp; ++sub) {
         bool first_sub = (sub == 0u);
@@ -3820,10 +3833,10 @@ kernel void crm_2d_rk3_stage_fused_simd(
                     }
                 }
             }
-            if (stg < 2u || !last_sub) {
-                threadgroup_barrier(mem_flags::mem_device);
-            }
+            // Single 32-thread SIMD group executes in lockstep with same-thread v_dst -> v_in reuse;
+            // no device-memory cache flush is required between stages.
         }
+    }
     }
 }
 
@@ -4489,21 +4502,19 @@ kernel void scvt_eta_edge(
     device const float* u_e        [[buffer(4)]],   // [nz, N_edges]
     device float2* eta_u           [[buffer(5)]],   // [nz, N_edges]: float2(eta_e, u_e)
     device const uint* u_params    [[buffer(6)]],   // [nz, N_verts, N_edges]
-    uint e [[thread_position_in_grid]])
+    uint gid [[thread_position_in_grid]])
 {
     uint nz = u_params[0];
     uint n_verts = u_params[1];
     uint n_edges = u_params[2];
-    if (e >= n_edges) return;
+    if (gid >= nz * n_edges) return;
+    uint k = gid / n_edges;
+    uint e = gid - k * n_edges;
     uint v0e = uint(v0_arr[e]);
     uint v1e = uint(v1_arr[e]);
-    float f_sum = f_vert[v0e] + f_vert[v1e];
-    for (uint k = 0u; k < nz; ++k) {
-        uint vbase = k * n_verts;
-        uint eidx = k * n_edges + e;
-        float eta = 0.5f * (zeta_v[vbase + v0e] + zeta_v[vbase + v1e] + f_sum);
-        eta_u[eidx] = float2(eta, u_e[eidx]);
-    }
+    uint vbase = k * n_verts;
+    float eta = 0.5f * (zeta_v[vbase + v0e] + zeta_v[vbase + v1e] + f_vert[v0e] + f_vert[v1e]);
+    eta_u[gid] = float2(eta, u_e[gid]);
 }
 
 kernel void scvt_trisk_rot_edge(
@@ -5201,7 +5212,7 @@ def run_scvt_fast_acoustic_metal(
             c0_i32, c1_i32, edge_c4, tu_c, spc_c,
             p_cell, uc,
             un, uh_fTh, ws["uh_acc"],
-            u_p_edge, f_p, threads=n_edges,
+            u_p_edge, f_p, threads=nz * n_edges,
         )
         lib.scvt_fast_cell_hevi(
             eoc_i32, esgn_c, area_c_c, dv_c, ae_c, zw_c, un, uh_fTh,
@@ -5453,7 +5464,7 @@ def run_scvt_trisk_rot_metal(lib: Any, mesh: Any, zeta_v: torch.Tensor, u_edge: 
     rot_out = torch.empty((nz, ne), device=dev, dtype=torch.float32)
     up = _scvt_u_param(mc, ("rot", nz), [nz, mc["n_verts"], ne], dev)
     lib.scvt_eta_edge(
-        mc["v0"], mc["v1"], zeta_v.contiguous(), mc["f_vert"], u_edge.contiguous(), eta_u, up, threads=ne,
+        mc["v0"], mc["v1"], zeta_v.contiguous(), mc["f_vert"], u_edge.contiguous(), eta_u, up, threads=nz * ne,
     )
     lib.scvt_trisk_rot_edge(
         mc["ep"], mc["w_trisk"], eta_u, rot_out, up, threads=ne,
