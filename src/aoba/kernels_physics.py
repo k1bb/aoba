@@ -6175,17 +6175,18 @@ kernel void crm_distill_closure_col(
         }
         float qv0 = max(qn0 - qc0 - qi0, 0.0f);
         float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
-        float t_env = clamp(t_post_ls, 180.0f, 340.0f);
+        float t_li0 = t_post_ls - (l_v0 * (qc0 + qi0) + l_f0 * qi0) / cp_d;
+        float t_env0 = clamp(t_li0, 180.0f, 340.0f);
         float ex2 = ex_safe * ex_safe;
         float p_env = p_ref * ex2 * ex_safe * sqrt(ex_safe);
-        float es_w = 611.2f * exp(clamp(17.67f * (t_env - t_frz) / max(t_env - 29.65f, 20.0f), -25.0f, 12.0f));
-        float es_i = 611.2f * exp(clamp(21.875f * (t_env - t_frz) / max(t_env - 7.66f, 20.0f), -25.0f, 12.0f));
-        float om_liq = clamp((t_env - 253.15f) / 20.0f, 0.0f, 1.0f);
+        float es_w = 611.2f * exp(clamp(17.67f * (t_env0 - t_frz) / max(t_env0 - 29.65f, 20.0f), -25.0f, 12.0f));
+        float es_i = 611.2f * exp(clamp(21.875f * (t_env0 - t_frz) / max(t_env0 - 7.66f, 20.0f), -25.0f, 12.0f));
+        float om_liq = clamp((t_env0 - 253.15f) / 20.0f, 0.0f, 1.0f);
         float es_env = om_liq * es_w + (1.0f - om_liq) * es_i;
         float qsat_env = clamp(eps_w * es_env / max(p_env - es_env, 100.0f), 1.0e-7f, 0.10f);
         float inv_ex = 1.0f / ex_safe;
-        float th_e_k = (t_env + lv_cp * qv0) * inv_ex;
-        float th_es_k = (t_env + lv_cp * qsat_env) * inv_ex;
+        float th_e_k = (t_env0 + lv_cp * qn0) * inv_ex;
+        float th_es_k = (t_env0 + lv_cp * qsat_env) * inv_ex;
         if (k > 0u && k < 64u) {
             qp_p_col[k - 1u] = clamp((th_e_run - th_es_k + 1.0f) / 6.0f, 0.0f, 1.0f);
         }
@@ -6267,10 +6268,10 @@ kernel void crm_distill_closure_col(
             if (k + 1u < nz_c && sconv_col[k + 1u] > 0.0f) {
                 float dm_min = min(dm_c_col[k], dm_c_col[k + 1u]);
                 float rho_int = 0.5f * (max(rho_d[k * N + c], 1.0e-6f) + max(rho_d[(k + 1u) * N + c], 1.0e-6f));
-                float m_max = min(0.45f * dm_min, rho_int * dt);
+                float m_max = min(0.25f * dm_min, rho_int * (0.25f * dt));
                 float m_exch = m_max * sc_k * col_rh_gate * buoy_int_k * aoba_sigmoid(rp1_s[k] - 4.0f);
                 rp1_s[k] = m_exch * (qnb_col[k] - qnb_col[k + 1u]);
-                qp_p_col[k] = (cp_d * dm_min * 2.0f) * wh_k * tanh(rp0_s[k] * 0.25f);
+                qp_p_col[k] = (cp_d * m_max * 3.0f) * wh_k * tanh(rp0_s[k] * 0.25f);
             } else {
                 rp1_s[k] = 0.0f;
                 qp_p_col[k] = 0.0f;
@@ -6283,7 +6284,9 @@ kernel void crm_distill_closure_col(
         // Actually we can store wh_k in qnb_col[k] after Pass 2 uses qnb_col[k]!
     }
 
-    // Pass 2: exact telescoping flux updates, saturation consistency, layerwise fallout & precip integral
+    // Pass 2: exact telescoping flux updates, 2-iter Clausius-Clapeyron saturation adjustment from T_li*,
+    // Sommeria-Deardorff subgrid condensation, layerwise fallout & precip integral
+    float dT_shf_scale = (shf * dt) / (cp_d * max(dm_pbl_sum, 1.0e-3f));
     float p_tot_fin = 0.0f;
     float fq_below = 0.0f;
     float hf_below = 0.0f;
@@ -6292,6 +6295,7 @@ kernel void crm_distill_closure_col(
         uint idx = k * N + c;
         float dm = (k < 64u) ? dm_c_col[k] : max(rho_d[idx] * dz_c[idx], 1.0e-6f);
         float ex = exner[idx];
+        float ex_safe = max(ex, 0.005f);
         float s_conv = (k < 64u) ? sconv_col[k] : 0.0f;
         float fq_above = (k < 64u) ? rp1_s[k] : 0.0f;
         float hf_above = (k < 64u) ? qp_p_col[k] : 0.0f;
@@ -6316,36 +6320,77 @@ kernel void crm_distill_closure_col(
 
         if (s_conv > 0.0f && k < 64u) {
             float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
-            float t_env = clamp(t_post_ls, 180.0f, 340.0f);
-            float qsat_env = qsat_col[k];
+            float t_li0 = t_post_ls - (l_v0 * (qc0 + qi0) + l_f0 * qi0) / cp_d;
+            float pbl_sh = clamp(1.0f - (ex0 - ex) * inv_pbl_ex, 0.0f, 1.0f) * s_conv;
+            float d_temp_shf_k = dT_shf_scale * pbl_sh;
+            float d_temp_tr_k = (hf_below - hf_above) / (cp_d * dm);
+            float t_li_star = t_li0 + d_temp_shf_k + d_temp_tr_k;
 
             float qn_tr = max(qnb_col[k] + (fq_below - fq_above) / dm, 0.0f);
-            float rh_tr = qn_tr / max(qsat_env, 1.0e-7f);
+            float ex2 = ex_safe * ex_safe;
+            float p_env = p_ref * ex2 * ex_safe * sqrt(ex_safe);
+
+            // Iter 0 at t_li_star
+            float tc0 = clamp(t_li_star, 180.0f, 340.0f);
+            float esw0 = 611.2f * exp(clamp(17.67f * (tc0 - t_frz) / max(tc0 - 29.65f, 20.0f), -25.0f, 12.0f));
+            float esi0 = 611.2f * exp(clamp(21.875f * (tc0 - t_frz) / max(tc0 - 7.66f, 20.0f), -25.0f, 12.0f));
+            float om0 = clamp((tc0 - 253.15f) / 20.0f, 0.0f, 1.0f);
+            float es0 = om0 * esw0 + (1.0f - om0) * esi0;
+            float qs0 = clamp(eps_w * es0 / max(p_env - es0, 100.0f), 1.0e-7f, 0.10f);
+            float le0 = l_v0 + (1.0f - om0) * l_f0;
+            float gam0 = 1.0f + (le0 / cp_d) * ((le0 * qs0) / (461.5f * tc0 * tc0));
+            float q_eq1 = clamp((qn_tr - qs0) / gam0, 0.0f, qn_tr);
+
+            // Iter 1 at t_1 = t_li_star + (le0 / cp_d) * q_eq1
+            float tc1 = clamp(t_li_star + (le0 / cp_d) * q_eq1, 180.0f, 340.0f);
+            float esw1 = 611.2f * exp(clamp(17.67f * (tc1 - t_frz) / max(tc1 - 29.65f, 20.0f), -25.0f, 12.0f));
+            float esi1 = 611.2f * exp(clamp(21.875f * (tc1 - t_frz) / max(tc1 - 7.66f, 20.0f), -25.0f, 12.0f));
+            float om1 = clamp((tc1 - 253.15f) / 20.0f, 0.0f, 1.0f);
+            float es1 = om1 * esw1 + (1.0f - om1) * esi1;
+            float qs1 = clamp(eps_w * es1 / max(p_env - es1, 100.0f), 1.0e-7f, 0.10f);
+            float le1 = l_v0 + (1.0f - om1) * l_f0;
+            float gam1 = 1.0f + (le1 / cp_d) * ((le1 * qs1) / (461.5f * tc1 * tc1));
+            float q_eq = clamp(q_eq1 + ((qn_tr - q_eq1) - qs1) / gam1, 0.0f, qn_tr);
+
+            // Equilibrium state at t_eq
+            float t_eq = clamp(t_li_star + (le0 / cp_d) * q_eq, 180.0f, 340.0f);
+            float eswe = 611.2f * exp(clamp(17.67f * (t_eq - t_frz) / max(t_eq - 29.65f, 20.0f), -25.0f, 12.0f));
+            float esie = 611.2f * exp(clamp(21.875f * (t_eq - t_frz) / max(t_eq - 7.66f, 20.0f), -25.0f, 12.0f));
+            float om_eq = clamp((t_eq - 253.15f) / 20.0f, 0.0f, 1.0f);
+            float ese = om_eq * eswe + (1.0f - om_eq) * esie;
+            float qs_eq = clamp(eps_w * ese / max(p_env - ese, 100.0f), 1.0e-7f, 0.10f);
+            float le_eq = l_v0 + (1.0f - om_eq) * l_f0;
+            float gam_eq = 1.0f + (le_eq / cp_d) * ((le_eq * qs_eq) / (461.5f * t_eq * t_eq));
+
+            float rh_tr = qn_tr / max(qs0, 1.0e-7f);
             float rh_lin = clamp((rh_tr - 0.65f) / 0.30f, 0.0f, 1.0f);
             float rh_gate = rh_lin * rh_lin;
-            float f_cond = s_conv * rh_gate * 0.95f * aoba_sigmoid(RP_LOAD(3u, k) - 3.0f);
-            float q_ovsat = max(qn_tr - qsat_env, 0.0f);
-            float q_cond_tot = min(qn_tr, max(q_ovsat, qn_tr * f_cond));
+            float q_sub_max = min(max(qn_tr - q_eq, 0.0f), (0.25f * qs_eq) / gam_eq);
+            float q_sub = s_conv * rh_gate * aoba_sigmoid(RP_LOAD(3u, k) - 3.0f) * q_sub_max;
+            float q_cond_tot = min(qn_tr, q_eq + q_sub);
             qv_n = max(qn_tr - q_cond_tot, 0.0f);
 
             float rp2_k = RP_LOAD(2u, k);
-            float f_fall = s_conv * aoba_sigmoid(0.5f * scal0 + rp2_k);
+            float q_crit = om_eq * 3.0e-4f + (1.0f - om_eq) * 6.0e-5f;
+            float r_c = clamp(q_cond_tot / q_crit, 0.0f, 5.0f);
+            float phi_auto = 1.0f - exp(-(r_c * r_c));
+            float alpha_nn = exp(1.4f * tanh(0.25f * scal0));
+            float f_fall = s_conv * (1.0f - exp(-(dt / 900.0f) * alpha_nn * phi_auto));
             float q_out = f_fall * q_cond_tot;
             float q_cld = max(q_cond_tot - q_out, 0.0f);
-            float om_liq_p = clamp((t_env - 253.15f) / 20.0f, 0.0f, 1.0f);
             float f_ice_nn = aoba_sigmoid(RP_LOAD(4u, k));
-            float f_ice = (t_env <= 253.15f) ? 1.0f : ((1.0f - om_liq_p) * f_ice_nn);
+            float f_ice = (t_eq <= 253.15f) ? 1.0f : ((1.0f - om_eq) * f_ice_nn);
             qc_n = q_cld * (1.0f - f_ice);
             qi_n = q_cld * f_ice;
             qn_n = qv_n + qc_n + qi_n;
 
             float qp_avail = q_out + qp0;
-            qp_n = s_conv * (0.50f * aoba_sigmoid(rp2_k)) * qp_avail;
+            qp_n = s_conv * (0.50f * aoba_sigmoid(3.0f * tanh(0.3f * rp2_k))) * qp_avail;
             p_tot_fin += dm * max(qp_avail - qp_n, 0.0f);
 
             // Store q_cond_tot in rp1_s[k] and d_temp_trans in rp0_s[k] for Pass 3
             rp1_s[k] = q_cond_tot;
-            rp0_s[k] = (hf_below - hf_above) / (cp_d * dm);
+            rp0_s[k] = d_temp_tr_k;
 
             float f_cld_nn = s_conv * rh_gate * aoba_sigmoid(RP_LOAD(7u, k) - 1.5f);
             float f_cld_fl = (q_cld > 1.0e-6f) ? clamp(q_cld * 1.0e3f, 0.0f, 1.0f) : 0.0f;
@@ -6374,7 +6419,6 @@ kernel void crm_distill_closure_col(
 
     float dh_snow = l_f0 * (p_tot_fin * f_snow);
     float h_corr = dh_snow / max(denom_h_w, 1.0f);
-    float dT_shf_scale = (shf * dt) / (cp_d * max(dm_pbl_sum, 1.0e-3f));
     float dm_sum_u_safe = max(dm_sum_u, 1.0e-3f);
     float u_corr = (tau_x * dt - du_imp) / dm_sum_u_safe;
     float v_corr = (tau_y * dt - dv_imp) / dm_sum_u_safe;
@@ -6399,10 +6443,11 @@ kernel void crm_distill_closure_col(
         }
         float qv0 = max(qn0 - qc0 - qi0, 0.0f);
         float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
-        float t_env3 = clamp(t_post_ls, 180.0f, 340.0f);
+        float t_li0_3 = t_post_ls - (l_v0 * (qc0 + qi0) + l_f0 * qi0) / cp_d;
+        float t_env3 = clamp(t_li0_3, 180.0f, 340.0f);
         float qsat_k_v = (k < 64u) ? qsat_col[k] : 1.0e-7f;
         float inv_ex3 = 1.0f / ex_safe;
-        float th_e3 = (t_env3 + lv_cp * qv0) * inv_ex3;
+        float th_e3 = (t_env3 + lv_cp * qn0) * inv_ex3;
         float th_es3 = (t_env3 + lv_cp * qsat_k_v) * inv_ex3;
         float buoy_lay3 = (k == 0u) ? 1.0f : clamp((th_e_run3 - th_es3 + 1.0f) / 6.0f, 0.0f, 1.0f);
         th_e_run3 = max(th_e_run3, th_e3);

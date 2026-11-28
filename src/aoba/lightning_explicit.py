@@ -715,10 +715,10 @@ class LightningSelfDistillNet(nn.Module):
         self.fc_mid = nn.Linear(hidden_dim, hidden_dim)
         self.ln2 = nn.LayerNorm(hidden_dim)
         self.fc_out = nn.Linear(hidden_dim, 4)
-        # Initialize strike probability slightly negative so untrained warmup never hallucinates storms
+        # Initialize strike probability strongly negative so untrained warmup never hallucinates storms
         nn.init.zeros_(self.fc_out.weight)
         with torch.no_grad():
-            self.fc_out.bias.copy_(torch.tensor([-3.5, 0.5, -1.2, -1.0]))
+            self.fc_out.bias.copy_(torch.tensor([-6.0, 0.5, -1.2, -1.0]))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = F.silu(self.ln1(self.fc_in(x)))
@@ -880,7 +880,14 @@ def extract_lightning_distill_features(
         dim=-1,
     )
     feats = torch.nan_to_num(feats, nan=0.0, posinf=5.0, neginf=-5.0)
-    conv_gate = ((mix_iwp > 1.0e-4) | ((rain_mm + snow_mm) > 0.25)).to(rho_d.dtype)
+    # Non-inductive ice-graupel riming gate (Takahashi 1978; Saunders et al. 1991; Price & Rind 1992):
+    # require genuine mixed-phase convective ice (mix_iwp > 15 g/m^2 with active precipitation > 1.5 mm/d,
+    # or deep mixed-phase glaciated cores > 50 g/m^2 & cold-cloud depth > 2.5 km) so thin cirrus and
+    # stratiform drizzle never emit spurious background lightning glow.
+    conv_gate = (
+        ((mix_iwp > 0.015) & ((rain_mm + snow_mm) > 1.5))
+        | ((mix_iwp > 0.05) & (ccd_proxy_km > 2.5))
+    ).to(rho_d.dtype)
     return feats, conv_gate
 
 
@@ -931,6 +938,8 @@ def step_ossp_distilled_lightning(
     dt: float,
     has_pool: bool,
     k_top_trop: int | None = None,
+    rain_t_3d: torch.Tensor | None = None,  # [n_t, ny_t, nx_t] detached-dwell teacher precip
+    snow_t_3d: torch.Tensor | None = None,  # [n_t, ny_t, nx_t] detached-dwell teacher snow
 ) -> tuple[LightningDiagnostics, ExplicitLightningState | None]:
     """Run genuine full-res 2 km CRM lightning on OSSP teacher cells & distill onto student cells.
 
@@ -1011,17 +1020,39 @@ def step_ossp_distilled_lightning(
             q_s_prog=getattr(teacher_crm, "q_s", None),
         )
 
-    # 3. Extract 14 universal physical column features across all host cells
+    # 3. Extract 14 universal physical column features across all host cells; when detached-dwell
+    #    SparseCRMPool (`has_pool=True`) is active, extract teacher training features directly from
+    #    `teacher_crm`'s own post-step column mean so `(x_t, fl_t)` pairs are 100% matched.
     feats_all, conv_gate = extract_lightning_distill_features(
         rho_host, theta_m_host, q_v_host, q_c_host, q_i_host, q_p_host,
         z_c_host, dz_c_host, rain_3d, snow_3d, buoy_sfc,
         k_top_trop=k_top_trop,
     )
+    if has_pool and rain_t_3d is not None and snow_t_3d is not None:
+        rho_tm = teacher_crm.rho_d.mean(dim=(-2, -1))
+        inv_rtm = 1.0 / torch.clamp(rho_tm, min=1.0e-8)
+        x_t_full, conv_gate_t = extract_lightning_distill_features(
+            rho_tm,
+            (teacher_crm.rho_d * teacher_crm.theta_m).mean(dim=(-2, -1)) * inv_rtm,
+            (teacher_crm.rho_d * teacher_crm.q_v).mean(dim=(-2, -1)) * inv_rtm,
+            (teacher_crm.rho_d * teacher_crm.q_c).mean(dim=(-2, -1)) * inv_rtm,
+            (teacher_crm.rho_d * teacher_crm.q_i).mean(dim=(-2, -1)) * inv_rtm,
+            (teacher_crm.rho_d * teacher_crm.q_p).mean(dim=(-2, -1)) * inv_rtm,
+            z_c_host[:, t_idx],
+            dz_c_host[:, t_idx],
+            rain_t_3d,
+            snow_t_3d,
+            buoy_sfc[t_idx],
+            k_top_trop=k_top_trop,
+        )
+        x_t = x_t_full.detach()
+    else:
+        x_t = feats_all[t_idx].detach()
+        conv_gate_t = conv_gate[t_idx]
 
     # 4. Zero-sync fixed-shape push of teacher samples into all-sky & top-k active-storm Hurdle buffers
     min_dwell = 2 if use_explicit else 1
     mature_f = (distill_state.slot_dwell_age >= min_dwell).to(torch.float32)
-    x_t = feats_all[t_idx].detach()
     fl_t = diag_t.flash_tot_cell.detach()
     cg_t = diag_t.flash_cg_cell.detach()
     ccd_t = diag_t.cold_cloud_km_sub.reshape(n_t, -1).mean(dim=-1).detach()
@@ -1154,8 +1185,8 @@ def step_ossp_distilled_lightning(
             log_rate = torch.clamp(F.softplus(out_s[:, 1]), max=11.0)
             f_cg_s = torch.sigmoid(out_s[:, 2])
             ccd_s = 15.0 * torch.sigmoid(out_s[:, 3])
-            if distill_state.grad_updates >= 10:
-                has_seen_storm = (distill_state.act_valid[: distill_state.act_size].sum() > 0.5).to(dtype)
+            if distill_state.grad_updates >= 20:
+                has_seen_storm = (distill_state.act_valid[: distill_state.act_size].sum() >= 3.0).to(dtype)
                 raw_flash_s = has_seen_storm * gate_s * p_strike * (LIGHTNING_FLASH_LOG_SCALE * torch.expm1(log_rate))
                 # Zero-sync GPU EMA Jensen moment-matching so heavy-tailed log1p training preserves E[student] == E[teacher]
                 if distill_state.ema_tea_fl_gpu is None:
@@ -1164,13 +1195,13 @@ def step_ossp_distilled_lightning(
                 assert distill_state.ema_stu_fl_gpu is not None
                 mat_sum = torch.clamp(mature_f.sum(), min=1.0)
                 tea_mean_cur = (fl_t * mature_f).sum() / mat_sum
-                if use_contig_lt:
+                if use_contig_lt and not (has_pool and rain_t_3d is not None):
                     stu_raw_on_t = raw_flash_s[t_idx]
                 else:
-                    out_t_chk = distill_state.net(feats_all[t_idx])
+                    out_t_chk = distill_state.net(x_t)
                     stu_raw_on_t = (
                         has_seen_storm
-                        * conv_gate[t_idx]
+                        * conv_gate_t
                         * torch.sigmoid(out_t_chk[:, 0])
                         * (LIGHTNING_FLASH_LOG_SCALE * torch.expm1(torch.clamp(F.softplus(out_t_chk[:, 1]), max=11.0)))
                     )
@@ -1220,16 +1251,18 @@ def step_ossp_distilled_lightning(
                 f_cg_sub[s_idx] = f_cg_s.view(-1, 1, 1).expand(-1, ny_out, nx_out)
                 ccd_km_sub[s_idx] = ccd_s.view(-1, 1, 1).expand(-1, ny_out, nx_out)
 
-    # 7. Insert exact 2 km teacher CRM fields onto t_idx (downsampling to tile grid when has_pool=True)
-    def _map_teacher_3d(arr: torch.Tensor) -> torch.Tensor:
-        if arr.shape[-2] == ny_out and arr.shape[-1] == nx_out:
-            return arr
-        return F.adaptive_avg_pool2d(arr.unsqueeze(1), (ny_out, nx_out)).squeeze(1)
+    # 7. Insert exact 2 km teacher CRM fields onto t_idx only when NOT in shadow-coupled pool mode
+    #    (in detached-dwell pool mode, student predictions cover all host cells seamlessly without 1-cell dots)
+    if not has_pool or distill_state.grad_updates < 20:
+        def _map_teacher_3d(arr: torch.Tensor) -> torch.Tensor:
+            if arr.shape[-2] == ny_out and arr.shape[-1] == nx_out:
+                return arr
+            return F.adaptive_avg_pool2d(arr.unsqueeze(1), (ny_out, nx_out)).squeeze(1)
 
-    flash_tot_sub[t_idx] = _map_teacher_3d(diag_t.flash_tot_sub)
-    flash_cg_sub[t_idx] = _map_teacher_3d(diag_t.flash_cg_sub)
-    f_cg_sub[t_idx] = _map_teacher_3d(diag_t.f_cg_sub)
-    ccd_km_sub[t_idx] = _map_teacher_3d(diag_t.cold_cloud_km_sub)
+        flash_tot_sub[t_idx] = _map_teacher_3d(diag_t.flash_tot_sub)
+        flash_cg_sub[t_idx] = _map_teacher_3d(diag_t.flash_cg_sub)
+        f_cg_sub[t_idx] = _map_teacher_3d(diag_t.f_cg_sub)
+        ccd_km_sub[t_idx] = _map_teacher_3d(diag_t.cold_cloud_km_sub)
 
     distill_state.steps_seen += 1
 

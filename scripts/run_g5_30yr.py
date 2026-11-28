@@ -378,6 +378,7 @@ def _save_restart_atomic(model: AOBAState, path: Path, *, extra: dict[str, Any] 
         ),
         "crm_distill": (
             {
+                "closure_version": int(getattr(__import__("aoba.crm_self_distill", fromlist=["CRM_DISTILL_CLOSURE_VERSION"]), "CRM_DISTILL_CLOSURE_VERSION", 3)),
                 "net_state": {k: v.detach().cpu() for k, v in model.crm_distill.net.state_dict().items()},
                 "steps_seen": int(model.crm_distill.steps_seen),
                 "grad_updates": int(model.crm_distill.grad_updates),
@@ -1428,27 +1429,36 @@ def _load_restart_into_model(model: AOBAState, path: Path, device: torch.device)
     else:
         if ckpt.get("crm_distill") is not None and getattr(model, "crm_distill", None) is not None:
             ck_cd = ckpt["crm_distill"]
-            try:
-                model.crm_distill.net.load_state_dict(
-                    {k: v.to(device=device) for k, v in ck_cd["net_state"].items()}, strict=True
+            from aoba.crm_self_distill import CRM_DISTILL_CLOSURE_VERSION as _CRM_CLOS_VER
+            ck_ver = int(ck_cd.get("closure_version", 1))
+            if ck_ver != int(_CRM_CLOS_VER):
+                print(
+                    f"  [OSSP Closure Upgrade] Checkpoint closure_version={ck_ver} != active {_CRM_CLOS_VER}: "
+                    f"resetting CRM OSSP student for clean warmup (host & ocean states preserved).",
+                    flush=True,
                 )
-                if needs_hremap or needs_subremap:
-                    # Same vertical grid, new horizontal/CRM resolution: keep warm weights
-                    # but reset schedule & EMA RMSE so full warmup + fast adaptation runs.
-                    model.crm_distill.steps_seen = 0
-                    model.crm_distill.grad_updates = 0
-                    model.crm_distill.ema_loss = 1.0
-                    model.crm_distill.ema_val_rmse_thm = 2.0
-                    model.crm_distill.ema_val_rmse_qn = 1.0e-3
-                else:
-                    model.crm_distill.steps_seen = int(ck_cd.get("steps_seen", model.crm_distill.warmup_steps))
-                    model.crm_distill.grad_updates = int(ck_cd.get("grad_updates", 0))
-                    model.crm_distill.ema_loss = float(ck_cd.get("ema_loss", 1.0))
-                    model.crm_distill.ema_val_rmse_thm = float(ck_cd.get("ema_val_rmse_thm", 1.0))
-                    model.crm_distill.ema_val_rmse_qn = float(ck_cd.get("ema_val_rmse_qn", 1.0e-3))
-            except Exception:
-                # Architecture width changed: start student fresh with warmup automatically
-                pass
+            else:
+                try:
+                    model.crm_distill.net.load_state_dict(
+                        {k: v.to(device=device) for k, v in ck_cd["net_state"].items()}, strict=True
+                    )
+                    if needs_hremap or needs_subremap:
+                        # Same vertical grid, new horizontal/CRM resolution: keep warm weights
+                        # but reset schedule & EMA RMSE so full warmup + fast adaptation runs.
+                        model.crm_distill.steps_seen = 0
+                        model.crm_distill.grad_updates = 0
+                        model.crm_distill.ema_loss = 1.0
+                        model.crm_distill.ema_val_rmse_thm = 2.0
+                        model.crm_distill.ema_val_rmse_qn = 1.0e-3
+                    else:
+                        model.crm_distill.steps_seen = int(ck_cd.get("steps_seen", model.crm_distill.warmup_steps))
+                        model.crm_distill.grad_updates = int(ck_cd.get("grad_updates", 0))
+                        model.crm_distill.ema_loss = float(ck_cd.get("ema_loss", 1.0))
+                        model.crm_distill.ema_val_rmse_thm = float(ck_cd.get("ema_val_rmse_thm", 1.0))
+                        model.crm_distill.ema_val_rmse_qn = float(ck_cd.get("ema_val_rmse_qn", 1.0e-3))
+                except Exception:
+                    # Architecture width changed: start student fresh with warmup automatically
+                    pass
         if ckpt.get("rad_distill") is not None and getattr(model, "rad_distill", None) is not None:
             ck_rd = ckpt["rad_distill"]
             try:

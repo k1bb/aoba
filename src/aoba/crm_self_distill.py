@@ -75,6 +75,7 @@ from aoba.thermodynamics import diagnose_pressure_temperature, qsat_mixed_val
 # ---------------------------------------------------------------------------
 # 1. Universal Map-Free Feature Extraction & Exact Physical Conservation
 # ---------------------------------------------------------------------------
+CRM_DISTILL_CLOSURE_VERSION: int = 3  # Bump whenever closure parameterization/semantics change
 _N_PROF_IN = 14      # 14 vertical profile channels per level
 _N_STRUCT_IN = 16    # 2D/3D periodic surface heterogeneity + atmospheric organization invariants
 _N_SCAL_IN = 7 + _N_STRUCT_IN  # 7 cell-mean boundary forcings + 16 spatial-clustering invariants = 23
@@ -374,27 +375,37 @@ def apply_exact_conservation_closure(
     qi0 = qi0_raw * sc_ci
     qv0 = torch.clamp(qn0 - qc0 - qi0, min=0.0)
 
-    # Local Clausius-Clapeyron saturation mixing ratio q_sat(T_env, p_env) in true temperature space
-    # bounds d_qn_raw so cold upper-tropospheric layers can never receive unphysical multi-g/kg injections.
+    # Conserved pre-step liquid-ice temperature T_li0 = T_post_ls - (L_v*(qc0+qi0) + L_f*qi0)/c_p.
+    # Evaluating Clausius-Clapeyron saturation and RH from conserved T_li eliminates 2*dt phase-flip
+    # condensation/evaporation overshoot oscillations identically.
     t_post_ls = (thm_post_ls * exner) / (1.0 + C.RV_OVER_RD * qv0)
-    t_env = torch.clamp(t_post_ls, min=180.0, max=340.0)
+    t_li0 = t_post_ls - (C.L_V0 * (qc0 + qi0) + C.L_F0 * qi0) / C.CP_D
     p_env = C.P_REF * torch.pow(ex_safe, 3.5)
-    es_w = 611.2 * torch.exp(torch.clamp(17.67 * (t_env - C.T_FREEZE) / torch.clamp(t_env - 29.65, min=20.0), -25.0, 12.0))
-    es_i = 611.2 * torch.exp(torch.clamp(21.875 * (t_env - C.T_FREEZE) / torch.clamp(t_env - 7.66, min=20.0), -25.0, 12.0))
-    om_liq = torch.clamp((t_env - 253.15) / 20.0, min=0.0, max=1.0)
-    es_env = om_liq * es_w + (1.0 - om_liq) * es_i
-    qsat_env = torch.clamp(C.EPS_WATER * es_env / torch.clamp(p_env - es_env, min=100.0), min=1.0e-7, max=0.10)
+
+    def _qsat_cc(t_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        t_c = torch.clamp(t_in, min=180.0, max=340.0)
+        es_w = 611.2 * torch.exp(torch.clamp(17.67 * (t_c - C.T_FREEZE) / torch.clamp(t_c - 29.65, min=20.0), -25.0, 12.0))
+        es_i = 611.2 * torch.exp(torch.clamp(21.875 * (t_c - C.T_FREEZE) / torch.clamp(t_c - 7.66, min=20.0), -25.0, 12.0))
+        om = torch.clamp((t_c - 253.15) / 20.0, min=0.0, max=1.0)
+        es = om * es_w + (1.0 - om) * es_i
+        qs = torch.clamp(C.EPS_WATER * es / torch.clamp(p_env - es, min=100.0), min=1.0e-7, max=0.10)
+        l_eff = C.L_V0 + (1.0 - om) * C.L_F0
+        gamma = 1.0 + (l_eff / C.CP_D) * ((l_eff * qs) / (461.5 * t_c * t_c))
+        return qs, om, l_eff, gamma
+
+    t_env0 = torch.clamp(t_li0, min=180.0, max=340.0)
+    qsat_env, _, _, _ = _qsat_cc(t_env0)
     dm = torch.clamp(rho_d * dz_c, min=1.0e-6)                # [nz, N] kg m^-2
 
     # Thermodynamic parcel buoyancy / LNB gate (Emanuel 1994; Hartmann & Larson 2002 FAT law):
-    # theta_e = (T + (L_v/c_p) * q_v) / exner, theta_es = (T + (L_v/c_p) * q_sat) / exner.
+    # theta_e = (T_li0 + (L_v/c_p) * q_n0) / exner, theta_es = (T_li0 + (L_v/c_p) * q_sat(T_li0)) / exner.
     # Convective mass exchange across interface k+1/2 is physically unlocked wherever an undilute
-    # parcel from below (cummax theta_e) is buoyant relative to layer k+1 (theta_e_max >= theta_es - 4 K),
+    # parcel from below (cummax theta_e) is buoyant relative to layer k+1 (theta_e_max >= theta_es - 1 K),
     # automatically tracking the tropical tropopause across piControl, 4xCO2, and paleoclimates while
     # cleanly stopping above shallow subtropical inversions and the cold-point tropopause.
     lv_cp_ex = (C.L_V0 / C.CP_D) / ex_safe
-    th_e = (t_env / ex_safe) + lv_cp_ex * qv0
-    th_es = (t_env / ex_safe) + lv_cp_ex * qsat_env
+    th_e = (t_env0 / ex_safe) + lv_cp_ex * qn0
+    th_es = (t_env0 / ex_safe) + lv_cp_ex * qsat_env
     th_e_max = torch.cummax(th_e, dim=0).values
     buoy_int = (
         torch.clamp((th_e_max[:-1] - th_es[1:] + 1.0) / 6.0, min=0.0, max=1.0)
@@ -438,53 +449,75 @@ def apply_exact_conservation_closure(
 
     dm_sum_u = torch.clamp((dm * w_u).sum(dim=0), min=1.0e-3)
 
-    # --- 1. Exact Total Column Water Mass Conservation via CFL-Bounded Convective Mass Exchange ---
+    # --- 1. Exact Total Column Water Mass & Dry-Enthalpy Flux Transport ---
     # Apply surface evaporation into lowest layer, then exchange air mass M_{k+1/2} >= 0 across
-    # adjacent convective layers strictly bounded only by the universal CFL positivity limit
-    # min(0.45 * dm_k, 0.45 * dm_{k+1}, rho_{k+1/2} * w_ref * dt) (w_ref = 1.0 m s^-1).
-    # F_{k+1/2} = M_{k+1/2} * (q_{n,k} - q_{n,k+1}) satisfies exact mass conservation and the
-    # discrete maximum principle (strict convex combination -> zero arbitrary moisture caps and
-    # zero unphysical uphill supersaturation waves at the tropopause across all climates & dt).
+    # adjacent convective layers bounded by the physical host-cell convective mass-flux velocity
+    # w_conv = sigma_u * w_u = 0.25 m s^-1 and explicit CFL positivity bound 0.25 * dm_min.
+    # Convective sensible heat flux H_{k+1/2} scales directly with the same mass flux M_max * c_p * dT_exc
+    # (dT_exc = 3.0 K), so both water and dry-static-energy transport scale consistently with dt and dz.
+    pbl_shape = torch.clamp(1.0 - (ex0 - exner) / (0.015 * ex0), min=0.0, max=1.0) * s_conv
+    dm_pbl_sum = torch.clamp((dm * pbl_shape).sum(dim=0), min=1.0e-3)
+    d_temp_shf = ((shf * dt) / (C.CP_D * dm_pbl_sum)).unsqueeze(0) * pbl_shape
+
     qn_base = qn0.clone()
     qn_base[0] = torch.clamp(qn_base[0] + (evap * dt) / torch.clamp(dm[0], min=1.0e-4), min=0.0)
     if int(qn_base.shape[0]) >= 2:
         dm_min = torch.minimum(dm[:-1], dm[1:])
         rho_int = 0.5 * (torch.clamp(rho_d[:-1], min=1.0e-6) + torch.clamp(rho_d[1:], min=1.0e-6))
-        m_max = torch.minimum(0.45 * dm_min, rho_int * (1.0 * dt))
+        m_max = torch.minimum(0.25 * dm_min, rho_int * (0.25 * dt))
         int_active = (s_conv[1:] > 0.0).to(dm.dtype)
-        # Buoyancy-gated CFL mass exchange: starts gentle near init (sigmoid(-4) = 0.018) inside
-        # unstable CAPE layers and vanishes identically above the LNB (buoy_int == 0), while
-        # allowing the NN to drive up to 100% of the exact CFL limit during deep convection.
         m_exch = m_max * s_conv[:-1] * col_rh_gate.unsqueeze(0) * buoy_int * int_active * torch.sigmoid(rp1_s[:-1] - 4.0)
         f_q = m_exch * (qn_base[:-1] - qn_base[1:])
         dqn_flux = torch.zeros_like(qn_base)
         dqn_flux[:-1] = dqn_flux[:-1] - f_q / dm[:-1]
         dqn_flux[1:] = dqn_flux[1:] + f_q / dm[1:]
         qn_trans = torch.clamp(qn_base + dqn_flux, min=0.0)
+
+        h_max = C.CP_D * m_max * 3.0
+        h_flux = h_max * w_h[:-1] * int_active * torch.tanh(rp0_s[:-1] * 0.25)
+        d_temp_trans = torch.zeros_like(qn_base)
+        d_temp_trans[:-1] = d_temp_trans[:-1] - h_flux / (C.CP_D * dm[:-1])
+        d_temp_trans[1:] = d_temp_trans[1:] + h_flux / (C.CP_D * dm[1:])
     else:
         qn_trans = qn_base
+        d_temp_trans = torch.zeros_like(qn_base)
 
-    # Exact Clausius-Clapeyron saturation consistency + NN-predicted layerwise condensate fallout:
-    # q_cond_tot = min(qn_trans, max(q_ovsat, f_cond * qn_trans)) guarantees q_v <= qsat_env everywhere,
-    # while centered layerwise fallout f_fall(k) = sigmoid(0.5*scal0 + rp2) (0.50 at init, max gradient)
-    # splits condensed water directly into precipitating fallout q_out and suspended cloud (q_c, q_i)
-    # with ZERO arbitrary cloud caps and zero cold-start dead-sigmoid trapping.
-    rh_tr = qn_trans / torch.clamp(qsat_env, min=1.0e-7)
+    # Exact 2-iteration Clausius-Clapeyron saturation adjustment from conserved T_li* = T_li0 + dT_shf + dT_trans:
+    # removes grid-scale supersaturation with exact latent-heat stability denominator gamma = 1 + (L/cp)*dqs/dT
+    # (100% idempotent -> zero 2*dt condensation/evaporation overshoot oscillations), plus Sommeria-Deardorff
+    # subgrid fractional condensation bounded thermodynamically by 0.25 * q_sat(T_eq) / gamma_eq.
+    t_li_star = t_li0 + d_temp_shf + d_temp_trans
+    qs0, _, l_eff0, gamma0 = _qsat_cc(t_li_star)
+    q_eq1 = torch.clamp((qn_trans - qs0) / gamma0, min=torch.zeros_like(qn_trans), max=qn_trans)
+    t_1 = t_li_star + (l_eff0 / C.CP_D) * q_eq1
+    qs1, _, _, gamma1 = _qsat_cc(t_1)
+    q_eq = torch.clamp(q_eq1 + ((qn_trans - q_eq1) - qs1) / gamma1, min=torch.zeros_like(qn_trans), max=qn_trans)
+    t_eq = torch.clamp(t_li_star + (l_eff0 / C.CP_D) * q_eq, min=180.0, max=340.0)
+    qs_eq, om_eq, _, gamma_eq = _qsat_cc(t_eq)
+
+    rh_tr = qn_trans / torch.clamp(qs0, min=1.0e-7)
     rh_lin = torch.clamp((rh_tr - 0.65) / 0.30, min=0.0, max=1.0)
     rh_gate = rh_lin * rh_lin
-    f_cond = s_conv * rh_gate * 0.95 * torch.sigmoid(f_cond_logit - 3.0)
-    q_ovsat = torch.clamp(qn_trans - qsat_env, min=0.0)
-    q_cond_tot = torch.minimum(qn_trans, torch.maximum(q_ovsat, qn_trans * f_cond))
+    q_sub_max = torch.minimum(torch.clamp(qn_trans - q_eq, min=0.0), (0.25 * qs_eq) / gamma_eq)
+    q_sub = s_conv * rh_gate * torch.sigmoid(f_cond_logit - 3.0) * q_sub_max
+    q_cond_tot = torch.minimum(qn_trans, q_eq + q_sub)
     qv_conv = torch.clamp(qn_trans - q_cond_tot, min=0.0)
 
-    f_fall = s_conv * torch.sigmoid(0.5 * raw_scal[:, 0].unsqueeze(0) + f_qp_logit)
+    # Sundqvist (1978) / Rotstayn (1997) exact exponential autoconversion & ice sedimentation over dt,
+    # modulated strictly positively by NN column efficiency alpha_nn in [0.25, 4.0] via bounded tanh
+    # (eliminates dry-warmup dead-sigmoid LWP runaway and decouples f_fall from suspended q_p logit).
+    q_crit = om_eq * 3.0e-4 + (1.0 - om_eq) * 6.0e-5
+    r_c = torch.clamp(q_cond_tot / q_crit, min=0.0, max=5.0)
+    phi_auto = -torch.expm1(-(r_c * r_c))
+    alpha_nn = torch.exp(1.4 * torch.tanh(0.25 * raw_scal[:, 0])).unsqueeze(0)
+    f_fall = s_conv * (-torch.expm1(-(dt / 900.0) * alpha_nn * phi_auto))
     q_out = torch.where(in_conv, f_fall * q_cond_tot, torch.zeros_like(q_cond_tot))
     q_cld = torch.clamp(q_cond_tot - q_out, min=0.0)
     f_ice_nn = torch.sigmoid(f_ice_logit)
     f_ice = torch.where(
-        t_env <= 253.15,
+        t_eq <= 253.15,
         torch.ones_like(f_ice_nn),
-        (1.0 - om_liq) * f_ice_nn,
+        (1.0 - om_eq) * f_ice_nn,
     )
     qc_new = torch.where(in_conv, q_cld * (1.0 - f_ice), qc0)
     qi_new = torch.where(in_conv, q_cld * f_ice, qi0)
@@ -494,7 +527,7 @@ def apply_exact_conservation_closure(
     # Exact algebraic split of available precipitating mass (q_out + qp0) into suspended q_p and
     # surface precipitation P_tot * dt >= 0 (strictly conserving total column water to machine epsilon).
     qp_avail = q_out + qp0
-    qp_conv = s_conv * (0.50 * torch.sigmoid(f_qp_logit)) * qp_avail
+    qp_conv = s_conv * (0.50 * torch.sigmoid(3.0 * torch.tanh(0.3 * f_qp_logit))) * qp_avail
     qp_new = torch.where(in_conv, qp_conv, qp0)
     p_tot_mass = (dm * conv_f * torch.clamp(qp_avail - qp_new, min=0.0)).sum(dim=0)
 
@@ -509,30 +542,12 @@ def apply_exact_conservation_closure(
     p_rain_rate = (p_tot_mass * (1.0 - f_snow)) / dt
 
     # --- 2. Exact Column Sensible Enthalpy Closure in True Temperature Space ---
-    # Pre-inject surface sensible heat flux (shf * dt) into the lowest PBL (~p >= 0.95 p_s).
-    pbl_shape = torch.clamp(1.0 - (ex0 - exner) / (0.015 * ex0), min=0.0, max=1.0) * s_conv
-    dm_pbl_sum = torch.clamp((dm * pbl_shape).sum(dim=0), min=1.0e-3)
-    d_temp_shf = ((shf * dt) / (C.CP_D * dm_pbl_sum)).unsqueeze(0) * pbl_shape
-
     # Exact in-situ condensation & freezing latent heating: since sum dm * q_out == P_tot*dt + dM_qp,
     # sum dm * L_v0 * (q_cond_tot - qc0 - qi0) equals L_v0 * (P_tot*dt + dM_c + dM_i + dM_qp) identically!
     d_temp_lat = conv_f * (
         C.L_V0 * (q_cond_tot - (qc0 + qi0))
         + C.L_F0 * (qi_new - qi0)
     ) / C.CP_D
-
-    # Exact zero-sum telescoping convective sensible heat flux H_{k+1/2}: redistributes enthalpy
-    # across convective layers (downdraft PBL cooling & mid-tropospheric warming) with dh_trans == 0
-    # identically and zero arbitrary 0.15 K cap or nonlocal h_corr leak into the tropopause.
-    if int(qn_base.shape[0]) >= 2:
-        h_max = C.CP_D * torch.minimum(dm[:-1], dm[1:]) * 2.0
-        int_active_h = (s_conv[1:] > 0.0).to(dm.dtype)
-        h_flux = h_max * w_h[:-1] * int_active_h * torch.tanh(rp0_s[:-1] * 0.25)
-        d_temp_trans = torch.zeros_like(qn_base)
-        d_temp_trans[:-1] = d_temp_trans[:-1] - h_flux / (C.CP_D * dm[:-1])
-        d_temp_trans[1:] = d_temp_trans[1:] + h_flux / (C.CP_D * dm[1:])
-    else:
-        d_temp_trans = torch.zeros_like(qn_base)
 
     # Only surface snow fusion enthalpy (L_f * P_snow * dt) remains for column projection on w_h.
     dh_snow = C.L_F0 * (p_tot_mass * f_snow)
