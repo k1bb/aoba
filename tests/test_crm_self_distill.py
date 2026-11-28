@@ -623,7 +623,7 @@ def test_shadow_divergence_abrupt_4xco2_atmos_and_land() -> None:
         enable_land_carbon=False, enable_ocean_bgc=False, enable_river_routing=False,
         enable_crm_self_distill=True, enable_rad_self_distill=True,
         enable_distill_shadow_diag=True,
-        crm_distill_stride=4, crm_distill_warmup_steps=8, crm_distill_dwell_steps=64,
+        crm_distill_stride=2, crm_distill_warmup_steps=8, crm_distill_dwell_steps=64,
         crm_distill_hidden_dim=64, crm_distill_replay_size=2048,
     )
     model = init_aoba_model(cfg, device=dev)

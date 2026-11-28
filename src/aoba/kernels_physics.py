@@ -6076,7 +6076,7 @@ kernel void crm_distill_extract_col(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Group B (5 kinematics/forcing features: 8=u, 9=v, 10=dthm_ls, 11=dqn_ls, 12=q_rad)
+        // Group B (4 kinematics/forcing features: 8=u, 9=v, 10=dthm_ls, 11=dqn_ls; 12=0 to block q_rad cloud-mask echo)
         if (active) {
             for (uint dk = 0u; dk < klen; ++dk) {
                 uint idx = (k0 + dk) * N + c;
@@ -6085,7 +6085,6 @@ kernel void crm_distill_extract_col(
                 sm_t[1u * s_str + s_off] = clamp(v_in[idx] * (1.0f / 30.0f), -4.0f, 4.0f);
                 sm_t[2u * s_str + s_off] = clamp(dthm_ls[idx] * dt, -10.0f, 10.0f);
                 sm_t[3u * s_str + s_off] = clamp(dqn_ls[idx] * dt * 1.0e3f, -10.0f, 10.0f);
-                sm_t[4u * s_str + s_off] = clamp(q_rad[idx] * dt * 2.0f, -10.0f, 10.0f);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6098,7 +6097,7 @@ kernel void crm_distill_extract_col(
                 x_out[xb + 9u * nz]  = sm_t[1u * s_str + rs];
                 x_out[xb + 10u * nz] = sm_t[2u * s_str + rs];
                 x_out[xb + 11u * nz] = sm_t[3u * s_str + rs];
-                x_out[xb + 12u * nz] = sm_t[4u * s_str + rs];
+                x_out[xb + 12u * nz] = 0.0f;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6222,7 +6221,7 @@ kernel void crm_distill_closure_col(
         float dm = max(rho_d[idx] * dz_c[idx], 1.0e-6f);
         float ex = exner[idx];
         float ex_safe = max(ex, 0.005f);
-        float s_lin = clamp((ex - 0.50f) / 0.14f, 0.0f, 1.0f);
+        float s_lin = clamp((ex - 0.50f) / 0.08f, 0.0f, 1.0f);
         float s_conv = s_lin * s_lin;
         float pbl_sh = clamp(1.0f - (ex0 - ex) * inv_pbl_ex, 0.0f, 1.0f) * s_conv;
 
@@ -6421,7 +6420,8 @@ kernel void crm_distill_closure_col(
             qp_n = qp_p_col[k] * qp_sc;
             w_post_conv += dm * (qn_n + qp_n);
 
-            float rh_lin = clamp((qn_n / max(qsat_env, 1.0e-7f) - 0.55f) / 0.40f, 0.0f, 1.0f);
+            float rh_now = qn_n / max(qsat_env, 1.0e-7f);
+            float rh_lin = clamp((rh_now - 0.55f) / 0.40f, 0.0f, 1.0f);
             float rh_gate = rh_lin * rh_lin;
             float fc_sig = aoba_sigmoid(RP_LOAD(3u, k) - 2.2f);
             float f_cond = s_conv * rh_gate * 0.95f * (fc_sig * fc_sig);
@@ -6429,15 +6429,27 @@ kernel void crm_distill_closure_col(
             float f_ice_nn = aoba_sigmoid(RP_LOAD(4u, k));
             float f_ice = (t_env <= 253.15f) ? 1.0f : ((1.0f - om_liq_p) * f_ice_nn);
             float q_cond_nn = qn_n * f_cond;
+            float f_ice_env = clamp((263.15f - t_env) * 0.1f, 0.0f, 1.0f);
+            float dry_def = clamp((0.75f - rh_now) / 0.55f, 0.0f, 1.0f);
+            float k_subl = (1.0f / 10800.0f) + (1.0f / 900.0f) * (dry_def * dry_def);
+            float qi_adv_surv = min(qi0 * exp(-k_subl * dt), 0.90f * qn_n) * f_ice_env;
+            float qc_nn = q_cond_nn * (1.0f - f_ice);
+            float qi_nn_or_adv = max(q_cond_nn * f_ice, qi_adv_surv);
+            float q_sum_ci = qc_nn + qi_nn_or_adv;
+            if (q_sum_ci > qn_n) {
+                float sc_ci = qn_n / max(q_sum_ci, 1.0e-12f);
+                qc_nn *= sc_ci;
+                qi_nn_or_adv *= sc_ci;
+            }
             float q_ovsat = max(qn_n - qsat_env, 0.0f);
-            float q_cond_tot = max(q_cond_nn, q_ovsat);
-            float qc_pf = q_cond_tot * (1.0f - f_ice);
-            float qi_pf = q_cond_tot * f_ice;
-            qv_n = max(qn_n - q_cond_tot, 0.0f);
+            float q_excess = max(q_ovsat - (qc_nn + qi_nn_or_adv), 0.0f);
+            float qc_pf = qc_nn + q_excess * (1.0f - f_ice);
+            float qi_pf = qi_nn_or_adv + q_excess * f_ice;
+            qv_n = max(qn_n - qc_pf - qi_pf, 0.0f);
 
-            float qi_cap = min(qsat_env, 1.0e-4f);
-            qc_n = min(q_cond_nn * (1.0f - f_ice), 5.0e-4f);
-            qi_n = min(q_cond_nn * f_ice, qi_cap);
+            float qi_cap = min(qsat_env, 1.2e-4f);
+            qc_n = min(qc_nn, 5.0e-4f);
+            qi_n = min(qi_nn_or_adv, qi_cap);
             float qc_fall = max(qc_pf - qc_n, 0.0f);
             float qi_fall = max(qi_pf - qi_n, 0.0f);
             qn_n = qv_n + qc_n + qi_n;
@@ -6446,7 +6458,8 @@ kernel void crm_distill_closure_col(
             rp1_s[k] += (qc_fall + qi_fall);
 
             d_m_qp += dm * (qp_n - qp0);
-            out_prof[8u * plane + idx] = s_conv * rh_gate * aoba_sigmoid(RP_LOAD(7u, k) - 2.0f);
+            float f_cld_nn = s_conv * rh_gate * aoba_sigmoid(RP_LOAD(7u, k) - 2.0f);
+            out_prof[8u * plane + idx] = max(f_cld_nn, clamp(qi_n / 2.0e-5f, 0.0f, 0.85f));
         } else {
             out_prof[8u * plane + idx] = 0.0f;
         }

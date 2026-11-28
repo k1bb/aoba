@@ -293,7 +293,7 @@ def extract_crm_distill_features(
         torch.clamp(v * (1.0 / 30.0), -4.0, 4.0),
         torch.clamp(dthm_ls * dt, -10.0, 10.0),
         torch.clamp(dqn_ls * dt * 1.0e3, -10.0, 10.0),
-        torch.clamp(q_rad * dt * 2.0, -10.0, 10.0),
+        z0,
         torch.log(torch.clamp(dz_c, min=10.0) * 2.0e-3),
     ], dim=0)  # [14, nz, N]
 
@@ -356,10 +356,10 @@ def apply_exact_conservation_closure(
     # Convert [N, 8, nz] -> [nz, N] per field (contiguous for MPS backward kernels)
     rp = raw_prof.permute(1, 2, 0).contiguous()  # [8, nz, N]
     # Universal thermodynamic convective envelope s_conv(exner) in [0, 1]:
-    # 1.0 throughout the troposphere (p >= 210 hPa, exner >= 0.64), tapering smoothly via C^1 quadratic
-    # ramp across the tropical anvil zone to 0.0 at/above the 90 hPa tropopause cold point (exner <= 0.50)
+    # 1.0 throughout the troposphere and tropical anvil detrainment zone (p >= 145 hPa, exner >= 0.58),
+    # tapering smoothly via C^1 quadratic ramp to 0.0 at/above the 90 hPa tropopause cold point (exner <= 0.50)
     # so the stratosphere & mesosphere obey pure host dynamics + radiation + O3 + GWD with zero ML drift.
-    s_lin = torch.clamp((exner - 0.50) / 0.14, min=0.0, max=1.0)
+    s_lin = torch.clamp((exner - 0.50) / 0.08, min=0.0, max=1.0)
     s_conv = s_lin * s_lin
     in_conv = s_conv > 0.0
     ex_safe = torch.clamp(exner, min=0.005)
@@ -479,13 +479,14 @@ def apply_exact_conservation_closure(
 
     # Partition convective q_n into (q_v, q_c, q_i) strictly preserving q_v + q_c + q_i == q_n
     # and thermodynamic saturation consistency (q_v <= qsat_env, homogeneous freezing T <= 253.15 K,
-    # liquid-only T >= 273.15 K), with a smooth C^1 quadratic RH gate starting at RH = 0.55 so clear
-    # dry skies stay cloud-free while anvil/cirrus edges transition continuously without binary OLR holes.
-    rh_lin = torch.clamp((qn_new / torch.clamp(qsat_env, min=1.0e-7) - 0.55) / 0.40, min=0.0, max=1.0)
+    # liquid-only T >= 273.15 K), while preserving 3D-advected upper-tropospheric cirrus anvils
+    # (qi0 at T < 263.15 K) via exact exponential sublimation relaxation (tau ~ 3 h in moist outflow,
+    # ~14 min in dry subsiding air) so sheared cirrus tails are not erased in one host step.
+    rh_now = qn_new / torch.clamp(qsat_env, min=1.0e-7)
+    rh_lin = torch.clamp((rh_now - 0.55) / 0.40, min=0.0, max=1.0)
     rh_gate = rh_lin * rh_lin
     fc_sig = torch.sigmoid(f_cond_logit - 2.2)
     f_cond = s_conv * rh_gate * 0.95 * (fc_sig * fc_sig)
-    f_cld_pred = s_conv * rh_gate * torch.sigmoid(rp[7] - 2.0)
     f_ice_nn = torch.sigmoid(f_ice_logit)
     f_ice = torch.where(
         t_env <= 253.15,
@@ -493,20 +494,37 @@ def apply_exact_conservation_closure(
         (1.0 - om_liq) * f_ice_nn,
     )
     q_cond_nn = qn_new * f_cond
+    qc_nn = q_cond_nn * (1.0 - f_ice)
+    if not raw_prof.requires_grad:
+        # Inference-only physical cirrus sublimation floor: preserves 3D-advected upper-tropospheric
+        # ice (T < 263.15 K) downwind on a ~3 h timescale in moist outflow (~14 min in dry subsidence)
+        # without masking dL/d(f_cond_logit) gradients during online student training.
+        f_ice_env = torch.clamp((263.15 - t_env) / 10.0, min=0.0, max=1.0)
+        dry_def = torch.clamp((0.75 - rh_now) / 0.55, min=0.0, max=1.0)
+        k_subl = (1.0 / 10800.0) + (1.0 / 900.0) * (dry_def * dry_def)
+        qi_adv_surv = torch.minimum(qi0 * torch.exp(-k_subl * dt), 0.90 * qn_new) * f_ice_env
+        qi_nn_or_adv = torch.maximum(q_cond_nn * f_ice, qi_adv_surv)
+        q_sum_ci = qc_nn + qi_nn_or_adv
+        sc_ci_n = torch.where(q_sum_ci > qn_new, qn_new / torch.clamp(q_sum_ci, min=1.0e-12), torch.ones_like(qn_new))
+        qc_nn = qc_nn * sc_ci_n
+        qi_nn_or_adv = qi_nn_or_adv * sc_ci_n
+    else:
+        qi_nn_or_adv = q_cond_nn * f_ice
     q_ovsat = torch.clamp(qn_new - qsat_env, min=0.0)
-    q_cond_tot = torch.maximum(q_cond_nn, q_ovsat)
-    qc_pre_fall = torch.where(in_conv, q_cond_tot * (1.0 - f_ice), qc0)
-    qi_pre_fall = torch.where(in_conv, q_cond_tot * f_ice, qi0)
-    qv_new = torch.where(in_conv, torch.clamp(qn_new - q_cond_tot, min=0.0), qv0)
+    q_excess = torch.clamp(q_ovsat - (qc_nn + qi_nn_or_adv), min=0.0)
+    qc_pre_fall = torch.where(in_conv, qc_nn + q_excess * (1.0 - f_ice), qc0)
+    qi_pre_fall = torch.where(in_conv, qi_nn_or_adv + q_excess * f_ice, qi0)
+    qv_new = torch.where(in_conv, torch.clamp(qn_new - qc_pre_fall - qi_pre_fall, min=0.0), qv0)
 
     # Physical autoconversion & ice-sedimentation fallout: excess supersaturated condensate above
-    # the NN-predicted suspended cloud (`q_cond_nn`, bounded by 5e-4 liquid / min(qsat, 1e-4) ice
-    # ceilings) precipitates conservatively instead of being trapped permanently as artificial ice.
-    qc_keep = torch.clamp(q_cond_nn * (1.0 - f_ice), max=5.0e-4)
-    qi_cap = torch.clamp(qsat_env, max=1.0e-4)
-    qi_keep = torch.minimum(q_cond_nn * f_ice, qi_cap)
+    # the suspended cloud ceiling precipitates conservatively instead of being trapped as artificial ice.
+    qc_keep = torch.clamp(qc_nn, max=5.0e-4)
+    qi_cap = torch.clamp(qsat_env, max=1.2e-4)
+    qi_keep = torch.minimum(qi_nn_or_adv, qi_cap)
     qc_new = torch.where(in_conv, qc_keep, qc0)
     qi_new = torch.where(in_conv, qi_keep, qi0)
+    f_cld_nn = s_conv * rh_gate * torch.sigmoid(rp[7] - 2.0)
+    f_cld_pred = torch.where(in_conv, torch.maximum(f_cld_nn, torch.clamp(qi_keep / 2.0e-5, min=0.0, max=0.85)), torch.zeros_like(f_cld_nn))
     qc_fall = torch.where(in_conv, torch.clamp(qc_pre_fall - qc_new, min=0.0), torch.zeros_like(qc_pre_fall))
     qi_fall = torch.where(in_conv, torch.clamp(qi_pre_fall - qi_new, min=0.0), torch.zeros_like(qi_pre_fall))
     qn_new = torch.where(in_conv, qv_new + qc_new + qi_new, qn0)
@@ -1308,12 +1326,18 @@ def get_convective_memory_features(
     state: CRMSelfDistillState,
     buoy_flux_cell: torch.Tensor,
 ) -> torch.Tensor:
-    """Return `[n_cells, 4]` train-test-invariant convective lifecycle & diurnal-phase memory features."""
-    mp_f, mp_s, mb_s = _ensure_convective_memory(state, buoy_flux_cell)
+    """Return `[n_cells, 4]` train-test-invariant diurnal surface-buoyancy memory features.
+
+    Cols 0–1 (previously non-advected Eulerian precipitation EMAs) are zeroed to eliminate
+    cell-fixed autoregressive precipitation locking while retaining purely external diurnal
+    surface-buoyancy forcing in cols 2–3.
+    """
+    _, _, mb_s = _ensure_convective_memory(state, buoy_flux_cell)
     b_pos = torch.clamp(buoy_flux_cell, min=0.0)
+    z0 = torch.zeros_like(b_pos)
     return torch.stack([
-        torch.log1p(torch.clamp(mp_f, min=0.0, max=500.0)),
-        torch.log1p(torch.clamp(mp_s, min=0.0, max=500.0)),
+        z0,
+        z0,
         torch.clamp(mb_s * 200.0, 0.0, 5.0),
         torch.clamp((b_pos - mb_s) * 200.0, -5.0, 5.0),
     ], dim=1).contiguous()
