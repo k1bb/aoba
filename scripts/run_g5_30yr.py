@@ -2285,6 +2285,11 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="")
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument(
+        "--reset-ossp",
+        action="store_true",
+        help="Reset loaded CRM/Rad OSSP student weights on resume so fresh warmup runs on updated closure physics",
+    )
+    parser.add_argument(
         "--init-from-restart",
         type=str,
         default="",
@@ -2443,6 +2448,13 @@ def main() -> None:
             f"(start_year={start_year:04d}/{years:04d})",
             flush=True,
         )
+
+    if args.reset_ossp:
+        if getattr(model, "crm_distill", None) is not None:
+            model.crm_distill = None
+        if getattr(model, "rad_distill", None) is not None:
+            model.rad_distill = None
+        print("  [--reset-ossp] Cleared CRM/Rad OSSP student weights for clean warmup on current closure.", flush=True)
 
     # Automatic spin-up tuning & provenance history log (`tuning_history.jsonl` + `tuning_history.md`)
     applied_cfg_snapshot = _record_tuning_history(
