@@ -75,7 +75,7 @@ from aoba.thermodynamics import diagnose_pressure_temperature, qsat_mixed_val
 # ---------------------------------------------------------------------------
 # 1. Universal Map-Free Feature Extraction & Exact Physical Conservation
 # ---------------------------------------------------------------------------
-CRM_DISTILL_CLOSURE_VERSION: int = 3  # Bump whenever closure parameterization/semantics change
+CRM_DISTILL_CLOSURE_VERSION: int = 4  # Bump whenever closure parameterization/semantics change
 _N_PROF_IN = 14      # 14 vertical profile channels per level
 _N_STRUCT_IN = 16    # 2D/3D periodic surface heterogeneity + atmospheric organization invariants
 _N_SCAL_IN = 7 + _N_STRUCT_IN  # 7 cell-mean boundary forcings + 16 spatial-clustering invariants = 23
@@ -442,8 +442,8 @@ def apply_exact_conservation_closure(
     col_rh_gate = torch.clamp((rh_pre_max - 0.72) / 0.25, min=0.0, max=1.0)
     pbl_gate = torch.clamp(1.0 - (ex0 - exner) / (0.08 * ex0), min=0.0, max=1.0)
     layer_gate = torch.maximum(col_rh_gate.unsqueeze(0), pbl_gate)
-    f_trop = torch.maximum(pbl_gate, torch.clamp(qsat_env / 3.0e-4, min=0.0, max=1.0))
-    w_h = s_conv * layer_gate * torch.maximum(pbl_gate, buoy_layer * f_trop)
+    f_trop = torch.maximum(pbl_gate, torch.clamp(qsat_env / 5.0e-5, min=0.0, max=1.0))
+    w_h = s_conv * layer_gate * torch.maximum(pbl_gate, (0.25 + 0.75 * buoy_layer) * f_trop)
     w_u = s_conv * layer_gate
 
     # Vertically smooth raw convective heating & moisture logits with 2-pass [0.25, 0.5, 0.25]
@@ -483,16 +483,16 @@ def apply_exact_conservation_closure(
     if int(qn_base.shape[0]) >= 2:
         dm_min = torch.minimum(dm[:-1], dm[1:])
         rho_int = 0.5 * (torch.clamp(rho_d[:-1], min=1.0e-6) + torch.clamp(rho_d[1:], min=1.0e-6))
-        m_max = torch.minimum(0.25 * dm_min, rho_int * (0.25 * dt))
+        m_max = torch.minimum(0.45 * dm_min, rho_int * (1.0 * dt))
         int_active = (s_conv[1:] > 0.0).to(dm.dtype)
-        m_exch = m_max * s_conv[:-1] * col_rh_gate.unsqueeze(0) * buoy_int * int_active * torch.sigmoid(rp1_s[:-1] - 4.0)
+        m_exch = m_max * s_conv[:-1] * col_rh_gate.unsqueeze(0) * buoy_int * int_active * torch.sigmoid(rp1_s[:-1] - 2.5)
         f_q = m_exch * (qn_base[:-1] - qn_base[1:])
         dqn_flux = torch.zeros_like(qn_base)
         dqn_flux[:-1] = dqn_flux[:-1] - f_q / dm[:-1]
         dqn_flux[1:] = dqn_flux[1:] + f_q / dm[1:]
         qn_trans = torch.clamp(qn_base + dqn_flux, min=0.0)
 
-        h_max = C.CP_D * m_max * 3.0
+        h_max = C.CP_D * dm_min * 1.0
         h_flux = h_max * w_h[:-1] * int_active * torch.tanh(rp0_s[:-1] * 0.25)
         d_temp_trans = torch.zeros_like(qn_base)
         d_temp_trans[:-1] = d_temp_trans[:-1] - h_flux / (C.CP_D * dm[:-1])
@@ -503,8 +503,9 @@ def apply_exact_conservation_closure(
 
     # Exact 2-iteration Clausius-Clapeyron saturation adjustment from conserved T_li* = T_li0 + dT_shf + dT_trans:
     # removes grid-scale supersaturation with exact latent-heat stability denominator gamma = 1 + (L/cp)*dqs/dT
-    # (100% idempotent -> zero 2*dt condensation/evaporation overshoot oscillations), plus Sommeria-Deardorff
-    # subgrid fractional condensation bounded thermodynamically by 0.25 * q_sat(T_eq) / gamma_eq.
+    # (100% idempotent -> zero 2*dt condensation/evaporation overshoot oscillations), plus subgrid fractional
+    # condensation active in both moist stratiform layers (RH > 0.65) and buoyant deep convective towers
+    # (RH > 0.25 when CAPE/buoy_layer > 0) so convective precipitation does not stall until 100% host saturation.
     t_li_star = t_li0 + d_temp_shf + d_temp_trans
     qs0, _, l_eff0, gamma0 = _qsat_cc(t_li_star)
     q_eq1 = torch.clamp((qn_trans - qs0) / gamma0, min=torch.zeros_like(qn_trans), max=qn_trans)
@@ -515,21 +516,36 @@ def apply_exact_conservation_closure(
     qs_eq, om_eq, _, gamma_eq = _qsat_cc(t_eq)
 
     rh_tr = qn_trans / torch.clamp(qs0, min=1.0e-7)
-    rh_lin = torch.clamp((rh_tr - 0.65) / 0.30, min=0.0, max=1.0)
+    rh_lin = torch.clamp((rh_tr - 0.65) / 0.35, min=0.0, max=1.0)
     rh_gate = rh_lin * rh_lin
-    q_sub_max = torch.minimum(torch.clamp(qn_trans - q_eq, min=0.0), (0.25 * qs_eq) / gamma_eq)
-    q_sub = s_conv * rh_gate * torch.sigmoid(f_cond_logit - 3.0) * q_sub_max
+    conv_rh_lin = torch.clamp((rh_tr - 0.55) / 0.35, min=0.0, max=1.0)
+    conv_cond_gate = col_rh_gate.unsqueeze(0) * buoy_layer * (conv_rh_lin * conv_rh_lin)
+    cond_gate = torch.maximum(rh_gate, conv_cond_gate)
+    q_sub_max = torch.minimum(torch.clamp(qn_trans - q_eq, min=0.0), (0.15 * qs_eq) / gamma_eq)
+    q_sub = s_conv * cond_gate * torch.sigmoid(f_cond_logit - 4.5) * q_sub_max
     q_cond_tot = torch.minimum(qn_trans, q_eq + q_sub)
     qv_conv = torch.clamp(qn_trans - q_cond_tot, min=0.0)
 
-    # Sundqvist (1978) / Rotstayn (1997) exact exponential autoconversion & ice sedimentation over dt,
-    # modulated strictly positively by NN column efficiency alpha_nn in [0.25, 4.0] via bounded tanh
-    # (eliminates dry-warmup dead-sigmoid LWP runaway and decouples f_fall from suspended q_p logit).
-    q_crit = om_eq * 3.0e-4 + (1.0 - om_eq) * 6.0e-5
-    r_c = torch.clamp(q_cond_tot / q_crit, min=0.0, max=5.0)
-    phi_auto = -torch.expm1(-(r_c * r_c))
-    alpha_nn = torch.exp(1.4 * torch.tanh(0.25 * raw_scal[:, 0])).unsqueeze(0)
-    f_fall = s_conv * (-torch.expm1(-(dt / 900.0) * alpha_nn * phi_auto))
+    # Exact dt-invariant exponential condensate fallout rate combining:
+    # (1) baseline linear liquid autoconversion / ice sedimentation (lam_base) modulated by strictly
+    #     positive alpha_nn in [0.165, 6.05] (preserves thin stratocumulus & cirrus with zero dry-warmup
+    #     dead-sigmoid trapping), plus
+    # (2) nonlinear in-cloud Sundqvist (1978) / Morrison (2005) autoconversion & ice aggregation
+    #     (lam_auto) evaluated on in-cloud condensate q_in = q_cond_tot / f_cld_eff so dense ITCZ
+    #     storm cores (q_i > 50 mg/kg) cannot pile up 4000 g/m^2 of suspended ice.
+    # Full gravitational fallout applies across all tropospheric/TTL levels (conv_f, not tapered by
+    # s_conv) so overshooting ice at 12-16 km (exner 0.50..0.64) sediments naturally instead of trapping.
+    f_cld_nn_raw = s_conv * rh_gate * torch.sigmoid(rp[7] - 1.5)
+    f_cld_eff = torch.clamp(torch.maximum(f_cld_nn_raw, q_cond_tot * 1.0e3), min=0.05, max=1.0)
+    q_in = q_cond_tot / f_cld_eff
+    q_crit = om_eq * 2.5e-4 + (1.0 - om_eq) * 5.0e-5
+    r_c = torch.clamp(q_in / q_crit, min=0.0, max=5.0)
+    lam_auto = 4.0 * (-torch.expm1(-(r_c * r_c)))
+    z_fall = 0.5 * raw_scal[:, 0].unsqueeze(0) + f_qp_logit
+    alpha_nn = torch.exp(1.8 * torch.tanh(0.30 * z_fall))
+    lam_base = om_eq * 0.55 + (1.0 - om_eq) * 1.15
+    lam_tot = alpha_nn * lam_base + torch.sqrt(alpha_nn) * lam_auto
+    f_fall = conv_f * (-torch.expm1(-(dt / 720.0) * lam_tot))
     q_out = torch.where(in_conv, f_fall * q_cond_tot, torch.zeros_like(q_cond_tot))
     q_cld = torch.clamp(q_cond_tot - q_out, min=0.0)
     f_ice_nn = torch.sigmoid(f_ice_logit)
@@ -544,14 +560,19 @@ def apply_exact_conservation_closure(
     qn_new = torch.where(in_conv, qv_new + qc_new + qi_new, qn0)
 
     # Exact algebraic split of available precipitating mass (q_out + qp0) into suspended q_p and
-    # surface precipitation P_tot * dt >= 0 (strictly conserving total column water to machine epsilon).
+    # surface precipitation P_tot * dt >= 0 using physical dt-invariant sedimentation survival
+    # (tau_rain = 340 s, tau_snow = 600 s; decoupled from rp2_k so q_p loss never throttles f_fall).
     qp_avail = q_out + qp0
-    qp_conv = s_conv * (0.50 * torch.sigmoid(3.0 * torch.tanh(0.3 * f_qp_logit))) * qp_avail
+    f_susp_rain = math.exp(-dt / 340.0)
+    f_susp_snow = math.exp(-dt / 600.0)
+    f_susp = om_eq * f_susp_rain + (1.0 - om_eq) * f_susp_snow
+    qp_conv = s_conv * f_susp * qp_avail
     qp_new = torch.where(in_conv, qp_conv, qp0)
     p_tot_mass = (dm * conv_f * torch.clamp(qp_avail - qp_new, min=0.0)).sum(dim=0)
 
-    # Subgrid cloud fraction predicted by NN with physical in-cloud mass-ratio floor (q_cld / 1 g kg^-1)
-    f_cld_nn = s_conv * rh_gate * torch.sigmoid(rp[7] - 1.5)
+    # Subgrid cloud fraction gated smoothly by actual suspended condensate q_cld so clear/trace layers
+    # never inflate tile cloud cover (preventing 2-3x Jensen LW/SW radiative smearing on 4-tile grids).
+    f_cld_nn = f_cld_nn_raw * (q_cld / (q_cld + 1.0e-5))
     f_cld_floor = torch.where(q_cld > 1.0e-6, torch.clamp(q_cld * 1.0e3, min=0.0, max=1.0), torch.zeros_like(q_cld))
     f_cld_pred = torch.where(in_conv, torch.maximum(f_cld_nn, f_cld_floor), torch.zeros_like(f_cld_nn))
 
@@ -1913,22 +1934,26 @@ def train_student_online(
             pred_a, pred_b, tpb_i, tsb_i, ex_b, dt, dm=dm_b, qn_in=qn_ls_b, t_in=t_in_b, qsat_in=qsat_in_b
         )
 
-        # Gauge-fix uniform-weight projection nullspace on raw temperature & momentum logits (m0, m5, m6);
-        # do NOT couple upper- and lower-tropospheric moisture logits via uniform-mean m1 because dq_lim
-        # spans 3+ orders of magnitude vertically (small L2 alone prevents rp1 rail saturation).
+        # Gauge-fix uniform-weight projection nullspace strictly on momentum logits (m5, m6);
+        # rp0 (telescoping interface heat flux H_{k+1/2}) has NO uniform-shift nullspace because
+        # a strictly positive mean(rp0) > 0 IS deep convective upward enthalpy overturning.
         s_conv_b = torch.clamp((ex_b - 0.50) / 0.14, min=0.0, max=1.0).square().transpose(0, 1).repeat(2, 1)
         s_conv_den = torch.clamp(s_conv_b.sum(dim=1), min=1.0)
         rp0_b = p_both[:, 0, :]
         rp1_b = p_both[:, 1, :]
+        rp2_b = p_both[:, 2, :]
+        rp3_b = p_both[:, 3, :]
         rp5_b = p_both[:, 5, :]
         rp6_b = p_both[:, 6, :]
-        m0 = (rp0_b * s_conv_b).sum(dim=1) / s_conv_den
         m5 = (rp5_b * s_conv_b).sum(dim=1) / s_conv_den
         m6 = (rp6_b * s_conv_b).sum(dim=1) / s_conv_den
         loss_gauge = (
-            0.05 * (m0.square().mean() + m5.square().mean() + m6.square().mean())
-            + 0.002 * (rp0_b * s_conv_b).square().mean()
+            0.05 * (m5.square().mean() + m6.square().mean())
+            + 1.0e-4 * (rp0_b * s_conv_b).square().mean()
             + 1.0e-4 * (rp1_b * s_conv_b).square().mean()
+            + 1.0e-3 * (rp2_b * s_conv_b).square().mean()
+            + 1.0e-3 * (rp3_b * s_conv_b).square().mean()
+            + 1.0e-3 * s_both[:, 0].square().mean()
         )
         loss_i = loss_i + loss_gauge
 

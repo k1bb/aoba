@@ -6256,8 +6256,8 @@ kernel void crm_distill_closure_col(
             float ex_k = exner[k * N + c];
             float pbl_g = clamp(1.0f - (ex0 - ex_k) * inv_pbl_g, 0.0f, 1.0f);
             float l_gate = max(col_rh_gate, pbl_g);
-            float f_trop = max(pbl_g, clamp(qsat_col[k] / 3.0e-4f, 0.0f, 1.0f));
-            float wh_k = sc_k * l_gate * max(pbl_g, buoy_lay_k * f_trop);
+            float f_trop = max(pbl_g, clamp(qsat_col[k] / 5.0e-5f, 0.0f, 1.0f));
+            float wh_k = sc_k * l_gate * max(pbl_g, (0.25f + 0.75f * buoy_lay_k) * f_trop);
             float wu_k = sc_k * l_gate;
             denom_h_w += cp_d * dm_c_col[k] * wh_k;
             dm_sum_u += dm_c_col[k] * wu_k;
@@ -6268,10 +6268,10 @@ kernel void crm_distill_closure_col(
             if (k + 1u < nz_c && sconv_col[k + 1u] > 0.0f) {
                 float dm_min = min(dm_c_col[k], dm_c_col[k + 1u]);
                 float rho_int = 0.5f * (max(rho_d[k * N + c], 1.0e-6f) + max(rho_d[(k + 1u) * N + c], 1.0e-6f));
-                float m_max = min(0.25f * dm_min, rho_int * (0.25f * dt));
-                float m_exch = m_max * sc_k * col_rh_gate * buoy_int_k * aoba_sigmoid(rp1_s[k] - 4.0f);
+                float m_max = min(0.45f * dm_min, rho_int * (1.0f * dt));
+                float m_exch = m_max * sc_k * col_rh_gate * buoy_int_k * aoba_sigmoid(rp1_s[k] - 2.5f);
                 rp1_s[k] = m_exch * (qnb_col[k] - qnb_col[k + 1u]);
-                qp_p_col[k] = (cp_d * m_max * 3.0f) * wh_k * tanh(rp0_s[k] * 0.25f);
+                qp_p_col[k] = (cp_d * dm_min * 1.0f) * wh_k * tanh(rp0_s[k] * 0.25f);
             } else {
                 rp1_s[k] = 0.0f;
                 qp_p_col[k] = 0.0f;
@@ -6285,11 +6285,14 @@ kernel void crm_distill_closure_col(
     }
 
     // Pass 2: exact telescoping flux updates, 2-iter Clausius-Clapeyron saturation adjustment from T_li*,
-    // Sommeria-Deardorff subgrid condensation, layerwise fallout & precip integral
+    // stratiform + convective subgrid condensation, dt-invariant softplus fallout & precip integral
     float dT_shf_scale = (shf * dt) / (cp_d * max(dm_pbl_sum, 1.0e-3f));
     float p_tot_fin = 0.0f;
     float fq_below = 0.0f;
     float hf_below = 0.0f;
+    float f_susp_rain = exp(-dt / 340.0f);
+    float f_susp_snow = exp(-dt / 600.0f);
+    float th_e_run2 = -1.0e9f;
 
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * N + c;
@@ -6312,6 +6315,16 @@ kernel void crm_distill_closure_col(
         }
         float qv0 = max(qn0 - qc0 - qi0, 0.0f);
 
+        float t_post_ls2 = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
+        float t_li0_2 = t_post_ls2 - (l_v0 * (qc0 + qi0) + l_f0 * qi0) / cp_d;
+        float t_env2 = clamp(t_li0_2, 180.0f, 340.0f);
+        float qsat_k2 = (k < 64u) ? qsat_col[k] : 1.0e-7f;
+        float inv_ex2 = 1.0f / ex_safe;
+        float th_e2 = (t_env2 + lv_cp * qn0) * inv_ex2;
+        float th_es2 = (t_env2 + lv_cp * qsat_k2) * inv_ex2;
+        float buoy_lay2 = (k == 0u) ? 1.0f : clamp((th_e_run2 - th_es2 + 1.0f) / 6.0f, 0.0f, 1.0f);
+        th_e_run2 = max(th_e_run2, th_e2);
+
         float qn_n = qn0;
         float qp_n = qp0;
         float qc_n = qc0;
@@ -6319,8 +6332,8 @@ kernel void crm_distill_closure_col(
         float qv_n = qv0;
 
         if (s_conv > 0.0f && k < 64u) {
-            float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
-            float t_li0 = t_post_ls - (l_v0 * (qc0 + qi0) + l_f0 * qi0) / cp_d;
+            float t_post_ls = t_post_ls2;
+            float t_li0 = t_li0_2;
             float pbl_sh = clamp(1.0f - (ex0 - ex) * inv_pbl_ex, 0.0f, 1.0f) * s_conv;
             float d_temp_shf_k = dT_shf_scale * pbl_sh;
             float d_temp_tr_k = (hf_below - hf_above) / (cp_d * dm);
@@ -6363,19 +6376,28 @@ kernel void crm_distill_closure_col(
             float gam_eq = 1.0f + (le_eq / cp_d) * ((le_eq * qs_eq) / (461.5f * t_eq * t_eq));
 
             float rh_tr = qn_tr / max(qs0, 1.0e-7f);
-            float rh_lin = clamp((rh_tr - 0.65f) / 0.30f, 0.0f, 1.0f);
+            float rh_lin = clamp((rh_tr - 0.65f) / 0.35f, 0.0f, 1.0f);
             float rh_gate = rh_lin * rh_lin;
-            float q_sub_max = min(max(qn_tr - q_eq, 0.0f), (0.25f * qs_eq) / gam_eq);
-            float q_sub = s_conv * rh_gate * aoba_sigmoid(RP_LOAD(3u, k) - 3.0f) * q_sub_max;
+            float conv_rh_lin = clamp((rh_tr - 0.55f) / 0.35f, 0.0f, 1.0f);
+            float conv_cond_gate = col_rh_gate * buoy_lay2 * (conv_rh_lin * conv_rh_lin);
+            float cond_gate = max(rh_gate, conv_cond_gate);
+            float q_sub_max = min(max(qn_tr - q_eq, 0.0f), (0.15f * qs_eq) / gam_eq);
+            float q_sub = s_conv * cond_gate * aoba_sigmoid(RP_LOAD(3u, k) - 4.5f) * q_sub_max;
             float q_cond_tot = min(qn_tr, q_eq + q_sub);
             qv_n = max(qn_tr - q_cond_tot, 0.0f);
 
             float rp2_k = RP_LOAD(2u, k);
-            float q_crit = om_eq * 3.0e-4f + (1.0f - om_eq) * 6.0e-5f;
-            float r_c = clamp(q_cond_tot / q_crit, 0.0f, 5.0f);
-            float phi_auto = 1.0f - exp(-(r_c * r_c));
-            float alpha_nn = exp(1.4f * tanh(0.25f * scal0));
-            float f_fall = s_conv * (1.0f - exp(-(dt / 900.0f) * alpha_nn * phi_auto));
+            float f_cld_nn_raw = s_conv * rh_gate * aoba_sigmoid(RP_LOAD(7u, k) - 1.5f);
+            float f_cld_eff = clamp(max(f_cld_nn_raw, q_cond_tot * 1.0e3f), 0.05f, 1.0f);
+            float q_in = q_cond_tot / f_cld_eff;
+            float q_crit = om_eq * 2.5e-4f + (1.0f - om_eq) * 5.0e-5f;
+            float r_c = clamp(q_in / q_crit, 0.0f, 5.0f);
+            float lam_auto = 4.0f * (1.0f - exp(-(r_c * r_c)));
+            float z_fall = 0.5f * scal0 + rp2_k;
+            float alpha_nn = exp(1.8f * tanh(0.30f * z_fall));
+            float lam_base = om_eq * 0.55f + (1.0f - om_eq) * 1.15f;
+            float lam_tot = alpha_nn * lam_base + sqrt(alpha_nn) * lam_auto;
+            float f_fall = 1.0f - exp(-(dt / 720.0f) * lam_tot);
             float q_out = f_fall * q_cond_tot;
             float q_cld = max(q_cond_tot - q_out, 0.0f);
             float f_ice_nn = aoba_sigmoid(RP_LOAD(4u, k));
@@ -6385,14 +6407,15 @@ kernel void crm_distill_closure_col(
             qn_n = qv_n + qc_n + qi_n;
 
             float qp_avail = q_out + qp0;
-            qp_n = s_conv * (0.50f * aoba_sigmoid(3.0f * tanh(0.3f * rp2_k))) * qp_avail;
+            float f_susp = om_eq * f_susp_rain + (1.0f - om_eq) * f_susp_snow;
+            qp_n = s_conv * f_susp * qp_avail;
             p_tot_fin += dm * max(qp_avail - qp_n, 0.0f);
 
             // Store q_cond_tot in rp1_s[k] and d_temp_trans in rp0_s[k] for Pass 3
             rp1_s[k] = q_cond_tot;
             rp0_s[k] = d_temp_tr_k;
 
-            float f_cld_nn = s_conv * rh_gate * aoba_sigmoid(RP_LOAD(7u, k) - 1.5f);
+            float f_cld_nn = f_cld_nn_raw * (q_cld / (q_cld + 1.0e-5f));
             float f_cld_fl = (q_cld > 1.0e-6f) ? clamp(q_cld * 1.0e3f, 0.0f, 1.0f) : 0.0f;
             out_prof[8u * plane + idx] = max(f_cld_nn, f_cld_fl);
         } else {
@@ -6455,8 +6478,8 @@ kernel void crm_distill_closure_col(
         float d_temp_cons = 0.0f;
         float pbl_g = clamp(1.0f - (ex0 - ex) * inv_pbl_g, 0.0f, 1.0f);
         float l_gate = max(col_rh_gate, pbl_g);
-        float f_trop = max(pbl_g, clamp(qsat_k_v / 3.0e-4f, 0.0f, 1.0f));
-        float wh_k = s_conv * l_gate * max(pbl_g, buoy_lay3 * f_trop);
+        float f_trop = max(pbl_g, clamp(qsat_k_v / 5.0e-5f, 0.0f, 1.0f));
+        float wh_k = s_conv * l_gate * max(pbl_g, (0.25f + 0.75f * buoy_lay3) * f_trop);
         float wu_k = s_conv * l_gate;
         if (s_conv > 0.0f) {
             float pbl_sh = clamp(1.0f - (ex0 - ex) * inv_pbl_ex, 0.0f, 1.0f) * s_conv;

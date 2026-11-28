@@ -3135,6 +3135,181 @@ def step_aoba_model(
                 update_convective_memory,
             )
 
+            # Synoptic-timescale nudging factor for shadow-pool teacher CRMs (tau = 3 h = 10800 s):
+            # - Slow enough (alpha ~ 0.065 at dt=720s) that active 2D/3D plumes complete their own
+            #   convective CAPE stabilization & cold-pool lifecycle without a 12-min CAPE-pump runaway.
+            # - Fast enough that multi-day (64..480 step) dwells stay tightly anchored to the live
+            #   host atmosphere with zero open-loop moisture/temperature runaway.
+            _shadow_alpha = float(-math.expm1(-dt / 10800.0))
+            _shadow_ls_scale = 1.0 - _shadow_alpha
+
+            def _reanchor_shadow_crm_to_host(
+                sub_crm: CRMState,
+                rho_h: torch.Tensor,
+                thm_h: torch.Tensor,
+                qv_h: torch.Tensor,
+                qc_h: torch.Tensor,
+                qi_h: torch.Tensor,
+                qp_h: torch.Tensor,
+                u_h: torch.Tensor,
+                v_h: torch.Tensor,
+                k_top_crm: int | None = None,
+                alpha_nudg: float = _shadow_alpha,
+            ) -> None:
+                """Variance-contracting convex synoptic nudging of shadow teacher CRM toward host means.
+
+                Blends mass-weighted column means toward the post-advection host state at timescale
+                `tau_nudg = 3 h` (exact host lock above `k_top_crm`), preserving 2D/3D convective
+                plumes and cold pools while preventing both CAPE-pump amplification and multi-day
+                open-loop drift.
+                """
+                drho_t = (rho_h - mean_2d(sub_crm.rho_d)).unsqueeze(-1).unsqueeze(-1)
+                sub_crm.rho_d = torch.clamp(torch.nan_to_num(sub_crm.rho_d + drho_t, nan=1.0), min=1.0e-8)
+                sub_crm.theta_m = torch.nan_to_num(sub_crm.theta_m, nan=300.0, posinf=600.0, neginf=150.0)
+                sub_crm.q_v = torch.nan_to_num(sub_crm.q_v, nan=0.0, posinf=0.06, neginf=0.0)
+                sub_crm.q_c = torch.nan_to_num(sub_crm.q_c, nan=0.0, posinf=0.015, neginf=0.0)
+                sub_crm.q_i = torch.nan_to_num(sub_crm.q_i, nan=0.0, posinf=0.015, neginf=0.0)
+                sub_crm.q_p = torch.nan_to_num(sub_crm.q_p, nan=0.0, posinf=0.02, neginf=0.0)
+                sub_crm.u = torch.nan_to_num(sub_crm.u, nan=0.0, posinf=150.0, neginf=-150.0)
+                sub_crm.v = torch.nan_to_num(sub_crm.v, nan=0.0, posinf=150.0, neginf=-150.0)
+                sub_crm.w = torch.clamp(torch.nan_to_num(sub_crm.w, nan=0.0, posinf=35.0, neginf=-35.0), -35.0, 35.0)
+
+                inv_rt = 1.0 / torch.clamp(mean_2d(sub_crm.rho_d), min=1.0e-8)
+                inv_rt_b = inv_rt.unsqueeze(-1).unsqueeze(-1)
+                thm_cm = mean_2d(sub_crm.rho_d * sub_crm.theta_m) * inv_rt
+                thm_tgt = thm_cm + alpha_nudg * (thm_h - thm_cm)
+                thm_an = torch.clamp(sub_crm.theta_m - thm_cm.unsqueeze(-1).unsqueeze(-1), -12.0, 12.0)
+                thm_an = thm_an - mean_2d(sub_crm.rho_d * thm_an, keepdim=True) * inv_rt_b
+                sub_crm.theta_m = torch.clamp(thm_tgt.unsqueeze(-1).unsqueeze(-1) + thm_an, min=100.0)
+
+                def _nudge_convex(fld: torch.Tensor, tgt_c: torch.Tensor, hi_cap: float) -> torch.Tensor:
+                    fld_c = torch.clamp(fld, 0.0, hi_cap)
+                    cm = mean_2d(sub_crm.rho_d * fld_c) * inv_rt
+                    an = fld_c - cm.unsqueeze(-1).unsqueeze(-1)
+                    tb_raw = cm + alpha_nudg * (torch.clamp(tgt_c, 0.0, hi_cap) - cm)
+                    tb = torch.clamp(tb_raw, 0.0, hi_cap).unsqueeze(-1).unsqueeze(-1)
+                    min_an = an.amin(dim=(-2, -1), keepdim=True)
+                    max_an = an.amax(dim=(-2, -1), keepdim=True)
+                    alpha_lo = torch.where(
+                        min_an < -1.0e-12,
+                        torch.clamp(tb / torch.clamp(-min_an, min=1.0e-12), 0.0, 1.0),
+                        torch.ones_like(tb),
+                    )
+                    alpha_hi = torch.where(
+                        max_an > 1.0e-12,
+                        torch.clamp((hi_cap - tb) / torch.clamp(max_an, min=1.0e-12), 0.0, 1.0),
+                        torch.ones_like(tb),
+                    )
+                    alpha_c = torch.minimum(alpha_lo, alpha_hi)
+                    return torch.clamp(tb + alpha_c * an, 0.0, hi_cap)
+
+                sub_crm.q_v = _nudge_convex(sub_crm.q_v, qv_h, 0.06)
+                sub_crm.q_c = _nudge_convex(sub_crm.q_c, qc_h, 0.015)
+                sub_crm.q_i = _nudge_convex(sub_crm.q_i, qi_h, 0.015)
+                sub_crm.q_p = _nudge_convex(sub_crm.q_p, qp_h, 0.02)
+                sub_crm.q_n = sub_crm.q_v + sub_crm.q_c + sub_crm.q_i
+
+                u_cm = mean_2d(sub_crm.u)
+                v_cm = mean_2d(sub_crm.v)
+                u_an = torch.clamp(sub_crm.u - u_cm.unsqueeze(-1).unsqueeze(-1), -25.0, 25.0)
+                u_an = u_an - mean_2d(u_an, keepdim=True)
+                v_an = torch.clamp(sub_crm.v - v_cm.unsqueeze(-1).unsqueeze(-1), -25.0, 25.0)
+                v_an = v_an - mean_2d(v_an, keepdim=True)
+                sub_crm.u = (u_cm + alpha_nudg * (u_h - u_cm)).unsqueeze(-1).unsqueeze(-1) + u_an
+                sub_crm.v = (v_cm + alpha_nudg * (v_h - v_cm)).unsqueeze(-1).unsqueeze(-1) + v_an
+
+                if (
+                    getattr(sub_crm, "q_r", None) is not None
+                    and getattr(sub_crm, "q_s", None) is not None
+                    and getattr(sub_crm, "q_g", None) is not None
+                ):
+                    qr_c = torch.clamp(torch.nan_to_num(sub_crm.q_r, nan=0.0), 0.0, 0.02)
+                    qs_c = torch.clamp(torch.nan_to_num(sub_crm.q_s, nan=0.0), 0.0, 0.02)
+                    qg_c = torch.clamp(torch.nan_to_num(sub_crm.q_g, nan=0.0), 0.0, 0.02)
+                    qp_sum6 = qr_c + qs_c + qg_c
+                    sc6 = torch.where(
+                        qp_sum6 > 1.0e-9,
+                        torch.clamp(sub_crm.q_p / torch.clamp(qp_sum6, min=1.0e-9), 0.0, 4.0),
+                        torch.zeros_like(qp_sum6),
+                    )
+                    sub_crm.q_r = qr_c * sc6
+                    sub_crm.q_s = qs_c * sc6
+                    sub_crm.q_g = qg_c * sc6
+                if getattr(sub_crm, "n_c", None) is not None:
+                    sub_crm.n_c = torch.clamp(
+                        torch.maximum(torch.nan_to_num(sub_crm.n_c, nan=0.0), sub_crm.q_c / 4.2e-12),
+                        0.0, 1.0e10,
+                    )
+                if getattr(sub_crm, "n_i", None) is not None:
+                    sub_crm.n_i = torch.clamp(
+                        torch.maximum(torch.nan_to_num(sub_crm.n_i, nan=0.0), sub_crm.q_i / 1.6e-10),
+                        0.0, 1.0e9,
+                    )
+                if k_top_crm is not None and 0 < int(k_top_crm) < int(sub_crm.theta_m.shape[0]):
+                    kl = int(k_top_crm)
+                    sub_crm.theta_m = torch.cat(
+                        [sub_crm.theta_m[:kl], thm_h[kl:].unsqueeze(-1).unsqueeze(-1).expand_as(sub_crm.theta_m[kl:])],
+                        dim=0,
+                    )
+                    sub_crm.q_v = torch.cat(
+                        [sub_crm.q_v[:kl], qv_h[kl:].unsqueeze(-1).unsqueeze(-1).expand_as(sub_crm.q_v[kl:])],
+                        dim=0,
+                    )
+                    sub_crm.q_c = torch.cat(
+                        [sub_crm.q_c[:kl], qc_h[kl:].unsqueeze(-1).unsqueeze(-1).expand_as(sub_crm.q_c[kl:])],
+                        dim=0,
+                    )
+                    sub_crm.q_i = torch.cat(
+                        [sub_crm.q_i[:kl], qi_h[kl:].unsqueeze(-1).unsqueeze(-1).expand_as(sub_crm.q_i[kl:])],
+                        dim=0,
+                    )
+                    sub_crm.q_n = torch.cat(
+                        [sub_crm.q_n[:kl], (qv_h[kl:] + qc_h[kl:] + qi_h[kl:]).unsqueeze(-1).unsqueeze(-1).expand_as(sub_crm.q_n[kl:])],
+                        dim=0,
+                    )
+                    sub_crm.w = torch.cat([sub_crm.w[: kl + 1], torch.zeros_like(sub_crm.w[kl + 1 :])], dim=0)
+
+            def _sanitize_shadow_crm_post(
+                sub_crm: CRMState,
+                thm_fb: torch.Tensor,
+                qn_fb: torch.Tensor,
+                qp_fb: torch.Tensor,
+                qv_fb: torch.Tensor,
+                qc_fb: torch.Tensor,
+                qi_fb: torch.Tensor,
+                u_fb: torch.Tensor,
+                v_fb: torch.Tensor,
+                rain_col: torch.Tensor,
+                snow_col: torch.Tensor,
+                rain_sub: torch.Tensor | None,
+                snow_sub: torch.Tensor | None,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+                """Zero-sync GPU finiteness guard preventing any non-finite teacher slot from poisoning pool or NN."""
+                ok_1d = (
+                    torch.isfinite(sub_crm.theta_m).all(dim=(0, 2, 3))
+                    & torch.isfinite(sub_crm.q_n).all(dim=(0, 2, 3))
+                    & torch.isfinite(sub_crm.q_c).all(dim=(0, 2, 3))
+                    & torch.isfinite(sub_crm.q_i).all(dim=(0, 2, 3))
+                    & torch.isfinite(sub_crm.w).all(dim=(0, 2, 3))
+                    & torch.isfinite(rain_col)
+                    & torch.isfinite(snow_col)
+                )
+                ok_4d = ok_1d.view(1, -1, 1, 1)
+                sub_crm.theta_m = torch.where(ok_4d, sub_crm.theta_m, thm_fb.unsqueeze(-1).unsqueeze(-1))
+                sub_crm.q_n = torch.where(ok_4d, sub_crm.q_n, qn_fb.unsqueeze(-1).unsqueeze(-1))
+                sub_crm.q_p = torch.where(ok_4d, sub_crm.q_p, qp_fb.unsqueeze(-1).unsqueeze(-1))
+                sub_crm.q_v = torch.where(ok_4d, sub_crm.q_v, qv_fb.unsqueeze(-1).unsqueeze(-1))
+                sub_crm.q_c = torch.where(ok_4d, sub_crm.q_c, qc_fb.unsqueeze(-1).unsqueeze(-1))
+                sub_crm.q_i = torch.where(ok_4d, sub_crm.q_i, qi_fb.unsqueeze(-1).unsqueeze(-1))
+                sub_crm.u = torch.where(ok_4d, sub_crm.u, u_fb.unsqueeze(-1).unsqueeze(-1))
+                sub_crm.v = torch.where(ok_4d, sub_crm.v, v_fb.unsqueeze(-1).unsqueeze(-1))
+                sub_crm.w = torch.where(ok_4d, sub_crm.w, torch.zeros_like(sub_crm.w))
+                rain_c_out = torch.where(ok_1d, rain_col, torch.zeros_like(rain_col))
+                snow_c_out = torch.where(ok_1d, snow_col, torch.zeros_like(snow_col))
+                rain_s_out = torch.where(ok_1d.view(-1, 1, 1), rain_sub, torch.zeros_like(rain_sub)) if rain_sub is not None else None
+                snow_s_out = torch.where(ok_1d.view(-1, 1, 1), snow_sub, torch.zeros_like(snow_sub)) if snow_sub is not None else None
+                return rain_c_out, snow_c_out, rain_s_out, snow_s_out
+
             _can_super_ossp_t = (
                 can_use_cuda_graph(atmos.rho_d.device)
                 and has_pool
@@ -3239,14 +3414,21 @@ def step_aoba_model(
                     sub_c.qke = p_core_i[10].clone()
                     for ak, av in zip(_opt_crm_keys, p_opt_i):
                         setattr(sub_c, ak, av.clone())
-                    drho_t = (arho_i[:, t_idx_i] - mean_2d(sub_c.rho_d)).unsqueeze(-1).unsqueeze(-1)
-                    sub_c.rho_d = torch.clamp(sub_c.rho_d + drho_t, min=1.0e-8)
+                    _reanchor_shadow_crm_to_host(
+                        sub_c,
+                        arho_i[:, t_idx_i], athm_i[:, t_idx_i],
+                        aqv_i[:, t_idx_i], aqc_i[:, t_idx_i], aqi_i[:, t_idx_i], aqp_i[:, t_idx_i],
+                        uhn_i[:, t_idx_i], vhn_i[:, t_idx_i],
+                        k_top_crm=k_top_crm_sp,
+                    )
                     sub_c.f_coriolis = mesh.f_cell[t_idx_i]
 
+                    dthm_t_ls = _shadow_ls_scale * dthm_i[:, t_idx_i]
+                    dqn_t_ls = _shadow_ls_scale * dqn_i[:, t_idx_i]
                     rho_tp = mean_2d(sub_c.rho_d)
                     inv_rtp = 1.0 / torch.clamp(rho_tp, min=1.0e-8)
-                    thm_tp = mean_2d(sub_c.rho_d * sub_c.theta_m) * inv_rtp + dt * dthm_i[:, t_idx_i]
-                    qn_tp = torch.clamp(mean_2d(sub_c.rho_d * sub_c.q_n) * inv_rtp + dt * dqn_i[:, t_idx_i], min=0.0)
+                    thm_tp = mean_2d(sub_c.rho_d * sub_c.theta_m) * inv_rtp + dt * dthm_t_ls
+                    qn_tp = torch.clamp(mean_2d(sub_c.rho_d * sub_c.q_n) * inv_rtp + dt * dqn_t_ls, min=0.0)
                     qp_tp = torch.clamp(mean_2d(sub_c.rho_d * sub_c.q_p) * inv_rtp, min=0.0)
                     qc_tp = torch.clamp(mean_2d(sub_c.rho_d * sub_c.q_c) * inv_rtp, min=0.0)
                     qi_tp = torch.clamp(mean_2d(sub_c.rho_d * sub_c.q_i) * inv_rtp, min=0.0)
@@ -3319,13 +3501,18 @@ def step_aoba_model(
                     sp_t_cg = step_crm_physics_and_dynamics(
                         crm=sub_c, vgrid=vgrid, dt_crm=dt, n_dyn_substeps=cfg.n_crm_dyn_substeps,
                         u_host_target=uhn_i[:, t_idx_i], v_host_target=vhn_i[:, t_idx_i], tau_sp_mom=dt,
-                        dtheta_m_ls_dt=dthm_i[:, t_idx_i], dq_n_ls_dt=dqn_i[:, t_idx_i],
+                        dtheta_m_ls_dt=dthm_t_ls, dq_n_ls_dt=dqn_t_ls,
                         sfc_fluxes=sub_sfc_t_cg, rad_heating_k_s=qrad_pool_i,
                         z_c_col=atmos.z_c[:, t_idx_i], z_w_col=atmos.z_w[:, t_idx_i], dz_c_col=atmos.dz_c[:, t_idx_i],
                         microphysics_scheme=cfg.microphysics_scheme,
                         is_ocean_sub=_tile3d_to_crm3d(is_ocn_t_cg.index_select(0, t_idx_i), to_full=True),
                         u_sfc_sub=_tile3d_to_crm3d(usfc_t_i.index_select(0, t_idx_i), to_full=True),
                         q_dust_sub=qd_tin, k_top_crm=k_top_crm_sp,
+                    )
+                    pr_r_cg, pr_s_cg, pr_rs_cg, pr_ss_cg = _sanitize_shadow_crm_post(
+                        sub_c, thm_mt, qn_mt, qp_tp, qv_mt, qc_mt, qi_mt, u_mt, v_mt,
+                        sp_t_cg.precip_rain, sp_t_cg.precip_snow,
+                        sp_t_cg.precip_rain_sub, sp_t_cg.precip_snow_sub,
                     )
 
                     rt_m = mean_2d(sub_c.rho_d)
@@ -3337,21 +3524,21 @@ def step_aoba_model(
                     qi_po = mean_2d(sub_c.rho_d * sub_c.q_i) * irt
                     u_po = mean_2d(sub_c.u)
                     v_po = mean_2d(sub_c.v)
-                    if sp_t_cg.precip_rain_sub is not None and sp_t_cg.precip_snow_sub is not None:
-                        rn_tl = _crm3d_to_tile3d(sp_t_cg.precip_rain_sub, from_full=True)
-                        sn_tl = _crm3d_to_tile3d(sp_t_cg.precip_snow_sub, from_full=True)
-                        f_pr_t = mean_2d(((sp_t_cg.precip_rain_sub + sp_t_cg.precip_snow_sub) > 1.0e-7).to(aqn_i.dtype))
+                    if pr_rs_cg is not None and pr_ss_cg is not None:
+                        rn_tl = _crm3d_to_tile3d(pr_rs_cg, from_full=True)
+                        sn_tl = _crm3d_to_tile3d(pr_ss_cg, from_full=True)
+                        f_pr_t = mean_2d(((pr_rs_cg + pr_ss_cg) > 1.0e-7).to(aqn_i.dtype))
                     else:
-                        rn_tl = sp_t_cg.precip_rain.unsqueeze(-1).unsqueeze(-1).expand(-1, ny_t, nx_t)
-                        sn_tl = sp_t_cg.precip_snow.unsqueeze(-1).unsqueeze(-1).expand(-1, ny_t, nx_t)
-                        f_pr_t = ((sp_t_cg.precip_rain + sp_t_cg.precip_snow) > 1.0e-7).to(aqn_i.dtype)
+                        rn_tl = pr_r_cg.unsqueeze(-1).unsqueeze(-1).expand(-1, ny_t, nx_t)
+                        sn_tl = pr_s_cg.unsqueeze(-1).unsqueeze(-1).expand(-1, ny_t, nx_t)
+                        f_pr_t = ((pr_r_cg + pr_s_cg) > 1.0e-7).to(aqn_i.dtype)
                     f_cl_t = mean_2d(((sub_c.q_c + sub_c.q_i) > 1.0e-6).to(aqn_i.dtype))
                     cp_t, cs_t, tp_t, ts_t = pack_teacher_context_and_targets(
                         rho_tp, atmos.dz_c[:, t_idx_i], ex_mt, temp_mt[0],
                         thm_mt, qn_mt, qp_tp, qc_mt, qi_mt, u_mt, v_mt,
                         z_sfc[t_idx_i], z_sfc[t_idx_i], z_sfc[t_idx_i], z_sfc[t_idx_i],
                         thm_po, qn_po, qp_po, qc_po, qi_po, u_po, v_po,
-                        sp_t_cg.precip_rain, sp_t_cg.precip_snow, f_cl_t, f_pr_t,
+                        pr_r_cg, pr_s_cg, f_cl_t, f_pr_t,
                     )
                     th0_tl = _crm3d_to_tile3d(sub_c.theta_m[0], from_full=True)
                     qv0_tl = _crm3d_to_tile3d(sub_c.q_v[0], from_full=True)
@@ -3373,7 +3560,7 @@ def step_aoba_model(
                         u_m, v_m, thm_m, qn_m, qke_m, qv_m, qc_m, qi_m, pres_m, ex_m, temp_m, z_sfc,
                         x_t, cp_t, cs_t, tp_t, ts_t, tmaps_t, hmap_t,
                         rn_tl, sn_tl, th0_tl, qv0_tl,
-                        thm_po, qn_po, qc_po, qi_po, u_po, v_po, sp_t_cg.precip_rain, sp_t_cg.precip_snow, f_cl_t,
+                        thm_po, qn_po, qc_po, qi_po, u_po, v_po, pr_r_cg, pr_s_cg, f_cl_t,
                         rho_tp, ex_mt, temp_mt[0], thm_mt, qn_mt, qp_tp, qc_mt, qi_mt, u_mt, v_mt,
                     ] + p_core_out + p_opt_out
 
@@ -3563,8 +3750,17 @@ def step_aoba_model(
                             n_s=pool.crm.n_s[:, :n_t] if getattr(pool.crm, "n_s", None) is not None else None,
                             n_g=pool.crm.n_g[:, :n_t] if getattr(pool.crm, "n_g", None) is not None else None,
                         )
-                    drho_t = (atmos.rho_d[:, t_idx] - mean_2d(sub_crm_t.rho_d)).unsqueeze(-1).unsqueeze(-1)
-                    sub_crm_t.rho_d = torch.clamp(sub_crm_t.rho_d + drho_t, min=1.0e-8)
+                    if shadow_pool:
+                        _reanchor_shadow_crm_to_host(
+                            sub_crm_t,
+                            atmos.rho_d[:, t_idx], atmos.theta_m[:, t_idx],
+                            atmos.q_v[:, t_idx], atmos.q_c[:, t_idx], atmos.q_i[:, t_idx], atmos.q_p[:, t_idx],
+                            u_host_new[:, t_idx], v_host_new[:, t_idx],
+                            k_top_crm=k_top_crm_sp,
+                        )
+                    else:
+                        drho_t = (atmos.rho_d[:, t_idx] - mean_2d(sub_crm_t.rho_d)).unsqueeze(-1).unsqueeze(-1)
+                        sub_crm_t.rho_d = torch.clamp(sub_crm_t.rho_d + drho_t, min=1.0e-8)
                     sub_crm_t.f_coriolis = mesh.f_cell[t_idx]
                     q_rad_t_in = (
                         pool.q_rad[:, :n_t]
@@ -3572,11 +3768,13 @@ def step_aoba_model(
                         else _tile4d_to_crm4d(q_rad_4d[:, t_idx], to_full=True)
                     )
                     if shadow_pool:
+                        dthm_t_ls = _shadow_ls_scale * dthm_ls[:, t_idx]
+                        dqn_t_ls = _shadow_ls_scale * dqn_ls[:, t_idx]
                         rho_t_pre = mean_2d(sub_crm_t.rho_d)
                         inv_rt_pre = 1.0 / torch.clamp(rho_t_pre, min=1.0e-8)
-                        thm_t_pre = mean_2d(sub_crm_t.rho_d * sub_crm_t.theta_m) * inv_rt_pre + dt * dthm_ls[:, t_idx]
+                        thm_t_pre = mean_2d(sub_crm_t.rho_d * sub_crm_t.theta_m) * inv_rt_pre + dt * dthm_t_ls
                         qn_t_pre = torch.clamp(
-                            mean_2d(sub_crm_t.rho_d * sub_crm_t.q_n) * inv_rt_pre + dt * dqn_ls[:, t_idx],
+                            mean_2d(sub_crm_t.rho_d * sub_crm_t.q_n) * inv_rt_pre + dt * dqn_t_ls,
                             min=0.0,
                         )
                         qp_t_pre = torch.clamp(mean_2d(sub_crm_t.rho_d * sub_crm_t.q_p) * inv_rt_pre, min=0.0)
@@ -3651,8 +3849,8 @@ def step_aoba_model(
                         u_host_target=u_host_new[:, t_idx],
                         v_host_target=v_host_new[:, t_idx],
                         tau_sp_mom=dt,
-                        dtheta_m_ls_dt=dthm_ls[:, t_idx],
-                        dq_n_ls_dt=dqn_ls[:, t_idx],
+                        dtheta_m_ls_dt=dthm_t_ls if shadow_pool else dthm_ls[:, t_idx],
+                        dq_n_ls_dt=dqn_t_ls if shadow_pool else dqn_ls[:, t_idx],
                         sfc_fluxes=sub_sfc_t,
                         rad_heating_k_s=q_rad_t_in,
                         z_c_col=atmos.z_c[:, t_idx],
@@ -3664,6 +3862,15 @@ def step_aoba_model(
                         q_dust_sub=q_dust_t_in,
                         k_top_crm=k_top_crm_sp,
                     )
+                    if shadow_pool:
+                        sp_t.precip_rain, sp_t.precip_snow, sp_t.precip_rain_sub, sp_t.precip_snow_sub = (
+                            _sanitize_shadow_crm_post(
+                                sub_crm_t, thm_mynn_t, qn_mynn_t, qp_t_pre,
+                                qv_mynn_t, qc_mynn_t, qi_mynn_t, u_mynn_t, v_mynn_t,
+                                sp_t.precip_rain, sp_t.precip_snow,
+                                sp_t.precip_rain_sub, sp_t.precip_snow_sub,
+                            )
+                        )
                     if n_t < pool.n_pool:
                         pool.crm.rho_d[:, :n_t] = sub_crm_t.rho_d
                         pool.crm.u[:, :n_t] = sub_crm_t.u
