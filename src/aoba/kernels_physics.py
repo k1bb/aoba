@@ -8312,6 +8312,639 @@ kernel void land_carbon_fire_commit_tile(
         fire_c_n_out[M + i] = 0.0f;
     }
 }
+
+// =========================================================================
+// 29. Fused Column Kernels: Ozone Perturbations, Mesosphere NOx+NLC,
+//     Mesospheric Molecular Diffusion (Cell/Edge), and Water Isotopes
+// =========================================================================
+
+kernel void ozone_pert_col(
+    device float* o3_io            [[buffer(0)]],   // [nz, nc] in/out
+    device const float* pres_c     [[buffer(1)]],   // [nz, nc]
+    device const float* temp_c     [[buffer(2)]],   // [nz, nc]
+    device const float* rho_d      [[buffer(3)]],   // [nz, nc]
+    device const float* dz_c       [[buffer(4)]],   // [nz, nc]
+    device const float* mu0        [[buffer(5)]],   // [nc]
+    device const float* volc_sad   [[buffer(6)]],   // [nz, nc] (or dummy)
+    device const float* nox_3d     [[buffer(7)]],   // [nz, nc] (or dummy)
+    device const float* z_c        [[buffer(8)]],   // [nz, nc] (or dummy)
+    device float* tco_du_out       [[buffer(9)]],   // [nc]
+    device float* o3_sfc_out       [[buffer(10)]],  // [nc]
+    constant ulong4& u_dim         [[buffer(11)]],  // [nz, nc, flags (bit0=volc, bit1=uv, bit2=nox, bit3=zc), 0]
+    constant float4& f_p0          [[buffer(12)]],  // [dt, ecl_fac, uv_scale_m1, n2o_fac]
+    uint c [[thread_position_in_grid]])
+{
+    uint nz = uint(u_dim.x);
+    uint nc = uint(u_dim.y);
+    uint flags = uint(u_dim.z);
+    if (c >= nc) return;
+
+    bool has_volc = (flags & 1u) != 0u;
+    bool has_uv   = (flags & 2u) != 0u;
+    bool has_nox  = (flags & 4u) != 0u;
+    bool has_zc   = (flags & 8u) != 0u;
+
+    float dt = f_p0.x;
+    float ecl_fac2 = f_p0.y * f_p0.y;
+    float uv_m1 = f_p0.z;
+    float n2o_fac = f_p0.w;
+    float is_day = (mu0[c] > 1.0e-4f) ? 1.0f : 0.0f;
+
+    float inv_60d = 1.0f / (60.0f * 86400.0f);
+    float inv_15d = 1.0f / (15.0f * 86400.0f);
+    float inv_m_air_e4 = 1.0e-4f / (28.9647e-3f / 6.02214076e23f);
+    float inv_du = 1.0f / 2.6867e16f;
+    float tco_acc = 0.0f;
+    float chi_sfc = 0.0f;
+
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * nc + c;
+        float chi = o3_io[idx];
+        float p_pa = max(pres_c[idx], 0.05f);
+        float p_hpa = p_pa * 0.01f;
+        float t_k = clamp(temp_c[idx], 115.0f, 350.0f);
+
+        if (has_volc) {
+            float p_win = aoba_sigmoid((180.0f - p_hpa) * 0.05f) * aoba_sigmoid((p_hpa - 8.0f) * (1.0f / 3.0f));
+            float t_cold = aoba_sigmoid((215.0f - t_k) * (1.0f / 6.0f));
+            float sad_sc = clamp(volc_sad[idx] * 0.05f, 0.0f, 6.0f);
+            float k_volc = inv_60d * ecl_fac2 * sad_sc * is_day * p_win * t_cold;
+            chi *= exp(-clamp(k_volc * dt, 0.0f, 5.0f));
+        }
+        if (has_uv) {
+            float p_uv = aoba_sigmoid((40.0f - p_hpa) * 0.125f) * aoba_sigmoid((p_hpa - 0.5f) * 2.0f);
+            float k_uv = uv_m1 * inv_15d * is_day * p_uv;
+            chi *= exp(clamp(k_uv * dt, -0.2f, 0.2f));
+        }
+        float nox_k = has_nox ? nox_3d[idx] : 0.0f;
+        if (has_nox) {
+            float f_strat_n = aoba_sigmoid((130.0f - p_hpa) * 0.04f);
+            float lp = log(max(p_hpa, 0.05f) * (1.0f / 6.0f)) * (1.0f / 1.65f);
+            float nox_bg = 5.4e-9f * n2o_fac * exp(-(lp * lp)) * f_strat_n
+                         + 6.0e-10f * aoba_sigmoid((0.5f - p_hpa) * 4.0f);
+            float nox_ex = clamp(nox_k - nox_bg, 0.0f, 5.0e-7f);
+            if (nox_ex > 0.0f && f_strat_n > 1.0e-6f) {
+                float m_cm3 = (p_pa / (1.380649e-23f * t_k)) * 1.0e-6f;
+                float k2 = 6.0e-34f * pow(300.0f / t_k, 2.4f);
+                float k_no2_o = 5.1e-12f * exp(210.0f / t_k);
+                float j_o3_eff = is_day * (8.5e-3f * exp(-min(p_hpa * 0.4f, 20.0f)) + 4.5e-4f);
+                // Grouped (k2*m_cm3)*(O2*m_cm3) avoids float32 overflow at surface m_cm3^2 ~ 6e38
+                float denom_o = max((k2 * m_cm3) * (0.20946f * m_cm3), 1.0e-30f);
+                float o_over_o3_n = min(j_o3_eff / denom_o, 50.0f);
+                float k_no_o3_night = 3.0e-12f * exp(-1500.0f / t_k) * (1.0f - is_day) * aoba_sigmoid((0.6f - p_hpa) * 5.0f);
+                float nm = nox_ex * m_cm3;
+                float l_nox_cat = f_strat_n * (2.0f * k_no2_o * (0.45f * nm) * o_over_o3_n + k_no_o3_night * nm);
+                chi *= exp(-clamp(l_nox_cat * dt, 0.0f, 3.0f));
+            }
+        }
+        if (has_zc) {
+            float z_km = z_c[idx] * 1.0e-3f;
+            float w_sec = aoba_sigmoid((z_km - 72.0f) * (1.0f / 3.0f)) * aoba_sigmoid((90.0f - z_km) * (1.0f / 3.0f));
+            if (w_sec > 1.0e-7f) {
+                float nox_mod = has_nox ? (1.0f / (1.0f + clamp(nox_k * 1.0e9f * 0.04f, 0.0f, 4.0f))) : 1.0f;
+                float chi_tgt = 0.25e-6f * is_day + 3.5e-6f * (1.0f - is_day) * nox_mod;
+                float tau_s = 1200.0f * is_day + 2400.0f * (1.0f - is_day);
+                float rel_m = _aoba_neg_expm1_neg(clamp(w_sec * dt / tau_s, 0.0f, 10.0f));
+                chi = chi + (chi_tgt - chi) * rel_m;
+            }
+        }
+        chi = clamp(chi, 1.0e-10f, 4.0e-5f);
+        o3_io[idx] = chi;
+        if (k == 0u) chi_sfc = chi * 1.0e9f;
+        float dm = max(rho_d[idx] * dz_c[idx], 1.0e-5f);
+        tco_acc += chi * (dm * inv_m_air_e4);
+    }
+    tco_du_out[c] = tco_acc * inv_du;
+    o3_sfc_out[c] = chi_sfc;
+}
+
+kernel void meso_nox_nlc_col(
+    device float* q_nox_io         [[buffer(0)]],   // [nz, nc] in/out
+    device const float* pres_c     [[buffer(1)]],   // [nz, nc]
+    device const float* temp_c     [[buffer(2)]],   // [nz, nc]
+    device const float* rho_d      [[buffer(3)]],   // [nz, nc]
+    device const float* z_c        [[buffer(4)]],   // [nz, nc]
+    device const float* dz_c       [[buffer(5)]],   // [nz, nc]
+    device const float* q_v        [[buffer(6)]],   // [nz, nc]
+    device const float* mu0        [[buffer(7)]],   // [nc]
+    device const float* lat_cell   [[buffer(8)]],   // [nc]
+    device const float* precip     [[buffer(9)]],   // [nc]
+    device const float* lnox_cell  [[buffer(10)]],  // [nc] (or dummy)
+    device const float* sp_nox     [[buffer(11)]],  // [nc] (or dummy)
+    device const float* sp_zhi     [[buffer(12)]],  // [nc] (or dummy)
+    device const float* sp_zlo     [[buffer(13)]],  // [nc] (or dummy)
+    device float* diag_out         [[buffer(14)]],  // [4, nc]: nox_meso_ppbv, nlc_frac, nlc_iwc, t_mesopause
+    constant ulong4& u_dim         [[buffer(15)]],  // [nz, nc, k_meso_start, flags (bit0=lnox, bit1=sp, bit2=zhi, bit3=zlo)]
+    constant float4& f_p0          [[buffer(16)]],  // [dt, n2o_fac, solar_uv_scale, 0]
+    uint c [[thread_position_in_grid]])
+{
+    uint nz = uint(u_dim.x);
+    uint nc = uint(u_dim.y);
+    uint k_ms = uint(u_dim.z);
+    uint flags = uint(u_dim.w);
+    if (c >= nc) return;
+
+    bool has_lnox = (flags & 1u) != 0u;
+    bool has_sp   = (flags & 2u) != 0u;
+    bool has_zhi  = (flags & 4u) != 0u;
+    bool has_zlo  = (flags & 8u) != 0u;
+
+    float dt = f_p0.x;
+    float n2o_fac = f_p0.y;
+    float uv_scale = f_p0.z;
+    float inv_m_air = 1.0f / 28.9647e-3f;
+    float inv_avo = 1.0f / 6.02214076e23f;
+    float inv_m_n = 1.0f / 14.007e-3f;
+    float inv_20d = 1.0f / (20.0f * 86400.0f);
+    float inv_2p5d = 1.0f / (2.5f * 86400.0f);
+
+    float mu_c = mu0[c];
+    float is_day = (mu_c > 1.0e-4f) ? 1.0f : 0.0f;
+    float sqrt_mu = sqrt(clamp(mu_c, 0.0f, 1.0f) + 1.0e-6f);
+    float p_sink_rate = inv_2p5d + 2.5e-4f * clamp(precip[c] * 1.0e3f, 0.0f, 5.0f);
+
+    float z_top_km = z_c[(nz - 1u) * nc + c] * 1.0e-3f;
+    float has_upper = (z_top_km > 70.0f) ? 1.0f : 0.0f;
+    float s_lat = fabs(sin(lat_cell[c]));
+    float polar_cap = (s_lat * s_lat) * (s_lat * s_lat);
+    float mol_epp = (1.2e12f * inv_avo) * uv_scale * (0.05f + 0.95f * polar_cap);
+
+    float mol_ln = has_lnox ? (max(lnox_cell[c], 0.0f) * inv_m_n) : 0.0f;
+    float mol_sp = has_sp ? (max(sp_nox[c], 0.0f) * inv_avo) : 0.0f;
+    float z_hi_eff = 78.0f;
+    float z_lo_eff = 48.0f;
+    if (has_sp) {
+        float zh = (has_zhi && sp_zhi[c] > 10.0f) ? sp_zhi[c] : 78.0f;
+        float zl = (has_zlo && sp_zlo[c] > 10.0f) ? sp_zlo[c] : 48.0f;
+        z_hi_eff = min(zh, z_top_km + 1.0f);
+        z_lo_eff = min(zl, z_hi_eff - 6.0f);
+    }
+
+    // Pass 1: column normalization integrals for sprite, LNOx, and EPP weights
+    float w_sp_sum = 0.0f;
+    float w_ln_sum = 0.0f;
+    float w_epp_sum = 0.0f;
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * nc + c;
+        float p_hpa = max(pres_c[idx], 0.05f) * 0.01f;
+        float z_km = z_c[idx] * 1.0e-3f;
+        float mol_air = max(rho_d[idx] * dz_c[idx], 1.0e-7f) * inv_m_air;
+        float f_strat = aoba_sigmoid((130.0f - p_hpa) * 0.04f);
+        float f_trop = 1.0f - f_strat;
+        if (has_sp) {
+            float w_sp = aoba_sigmoid((z_km - z_lo_eff) * 0.4f) * aoba_sigmoid((z_hi_eff - z_km) * 0.4f);
+            w_sp_sum += w_sp * mol_air;
+        }
+        if (has_lnox) {
+            float dp = (p_hpa - 350.0f) * (1.0f / 180.0f);
+            w_ln_sum += exp(-(dp * dp)) * f_trop * mol_air;
+        }
+        if (has_upper > 0.5f) {
+            w_epp_sum += aoba_sigmoid((z_km - 74.0f) * (1.0f / 3.0f)) * mol_air;
+        }
+    }
+    float inv_wsp = 1.0f / max(w_sp_sum, 1.0e-6f);
+    float inv_wln = 1.0f / max(w_ln_sum, 1.0e-6f);
+    float inv_wepp = has_upper / max(w_epp_sum, 1.0e-6f);
+
+    // Pass 2: exact exponential NOx update + mesospheric NOx & Murphy-Koop NLC diagnostics
+    float meso_num = 0.0f;
+    float meso_den = 0.0f;
+    float q_last = 1.0e-12f;
+    bool any_meso_t = false;
+    float t_min_meso = 350.0f;
+    bool any_nlc = false;
+    float nlc_iwc_peak = 0.0f;
+    float s_ice_peak = 0.0f;
+    float t_top = temp_c[(nz - 1u) * nc + c];
+
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * nc + c;
+        float p_pa = max(pres_c[idx], 0.05f);
+        float p_hpa = p_pa * 0.01f;
+        float z_km = z_c[idx] * 1.0e-3f;
+        float rho_k = rho_d[idx];
+        float mol_air = max(rho_k * dz_c[idx], 1.0e-7f) * inv_m_air;
+        float inv_mol_safe = 1.0f / max(mol_air, 1.0e-6f);
+
+        float q0 = clamp(q_nox_io[idx], 1.0e-12f, 2.0e-6f);
+        float f_strat = aoba_sigmoid((130.0f - p_hpa) * 0.04f);
+        float f_trop = 1.0f - f_strat;
+        float f_meso = aoba_sigmoid((z_km - 52.0f) * 0.2f);
+
+        float p_hpa_bg = max(pres_c[idx] * 0.01f, 1.0e-4f);
+        float f_strat_bg = aoba_sigmoid((130.0f - p_hpa_bg) * 0.04f);
+        float lp = log(max(p_hpa_bg, 0.05f) * (1.0f / 6.0f)) * (1.0f / 1.65f);
+        float nox_bg = clamp(
+            5.4e-9f * n2o_fac * exp(-(lp * lp)) * f_strat_bg
+            + 5.0e-11f * (1.0f - f_strat_bg)
+            + 6.0e-10f * aoba_sigmoid((0.5f - p_hpa_bg) * 4.0f),
+            1.0e-12f, 2.0e-6f
+        );
+        float k_strat_relax = inv_20d * f_strat * (1.0f - f_meso);
+        float p_nox = k_strat_relax * nox_bg;
+
+        if (has_sp && mol_sp > 0.0f) {
+            float w_sp = aoba_sigmoid((z_km - z_lo_eff) * 0.4f) * aoba_sigmoid((z_hi_eff - z_km) * 0.4f);
+            p_nox += (mol_sp * (w_sp * mol_air * inv_wsp)) * inv_mol_safe;
+        }
+        if (has_lnox && mol_ln > 0.0f) {
+            float dp = (p_hpa - 350.0f) * (1.0f / 180.0f);
+            float w_ln = exp(-(dp * dp)) * f_trop;
+            p_nox += (mol_ln * (w_ln * mol_air * inv_wln)) * inv_mol_safe;
+        }
+        if (has_upper > 0.5f) {
+            float w_epp = aoba_sigmoid((z_km - 74.0f) * (1.0f / 3.0f));
+            p_nox += (mol_epp * (w_epp * mol_air * inv_wepp)) * inv_mol_safe;
+        }
+
+        float k_phot = 4.5e-6f * is_day * sqrt_mu * aoba_sigmoid((z_km - 60.0f) * 0.2f);
+        float k_trop = f_trop * p_sink_rate;
+        float l_tot = k_strat_relax + k_phot + k_trop;
+        float l_safe = max(l_tot, 1.0e-12f);
+        float q_new;
+        if (l_tot > 1.0e-11f) {
+            float q_eq = p_nox / l_safe;
+            float relax = _aoba_neg_expm1_neg(clamp(l_safe * dt, 0.0f, 40.0f));
+            q_new = q0 + (q_eq - q0) * relax;
+        } else {
+            q_new = q0 + p_nox * dt;
+        }
+        q_new = clamp(q_new, 1.0e-12f, 2.0e-6f);
+        q_nox_io[idx] = q_new;
+        q_last = q_new;
+
+        if (z_km >= 55.0f) {
+            meso_num += q_new * mol_air;
+            meso_den += mol_air;
+        }
+        if (k >= k_ms) {
+            float t_s = temp_c[idx];
+            if (z_km >= 62.0f) {
+                any_meso_t = true;
+                t_min_meso = min(t_min_meso, t_s);
+            }
+            if (z_km >= 72.0f && z_km <= 92.0f) {
+                any_nlc = true;
+                float t_k = clamp(t_s, 110.0f, 273.15f);
+                float ln_es = 9.550426f - 5723.265f / t_k + 3.53068f * log(t_k) - 0.00728332f * t_k;
+                float es_pa = exp(clamp(ln_es, -45.0f, 10.0f));
+                float h2o_vmr = clamp(q_v[idx] * (28.9647f / 18.01528f), 2.5e-6f, 1.0e-4f);
+                float s_ice = (h2o_vmr * p_pa) / max(es_pa, 1.0e-20f);
+                float q_ex = max(h2o_vmr * (1.0f - 1.0f / max(s_ice, 1.0f)), 0.0f) * (18.01528f / 28.9647f);
+                nlc_iwc_peak = max(nlc_iwc_peak, q_ex * rho_k * 1.0e6f);
+                s_ice_peak = max(s_ice_peak, s_ice);
+            }
+        }
+    }
+
+    diag_out[c]          = (meso_den > 1.0e-6f) ? ((meso_num / meso_den) * 1.0e9f) : (q_last * 1.0e9f);
+    diag_out[nc + c]     = (any_nlc && s_ice_peak > 1.0f) ? aoba_sigmoid((s_ice_peak - 1.15f) * 4.0f) : 0.0f;
+    diag_out[2u * nc + c]= nlc_iwc_peak;
+    diag_out[3u * nc + c]= any_meso_t ? t_min_meso : t_top;
+}
+
+kernel void meso_mol_diff_cell_col(
+    device const float* rho_d      [[buffer(0)]],   // [nz, nc]
+    device float* theta_m_io       [[buffer(1)]],   // [nz, nc] in/out
+    device const float* z_c        [[buffer(2)]],   // [nz, nc]
+    device const float* dz_c       [[buffer(3)]],   // [nz, nc]
+    device const float* temp_c     [[buffer(4)]],   // [nz, nc]
+    device float* nu_c_out         [[buffer(5)]],   // [nz_s, nc]
+    constant ulong4& u_dim         [[buffer(6)]],   // [nz, nc, ks, nz_s]
+    constant float4& f_p0          [[buffer(7)]],   // [dt, inv_pr, 0, 0]
+    uint c [[thread_position_in_grid]])
+{
+    uint nc = uint(u_dim.y);
+    uint ks = uint(u_dim.z);
+    uint nz_s = uint(u_dim.w);
+    if (c >= nc || nz_s < 3u || nz_s > 64u) return;
+
+    float dt = f_p0.x;
+    float inv_pr = f_p0.y;
+    float t_loc[64];
+    float rho_loc[64];
+    float dz_loc[64];
+    float kap_loc[64];
+    float cp[64];
+    float dp[64];
+
+    for (uint j = 0u; j < nz_s; ++j) {
+        uint idx = (ks + j) * nc + c;
+        float t_s = clamp(temp_c[idx], 110.0f, 350.0f);
+        float r_s = rho_d[idx];
+        float mu = 1.458e-6f * (t_s * sqrt(t_s)) / (t_s + 110.4f);
+        float w_mol = aoba_sigmoid((z_c[idx] * 1.0e-3f - 62.0f) * 0.25f);
+        float nu = min(mu / max(r_s, 1.0e-7f), 40.0f) * w_mol;
+        nu_c_out[j * nc + c] = nu;
+        t_loc[j] = t_s;
+        rho_loc[j] = r_s;
+        dz_loc[j] = dz_c[idx];
+        kap_loc[j] = nu * inv_pr;
+    }
+
+    float c_dn = 0.0f;
+    float fl_dn = 0.0f;
+    float c_prev = 0.0f;
+    float d_prev = 0.0f;
+    for (uint j = 0u; j < nz_s; ++j) {
+        float c_up = 0.0f;
+        float fl_up = 0.0f;
+        if (j + 1u < nz_s) {
+            float r_i = 0.5f * (rho_loc[j] + rho_loc[j + 1u]);
+            float k_i = 0.5f * (kap_loc[j] + kap_loc[j + 1u]);
+            float dz_i = max(0.5f * (dz_loc[j] + dz_loc[j + 1u]), 10.0f);
+            c_up = dt * (r_i * k_i / dz_i);
+            fl_up = c_up * (t_loc[j + 1u] - t_loc[j]);
+        }
+        float inv_dm = 1.0f / max(rho_loc[j] * dz_loc[j], 1.0e-7f);
+        float dl = -c_dn * inv_dm;
+        float du = -c_up * inv_dm;
+        float dg = 1.0f + (c_dn + c_up) * inv_dm;
+        float rhs = (fl_up - fl_dn) * inv_dm;
+        float inv_den = 1.0f / max((j == 0u) ? dg : (dg - dl * c_prev), 1.0e-20f);
+        c_prev = (j + 1u < nz_s) ? (du * inv_den) : 0.0f;
+        d_prev = (j == 0u) ? (rhs * inv_den) : ((rhs - dl * d_prev) * inv_den);
+        cp[j] = c_prev;
+        dp[j] = d_prev;
+        c_dn = c_up;
+        fl_dn = fl_up;
+    }
+
+    float dq_next = 0.0f;
+    for (int ji = int(nz_s) - 1; ji >= 0; --ji) {
+        uint j = uint(ji);
+        float dq = (ji == int(nz_s) - 1) ? dp[j] : (dp[j] - cp[j] * dq_next);
+        dq_next = dq;
+        uint idx = (ks + j) * nc + c;
+        float thm_s = theta_m_io[idx];
+        theta_m_io[idx] = clamp(thm_s + dq * (thm_s / t_loc[j]), 150.0f, 50000.0f);
+    }
+}
+
+kernel void meso_mol_diff_edge_col(
+    device const int* c0_arr       [[buffer(0)]],   // [ne]
+    device const int* c1_arr       [[buffer(1)]],   // [ne]
+    device const float* rho_d      [[buffer(2)]],   // [nz, nc]
+    device const float* dz_c       [[buffer(3)]],   // [nz, nc]
+    device const float* nu_c       [[buffer(4)]],   // [nz_s, nc]
+    device float* u_edge_io        [[buffer(5)]],   // [nz, ne] in/out
+    constant ulong4& u_dim         [[buffer(6)]],   // [nc, ne, ks, nz_s]
+    constant float& dt             [[buffer(7)]],
+    uint e [[thread_position_in_grid]])
+{
+    uint nc = uint(u_dim.x);
+    uint ne = uint(u_dim.y);
+    uint ks = uint(u_dim.z);
+    uint nz_s = uint(u_dim.w);
+    if (e >= ne || nz_s < 3u || nz_s > 64u) return;
+
+    uint c0 = uint(c0_arr[e]);
+    uint c1 = uint(c1_arr[e]);
+    float u_loc[64];
+    float rho_loc[64];
+    float dz_loc[64];
+    float nu_loc[64];
+    float cp[64];
+    float dp[64];
+
+    for (uint j = 0u; j < nz_s; ++j) {
+        uint cbase = (ks + j) * nc;
+        u_loc[j] = u_edge_io[(ks + j) * ne + e];
+        rho_loc[j] = 0.5f * (rho_d[cbase + c0] + rho_d[cbase + c1]);
+        dz_loc[j] = 0.5f * (dz_c[cbase + c0] + dz_c[cbase + c1]);
+        nu_loc[j] = 0.5f * (nu_c[j * nc + c0] + nu_c[j * nc + c1]);
+    }
+
+    float c_dn = 0.0f;
+    float fl_dn = 0.0f;
+    float c_prev = 0.0f;
+    float d_prev = 0.0f;
+    for (uint j = 0u; j < nz_s; ++j) {
+        float c_up = 0.0f;
+        float fl_up = 0.0f;
+        if (j + 1u < nz_s) {
+            float r_i = 0.5f * (rho_loc[j] + rho_loc[j + 1u]);
+            float k_i = 0.5f * (nu_loc[j] + nu_loc[j + 1u]);
+            float dz_i = max(0.5f * (dz_loc[j] + dz_loc[j + 1u]), 10.0f);
+            c_up = dt * (r_i * k_i / dz_i);
+            fl_up = c_up * (u_loc[j + 1u] - u_loc[j]);
+        }
+        float inv_dm = 1.0f / max(rho_loc[j] * dz_loc[j], 1.0e-7f);
+        float dl = -c_dn * inv_dm;
+        float du = -c_up * inv_dm;
+        float dg = 1.0f + (c_dn + c_up) * inv_dm;
+        float rhs = (fl_up - fl_dn) * inv_dm;
+        float inv_den = 1.0f / max((j == 0u) ? dg : (dg - dl * c_prev), 1.0e-20f);
+        c_prev = (j + 1u < nz_s) ? (du * inv_den) : 0.0f;
+        d_prev = (j == 0u) ? (rhs * inv_den) : ((rhs - dl * d_prev) * inv_den);
+        cp[j] = c_prev;
+        dp[j] = d_prev;
+        c_dn = c_up;
+        fl_dn = fl_up;
+    }
+
+    float dq_next = 0.0f;
+    for (int ji = int(nz_s) - 1; ji >= 0; --ji) {
+        uint j = uint(ji);
+        float dq = (ji == int(nz_s) - 1) ? dp[j] : (dp[j] - cp[j] * dq_next);
+        dq_next = dq;
+        u_edge_io[(ks + j) * ne + e] = u_loc[j] + dq;
+    }
+}
+
+inline void _iso_eq_factors(float temp_k, thread float& a18_eff, thread float& ad_eff, thread float& a18_l, thread float& ad_l) {
+    float t = clamp(temp_k, 190.0f, 330.0f);
+    float inv_t = 1.0f / t;
+    float inv_t2 = inv_t * inv_t;
+    a18_l = exp(1137.0f * inv_t2 - 0.4156f * inv_t - 0.0020667f);
+    ad_l  = exp(24844.0f * inv_t2 - 76.248f * inv_t + 0.052612f);
+    float a_i18_eq = exp(11.839f * inv_t - 0.028224f);
+    float a_id_eq  = exp(16288.0f * inv_t2 - 0.0934f);
+    float s_ice = 1.0f + 0.003f * clamp(273.15f - t, 0.0f, 60.0f);
+    float a_i18 = a_i18_eq * (s_ice / (1.0f + a_i18_eq * (s_ice - 1.0f) * 1.0285f));
+    float a_id  = a_id_eq  * (s_ice / (1.0f + a_id_eq  * (s_ice - 1.0f) * 1.0251f));
+    float f_liq = clamp((t - 253.15f) * 0.05f, 0.0f, 1.0f);
+    a18_eff = f_liq * a18_l + (1.0f - f_liq) * a_i18;
+    ad_eff  = f_liq * ad_l  + (1.0f - f_liq) * a_id;
+}
+
+kernel void water_isotopes_col(
+    device float* q18_io           [[buffer(0)]],   // [nz, nc] in/out
+    device float* qd_io            [[buffer(1)]],   // [nz, nc] in/out
+    device float* sfc_io           [[buffer(2)]],   // [6, nc]: d18p, ddp, dex, d18s, dds, snow_w
+    device const float* q_v        [[buffer(3)]],   // [nz, nc]
+    device const float* temp_c     [[buffer(4)]],   // [nz, nc]
+    device const float* rho_d      [[buffer(5)]],   // [nz, nc]
+    device const float* dz_c       [[buffer(6)]],   // [nz, nc]
+    device const float* sfc_in     [[buffer(7)]],   // [8, nc]: is_ocn, t_sfc, evap, rain, snow, rh_sfc, u10, lai
+    constant ulong4& u_dim         [[buffer(8)]],   // [nz, nc, flags (bit0=rh, bit1=u10, bit2=lai), 0]
+    constant float4& f_p0          [[buffer(9)]],   // [dt, kappa_drop_18, kappa_drop_d, 0]
+    uint c [[thread_position_in_grid]])
+{
+    uint nz = uint(u_dim.x);
+    uint nc = uint(u_dim.y);
+    uint flags = uint(u_dim.z);
+    if (c >= nc) return;
+
+    bool has_rh  = (flags & 1u) != 0u;
+    bool has_u10 = (flags & 2u) != 0u;
+    bool has_lai = (flags & 4u) != 0u;
+    float dt = f_p0.x;
+    float k_drop18 = f_p0.y;
+    float k_dropd  = f_p0.z;
+
+    float is_ocn   = sfc_in[c];
+    float t_sfc    = sfc_in[nc + c];
+    float evap_c   = max(sfc_in[2u * nc + c], 0.0f);
+    float rain_pos = max(sfc_in[3u * nc + c], 0.0f);
+    float snow_pos = max(sfc_in[4u * nc + c], 0.0f);
+    float rh_raw   = has_rh ? sfc_in[5u * nc + c] : 0.78f;
+    float u10_raw  = has_u10 ? sfc_in[6u * nc + c] : 0.0f;
+    float lai_raw  = has_lai ? sfc_in[7u * nc + c] : 0.0f;
+
+    float d18_p_old = sfc_io[c];
+    float dd_p_old  = sfc_io[nc + c];
+    float d18_s_old = sfc_io[3u * nc + c];
+    float dd_s_old  = sfc_io[4u * nc + c];
+    float sw_old    = sfc_io[5u * nc + c];
+
+    // 1. Surface evaporation Craig-Gordon update at k = 0
+    float a18_e_s, ad_e_s, a18_sfc, ad_sfc;
+    _iso_eq_factors(t_sfc, a18_e_s, ad_e_s, a18_sfc, ad_sfc);
+    float h_rel = clamp(rh_raw, 0.25f, 0.94f);
+    float k18_ocn = 0.0060f;
+    if (has_u10) {
+        float u10_p = clamp(u10_raw, 0.0f, 50.0f);
+        k18_ocn = (u10_p < 7.0f) ? 0.0060f : clamp(0.000285f * u10_p + 0.00082f, 0.0028f, 0.012f);
+    }
+    float kd_ocn = 0.88f * k18_ocn;
+    float one_m_h = max(1.0f - h_rel, 0.06f);
+
+    float qv0 = max(q_v[c], 1.0e-8f);
+    float dm0 = max(rho_d[c] * dz_c[c], 1.0e-4f);
+    float r18_0_in = clamp(q18_io[c] / qv0, 0.90f, 1.03f);
+    float rd_0_in  = clamp(qd_io[c]  / qv0, 0.35f, 1.15f);
+
+    float r18_ev_ocn = clamp(((1.0f / a18_sfc - h_rel * r18_0_in) / one_m_h) * (1.0f - k18_ocn), 0.94f, 1.01f);
+    float rd_ev_ocn  = clamp(((1.0f / ad_sfc  - h_rel * rd_0_in)  / one_m_h) * (1.0f - kd_ocn),  0.72f, 1.05f);
+    float r18_soil = clamp(1.0f + d18_p_old * 1.0e-3f, 0.92f, 1.02f);
+    float rd_soil  = clamp(1.0f + dd_p_old  * 1.0e-3f, 0.45f, 1.08f);
+    float r18_land = r18_soil;
+    float rd_land  = rd_soil;
+    if (has_lai) {
+        float f_bare = exp(-0.5f * max(lai_raw, 0.0f));
+        float r18_bare = clamp(((r18_soil / a18_sfc - h_rel * r18_0_in) / one_m_h) * (1.0f - 0.0120f), 0.90f, 1.02f);
+        float rd_bare  = clamp(((rd_soil  / ad_sfc  - h_rel * rd_0_in)  / one_m_h) * (1.0f - 0.88f * 0.0120f), 0.40f, 1.08f);
+        r18_land = (1.0f - f_bare) * r18_soil + f_bare * r18_bare;
+        rd_land  = (1.0f - f_bare) * rd_soil  + f_bare * rd_bare;
+    }
+    float r18_ev = is_ocn * r18_ev_ocn + (1.0f - is_ocn) * r18_land;
+    float rd_ev  = is_ocn * rd_ev_ocn  + (1.0f - is_ocn) * rd_land;
+    float dq_ev = (evap_c * dt) / dm0;
+    float f_ev = dq_ev / (qv0 + dq_ev);
+    float r18_0 = r18_0_in + (r18_ev - r18_0_in) * f_ev;
+    float rd_0  = rd_0_in  + (rd_ev  - rd_0_in)  * f_ev;
+
+    // Pass 1: column vapor integral & condensation-weighted isotopic ratios
+    float cwv = 0.0f;
+    float r18_num = 0.0f;
+    float rd_num = 0.0f;
+    float a18_l0 = 1.0f;
+    float ad_l0 = 1.0f;
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * nc + c;
+        float qvk = max(q_v[idx], 1.0e-8f);
+        float dmk = max(rho_d[idx] * dz_c[idx], 1.0e-4f);
+        float qm = qvk * dmk;
+        float a18_e, ad_e, a18_l, ad_l;
+        _iso_eq_factors(temp_c[idx], a18_e, ad_e, a18_l, ad_l);
+        if (k == 0u) { a18_l0 = a18_l; ad_l0 = ad_l; }
+        float r18k = (k == 0u) ? r18_0 : clamp(q18_io[idx] / qvk, 0.90f, 1.03f);
+        float rdk  = (k == 0u) ? rd_0  : clamp(qd_io[idx]  / qvk, 0.35f, 1.15f);
+        cwv += qm;
+        r18_num += qm * r18k * a18_e;
+        rd_num  += qm * rdk  * ad_e;
+    }
+    float cwv_safe = max(cwv, 1.0e-3f);
+    float inv_cwv = 1.0f / cwv_safe;
+    float r18_cond = r18_num * inv_cwv;
+    float rd_cond  = rd_num  * inv_cwv;
+
+    float precip_tot = rain_pos + snow_pos;
+    float f_rem = exp(-clamp((precip_tot * dt) * inv_cwv, 0.0f, 2.0f));
+    float ln_f = log(clamp(f_rem, 0.05f, 1.0f));
+
+    // Pass 2: Rayleigh distillation on all levels + Stewart raindrop re-evap at k = 0
+    float r18_0_post = r18_0;
+    float rd_0_post  = rd_0;
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * nc + c;
+        float qvk = max(q_v[idx], 1.0e-8f);
+        float a18_e, ad_e, a18_l, ad_l;
+        _iso_eq_factors(temp_c[idx], a18_e, ad_e, a18_l, ad_l);
+        float r18k = (k == 0u) ? r18_0 : clamp(q18_io[idx] / qvk, 0.90f, 1.03f);
+        float rdk  = (k == 0u) ? rd_0  : clamp(qd_io[idx]  / qvk, 0.35f, 1.15f);
+        r18k = clamp(r18k * exp((a18_e - 1.0f) * ln_f), 0.90f, 1.03f);
+        rdk  = clamp(rdk  * exp((ad_e  - 1.0f) * ln_f), 0.35f, 1.15f);
+        if (k == 0u) {
+            r18_0_post = r18k;
+            rd_0_post = rdk;
+        } else {
+            q18_io[idx] = r18k * qvk;
+            qd_io[idx]  = rdk  * qvk;
+        }
+    }
+
+    float h_sub = clamp(rh_raw, 0.25f, 0.98f);
+    float one_m_hs = max(1.0f - h_sub, 0.02f);
+    float f_rain_share = (precip_tot > 1.0e-12f) ? (rain_pos / precip_tot) : 0.0f;
+    float f_reevap = f_rain_share * clamp(0.35f * one_m_hs / (1.0f + rain_pos / 1.5e-4f), 0.0f, 0.45f);
+    float f_drop = clamp(1.0f - f_reevap, 0.55f, 1.0f);
+    float ln_fdrop = log(f_drop);
+
+    float ak18 = a18_l0 * k_drop18;
+    float akd  = ad_l0  * k_dropd;
+    float den18 = max(1.0f - ak18 * one_m_hs, 0.10f);
+    float dend  = max(1.0f - akd  * one_m_hs, 0.10f);
+    float g18 = (a18_l0 * h_sub) / den18;
+    float gd  = (ad_l0  * h_sub) / dend;
+    float b18 = den18 / (ak18 * one_m_hs);
+    float bd  = dend  / (akd  * one_m_hs);
+    float p18 = exp(clamp(b18 * ln_fdrop, -10.0f, 0.0f));
+    float pd  = exp(clamp(bd  * ln_fdrop, -10.0f, 0.0f));
+
+    float r18_drop = clamp(g18 * r18_0_post + (r18_cond - g18 * r18_0_post) * p18, 0.90f, 1.03f);
+    float rd_drop  = clamp(gd  * rd_0_post  + (rd_cond  - gd  * rd_0_post)  * pd,  0.35f, 1.15f);
+    float r18_re = (f_reevap > 1.0e-5f) ? clamp((r18_cond - f_drop * r18_drop) / f_reevap, 0.90f, 1.03f) : r18_0_post;
+    float rd_re  = (f_reevap > 1.0e-5f) ? clamp((rd_cond  - f_drop * rd_drop)  / f_reevap, 0.35f, 1.15f) : rd_0_post;
+
+    float dq_re = (f_reevap * rain_pos * dt) / dm0;
+    float f_mix = dq_re / (qv0 + dq_re);
+    q18_io[c] = clamp(r18_0_post + (r18_re - r18_0_post) * f_mix, 0.90f, 1.03f) * qv0;
+    qd_io[c]  = clamp(rd_0_post  + (rd_re  - rd_0_post)  * f_mix, 0.35f, 1.15f) * qv0;
+
+    float r18_sfc_p = f_rain_share * r18_drop + (1.0f - f_rain_share) * r18_cond;
+    float rd_sfc_p  = f_rain_share * rd_drop  + (1.0f - f_rain_share) * rd_cond;
+    bool has_p = precip_tot > 1.0e-8f;
+    float d18_p_new = has_p ? ((r18_sfc_p - 1.0f) * 1000.0f) : d18_p_old;
+    float dd_p_new  = has_p ? ((rd_sfc_p  - 1.0f) * 1000.0f) : dd_p_old;
+    float dex_new   = dd_p_new - 8.0f * d18_p_new;
+
+    float dsnow = snow_pos * dt;
+    float w_old = clamp(sw_old, 0.0f, 500.0f);
+    float w_new = w_old + dsnow;
+    float a_sn = (w_new > 1.0e-9f) ? (dsnow / w_new) : 0.0f;
+    float d18_s_new = d18_s_old + (((r18_cond - 1.0f) * 1000.0f) - d18_s_old) * a_sn;
+    float dd_s_new  = dd_s_old  + (((rd_cond  - 1.0f) * 1000.0f) - dd_s_old)  * a_sn;
+
+    sfc_io[c]          = d18_p_new;
+    sfc_io[nc + c]     = dd_p_new;
+    sfc_io[2u * nc + c]= dex_new;
+    sfc_io[3u * nc + c]= d18_s_new;
+    sfc_io[4u * nc + c]= dd_s_new;
+    sfc_io[5u * nc + c]= min(w_new, 500.0f);
+}
 """
 
 
@@ -10576,3 +11209,195 @@ def run_rad_distill_closure_metal(
         "olr": scal_out[5],
         "asr": scal_out[6],
     }
+
+
+def run_ozone_pert_metal(
+    lib: Any,
+    o3_vmr: torch.Tensor,
+    pres_c: torch.Tensor,
+    temp_c: torch.Tensor,
+    rho_d: torch.Tensor,
+    dz_c: torch.Tensor,
+    mu0: torch.Tensor,
+    dt: float,
+    ecl_ppbv: float,
+    uv_j_o2_scale: float,
+    volc_sad_um2_cm3: torch.Tensor | None,
+    n2o_ppmv: float,
+    nox_vmr_3d: torch.Tensor | None,
+    z_c: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    nz, nc = pres_c.shape
+    dev = pres_c.device
+    o3_io = o3_vmr.contiguous().clone()
+    dummy = pres_c
+    flags = 0
+    if volc_sad_um2_cm3 is not None:
+        flags |= 1
+    if abs(float(uv_j_o2_scale) - 1.0) > 1.0e-5:
+        flags |= 2
+    if nox_vmr_3d is not None:
+        flags |= 4
+    if z_c is not None:
+        flags |= 8
+    tco_out = torch.empty((nc,), device=dev, dtype=torch.float32)
+    sfc_out = torch.empty((nc,), device=dev, dtype=torch.float32)
+    lib.ozone_pert_col(
+        o3_io, pres_c.contiguous(), temp_c.contiguous(), rho_d.contiguous(), dz_c.contiguous(),
+        mu0.contiguous(),
+        volc_sad_um2_cm3.contiguous() if volc_sad_um2_cm3 is not None else dummy,
+        nox_vmr_3d.contiguous() if nox_vmr_3d is not None else dummy,
+        z_c.contiguous() if z_c is not None else dummy,
+        tco_out, sfc_out,
+        [nz, nc, flags, 0],
+        [float(dt), max(float(ecl_ppbv), 0.1) / 3.5, float(uv_j_o2_scale) - 1.0, max(float(n2o_ppmv), 0.01) / 0.273],
+        threads=nc,
+    )
+    return o3_io, tco_out, sfc_out
+
+
+def run_meso_nox_nlc_metal(
+    lib: Any,
+    q_nox: torch.Tensor,
+    pres_c: torch.Tensor,
+    temp_c: torch.Tensor,
+    rho_d: torch.Tensor,
+    z_c: torch.Tensor,
+    dz_c: torch.Tensor,
+    q_v: torch.Tensor,
+    mu0: torch.Tensor,
+    lat_cell: torch.Tensor,
+    precip_cell: torch.Tensor,
+    dt: float,
+    n2o_ppmv: float,
+    lnox_cell_kgn_m2s: torch.Tensor | None,
+    sprite_nox_mol_m2s: torch.Tensor | None,
+    sprite_z_init_km: torch.Tensor | None,
+    sprite_z_stop_km: torch.Tensor | None,
+    solar_uv_scale: float,
+    k_meso_start: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    nz, nc = pres_c.shape
+    dev = pres_c.device
+    ks = max(0, min(int(k_meso_start), max(nz - 1, 0)))
+    q_io = q_nox.contiguous().clone()
+    d1 = mu0.contiguous()
+    flags = 0
+    if lnox_cell_kgn_m2s is not None:
+        flags |= 1
+    if sprite_nox_mol_m2s is not None:
+        flags |= 2
+    if sprite_z_init_km is not None:
+        flags |= 4
+    if sprite_z_stop_km is not None:
+        flags |= 8
+    diag_out = torch.empty((4, nc), device=dev, dtype=torch.float32)
+    lib.meso_nox_nlc_col(
+        q_io, pres_c.contiguous(), temp_c.contiguous(), rho_d.contiguous(),
+        z_c.contiguous(), dz_c.contiguous(), q_v.contiguous(),
+        d1, lat_cell.contiguous(), precip_cell.contiguous(),
+        lnox_cell_kgn_m2s.contiguous() if lnox_cell_kgn_m2s is not None else d1,
+        sprite_nox_mol_m2s.contiguous() if sprite_nox_mol_m2s is not None else d1,
+        sprite_z_init_km.contiguous() if sprite_z_init_km is not None else d1,
+        sprite_z_stop_km.contiguous() if sprite_z_stop_km is not None else d1,
+        diag_out,
+        [nz, nc, ks, flags],
+        [float(dt), max(float(n2o_ppmv), 0.01) / 0.273, float(solar_uv_scale), 0.0],
+        threads=nc,
+    )
+    return q_io, diag_out[0], diag_out[1], diag_out[2], diag_out[3]
+
+
+def run_meso_mol_diff_metal(
+    lib: Any,
+    rho_d: torch.Tensor,
+    theta_m: torch.Tensor,
+    u_edge: torch.Tensor,
+    z_c: torch.Tensor,
+    dz_c: torch.Tensor,
+    temp_c: torch.Tensor,
+    c0: torch.Tensor,
+    c1: torch.Tensor,
+    dt: float,
+    k_start: int,
+    prandtl_mol: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    nz, nc = rho_d.shape
+    ne = u_edge.shape[1]
+    ks = max(0, min(int(k_start), nz - 3))
+    nz_s = nz - ks
+    dev = rho_d.device
+    thm_io = theta_m.contiguous().clone()
+    ue_io = u_edge.contiguous().clone()
+    nu_c = torch.empty((nz_s, nc), device=dev, dtype=torch.float32)
+    rho_c = rho_d.contiguous()
+    dz_cc = dz_c.contiguous()
+    lib.meso_mol_diff_cell_col(
+        rho_c, thm_io, z_c.contiguous(), dz_cc, temp_c.contiguous(), nu_c,
+        [nz, nc, ks, nz_s], [float(dt), 1.0 / float(prandtl_mol), 0.0, 0.0],
+        threads=nc,
+    )
+    lib.meso_mol_diff_edge_col(
+        c0.to(torch.int32).contiguous(), c1.to(torch.int32).contiguous(),
+        rho_c, dz_cc, nu_c, ue_io,
+        [nc, ne, ks, nz_s], float(dt),
+        threads=ne,
+    )
+    return thm_io, ue_io
+
+
+def run_water_isotopes_metal(
+    lib: Any,
+    q_v_18o: torch.Tensor,
+    q_v_hdo: torch.Tensor,
+    d18o_precip: torch.Tensor,
+    dd_precip: torch.Tensor,
+    d18o_snow: torch.Tensor,
+    dd_snow: torch.Tensor,
+    snow_iso_weight: torch.Tensor,
+    q_v: torch.Tensor,
+    temp_c: torch.Tensor,
+    rho_d: torch.Tensor,
+    dz_c: torch.Tensor,
+    surf_type: torch.Tensor,
+    t_sfc: torch.Tensor,
+    evap_cell: torch.Tensor,
+    rain_cell: torch.Tensor,
+    snow_cell: torch.Tensor,
+    dt: float,
+    rh_sfc: torch.Tensor | None,
+    u10_cell: torch.Tensor | None,
+    lai_cell: torch.Tensor | None,
+    surf_ocean_id: int,
+    kappa_drop_18o: float,
+    kappa_drop_hdo: float,
+) -> tuple[torch.Tensor, ...]:
+    nz, nc = q_v.shape
+    dev = q_v.device
+    q18_io = q_v_18o.contiguous().clone()
+    qd_io = q_v_hdo.contiguous().clone()
+    z0 = torch.zeros((nc,), device=dev, dtype=torch.float32)
+    sfc_io = torch.stack([d18o_precip, dd_precip, z0, d18o_snow, dd_snow, snow_iso_weight], dim=0).contiguous()
+    is_ocn = (surf_type == surf_ocean_id).to(torch.float32)
+    flags = 0
+    if rh_sfc is not None:
+        flags |= 1
+    if u10_cell is not None:
+        flags |= 2
+    if lai_cell is not None:
+        flags |= 4
+    sfc_in = torch.stack([
+        is_ocn, t_sfc, evap_cell, rain_cell, snow_cell,
+        rh_sfc if rh_sfc is not None else z0,
+        u10_cell if u10_cell is not None else z0,
+        lai_cell if lai_cell is not None else z0,
+    ], dim=0).contiguous()
+    lib.water_isotopes_col(
+        q18_io, qd_io, sfc_io,
+        q_v.contiguous(), temp_c.contiguous(), rho_d.contiguous(), dz_c.contiguous(),
+        sfc_in,
+        [nz, nc, flags, 0],
+        [float(dt), float(kappa_drop_18o), float(kappa_drop_hdo), 0.0],
+        threads=nc,
+    )
+    return q18_io, qd_io, sfc_io[0], sfc_io[1], sfc_io[2], sfc_io[3], sfc_io[4], sfc_io[5]

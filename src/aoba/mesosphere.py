@@ -55,7 +55,12 @@ import math
 import torch
 
 from aoba import constants as C
-from aoba.kernels import solve_tridiagonal_batched
+from aoba.kernels import (
+    can_use_crm_metal,
+    dispatch_meso_mol_diff_metal,
+    dispatch_meso_nox_nlc_metal,
+    solve_tridiagonal_batched,
+)
 
 # Fundamental physical constants for mesospheric radiation, transport, and chemistry
 K_BOLTZMANN: float = 1.380649e-23        # [J K^-1]
@@ -239,6 +244,12 @@ def apply_mesospheric_molecular_diffusion(
     if nz < 3:
         return theta_m, u_edge
     ks = max(0, min(int(k_start), nz - 3))
+    if can_use_crm_metal(rho_d) and (nz - ks) <= 64 and rho_d.numel() > 0:
+        return dispatch_meso_mol_diff_metal(
+            rho_d=rho_d, theta_m=theta_m, u_edge=u_edge,
+            z_c=z_c, dz_c=dz_c, temp_c=temp_c, c0=c0, c1=c1,
+            dt=dt, k_start=ks, prandtl_mol=PRANDTL_MOL,
+        )
     rho_s = rho_d[ks:]
     thm_s = theta_m[ks:]
     ue_s = u_edge[ks:]
@@ -326,6 +337,24 @@ def step_prognostic_nox(
     Integrates sources and photochemical/scavenging sinks with exact exponential relaxation
     (zero Forward Euler, unconditionally positivity-preserving and stable for arbitrary `dt`).
     """
+    if can_use_crm_metal(pres_c) and pres_c.numel() > 0:
+        q_new, nox_ppbv, nlc_f, nlc_iwc, t_meso = dispatch_meso_nox_nlc_metal(
+            q_nox=nox.q_nox, pres_c=pres_c, temp_c=temp_c, rho_d=rho_d,
+            z_c=z_c, dz_c=dz_c, q_v=q_v, mu0=mu0, lat_cell=lat_cell,
+            precip_cell=precip_cell, dt=dt, n2o_ppmv=n2o_ppmv,
+            lnox_cell_kgn_m2s=lnox_cell_kgn_m2s,
+            sprite_nox_mol_m2s=sprite_nox_mol_m2s,
+            sprite_z_init_km=sprite_z_init_km,
+            sprite_z_stop_km=sprite_z_stop_km,
+            solar_uv_scale=solar_uv_scale,
+            k_meso_start=k_meso_start,
+        )
+        nox.q_nox = q_new
+        nox.nox_meso_ppbv = nox_ppbv
+        nox.nlc_frac = nlc_f
+        nox.nlc_iwc_mg_m3 = nlc_iwc
+        nox.t_mesopause_k = t_meso
+        return
     p_pa = torch.clamp(pres_c, min=0.05)
     p_hpa = p_pa * 0.01
     z_km = z_c * 1.0e-3

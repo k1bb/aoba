@@ -299,8 +299,34 @@ def step_water_isotopes(
     """Advance isotopic fractionation (Craig-Gordon wind-regime + bare-soil + Rayleigh + Stewart raindrop re-evap).
 
     Zero Forward Euler, strictly ratio-bounded (`R_18 in [0.90, 1.03]`, `R_D in [0.35, 1.15]`),
-    zero Python vertical loops or CPU-GPU syncs; fuses via `torch.compile` on CUDA.
+    zero Python vertical loops or CPU-GPU syncs; uses fused Metal/CUDA column kernel when available.
     """
+    from aoba.kernels import can_use_crm_metal, dispatch_water_isotopes_metal
+
+    if can_use_crm_metal(q_v) and q_v.numel() > 0:
+        (
+            iso.q_v_18o,
+            iso.q_v_hdo,
+            iso.d18o_precip_permil,
+            iso.dd_precip_permil,
+            iso.dexcess_permil,
+            iso.d18o_snow_permil,
+            iso.dd_snow_permil,
+            iso.snow_iso_weight,
+        ) = dispatch_water_isotopes_metal(
+            q_v_18o=iso.q_v_18o, q_v_hdo=iso.q_v_hdo,
+            d18o_precip=iso.d18o_precip_permil, dd_precip=iso.dd_precip_permil,
+            d18o_snow=iso.d18o_snow_permil, dd_snow=iso.dd_snow_permil,
+            snow_iso_weight=iso.snow_iso_weight,
+            q_v=q_v, temp_c=temp_c, rho_d=rho_d, dz_c=dz_c,
+            surf_type=surf_type, t_sfc=t_sfc, evap_cell=evap_cell,
+            rain_cell=rain_cell, snow_cell=snow_cell, dt=float(dt),
+            rh_sfc=rh_sfc, u10_cell=u10_cell, lai_cell=lai_cell,
+            surf_ocean_id=int(SURF_OCEAN),
+            kappa_drop_18o=float(KAPPA_DROP_18O),
+            kappa_drop_hdo=float(KAPPA_DROP_HDO),
+        )
+        return
     fn = maybe_cuda_compile(_step_water_isotopes_core, device=q_v.device)
     (
         iso.q_v_18o,

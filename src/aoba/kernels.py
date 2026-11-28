@@ -65,6 +65,8 @@ from aoba.kernels_physics import (
     run_diagnose_p_T_metal,
     run_dust_column_metal,
     run_land_carbon_cn_fire_metal,
+    run_meso_mol_diff_metal,
+    run_meso_nox_nlc_metal,
     run_natural_aerosol_4sp_metal,
     run_ngwd_front_extract_metal,
     run_ngwd_full_metal,
@@ -83,6 +85,7 @@ from aoba.kernels_physics import (
     run_ogcm_trisk_coriolis_wet_metal,
     run_ogcm_vec_lap_wet_metal,
     run_oro_gwd_metal,
+    run_ozone_pert_metal,
     run_rad_ckd_metal,
     run_rad_distill_closure_metal,
     run_rad_distill_extract_metal,
@@ -99,6 +102,7 @@ from aoba.kernels_physics import (
     run_surface_ocean_seaice_post_metal,
     run_surface_transfer_metal,
     run_two_leaf_gas_exchange_metal,
+    run_water_isotopes_metal,
 )
 from aoba.kernels_esm import (
     ESM_METAL_SHADER_SRC,
@@ -1377,6 +1381,30 @@ def dispatch_ozone_chem_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
     lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_ozone_chem_metal(lib, **kwargs)
+
+
+def dispatch_ozone_pert_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_ozone_pert_metal(lib, **kwargs)
+
+
+def dispatch_meso_nox_nlc_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_meso_nox_nlc_metal(lib, **kwargs)
+
+
+def dispatch_meso_mol_diff_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_meso_mol_diff_metal(lib, **kwargs)
+
+
+def dispatch_water_isotopes_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_water_isotopes_metal(lib, **kwargs)
 
 
 def dispatch_dynamic_lake_step_metal(**kwargs: Any) -> None:

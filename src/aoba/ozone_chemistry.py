@@ -374,6 +374,16 @@ def _apply_volcanic_solar_ozone_pert(
     z_c: torch.Tensor | None = None,
 ) -> None:
     """Apply volcanic sulfate, solar UV, prognostic sprite/EPP NOx catalytic loss, & mesospheric O3 (exact exp)."""
+    if can_use_crm_metal(pres_c) and pres_c.numel() > 0:
+        from aoba.kernels import dispatch_ozone_pert_metal
+
+        oz.o3_vmr, oz.tco_du, oz.o3_sfc_ppbv = dispatch_ozone_pert_metal(
+            o3_vmr=oz.o3_vmr, pres_c=pres_c, temp_c=temp_c, rho_d=rho_d, dz_c=dz_c,
+            mu0=mu0, dt=dt, ecl_ppbv=ecl_ppbv, uv_j_o2_scale=uv_j_o2_scale,
+            volc_sad_um2_cm3=volc_sad_um2_cm3, n2o_ppmv=n2o_ppmv,
+            nox_vmr_3d=nox_vmr_3d, z_c=z_c,
+        )
+        return
     p_pa = torch.clamp(pres_c, min=0.05)
     p_hpa = p_pa * 0.01
     is_day = (mu0 > 1.0e-4).to(pres_c.dtype).unsqueeze(0)
