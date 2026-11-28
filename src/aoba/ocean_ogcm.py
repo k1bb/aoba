@@ -2372,6 +2372,7 @@ def _step_ogcm_voronoi_impl(
                 dt=dt,
                 kappa_redi=float(KAPPA_REDI_HORIZ),
                 enable_full_redi=bool(ENABLE_FULL_REDI),
+                in_place=True,
             )
         else:
             fct_b_fn = maybe_cuda_compile(_ogcm_advect_fct_zstar_batch, device=dev)

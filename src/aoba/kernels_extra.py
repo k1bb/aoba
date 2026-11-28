@@ -4148,9 +4148,12 @@ kernel void crm_2d_fct_simd_pair(
     }
 }
 
-// L2-coherent 1..4-tracer 2D Zalesak FCT kernel (nz <= 64, nx in {2,4,8,16,32}).
+// Zero-stack single-pass 3-stage pipelined L2-coherent 1..4-tracer 2D Zalesak FCT kernel
+// (arbitrary nz >= 1, nx in {2,4,8,16,32}).
 // Tracer index `b` is the inner threadgroup dimension so all tracers for the same columns
 // run concurrently and share `fx`, `fz`, `rho_old`, `rho_new`, and `dz_c` in L2 cache.
+// A 2-layer shift-register pipeline fuses Pass 1 (k), Pass 2 (k-1), and Pass 3 (k-2) into
+// one vertical sweep with 0 B thread-local stack and a single DRAM read of rho_new & dz_c.
 kernel void crm_2d_fct_simd_quad(
     device const float* q0_in      [[buffer(0)]],
     device const float* q1_in      [[buffer(1)]],
@@ -4203,300 +4206,149 @@ kernel void crm_2d_fct_simd_quad(
     float inv_dx = 1.0f / f_p.y;
     float eps = 1.0e-20f;
 
-    float q_td[64];
-    float ax[64];
-    float az[64];
-    float r_p[64];
-    float r_m[64];
-
-    az[0] = 0.0f;
     float q_km1 = 0.0f;
     float q_k   = q_in[tid];
     float q_kp1 = (nz > 1u) ? q_in[M + tid] : q_k;
     float q_kp2 = (nz > 2u) ? q_in[2u * M + tid] : q_kp1;
     float fl_z_dn = 0.0f;
+    float az_dn_k = 0.0f;
 
-    for (uint k = 0u; k < nz; ++k) {
-        uint idx = k * M + tid;
-        float q_xm1 = simd_shuffle(q_k, l_xm1);
-        float q_xp1 = simd_shuffle(q_k, l_xp1);
-        float q_xp2 = simd_shuffle(q_k, l_xp2);
+    // Stage 1 -> Stage 2 shift registers (layer j = step - 1 and j - 1)
+    float qhi_jm1 = 0.0f, qlo_jm1 = 0.0f;
+    float qhi_j = 0.0f, qlo_j = 0.0f;
+    float ax_j = 0.0f, az_dn_j = 0.0f, az_up_j = 0.0f;
+    float q_td_j = 0.0f, rho_j = 1.0f, inv_rho_j = 1.0f, inv_dz_j = 1.0f;
 
-        float fx_self = fx[idx];
-        float fl_x_self = max(fx_self, 0.0f) * q_k + min(fx_self, 0.0f) * q_xp1;
-        float fl_x_xm1  = simd_shuffle(fl_x_self, l_xm1);
-        float fh_x_self = fx_self * ((-q_xm1 + 7.0f * q_k + 7.0f * q_xp1 - q_xp2) * (1.0f / 12.0f));
-        ax[k] = fh_x_self - fl_x_self;
-
-        float fl_z_up = 0.0f;
-        if (k + 1u < nz) {
-            uint m = k + 1u;
-            float fz_up = fz[m * M + tid];
-            fl_z_up = max(fz_up, 0.0f) * q_k + min(fz_up, 0.0f) * q_kp1;
-            float fh_z_up;
-            if (nz >= 4u && m >= 2u && m <= nz - 2u) {
-                fh_z_up = fz_up * ((-q_km1 + 7.0f * q_k + 7.0f * q_kp1 - q_kp2) * (1.0f / 12.0f));
-            } else {
-                fh_z_up = fz_up * (0.5f * (q_k + q_kp1));
-            }
-            az[m] = fh_z_up - fl_z_up;
-        }
-
-        float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
-        float div_fl = (fl_x_self - fl_x_xm1) * inv_dx + (fl_z_up - fl_z_dn) * inv_dz;
-        float rho_safe = max(rho_new[idx], 1.0e-8f);
-        float qt = max((rho_old[idx] * q_k - dt * div_fl) / rho_safe, 0.0f);
-        q_td[k] = qt;
-        r_p[k] = max(q_k, qt);
-        r_m[k] = min(q_k, qt);
-
-        fl_z_dn = fl_z_up;
-        q_km1 = q_k;
-        q_k = q_kp1;
-        q_kp1 = q_kp2;
-        q_kp2 = (k + 3u < nz) ? q_in[(k + 3u) * M + tid] : q_kp1;
-    }
-
-    float qhi_prev = r_p[0];
-    float qlo_prev = r_m[0];
-    for (uint k = 0u; k < nz; ++k) {
-        uint idx = k * M + tid;
-        float qhi_cur = r_p[k];
-        float qlo_cur = r_m[k];
-        float qhi_next = (k + 1u < nz) ? r_p[k + 1u] : qhi_cur;
-        float qlo_next = (k + 1u < nz) ? r_m[k + 1u] : qlo_cur;
-
-        float qhi_xm1 = simd_shuffle(qhi_cur, l_xm1);
-        float qhi_xp1 = simd_shuffle(qhi_cur, l_xp1);
-        float qlo_xm1 = simd_shuffle(qlo_cur, l_xm1);
-        float qlo_xp1 = simd_shuffle(qlo_cur, l_xp1);
-
-        float q_max = max(qhi_cur, max(max(qhi_prev, qhi_next), max(qhi_xm1, qhi_xp1)));
-        float q_min = min(qlo_cur, min(min(qlo_prev, qlo_next), min(qlo_xm1, qlo_xp1)));
-
-        float ax0 = ax[k];
-        float ax_m = simd_shuffle(ax0, l_xm1);
-        float az_dn = az[k];
-        float az_up = (k + 1u < nz) ? az[k + 1u] : 0.0f;
-        float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
-
-        float p_plus  = dt * ((max(ax_m, 0.0f) - min(ax0, 0.0f)) * inv_dx + (max(az_dn, 0.0f) - min(az_up, 0.0f)) * inv_dz);
-        float p_minus = dt * ((max(ax0, 0.0f) - min(ax_m, 0.0f)) * inv_dx + (max(az_up, 0.0f) - min(az_dn, 0.0f)) * inv_dz);
-
-        float rho_safe = max(rho_new[idx], 1.0e-8f);
-        float q_plus  = rho_safe * max(q_max - q_td[k], 0.0f);
-        float q_minus = rho_safe * max(q_td[k] - q_min, 0.0f);
-
-        r_p[k] = (p_plus  > eps) ? clamp(q_plus  / (p_plus  + eps), 0.0f, 1.0f) : 1.0f;
-        r_m[k] = (p_minus > eps) ? clamp(q_minus / (p_minus + eps), 0.0f, 1.0f) : 1.0f;
-
-        qhi_prev = qhi_cur;
-        qlo_prev = qlo_cur;
-    }
-
+    // Stage 2 -> Stage 3 shift registers (layer m = step - 2)
+    float rp_m = 1.0f, rm_m = 1.0f;
+    float ax_m = 0.0f, az_up_m = 0.0f;
+    float q_td_m = 0.0f, inv_rho_m = 1.0f, inv_dz_m = 1.0f;
     float az_lim_dn = 0.0f;
-    for (uint k = 0u; k < nz; ++k) {
-        uint idx = k * M + tid;
-        float rp0 = r_p[k];
-        float rm0 = r_m[k];
-        float rp_x1 = simd_shuffle(rp0, l_xp1);
-        float rm_x1 = simd_shuffle(rm0, l_xp1);
 
-        float ax0 = ax[k];
-        float cx = (ax0 >= 0.0f) ? min(rm0, rp_x1) : min(rp0, rm_x1);
-        float ax_lim = cx * ax0;
-        float ax_lim_m = simd_shuffle(ax_lim, l_xm1);
+    for (uint step = 0u; step < nz + 2u; ++step) {
+        // ---- Stage 1 (k = step): low-order TD & antidiffusive fluxes ----
+        float qhi_k = qhi_j;
+        float qlo_k = qlo_j;
+        float ax_k = 0.0f;
+        float az_up_k = 0.0f;
+        float qt_k = 0.0f;
+        float rho_k = 1.0f;
+        float inv_rho_k = 1.0f;
+        float inv_dz_k = 1.0f;
+        if (step < nz) {
+            uint k = step;
+            uint idx = k * M + tid;
+            float q_xm1 = simd_shuffle(q_k, l_xm1);
+            float q_xp1 = simd_shuffle(q_k, l_xp1);
+            float q_xp2 = simd_shuffle(q_k, l_xp2);
 
-        float az_lim_up = 0.0f;
-        if (k + 1u < nz) {
-            float az_u = az[k + 1u];
-            float cz = (az_u >= 0.0f) ? min(rm0, r_p[k + 1u]) : min(rp0, r_m[k + 1u]);
-            az_lim_up = cz * az_u;
-        }
+            float fx_self = fx[idx];
+            float fl_x_self = max(fx_self, 0.0f) * q_k + min(fx_self, 0.0f) * q_xp1;
+            float fl_x_xm1  = simd_shuffle(fl_x_self, l_xm1);
+            float fh_x_self = fx_self * ((-q_xm1 + 7.0f * q_k + 7.0f * q_xp1 - q_xp2) * (1.0f / 12.0f));
+            ax_k = fh_x_self - fl_x_self;
 
-        float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
-        float div_anti = (ax_lim - ax_lim_m) * inv_dx + (az_lim_up - az_lim_dn) * inv_dz;
-        float rho_safe = max(rho_new[idx], 1.0e-8f);
-        if (active) {
-            q_out[idx] = max(q_td[k] - (dt / rho_safe) * div_anti, 0.0f);
-        }
-        az_lim_dn = az_lim_up;
-    }
-}
-
-// Identical to crm_2d_fct_simd_quad but specialized with [48] thread-local stack arrays for
-// nz <= 48 (e.g. 28 km high-top SP-CRM lid nz=44): cuts stack footprint 25% (1280->960 B/thread)
-// for ~1.49x faster CRM FCT throughput on Apple Silicon and NVIDIA CUDA.
-kernel void crm_2d_fct_simd_quad_48(
-    device const float* q0_in      [[buffer(0)]],
-    device const float* q1_in      [[buffer(1)]],
-    device const float* q2_in      [[buffer(2)]],
-    device const float* q3_in      [[buffer(3)]],
-    device const float* rho_old    [[buffer(4)]],
-    device const float* rho_new    [[buffer(5)]],
-    device const float* fx         [[buffer(6)]],
-    device const float* fz         [[buffer(7)]],
-    device const float* dz_c       [[buffer(8)]],
-    device float* q0_out           [[buffer(9)]],
-    device float* q1_out           [[buffer(10)]],
-    device float* q2_out           [[buffer(11)]],
-    device float* q3_out           [[buffer(12)]],
-    constant ulong4& u_p0          [[buffer(13)]],  // [nz, n_col, nx, (dz_cols<<16) | n_tr]
-    constant float4& f_p           [[buffer(14)]],  // [dt, dx, 0, 0]
-    uint lid                       [[thread_position_in_threadgroup]],
-    uint tg_id                     [[threadgroup_position_in_grid]],
-    uint simd_lane                 [[thread_index_in_simdgroup]])
-{
-    uint nz = uint(u_p0.x);
-    uint n_col = uint(u_p0.y);
-    uint nx = uint(u_p0.z);
-    uint pk = uint(u_p0.w);
-    uint dz_cols = pk >> 16u;
-    uint n_tr = pk & 0xFFFFu;
-
-    uint tg_loc = tg_id / n_tr;
-    uint b = tg_id - tg_loc * n_tr;
-    uint g_loc = tg_loc * 64u + lid;
-
-    uint col = g_loc / nx;
-    uint ix = g_loc - col * nx;
-    bool active = (col < n_col);
-    uint col_s = active ? col : 0u;
-    uint M = n_col * nx;
-    uint tid = col_s * nx + ix;
-    uint col_dz = (dz_cols > 1u) ? col_s : 0u;
-
-    device const float* q_in = (b == 0u) ? q0_in : ((b == 1u) ? q1_in : ((b == 2u) ? q2_in : q3_in));
-    device float* q_out = (b == 0u) ? q0_out : ((b == 1u) ? q1_out : ((b == 2u) ? q2_out : q3_out));
-
-    uint mask = nx - 1u;
-    uint lane_base = simd_lane & (~mask);
-    ushort l_xm1 = ushort(lane_base + ((ix + nx - 1u) & mask));
-    ushort l_xp1 = ushort(lane_base + ((ix + 1u) & mask));
-    ushort l_xp2 = ushort(lane_base + ((ix + 2u) & mask));
-
-    float dt = f_p.x;
-    float inv_dx = 1.0f / f_p.y;
-    float eps = 1.0e-20f;
-
-    float q_td[48];
-    float ax[48];
-    float az[48];
-    float r_p[48];
-    float r_m[48];
-
-    az[0] = 0.0f;
-    float q_km1 = 0.0f;
-    float q_k   = q_in[tid];
-    float q_kp1 = (nz > 1u) ? q_in[M + tid] : q_k;
-    float q_kp2 = (nz > 2u) ? q_in[2u * M + tid] : q_kp1;
-    float fl_z_dn = 0.0f;
-
-    for (uint k = 0u; k < nz; ++k) {
-        uint idx = k * M + tid;
-        float q_xm1 = simd_shuffle(q_k, l_xm1);
-        float q_xp1 = simd_shuffle(q_k, l_xp1);
-        float q_xp2 = simd_shuffle(q_k, l_xp2);
-
-        float fx_self = fx[idx];
-        float fl_x_self = max(fx_self, 0.0f) * q_k + min(fx_self, 0.0f) * q_xp1;
-        float fl_x_xm1  = simd_shuffle(fl_x_self, l_xm1);
-        float fh_x_self = fx_self * ((-q_xm1 + 7.0f * q_k + 7.0f * q_xp1 - q_xp2) * (1.0f / 12.0f));
-        ax[k] = fh_x_self - fl_x_self;
-
-        float fl_z_up = 0.0f;
-        if (k + 1u < nz) {
-            uint m = k + 1u;
-            float fz_up = fz[m * M + tid];
-            fl_z_up = max(fz_up, 0.0f) * q_k + min(fz_up, 0.0f) * q_kp1;
-            float fh_z_up;
-            if (nz >= 4u && m >= 2u && m <= nz - 2u) {
-                fh_z_up = fz_up * ((-q_km1 + 7.0f * q_k + 7.0f * q_kp1 - q_kp2) * (1.0f / 12.0f));
-            } else {
-                fh_z_up = fz_up * (0.5f * (q_k + q_kp1));
+            float fl_z_up = 0.0f;
+            if (k + 1u < nz) {
+                uint m_up = k + 1u;
+                float fz_up = fz[m_up * M + tid];
+                fl_z_up = max(fz_up, 0.0f) * q_k + min(fz_up, 0.0f) * q_kp1;
+                float fh_z_up;
+                if (nz >= 4u && m_up >= 2u && m_up <= nz - 2u) {
+                    fh_z_up = fz_up * ((-q_km1 + 7.0f * q_k + 7.0f * q_kp1 - q_kp2) * (1.0f / 12.0f));
+                } else {
+                    fh_z_up = fz_up * (0.5f * (q_k + q_kp1));
+                }
+                az_up_k = fh_z_up - fl_z_up;
             }
-            az[m] = fh_z_up - fl_z_up;
+
+            inv_dz_k = 1.0f / dz_c[k * dz_cols + col_dz];
+            float div_fl = (fl_x_self - fl_x_xm1) * inv_dx + (fl_z_up - fl_z_dn) * inv_dz_k;
+            rho_k = max(rho_new[idx], 1.0e-8f);
+            inv_rho_k = 1.0f / rho_k;
+            qt_k = max((rho_old[idx] * q_k - dt * div_fl) * inv_rho_k, 0.0f);
+            qhi_k = max(q_k, qt_k);
+            qlo_k = min(q_k, qt_k);
+
+            fl_z_dn = fl_z_up;
+            q_km1 = q_k;
+            q_k = q_kp1;
+            q_kp1 = q_kp2;
+            q_kp2 = (k + 3u < nz) ? q_in[(k + 3u) * M + tid] : q_kp1;
         }
 
-        float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
-        float div_fl = (fl_x_self - fl_x_xm1) * inv_dx + (fl_z_up - fl_z_dn) * inv_dz;
-        float rho_safe = max(rho_new[idx], 1.0e-8f);
-        float qt = max((rho_old[idx] * q_k - dt * div_fl) / rho_safe, 0.0f);
-        q_td[k] = qt;
-        r_p[k] = max(q_k, qt);
-        r_m[k] = min(q_k, qt);
+        // ---- Stage 2 (j = step - 1): Zalesak neighborhood bounds & ratios ----
+        float rp_j = 1.0f;
+        float rm_j = 1.0f;
+        if (step >= 1u && step <= nz) {
+            float qhi_prev = (step == 1u) ? qhi_j : qhi_jm1;
+            float qlo_prev = (step == 1u) ? qlo_j : qlo_jm1;
+            float qhi_xm1 = simd_shuffle(qhi_j, l_xm1);
+            float qhi_xp1 = simd_shuffle(qhi_j, l_xp1);
+            float qlo_xm1 = simd_shuffle(qlo_j, l_xm1);
+            float qlo_xp1 = simd_shuffle(qlo_j, l_xp1);
 
-        fl_z_dn = fl_z_up;
-        q_km1 = q_k;
-        q_k = q_kp1;
-        q_kp1 = q_kp2;
-        q_kp2 = (k + 3u < nz) ? q_in[(k + 3u) * M + tid] : q_kp1;
-    }
+            float q_max = max(qhi_j, max(max(qhi_prev, qhi_k), max(qhi_xm1, qhi_xp1)));
+            float q_min = min(qlo_j, min(min(qlo_prev, qlo_k), min(qlo_xm1, qlo_xp1)));
 
-    float qhi_prev = r_p[0];
-    float qlo_prev = r_m[0];
-    for (uint k = 0u; k < nz; ++k) {
-        uint idx = k * M + tid;
-        float qhi_cur = r_p[k];
-        float qlo_cur = r_m[k];
-        float qhi_next = (k + 1u < nz) ? r_p[k + 1u] : qhi_cur;
-        float qlo_next = (k + 1u < nz) ? r_m[k + 1u] : qlo_cur;
+            float ax_xm1 = simd_shuffle(ax_j, l_xm1);
+            float p_plus  = dt * ((max(ax_xm1, 0.0f) - min(ax_j, 0.0f)) * inv_dx + (max(az_dn_j, 0.0f) - min(az_up_j, 0.0f)) * inv_dz_j);
+            float p_minus = dt * ((max(ax_j, 0.0f) - min(ax_xm1, 0.0f)) * inv_dx + (max(az_up_j, 0.0f) - min(az_dn_j, 0.0f)) * inv_dz_j);
 
-        float qhi_xm1 = simd_shuffle(qhi_cur, l_xm1);
-        float qhi_xp1 = simd_shuffle(qhi_cur, l_xp1);
-        float qlo_xm1 = simd_shuffle(qlo_cur, l_xm1);
-        float qlo_xp1 = simd_shuffle(qlo_cur, l_xp1);
+            float q_plus  = rho_j * max(q_max - q_td_j, 0.0f);
+            float q_minus = rho_j * max(q_td_j - q_min, 0.0f);
 
-        float q_max = max(qhi_cur, max(max(qhi_prev, qhi_next), max(qhi_xm1, qhi_xp1)));
-        float q_min = min(qlo_cur, min(min(qlo_prev, qlo_next), min(qlo_xm1, qlo_xp1)));
-
-        float ax0 = ax[k];
-        float ax_m = simd_shuffle(ax0, l_xm1);
-        float az_dn = az[k];
-        float az_up = (k + 1u < nz) ? az[k + 1u] : 0.0f;
-        float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
-
-        float p_plus  = dt * ((max(ax_m, 0.0f) - min(ax0, 0.0f)) * inv_dx + (max(az_dn, 0.0f) - min(az_up, 0.0f)) * inv_dz);
-        float p_minus = dt * ((max(ax0, 0.0f) - min(ax_m, 0.0f)) * inv_dx + (max(az_up, 0.0f) - min(az_dn, 0.0f)) * inv_dz);
-
-        float rho_safe = max(rho_new[idx], 1.0e-8f);
-        float q_plus  = rho_safe * max(q_max - q_td[k], 0.0f);
-        float q_minus = rho_safe * max(q_td[k] - q_min, 0.0f);
-
-        r_p[k] = (p_plus  > eps) ? clamp(q_plus  / (p_plus  + eps), 0.0f, 1.0f) : 1.0f;
-        r_m[k] = (p_minus > eps) ? clamp(q_minus / (p_minus + eps), 0.0f, 1.0f) : 1.0f;
-
-        qhi_prev = qhi_cur;
-        qlo_prev = qlo_cur;
-    }
-
-    float az_lim_dn = 0.0f;
-    for (uint k = 0u; k < nz; ++k) {
-        uint idx = k * M + tid;
-        float rp0 = r_p[k];
-        float rm0 = r_m[k];
-        float rp_x1 = simd_shuffle(rp0, l_xp1);
-        float rm_x1 = simd_shuffle(rm0, l_xp1);
-
-        float ax0 = ax[k];
-        float cx = (ax0 >= 0.0f) ? min(rm0, rp_x1) : min(rp0, rm_x1);
-        float ax_lim = cx * ax0;
-        float ax_lim_m = simd_shuffle(ax_lim, l_xm1);
-
-        float az_lim_up = 0.0f;
-        if (k + 1u < nz) {
-            float az_u = az[k + 1u];
-            float cz = (az_u >= 0.0f) ? min(rm0, r_p[k + 1u]) : min(rp0, r_m[k + 1u]);
-            az_lim_up = cz * az_u;
+            rp_j = (p_plus  > eps) ? clamp(q_plus  / (p_plus  + eps), 0.0f, 1.0f) : 1.0f;
+            rm_j = (p_minus > eps) ? clamp(q_minus / (p_minus + eps), 0.0f, 1.0f) : 1.0f;
         }
 
-        float inv_dz = 1.0f / dz_c[k * dz_cols + col_dz];
-        float div_anti = (ax_lim - ax_lim_m) * inv_dx + (az_lim_up - az_lim_dn) * inv_dz;
-        float rho_safe = max(rho_new[idx], 1.0e-8f);
-        if (active) {
-            q_out[idx] = max(q_td[k] - (dt / rho_safe) * div_anti, 0.0f);
+        // ---- Stage 3 (m = step - 2): apply limited antidiffusive fluxes ----
+        if (step >= 2u) {
+            uint m = step - 2u;
+            float rp_x1 = simd_shuffle(rp_m, l_xp1);
+            float rm_x1 = simd_shuffle(rm_m, l_xp1);
+
+            float cx = (ax_m >= 0.0f) ? min(rm_m, rp_x1) : min(rp_m, rm_x1);
+            float ax_lim = cx * ax_m;
+            float ax_lim_m = simd_shuffle(ax_lim, l_xm1);
+
+            float az_lim_up = 0.0f;
+            if (m + 1u < nz) {
+                float cz = (az_up_m >= 0.0f) ? min(rm_m, rp_j) : min(rp_m, rm_j);
+                az_lim_up = cz * az_up_m;
+            }
+
+            float div_anti = (ax_lim - ax_lim_m) * inv_dx + (az_lim_up - az_lim_dn) * inv_dz_m;
+            if (active) {
+                q_out[m * M + tid] = max(q_td_m - (dt * inv_rho_m) * div_anti, 0.0f);
+            }
+            az_lim_dn = az_lim_up;
         }
-        az_lim_dn = az_lim_up;
+
+        // ---- Advance pipeline shift registers ----
+        if (step >= 1u && step <= nz) {
+            rp_m = rp_j;
+            rm_m = rm_j;
+            ax_m = ax_j;
+            az_up_m = az_up_j;
+            q_td_m = q_td_j;
+            inv_rho_m = inv_rho_j;
+            inv_dz_m = inv_dz_j;
+        }
+        if (step < nz) {
+            qhi_jm1 = qhi_j;
+            qlo_jm1 = qlo_j;
+            qhi_j = qhi_k;
+            qlo_j = qlo_k;
+            ax_j = ax_k;
+            az_dn_j = az_dn_k;
+            az_up_j = az_up_k;
+            az_dn_k = az_up_k;
+            q_td_j = qt_k;
+            rho_j = rho_k;
+            inv_rho_j = inv_rho_k;
+            inv_dz_j = inv_dz_k;
+        }
     }
 }
 
@@ -4861,7 +4713,7 @@ def run_crm_fct_advect_metal(
     dz_2d = dz_c.view(nz, -1).contiguous()
     dz_cols = dz_2d.shape[1]
 
-    if ny == 1 and 1 < nx <= 32 and nz <= 64 and (32 % nx == 0) and B in (1, 2, 3, 4):
+    if ny == 1 and 1 < nx <= 32 and nz >= 1 and (32 % nx == 0) and B in (1, 2, 3, 4):
         q_out = torch.empty_like(q_batch)
         q0_in = q_batch[0].contiguous()
         q1_in = q_batch[1].contiguous() if B >= 2 else q0_in
@@ -4873,8 +4725,7 @@ def run_crm_fct_advect_metal(
         q3_out = q_out[3] if B >= 4 else q0_out
         c_tg = 64 // nx
         n_tg = (n_col + c_tg - 1) // c_tg
-        fct_quad_fn = lib.crm_2d_fct_simd_quad_48 if nz <= 48 else lib.crm_2d_fct_simd_quad
-        fct_quad_fn(
+        lib.crm_2d_fct_simd_quad(
             q0_in, q1_in, q2_in, q3_in,
             rho_old.contiguous(), rho_new.contiguous(),
             fx.contiguous(), fz.contiguous(), dz_2d,
@@ -4942,7 +4793,7 @@ def run_crm_fct_pair_metal(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Zero-stack L2-coherent 2-tracer Zalesak FCT on GPU for `(q_n, q_p)`."""
     nz, n_col, ny, nx = q0.shape
-    if ny == 1 and 1 < nx <= 32 and nz <= 64 and (32 % nx == 0):
+    if ny == 1 and 1 < nx <= 32 and nz >= 1 and (32 % nx == 0):
         dz_2d = dz_c.view(nz, -1).contiguous()
         dz_cols = dz_2d.shape[1]
         q0_c = q0.contiguous()
@@ -4990,7 +4841,7 @@ def run_crm_fct_quad_metal(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Zero-stack L2-coherent 4-tracer Zalesak FCT on GPU for `(q_n, q_p, n_c, n_i)`."""
     nz, n_col, ny, nx = q0.shape
-    if ny == 1 and 1 < nx <= 32 and nz <= 64 and (32 % nx == 0):
+    if ny == 1 and 1 < nx <= 32 and nz >= 1 and (32 % nx == 0):
         dz_2d = dz_c.view(nz, -1).contiguous()
         dz_cols = dz_2d.shape[1]
         if clone_out:
