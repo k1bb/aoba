@@ -1729,15 +1729,9 @@ def step_aoba_model(
                         asr_sub[s0:s1] = rad_stu_out["asr"]
                         model.rad_distill.last_uncertainty[c0:c1] = rad_stu_unc.reshape(n_ch, n_sub).mean(dim=-1)
 
-                    # Overwrite active teacher cells with genuine full-3D ICA / 3D-TICA radiation outputs
-                    q_rad_sub[:, t_sfc] = _f2s(q_rad_t, n_tr)
-                    sw1_dir_sub[t_sfc] = _f2s(sw1d_t, n_tr)
-                    sw1_dif_sub[t_sfc] = _f2s(sw1f_t, n_tr)
-                    sw2_dir_sub[t_sfc] = _f2s(sw2d_t, n_tr)
-                    sw2_dif_sub[t_sfc] = _f2s(sw2f_t, n_tr)
-                    lw_dn_sub[t_sfc] = _f2s(lwd_t, n_tr)
-                    olr_sub[t_sfc] = _f2s(olr_t, n_tr)
-                    asr_sub[t_sfc] = _f2s(asr_t, n_tr)
+                    # Shadow-coupled SparseCRMPool keeps host radiation 100% spatially homogeneous
+                    # across all cells (preventing 1-cell teacher OLR/ASR jumps) while genuine 32-col
+                    # teacher fluxes remain cached in `pool.q_rad` and continuously train `rad_distill`.
                 else:
                     # Clean radiation warmup: evaluate genuine tile-level RRTMGP on student cells
                     # while `rad_distill` warms up on 32-subcolumn teachers (zero untrained-NN shock).
@@ -3143,8 +3137,12 @@ def step_aoba_model(
             pres_mynn_sd, exner_mynn_sd, temp_mynn_sd = diagnose_pressure_temperature(rho_pre_sd, thm_mynn_sd, qv_mynn_sd)
             zero_sfc_sd = torch.zeros_like(shf_cell_pre)
 
-            # 7a-i. Execute genuine 2D/3D CRM strictly on the active teacher subset (`1 / stride` columns)
-            use_contig_stu = int(t_idx.numel()) * 4 < nc
+            # 7a-i. Execute genuine 2D/3D CRM strictly on the active teacher subset (`1 / stride` columns).
+            # In SparseCRMPool mode (`shadow_pool = True`), teachers run shadow-coupled to the live host
+            # column mean (preserving 100% of their 2D/3D subgrid convective plumes & cold pools) without
+            # overwriting isolated single host cells, eliminating single-cell CISK chimneys & donut halos.
+            shadow_pool = bool(has_pool)
+            use_contig_stu = shadow_pool or (int(t_idx.numel()) * 4 < nc)
             if has_pool:
                 n_t = n_pool_act
                 if n_t == pool.n_pool:
@@ -3177,6 +3175,58 @@ def step_aoba_model(
                 drho_t = (atmos.rho_d[:, t_idx] - mean_2d(sub_crm_t.rho_d)).unsqueeze(-1).unsqueeze(-1)
                 sub_crm_t.rho_d = torch.clamp(sub_crm_t.rho_d + drho_t, min=1.0e-8)
                 sub_crm_t.f_coriolis = mesh.f_cell[t_idx]
+                if shadow_pool:
+                    inv_rt = 1.0 / torch.clamp(mean_2d(sub_crm_t.rho_d), min=1.0e-8)
+                    inv_rt_b = inv_rt.unsqueeze(-1).unsqueeze(-1)
+                    # Variance-contracting convex re-anchoring: matches exact host mass-weighted
+                    # column means while strictly preserving non-negativity and never amplifying
+                    # subgrid spikes (Var_new <= Var_old, preventing shadow-pool RK3-HEVI blowup).
+                    thm_cm = mean_2d(sub_crm_t.rho_d * sub_crm_t.theta_m) * inv_rt
+                    thm_an = torch.clamp(sub_crm_t.theta_m - thm_cm.unsqueeze(-1).unsqueeze(-1), -12.0, 12.0)
+                    thm_an = thm_an - mean_2d(sub_crm_t.rho_d * thm_an, keepdim=True) * inv_rt_b
+                    sub_crm_t.theta_m = torch.clamp(
+                        atmos.theta_m[:, t_idx].unsqueeze(-1).unsqueeze(-1) + thm_an,
+                        min=100.0,
+                    )
+                    def _reanchor_convex_pool(fld: torch.Tensor, tgt_c: torch.Tensor, hi_cap: float) -> torch.Tensor:
+                        fld_c = torch.clamp(fld, 0.0, hi_cap)
+                        cm = mean_2d(sub_crm_t.rho_d * fld_c) * inv_rt
+                        an = fld_c - cm.unsqueeze(-1).unsqueeze(-1)
+                        tb = torch.clamp(tgt_c, 0.0, hi_cap).unsqueeze(-1).unsqueeze(-1)
+                        min_an = an.amin(dim=(-2, -1), keepdim=True)
+                        alpha = torch.where(
+                            min_an < -1.0e-12,
+                            torch.clamp(tb / torch.clamp(-min_an, min=1.0e-12), 0.0, 1.0),
+                            torch.ones_like(tb),
+                        )
+                        return torch.clamp(tb + alpha * an, 0.0, hi_cap)
+                    sub_crm_t.q_v = _reanchor_convex_pool(sub_crm_t.q_v, atmos.q_v[:, t_idx], 0.06)
+                    sub_crm_t.q_c = _reanchor_convex_pool(sub_crm_t.q_c, atmos.q_c[:, t_idx], 0.015)
+                    sub_crm_t.q_i = _reanchor_convex_pool(sub_crm_t.q_i, atmos.q_i[:, t_idx], 0.015)
+                    sub_crm_t.q_p = _reanchor_convex_pool(sub_crm_t.q_p, atmos.q_p[:, t_idx], 0.02)
+                    sub_crm_t.q_n = sub_crm_t.q_v + sub_crm_t.q_c + sub_crm_t.q_i
+                    if (
+                        getattr(sub_crm_t, "q_r", None) is not None
+                        and getattr(sub_crm_t, "q_s", None) is not None
+                        and getattr(sub_crm_t, "q_g", None) is not None
+                    ):
+                        qr_c = torch.clamp(sub_crm_t.q_r, 0.0, 0.02)
+                        qs_c = torch.clamp(sub_crm_t.q_s, 0.0, 0.02)
+                        qg_c = torch.clamp(sub_crm_t.q_g, 0.0, 0.02)
+                        qp_sum6 = qr_c + qs_c + qg_c
+                        sc6 = torch.where(
+                            qp_sum6 > 1.0e-9,
+                            torch.clamp(sub_crm_t.q_p / torch.clamp(qp_sum6, min=1.0e-9), 0.0, 4.0),
+                            torch.zeros_like(qp_sum6),
+                        )
+                        sub_crm_t.q_r = qr_c * sc6
+                        sub_crm_t.q_s = qs_c * sc6
+                        sub_crm_t.q_g = qg_c * sc6
+                    sub_crm_t.w = torch.clamp(sub_crm_t.w, -35.0, 35.0)
+                    if sub_crm_t.n_c is not None:
+                        sub_crm_t.n_c = torch.clamp(torch.maximum(sub_crm_t.n_c, sub_crm_t.q_c / 4.2e-12), 0.0, 1.0e10)
+                    if sub_crm_t.n_i is not None:
+                        sub_crm_t.n_i = torch.clamp(torch.maximum(sub_crm_t.n_i, sub_crm_t.q_i / 1.6e-10), 0.0, 1.0e9)
                 q_rad_t_in = (
                     pool.q_rad[:, :n_t]
                     if pool.q_rad_valid
@@ -3203,8 +3253,8 @@ def step_aoba_model(
                     u_host_target=u_host_new[:, t_idx],
                     v_host_target=v_host_new[:, t_idx],
                     tau_sp_mom=dt,
-                    dtheta_m_ls_dt=dthm_ls[:, t_idx],
-                    dq_n_ls_dt=dqn_ls[:, t_idx],
+                    dtheta_m_ls_dt=None if shadow_pool else dthm_ls[:, t_idx],
+                    dq_n_ls_dt=None if shadow_pool else dqn_ls[:, t_idx],
                     sfc_fluxes=sub_sfc_t,
                     rad_heating_k_s=q_rad_t_in,
                     z_c_col=atmos.z_c[:, t_idx],
@@ -3231,11 +3281,12 @@ def step_aoba_model(
                 for opt_attr in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
                     src_f = getattr(sub_crm_t, opt_attr, None)
                     if src_f is not None:
-                        dst_f = getattr(crm, opt_attr, None)
-                        if dst_f is None:
-                            dst_f = torch.zeros_like(crm.q_c)
-                            setattr(crm, opt_attr, dst_f)
-                        dst_f.index_copy_(1, t_idx, _crm4d_to_tile4d(src_f, from_full=True))
+                        if not shadow_pool:
+                            dst_f = getattr(crm, opt_attr, None)
+                            if dst_f is None:
+                                dst_f = torch.zeros_like(crm.q_c)
+                                setattr(crm, opt_attr, dst_f)
+                            dst_f.index_copy_(1, t_idx, _crm4d_to_tile4d(src_f, from_full=True))
                         if n_t < pool.n_pool:
                             p_dst = getattr(pool.crm, opt_attr, None)
                             if p_dst is None:
@@ -3375,7 +3426,7 @@ def step_aoba_model(
                 )
             if (has_pool or sparse_warmup_crm) and model.crm_distill.steps_seen < model.crm_distill.warmup_steps:
                 n_cgrad = 4
-            elif model.crm_distill.steps_seen >= max(model.crm_distill.warmup_steps + 240, 240) and model.crm_distill.ema_val_rmse_thm < 0.8:
+            elif model.crm_distill.steps_seen >= max(model.crm_distill.warmup_steps + 600, 600) and model.crm_distill.ema_val_rmse_thm < 0.8:
                 n_cgrad = 1 if (model.step_count % 4 == 0) else 0
             elif model.crm_distill.steps_seen >= max(model.crm_distill.warmup_steps + 120, 120) and model.crm_distill.ema_val_rmse_thm < 1.2:
                 n_cgrad = 1 if (model.step_count % 2 == 0) else 0
@@ -3636,43 +3687,46 @@ def step_aoba_model(
                 model.crm_distill.last_uncertainty.zero_()
                 model.crm_distill.last_uncertainty[s_idx] = stu_unc
 
-            # Commit exact genuine teacher state onto the active `t_idx` columns.
-            atmos.theta_m[:, t_idx] = thm_t_post
-            atmos.q_n[:, t_idx] = qn_t_post
-            atmos.q_p[:, t_idx] = qp_t_post
-            atmos.q_v[:, t_idx] = qv_t_post
-            atmos.q_c[:, t_idx] = qc_t_post
-            atmos.q_i[:, t_idx] = qi_t_post
-            du_crm_c[:, t_idx] = (u_t_post - u_host_new[:, t_idx]) / dt
-            dv_crm_c[:, t_idx] = (v_t_post - v_host_new[:, t_idx]) / dt
-            rain_3d[t_idx] = rain_t_tile
-            snow_3d[t_idx] = snow_t_tile
+            # Commit exact genuine teacher state onto active `t_idx` columns only when NOT in
+            # shadow-coupled SparseCRMPool mode (in shadow mode, all host cells evolve homogeneously
+            # via the distilled conservation closure to eliminate single-cell CISK chimneys & halos).
+            if not shadow_pool:
+                atmos.theta_m[:, t_idx] = thm_t_post
+                atmos.q_n[:, t_idx] = qn_t_post
+                atmos.q_p[:, t_idx] = qp_t_post
+                atmos.q_v[:, t_idx] = qv_t_post
+                atmos.q_c[:, t_idx] = qc_t_post
+                atmos.q_i[:, t_idx] = qi_t_post
+                du_crm_c[:, t_idx] = (u_t_post - u_host_new[:, t_idx]) / dt
+                dv_crm_c[:, t_idx] = (v_t_post - v_host_new[:, t_idx]) / dt
+                rain_3d[t_idx] = rain_t_tile
+                snow_3d[t_idx] = snow_t_tile
+                if has_pool:
+                    crm.rho_d.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.rho_d, from_full=True))
+                    crm.u.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.u, from_full=True))
+                    crm.v.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.v, from_full=True))
+                    crm.w.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.w, from_full=True))
+                    crm.theta_m.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.theta_m, from_full=True))
+                    crm.q_n.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.q_n, from_full=True))
+                    crm.q_p.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.q_p, from_full=True))
+                    crm.q_v.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.q_v, from_full=True))
+                    crm.q_c.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.q_c, from_full=True))
+                    crm.q_i.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.q_i, from_full=True))
+                    crm.qke.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.qke, from_full=True))
+                else:
+                    crm.rho_d.index_copy_(1, t_idx, sub_crm_t.rho_d)
+                    crm.u.index_copy_(1, t_idx, sub_crm_t.u)
+                    crm.v.index_copy_(1, t_idx, sub_crm_t.v)
+                    crm.w.index_copy_(1, t_idx, sub_crm_t.w)
+                    crm.theta_m.index_copy_(1, t_idx, sub_crm_t.theta_m)
+                    crm.q_n.index_copy_(1, t_idx, sub_crm_t.q_n)
+                    crm.q_p.index_copy_(1, t_idx, sub_crm_t.q_p)
+                    crm.q_v.index_copy_(1, t_idx, sub_crm_t.q_v)
+                    crm.q_c.index_copy_(1, t_idx, sub_crm_t.q_c)
+                    crm.q_i.index_copy_(1, t_idx, sub_crm_t.q_i)
+                    crm.qke.index_copy_(1, t_idx, sub_crm_t.qke)
             rain_new_sub = rain_3d.reshape(m_sub)
             snow_new_sub = snow_3d.reshape(m_sub)
-            if has_pool:
-                crm.rho_d.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.rho_d, from_full=True))
-                crm.u.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.u, from_full=True))
-                crm.v.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.v, from_full=True))
-                crm.w.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.w, from_full=True))
-                crm.theta_m.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.theta_m, from_full=True))
-                crm.q_n.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.q_n, from_full=True))
-                crm.q_p.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.q_p, from_full=True))
-                crm.q_v.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.q_v, from_full=True))
-                crm.q_c.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.q_c, from_full=True))
-                crm.q_i.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.q_i, from_full=True))
-                crm.qke.index_copy_(1, t_idx, _crm4d_to_tile4d(sub_crm_t.qke, from_full=True))
-            else:
-                crm.rho_d.index_copy_(1, t_idx, sub_crm_t.rho_d)
-                crm.u.index_copy_(1, t_idx, sub_crm_t.u)
-                crm.v.index_copy_(1, t_idx, sub_crm_t.v)
-                crm.w.index_copy_(1, t_idx, sub_crm_t.w)
-                crm.theta_m.index_copy_(1, t_idx, sub_crm_t.theta_m)
-                crm.q_n.index_copy_(1, t_idx, sub_crm_t.q_n)
-                crm.q_p.index_copy_(1, t_idx, sub_crm_t.q_p)
-                crm.q_v.index_copy_(1, t_idx, sub_crm_t.q_v)
-                crm.q_c.index_copy_(1, t_idx, sub_crm_t.q_c)
-                crm.q_i.index_copy_(1, t_idx, sub_crm_t.q_i)
-                crm.qke.index_copy_(1, t_idx, sub_crm_t.qke)
 
             model.crm_distill.teacher_frac_last = float(t_idx.numel()) / float(max(nc, 1))
             model.crm_distill.steps_seen += 1

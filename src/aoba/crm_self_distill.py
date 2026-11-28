@@ -287,7 +287,7 @@ def extract_crm_distill_features(
         torch.log1p(qn_tot * 1.0e3),
         z0,
         z0,
-        z0,
+        torch.log1p(torch.clamp(q_p, min=0.0) * 1.0e3),
         rh_tot,
         torch.clamp(u * (1.0 / 30.0), -4.0, 4.0),
         torch.clamp(v * (1.0 / 30.0), -4.0, 4.0),
@@ -356,10 +356,10 @@ def apply_exact_conservation_closure(
     # Convert [N, 8, nz] -> [nz, N] per field (contiguous for MPS backward kernels)
     rp = raw_prof.permute(1, 2, 0).contiguous()  # [8, nz, N]
     # Universal thermodynamic convective envelope s_conv(exner) in [0, 1]:
-    # 1.0 throughout the troposphere and tropical anvil detrainment zone (p >= 145 hPa, exner >= 0.58),
-    # tapering smoothly via C^1 quadratic ramp to 0.0 at/above the 90 hPa tropopause cold point (exner <= 0.50)
+    # 1.0 throughout the troposphere (p >= 210 hPa, exner >= 0.64), tapering smoothly via C^1 quadratic
+    # ramp across the tropical anvil zone to 0.0 at/above the 90 hPa tropopause cold point (exner <= 0.50)
     # so the stratosphere & mesosphere obey pure host dynamics + radiation + O3 + GWD with zero ML drift.
-    s_lin = torch.clamp((exner - 0.50) / 0.08, min=0.0, max=1.0)
+    s_lin = torch.clamp((exner - 0.50) / 0.14, min=0.0, max=1.0)
     s_conv = s_lin * s_lin
     in_conv = s_conv > 0.0
     ex_safe = torch.clamp(exner, min=0.005)
@@ -386,11 +386,26 @@ def apply_exact_conservation_closure(
     qsat_env = torch.clamp(C.EPS_WATER * es_env / torch.clamp(p_env - es_env, min=100.0), min=1.0e-7, max=0.10)
     dm = torch.clamp(rho_d * dz_c, min=1.0e-6)                # [nz, N] kg m^-2
 
+    # Thermodynamic parcel buoyancy / LNB gate (Emanuel 1994; Hartmann & Larson 2002 FAT law):
+    # theta_e = (T + (L_v/c_p) * q_v) / exner, theta_es = (T + (L_v/c_p) * q_sat) / exner.
+    # Convective mass exchange across interface k+1/2 is physically unlocked wherever an undilute
+    # parcel from below (cummax theta_e) is buoyant relative to layer k+1 (theta_e_max >= theta_es - 4 K),
+    # automatically tracking the tropical tropopause across piControl, 4xCO2, and paleoclimates while
+    # cleanly stopping above shallow subtropical inversions and the cold-point tropopause.
+    lv_cp_ex = (C.L_V0 / C.CP_D) / ex_safe
+    th_e = (t_env / ex_safe) + lv_cp_ex * qv0
+    th_es = (t_env / ex_safe) + lv_cp_ex * qsat_env
+    th_e_max = torch.cummax(th_e, dim=0).values
+    buoy_int = (
+        torch.clamp((th_e_max[:-1] - th_es[1:] + 1.0) / 6.0, min=0.0, max=1.0)
+        if int(qn0.shape[0]) >= 2
+        else torch.zeros_like(qn0[:0])
+    )
+    buoy_layer = torch.cat([torch.ones_like(qn0[:1]), buoy_int], dim=0) if int(qn0.shape[0]) >= 2 else torch.ones_like(qn0)
+
     # Column moisture activity gate (RH_max > 0.72) keeps dry upper/mid-tropospheric air free of
     # spurious ML drift, while a terrain-following boundary-layer gate pbl_gate (p >= 0.75 p_sfc,
     # z_AGL <= ~2.5 km) remains active over both oceans and high plateaus (Tibet/Antarctica).
-    # Thermodynamic moist-troposphere taper f_trop prevents dry cold-point tropopause and lower-
-    # stratospheric layers (q_sat < 0.3 g/kg) from receiving artificial convective or h_corr heating.
     conv_f = in_conv.to(dm.dtype)
     ex0 = torch.clamp(exner[0:1], min=0.10)
     rh_pre_max = (qn0 / torch.clamp(qsat_env, min=1.0e-7) * conv_f).amax(dim=0)
@@ -398,7 +413,7 @@ def apply_exact_conservation_closure(
     pbl_gate = torch.clamp(1.0 - (ex0 - exner) / (0.08 * ex0), min=0.0, max=1.0)
     layer_gate = torch.maximum(col_rh_gate.unsqueeze(0), pbl_gate)
     f_trop = torch.maximum(pbl_gate, torch.clamp(qsat_env / 3.0e-4, min=0.0, max=1.0))
-    w_h = s_conv * layer_gate * f_trop
+    w_h = s_conv * layer_gate * torch.maximum(pbl_gate, buoy_layer * f_trop)
     w_u = s_conv * layer_gate
 
     # Vertically smooth raw convective heating & moisture logits with 2-pass [0.25, 0.5, 0.25]
@@ -413,8 +428,7 @@ def apply_exact_conservation_closure(
             rp1_mid = 0.25 * rp1_s[:-2] + 0.50 * rp1_s[1:-1] + 0.25 * rp1_s[2:]
             rp1_s = torch.cat([0.75 * rp1_s[:1] + 0.25 * rp1_s[1:2], rp1_mid, 0.25 * rp1_s[-2:-1] + 0.75 * rp1_s[-1:]], dim=0)
 
-    # Predict physically bounded convective/PBL temperature & momentum residuals
-    d_temp_raw = w_h * torch.tanh(rp0_s * 0.2) * 0.15
+    # Predict physically bounded convective/PBL momentum residuals and microphysical logits
     f_qp_logit = rp[2]
     f_cond_logit = rp[3]
     f_ice_logit = rp[4]
@@ -424,124 +438,70 @@ def apply_exact_conservation_closure(
 
     dm_sum_u = torch.clamp((dm * w_u).sum(dim=0), min=1.0e-3)
 
-    # --- 1. Exact Total Column Water Mass Conservation (restricted to convective domain s_conv > 0) ---
-    w_pre_conv = (dm * conv_f * (qn0 + qp0)).sum(dim=0)
-    w_avail_conv = torch.clamp(w_pre_conv + evap * dt, min=1.0e-8)
-
-    # Predicted total precipitation mass [kg m^-2] bounded to physical column fraction <= 0.25
-    pf_sig = torch.sigmoid(raw_scal[:, 0] - 2.0)
-    p_frac = 0.25 * col_rh_gate * (pf_sig * pf_sig)
-    p_tot_mass = torch.clamp(p_frac * w_avail_conv, min=0.0)
-    p_tot_mass = torch.where(w_avail_conv > 0.05, p_tot_mass, torch.zeros_like(p_tot_mass))
-
-    # Apply surface evaporation into lowest layer, then smooth zero-sum convective and PBL transport
-    # gated by layer_gate with matching projection weight w_bal = conv_f * dq_lim so a uniform logit
-    # offset lies strictly in the zero-tendency nullspace and never pumps lower-tropospheric residuals aloft.
+    # --- 1. Exact Total Column Water Mass Conservation via CFL-Bounded Convective Mass Exchange ---
+    # Apply surface evaporation into lowest layer, then exchange air mass M_{k+1/2} >= 0 across
+    # adjacent convective layers strictly bounded only by the universal CFL positivity limit
+    # min(0.45 * dm_k, 0.45 * dm_{k+1}, rho_{k+1/2} * w_ref * dt) (w_ref = 1.0 m s^-1).
+    # F_{k+1/2} = M_{k+1/2} * (q_{n,k} - q_{n,k+1}) satisfies exact mass conservation and the
+    # discrete maximum principle (strict convex combination -> zero arbitrary moisture caps and
+    # zero unphysical uphill supersaturation waves at the tropopause across all climates & dt).
     qn_base = qn0.clone()
     qn_base[0] = torch.clamp(qn_base[0] + (evap * dt) / torch.clamp(dm[0], min=1.0e-4), min=0.0)
-    dq_lim = layer_gate * torch.clamp(0.015 * qn_base, max=1.0e-4)
-    d_qn_raw = s_conv * torch.tanh(rp1_s * 0.2) * dq_lim
-    w_bal = conv_f * dq_lim
-    dm_dqn_sum = (dm * conv_f * d_qn_raw).sum(dim=0)
-    dm_wbal_sum = torch.clamp((dm * w_bal).sum(dim=0), min=1.0e-8)
-    d_qn_bal = d_qn_raw - (dm_dqn_sum / dm_wbal_sum).unsqueeze(0) * w_bal
-    qn_trans = torch.clamp(qn_base + d_qn_bal, min=0.0)
+    if int(qn_base.shape[0]) >= 2:
+        dm_min = torch.minimum(dm[:-1], dm[1:])
+        rho_int = 0.5 * (torch.clamp(rho_d[:-1], min=1.0e-6) + torch.clamp(rho_d[1:], min=1.0e-6))
+        m_max = torch.minimum(0.45 * dm_min, rho_int * (1.0 * dt))
+        int_active = (s_conv[1:] > 0.0).to(dm.dtype)
+        # Buoyancy-gated CFL mass exchange: starts gentle near init (sigmoid(-4) = 0.018) inside
+        # unstable CAPE layers and vanishes identically above the LNB (buoy_int == 0), while
+        # allowing the NN to drive up to 100% of the exact CFL limit during deep convection.
+        m_exch = m_max * s_conv[:-1] * col_rh_gate.unsqueeze(0) * buoy_int * int_active * torch.sigmoid(rp1_s[:-1] - 4.0)
+        f_q = m_exch * (qn_base[:-1] - qn_base[1:])
+        dqn_flux = torch.zeros_like(qn_base)
+        dqn_flux[:-1] = dqn_flux[:-1] - f_q / dm[:-1]
+        dqn_flux[1:] = dqn_flux[1:] + f_q / dm[1:]
+        qn_trans = torch.clamp(qn_base + dqn_flux, min=0.0)
+    else:
+        qn_trans = qn_base
 
-    # Predict suspended precipitating hydrometeors q_p cleanly without rescaling q_n or
-    # self-amplifying pre-existing qp0: gated by col_rh_gate and bounded by moist air qn_base
-    # so student cells never convert cloud/vapor into invisible suspended q_p clear-sky holes.
-    fp_sig = torch.sigmoid(f_qp_logit - 2.0)
-    qp_prov = s_conv * col_rh_gate.unsqueeze(0) * torch.clamp(qn_base, max=2.0e-3) * (0.25 * (fp_sig * fp_sig))
-    w_qn_tr = (dm * conv_f * qn_trans).sum(dim=0)
-    w_qp0 = (dm * conv_f * qp0).sum(dim=0)
-    w_qp_prov = (dm * conv_f * qp_prov).sum(dim=0)
-    qp_cap_col = w_qp0 + 0.15 * w_qn_tr
-    qp_sc = torch.where(
-        w_qp_prov > qp_cap_col,
-        qp_cap_col / torch.clamp(w_qp_prov, min=1.0e-6),
-        torch.ones_like(w_qp_prov),
-    )
-    qp_conv = qp_prov * qp_sc.unsqueeze(0)
-    w_qp_conv = (dm * conv_f * qp_conv).sum(dim=0)
-
-    # Extract only the net non-precipitating sink needed for precipitation + suspended q_p growth,
-    # preferentially from warm liquid clouds and moist lower/mid-tropospheric layers so heavy warm
-    # rain does not strip cold upper-tropospheric cirrus anvils dry (preventing clear-sky OLR holes).
-    p_need_qn = torch.clamp(p_tot_mass + (w_qp_conv - w_qp0), min=0.0)
-    rh_trans = torch.clamp(qn_trans / torch.clamp(qsat_env, min=1.0e-7), min=0.0, max=2.0)
-    rh_p = torch.clamp((rh_trans - 0.60) / 0.35, min=0.0, max=1.0)
-    w_p_layer = conv_f * (qn_trans * (rh_p * rh_p + 0.01) + 2.0 * qc0 + 0.25 * qi0)
-    w_p_sum = torch.clamp((dm * w_p_layer).sum(dim=0), min=1.0e-6)
-    dq_psink = torch.minimum(
-        (p_need_qn / w_p_sum).unsqueeze(0) * w_p_layer,
-        0.9 * qn_trans,
-    )
-    qn_conv = torch.clamp(qn_trans - dq_psink, min=0.0)
-    qn_new = torch.where(in_conv, qn_conv, qn0)
-    qp_new = torch.where(in_conv, qp_conv, qp0)
-    w_post_conv = (dm * conv_f * (qn_new + qp_new)).sum(dim=0)
-    p_tot_mass = torch.clamp(w_avail_conv - w_post_conv, min=0.0)
-
-    # Partition convective q_n into (q_v, q_c, q_i) strictly preserving q_v + q_c + q_i == q_n
-    # and thermodynamic saturation consistency (q_v <= qsat_env, homogeneous freezing T <= 253.15 K,
-    # liquid-only T >= 273.15 K), while preserving 3D-advected upper-tropospheric cirrus anvils
-    # (qi0 at T < 263.15 K) via exact exponential sublimation relaxation (tau ~ 3 h in moist outflow,
-    # ~14 min in dry subsiding air) so sheared cirrus tails are not erased in one host step.
-    rh_now = qn_new / torch.clamp(qsat_env, min=1.0e-7)
-    rh_lin = torch.clamp((rh_now - 0.55) / 0.40, min=0.0, max=1.0)
+    # Exact Clausius-Clapeyron saturation consistency + NN-predicted layerwise condensate fallout:
+    # q_cond_tot = min(qn_trans, max(q_ovsat, f_cond * qn_trans)) guarantees q_v <= qsat_env everywhere,
+    # while centered layerwise fallout f_fall(k) = sigmoid(0.5*scal0 + rp2) (0.50 at init, max gradient)
+    # splits condensed water directly into precipitating fallout q_out and suspended cloud (q_c, q_i)
+    # with ZERO arbitrary cloud caps and zero cold-start dead-sigmoid trapping.
+    rh_tr = qn_trans / torch.clamp(qsat_env, min=1.0e-7)
+    rh_lin = torch.clamp((rh_tr - 0.65) / 0.30, min=0.0, max=1.0)
     rh_gate = rh_lin * rh_lin
-    fc_sig = torch.sigmoid(f_cond_logit - 2.2)
-    f_cond = s_conv * rh_gate * 0.95 * (fc_sig * fc_sig)
+    f_cond = s_conv * rh_gate * 0.95 * torch.sigmoid(f_cond_logit - 3.0)
+    q_ovsat = torch.clamp(qn_trans - qsat_env, min=0.0)
+    q_cond_tot = torch.minimum(qn_trans, torch.maximum(q_ovsat, qn_trans * f_cond))
+    qv_conv = torch.clamp(qn_trans - q_cond_tot, min=0.0)
+
+    f_fall = s_conv * torch.sigmoid(0.5 * raw_scal[:, 0].unsqueeze(0) + f_qp_logit)
+    q_out = torch.where(in_conv, f_fall * q_cond_tot, torch.zeros_like(q_cond_tot))
+    q_cld = torch.clamp(q_cond_tot - q_out, min=0.0)
     f_ice_nn = torch.sigmoid(f_ice_logit)
     f_ice = torch.where(
         t_env <= 253.15,
         torch.ones_like(f_ice_nn),
         (1.0 - om_liq) * f_ice_nn,
     )
-    q_cond_nn = qn_new * f_cond
-    qc_nn = q_cond_nn * (1.0 - f_ice)
-    if not raw_prof.requires_grad:
-        # Inference-only physical cirrus sublimation floor: preserves 3D-advected upper-tropospheric
-        # ice (T < 263.15 K) downwind on a ~3 h timescale in moist outflow (~14 min in dry subsidence)
-        # without masking dL/d(f_cond_logit) gradients during online student training.
-        f_ice_env = torch.clamp((263.15 - t_env) / 10.0, min=0.0, max=1.0)
-        dry_def = torch.clamp((0.75 - rh_now) / 0.55, min=0.0, max=1.0)
-        k_subl = (1.0 / 10800.0) + (1.0 / 900.0) * (dry_def * dry_def)
-        qi_adv_surv = torch.minimum(qi0 * torch.exp(-k_subl * dt), 0.90 * qn_new) * f_ice_env
-        qi_nn_or_adv = torch.maximum(q_cond_nn * f_ice, qi_adv_surv)
-        q_sum_ci = qc_nn + qi_nn_or_adv
-        sc_ci_n = torch.where(q_sum_ci > qn_new, qn_new / torch.clamp(q_sum_ci, min=1.0e-12), torch.ones_like(qn_new))
-        qc_nn = qc_nn * sc_ci_n
-        qi_nn_or_adv = qi_nn_or_adv * sc_ci_n
-    else:
-        qi_nn_or_adv = q_cond_nn * f_ice
-    q_ovsat = torch.clamp(qn_new - qsat_env, min=0.0)
-    q_excess = torch.clamp(q_ovsat - (qc_nn + qi_nn_or_adv), min=0.0)
-    qc_pre_fall = torch.where(in_conv, qc_nn + q_excess * (1.0 - f_ice), qc0)
-    qi_pre_fall = torch.where(in_conv, qi_nn_or_adv + q_excess * f_ice, qi0)
-    qv_new = torch.where(in_conv, torch.clamp(qn_new - qc_pre_fall - qi_pre_fall, min=0.0), qv0)
-
-    # Physical autoconversion & ice-sedimentation fallout: saturated condensation forms suspended
-    # cloud liquid/ice up to physical autoconversion/sedimentation ceilings (7.5e-4 liquid,
-    # min(qsat_env, 2.5e-4) ice), precipitating only excess condensate conservatively so marine
-    # stratocumulus and frontal clouds are not stripped instantly into surface rain.
-    qc_keep = torch.clamp(qc_pre_fall, max=7.5e-4)
-    qi_cap = torch.clamp(qsat_env, max=2.5e-4)
-    qi_keep = torch.minimum(qi_pre_fall, qi_cap)
-    qc_new = torch.where(in_conv, qc_keep, qc0)
-    qi_new = torch.where(in_conv, qi_keep, qi0)
-    f_cld_nn = s_conv * rh_gate * torch.sigmoid(rp[7] - 2.0)
-    f_cld_phys = torch.maximum(
-        torch.clamp(qi_keep / 2.0e-5, min=0.0, max=0.85),
-        torch.clamp((qc_keep - 5.0e-5) / 4.5e-4, min=0.0, max=0.80),
-    )
-    f_cld_pred = torch.where(in_conv, torch.maximum(f_cld_nn, f_cld_phys), torch.zeros_like(f_cld_nn))
-    qc_fall = torch.where(in_conv, torch.clamp(qc_pre_fall - qc_new, min=0.0), torch.zeros_like(qc_pre_fall))
-    qi_fall = torch.where(in_conv, torch.clamp(qi_pre_fall - qi_new, min=0.0), torch.zeros_like(qi_pre_fall))
+    qc_new = torch.where(in_conv, q_cld * (1.0 - f_ice), qc0)
+    qi_new = torch.where(in_conv, q_cld * f_ice, qi0)
+    qv_new = torch.where(in_conv, qv_conv, qv0)
     qn_new = torch.where(in_conv, qv_new + qc_new + qi_new, qn0)
-    p_fall_mass = (dm * (qc_fall + qi_fall)).sum(dim=0)
-    p_tot_orig = p_tot_mass
-    p_tot_mass = p_tot_orig + p_fall_mass
+
+    # Exact algebraic split of available precipitating mass (q_out + qp0) into suspended q_p and
+    # surface precipitation P_tot * dt >= 0 (strictly conserving total column water to machine epsilon).
+    qp_avail = q_out + qp0
+    qp_conv = s_conv * (0.50 * torch.sigmoid(f_qp_logit)) * qp_avail
+    qp_new = torch.where(in_conv, qp_conv, qp0)
+    p_tot_mass = (dm * conv_f * torch.clamp(qp_avail - qp_new, min=0.0)).sum(dim=0)
+
+    # Subgrid cloud fraction predicted by NN with physical in-cloud mass-ratio floor (q_cld / 1 g kg^-1)
+    f_cld_nn = s_conv * rh_gate * torch.sigmoid(rp[7] - 1.5)
+    f_cld_floor = torch.where(q_cld > 1.0e-6, torch.clamp(q_cld * 1.0e3, min=0.0, max=1.0), torch.zeros_like(q_cld))
+    f_cld_pred = torch.where(in_conv, torch.maximum(f_cld_nn, f_cld_floor), torch.zeros_like(f_cld_nn))
 
     # Rain / snow partition (zero snow above 278 K near surface)
     f_snow = torch.sigmoid(raw_scal[:, 1]) * torch.clamp((278.0 - temp_sfc) / 6.0, min=0.0, max=1.0)
@@ -549,31 +509,36 @@ def apply_exact_conservation_closure(
     p_rain_rate = (p_tot_mass * (1.0 - f_snow)) / dt
 
     # --- 2. Exact Column Sensible Enthalpy Closure in True Temperature Space ---
-    # Pre-inject surface sensible heat flux (shf * dt) into the lowest PBL (~p >= 0.95 p_s) so
-    # air-sea/air-land thermal restoring is physically localized even before NN convergence.
+    # Pre-inject surface sensible heat flux (shf * dt) into the lowest PBL (~p >= 0.95 p_s).
     pbl_shape = torch.clamp(1.0 - (ex0 - exner) / (0.015 * ex0), min=0.0, max=1.0) * s_conv
     dm_pbl_sum = torch.clamp((dm * pbl_shape).sum(dim=0), min=1.0e-3)
     d_temp_shf = ((shf * dt) / (C.CP_D * dm_pbl_sum)).unsqueeze(0) * pbl_shape
 
-    # Local in-situ phase-change latent heating (cloud formation + in-situ precipitation condensation)
-    # deposits latent heat directly in the cloudy layers where condensation occurs instead of dumping
-    # dh_precip uniformly into the cold dry upper troposphere via h_corr.
+    # Exact in-situ condensation & freezing latent heating: since sum dm * q_out == P_tot*dt + dM_qp,
+    # sum dm * L_v0 * (q_cond_tot - qc0 - qi0) equals L_v0 * (P_tot*dt + dM_c + dM_i + dM_qp) identically!
     d_temp_lat = conv_f * (
-        C.L_V0 * ((qc_pre_fall + qi_pre_fall) - (qc0 + qi0) + dq_psink)
+        C.L_V0 * (q_cond_tot - (qc0 + qi0))
         + C.L_F0 * (qi_new - qi0)
     ) / C.CP_D
-    # Remaining column enthalpy budget is projected strictly onto active convective/PBL layers w_h
-    # (matching d_temp_raw support) so clear-sky PBL residuals never leak into the dry tropopause.
-    d_m_qp = (dm * conv_f * (qp_new - qp0)).sum(dim=0)
-    p_sink_mass = (dm * conv_f * dq_psink).sum(dim=0)
-    dh_precip = (
-        C.L_V0 * (p_tot_orig - p_sink_mass + d_m_qp)
-        + C.L_F0 * (p_tot_mass * f_snow)
-    )
-    dh_raw = C.CP_D * (dm * d_temp_raw).sum(dim=0)
+
+    # Exact zero-sum telescoping convective sensible heat flux H_{k+1/2}: redistributes enthalpy
+    # across convective layers (downdraft PBL cooling & mid-tropospheric warming) with dh_trans == 0
+    # identically and zero arbitrary 0.15 K cap or nonlocal h_corr leak into the tropopause.
+    if int(qn_base.shape[0]) >= 2:
+        h_max = C.CP_D * torch.minimum(dm[:-1], dm[1:]) * 2.0
+        int_active_h = (s_conv[1:] > 0.0).to(dm.dtype)
+        h_flux = h_max * w_h[:-1] * int_active_h * torch.tanh(rp0_s[:-1] * 0.25)
+        d_temp_trans = torch.zeros_like(qn_base)
+        d_temp_trans[:-1] = d_temp_trans[:-1] - h_flux / (C.CP_D * dm[:-1])
+        d_temp_trans[1:] = d_temp_trans[1:] + h_flux / (C.CP_D * dm[1:])
+    else:
+        d_temp_trans = torch.zeros_like(qn_base)
+
+    # Only surface snow fusion enthalpy (L_f * P_snow * dt) remains for column projection on w_h.
+    dh_snow = C.L_F0 * (p_tot_mass * f_snow)
     denom_h = torch.clamp(C.CP_D * (dm * w_h).sum(dim=0), min=1.0)
-    h_corr = (dh_precip - dh_raw) / denom_h
-    d_temp_cons = d_temp_shf + d_temp_lat + d_temp_raw + h_corr.unsqueeze(0) * w_h
+    h_corr = dh_snow / denom_h
+    d_temp_cons = d_temp_shf + d_temp_lat + d_temp_trans + h_corr.unsqueeze(0) * w_h
 
     # Exact enthalpy-conserving 2-pass red-black dry-convective adjustment within s_conv > 0:
     # removes statically unstable super-adiabatic 2dz sawtooth pairs (theta_k > theta_{k+1})
@@ -1654,8 +1619,8 @@ def _compute_distill_loss(
     l_scal = (F.smooth_l1_loss(scal_p2, scal_t2, reduction="none") * w_scal).mean(dim=1).sum()
     loss = l_prof + l_scal + 2.0 * l_t_pbl + 1.2 * l_t_grad
 
-    # Gentle per-sample linear precipitation supervision reduces log1p downward bias without
-    # using batch-mean penalties that inflate fair-weather tropical drizzle floors.
+    # Linear per-sample + precipitating-only mean calibration eliminates log1p downward Jensen bias
+    # on precipitation (preventing excess LWP/IWP buildup) without inflating dry-column drizzle floors.
     p_tot_t_mmd = torch.clamp((tgt_s[:, 0] + tgt_s[:, 1]) * 86400.0, min=0.0)
     p_tot_t2 = torch.cat([p_tot_t_mmd, p_tot_t_mmd], dim=0)
     p_tot_p2 = torch.clamp(
@@ -1663,7 +1628,13 @@ def _compute_distill_loss(
          + torch.cat([pred_a["precip_snow"], pred_b["precip_snow"]], dim=0)) * 86400.0,
         min=0.0,
     )
-    loss = loss + 0.12 * F.smooth_l1_loss(p_tot_p2 * 0.1, p_tot_t2 * 0.1, beta=1.0)
+    m_pr = (p_tot_t2 > 0.5).to(p_tot_t2.dtype)
+    pr_mean_err = ((p_tot_p2 - p_tot_t2) * m_pr).sum() / torch.clamp(m_pr.sum(), min=1.0)
+    loss = (
+        loss
+        + 0.80 * F.smooth_l1_loss(p_tot_p2 * 0.1, p_tot_t2 * 0.1, beta=0.5)
+        + 0.40 * (pr_mean_err * 0.1).square()
+    )
 
     # Sharp per-step tendency & RH-normalized moisture supervision eliminates systematic PBL drying
     # and upper-tropospheric moistening/cirrus drift across 4 orders of magnitude in q_sat(z).
@@ -3606,7 +3577,8 @@ def sync_sparse_crm_pool(
         pool.crm.q_i[:, new_slots] = _exp4(tile_crm.q_i)
         pool.crm.qke[:, new_slots] = _exp4(tile_crm.qke)
 
-        # Optional 2-moment / 6-class 2-moment hydrometeor fields
+        # Optional 2-moment / 6-class 2-moment hydrometeor fields; keep n_c/n_i physically consistent
+        # with cloud mass so newly entering student cells never suffer stale-zero n_i snow fallout.
         for opt_attr in ("n_c", "n_i", "q_r", "q_s", "q_g", "n_r", "n_s", "n_g"):
             src_f = getattr(tile_crm, opt_attr, None)
             if src_f is not None:
@@ -3614,7 +3586,12 @@ def sync_sparse_crm_pool(
                 if dst_f is None:
                     dst_f = torch.zeros_like(pool.crm.q_c)
                     setattr(pool.crm, opt_attr, dst_f)
-                dst_f[:, new_slots] = _exp4(src_f)
+                exp_v = _exp4(src_f)
+                if opt_attr == "n_c":
+                    exp_v = torch.maximum(exp_v, pool.crm.q_c[:, new_slots] / 4.2e-12)
+                elif opt_attr == "n_i":
+                    exp_v = torch.maximum(exp_v, pool.crm.q_i[:, new_slots] / 1.6e-10)
+                dst_f[:, new_slots] = exp_v
 
         if tile_q_rad_4d is not None:
             pool.q_rad[:, new_slots] = _exp4(tile_q_rad_4d)
