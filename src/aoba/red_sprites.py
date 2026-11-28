@@ -341,7 +341,9 @@ def _compute_red_sprites_core(
     cmc_crit_delay, k_init_delay = cmc_req_delay_z.min(dim=0)
     cmc_crit_halo, _ = cmc_req_halo_z.min(dim=0)
 
-    anvil_fac = torch.clamp(iwp_cell / (iwp_cell + 1.5), 0.0, 1.0)
+    iwp_fac = iwp_cell / (iwp_cell + 0.25)
+    ccd_fac = torch.clamp((cold_cloud_km_cell - 6.0) / 7.0, 0.0, 1.0)
+    anvil_fac = torch.clamp(0.5 * iwp_fac + 0.5 * ccd_fac, 0.0, 1.0)
     cmc_med = 22.0 + 48.0 * anvil_fac
     sigma_ln = 1.15
     inv_s2 = 1.0 / (sigma_ln * math.sqrt(2.0))

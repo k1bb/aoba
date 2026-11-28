@@ -828,8 +828,13 @@ def step_land_carbon_and_fire(
     t_air_c = torch.clamp(t_sfc_k - C.T_FREEZE, min=-40.0, max=55.0)
     dp_dep = torch.clamp(vpd_pa / 160.0, 0.0, 35.0)
     di_inc = torch.clamp(t_air_c, min=0.0) * dp_dep * (dt / C.SECONDS_PER_DAY)
-    wet_reset = (precip_kgm2s * C.SECONDS_PER_DAY > 3.0) | (f_snow > 0.20)
-    di_new = torch.where(wet_reset, torch.zeros_like(lc.fire_di), torch.clamp(lc.fire_di + di_inc, 0.0, FIRE_DI_MAX)) * is_land
+    # dt-invariant continuous Nesterov rainfall damping (3 mm actual accumulated rain damps DI by 86%,
+    # while brief 12-min dry-lightning showers of ~0.1 mm do not falsely extinguish ignition danger!)
+    p_step_mm = torch.clamp(precip_kgm2s, min=0.0) * dt
+    is_wet_step = (precip_kgm2s * C.SECONDS_PER_DAY) > 3.0
+    di_inc_eff = torch.where(is_wet_step, torch.zeros_like(di_inc), di_inc)
+    di_damped = lc.fire_di * torch.exp(-p_step_mm / 1.5)
+    di_new = torch.where(f_snow > 0.20, torch.zeros_like(lc.fire_di), torch.clamp(di_damped + di_inc_eff, 0.0, FIRE_DI_MAX)) * is_land
     lc.fire_di = di_new
 
     fdi = -torch.expm1(-FIRE_DI_K * di_new)

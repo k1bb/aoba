@@ -5348,7 +5348,9 @@ kernel void red_sprites_col(
         }
     }
 
-    float anvil_fac = clamp(iwp / (iwp + 1.5f), 0.0f, 1.0f);
+    float iwp_fac = iwp / (iwp + 0.25f);
+    float ccd_fac = clamp((cold_cld_km[c] - 6.0f) * (1.0f / 7.0f), 0.0f, 1.0f);
+    float anvil_fac = clamp(0.5f * iwp_fac + 0.5f * ccd_fac, 0.0f, 1.0f);
     float cmc_med = 22.0f + 48.0f * anvil_fac;
     float inv_s2 = 0.61487523f;  // 1 / (1.15 * sqrt(2))
 

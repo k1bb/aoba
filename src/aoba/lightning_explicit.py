@@ -1072,7 +1072,7 @@ def step_ossp_distilled_lightning(
     mature_f = (distill_state.slot_dwell_age >= min_dwell).to(torch.float32)
     fl_t = diag_t.flash_tot_cell.detach()
     cg_t = diag_t.flash_cg_cell.detach()
-    ccd_t = diag_t.cold_cloud_km_sub.reshape(n_t, -1).mean(dim=-1).detach()
+    ccd_t = diag_t.cold_cloud_km_sub.reshape(n_t, -1).amax(dim=-1).detach()
     hit_t = (fl_t > 1.0e-14).to(torch.float32)
     ccd_norm_t = torch.clamp(ccd_t / 15.0, 0.0, 1.0)
 
@@ -1083,10 +1083,16 @@ def step_ossp_distilled_lightning(
     _ring_push(distill_state.all_ccd, ptr_all0, sz_all0, ccd_norm_t)
     _ring_push(distill_state.all_valid, ptr_all0, sz_all0, mature_f)
 
-    # Fixed-shape top-k storm extraction (zero `.item()` / `nonzero()` CPU-GPU sync!)
-    k_top = min(16, n_t)
-    top_fl, top_idx = torch.topk(fl_t * mature_f, k=k_top, dim=0)
-    top_valid = (top_fl > 1.0e-14).to(torch.float32)
+    # Fixed-shape UNBIASED active-storm extraction (zero `.item()` / `nonzero()` CPU-GPU sync!):
+    # rank active flashing teacher cells by a uniform random key in [1, 2) rather than by `fl_t`,
+    # eliminating upper-tail `topk` selection bias at high resolution (e.g. AG6 n_t=640 where 100+
+    # cells flash per step and `topk(fl_t, 16)` would train only on the top-2% extreme supercells!).
+    is_act = (fl_t > 1.0e-14) & (mature_f > 0.5)
+    k_top = min(max(32, n_t // 4), n_t)
+    rand_key = torch.where(is_act, torch.rand_like(fl_t) + 1.0, torch.zeros_like(fl_t))
+    top_key, top_idx = torch.topk(rand_key, k=k_top, dim=0)
+    top_valid = (top_key > 0.5).to(torch.float32)
+    top_fl = fl_t[top_idx]
     top_x = x_t[top_idx]
     top_y = torch.log1p(torch.clamp(top_fl, min=0.0) / LIGHTNING_FLASH_LOG_SCALE)
     top_fcg = torch.clamp(cg_t[top_idx] / torch.clamp(top_fl, min=1.0e-18), 0.0, 1.0)
@@ -1234,8 +1240,8 @@ def step_ossp_distilled_lightning(
                     gain_ready > 0.5,
                     torch.clamp(
                         distill_state.ema_tea_fl_gpu / torch.clamp(distill_state.ema_stu_fl_gpu, min=1.0e-18),
-                        min=0.35,
-                        max=40.0,
+                        min=0.25,
+                        max=8.0,
                     ),
                     torch.ones((), device=dev, dtype=dtype),
                 )

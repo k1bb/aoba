@@ -8183,8 +8183,10 @@ kernel void land_carbon_cn_fire_prep_tile(
     float t_air_c = clamp(t_sfc_k - 273.15f, -40.0f, 55.0f);
     float dp_dep = clamp(vpd_pa / 160.0f, 0.0f, 35.0f);
     float di_inc = max(t_air_c, 0.0f) * dp_dep * (dt / 86400.0f);
-    bool wet_rst = (precip_s * 86400.0f > 3.0f) || (f_snow > 0.20f);
-    float di_new = wet_rst ? 0.0f : clamp(aux_io[M + i] + di_inc, 0.0f, 5000.0f);
+    float p_step_mm = max(precip_s, 0.0f) * dt;
+    float di_inc_eff = (precip_s * 86400.0f > 3.0f) ? 0.0f : di_inc;
+    float di_damped = aux_io[M + i] * exp(-p_step_mm * (1.0f / 1.5f));
+    float di_new = (f_snow > 0.20f) ? 0.0f : clamp(di_damped + di_inc_eff, 0.0f, 5000.0f);
     aux_io[M + i] = di_new;
 
     float fdi = _aoba_neg_expm1_neg(3.0e-4f * di_new);

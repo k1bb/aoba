@@ -148,7 +148,7 @@ def test_water_isotope_physics() -> None:
 def test_planetary_presets_and_tidal_lock() -> None:
     """Verify aquaplanet, snowball_earth, trappist1e, mars_like presets and substellar insolation."""
     assert set(VALID_PLANET_PRESETS) == {
-        "earth", "aquaplanet", "snowball_earth", "tidally_locked", "trappist1e", "mars_like"
+        "earth", "aquaplanet", "snowball_earth", "tidally_locked", "trappist1e", "mars_like", "pangaea"
     }
 
     # Substellar insolation geometry

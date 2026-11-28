@@ -4853,7 +4853,7 @@ def step_aoba_model(
             sp_out: list[torch.Tensor] = []
             sp_diag_cg = None
             if _do_sprites and lgt_fcg_c is not None and lgt_ccd_s is not None:
-                ccd_c = lgt_ccd_s.reshape(nc, -1).mean(dim=-1)
+                ccd_c = lgt_ccd_s.reshape(nc, -1).amax(dim=-1)
                 sp_diag_cg = compute_red_sprites(
                     flash_cg_cell=lgt_fcg_c, cold_cloud_km_cell=ccd_c, mu0_cell=mu0_i,
                     rho_host=arho_i, theta_m_host=athm_i, q_v_host=aqv_i,
@@ -5295,7 +5295,7 @@ def step_aoba_model(
         if _do_sprites:
             from aoba.red_sprites import compute_red_sprites
 
-            ccd_cell = light_diag.cold_cloud_km_sub.reshape(nc, -1).mean(dim=-1)
+            ccd_cell = light_diag.cold_cloud_km_sub.reshape(nc, -1).amax(dim=-1)
             model.last_red_sprites = compute_red_sprites(
                 flash_cg_cell=light_diag.flash_cg_cell,
                 cold_cloud_km_cell=ccd_cell,
