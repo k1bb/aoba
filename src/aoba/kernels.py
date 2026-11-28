@@ -38,6 +38,7 @@ from aoba.kernels_cuda import get_cuda_lib
 from aoba.kernels_extra import (
     EXTRA_METAL_SHADER_SRC,
     _get_scvt_mesh_cache,
+    run_bio_prepare_two_leaf_metal,
     run_crm_fct_advect_metal,
     run_crm_fct_pair_metal,
     run_crm_fct_quad_metal,
@@ -45,6 +46,11 @@ from aoba.kernels_extra import (
     run_crm_microphysics_metal,
     run_crm_mynn_metal,
     run_crm_sgs_metal,
+    run_lgt_extract_feat_metal,
+    run_ossp_subgrid_struct_metal,
+    run_post_crm_accum_metal,
+    run_red_sprites_metal,
+    run_root_zone_water_5layer_metal,
     run_scvt_biharmonic_visc_metal,
     run_scvt_div_metal,
     run_scvt_fast_acoustic_metal,
@@ -53,6 +59,11 @@ from aoba.kernels_extra import (
     run_scvt_trisk_rot_metal,
     run_scvt_vec_lap_metal,
     run_scvt_vorticity_metal,
+    run_soil_hydro_5layer_metal,
+    run_soil_thermo_5layer_metal,
+    run_surface_land_post_newton_metal,
+    run_surface_land_pre_newton_metal,
+    run_surface_ocean_pre_transfer_metal,
 )
 from aoba.kernels_physics import (
     PHYSICS_METAL_SHADER_SRC,
@@ -1738,6 +1749,72 @@ def dispatch_rad_distill_closure_metal(**kwargs: Any) -> dict[str, torch.Tensor]
     lib = _get_gpu_lib(_first_tensor_device(**kwargs))
     assert lib is not None
     return run_rad_distill_closure_metal(lib, **kwargs)
+
+
+def dispatch_red_sprites_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_red_sprites_metal(lib, **kwargs)
+
+
+def dispatch_ossp_subgrid_struct_metal(**kwargs: Any) -> torch.Tensor:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_ossp_subgrid_struct_metal(lib, **kwargs)
+
+
+def dispatch_lgt_extract_feat_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_lgt_extract_feat_metal(lib, **kwargs)
+
+
+def dispatch_post_crm_accum_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_post_crm_accum_metal(lib, **kwargs)
+
+
+def dispatch_bio_prepare_two_leaf_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_bio_prepare_two_leaf_metal(lib, **kwargs)
+
+
+def dispatch_surface_land_pre_newton_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_surface_land_pre_newton_metal(lib, **kwargs)
+
+
+def dispatch_surface_land_post_newton_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_surface_land_post_newton_metal(lib, **kwargs)
+
+
+def dispatch_root_zone_water_5layer_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_root_zone_water_5layer_metal(lib, **kwargs)
+
+
+def dispatch_soil_hydro_5layer_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_soil_hydro_5layer_metal(lib, **kwargs)
+
+
+def dispatch_soil_thermo_5layer_metal(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_soil_thermo_5layer_metal(lib, **kwargs)
+
+
+def dispatch_surface_ocean_pre_transfer_metal(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+    lib = _get_gpu_lib(_first_tensor_device(**kwargs))
+    assert lib is not None
+    return run_surface_ocean_pre_transfer_metal(lib, **kwargs)
 
 
 _WEIGHTED_EDGE_SUM_UP_CACHE: dict[tuple[str, int, int, int, int], torch.Tensor] = {}

@@ -813,6 +813,8 @@ def extract_lightning_distill_features(
     k_top_trop: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build 14 universal map-free physical column features `[nc, 14]` and convective gate `[nc]`."""
+    from aoba.kernels import can_use_elem_metal, dispatch_lgt_extract_feat_metal
+
     nz_full, nc = rho_d.shape
     kt = nz_full if k_top_trop is None else max(min(int(k_top_trop), nz_full), 3)
     rho_s = rho_d[:kt]
@@ -823,6 +825,11 @@ def extract_lightning_distill_features(
     qp_s = q_p[:kt]
     z_s = z_c[:kt]
     dz_s = dz_c[:kt]
+    if can_use_elem_metal(rho_s):
+        return dispatch_lgt_extract_feat_metal(
+            rho_s=rho_s, thm_s=thm_s, qv_s=qv_s, qc_s=qc_s, qi_s=qi_s, qp_s=qp_s,
+            z_s=z_s, dz_s=dz_s, rain_3d=rain_3d, snow_3d=snow_3d, buoy_sfc=buoy_sfc,
+        )
     _, _, temp = diagnose_pressure_temperature(rho_s, thm_s, qv_s)
     dm = torch.clamp(rho_s * dz_s, min=0.0)
     qv_pos = torch.clamp(qv_s, min=0.0)
@@ -981,6 +988,8 @@ def step_ossp_distilled_lightning(
             keep_mask = (~swapped).to(dtype).view(1, 1, n_t, 1, 1)
             explicit_state.q_chg.mul_(keep_mask)
 
+        z_c_t = z_c_host.index_select(1, t_idx)
+        dz_c_t = dz_c_host.index_select(1, t_idx)
         diag_t = step_explicit_bulk_lightning_and_lnox(
             state=explicit_state,
             rho_d=teacher_crm.rho_d,
@@ -990,9 +999,9 @@ def step_ossp_distilled_lightning(
             q_i=teacher_crm.q_i,
             q_p=teacher_crm.q_p,
             w_stag=teacher_crm.w,
-            z_c=z_c_host[:, t_idx],
-            dz_c=dz_c_host[:, t_idx],
-            area_cell=area_cell[t_idx],
+            z_c=z_c_t,
+            dz_c=dz_c_t,
+            area_cell=area_cell.index_select(0, t_idx),
             dx=float(dx_crm),
             dt=float(dt),
             dy=float(dx_crm),
@@ -1006,6 +1015,8 @@ def step_ossp_distilled_lightning(
             n_g_prog=getattr(teacher_crm, "n_g", None),
         )
     else:
+        z_c_t = z_c_host.index_select(1, t_idx)
+        dz_c_t = dz_c_host.index_select(1, t_idx)
         diag_t = compute_crm_lightning_and_lnox(
             rho_d=teacher_crm.rho_d,
             theta_m=teacher_crm.theta_m,
@@ -1013,9 +1024,9 @@ def step_ossp_distilled_lightning(
             q_i=teacher_crm.q_i,
             q_p=teacher_crm.q_p,
             w_stag=teacher_crm.w,
-            z_c=z_c_host[:, t_idx],
-            dz_c=dz_c_host[:, t_idx],
-            area_cell=area_cell[t_idx],
+            z_c=z_c_t,
+            dz_c=dz_c_t,
+            area_cell=area_cell.index_select(0, t_idx),
             q_g_prog=getattr(teacher_crm, "q_g", None),
             q_s_prog=getattr(teacher_crm, "q_s", None),
         )
@@ -1038,17 +1049,17 @@ def step_ossp_distilled_lightning(
             (teacher_crm.rho_d * teacher_crm.q_c).mean(dim=(-2, -1)) * inv_rtm,
             (teacher_crm.rho_d * teacher_crm.q_i).mean(dim=(-2, -1)) * inv_rtm,
             (teacher_crm.rho_d * teacher_crm.q_p).mean(dim=(-2, -1)) * inv_rtm,
-            z_c_host[:, t_idx],
-            dz_c_host[:, t_idx],
+            z_c_t,
+            dz_c_t,
             rain_t_3d,
             snow_t_3d,
-            buoy_sfc[t_idx],
+            buoy_sfc.index_select(0, t_idx),
             k_top_trop=k_top_trop,
         )
         x_t = x_t_full.detach()
     else:
-        x_t = feats_all[t_idx].detach()
-        conv_gate_t = conv_gate[t_idx]
+        x_t = feats_all.index_select(0, t_idx).detach()
+        conv_gate_t = conv_gate.index_select(0, t_idx)
 
     # 4. Zero-sync fixed-shape push of teacher samples into all-sky & top-k active-storm Hurdle buffers
     min_dwell = 2 if use_explicit else 1
@@ -1142,19 +1153,19 @@ def step_ossp_distilled_lightning(
                 for _ in range(n_lt_grad):
                     idx_a = torch.randint(0, distill_state.all_size, (b_all,), device=dev)
                     step_in = [
-                        distill_state.all_x[idx_a],
-                        distill_state.all_hit[idx_a],
-                        distill_state.all_ccd[idx_a],
-                        distill_state.all_valid[idx_a],
+                        distill_state.all_x.index_select(0, idx_a),
+                        distill_state.all_hit.index_select(0, idx_a),
+                        distill_state.all_ccd.index_select(0, idx_a),
+                        distill_state.all_valid.index_select(0, idx_a),
                     ]
                     if has_act_batch:
                         idx_p = torch.randint(0, distill_state.act_size, (b_act,), device=dev)
                         step_in.extend([
-                            distill_state.act_x[idx_p],
-                            distill_state.act_y[idx_p],
-                            distill_state.act_fcg[idx_p],
-                            distill_state.act_valid[idx_p],
-                            distill_state.act_ccd[idx_p],
+                            distill_state.act_x.index_select(0, idx_p),
+                            distill_state.act_y.index_select(0, idx_p),
+                            distill_state.act_fcg.index_select(0, idx_p),
+                            distill_state.act_valid.index_select(0, idx_p),
+                            distill_state.act_ccd.index_select(0, idx_p),
                         ])
                     if use_cg_lt:
                         g_key = ("lt_ml_train", id(distill_state.net), b_all, b_act if has_act_batch else 0)
@@ -1246,10 +1257,10 @@ def step_ossp_distilled_lightning(
                 f_cg_sub = f_cg_s.view(-1, 1, 1).expand(-1, ny_out, nx_out).contiguous()
                 ccd_km_sub = ccd_s.view(-1, 1, 1).expand(-1, ny_out, nx_out).contiguous()
             else:
-                flash_tot_sub[s_idx] = flash_cell_s.view(-1, 1, 1) * rel_w
-                flash_cg_sub[s_idx] = cg_cell_s.view(-1, 1, 1) * rel_w
-                f_cg_sub[s_idx] = f_cg_s.view(-1, 1, 1).expand(-1, ny_out, nx_out)
-                ccd_km_sub[s_idx] = ccd_s.view(-1, 1, 1).expand(-1, ny_out, nx_out)
+                flash_tot_sub.index_copy_(0, s_idx, flash_cell_s.view(-1, 1, 1) * rel_w)
+                flash_cg_sub.index_copy_(0, s_idx, cg_cell_s.view(-1, 1, 1) * rel_w)
+                f_cg_sub.index_copy_(0, s_idx, f_cg_s.view(-1, 1, 1).expand(-1, ny_out, nx_out).contiguous())
+                ccd_km_sub.index_copy_(0, s_idx, ccd_s.view(-1, 1, 1).expand(-1, ny_out, nx_out).contiguous())
 
     # 7. Insert exact 2 km teacher CRM fields onto t_idx only when NOT in shadow-coupled pool mode
     #    (in detached-dwell pool mode, student predictions cover all host cells seamlessly without 1-cell dots)
@@ -1259,10 +1270,10 @@ def step_ossp_distilled_lightning(
                 return arr
             return F.adaptive_avg_pool2d(arr.unsqueeze(1), (ny_out, nx_out)).squeeze(1)
 
-        flash_tot_sub[t_idx] = _map_teacher_3d(diag_t.flash_tot_sub)
-        flash_cg_sub[t_idx] = _map_teacher_3d(diag_t.flash_cg_sub)
-        f_cg_sub[t_idx] = _map_teacher_3d(diag_t.f_cg_sub)
-        ccd_km_sub[t_idx] = _map_teacher_3d(diag_t.cold_cloud_km_sub)
+        flash_tot_sub.index_copy_(0, t_idx, _map_teacher_3d(diag_t.flash_tot_sub))
+        flash_cg_sub.index_copy_(0, t_idx, _map_teacher_3d(diag_t.flash_cg_sub))
+        f_cg_sub.index_copy_(0, t_idx, _map_teacher_3d(diag_t.f_cg_sub))
+        ccd_km_sub.index_copy_(0, t_idx, _map_teacher_3d(diag_t.cold_cloud_km_sub))
 
     distill_state.steps_seen += 1
 

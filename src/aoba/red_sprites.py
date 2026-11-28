@@ -467,16 +467,37 @@ def compute_red_sprites(
             pos_frac_3d = torch.clamp(q_pos_sum / torch.clamp(q_abs_sum, min=1.0e-12), 0.05, 0.50)
             f_pos_cg_explicit = torch.where(has_chg, 0.5 * pos_frac_3d, f_pos_cg_explicit)
 
-    core_fn = maybe_cuda_compile(_compute_red_sprites_core, device=rho_host.device)
-    (
-        sprite_rate, sprite_prompt_rate, sprite_delayed_rate, halo_rate, cmc_med,
-        e_over_ek_max, red_1pn2_kr, blue_2pn2_kr, z_init_km, z_stop_km,
-        sprite_nox_mol_m2s, elves_rate, blue_jet_rate, gigantic_jet_rate, blue_jet_top_km,
-    ) = core_fn(
-        flash_cg_cell, cold_cloud_km_cell, mu0_cell,
-        rho_host, temp_top, q_i_host, q_p_host, z_c_host, dz_c_host,
-        z_q_km, f_pos_cg_explicit,
-    )
+    from aoba.kernels import can_use_elem_metal, dispatch_red_sprites_metal
+
+    if can_use_elem_metal(rho_host):
+        (
+            sprite_rate, sprite_prompt_rate, sprite_delayed_rate, halo_rate, cmc_med,
+            e_over_ek_max, red_1pn2_kr, blue_2pn2_kr, z_init_km, z_stop_km,
+            sprite_nox_mol_m2s, elves_rate, blue_jet_rate, gigantic_jet_rate, blue_jet_top_km,
+        ) = dispatch_red_sprites_metal(
+            flash_cg_cell=flash_cg_cell,
+            cold_cloud_km_cell=cold_cloud_km_cell,
+            mu0_cell=mu0_cell,
+            temp_top=temp_top,
+            z_q_km_in=z_q_km,
+            f_pos_cg_explicit=f_pos_cg_explicit,
+            rho_host=rho_host,
+            q_i_host=q_i_host,
+            q_p_host=q_p_host,
+            z_c_host=z_c_host,
+            dz_c_host=dz_c_host,
+        )
+    else:
+        core_fn = maybe_cuda_compile(_compute_red_sprites_core, device=rho_host.device)
+        (
+            sprite_rate, sprite_prompt_rate, sprite_delayed_rate, halo_rate, cmc_med,
+            e_over_ek_max, red_1pn2_kr, blue_2pn2_kr, z_init_km, z_stop_km,
+            sprite_nox_mol_m2s, elves_rate, blue_jet_rate, gigantic_jet_rate, blue_jet_top_km,
+        ) = core_fn(
+            flash_cg_cell, cold_cloud_km_cell, mu0_cell,
+            rho_host, temp_top, q_i_host, q_p_host, z_c_host, dz_c_host,
+            z_q_km, f_pos_cg_explicit,
+        )
 
     return RedSpriteDiagnostics(
         sprite_rate_cell=sprite_rate,

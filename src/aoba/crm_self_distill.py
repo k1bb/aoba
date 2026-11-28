@@ -215,10 +215,20 @@ def compute_subgrid_structure_features(
     dy_sfc: float | None = None,
 ) -> torch.Tensor:
     """Build universal `[N, 16]` dimensionless 2D/3D surface-heterogeneity & organization features."""
+    from aoba.kernels import dispatch_ossp_subgrid_struct_metal
     from aoba.runtime import maybe_cuda_compile
 
     dxs = dx if dx_sfc is None else dx_sfc
     dys = dy if dy_sfc is None else dy_sfc
+    if (
+        can_use_elem_metal(shf_3d)
+        and int(shf_3d.shape[1] * shf_3d.shape[2]) <= 64
+        and int(qn_4d.shape[2] * qn_4d.shape[3]) <= 64
+    ):
+        return dispatch_ossp_subgrid_struct_metal(
+            shf_3d=shf_3d, lhf_3d=lhf_3d, t_rad_3d=t_rad_3d, alb_vis_3d=alb_vis_3d,
+            qn_4d=qn_4d, w_4d=w_4d, dx=dx, dy=dy, dxs=dxs, dys=dys,
+        )
     fn = maybe_cuda_compile(_compute_subgrid_structure_core, device=shf_3d.device)
     return fn(shf_3d, lhf_3d, t_rad_3d, alb_vis_3d, qn_4d, w_4d, dx, dy, dxs, dys)
 
@@ -1227,15 +1237,15 @@ class GPUReplayBuffer:
         # 1. Insert 75% into rolling recency ring [0, ring_cap)
         n_ring = max(1, (3 * b) // 4)
         idx_ring = (torch.arange(n_ring, device=self.device) + self.write_ptr) % self.ring_cap
-        self.x[idx_ring] = x_f16[:n_ring]
-        self.ctx_p[idx_ring] = ctx_p[:n_ring]
-        self.ctx_s[idx_ring] = ctx_s[:n_ring]
-        self.tgt_p[idx_ring] = tgt_p[:n_ring]
-        self.tgt_s[idx_ring] = tgt_s[:n_ring]
+        self.x.index_copy_(0, idx_ring, x_f16[:n_ring])
+        self.ctx_p.index_copy_(0, idx_ring, ctx_p[:n_ring])
+        self.ctx_s.index_copy_(0, idx_ring, ctx_s[:n_ring])
+        self.tgt_p.index_copy_(0, idx_ring, tgt_p[:n_ring])
+        self.tgt_s.index_copy_(0, idx_ring, tgt_s[:n_ring])
         if use_sp:
-            self.sub_maps[idx_ring] = sm_f16[:n_ring]
-            self.tgt_maps[idx_ring] = tm_f16[:n_ring]
-            self.tgt_has_map[idx_ring] = tgt_has_map[:n_ring]
+            self.sub_maps.index_copy_(0, idx_ring, sm_f16[:n_ring])
+            self.tgt_maps.index_copy_(0, idx_ring, tm_f16[:n_ring])
+            self.tgt_has_map.index_copy_(0, idx_ring, tgt_has_map[:n_ring])
         self.write_ptr = (self.write_ptr + n_ring) % self.ring_cap
         self.ring_size = min(self.ring_cap, self.ring_size + n_ring)
 
@@ -1244,28 +1254,29 @@ class GPUReplayBuffer:
         if n_res > 0 and self.res_cap > 0:
             if self.res_size < self.res_cap:
                 take = min(n_res, self.res_cap - self.res_size)
-                idx_r = torch.arange(self.res_size, self.res_size + take, device=self.device) + self.ring_cap
-                self.x[idx_r] = x_f16[n_ring : n_ring + take]
-                self.ctx_p[idx_r] = ctx_p[n_ring : n_ring + take]
-                self.ctx_s[idx_r] = ctx_s[n_ring : n_ring + take]
-                self.tgt_p[idx_r] = tgt_p[n_ring : n_ring + take]
-                self.tgt_s[idx_r] = tgt_s[n_ring : n_ring + take]
+                r0 = self.ring_cap + self.res_size
+                r1 = r0 + take
+                self.x[r0:r1].copy_(x_f16[n_ring : n_ring + take])
+                self.ctx_p[r0:r1].copy_(ctx_p[n_ring : n_ring + take])
+                self.ctx_s[r0:r1].copy_(ctx_s[n_ring : n_ring + take])
+                self.tgt_p[r0:r1].copy_(tgt_p[n_ring : n_ring + take])
+                self.tgt_s[r0:r1].copy_(tgt_s[n_ring : n_ring + take])
                 if use_sp:
-                    self.sub_maps[idx_r] = sm_f16[n_ring : n_ring + take]
-                    self.tgt_maps[idx_r] = tm_f16[n_ring : n_ring + take]
-                    self.tgt_has_map[idx_r] = tgt_has_map[n_ring : n_ring + take]
+                    self.sub_maps[r0:r1].copy_(sm_f16[n_ring : n_ring + take])
+                    self.tgt_maps[r0:r1].copy_(tm_f16[n_ring : n_ring + take])
+                    self.tgt_has_map[r0:r1].copy_(tgt_has_map[n_ring : n_ring + take])
                 self.res_size += take
             else:
                 idx_r = torch.randint(self.ring_cap, self.capacity, (n_res,), device=self.device)
-                self.x[idx_r] = x_f16[n_ring:]
-                self.ctx_p[idx_r] = ctx_p[n_ring:]
-                self.ctx_s[idx_r] = ctx_s[n_ring:]
-                self.tgt_p[idx_r] = tgt_p[n_ring:]
-                self.tgt_s[idx_r] = tgt_s[n_ring:]
+                self.x.index_copy_(0, idx_r, x_f16[n_ring:])
+                self.ctx_p.index_copy_(0, idx_r, ctx_p[n_ring:])
+                self.ctx_s.index_copy_(0, idx_r, ctx_s[n_ring:])
+                self.tgt_p.index_copy_(0, idx_r, tgt_p[n_ring:])
+                self.tgt_s.index_copy_(0, idx_r, tgt_s[n_ring:])
                 if use_sp:
-                    self.sub_maps[idx_r] = sm_f16[n_ring:]
-                    self.tgt_maps[idx_r] = tm_f16[n_ring:]
-                    self.tgt_has_map[idx_r] = tgt_has_map[n_ring:]
+                    self.sub_maps.index_copy_(0, idx_r, sm_f16[n_ring:])
+                    self.tgt_maps.index_copy_(0, idx_r, tm_f16[n_ring:])
+                    self.tgt_has_map.index_copy_(0, idx_r, tgt_has_map[n_ring:])
 
         self.total_seen += b
 
@@ -1288,15 +1299,15 @@ class GPUReplayBuffer:
             idx = torch.randint(0, self.ring_size, (n,), device=self.device)
         else:
             idx = torch.randint(self.ring_cap, self.ring_cap + self.res_size, (n,), device=self.device)
-        sm = self.sub_maps[idx].to(torch.float32) if self.sub_maps is not None else None
-        tm = self.tgt_maps[idx].to(torch.float32) if self.tgt_maps is not None else None
-        hm = self.tgt_has_map[idx] if self.tgt_has_map is not None else None
+        sm = self.sub_maps.index_select(0, idx).to(torch.float32) if self.sub_maps is not None else None
+        tm = self.tgt_maps.index_select(0, idx).to(torch.float32) if self.tgt_maps is not None else None
+        hm = self.tgt_has_map.index_select(0, idx) if self.tgt_has_map is not None else None
         return (
-            self.x[idx].to(torch.float32),
-            self.ctx_p[idx],
-            self.ctx_s[idx],
-            self.tgt_p[idx],
-            self.tgt_s[idx],
+            self.x.index_select(0, idx).to(torch.float32),
+            self.ctx_p.index_select(0, idx),
+            self.ctx_s.index_select(0, idx),
+            self.tgt_p.index_select(0, idx),
+            self.tgt_s.index_select(0, idx),
             sm,
             tm,
             hm,
@@ -1957,11 +1968,11 @@ def train_student_online(
         # Mix 50% fresh teacher columns + 50% long-horizon replay columns
         f_idx = torch.randint(0, b_fresh, (half_b,), device=x_fresh.device)
         xr, cpr, csr, tpr, tsr, smr, tmr, hmr = state.replay.sample(batch_size - half_b)
-        xb = torch.cat([x_fresh[f_idx], xr], dim=0)
-        cpb = torch.cat([ctx_p_fresh[f_idx], cpr], dim=0)
-        csb = torch.cat([ctx_s_fresh[f_idx], csr], dim=0)
-        tpb = torch.cat([tgt_p_fresh[f_idx], tpr], dim=0)
-        tsb = torch.cat([tgt_s_fresh[f_idx], tsr], dim=0)
+        xb = torch.cat([x_fresh.index_select(0, f_idx), xr], dim=0)
+        cpb = torch.cat([ctx_p_fresh.index_select(0, f_idx), cpr], dim=0)
+        csb = torch.cat([ctx_s_fresh.index_select(0, f_idx), csr], dim=0)
+        tpb = torch.cat([tgt_p_fresh.index_select(0, f_idx), tpr], dim=0)
+        tsb = torch.cat([tgt_s_fresh.index_select(0, f_idx), tsr], dim=0)
 
         has_sp_batch = (
             use_sp
@@ -1974,9 +1985,9 @@ def train_student_online(
         if has_sp_batch:
             assert sm_fresh_b is not None and tm_fresh_b is not None and tgt_has_map_fresh is not None
             assert smr is not None and tmr is not None and hmr is not None
-            smb = torch.cat([sm_fresh_b[f_idx], smr], dim=0)
-            tmb = torch.cat([tm_fresh_b[f_idx], tmr], dim=0)
-            hmb = torch.cat([tgt_has_map_fresh[f_idx], hmr], dim=0)
+            smb = torch.cat([sm_fresh_b.index_select(0, f_idx), smr], dim=0)
+            tmb = torch.cat([tm_fresh_b.index_select(0, f_idx), tmr], dim=0)
+            hmb = torch.cat([tgt_has_map_fresh.index_select(0, f_idx), hmr], dim=0)
             step_in = [xb, cpb, csb, tpb, tsb, smb, tmb, hmb]
         else:
             step_in = [xb, cpb, csb, tpb, tsb]
@@ -3065,11 +3076,11 @@ class GPURadReplayBuffer:
         else:
             idx = torch.randint(self.ring_cap, self.ring_cap + self.res_size, (n,), device=self.device)
         return (
-            self.x[idx].to(torch.float32),
-            self.cp_layer[idx],
-            self.ctx_s[idx],
-            self.tgt_qrad[idx],
-            self.tgt_s[idx],
+            self.x.index_select(0, idx).to(torch.float32),
+            self.cp_layer.index_select(0, idx),
+            self.ctx_s.index_select(0, idx),
+            self.tgt_qrad.index_select(0, idx),
+            self.tgt_s.index_select(0, idx),
         )
 
 

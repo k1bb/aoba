@@ -49,7 +49,11 @@ import math
 import torch
 
 from aoba import constants as C
-from aoba.kernels import can_use_elem_metal, dispatch_two_leaf_gas_exchange_metal
+from aoba.kernels import (
+    can_use_elem_metal,
+    dispatch_bio_prepare_two_leaf_metal,
+    dispatch_two_leaf_gas_exchange_metal,
+)
 
 # ---------------------------------------------------------------------------
 # 1. Universal EEO Constants (Smith et al., 2019; Scott & Smith, 2022; Cai et al., 2025; Zhou et al., 2025)
@@ -964,6 +968,58 @@ def prepare_two_leaf_allocation(
     lai_exposed: torch.Tensor,
 ) -> TwoLeafAllocation:
     """Precompute sunlit/shaded PAR profiles and enzyme capacities once per timestep before EB iterations."""
+    if can_use_elem_metal(lai_exposed):
+        out13 = dispatch_bio_prepare_two_leaf_metal(
+            ema_vis_beam=bio.ema_vis_beam,
+            ema_vis_diff=bio.ema_vis_diff,
+            ema_mu0_mid=bio.ema_mu0_mid,
+            vis_beam=vis_beam_wm2,
+            vis_diff=vis_diff_wm2,
+            mu0=mu0,
+            lai_exposed=lai_exposed,
+            chi_leaf=bio.chi_leaf,
+            leaf_scat_vis=LEAF_SCAT_VIS,
+            kd_prime_par=KD_PRIME_PAR,
+            rho_cd_par=RHO_CD_PAR,
+            crown_lai_min=CROWN_LAI_MIN,
+            chi_min=CHI_LEAF_MIN,
+            chi_max=CHI_LEAF_MAX,
+        )
+        inst_rad = CanopyRadiationProfile(
+            i_b0=out13[0],
+            i_d0=out13[1],
+            k_db=out13[2],
+            k_b_prime=out13[3],
+            rho_cb=out13[4],
+            l_sun=out13[5],
+            l_sh=out13[6],
+            i_c=out13[7],
+            i_sun=out13[8],
+            i_sh=out13[9],
+            kd_prime=out13[10],
+            omega_beam=out13[11],
+        )
+        zero = torch.zeros_like(bio.vcmax25_c3)
+        return TwoLeafAllocation(
+            inst_rad=inst_rad,
+            vc25_c3_sun=zero,
+            vc25_c3_sh=zero,
+            jm25_c3_sun=zero,
+            jm25_c3_sh=zero,
+            r25_c3_sun=zero,
+            r25_c3_sh=zero,
+            vc25_c4_sun=zero,
+            vc25_c4_sh=zero,
+            jm25_c4_sun=zero,
+            jm25_c4_sh=zero,
+            vp25_c4_sun=zero,
+            vp25_c4_sh=zero,
+            r25_c4_sun=zero,
+            r25_c4_sh=zero,
+            sun_frac=out13[12],
+            bio=bio,
+        )
+
     acclim_rad = canopy_light_absorption_depury(
         bio.ema_vis_beam, bio.ema_vis_diff, bio.ema_mu0_mid, lai_exposed, chi_leaf=bio.chi_leaf
     )

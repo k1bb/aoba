@@ -5208,6 +5208,1698 @@ kernel void scvt_storm_smag_cell(
         }
     }
 }
+
+// =========================================================================
+// Single-Source Metal/CUDA Fused ESM & OSSP Column Kernels (MPS + CUDA)
+// =========================================================================
+
+inline float aoba_erfc_f(float x) {
+    float ax = fabs(x);
+    float t = 1.0f / (1.0f + 0.3275911f * ax);
+    float poly = t * (0.254829592f + t * (-0.284496736f + t * (1.421413741f
+               + t * (-1.453152027f + t * 1.061405429f))));
+    float res = poly * exp(-ax * ax);
+    return (x >= 0.0f) ? res : (2.0f - res);
+}
+
+inline float aoba_expm1_f(float x) {
+    return (fabs(x) < 1.0e-4f) ? (x * (1.0f + 0.5f * x + x * x * (1.0f / 6.0f))) : (exp(x) - 1.0f);
+}
+
+inline float aoba_log1p_f(float x) {
+    if (fabs(x) < 1.0e-2f) {
+        return x * (1.0f - x * (0.5f - x * ((1.0f / 3.0f) - x * (0.25f - 0.2f * x))));
+    }
+    float y = 1.0f + x;
+    return (y == 1.0f) ? x : (log(y) * (x / (y - 1.0f)));
+}
+
+inline float aoba_dielectric_screen_f(float r_tau) {
+    float r_s = clamp(r_tau, 1.0e-6f, 1.0e6f);
+    float u = log(r_s);
+    float ratio = (fabs(u) < 1.0e-3f)
+        ? (1.0f - 0.5f * u + (u * u) * (1.0f / 12.0f))
+        : (u / aoba_expm1_f(u));
+    return exp(-ratio);
+}
+
+// 1. Fused 26-level Mesospheric Red Sprites, Halos, ELVES, Blue/Gigantic Jets & NOx
+kernel void red_sprites_col(
+    device const float* flash_cg      [[buffer(0)]],   // [nc]
+    device const float* cold_cld_km   [[buffer(1)]],   // [nc]
+    device const float* mu0_in        [[buffer(2)]],   // [nc]
+    device const float* temp_top_in   [[buffer(3)]],   // [nc]
+    device const float* z_q_km_in     [[buffer(4)]],   // [nc]
+    device const float* f_pos_exp_in  [[buffer(5)]],   // [nc]
+    device const float* rho_host      [[buffer(6)]],   // [nz, nc]
+    device const float* q_i_host      [[buffer(7)]],   // [nz, nc]
+    device const float* q_p_host      [[buffer(8)]],   // [nz, nc]
+    device const float* z_c_host      [[buffer(9)]],   // [nz, nc]
+    device const float* dz_c_host     [[buffer(10)]],  // [nz, nc]
+    device const int* idx_lo_26       [[buffer(11)]],  // [26]
+    device float* out15               [[buffer(12)]],  // [15, nc]
+    constant ulong4& u_dim            [[buffer(13)]],  // [nz, nc, 0, 0]
+    constant float4& f_c0             [[buffer(14)]],  // [rd_over_g_km, e_qe_const, e_emp_base, e_cld_const]
+    uint c [[thread_position_in_grid]])
+{
+    uint nz = uint(u_dim.x);
+    uint nc = uint(u_dim.y);
+    if (c >= nc) return;
+
+    float iwp = 0.0f;
+    for (uint k = 0u; k < nz; ++k) {
+        uint idx = k * nc + c;
+        float dm = max(rho_host[idx] * dz_c_host[idx], 0.0f);
+        iwp += dm * max(q_i_host[idx] + q_p_host[idx], 0.0f);
+    }
+
+    float mu0 = mu0_in[c];
+    float day_fac = clamp((mu0 + 0.10f) * 5.0f, 0.0f, 1.0f);
+    float h_prime = 85.0f * (1.0f - day_fac) + 70.0f * day_fac;
+    float beta = 0.50f * (1.0f - day_fac) + 0.30f * day_fac;
+
+    float rho_top = max(rho_host[(nz - 1u) * nc + c], 1.0e-8f);
+    float z_top_km = z_c_host[(nz - 1u) * nc + c] * 1.0e-3f;
+    float t_top = temp_top_in[c];
+    float t_top_c = clamp(t_top, 190.0f, 265.0f);
+    float zq_m = z_q_km_in[c] * 1.0e3f;
+    float zq2 = zq_m * zq_m;
+
+    float rd_over_g_km = f_c0.x;
+    float e_qe_const = f_c0.y;
+    float e_emp_base = f_c0.z;
+    float e_cld_const = f_c0.w;
+
+    float e_peak_u[26];
+    float e_k_a[26];
+    float n_air_a[26];
+
+    float cmc_crit_prompt = 1.0e30f;
+    float cmc_crit_delay = 1.0e30f;
+    float cmc_crit_halo = 1.0e30f;
+    uint k_init_delay = 0u;
+
+    for (uint m = 0u; m < 26u; ++m) {
+        float zm_km = 38.0f + 2.0f * float(m);
+        float n_air;
+        if (zm_km <= z_top_km) {
+            uint ilo = uint(idx_lo_26[m]);
+            uint ihi = ilo + 1u;
+            float z_lo = z_c_host[ilo * nc + c] * 1.0e-3f;
+            float z_hi = z_c_host[ihi * nc + c] * 1.0e-3f;
+            float w = clamp((zm_km - z_lo) / max(z_hi - z_lo, 1.0e-3f), 0.0f, 1.0f);
+            float lr = (1.0f - w) * log(max(rho_host[ilo * nc + c], 1.0e-9f))
+                     + w * log(max(rho_host[ihi * nc + c], 1.0e-9f));
+            n_air = clamp(exp(lr) * (1.0f / 4.810e-26f), 1.0e17f, 2.688e25f);
+        } else {
+            float t_eff = clamp(t_top - 1.8f * clamp(zm_km - 50.0f, 0.0f, 35.0f), 185.0f, 265.0f);
+            float h_sc = 0.5f * (t_top_c + t_eff) * rd_over_g_km;
+            float rho_m = rho_top * exp(-(zm_km - z_top_km) / h_sc);
+            n_air = clamp(rho_m * (1.0f / 4.810e-26f), 1.0e17f, 2.688e25f);
+        }
+
+        float arg_ne = clamp((beta - 0.15f) * (zm_km - h_prime), -40.0f, 25.0f);
+        float n_e = clamp(1.43e13f * exp(-0.15f * h_prime + arg_ne), 1.0e3f, 1.0e11f);
+        float mu_e = 0.045f * (2.688e25f / n_air);
+        float z_ion = min(zm_km, 55.0f) * (1.0f / 6.0f) + max(zm_km - 55.0f, 0.0f) * (1.0f / 16.0f);
+        float sigma_tot = 1.602176634e-19f * n_e * mu_e + 5.0e-14f * exp(z_ion);
+        float tau_sig = 8.854187817e-12f / max(sigma_tot, 1.0e-16f);
+
+        float n_ratio = n_air * (1.0f / 2.688e25f);
+        float e_k = 3.2e6f * n_ratio;
+        float z_m = zm_km * 1.0e3f;
+        float denom = max(z_m * z_m - zq2, 1.0e6f);
+        float e_qe_u = e_qe_const * (z_m / (denom * denom));
+        float scr = aoba_dielectric_screen_f(tau_sig * 1.0e3f);
+        float ep_u = max(e_qe_u * scr, 1.0e-12f);
+
+        e_peak_u[m] = ep_u;
+        e_k_a[m] = e_k;
+        n_air_a[m] = n_air;
+
+        float cmc_p = e_k / ep_u;
+        float cmc_h = (0.50f * e_k) / ep_u;
+        float cmc_d = (tau_sig >= 1.5e-3f) ? ((0.70f * e_k) / ep_u) : cmc_p;
+        if (cmc_p < cmc_crit_prompt) cmc_crit_prompt = cmc_p;
+        if (cmc_h < cmc_crit_halo) cmc_crit_halo = cmc_h;
+        if (cmc_d < cmc_crit_delay) {
+            cmc_crit_delay = cmc_d;
+            k_init_delay = m;
+        }
+    }
+
+    float anvil_fac = clamp(iwp / (iwp + 1.5f), 0.0f, 1.0f);
+    float cmc_med = 22.0f + 48.0f * anvil_fac;
+    float inv_s2 = 0.61487523f;  // 1 / (1.15 * sqrt(2))
+
+    float f_pos = 0.10f + 0.15f * anvil_fac;
+    float f_pos_e = f_pos_exp_in[c];
+    if (f_pos_e >= 0.0f) {
+        f_pos = 0.5f * f_pos + 0.5f * f_pos_e;
+    }
+
+    float p_prompt = 0.5f * aoba_erfc_f(log(max(cmc_crit_prompt / cmc_med, 1.0e-4f)) * inv_s2);
+    float p_any = 0.5f * aoba_erfc_f(log(max(cmc_crit_delay / cmc_med, 1.0e-4f)) * inv_s2);
+    float p_delay = max(p_any - p_prompt, 0.0f);
+    float p_halo = 0.5f * aoba_erfc_f(log(max(cmc_crit_halo / cmc_med, 1.0e-4f)) * inv_s2);
+
+    float eff_pol = f_pos + 0.12f * (1.0f - f_pos);
+    float cg_pos = max(flash_cg[c], 0.0f);
+    float sp_prompt = cg_pos * eff_pol * p_prompt;
+    float sp_delay = cg_pos * eff_pol * p_delay;
+    float sp_rate = sp_prompt + sp_delay;
+    float halo_rate = cg_pos * p_halo;
+
+    float cmc_99 = cmc_med * 14.515984f;  // exp(2.3263 * 1.15)
+    bool has_act = (sp_rate > 1.0e-18f);
+    float z_init = has_act ? (38.0f + 2.0f * float(k_init_delay)) : 0.0f;
+
+    float e_over_ek_max = 0.0f;
+    float z_stop_min = 100.0f;
+    bool any_str = false;
+    float red_max = 0.0f;
+    float blue_max = 0.0f;
+
+    for (uint m = 0u; m < 26u; ++m) {
+        float zm_km = 38.0f + 2.0f * float(m);
+        float ep99 = e_peak_u[m] * cmc_99;
+        float e_k = e_k_a[m];
+        float n_air = n_air_a[m];
+        float eok = ep99 / max(e_k, 1.0e-6f);
+        if (eok > e_over_ek_max) e_over_ek_max = eok;
+
+        float e_st = 4.4e5f * (n_air * (1.0f / 2.688e25f));
+        bool in_str = has_act && (zm_km <= z_init) && (ep99 >= e_st);
+        if (in_str) {
+            any_str = true;
+            if (zm_km < z_stop_min) z_stop_min = zm_km;
+        }
+        if (has_act) {
+            float q1p = 1.7e5f / (1.7e5f + 1.0e-17f * 0.7808f * n_air);
+            float q2p = 2.0e7f / (2.0e7f + 3.0e-16f * 0.2095f * n_air);
+            float xe = clamp(eok, 0.0f, 4.0f);
+            float ex1 = (xe > 0.20f) ? exp(-2.8f / max(xe, 0.20f)) : 0.0f;
+            float ex2 = (xe > 0.25f) ? exp(-4.2f / max(xe, 0.25f)) : 0.0f;
+            float bst = in_str ? 12.0f : 1.0f;
+            float r_v = 4.5e3f * bst * ex1 * q1p;
+            float b_v = 1.8e3f * bst * ex2 * q2p;
+            if (r_v > red_max) red_max = r_v;
+            if (b_v > blue_max) blue_max = b_v;
+        }
+    }
+    float z_stop = any_str ? z_stop_min : z_init;
+
+    // ELVES (Inan et al., 1991)
+    float e_emp_th = 0.45f * e_k_a[25];
+    float e_emp_pa = max(e_emp_base * exp(-3.2f * day_fac), 1.0e-12f);
+    float i_crit_ka = (e_emp_th / e_emp_pa) * 1.0e-3f;
+    float i_med_ka = 24.0f + 18.0f * anvil_fac;
+    float p_elves = 0.5f * aoba_erfc_f(log(max(i_crit_ka / i_med_ka, 1.0e-4f)) * 0.98209275f);
+    float elves_rate = cg_pos * p_elves;
+
+    // Blue Jets & Gigantic Jets (Pasko et al., 2002; Krehbiel et al., 2008)
+    float z_cld = clamp(4.0f + 0.85f * clamp(cold_cld_km[c], 0.0f, 16.0f), 4.0f, 17.5f);
+    float n_r_cld = exp(-z_cld * (1.0f / 7.2f));
+    float ov_gate = (1.0f / (1.0f + exp(-(z_cld - 11.5f) * (1.0f / 1.2f)))) * anvil_fac;
+    float e_cld_eff = cmc_med * e_cld_const * ov_gate;
+    float bj_ratio = e_cld_eff / max(4.4e5f * n_r_cld, 1.0f);
+    float p_bj = 0.008f * ov_gate * 0.5f * aoba_erfc_f(log(max(1.8f / max(bj_ratio, 1.0e-4f), 1.0e-4f)) * inv_s2);
+    float bj_rate = cg_pos * p_bj;
+    float bj_top = (bj_rate > 1.0e-20f) ? clamp(z_cld + 14.0f + 10.0f * tanh(bj_ratio), 24.0f, 44.0f) : 0.0f;
+
+    float gj_gate = (1.0f / (1.0f + exp(-(z_cld - 14.2f) * (1.0f / 0.85f)))) * (1.0f - 0.85f * day_fac);
+    float gj_rate = cg_pos * (p_bj * 0.14f * gj_gate * clamp(p_halo * 20.0f, 0.0f, 1.5f));
+
+    float len_sc = clamp((z_init - z_stop) * 0.04f, 0.3f, 2.0f);
+    float sp_nox = sp_rate * 5.0e22f * len_sc + gj_rate * 5.0e23f;
+
+    out15[0u * nc + c] = sp_rate;
+    out15[1u * nc + c] = sp_prompt;
+    out15[2u * nc + c] = sp_delay;
+    out15[3u * nc + c] = halo_rate;
+    out15[4u * nc + c] = cmc_med;
+    out15[5u * nc + c] = e_over_ek_max;
+    out15[6u * nc + c] = red_max;
+    out15[7u * nc + c] = blue_max;
+    out15[8u * nc + c] = z_init;
+    out15[9u * nc + c] = z_stop;
+    out15[10u * nc + c] = sp_nox;
+    out15[11u * nc + c] = elves_rate;
+    out15[12u * nc + c] = bj_rate;
+    out15[13u * nc + c] = gj_rate;
+    out15[14u * nc + c] = bj_top;
+}
+
+// 2. Fused 16-Feature Periodic Subgrid Structure & Organization Invariants (OSSP)
+kernel void ossp_subgrid_struct_col(
+    device const float* shf_in        [[buffer(0)]],   // [N, n_s]
+    device const float* lhf_in        [[buffer(1)]],   // [N, n_s]
+    device const float* trad_in       [[buffer(2)]],   // [N, n_s]
+    device const float* alb_in        [[buffer(3)]],   // [N, n_s]
+    device const float* qn_4d         [[buffer(4)]],   // [nz, N, n_c]
+    device const float* w_4d          [[buffer(5)]],   // [nz+1, N, n_c]
+    device float* out16               [[buffer(6)]],   // [N, 16]
+    constant ulong4& u_p0             [[buffer(7)]],   // [N, nz, (ny_s<<16)|nx_s, (ny<<16)|nx]
+    constant float4& f_p0             [[buffer(8)]],   // [inv_dx2, inv_dy2, inv_dxs2, inv_dys2]
+    uint c [[thread_position_in_grid]])
+{
+    uint nc = uint(u_p0.x);
+    if (c >= nc) return;
+    uint nz = uint(u_p0.y);
+    uint ny_s = uint(u_p0.z) >> 16u;
+    uint nx_s = uint(u_p0.z) & 0xFFFFu;
+    uint ny = uint(u_p0.w) >> 16u;
+    uint nx = uint(u_p0.w) & 0xFFFFu;
+    uint n_s = ny_s * nx_s;
+    uint n_c = ny * nx;
+
+    float inv_dx2 = f_p0.x;
+    float inv_dy2 = f_p0.y;
+    float inv_dxs2 = f_p0.z;
+    float inv_dys2 = f_p0.w;
+
+    float shf_a[64];
+    float lhf_a[64];
+    float tr_a[64];
+    float al_a[64];
+    float qn_a[64];
+
+    float inv_ns = 1.0f / float(max(n_s, 1u));
+    uint s_base = c * n_s;
+    float m_shf = 0.0f, m_lhf = 0.0f, m_tr = 0.0f, m_al = 0.0f;
+    for (uint i = 0u; i < n_s; ++i) {
+        float vs = shf_in[s_base + i];
+        float vl = lhf_in[s_base + i];
+        float vt = trad_in[s_base + i];
+        float va = alb_in[s_base + i];
+        shf_a[i] = vs; lhf_a[i] = vl; tr_a[i] = vt; al_a[i] = va;
+        m_shf += vs; m_lhf += vl; m_tr += vt; m_al += va;
+    }
+    m_shf *= inv_ns; m_lhf *= inv_ns; m_tr *= inv_ns; m_al *= inv_ns;
+
+    float v_shf = 0.0f, v_lhf = 0.0f, v_tr = 0.0f, v_al = 0.0f, cov_sl = 0.0f;
+    for (uint i = 0u; i < n_s; ++i) {
+        float ds = shf_a[i] - m_shf;
+        float dl = lhf_a[i] - m_lhf;
+        float dt = tr_a[i] - m_tr;
+        float da = al_a[i] - m_al;
+        shf_a[i] = ds; lhf_a[i] = dl; tr_a[i] = dt; al_a[i] = da;
+        v_shf += ds * ds; v_lhf += dl * dl; v_tr += dt * dt; v_al += da * da;
+        cov_sl += ds * dl;
+    }
+    v_shf *= inv_ns; v_lhf *= inv_ns; v_tr *= inv_ns; v_al *= inv_ns; cov_sl *= inv_ns;
+    float shf_std = sqrt(max(v_shf, 0.0f));
+    float lhf_std = sqrt(max(v_lhf, 0.0f));
+    float tr_std = sqrt(max(v_tr, 0.0f));
+    float alb_std = sqrt(max(v_al, 0.0f));
+    float den_sl = shf_std * lhf_std;
+    float rho_sl = (den_sl > 1.0e-4f) ? clamp(cov_sl / max(den_sl, 1.0e-4f), -1.0f, 1.0f) : 0.0f;
+
+    float cs_shf = 0.0f, gs_shf = 0.0f;
+    float cs_lhf = 0.0f, gs_lhf = 0.0f;
+    float cs_tr = 0.0f, gs_tr = 0.0f;
+    float cs_al = 0.0f;
+    uint n_ax_s = ((nx_s > 1u) ? 1u : 0u) + ((ny_s > 1u) ? 1u : 0u);
+    if (n_ax_s > 0u) {
+        float inv_ax = inv_ns / float(n_ax_s);
+        for (uint iy = 0u; iy < ny_s; ++iy) {
+            uint iyn = (iy + 1u < ny_s) ? (iy + 1u) : 0u;
+            for (uint ix = 0u; ix < nx_s; ++ix) {
+                uint idx = iy * nx_s + ix;
+                if (nx_s > 1u) {
+                    uint ixn = (ix + 1u < nx_s) ? (ix + 1u) : 0u;
+                    uint inx = iy * nx_s + ixn;
+                    float ds0 = shf_a[idx], ds1 = shf_a[inx];
+                    float dl0 = lhf_a[idx], dl1 = lhf_a[inx];
+                    float dt0 = tr_a[idx],  dt1 = tr_a[inx];
+                    float da0 = al_a[idx],  da1 = al_a[inx];
+                    cs_shf += ds0 * ds1; gs_shf += (ds1 - ds0) * (ds1 - ds0) * inv_dxs2;
+                    cs_lhf += dl0 * dl1; gs_lhf += (dl1 - dl0) * (dl1 - dl0) * inv_dxs2;
+                    cs_tr  += dt0 * dt1; gs_tr  += (dt1 - dt0) * (dt1 - dt0) * inv_dxs2;
+                    cs_al  += da0 * da1;
+                }
+                if (ny_s > 1u) {
+                    uint iny = iyn * nx_s + ix;
+                    float ds0 = shf_a[idx], ds1 = shf_a[iny];
+                    float dl0 = lhf_a[idx], dl1 = lhf_a[iny];
+                    float dt0 = tr_a[idx],  dt1 = tr_a[iny];
+                    float da0 = al_a[idx],  da1 = al_a[iny];
+                    cs_shf += ds0 * ds1; gs_shf += (ds1 - ds0) * (ds1 - ds0) * inv_dys2;
+                    cs_lhf += dl0 * dl1; gs_lhf += (dl1 - dl0) * (dl1 - dl0) * inv_dys2;
+                    cs_tr  += dt0 * dt1; gs_tr  += (dt1 - dt0) * (dt1 - dt0) * inv_dys2;
+                    cs_al  += da0 * da1;
+                }
+            }
+        }
+        cs_shf *= inv_ax; gs_shf *= inv_ax;
+        cs_lhf *= inv_ax; gs_lhf *= inv_ax;
+        cs_tr  *= inv_ax; gs_tr  *= inv_ax;
+        cs_al  *= inv_ax;
+    }
+
+    float shf_mi = (v_shf > 1.0e-12f && n_s > 1u) ? clamp(cs_shf / max(v_shf, 1.0e-12f), -1.0f, 1.0f) : 0.0f;
+    float lhf_mi = (v_lhf > 1.0e-12f && n_s > 1u) ? clamp(cs_lhf / max(v_lhf, 1.0e-12f), -1.0f, 1.0f) : 0.0f;
+    float tr_mi  = (v_tr  > 1.0e-12f && n_s > 1u) ? clamp(cs_tr  / max(v_tr,  1.0e-12f), -1.0f, 1.0f) : 0.0f;
+    float alb_mi = (v_al  > 1.0e-12f && n_s > 1u) ? clamp(cs_al  / max(v_al,  1.0e-12f), -1.0f, 1.0f) : 0.0f;
+    float shf_lp = (v_shf > 1.0e-12f && gs_shf > 1.0e-24f && n_s > 1u) ? (sqrt(max(2.0f * v_shf / gs_shf, 0.0f)) * 1.0e-3f) : 0.0f;
+    float lhf_lp = (v_lhf > 1.0e-12f && gs_lhf > 1.0e-24f && n_s > 1u) ? (sqrt(max(2.0f * v_lhf / gs_lhf, 0.0f)) * 1.0e-3f) : 0.0f;
+    float tr_lp  = (v_tr  > 1.0e-12f && gs_tr  > 1.0e-24f && n_s > 1u) ? (sqrt(max(2.0f * v_tr  / gs_tr,  0.0f)) * 1.0e-3f) : 0.0f;
+
+    // Column-mean q_n [n_c] and w_rms across [nz+1, n_c]
+    for (uint i = 0u; i < n_c; ++i) qn_a[i] = 0.0f;
+    float w2_sum = 0.0f;
+    uint stride_k = nc * n_c;
+    uint c_off = c * n_c;
+    for (uint k = 0u; k < nz; ++k) {
+        uint kb = k * stride_k + c_off;
+        for (uint i = 0u; i < n_c; ++i) {
+            qn_a[i] += qn_4d[kb + i];
+            float wv = w_4d[kb + i];
+            w2_sum += wv * wv;
+        }
+    }
+    uint kb_top = nz * stride_k + c_off;
+    for (uint i = 0u; i < n_c; ++i) {
+        float wv = w_4d[kb_top + i];
+        w2_sum += wv * wv;
+    }
+    float inv_nz = 1.0f / float(max(nz, 1u));
+    float inv_nc = 1.0f / float(max(n_c, 1u));
+    float w_rms = sqrt(max(w2_sum / float(max((nz + 1u) * n_c, 1u)), 0.0f));
+
+    float m_qn = 0.0f;
+    for (uint i = 0u; i < n_c; ++i) {
+        qn_a[i] *= inv_nz;
+        m_qn += qn_a[i];
+    }
+    m_qn *= inv_nc;
+    float v_qn = 0.0f;
+    for (uint i = 0u; i < n_c; ++i) {
+        float dq = qn_a[i] - m_qn;
+        qn_a[i] = dq;
+        v_qn += dq * dq;
+    }
+    v_qn *= inv_nc;
+    float qn_std = sqrt(max(v_qn, 0.0f));
+    float cs_qn = 0.0f, gs_qn = 0.0f;
+    uint n_ax_c = ((nx > 1u) ? 1u : 0u) + ((ny > 1u) ? 1u : 0u);
+    if (n_ax_c > 0u) {
+        float inv_ax = inv_nc / float(n_ax_c);
+        for (uint iy = 0u; iy < ny; ++iy) {
+            uint iyn = (iy + 1u < ny) ? (iy + 1u) : 0u;
+            for (uint ix = 0u; ix < nx; ++ix) {
+                uint idx = iy * nx + ix;
+                if (nx > 1u) {
+                    uint ixn = (ix + 1u < nx) ? (ix + 1u) : 0u;
+                    float d0 = qn_a[idx], d1 = qn_a[iy * nx + ixn];
+                    cs_qn += d0 * d1;
+                    gs_qn += (d1 - d0) * (d1 - d0) * inv_dx2;
+                }
+                if (ny > 1u) {
+                    float d0 = qn_a[idx], d1 = qn_a[iyn * nx + ix];
+                    cs_qn += d0 * d1;
+                    gs_qn += (d1 - d0) * (d1 - d0) * inv_dy2;
+                }
+            }
+        }
+        cs_qn *= inv_ax;
+        gs_qn *= inv_ax;
+    }
+    float qn_mi = (v_qn > 1.0e-12f && n_c > 1u) ? clamp(cs_qn / max(v_qn, 1.0e-12f), -1.0f, 1.0f) : 0.0f;
+    float qn_lp = (v_qn > 1.0e-12f && gs_qn > 1.0e-24f && n_c > 1u) ? (sqrt(max(2.0f * v_qn / gs_qn, 0.0f)) * 1.0e-3f) : 0.0f;
+
+    uint o = c * 16u;
+    out16[o + 0u]  = clamp(shf_std * 0.01f, 0.0f, 5.0f);
+    out16[o + 1u]  = shf_mi;
+    out16[o + 2u]  = aoba_log1p_f(clamp(shf_lp, 0.0f, 200.0f));
+    out16[o + 3u]  = clamp(lhf_std * 0.01f, 0.0f, 5.0f);
+    out16[o + 4u]  = lhf_mi;
+    out16[o + 5u]  = aoba_log1p_f(clamp(lhf_lp, 0.0f, 200.0f));
+    out16[o + 6u]  = rho_sl;
+    out16[o + 7u]  = clamp(tr_std * 0.2f, 0.0f, 5.0f);
+    out16[o + 8u]  = tr_mi;
+    out16[o + 9u]  = aoba_log1p_f(clamp(tr_lp, 0.0f, 200.0f));
+    out16[o + 10u] = clamp(alb_std * 5.0f, 0.0f, 5.0f);
+    out16[o + 11u] = alb_mi;
+    out16[o + 12u] = aoba_log1p_f(max(qn_std, 0.0f) * 1.0e3f);
+    out16[o + 13u] = qn_mi;
+    out16[o + 14u] = aoba_log1p_f(clamp(qn_lp, 0.0f, 200.0f));
+    out16[o + 15u] = clamp(w_rms, 0.0f, 10.0f);
+}
+
+// 3. Fused 14-Feature Lightning Hurdle Feature Extractor + Riming Gate
+kernel void lgt_extract_feat_col(
+    device const float* rho_s         [[buffer(0)]],   // [kt, nc]
+    device const float* thm_s         [[buffer(1)]],   // [kt, nc]
+    device const float* qv_s          [[buffer(2)]],   // [kt, nc]
+    device const float* qc_s          [[buffer(3)]],   // [kt, nc]
+    device const float* qi_s          [[buffer(4)]],   // [kt, nc]
+    device const float* qp_s          [[buffer(5)]],   // [kt, nc]
+    device const float* z_s           [[buffer(6)]],   // [kt, nc]
+    device const float* dz_s          [[buffer(7)]],   // [kt, nc]
+    device const float* rain_3d       [[buffer(8)]],   // [nc, n_t]
+    device const float* snow_3d       [[buffer(9)]],   // [nc, n_t]
+    device const float* buoy_sfc      [[buffer(10)]],  // [nc]
+    device float* feats_out           [[buffer(11)]],  // [nc, 14]
+    device float* gate_out            [[buffer(12)]],  // [nc]
+    constant ulong4& u_p0             [[buffer(13)]],  // [kt, nc, n_t, (k_mid<<16)|k_hi]
+    constant float4& f_c0             [[buffer(14)]],  // [r_d_over_pref, rd_over_cvd, rv_over_rd, t_freeze]
+    constant float4& f_c1             [[buffer(15)]],  // [lv0_over_cpd, sec_per_day, 0, 0]
+    uint c [[thread_position_in_grid]])
+{
+    uint kt = uint(u_p0.x);
+    uint nc = uint(u_p0.y);
+    if (c >= nc) return;
+    uint n_t = uint(u_p0.z);
+    uint k_mid = uint(u_p0.w) >> 16u;
+    uint k_hi = uint(u_p0.w) & 0xFFFFu;
+
+    float rd_over_pref = f_c0.x;
+    float rd_over_cvd = f_c0.y;
+    float rv_over_rd = f_c0.z;
+    float t_frz = f_c0.w;
+    float lv_over_cp = f_c1.x;
+    float sec_day = f_c1.y;
+
+    float r_sum = 0.0f, s_sum = 0.0f;
+    uint t_base = c * n_t;
+    for (uint i = 0u; i < n_t; ++i) {
+        r_sum += rain_3d[t_base + i];
+        s_sum += snow_3d[t_base + i];
+    }
+    float inv_nt = 1.0f / float(max(n_t, 1u));
+    float rain_mm = max(r_sum * inv_nt * sec_day, 0.0f);
+    float snow_mm = max(s_sum * inv_nt * sec_day, 0.0f);
+
+    float z0 = z_s[c];
+    float dz0 = dz_s[c];
+    float cwp = 0.0f, iwp = 0.0f, mix_iwp = 0.0f, mix_lwc = 0.0f;
+    float th_mid_sum = 0.0f;
+    float z_frz = 0.0f, z_ctop = 0.0f;
+    float t_sfc = t_frz, qv_low = 0.0f, thm_low = 300.0f;
+
+    for (uint k = 0u; k < kt; ++k) {
+        uint idx = k * nc + c;
+        float r_k = rho_s[idx];
+        float th_k = thm_s[idx];
+        float qv_k = max(qv_s[idx], 0.0f);
+        float qc_k = max(qc_s[idx], 0.0f);
+        float qi_k = max(qi_s[idx], 0.0f);
+        float qp_k = max(qp_s[idx], 0.0f);
+        float dm = max(r_k * dz_s[idx], 0.0f);
+
+        float arg = max(rd_over_pref * r_k * th_k, 1.0e-8f);
+        float ex = pow(arg, rd_over_cvd);
+        float temp = ex * (th_k / (1.0f + rv_over_rd * qv_k));
+
+        if (k == 0u) {
+            t_sfc = temp;
+            qv_low = qv_k;
+            thm_low = th_k;
+        }
+        if (k >= k_mid && k < k_hi) {
+            th_mid_sum += th_k;
+        }
+        cwp += dm * qc_k;
+        float qip = qi_k + qp_k;
+        iwp += dm * qip;
+        if (temp < t_frz && temp > (t_frz - 40.0f)) {
+            mix_iwp += dm * qip;
+            mix_lwc += dm * qc_k;
+        }
+        float z_agl = max((z_s[idx] - z0 + 0.5f * dz0) * 1.0e-3f, 0.0f);
+        if (temp >= t_frz && z_agl > z_frz) z_frz = z_agl;
+        if (qip >= 1.0e-5f && z_agl > z_ctop) z_ctop = z_agl;
+    }
+
+    float th_mid = th_mid_sum / float(max(k_hi - k_mid, 1u));
+    float th_e_low = thm_low + lv_over_cp * qv_low;
+    float cape_proxy = clamp((th_e_low - th_mid) * (1.0f / 30.0f), 0.0f, 4.0f);
+    float ccd_proxy = clamp(z_ctop - z_frz, 0.0f, 16.0f);
+
+    float fv[14];
+    fv[0]  = aoba_log1p_f(rain_mm);
+    fv[1]  = aoba_log1p_f(snow_mm);
+    fv[2]  = aoba_log1p_f(cwp * 10.0f);
+    fv[3]  = aoba_log1p_f(iwp * 10.0f);
+    fv[4]  = aoba_log1p_f(mix_iwp * 10.0f);
+    fv[5]  = aoba_log1p_f(mix_lwc * 10.0f);
+    fv[6]  = clamp((t_sfc - t_frz) * (1.0f / 30.0f), -3.0f, 3.0f);
+    fv[7]  = cape_proxy;
+    fv[8]  = clamp(qv_low * 50.0f, 0.0f, 3.0f);
+    fv[9]  = clamp(z_frz * (1.0f / 6.0f), 0.0f, 3.0f);
+    fv[10] = clamp(z_ctop * (1.0f / 16.0f), 0.0f, 2.0f);
+    fv[11] = clamp(ccd_proxy * (1.0f / 12.0f), 0.0f, 2.0f);
+    fv[12] = clamp(buoy_sfc[c] * 20.0f, -2.0f, 4.0f);
+    fv[13] = aoba_log1p_f(max((rain_mm + snow_mm) * mix_iwp * 10.0f, 0.0f));
+
+    uint o = c * 14u;
+    for (uint j = 0u; j < 14u; ++j) {
+        float x = fv[j];
+        if (isnan(x)) x = 0.0f;
+        else if (isinf(x)) x = (x > 0.0f) ? 5.0f : -5.0f;
+        feats_out[o + j] = x;
+    }
+    bool cg = ((mix_iwp > 0.015f) && ((rain_mm + snow_mm) > 1.5f))
+           || ((mix_iwp > 0.05f) && (ccd_proxy > 2.5f));
+    gate_out[c] = cg ? 1.0f : 0.0f;
+}
+
+// 4. Fused Post-CRM Lowest-Level Meteorology, Priestley-Taylor PET & Daily Accumulators
+kernel void post_crm_accum_elem(
+    device const float* rho0          [[buffer(0)]],
+    device const float* thm0          [[buffer(1)]],
+    device const float* qv0           [[buffer(2)]],
+    device const float* dz0           [[buffer(3)]],
+    device const float* rain          [[buffer(4)]],
+    device const float* snow          [[buffer(5)]],
+    device const float* sw1d          [[buffer(6)]],
+    device const float* sw1f          [[buffer(7)]],
+    device const float* sw2d          [[buffer(8)]],
+    device const float* sw2f          [[buffer(9)]],
+    device const float* lwd           [[buffer(10)]],
+    device const float* albvd         [[buffer(11)]],
+    device const float* albvf         [[buffer(12)]],
+    device const float* albnd         [[buffer(13)]],
+    device const float* albnf         [[buffer(14)]],
+    device const float* emiss         [[buffer(15)]],
+    device const float* trad          [[buffer(16)]],
+    device const float* d_pr_in       [[buffer(17)]],
+    device const float* d_pet_in      [[buffer(18)]],
+    device const float* d_ppfd_in     [[buffer(19)]],
+    device const float* d_t_in        [[buffer(20)]],
+    device const float* d_vpd_in      [[buffer(21)]],
+    device const float* d_tmin_in     [[buffer(22)]],
+    device float* out9                [[buffer(23)]],  // [9, m_sub]
+    constant ulong4& u_dim            [[buffer(24)]],  // [m_sub, 0, 0, 0]
+    constant float4& f_c0             [[buffer(25)]],  // [dt, r_d_over_pref, rd_over_cvd, rv_over_rd]
+    constant float4& f_c1             [[buffer(26)]],  // [p_ref, gravity, t_freeze, eps_water]
+    constant float4& f_c2             [[buffer(27)]],  // [sigma_sb, cp_over_eps_lv, inv_lv0, 0]
+    uint i [[thread_position_in_grid]])
+{
+    uint m = uint(u_dim.x);
+    if (i >= m) return;
+
+    float dt = f_c0.x;
+    float rd_over_pref = f_c0.y;
+    float rd_over_cvd = f_c0.z;
+    float rv_over_rd = f_c0.w;
+    float p_ref = f_c1.x;
+    float grav = f_c1.y;
+    float t_frz = f_c1.z;
+    float eps_w = f_c1.w;
+    float sigma_sb = f_c2.x;
+    float cp_over_eps_lv = f_c2.y;
+    float inv_lv0 = f_c2.z;
+
+    float r0 = rho0[i];
+    float th0 = thm0[i];
+    float q0 = qv0[i];
+    float arg = max(rd_over_pref * r0 * th0, 1.0e-8f);
+    float ex = pow(arg, rd_over_cvd);
+    float p0 = p_ref * arg * ex;
+    float t_air = ex * (th0 / (1.0f + rv_over_rd * max(q0, 0.0f)));
+    float p_sfc = p0 + grav * r0 * (1.0f + q0) * dz0[i];
+
+    float t_den = max(t_air - 29.65f, 10.0f);
+    float es = 611.2f * exp(17.67f * (t_air - t_frz) / t_den);
+    float e_v = q0 * p0 / (eps_w + (1.0f - eps_w) * q0);
+    float vpd = max(es - e_v, 50.0f);
+
+    float s1d = sw1d[i], s1f = sw1f[i];
+    float sw_net = (1.0f - albvd[i]) * s1d + (1.0f - albvf[i]) * s1f
+                 + (1.0f - albnd[i]) * sw2d[i] + (1.0f - albnf[i]) * sw2f[i];
+    float tr = trad[i];
+    float tr2 = tr * tr;
+    float lw_net = emiss[i] * (lwd[i] - sigma_sb * (tr2 * tr2));
+    float rn_pos = max(sw_net + lw_net, 0.0f);
+
+    float des_dt = es * (17.67f * 243.5f) / (t_den * t_den);
+    float gamma_p = cp_over_eps_lv * p_sfc;
+    float pet_pt = 1.26f * (des_dt / (des_dt + gamma_p)) * rn_pos * inv_lv0;
+
+    out9[0u * m + i] = t_air;
+    out9[1u * m + i] = p_sfc;
+    out9[2u * m + i] = vpd;
+    out9[3u * m + i] = d_pr_in[i] + (rain[i] + snow[i]) * dt;
+    out9[4u * m + i] = d_pet_in[i] + pet_pt * dt;
+    out9[5u * m + i] = d_ppfd_in[i] + (4.57f * s1d + 4.24f * s1f) * 1.0e-6f * dt;
+    out9[6u * m + i] = d_t_in[i] + t_air;
+    out9[7u * m + i] = d_vpd_in[i] + vpd;
+    out9[8u * m + i] = min(d_tmin_in[i], t_air);
+}
+
+// =========================================================================
+// Round 3: Single-Source Metal/CUDA Fused Surface, Soil & Biosphere Kernels
+// =========================================================================
+
+inline float aoba_rg_g_mu_f(float mu_s, float chi_val, bool has_chi, float chi_min, float chi_max) {
+    if (!has_chi) return 0.5f;
+    float chi = clamp(chi_val, chi_min, chi_max);
+    float phi1 = clamp(0.5f - 0.633f * chi - 0.330f * chi * chi, 0.05f, 0.95f);
+    float phi2 = 0.877f * (1.0f - 2.0f * phi1);
+    return clamp(phi1 + phi2 * mu_s, 0.05f, 1.2f);
+}
+
+inline float aoba_rg_mu_bar_f(float chi_val, bool has_chi, float chi_min, float chi_max) {
+    if (!has_chi) return 1.0f;
+    float chi = clamp(chi_val, chi_min, chi_max);
+    float phi1 = clamp(0.5f - 0.633f * chi - 0.330f * chi * chi, 0.05f, 0.95f);
+    float phi2 = 0.877f * (1.0f - 2.0f * phi1);
+    float u = clamp(phi2 / phi1, -0.95f, 20.0f);
+    float res = (fabs(u) < 2.0e-2f)
+        ? ((1.0f / phi1) * (0.5f - u * ((1.0f / 3.0f) - u * (0.25f - u * (0.2f - u * (1.0f / 6.0f))))))
+        : ((1.0f / phi1) * (u - aoba_log1p_f(u)) / (u * u));
+    return clamp(res, 0.4f, 2.5f);
+}
+
+inline float aoba_omega_clump_f(float lc, float k0, float mu_proj, float g_proj, float l_crown_min) {
+    float mu_p = clamp(mu_proj, 0.15f, 1.0f);
+    float lam_c = lc / (l_crown_min * mu_p);
+    float f_c = -aoba_expm1_f(-min(lam_c, 40.0f));
+    if (lc < 1.0e-3f) {
+        float gl0 = max(g_proj * l_crown_min, 1.0e-4f);
+        return -aoba_expm1_f(-gl0) / gl0;
+    }
+    float tau_tot = k0 * lc;
+    if (f_c > 0.9999f || tau_tot > 25.0f) return 1.0f;
+    float tau_crown = min(tau_tot / max(f_c, 1.0e-6f), 40.0f);
+    float abs_frac = clamp(f_c * (-aoba_expm1_f(-tau_crown)), 0.0f, 1.0f - 1.0e-7f);
+    float om_raw = (-aoba_log1p_f(-abs_frac)) / max(tau_tot, 1.0e-6f);
+    return clamp(om_raw, 0.35f, 1.0f);
+}
+
+inline float aoba_sunlit_sw_frac_f(
+    float sw_b, float sw_d, float lc, float k_db, float omega_d, float mu_bar,
+    float leaf_scat, float kd_par_unscat)
+{
+    float sqrt_1ms = sqrt(max(1.0f - leaf_scat, 1.0e-4f));
+    float k_bp = k_db * sqrt_1ms;
+    float k_dp = omega_d * (kd_par_unscat / mu_bar) * sqrt_1ms;
+    float rho_h = (1.0f - sqrt_1ms) / (1.0f + sqrt_1ms);
+    float rho_cb = 2.0f * rho_h * k_db / (1.0f + k_db);
+    float rho_cd = 2.0f * rho_h * (0.78f / 1.78f);
+
+    float ib = max(sw_b, 0.0f);
+    float id_ = max(sw_d, 0.0f);
+    float k_lc = k_db * lc;
+
+    float q_cb = (1.0f - rho_cb) * ib * (1.0f - exp(-min(k_bp * lc, 50.0f)));
+    float q_cd = (1.0f - rho_cd) * id_ * (1.0f - exp(-min(k_dp * lc, 50.0f)));
+    float q_c = q_cb + q_cd;
+
+    float q_sun_db = ib * (1.0f - leaf_scat) * (1.0f - exp(-min(k_lc, 50.0f)));
+    float q_sun_sb = ib * max(
+        (1.0f - rho_cb) * k_bp * (1.0f - exp(-min((k_bp + k_db) * lc, 50.0f))) / (k_bp + k_db)
+        - 0.5f * (1.0f - leaf_scat) * (1.0f - exp(-min(2.0f * k_lc, 50.0f))),
+        0.0f
+    );
+    float q_sun_d = id_ * (1.0f - rho_cd) * k_dp
+        * (1.0f - exp(-min((k_dp + k_db) * lc, 50.0f))) / (k_dp + k_db);
+    float q_sun = min(q_sun_db + q_sun_sb + q_sun_d, q_c);
+    float f_sun_area = (k_lc < 1.0e-4f) ? 1.0f : ((1.0f - exp(-min(k_lc, 50.0f))) / max(k_lc, 1.0e-4f));
+    return (q_c > 1.0e-4f) ? clamp(q_sun / max(q_c, 1.0e-4f), 0.0f, 1.0f) : f_sun_area;
+}
+
+// 5. Fused Two-Leaf Radiative Profile & Sunlit Allocation (`prepare_two_leaf_allocation`)
+kernel void bio_prepare_two_leaf_elem(
+    device const float* ema_vis_b     [[buffer(0)]],
+    device const float* ema_vis_d     [[buffer(1)]],
+    device const float* ema_mu0       [[buffer(2)]],
+    device const float* vis_b         [[buffer(3)]],
+    device const float* vis_d         [[buffer(4)]],
+    device const float* mu0_in        [[buffer(5)]],
+    device const float* lai_in        [[buffer(6)]],
+    device const float* chi_in        [[buffer(7)]],
+    device float* out13               [[buffer(8)]],   // [13, N]
+    constant ulong4& u_dim            [[buffer(9)]],   // [N, has_chi, 0, 0]
+    constant float4& f_c0             [[buffer(10)]],  // [leaf_scat_vis, kd_prime_par, rho_cd_par, crown_lai_min]
+    constant float4& f_c1             [[buffer(11)]],  // [chi_min, chi_max, 0, 0]
+    uint i [[thread_position_in_grid]])
+{
+    uint n = uint(u_dim.x);
+    if (i >= n) return;
+    bool has_chi = (uint(u_dim.y) != 0u);
+
+    float leaf_scat = f_c0.x;
+    float kd_par = f_c0.y;
+    float rho_cd = f_c0.z;
+    float l_crown_min = f_c0.w;
+    float chi_min = f_c1.x;
+    float chi_max = f_c1.y;
+
+    float lc = max(lai_in[i], 0.0f);
+    bool has_veg = (lc >= 0.01f);
+    float chi_v = has_chi ? chi_in[i] : 0.0f;
+    float sqrt_1ms = sqrt(max(1.0f - leaf_scat, 1.0e-4f));
+    float rho_h = (1.0f - sqrt_1ms) / (1.0f + sqrt_1ms);
+    float mu_bar = aoba_rg_mu_bar_f(chi_v, has_chi, chi_min, chi_max);
+    float mu_d = clamp(0.55f * mu_bar, 0.25f, 0.90f);
+    float k_d0 = 1.0f / mu_bar;
+    float g_d = k_d0 * mu_d;
+    float omega_d = aoba_omega_clump_f(lc, k_d0, mu_d, g_d, l_crown_min);
+    float kd_prime = omega_d * (kd_par / mu_bar);
+
+    // 1. Acclimated midday profile
+    float a_ib0 = 4.57f * max(ema_vis_b[i], 0.0f);
+    float a_id0 = 4.24f * max(ema_vis_d[i], 0.0f);
+    float a_mu = clamp(ema_mu0[i], 0.01f, 1.0f);
+    float a_g = aoba_rg_g_mu_f(a_mu, chi_v, has_chi, chi_min, chi_max);
+    float a_kdb0 = a_g / a_mu;
+    float a_omb = aoba_omega_clump_f(lc, a_kdb0, a_mu, a_g, l_crown_min);
+    float a_kdb = a_omb * a_kdb0;
+    float a_kbp = a_kdb * sqrt_1ms;
+    float a_rhocb = 2.0f * rho_h * a_kdb / (1.0f + a_kdb);
+    float a_icb = (1.0f - a_rhocb) * a_ib0 * (1.0f - exp(-min(a_kbp * lc, 50.0f)));
+    float a_icd = (1.0f - rho_cd) * a_id0 * (1.0f - exp(-min(kd_prime * lc, 50.0f)));
+    float a_ic = has_veg ? (a_icb + a_icd) : 0.0f;
+
+    // 2. Instantaneous profile
+    float ib0 = 4.57f * max(vis_b[i], 0.0f);
+    float id0 = 4.24f * max(vis_d[i], 0.0f);
+    float mu_s = clamp(mu0_in[i], 0.01f, 1.0f);
+    float g_mu = aoba_rg_g_mu_f(mu_s, chi_v, has_chi, chi_min, chi_max);
+    float kdb0 = g_mu / mu_s;
+    float om_b = aoba_omega_clump_f(lc, kdb0, mu_s, g_mu, l_crown_min);
+    float k_db = om_b * kdb0;
+    float k_bp = k_db * sqrt_1ms;
+    float rho_cb = 2.0f * rho_h * k_db / (1.0f + k_db);
+
+    float i_cb = (1.0f - rho_cb) * ib0 * (1.0f - exp(-min(k_bp * lc, 50.0f)));
+    float i_cd = (1.0f - rho_cd) * id0 * (1.0f - exp(-min(kd_prime * lc, 50.0f)));
+    float i_c = has_veg ? (i_cb + i_cd) : 0.0f;
+
+    float k_lc = k_db * lc;
+    float l_sun_raw = (k_lc < 1.0e-4f)
+        ? (lc * (1.0f - 0.5f * k_lc))
+        : ((1.0f - exp(-min(k_lc, 50.0f))) / max(k_db, 1.0e-4f));
+    float l_sun = has_veg ? min(max(l_sun_raw, 0.0f), lc) : 0.0f;
+    float l_sh = has_veg ? max(lc - l_sun, 0.0f) : 0.0f;
+
+    float i_sun_db = ib0 * (1.0f - leaf_scat) * (1.0f - exp(-min(k_lc, 50.0f)));
+    float i_sun_sb = ib0 * max(
+        (1.0f - rho_cb) * k_bp * (1.0f - exp(-min((k_bp + k_db) * lc, 50.0f))) / (k_bp + k_db)
+        - 0.5f * (1.0f - leaf_scat) * (1.0f - exp(-min(2.0f * k_lc, 50.0f))),
+        0.0f
+    );
+    float i_sun_d = id0 * (1.0f - rho_cd) * kd_prime
+        * (1.0f - exp(-min((kd_prime + k_db) * lc, 50.0f))) / (kd_prime + k_db);
+    float i_sun = has_veg ? min(i_sun_db + i_sun_sb + i_sun_d, i_c) : 0.0f;
+    float i_sh = has_veg ? max(i_c - i_sun, 0.0f) : 0.0f;
+
+    // 3. Optimal vertical nitrogen / enzyme allocation fraction `sun_frac`
+    float term_b = (1.0f - a_rhocb) * a_kbp * a_ib0
+        * (1.0f - exp(-min((a_kbp + k_db) * lc, 50.0f))) / (a_kbp + k_db);
+    float term_d = (1.0f - rho_cd) * kd_prime * a_id0
+        * (1.0f - exp(-min((kd_prime + k_db) * lc, 50.0f))) / (kd_prime + k_db);
+    float sun_opt = (term_b + term_d) / max(a_ic, 1.0e-2f);
+    float sun_area = l_sun / max(lc, 1.0e-4f);
+    float sun_frac = min((a_ic > 1.0e-2f) ? sun_opt : sun_area, 1.0f);
+
+    out13[0u * n + i]  = ib0;
+    out13[1u * n + i]  = id0;
+    out13[2u * n + i]  = k_db;
+    out13[3u * n + i]  = k_bp;
+    out13[4u * n + i]  = rho_cb;
+    out13[5u * n + i]  = l_sun;
+    out13[6u * n + i]  = l_sh;
+    out13[7u * n + i]  = i_c;
+    out13[8u * n + i]  = i_sun;
+    out13[9u * n + i]  = i_sh;
+    out13[10u * n + i] = kd_prime;
+    out13[11u * n + i] = om_b;
+    out13[12u * n + i] = sun_frac;
+}
+
+// 6. Fused Terrestrial Pre-Newton Setup (`_surface_land_pre_newton_core` + canopy heat capacity & flags)
+kernel void surface_land_pre_newton_elem(
+    device const float* sw_alb_8      [[buffer(0)]],   // [8, N]: sw1d, sw1f, sw2d, sw2f, avd, avf, and, anf
+    device const float* h_exp_in      [[buffer(1)]],
+    device const float* lai_exp_in    [[buffer(2)]],
+    device const float* a_sn_in       [[buffer(3)]],
+    device const float* temp_1_in     [[buffer(4)]],
+    device const float* qv_1_in       [[buffer(5)]],
+    device const float* pres_1_in     [[buffer(6)]],
+    device const float* pres_sfc_in   [[buffer(7)]],
+    device const float* mu0_in        [[buffer(8)]],
+    device const float* l_sun_in      [[buffer(9)]],
+    device const float* l_sh_in       [[buffer(10)]],
+    device const float* k_db_in       [[buffer(11)]],
+    device const float* kd_par_in     [[buffer(12)]],
+    device const float* chi_in        [[buffer(13)]],
+    device const float* snow_age_in   [[buffer(14)]],
+    device const float* w_liq0_in     [[buffer(15)]],
+    device const float* w_ice0_in     [[buffer(16)]],
+    device const float* t_soil0_in    [[buffer(17)]],
+    device const float* w_can_in      [[buffer(18)]],
+    device const float* swe_in        [[buffer(19)]],
+    device const float* c_buf         [[buffer(20)]],  // [32] physical constants
+    device float* out30               [[buffer(21)]],  // [30, N]
+    constant ulong4& u_dim            [[buffer(22)]],  // [N, has_chi, 0, 0]
+    constant float4& f_p0             [[buffer(23)]],  // [inv_dt_s, 0, 0, 0]
+    uint i [[thread_position_in_grid]])
+{
+    uint n = uint(u_dim.x);
+    if (i >= n) return;
+    bool has_chi = (uint(u_dim.y) != 0u);
+    float inv_dt_s = f_p0.x;
+
+    float sw1d = sw_alb_8[0u * n + i];
+    float sw1f = sw_alb_8[1u * n + i];
+    float sw2d = sw_alb_8[2u * n + i];
+    float sw2f = sw_alb_8[3u * n + i];
+    float avd  = sw_alb_8[4u * n + i];
+    float avf  = sw_alb_8[5u * n + i];
+    float and_ = sw_alb_8[6u * n + i];
+    float anf  = sw_alb_8[7u * n + i];
+
+    float h_exp   = h_exp_in[i];
+    float lai_exp = lai_exp_in[i];
+    float a_sn    = a_sn_in[i];
+    float temp_1  = temp_1_in[i];
+    float qv_1    = qv_1_in[i];
+    float pres_1  = pres_1_in[i];
+    float pres_s  = pres_sfc_in[i];
+    float mu0     = mu0_in[i];
+    float l_sun   = l_sun_in[i];
+    float l_sh    = l_sh_in[i];
+    float k_db_i  = k_db_in[i];
+    float kd_par  = kd_par_in[i];
+    float chi_v   = has_chi ? chi_in[i] : 0.0f;
+    float sn_age  = snow_age_in[i];
+    float wl0     = w_liq0_in[i];
+    float wi0     = w_ice0_in[i];
+    float ts0     = t_soil0_in[i];
+    float w_can   = w_can_in[i];
+    float swe     = swe_in[i];
+
+    float p_ref       = c_buf[0];
+    float kappa_d     = c_buf[1];
+    float zvir        = c_buf[2];
+    float r_d         = c_buf[3];
+    float cp_d        = c_buf[4];
+    float cp_v        = c_buf[5];
+    float von_karman  = c_buf[6];
+    float gravity     = c_buf[7];
+    float r_v         = c_buf[8];
+    float t_frz       = c_buf[9];
+    float k_therm_sn  = c_buf[10];
+    float alb_sn_vn   = c_buf[11];
+    float alb_sn_vo   = c_buf[12];
+    float alb_sn_nn   = c_buf[13];
+    float alb_sn_no   = c_buf[14];
+    float soil_por    = c_buf[15];
+    float psi_sat     = c_buf[16];
+    float b_clapp     = c_buf[17];
+    float leaf_sv     = c_buf[18];
+    float leaf_sn     = c_buf[19];
+    float wc_max_lai  = c_buf[20];
+    float f_wet_max   = c_buf[21];
+    float dsl_dmax_m  = c_buf[22];  // DSL_DMAX_MM * 1e-3
+    float theta_init  = c_buf[23];
+    float inv_dth_dsl = c_buf[24];  // 1 / max(theta_init - theta_air, 1e-3)
+    float tau_soil    = c_buf[25];
+    float dz_top_half = c_buf[26];
+    float kappa_dry   = c_buf[27];
+    float rho_snow    = c_buf[28];
+    float eps_g       = c_buf[29];
+    float kd_unscat   = c_buf[30];  // KD_PRIME_PAR / sqrt(1 - LEAF_SCAT_VIS)
+    float l_crown_min = c_buf[31];
+    float chi_min     = c_buf[32];
+    float chi_max     = c_buf[33];
+
+    float sw_tot_vis = sw1d * (1.0f - avd) + sw1f * (1.0f - avf);
+    float sw_tot_nir = sw2d * (1.0f - and_) + sw2f * (1.0f - anf);
+    float sw_abs = sw_tot_vis + sw_tot_nir;
+
+    float exner_1 = pow(pres_1 / p_ref, kappa_d);
+    float exner_s = pow(pres_s / p_ref, kappa_d);
+    float theta_1 = temp_1 / exner_1;
+    float qfac = 1.0f + zvir * qv_1;
+    float theta_v1 = theta_1 * qfac;
+    float rho_sfc = pres_s / (r_d * temp_1 * qfac);
+    float cp_air = cp_d + cp_v * qv_1;
+
+    // Raupach (1994) roughness
+    float hc = max(h_exp, 0.0f);
+    float lai_pos = max(lai_exp, 1.0e-4f);
+    float x_r = sqrt(7.5f * lai_pos);
+    float one_minus_dh = (1.0f - exp(-x_r)) / x_r;
+    float d_land = hc * (1.0f - one_minus_dh);
+    float us_uh = min(sqrt(0.003f + 0.15f * lai_pos), 0.30f);
+    float z0m_veg = hc * one_minus_dh * exp(-von_karman / us_uh + 0.193f);
+    float z0m_land = max(z0m_veg, 0.01f);
+    float z0m_terr = (lai_exp < 0.05f) ? ((1.0f - a_sn) * z0m_land + a_sn * 0.002f) : z0m_land;
+    bool has_veg = (lai_exp >= 0.01f);
+    float f_veg_rad = has_veg ? (1.0f - exp(-lai_exp)) : 0.0f;
+    float z0h_terr = has_veg
+        ? ((1.0f - f_veg_rad) * (0.135335f * z0m_terr) + f_veg_rad * z0m_terr)
+        : (0.135335f * z0m_terr);
+    float rsl_depth = max(2.0f * h_exp - d_land, 0.0f);
+
+    bool has_sun = has_veg && (l_sun > 1.0e-4f);
+    bool has_sh  = has_veg && (l_sh  > 1.0e-4f);
+    float f_sun_area = has_veg ? clamp(l_sun / lai_pos, 0.0f, 1.0f) : 0.0f;
+    float f_sh_area  = has_veg ? (1.0f - f_sun_area) : 0.0f;
+
+    // Snow + bare soil ground albedos
+    float f_alb = clamp(sn_age / (1.0f + max(sn_age, 0.0f)), 0.0f, 0.999f);
+    float vis0 = alb_sn_vn + f_alb * (alb_sn_vo - alb_sn_vn);
+    float nir0 = alb_sn_nn + f_alb * (alb_sn_no - alb_sn_nn);
+    float om_mu = 1.0f - clamp(mu0, 0.0f, 1.0f);
+    float om2 = om_mu * om_mu;
+    float zen_dir = 0.4f * (om2 * om2 * om_mu);
+    float zen_dif = 0.002325107f; // 0.4 * (1 - cos(50 deg))^5
+    float sn_vd = clamp(vis0 + (1.0f - vis0) * zen_dir, 0.05f, 0.98f);
+    float sn_vf = clamp(vis0 + (1.0f - vis0) * zen_dif, 0.05f, 0.98f);
+    float sn_nd = clamp(nir0 + (1.0f - nir0) * zen_dir, 0.05f, 0.95f);
+    float sn_nf = clamp(nir0 + (1.0f - nir0) * zen_dif, 0.05f, 0.95f);
+
+    float wet = clamp(wl0 / soil_por, 0.0f, 1.0f);
+    float dry15 = pow(1.0f - wet, 1.5f);
+    float soil_v = 0.14f + 0.14f * dry15;
+    float soil_n = 0.28f + 0.22f * dry15;
+    float ag_vd = (1.0f - a_sn) * soil_v + a_sn * sn_vd;
+    float ag_vf = (1.0f - a_sn) * soil_v + a_sn * sn_vf;
+    float ag_nd = (1.0f - a_sn) * soil_n + a_sn * sn_nd;
+    float ag_nf = (1.0f - a_sn) * soil_n + a_sn * sn_nf;
+
+    float sq_v = sqrt(1.0f - leaf_sv);
+    float sq_n = sqrt(1.0f - leaf_sn);
+    float kb_vp = k_db_i * sq_v;
+    float kd_vp = kd_par;
+    float kb_np = k_db_i * sq_n;
+    float kd_np = (kd_par / sq_v) * sq_n;
+
+    float tr_vd = exp(-min(kb_vp * lai_exp, 40.0f));
+    float tr_vf = exp(-min(kd_vp * lai_exp, 40.0f));
+    float tr_nd = exp(-min(kb_np * lai_exp, 40.0f));
+    float tr_nf = exp(-min(kd_np * lai_exp, 40.0f));
+
+    float sw_gnd_v = min(sw_tot_vis, tr_vd * sw1d * (1.0f - ag_vd) + tr_vf * sw1f * (1.0f - ag_vf));
+    float sw_gnd_n = min(sw_tot_nir, tr_nd * sw2d * (1.0f - ag_nd) + tr_nf * sw2f * (1.0f - ag_nf));
+    float sw_can_v = has_veg ? max(sw_tot_vis - sw_gnd_v, 0.0f) : 0.0f;
+    float sw_can_n = has_veg ? max(sw_tot_nir - sw_gnd_n, 0.0f) : 0.0f;
+
+    float sw_abs_sun = 0.0f;
+    if (has_sun) {
+        float lc_p = max(lai_exp, 0.0f);
+        float mu_s = clamp(mu0, 0.01f, 1.0f);
+        float g_mu = aoba_rg_g_mu_f(mu_s, chi_v, has_chi, chi_min, chi_max);
+        float mu_bar = aoba_rg_mu_bar_f(chi_v, has_chi, chi_min, chi_max);
+        float kdb0 = g_mu / mu_s;
+        float om_b = aoba_omega_clump_f(lc_p, kdb0, mu_s, g_mu, l_crown_min);
+        float k_db_c = om_b * kdb0;
+        float mu_d = clamp(0.55f * mu_bar, 0.25f, 0.90f);
+        float k_d0 = 1.0f / mu_bar;
+        float om_d = aoba_omega_clump_f(lc_p, k_d0, mu_d, k_d0 * mu_d, l_crown_min);
+        float f_sv = aoba_sunlit_sw_frac_f(sw1d, sw1f, lc_p, k_db_c, om_d, mu_bar, leaf_sv, kd_unscat);
+        float f_sn = aoba_sunlit_sw_frac_f(sw2d, sw2f, lc_p, k_db_c, om_d, mu_bar, leaf_sn, kd_unscat);
+        sw_abs_sun = f_sv * sw_can_v + f_sn * sw_can_n;
+    }
+    float sw_abs_sh = has_sh ? ((sw_can_v + sw_can_n) - sw_abs_sun) : 0.0f;
+    float sw_abs_gnd = sw_abs - sw_abs_sun - sw_abs_sh;
+
+    float wc_cap = wc_max_lai * lai_exp;
+    float f_wet = has_veg
+        ? clamp(pow(max(w_can, 0.0f) / max(wc_cap, 1.0e-4f), 2.0f / 3.0f), 0.0f, f_wet_max)
+        : 0.0f;
+
+    float sat_top = clamp((wl0 + wi0) / soil_por, 0.01f, 1.0f);
+    float psi_top = psi_sat * pow(sat_top, -b_clapp);
+    float h_soil_base = exp(clamp(psi_top * gravity / (r_v * ts0), -10.0f, 0.0f));
+
+    float th_liq_top = clamp(wl0, 0.0f, soil_por);
+    float d_sl = dsl_dmax_m * clamp((theta_init - th_liq_top) * inv_dth_dsl, 0.0f, 13.0f);
+    float d_vap = 2.12e-5f * pow(ts0 / t_frz, 1.75f);
+    float r_soil = d_sl / (d_vap * tau_soil);
+
+    float k_top = kappa_dry * (1.0f + 5.5f * tanh((wl0 + wi0) * 4.0f));
+    float r_sn_th = a_sn * (0.5f * min(swe / rho_snow, 1.0f) / k_therm_sn);
+    float g_cond_coeff = 1.0f / (dz_top_half / k_top + r_sn_th);
+
+    float beta_rsl = clamp(sqrt(0.003f + 0.15f * lai_pos), 0.12f, 0.30f);
+    float alpha_u_half = 0.5f * clamp(0.20f / (2.0f * beta_rsl * beta_rsl), 0.30f, 1.20f);
+    float t_air_sfc = theta_1 * exner_s;
+    bool has_snow = (swe > 1.0e-3f);
+    float lw_refl_c = 1.0f + (1.0f - f_veg_rad) * (1.0f - eps_g);
+    float lw_emit_c = 2.0f - f_veg_rad * (1.0f - eps_g);
+
+    float c_can_tot = has_veg ? (4200.0f * lai_exp + 5500.0f * h_exp) : 0.0f;
+    float c_sun_dt = has_sun ? (f_sun_area * c_can_tot * inv_dt_s) : 0.0f;
+    float c_sh_dt  = has_sh  ? (f_sh_area  * c_can_tot * inv_dt_s) : 0.0f;
+    float flags_pb = (has_veg ? 1.0f : 0.0f) + (has_sun ? 2.0f : 0.0f) + (has_sh ? 4.0f : 0.0f);
+    float flags_jc = flags_pb + (has_snow ? 8.0f : 0.0f);
+
+    out30[0u * n + i]  = sw_abs;
+    out30[1u * n + i]  = exner_s;
+    out30[2u * n + i]  = theta_1;
+    out30[3u * n + i]  = theta_v1;
+    out30[4u * n + i]  = rho_sfc;
+    out30[5u * n + i]  = cp_air;
+    out30[6u * n + i]  = d_land;
+    out30[7u * n + i]  = z0m_terr;
+    out30[8u * n + i]  = z0h_terr;
+    out30[9u * n + i]  = rsl_depth;
+    out30[10u * n + i] = f_veg_rad;
+    out30[11u * n + i] = f_sun_area;
+    out30[12u * n + i] = f_sh_area;
+    out30[13u * n + i] = sw_abs_sun;
+    out30[14u * n + i] = sw_abs_sh;
+    out30[15u * n + i] = sw_abs_gnd;
+    out30[16u * n + i] = wc_cap;
+    out30[17u * n + i] = f_wet;
+    out30[18u * n + i] = h_soil_base;
+    out30[19u * n + i] = r_soil;
+    out30[20u * n + i] = g_cond_coeff;
+    out30[21u * n + i] = beta_rsl;
+    out30[22u * n + i] = alpha_u_half;
+    out30[23u * n + i] = t_air_sfc;
+    out30[24u * n + i] = lw_refl_c;
+    out30[25u * n + i] = lw_emit_c;
+    out30[26u * n + i] = c_sun_dt;
+    out30[27u * n + i] = c_sh_dt;
+    out30[28u * n + i] = flags_pb;
+    out30[29u * n + i] = flags_jc;
+}
+
+// 7. Fused Terrestrial Post-Newton Fluxes, Canopy Interception & Snowpack (`_land_post_newton_core`)
+kernel void surface_land_post_newton_elem(
+    device const float* pb_out        [[buffer(0)]],   // [13, N]
+    device const float* jac_out       [[buffer(1)]],   // [33, N]
+    device const float* jac_const     [[buffer(2)]],   // [25, N]
+    device const float* t_sun_cur_in  [[buffer(3)]],
+    device const float* t_sh_cur_in   [[buffer(4)]],
+    device const float* sw_abs_in     [[buffer(5)]],
+    device const float* lai_exp_in    [[buffer(6)]],
+    device const float* wc_cap_in     [[buffer(7)]],
+    device const float* w_avail_in    [[buffer(8)]],
+    device const float* s_root_in     [[buffer(9)]],
+    device const float* wstress_in    [[buffer(10)]],
+    device const float* swe_in        [[buffer(11)]],
+    device const float* swe_max_in    [[buffer(12)]],
+    device const float* sn_age_in     [[buffer(13)]],
+    device const float* w_liq0_in     [[buffer(14)]],
+    device const float* pr_in         [[buffer(15)]],
+    device const float* ps_in         [[buffer(16)]],
+    device const float* flags_ti_in   [[buffer(17)]],  // is_terr + 2 * is_ice
+    device const float* c_buf         [[buffer(18)]],  // [12] constants
+    device float* out18               [[buffer(19)]],  // [18, N]
+    constant ulong4& u_dim            [[buffer(20)]],  // [N, 0, 0, 0]
+    constant float4& f_p0             [[buffer(21)]],  // [dt, 0, 0, 0]
+    uint i [[thread_position_in_grid]])
+{
+    uint n = uint(u_dim.x);
+    if (i >= n) return;
+    float dt = f_p0.x;
+    float inv_dt = 1.0f / dt;
+
+    float eps_g       = c_buf[0];
+    float sig         = c_buf[1];
+    float t_frz       = c_buf[2];
+    float l_v0        = c_buf[3];
+    float l_s0        = c_buf[4];
+    float l_f0        = c_buf[5];
+    float rho_water   = c_buf[6];
+    float dz0         = c_buf[7];
+    float alpha_int   = c_buf[8];
+    float swe_glac    = c_buf[9];
+    float tau_sn_age  = c_buf[10];
+
+    // Unpack from existing packed GPU buffers
+    float ga_land  = pb_out[0u * n + i];
+    float qsat_sun = pb_out[4u * n + i];
+    float dq_sun   = pb_out[5u * n + i];
+    float qsat_sh  = pb_out[6u * n + i];
+    float dq_sh    = pb_out[7u * n + i];
+    float qsat_gnd = pb_out[8u * n + i];
+    float dq_gnd   = pb_out[9u * n + i];
+
+    float t_sun_new  = jac_out[0u * n + i];
+    float t_sh_new   = jac_out[1u * n + i];
+    float t_gnd_new  = jac_out[2u * n + i];
+    float t_gnd_fin  = jac_out[3u * n + i];
+    float dt2_fin    = jac_out[7u * n + i];
+    float q_melt_av  = jac_out[8u * n + i];
+    float q_af       = jac_out[9u * n + i];
+    float wh_0       = jac_out[10u * n + i];
+    float wh_1       = jac_out[11u * n + i];
+    float wh_2       = jac_out[12u * n + i];
+    float ww_0       = jac_out[13u * n + i];
+    float ww_1       = jac_out[14u * n + i];
+    float ww_2       = jac_out[15u * n + i];
+    float gh_0       = jac_out[16u * n + i];
+    float gh_1       = jac_out[17u * n + i];
+    float gh_2       = jac_out[18u * n + i];
+    float rho_cp     = jac_out[19u * n + i];
+    float h_0        = jac_out[20u * n + i];
+    float h_1        = jac_out[21u * n + i];
+    float h_2        = jac_out[22u * n + i];
+    float g_tr_sun   = jac_out[23u * n + i];
+    float g_tr_sh    = jac_out[24u * n + i];
+    float g_in_sun   = jac_out[25u * n + i];
+    float g_in_sh    = jac_out[26u * n + i];
+    float g_soil_sf  = jac_out[27u * n + i];
+    float g_sn_subl  = jac_out[28u * n + i];
+    float h_soil     = jac_out[29u * n + i];
+    bool dry_cap     = (jac_out[30u * n + i] > 0.5f);
+    float dhq_gnd    = jac_out[31u * n + i];
+    float j22_s      = jac_out[32u * n + i];
+
+    float t_soil0    = jac_const[0u * n + i];
+    float qv_1       = jac_const[2u * n + i];
+    float a_sn       = jac_const[5u * n + i];
+    float w_can      = jac_const[7u * n + i];
+    float rho_sfc    = jac_const[8u * n + i];
+    float f_veg_rad  = jac_const[10u * n + i];
+    float f_sun_area = jac_const[11u * n + i];
+    float f_sh_area  = jac_const[12u * n + i];
+    float lw_refl_c  = jac_const[13u * n + i];
+    float lw_down    = jac_const[18u * n + i];
+    int jflg         = int(jac_const[20u * n + i] + 0.5f);
+    float t_sun_t0   = jac_const[21u * n + i];
+    float t_sh_t0    = jac_const[22u * n + i];
+    float c_sun_dt   = jac_const[23u * n + i];
+    float c_sh_dt    = jac_const[24u * n + i];
+
+    bool has_veg  = (jflg & 1) != 0;
+    bool has_sun  = (jflg & 2) != 0;
+    bool has_sh   = (jflg & 4) != 0;
+    bool has_snow = (jflg & 8) != 0;
+    int ti_flg    = int(flags_ti_in[i] + 0.5f);
+    bool is_terr  = (ti_flg & 1) != 0;
+    bool is_ice   = (ti_flg & 2) != 0;
+
+    float t_sun_fin = has_sun ? t_sun_new : (has_sh ? t_sh_new : t_gnd_fin);
+    float t_sh_fin  = has_sh  ? t_sh_new  : (has_sun ? t_sun_new : t_gnd_fin);
+    float dt0_fin = t_sun_fin - t_sun_cur_in[i];
+    float dt1_fin = t_sh_fin  - t_sh_cur_in[i];
+
+    float dt_af_fin = wh_0 * dt0_fin + wh_1 * dt1_fin + wh_2 * dt2_fin;
+    float dq_af_fin = ww_0 * dq_sun * dt0_fin + ww_1 * dq_sh * dt1_fin + ww_2 * dhq_gnd * dt2_fin;
+
+    float shf_0 = h_0 + rho_cp * gh_0 * (dt0_fin - dt_af_fin);
+    float shf_1 = h_1 + rho_cp * gh_1 * (dt1_fin - dt_af_fin);
+    float shf_2 = has_veg ? (h_2 + rho_cp * gh_2 * (dt2_fin - dt_af_fin)) : (h_2 + rho_cp * ga_land * dt2_fin);
+    float shf_l = shf_0 + shf_1 + shf_2;
+
+    float q_af_fin = q_af + dq_af_fin;
+    float dq0_fin = (qsat_sun + dq_sun * dt0_fin) - q_af_fin;
+    float dq1_fin = (qsat_sh  + dq_sh  * dt1_fin) - q_af_fin;
+    float dq2_soil = dry_cap ? 0.0f : (h_soil * (qsat_gnd + dq_gnd * dt2_fin) - q_af_fin);
+    float dq2_snow = (qsat_gnd + dq_gnd * dt2_fin) - q_af_fin;
+
+    float e_tr_raw = rho_sfc * (g_tr_sun * dq0_fin + g_tr_sh * dq1_fin);
+    float e_in_raw = rho_sfc * (g_in_sun * dq0_fin + g_in_sh * dq1_fin);
+    float e_so_raw = rho_sfc * g_soil_sf * dq2_soil;
+    float e_sn_raw = rho_sfc * g_sn_subl * dq2_snow;
+
+    float e_in_pos = max(e_in_raw, 0.0f);
+    float e_tr_pos = max(e_tr_raw, 0.0f);
+    float e_so_pos = max(e_so_raw, 0.0f);
+    float e_sn_pos = max(e_sn_raw, 0.0f);
+    float dew_leaf_neg = min(e_in_raw, 0.0f) + min(e_tr_raw, 0.0f);
+    float dew_gnd_neg  = min(e_so_raw, 0.0f) + min(e_sn_raw, 0.0f);
+    float dew_neg = max(dew_leaf_neg + dew_gnd_neg, -rho_sfc * ga_land * qv_1);
+
+    float l_vap = ((a_sn > 0.5f) || (t_gnd_fin < t_frz)) ? l_s0 : l_v0;
+    float e_inter = is_terr ? min(e_in_pos, w_can * inv_dt) : e_in_pos;
+    shf_l += l_vap * (e_in_pos - e_inter);
+
+    float sw_max_rate = (1.05f / 3600.0f) * wstress_in[i] * (s_root_in[i] * (1.0f / 150.0f));
+    float e_trans = min(e_tr_pos, sw_max_rate);
+    if (is_terr) e_trans = min(e_trans, w_avail_in[i] * inv_dt);
+
+    float swe_v = swe_in[i];
+    float e_snow = is_terr ? min(e_sn_pos, swe_v * inv_dt) : e_sn_pos;
+    float max_soil_e = rho_water * dz0 * max(w_liq0_in[i] - 0.02f, 0.0f) * inv_dt;
+    float e_soil = is_terr ? min(e_so_pos, max_soil_e) : e_so_pos;
+
+    float evap_l = e_inter + e_trans + e_snow + e_soil + dew_neg;
+    float lhf_l = l_vap * evap_l;
+
+    float tg2 = t_gnd_fin * t_gnd_fin; float tg4 = tg2 * tg2;
+    float ts2 = t_sun_fin * t_sun_fin; float ts4 = ts2 * ts2;
+    float th2 = t_sh_fin  * t_sh_fin;  float th4 = th2 * th2;
+    float lw_emit = (1.0f - f_veg_rad) * eps_g * sig * tg4
+        + f_veg_rad * lw_refl_c * sig * (f_sun_area * ts4 + f_sh_area * th4);
+    float om_fv = 1.0f - f_veg_rad;
+    float lw_up_l = (om_fv * om_fv) * (1.0f - eps_g) * lw_down + lw_emit;
+    float t_skin_fin = pow(max(lw_emit / (eps_g * sig), 1.0e4f), 0.25f);
+    float s_can = has_veg ? (c_sun_dt * (t_sun_fin - t_sun_t0) + c_sh_dt * (t_sh_fin - t_sh_t0)) : 0.0f;
+    float g_into_soil = sw_abs_in[i] + lw_down - lw_up_l - shf_l - lhf_l - q_melt_av - s_can;
+
+    float pr = pr_in[i];
+    float ps = ps_in[i];
+    float f_int = clamp(alpha_int * tanh(lai_exp_in[i]), 0.0f, 1.0f);
+    float wc_mid = w_can + dt * (f_int * pr - e_inter - dew_leaf_neg);
+    float drip = max(wc_mid - wc_cap_in[i], 0.0f) * inv_dt;
+    float wc_next = max(wc_mid - drip * dt, 0.0f);
+    float rain_thru = (1.0f - f_int) * pr + drip;
+    float snow_thru = ps;
+
+    float swe_mid = max(swe_v + dt * (snow_thru - e_snow), 0.0f);
+    float melt_rate = min(q_melt_av / l_f0, swe_mid * inv_dt);
+    float warm_melt = ((t_soil0 > t_frz + 1.0f) && (swe_mid < 2.0f)) ? (swe_mid * inv_dt) : 0.0f;
+    float melt_tot = min(melt_rate + warm_melt, swe_mid * inv_dt);
+    g_into_soil -= l_f0 * (melt_tot - melt_rate);
+    float swe_after = max(swe_mid - melt_tot * dt, 0.0f);
+
+    float glac_runoff = max(swe_after - swe_glac, 0.0f) * inv_dt;
+    float swe_next = swe_after - glac_runoff * dt;
+    float bare_melt_pot = ((!has_snow) && (t_gnd_new > t_frz)) ? ((t_gnd_new - t_frz) * j22_s / l_f0) : 0.0f;
+    float smb_ice = is_terr ? (snow_thru - e_snow - melt_tot - bare_melt_pot) : 0.0f;
+
+    float swe_max_next = (swe_next <= 1.0e-2f) ? 0.0f : max(swe_max_in[i], swe_next);
+    float t_sn = min(t_skin_fin, t_frz);
+    float f_age = exp(5000.0f * (1.0f / t_frz - 1.0f / max(t_sn, 200.0f)));
+    float f2 = f_age * f_age; float f4 = f2 * f2; float f10 = f4 * f4 * f2;
+    float r_dirt = is_ice ? 0.01f : 0.30f;
+    float age_inc = (f_age + f10 + r_dirt) * (dt / tau_sn_age);
+    float fresh_ref = clamp(snow_thru * dt * 0.1f, 0.0f, 1.0f);
+    float sn_age_next = (swe_next <= 1.0e-3f) ? 0.0f : ((1.0f - fresh_ref) * (sn_age_in[i] + age_inc));
+    float dew_ground = -dew_gnd_neg;
+
+    out18[0u * n + i]  = t_sun_fin;
+    out18[1u * n + i]  = t_sh_fin;
+    out18[2u * n + i]  = t_skin_fin;
+    out18[3u * n + i]  = shf_l;
+    out18[4u * n + i]  = lhf_l;
+    out18[5u * n + i]  = evap_l;
+    out18[6u * n + i]  = e_soil;
+    out18[7u * n + i]  = e_trans;
+    out18[8u * n + i]  = g_into_soil;
+    out18[9u * n + i]  = wc_next;
+    out18[10u * n + i] = rain_thru;
+    out18[11u * n + i] = melt_tot;
+    out18[12u * n + i] = dew_ground;
+    out18[13u * n + i] = glac_runoff;
+    out18[14u * n + i] = swe_next;
+    out18[15u * n + i] = smb_ice;
+    out18[16u * n + i] = swe_max_next;
+    out18[17u * n + i] = sn_age_next;
+}
+
+// 8. Fused 5-Layer Root-Zone Plant-Available Water & Uptake Weights (`compute_root_zone_weights_and_water`)
+kernel void root_zone_water_5layer_col(
+    device const float* w_liq         [[buffer(0)]],   // [5, N]
+    device const float* s_root_cap    [[buffer(1)]],   // [N]
+    device const float* c_buf         [[buffer(2)]],   // [14]: dz[5], z_top[5], z_tot, theta_wp, dtheta_paw, rho_water
+    device float* w_avail_out         [[buffer(3)]],   // [N]
+    device float* w_up_out            [[buffer(4)]],   // [5, N]
+    device float* alpha_out           [[buffer(5)]],   // [5, N]
+    constant ulong4& u_dim            [[buffer(6)]],   // [N, 0, 0, 0]
+    uint i [[thread_position_in_grid]])
+{
+    uint n = uint(u_dim.x);
+    if (i >= n) return;
+
+    float z_tot = c_buf[10];
+    float theta_wp = c_buf[11];
+    float dtheta_paw = c_buf[12];
+    float rho_w = c_buf[13];
+
+    float z_root = clamp(max(s_root_cap[i], 20.0f) / (rho_w * dtheta_paw), 0.15f, z_tot);
+    float avail[5];
+    float alpha[5];
+    float rdw[5];
+    float w_avail = 0.0f;
+    float rdw_sum = 0.0f;
+    for (uint k = 0u; k < 5u; ++k) {
+        float dzk = c_buf[k];
+        float ztk = c_buf[5u + k];
+        float ak = clamp((z_root - ztk) / dzk, 0.0f, 1.0f);
+        float avk = rho_w * dzk * ak * max(w_liq[k * n + i] - theta_wp, 0.0f);
+        alpha[k] = ak;
+        avail[k] = avk;
+        rdw[k] = ak * dzk;
+        w_avail += avk;
+        rdw_sum += ak * dzk;
+    }
+    w_avail_out[i] = w_avail;
+    float inv_av = 1.0f / max(w_avail, 1.0e-6f);
+    float inv_rdw = 1.0f / max(rdw_sum, 1.0e-6f);
+    bool use_av = (w_avail > 1.0e-6f);
+    for (uint k = 0u; k < 5u; ++k) {
+        alpha_out[k * n + i] = alpha[k];
+        w_up_out[k * n + i] = use_av ? (avail[k] * inv_av) : (rdw[k] * inv_rdw);
+    }
+}
+
+// 9. Fused 5-Layer Implicit Richards Soil Hydrology (`step_multilayer_soil_hydrology`)
+kernel void soil_hydro_5layer_col(
+    device const float* w_liq_in      [[buffer(0)]],   // [5, N]
+    device const float* w_ice_in      [[buffer(1)]],   // [5, N]
+    device const float* rain_thru_in  [[buffer(2)]],   // [N]
+    device const float* melt_tot_in   [[buffer(3)]],   // [N]
+    device const float* e_soil_in     [[buffer(4)]],   // [N]
+    device const float* e_trans_in    [[buffer(5)]],   // [N]
+    device const float* dew_gnd_in    [[buffer(6)]],   // [N]
+    device const float* s_root_in     [[buffer(7)]],   // [N]
+    device const float* is_ice_in     [[buffer(8)]],   // [N]
+    device const float* c_buf         [[buffer(9)]],   // [23]: dz[5], z_top[5], dz_int[4], z_tot, por, psi_s, b, k_sat, omega, rho_w, theta_wp, dtheta_paw
+    device float* w_liq_out           [[buffer(10)]],  // [5, N]
+    device float* sfc_runoff_out      [[buffer(11)]],  // [N]
+    device float* sub_runoff_out      [[buffer(12)]],  // [N]
+    constant ulong4& u_dim            [[buffer(13)]],  // [N, 0, 0, 0]
+    constant float4& f_p0             [[buffer(14)]],  // [dt, 0, 0, 0]
+    uint i [[thread_position_in_grid]])
+{
+    uint n = uint(u_dim.x);
+    if (i >= n) return;
+    float dt = f_p0.x;
+    float inv_dt = 1.0f / dt;
+
+    float dz[5];
+    float z_top[5];
+    float dz_int[4];
+    for (uint k = 0u; k < 5u; ++k) {
+        dz[k] = c_buf[k];
+        z_top[k] = c_buf[5u + k];
+    }
+    for (uint k = 0u; k < 4u; ++k) {
+        dz_int[k] = c_buf[10u + k];
+    }
+    float z_tot      = c_buf[14];
+    float por        = c_buf[15];
+    float psi_sat    = c_buf[16];
+    float b_clapp    = c_buf[17];
+    float k_sat      = c_buf[18];
+    float ice_omega  = c_buf[19];
+    float rho_w      = c_buf[20];
+    float theta_wp   = c_buf[21];
+    float dtheta_paw = c_buf[22];
+
+    bool is_ice = (is_ice_in[i] > 0.5f);
+    float exp_k = 2.0f * b_clapp + 3.0f;
+    float s_min = 0.02f;
+
+    float wl_orig[5];
+    float wl[5];
+    float wi[5];
+    float th_max[5];
+    float f_ice[5];
+    float s_eff[5];
+    float th_safe[5];
+    float psi[5];
+    float dpsi_dth[5];
+
+    for (uint k = 0u; k < 5u; ++k) {
+        float wlo = w_liq_in[k * n + i];
+        wl_orig[k] = wlo;
+        wl[k] = max(wlo, 0.0f);
+        wi[k] = max(w_ice_in[k * n + i], 0.0f);
+        th_max[k] = max(por - wi[k], 0.0f);
+        float ice_frac = clamp(wi[k] / por, 0.0f, 1.0f);
+        f_ice[k] = pow(10.0f, -ice_omega * ice_frac);
+        s_eff[k] = clamp(wl[k] / por, s_min, 1.0f);
+        th_safe[k] = max(wl[k], s_min * por);
+        psi[k] = max(psi_sat * pow(s_eff[k], -b_clapp), -1.0e5f);
+        dpsi_dth[k] = min(-b_clapp * psi[k] / th_safe[k], 1.0e6f);
+    }
+
+    float k_int[4];
+    float q_int[4];
+    float a_int[4];
+    float c_int[4];
+    for (uint k = 0u; k < 4u; ++k) {
+        float s_mid = 0.5f * (s_eff[k] + s_eff[k + 1u]);
+        float fi_mid = min(f_ice[k], f_ice[k + 1u]);
+        k_int[k] = fi_mid * k_sat * pow(s_mid, exp_k);
+        q_int[k] = k_int[k] * (1.0f + (psi[k] - psi[k + 1u]) / dz_int[k]);
+        float k_dz = k_int[k] / dz_int[k];
+        a_int[k] = k_dz * dpsi_dth[k];
+        c_int[k] = k_dz * dpsi_dth[k + 1u];
+    }
+
+    float k_bot = f_ice[4] * k_sat * pow(s_eff[4], exp_k);
+    float dk_bot_dth = exp_k * k_bot / th_safe[4];
+
+    float q_liq_in = max(rain_thru_in[i] + melt_tot_in[i] + dew_gnd_in[i], 0.0f);
+    float s_top_tot = clamp((wl[0] + wi[0]) / por, 0.0f, 1.0f);
+    float s2 = s_top_tot * s_top_tot;
+    float f_imp = 1.0f - f_ice[0];
+    float f_sat = f_imp + (1.0f - f_imp) * (s2 * s2);
+    float q_infil_cap = rho_w * f_ice[0] * k_sat * clamp(
+        1.0f + (psi_sat - psi[0]) / (0.5f * dz[0]), 1.0f, 1.0e4f
+    );
+    float q_infil = is_ice ? 0.0f : min((1.0f - f_sat) * q_liq_in, q_infil_cap);
+    float sfc_runoff_0 = is_ice ? q_liq_in : (q_liq_in - q_infil);
+
+    // Inline root-zone uptake weights
+    float z_root = clamp(max(s_root_in[i], 20.0f) / (rho_w * dtheta_paw), 0.15f, z_tot);
+    float avail[5];
+    float rdw[5];
+    float w_avail = 0.0f;
+    float rdw_sum = 0.0f;
+    for (uint k = 0u; k < 5u; ++k) {
+        float ak = clamp((z_root - z_top[k]) / dz[k], 0.0f, 1.0f);
+        avail[k] = rho_w * dz[k] * ak * max(wl[k] - theta_wp, 0.0f);
+        rdw[k] = ak * dz[k];
+        w_avail += avail[k];
+        rdw_sum += rdw[k];
+    }
+    float e_tr_ms = is_ice ? 0.0f : (max(e_trans_in[i], 0.0f) / rho_w);
+    float s_trans[5];
+    float inv_av = 1.0f / max(w_avail, 1.0e-6f);
+    float inv_rdw = 1.0f / max(rdw_sum, 1.0e-6f);
+    bool use_av = (w_avail > 1.0e-6f);
+    for (uint k = 0u; k < 5u; ++k) {
+        float w_up_k = use_av ? (avail[k] * inv_av) : (rdw[k] * inv_rdw);
+        s_trans[k] = e_tr_ms * w_up_k;
+    }
+
+    float e_soil_ms = is_ice ? 0.0f : (max(e_soil_in[i], 0.0f) / rho_w);
+    float dl[5], diag[5], du[5], rhs[5];
+    dl[0] = 0.0f;      du[0] = -c_int[0]; diag[0] = dz[0] * inv_dt + a_int[0];
+    dl[1] = -a_int[0]; du[1] = -c_int[1]; diag[1] = dz[1] * inv_dt + a_int[1] + c_int[0];
+    dl[2] = -a_int[1]; du[2] = -c_int[2]; diag[2] = dz[2] * inv_dt + a_int[2] + c_int[1];
+    dl[3] = -a_int[2]; du[3] = -c_int[3]; diag[3] = dz[3] * inv_dt + a_int[3] + c_int[2];
+    dl[4] = -a_int[3]; du[4] = 0.0f;      diag[4] = dz[4] * inv_dt + c_int[3] + dk_bot_dth;
+
+    rhs[0] = (q_infil / rho_w - e_soil_ms) - q_int[0] - s_trans[0];
+    rhs[1] = q_int[0] - q_int[1] - s_trans[1];
+    rhs[2] = q_int[1] - q_int[2] - s_trans[2];
+    rhs[3] = q_int[2] - q_int[3] - s_trans[3];
+    rhs[4] = q_int[3] - k_bot    - s_trans[4];
+
+    // 5-layer Thomas solve in registers
+    float cs[5], ds[5], dth[5];
+    float inv0 = 1.0f / diag[0];
+    cs[0] = du[0] * inv0;
+    ds[0] = rhs[0] * inv0;
+    for (uint k = 1u; k < 5u; ++k) {
+        float invk = 1.0f / (diag[k] - dl[k] * cs[k - 1u]);
+        cs[k] = (k < 4u) ? (du[k] * invk) : 0.0f;
+        ds[k] = (rhs[k] - dl[k] * ds[k - 1u]) * invk;
+    }
+    dth[4] = ds[4];
+    for (int k = 3; k >= 0; --k) {
+        dth[k] = ds[k] - cs[k] * dth[k + 1];
+    }
+
+    float th[5];
+    for (uint k = 0u; k < 5u; ++k) {
+        th[k] = wl[k] + dth[k];
+    }
+    float q_drain_raw = k_bot + dk_bot_dth * dth[4];
+    float q_drain_neg = max(-q_drain_raw, 0.0f);
+    float q_drain = max(q_drain_raw, 0.0f);
+    th[4] -= (dt / dz[4]) * q_drain_neg;
+
+    // Upward saturation-excess cascade
+    float excess_mass = 0.0f;
+    for (int k = 4; k >= 0; --k) {
+        float rdz = rho_w * dz[k];
+        float th_k = th[k] + excess_mass / rdz;
+        float over = max(th_k - th_max[k], 0.0f);
+        th[k] = th_k - over;
+        excess_mass = over * rdz;
+    }
+    sfc_runoff_out[i] = sfc_runoff_0 + excess_mass * inv_dt;
+
+    // Downward non-negativity deficit cascade
+    float deficit_mass = 0.0f;
+    for (uint k = 0u; k < 5u; ++k) {
+        float rdz = rho_w * dz[k];
+        float th_k = th[k] - deficit_mass / rdz;
+        float under = max(-th_k, 0.0f);
+        th[k] = th_k + under;
+        deficit_mass = under * rdz;
+    }
+
+    float q_drain_mass = rho_w * q_drain * dt;
+    q_drain_mass -= min(deficit_mass, q_drain_mass);
+    sub_runoff_out[i] = is_ice ? 0.0f : (q_drain_mass * inv_dt);
+    for (uint k = 0u; k < 5u; ++k) {
+        w_liq_out[k * n + i] = is_ice ? wl_orig[k] : th[k];
+    }
+}
+
+// 10. Fused 5-Layer Soil Thermodynamics & Freeze-Thaw Phase Change (`step_multilayer_soil_thermodynamics`)
+kernel void soil_thermo_5layer_col(
+    device const float* t_soil_in     [[buffer(0)]],   // [5, N]
+    device const float* w_liq_in      [[buffer(1)]],   // [5, N]
+    device const float* w_ice_in      [[buffer(2)]],   // [5, N]
+    device const float* g_gnd_in      [[buffer(3)]],   // [N]
+    device const float* c_buf         [[buffer(4)]],   // [13]: dz[5], t_frz, l_f0, rho_w, rho_i, cs_dry, cp_l, cp_i, kappa_dry
+    device float* t_final_out         [[buffer(5)]],   // [5, N]
+    device float* w_liq_out           [[buffer(6)]],   // [5, N]
+    device float* w_ice_out           [[buffer(7)]],   // [5, N]
+    constant ulong4& u_dim            [[buffer(8)]],   // [N, 0, 0, 0]
+    constant float4& f_p0             [[buffer(9)]],   // [dt, 0, 0, 0]
+    uint i [[thread_position_in_grid]])
+{
+    uint n = uint(u_dim.x);
+    if (i >= n) return;
+    float dt = f_p0.x;
+
+    float dz[5];
+    for (uint k = 0u; k < 5u; ++k) dz[k] = c_buf[k];
+    float t0        = c_buf[5];
+    float l_f0      = c_buf[6];
+    float rho_w     = c_buf[7];
+    float rho_i     = c_buf[8];
+    float cs_dry    = c_buf[9];
+    float cp_l      = c_buf[10];
+    float cp_i      = c_buf[11];
+    float kappa_dry = c_buf[12];
+
+    float dt_mid[5];
+    float kappa[5];
+    float cap[5];
+
+    for (uint k = 0u; k < 5u; ++k) {
+        float mw = rho_w * max(w_liq_in[k * n + i], 0.0f);
+        float mi = rho_i * max(w_ice_in[k * n + i], 0.0f);
+        float m_tot = mw + mi;
+        float c_vol = cs_dry + cp_l * mw + cp_i * mi;
+        float u_int = c_vol * (t_soil_in[k * n + i] - t0) - l_f0 * mi;
+        if (k == 0u) u_int += (dt / dz[0]) * g_gnd_in[i];
+
+        float mi_new = min(max(-u_int / l_f0, 0.0f), m_tot);
+        float mw_new = max(m_tot - mi_new, 0.0f);
+        float wl_n = mw_new / rho_w;
+        float wi_n = mi_new / rho_i;
+        w_liq_out[k * n + i] = wl_n;
+        w_ice_out[k * n + i] = wi_n;
+
+        float c_vol_new = cs_dry + cp_l * mw_new + cp_i * mi_new;
+        dt_mid[k] = (u_int + l_f0 * mi_new) / c_vol_new;
+        kappa[k] = kappa_dry * (1.0f + 5.5f * tanh((wl_n + wi_n) * 4.0f)) + 0.8f * wi_n;
+        cap[k] = c_vol_new * dz[k];
+    }
+
+    float cond_int[4];
+    for (uint k = 0u; k < 4u; ++k) {
+        float dz_mid = 0.5f * (dz[k + 1u] + dz[k]);
+        float k_mid = 0.5f * (kappa[k + 1u] + kappa[k]);
+        cond_int[k] = dt * k_mid / dz_mid;
+    }
+
+    float dl[5], du[5], diag[5];
+    for (uint k = 0u; k < 5u; ++k) {
+        dl[k] = (k > 0u) ? (-cond_int[k - 1u] / cap[k]) : 0.0f;
+        du[k] = (k < 4u) ? (-cond_int[k] / cap[k]) : 0.0f;
+        diag[k] = 1.0f - dl[k] - du[k];
+    }
+
+    float cs[5], ds[5], x[5];
+    float inv0 = 1.0f / diag[0];
+    cs[0] = du[0] * inv0;
+    ds[0] = dt_mid[0] * inv0;
+    for (uint k = 1u; k < 5u; ++k) {
+        float invk = 1.0f / (diag[k] - dl[k] * cs[k - 1u]);
+        cs[k] = (k < 4u) ? (du[k] * invk) : 0.0f;
+        ds[k] = (dt_mid[k] - dl[k] * ds[k - 1u]) * invk;
+    }
+    x[4] = ds[4];
+    for (int k = 3; k >= 0; --k) {
+        x[k] = ds[k] - cs[k] * x[k + 1];
+    }
+    for (uint k = 0u; k < 5u; ++k) {
+        t_final_out[k * n + i] = t0 + x[k];
+    }
+}
+
+// 11. Fused Ocean/Sea-Ice Pre-Transfer Meteorology & Roughness (`_surface_ocean_pre_transfer_core` + met)
+kernel void surface_ocean_pre_transfer_elem(
+    device const float* temp_1_in     [[buffer(0)]],
+    device const float* qv_1_in       [[buffer(1)]],
+    device const float* pres_1_in     [[buffer(2)]],
+    device const float* pres_sfc_in   [[buffer(3)]],
+    device const float* u_star_in     [[buffer(4)]],
+    device const float* f_ice_in      [[buffer(5)]],
+    device const float* t_ml_in       [[buffer(6)]],
+    device const float* t_si_in       [[buffer(7)]],
+    device const float* c_buf         [[buffer(8)]],   // [11]: p_ref, kappa_d, zvir, r_d, cp_d, cp_v, nu_air, gravity, e_triple, t_freeze, eps_water
+    device float* out12               [[buffer(9)]],   // [12, N]
+    constant ulong4& u_dim            [[buffer(10)]],  // [N, 0, 0, 0]
+    uint i [[thread_position_in_grid]])
+{
+    uint n = uint(u_dim.x);
+    if (i >= n) return;
+
+    float p_ref    = c_buf[0];
+    float kappa_d  = c_buf[1];
+    float zvir     = c_buf[2];
+    float r_d      = c_buf[3];
+    float cp_d     = c_buf[4];
+    float cp_v     = c_buf[5];
+    float nu_air   = c_buf[6];
+    float gravity  = c_buf[7];
+    float e_triple = c_buf[8];
+    float t_frz    = c_buf[9];
+    float eps_w    = c_buf[10];
+
+    float temp_1 = temp_1_in[i];
+    float qv_1   = qv_1_in[i];
+    float pres_1 = pres_1_in[i];
+    float pres_s = pres_sfc_in[i];
+    float us     = max(u_star_in[i], 0.02f);
+    float f_ice  = f_ice_in[i];
+    float t_ml   = t_ml_in[i];
+    float t_si   = t_si_in[i];
+
+    float exner_1 = pow(pres_1 / p_ref, kappa_d);
+    float exner_s = pow(pres_s / p_ref, kappa_d);
+    float theta_1 = temp_1 / exner_1;
+    float qfac = 1.0f + zvir * qv_1;
+    float theta_v1 = theta_1 * qfac;
+    float rho_sfc = pres_s / (r_d * temp_1 * qfac);
+    float cp_air = cp_d + cp_v * qv_1;
+    float t_air_sfc = theta_1 * exner_s;
+
+    float z0m_o = clamp(0.11f * nu_air / us + 0.018f * (us * us) / gravity, 1.0e-6f, 0.05f);
+    float z0h_o = clamp(0.40f * nu_air / us + 1.4e-5f, 1.0e-6f, 0.02f);
+    float z0q_o = clamp(0.62f * nu_air / us + 1.3e-4f, 1.0e-6f, 0.02f);
+    float z0m_sea = (1.0f - f_ice) * z0m_o + f_ice * 0.001f;
+    float z0h_sea = (1.0f - f_ice) * z0h_o + f_ice * 0.0002f;
+    float z0q_sea = (1.0f - f_ice) * z0q_o + f_ice * 0.0002f;
+
+    float tc_ow = max(t_ml, 160.0f) - t_frz;
+    float esat_ow = e_triple * exp(17.67f * tc_ow / (tc_ow + 243.50f));
+    float ts_si = max(t_si, 120.0f);
+    float esat_si = e_triple * exp(21.8745584f * (ts_si - t_frz) / (ts_si - 7.66f));
+    float qsat_ow = 0.98f * eps_w * esat_ow / max(pres_s - esat_ow, 0.1f * pres_s);
+    float qsat_si = eps_w * esat_si / max(pres_s - esat_si, 0.1f * pres_s);
+    float t_skin = (1.0f - f_ice) * t_ml + f_ice * t_si;
+    float q_skin = (1.0f - f_ice) * qsat_ow + f_ice * qsat_si;
+    float theta_vsfc_o = (t_skin / exner_s) * (1.0f + zvir * q_skin);
+
+    out12[0u * n + i]  = exner_s;
+    out12[1u * n + i]  = theta_1;
+    out12[2u * n + i]  = theta_v1;
+    out12[3u * n + i]  = rho_sfc;
+    out12[4u * n + i]  = cp_air;
+    out12[5u * n + i]  = t_air_sfc;
+    out12[6u * n + i]  = z0m_sea;
+    out12[7u * n + i]  = z0h_sea;
+    out12[8u * n + i]  = z0q_sea;
+    out12[9u * n + i]  = qsat_ow;
+    out12[10u * n + i] = qsat_si;
+    out12[11u * n + i] = theta_vsfc_o;
+}
 """
 
 
@@ -6076,3 +7768,451 @@ def run_scvt_storm_smag_metal(
         u_dim, threads=nc,
     )
     return qn_io, th_io, u_io, w_io
+
+
+def run_red_sprites_metal(
+    lib: Any,
+    flash_cg_cell: torch.Tensor,
+    cold_cloud_km_cell: torch.Tensor,
+    mu0_cell: torch.Tensor,
+    temp_top: torch.Tensor,
+    z_q_km_in: torch.Tensor,
+    f_pos_cg_explicit: torch.Tensor,
+    rho_host: torch.Tensor,
+    q_i_host: torch.Tensor,
+    q_p_host: torch.Tensor,
+    z_c_host: torch.Tensor,
+    dz_c_host: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """Execute 26-level mesospheric Red Sprites, Halos, ELVES & Blue/Gigantic Jets in 1 GPU kernel."""
+    from aoba import constants as C
+
+    nz, nc = rho_host.shape
+    dev = rho_host.device
+    z_meso_km = 38.0 + 2.0 * torch.arange(26, device=dev, dtype=torch.float32)
+    z_ref_1d = (z_c_host[:, 0] * 1.0e-3).contiguous()
+    idx_hi = torch.clamp(torch.searchsorted(z_ref_1d, z_meso_km), min=1, max=max(nz - 1, 1))
+    idx_lo = (idx_hi - 1).to(torch.int32).contiguous()
+
+    out15 = torch.empty((15, nc), device=dev, dtype=torch.float32)
+    u_dim = [nz, nc, 0, 0]
+    eps0 = 8.854187817e-12
+    rd_over_g_km = (C.R_D / C.GRAVITY) * 1.0e-3
+    e_qe_const = 1.0e3 / (math.pi * eps0)
+    e_emp_base = (4.0e-7 * math.pi * 1.5e8 / (2.0 * math.pi * 1.5e5)) * 0.82
+    e_cld_const = 1.0e3 / (2.0 * math.pi * eps0 * (3.5e3 ** 3))
+    f_c0 = [float(rd_over_g_km), float(e_qe_const), float(e_emp_base), float(e_cld_const)]
+
+    lib.red_sprites_col(
+        flash_cg_cell.contiguous(),
+        cold_cloud_km_cell.contiguous(),
+        mu0_cell.contiguous(),
+        temp_top.contiguous(),
+        z_q_km_in.contiguous(),
+        f_pos_cg_explicit.contiguous(),
+        rho_host.contiguous(),
+        q_i_host.contiguous(),
+        q_p_host.contiguous(),
+        z_c_host.contiguous(),
+        dz_c_host.contiguous(),
+        idx_lo,
+        out15,
+        u_dim,
+        f_c0,
+        threads=nc,
+    )
+    return out15.unbind(dim=0)
+
+
+def run_ossp_subgrid_struct_metal(
+    lib: Any,
+    shf_3d: torch.Tensor,
+    lhf_3d: torch.Tensor,
+    t_rad_3d: torch.Tensor,
+    alb_vis_3d: torch.Tensor,
+    qn_4d: torch.Tensor,
+    w_4d: torch.Tensor,
+    dx: float,
+    dy: float | None,
+    dxs: float,
+    dys: float | None,
+) -> torch.Tensor:
+    """Compute all 16 OSSP subgrid structure & periodic organization invariants in 1 GPU kernel."""
+    n_col, ny_s, nx_s = shf_3d.shape
+    nz, _, ny, nx = qn_4d.shape
+    dx_m = max(float(dx), 1.0)
+    dy_m = max(float(dx if dy is None else dy), 1.0)
+    dxs_m = max(float(dxs), 1.0)
+    dys_m = max(float(dxs if dys is None else dys), 1.0)
+    out16 = torch.empty((n_col, 16), device=shf_3d.device, dtype=torch.float32)
+    u_p0 = [n_col, nz, (ny_s << 16) | nx_s, (ny << 16) | nx]
+    f_p0 = [1.0 / (dx_m * dx_m), 1.0 / (dy_m * dy_m), 1.0 / (dxs_m * dxs_m), 1.0 / (dys_m * dys_m)]
+    lib.ossp_subgrid_struct_col(
+        shf_3d.reshape(n_col, ny_s * nx_s).contiguous(),
+        lhf_3d.reshape(n_col, ny_s * nx_s).contiguous(),
+        t_rad_3d.reshape(n_col, ny_s * nx_s).contiguous(),
+        alb_vis_3d.reshape(n_col, ny_s * nx_s).contiguous(),
+        qn_4d.reshape(nz, n_col, ny * nx).contiguous(),
+        w_4d.reshape(nz + 1, n_col, ny * nx).contiguous(),
+        out16,
+        u_p0,
+        f_p0,
+        threads=n_col,
+    )
+    return out16
+
+
+def run_lgt_extract_feat_metal(
+    lib: Any,
+    rho_s: torch.Tensor,
+    thm_s: torch.Tensor,
+    qv_s: torch.Tensor,
+    qc_s: torch.Tensor,
+    qi_s: torch.Tensor,
+    qp_s: torch.Tensor,
+    z_s: torch.Tensor,
+    dz_s: torch.Tensor,
+    rain_3d: torch.Tensor,
+    snow_3d: torch.Tensor,
+    buoy_sfc: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract 14 lightning Hurdle features & convective riming gate in 1 GPU kernel."""
+    from aoba import constants as C
+
+    kt, nc = rho_s.shape
+    n_t = int(rain_3d.numel()) // max(nc, 1)
+    k_mid = min(max(kt // 3, 1), kt - 1)
+    k_hi = min(max((2 * kt) // 3, k_mid + 1), kt)
+    feats_out = torch.empty((nc, 14), device=rho_s.device, dtype=torch.float32)
+    gate_out = torch.empty((nc,), device=rho_s.device, dtype=torch.float32)
+    u_p0 = [kt, nc, n_t, (k_mid << 16) | k_hi]
+    f_c0 = [float(C.R_D / C.P_REF), float(C.R_D / C.CV_D), float(C.RV_OVER_RD), float(C.T_FREEZE)]
+    f_c1 = [float(C.L_V0 / C.CP_D), float(C.SECONDS_PER_DAY), 0.0, 0.0]
+    lib.lgt_extract_feat_col(
+        rho_s.contiguous(),
+        thm_s.contiguous(),
+        qv_s.contiguous(),
+        qc_s.contiguous(),
+        qi_s.contiguous(),
+        qp_s.contiguous(),
+        z_s.contiguous(),
+        dz_s.contiguous(),
+        rain_3d.reshape(nc, n_t).contiguous(),
+        snow_3d.reshape(nc, n_t).contiguous(),
+        buoy_sfc.contiguous(),
+        feats_out,
+        gate_out,
+        u_p0,
+        f_c0,
+        f_c1,
+        threads=nc,
+    )
+    return feats_out, gate_out
+
+
+def run_post_crm_accum_metal(
+    lib: Any,
+    rho_post_0: torch.Tensor,
+    thm_post_0: torch.Tensor,
+    qv_post_0: torch.Tensor,
+    dz0_sub: torch.Tensor,
+    rain_new_sub: torch.Tensor,
+    snow_new_sub: torch.Tensor,
+    sw1_dir_sub: torch.Tensor,
+    sw1_dif_sub: torch.Tensor,
+    sw2_dir_sub: torch.Tensor,
+    sw2_dif_sub: torch.Tensor,
+    lw_dn_sub: torch.Tensor,
+    alb_vis_dir: torch.Tensor,
+    alb_vis_dif: torch.Tensor,
+    alb_nir_dir: torch.Tensor,
+    alb_nir_dif: torch.Tensor,
+    emiss_sfc: torch.Tensor,
+    t_rad_sfc: torch.Tensor,
+    day_precip_mm: torch.Tensor,
+    day_pet_mm: torch.Tensor,
+    day_ppfd_mol: torch.Tensor,
+    day_temp_sum: torch.Tensor,
+    day_vpd_sum: torch.Tensor,
+    day_t_min: torch.Tensor,
+    dt: float,
+) -> tuple[torch.Tensor, ...]:
+    """Execute post-CRM lowest-level meteorology, Priestley-Taylor PET & daily accumulators in 1 GPU kernel."""
+    from aoba import constants as C
+
+    m_sub = int(rho_post_0.numel())
+    out9 = torch.empty((9, m_sub), device=rho_post_0.device, dtype=torch.float32)
+    u_dim = [m_sub, 0, 0, 0]
+    f_c0 = [float(dt), float(C.R_D / C.P_REF), float(C.R_D / C.CV_D), float(C.RV_OVER_RD)]
+    f_c1 = [float(C.P_REF), float(C.GRAVITY), float(C.T_FREEZE), float(C.EPS_WATER)]
+    f_c2 = [float(C.STEFAN_BOLTZMANN), float(C.CP_D / (C.EPS_WATER * C.L_V0)), float(1.0 / C.L_V0), 0.0]
+    lib.post_crm_accum_elem(
+        rho_post_0.contiguous(), thm_post_0.contiguous(), qv_post_0.contiguous(), dz0_sub.contiguous(),
+        rain_new_sub.contiguous(), snow_new_sub.contiguous(),
+        sw1_dir_sub.contiguous(), sw1_dif_sub.contiguous(), sw2_dir_sub.contiguous(), sw2_dif_sub.contiguous(),
+        lw_dn_sub.contiguous(),
+        alb_vis_dir.contiguous(), alb_vis_dif.contiguous(), alb_nir_dir.contiguous(), alb_nir_dif.contiguous(),
+        emiss_sfc.contiguous(), t_rad_sfc.contiguous(),
+        day_precip_mm.contiguous(), day_pet_mm.contiguous(), day_ppfd_mol.contiguous(),
+        day_temp_sum.contiguous(), day_vpd_sum.contiguous(), day_t_min.contiguous(),
+        out9, u_dim, f_c0, f_c1, f_c2,
+        threads=m_sub,
+    )
+    return out9.unbind(dim=0)
+
+
+def run_bio_prepare_two_leaf_metal(
+    lib: Any,
+    ema_vis_beam: torch.Tensor,
+    ema_vis_diff: torch.Tensor,
+    ema_mu0_mid: torch.Tensor,
+    vis_beam: torch.Tensor,
+    vis_diff: torch.Tensor,
+    mu0: torch.Tensor,
+    lai_exposed: torch.Tensor,
+    chi_leaf: torch.Tensor | None,
+    leaf_scat_vis: float,
+    kd_prime_par: float,
+    rho_cd_par: float,
+    crown_lai_min: float,
+    chi_min: float,
+    chi_max: float,
+) -> tuple[torch.Tensor, ...]:
+    """Compute acclimated + instantaneous two-leaf PAR profile and sunlit allocation in 1 GPU kernel."""
+    orig_shape = lai_exposed.shape
+    n = int(lai_exposed.numel())
+    dev = lai_exposed.device
+    has_chi = 1 if chi_leaf is not None else 0
+    chi_buf = chi_leaf.reshape(-1).contiguous() if chi_leaf is not None else lai_exposed.reshape(-1).contiguous()
+    out13 = torch.empty((13, n), device=dev, dtype=torch.float32)
+    lib.bio_prepare_two_leaf_elem(
+        ema_vis_beam.reshape(-1).contiguous(),
+        ema_vis_diff.reshape(-1).contiguous(),
+        ema_mu0_mid.reshape(-1).contiguous(),
+        vis_beam.reshape(-1).contiguous(),
+        vis_diff.reshape(-1).contiguous(),
+        mu0.reshape(-1).contiguous(),
+        lai_exposed.reshape(-1).contiguous(),
+        chi_buf,
+        out13,
+        [n, has_chi, 0, 0],
+        [float(leaf_scat_vis), float(kd_prime_par), float(rho_cd_par), float(crown_lai_min)],
+        [float(chi_min), float(chi_max), 0.0, 0.0],
+        threads=n,
+    )
+    return tuple(t.view(orig_shape) for t in out13.unbind(dim=0))
+
+
+def run_surface_land_pre_newton_metal(
+    lib: Any,
+    sw1_dir_down: torch.Tensor,
+    sw1_dif_down: torch.Tensor,
+    sw2_dir_down: torch.Tensor,
+    sw2_dif_down: torch.Tensor,
+    alb_vis_dir: torch.Tensor,
+    alb_vis_dif: torch.Tensor,
+    alb_nir_dir: torch.Tensor,
+    alb_nir_dif: torch.Tensor,
+    h_exp: torch.Tensor,
+    lai_exp: torch.Tensor,
+    a_sn: torch.Tensor,
+    temp_1: torch.Tensor,
+    qv_1: torch.Tensor,
+    pres_1: torch.Tensor,
+    pres_sfc: torch.Tensor,
+    mu0: torch.Tensor,
+    l_sun: torch.Tensor,
+    l_sh: torch.Tensor,
+    k_db_inst: torch.Tensor,
+    kd_par_inst: torch.Tensor,
+    chi_leaf: torch.Tensor | None,
+    snow_age: torch.Tensor,
+    w_liq_soil0: torch.Tensor,
+    w_ice_soil0: torch.Tensor,
+    t_soil0: torch.Tensor,
+    w_canopy: torch.Tensor,
+    swe_land: torch.Tensor,
+    consts: list[float],
+    inv_dt_s: float,
+) -> tuple[torch.Tensor, ...]:
+    """Execute terrestrial pre-Newton meteorology, roughness, 3-source SW, DSL & flags in 1 GPU kernel."""
+    n = int(h_exp.numel())
+    dev = h_exp.device
+    has_chi = 1 if chi_leaf is not None else 0
+    chi_buf = chi_leaf.contiguous() if chi_leaf is not None else h_exp.contiguous()
+    sw_alb_8 = torch.stack([
+        sw1_dir_down, sw1_dif_down, sw2_dir_down, sw2_dif_down,
+        alb_vis_dir, alb_vis_dif, alb_nir_dir, alb_nir_dif,
+    ], dim=0).contiguous()
+    c_buf = _get_const_buf(dev, "sfc_lpre", consts)
+    out30 = torch.empty((30, n), device=dev, dtype=torch.float32)
+    lib.surface_land_pre_newton_elem(
+        sw_alb_8,
+        h_exp.contiguous(), lai_exp.contiguous(), a_sn.contiguous(),
+        temp_1.contiguous(), qv_1.contiguous(), pres_1.contiguous(), pres_sfc.contiguous(),
+        mu0.contiguous(), l_sun.contiguous(), l_sh.contiguous(), k_db_inst.contiguous(),
+        kd_par_inst.contiguous(), chi_buf, snow_age.contiguous(),
+        w_liq_soil0.contiguous(), w_ice_soil0.contiguous(), t_soil0.contiguous(),
+        w_canopy.contiguous(), swe_land.contiguous(),
+        c_buf, out30, [n, has_chi, 0, 0], [float(inv_dt_s), 0.0, 0.0, 0.0],
+        threads=n,
+    )
+    return out30.unbind(dim=0)
+
+
+def run_surface_land_post_newton_metal(
+    lib: Any,
+    pb_out: torch.Tensor,
+    jac_out: torch.Tensor,
+    jac_const: torch.Tensor,
+    t_sun_cur: torch.Tensor,
+    t_sh_cur: torch.Tensor,
+    sw_abs: torch.Tensor,
+    lai_exp: torch.Tensor,
+    wc_cap: torch.Tensor,
+    w_avail_root: torch.Tensor,
+    s_root_cap: torch.Tensor,
+    water_stress: torch.Tensor,
+    swe_land: torch.Tensor,
+    swe_max_season: torch.Tensor,
+    snow_age: torch.Tensor,
+    w_liq_soil0: torch.Tensor,
+    precip_rain: torch.Tensor,
+    precip_snow: torch.Tensor,
+    flags_ti: torch.Tensor,
+    consts: list[float],
+    dt: float,
+) -> tuple[torch.Tensor, ...]:
+    """Execute terrestrial post-Newton fluxes, canopy interception & snowpack in 1 GPU kernel."""
+    n = int(t_sun_cur.numel())
+    dev = t_sun_cur.device
+    c_buf = _get_const_buf(dev, "sfc_lpost", consts)
+    out18 = torch.empty((18, n), device=dev, dtype=torch.float32)
+    lib.surface_land_post_newton_elem(
+        pb_out.contiguous(), jac_out.contiguous(), jac_const.contiguous(),
+        t_sun_cur.contiguous(), t_sh_cur.contiguous(), sw_abs.contiguous(),
+        lai_exp.contiguous(), wc_cap.contiguous(), w_avail_root.contiguous(),
+        s_root_cap.contiguous(), water_stress.contiguous(), swe_land.contiguous(),
+        swe_max_season.contiguous(), snow_age.contiguous(), w_liq_soil0.contiguous(),
+        precip_rain.contiguous(), precip_snow.contiguous(), flags_ti.contiguous(),
+        c_buf, out18, [n, 0, 0, 0], [float(dt), 0.0, 0.0, 0.0],
+        threads=n,
+    )
+    return out18.unbind(dim=0)
+
+
+def run_root_zone_water_5layer_metal(
+    lib: Any,
+    w_liq_soil: torch.Tensor,
+    s_root_cap: torch.Tensor,
+    consts: list[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Execute 5-layer root-zone plant-available water & layer uptake weights in 1 GPU kernel."""
+    col_shape = w_liq_soil.shape[1:]
+    n = int(s_root_cap.numel())
+    dev = w_liq_soil.device
+    c_buf = _get_const_buf(dev, "soil_rz5", consts)
+    w_avail = torch.empty((n,), device=dev, dtype=torch.float32)
+    w_up = torch.empty((5, n), device=dev, dtype=torch.float32)
+    alpha = torch.empty((5, n), device=dev, dtype=torch.float32)
+    lib.root_zone_water_5layer_col(
+        w_liq_soil.reshape(5, n).contiguous(),
+        s_root_cap.reshape(n).contiguous(),
+        c_buf, w_avail, w_up, alpha, [n, 0, 0, 0],
+        threads=n,
+    )
+    return w_avail.view(col_shape), w_up.view((5,) + col_shape), alpha.view((5,) + col_shape)
+
+
+def run_soil_hydro_5layer_metal(
+    lib: Any,
+    w_liq: torch.Tensor,
+    w_ice: torch.Tensor,
+    rain_thru: torch.Tensor,
+    melt_tot: torch.Tensor,
+    e_soil: torch.Tensor,
+    e_trans: torch.Tensor,
+    dew_ground: torch.Tensor,
+    s_root_cap: torch.Tensor,
+    is_ice: torch.Tensor,
+    consts: list[float],
+    dt: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Execute 5-layer implicit Richards soil hydrology + excess/deficit cascades in 1 GPU kernel."""
+    col_shape = w_liq.shape[1:]
+    n = int(rain_thru.numel())
+    dev = w_liq.device
+    c_buf = _get_const_buf(dev, "soil_hyd5", consts)
+    w_liq_out = torch.empty((5, n), device=dev, dtype=torch.float32)
+    sfc_ro = torch.empty((n,), device=dev, dtype=torch.float32)
+    sub_ro = torch.empty((n,), device=dev, dtype=torch.float32)
+    lib.soil_hydro_5layer_col(
+        w_liq.reshape(5, n).contiguous(),
+        w_ice.reshape(5, n).contiguous(),
+        rain_thru.reshape(n).contiguous(),
+        melt_tot.reshape(n).contiguous(),
+        e_soil.reshape(n).contiguous(),
+        e_trans.reshape(n).contiguous(),
+        dew_ground.reshape(n).contiguous(),
+        s_root_cap.reshape(n).contiguous(),
+        is_ice.reshape(n).to(torch.float32).contiguous(),
+        c_buf, w_liq_out, sfc_ro, sub_ro,
+        [n, 0, 0, 0], [float(dt), 0.0, 0.0, 0.0],
+        threads=n,
+    )
+    return w_liq_out.view((5,) + col_shape), sfc_ro.view(col_shape), sub_ro.view(col_shape)
+
+
+def run_soil_thermo_5layer_metal(
+    lib: Any,
+    t_soil: torch.Tensor,
+    w_liq: torch.Tensor,
+    w_ice: torch.Tensor,
+    g_ground_down: torch.Tensor,
+    consts: list[float],
+    dt: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Execute 5-layer enthalpy-conserving freeze-thaw & implicit Fourier soil heat conduction in 1 GPU kernel."""
+    col_shape = t_soil.shape[1:]
+    n = int(g_ground_down.numel())
+    dev = t_soil.device
+    c_buf = _get_const_buf(dev, "soil_thm5", consts)
+    t_out = torch.empty((5, n), device=dev, dtype=torch.float32)
+    wl_out = torch.empty((5, n), device=dev, dtype=torch.float32)
+    wi_out = torch.empty((5, n), device=dev, dtype=torch.float32)
+    lib.soil_thermo_5layer_col(
+        t_soil.reshape(5, n).contiguous(),
+        w_liq.reshape(5, n).contiguous(),
+        w_ice.reshape(5, n).contiguous(),
+        g_ground_down.reshape(n).contiguous(),
+        c_buf, t_out, wl_out, wi_out,
+        [n, 0, 0, 0], [float(dt), 0.0, 0.0, 0.0],
+        threads=n,
+    )
+    return t_out.view((5,) + col_shape), wl_out.view((5,) + col_shape), wi_out.view((5,) + col_shape)
+
+
+def run_surface_ocean_pre_transfer_metal(
+    lib: Any,
+    temp_1: torch.Tensor,
+    qv_1: torch.Tensor,
+    pres_1: torch.Tensor,
+    pres_sfc: torch.Tensor,
+    u_star_ocean: torch.Tensor,
+    f_ice: torch.Tensor,
+    t_ocean_ml: torch.Tensor,
+    t_seaice: torch.Tensor,
+    consts: list[float],
+) -> tuple[torch.Tensor, ...]:
+    """Execute ocean/sea-ice meteorology, Miller roughness & surface qsat/theta_vsfc in 1 GPU kernel."""
+    n = int(temp_1.numel())
+    dev = temp_1.device
+    c_buf = _get_const_buf(dev, "sfc_opre", consts)
+    out12 = torch.empty((12, n), device=dev, dtype=torch.float32)
+    lib.surface_ocean_pre_transfer_elem(
+        temp_1.contiguous(), qv_1.contiguous(), pres_1.contiguous(), pres_sfc.contiguous(),
+        u_star_ocean.contiguous(), f_ice.contiguous(), t_ocean_ml.contiguous(), t_seaice.contiguous(),
+        c_buf, out12, [n, 0, 0, 0],
+        threads=n,
+    )
+    return out12.unbind(dim=0)

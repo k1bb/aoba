@@ -169,7 +169,7 @@ def atm_to_ocn_intensive(
     land wind stress or dry-soil increments from contaminating coastal marine cells.
     """
     idx = coupler.ocn_to_atm_ocn_idx if ocean_only_source else coupler.ocn_to_atm_idx
-    return field_atm[idx]
+    return field_atm.index_select(0, idx)
 
 
 def atm_to_ocn_intensive_batch(
@@ -180,7 +180,7 @@ def atm_to_ocn_intensive_batch(
 ) -> torch.Tensor:
     """Batched gather of `[K, N_atm]` intensive atmospheric surface fields onto `[K, N_ocn]` in 1 launch."""
     idx = coupler.ocn_to_atm_ocn_idx if ocean_only_source else coupler.ocn_to_atm_idx
-    return fields_atm[:, idx]
+    return fields_atm.index_select(1, idx)
 
 
 def atm_to_ocn_conservative_flux(
@@ -198,7 +198,7 @@ def atm_to_ocn_conservative_flux(
     total_mass_atm = (flux_atm * coupler.atm_area * src_mask.to(flux_atm.dtype)).sum()
 
     # Map via parent cell; for coarse cells with no wet children (coastal mismatch), deposit to nearest wet cell
-    raw_ocn = flux_atm[coupler.ocn_to_atm_idx] * coupler.ocn_wet_mask.to(flux_atm.dtype)
+    raw_ocn = flux_atm.index_select(0, coupler.ocn_to_atm_idx) * coupler.ocn_wet_mask.to(flux_atm.dtype)
     has_orphan = coupler.has_orphan_ocn if ocean_only_source else coupler.has_orphan_all
     if has_orphan:
         orphan_mask = src_mask & (~coupler.has_wet_children)
@@ -229,7 +229,7 @@ def ocn_to_atm_mean(
     den = torch.clamp(coupler.atm_wet_area_sum.to(field_ocn.dtype), min=1.0)
     mean_atm = num / den
     # Coastal coarse ocean cells without wet children fall back to nearest wet fine ocean cell
-    nearest_val = field_ocn[coupler.atm_to_ocn_nearest_wet]
+    nearest_val = field_ocn.index_select(0, coupler.atm_to_ocn_nearest_wet)
     ocn_agg = torch.where(coupler.has_wet_children, mean_atm, nearest_val)
     if fallback_atm is None:
         return ocn_agg
@@ -249,7 +249,7 @@ def ocn_to_atm_mean_batch(
     num.scatter_add_(1, idx_2d, fields_ocn * coupler.ocn_wet_area.to(dtype).unsqueeze(0))
     den = torch.clamp(coupler.atm_wet_area_sum.to(dtype), min=1.0).unsqueeze(0)
     mean_atm = num / den
-    nearest_val = fields_ocn[:, coupler.atm_to_ocn_nearest_wet]
+    nearest_val = fields_ocn.index_select(1, coupler.atm_to_ocn_nearest_wet)
     ocn_agg = torch.where(coupler.has_wet_children.unsqueeze(0), mean_atm, nearest_val)
     if fallback_atm is None:
         return ocn_agg

@@ -51,6 +51,10 @@ import torch
 from aoba import constants as C
 from aoba.biosphere import (
     BiosphereState,
+    CHI_LEAF_MAX,
+    CHI_LEAF_MIN,
+    CROWN_LAI_MIN,
+    KD_PRIME_PAR,
     LEAF_SCAT_NIR,
     LEAF_SCAT_VIS,
     canopy_sunlit_sw_fraction,
@@ -62,15 +66,22 @@ from aoba.biosphere import (
 )
 from aoba.kernels import (
     can_use_elem_metal,
+    dispatch_root_zone_water_5layer_metal,
+    dispatch_soil_hydro_5layer_metal,
+    dispatch_soil_thermo_5layer_metal,
     dispatch_surface_albedos_metal,
     dispatch_surface_land_newton_jac_metal,
+    dispatch_surface_land_post_newton_metal,
     dispatch_surface_land_pre_bio_metal,
+    dispatch_surface_land_pre_newton_metal,
+    dispatch_surface_ocean_pre_transfer_metal,
     dispatch_surface_ocean_seaice_post_metal,
     solve_tridiagonal_batched,
 )
 from aoba.runtime import can_use_cuda_graph, maybe_cuda_compile, run_cuda_graph_cached
 from aoba.thermodynamics import esat_ice, esat_liquid, qsat_mixed
 from aoba.turbulence import (
+    KINEMATIC_VISC_AIR,
     canopy_roughness_raupach,
     compute_surface_transfer,
     ocean_roughness_miller,
@@ -657,6 +668,20 @@ def step_multilayer_soil_thermodynamics(
     """
     dev = t_soil.device
     dtype = t_soil.dtype
+    if can_use_elem_metal(t_soil) and t_soil.shape[0] == 5 and N_SOIL_LAYERS == 5:
+        consts = [
+            float(SOIL_LAYER_DEPTHS[0]), float(SOIL_LAYER_DEPTHS[1]),
+            float(SOIL_LAYER_DEPTHS[2]), float(SOIL_LAYER_DEPTHS[3]),
+            float(SOIL_LAYER_DEPTHS[4]),
+            float(C.T_FREEZE), float(C.L_F0),
+            float(RHO_WATER), float(RHO_ICE_SOLID),
+            float(CS_DRY_SOIL), float(CP_LIQ_WATER),
+            float(CP_ICE_SOLID), float(KAPPA_DRY_SOIL),
+        ]
+        return dispatch_soil_thermo_5layer_metal(
+            t_soil=t_soil, w_liq=w_liq, w_ice=w_ice,
+            g_ground_down=g_ground_down, consts=consts, dt=dt,
+        )
     col_shape = t_soil.shape[1:]
     dz, _, _ = _get_soil_geom_tensors(dev, dtype, col_shape)
     use_pure = (dev.type == "cuda") and (t_soil.shape[0] == 5)
@@ -686,14 +711,29 @@ def compute_root_zone_weights_and_water(
     """
     dev = w_liq_soil.device
     dtype = w_liq_soil.dtype
-    col_shape = w_liq_soil.shape[1:]
-
-    dz, z_top, _ = _get_soil_geom_tensors(dev, dtype, col_shape)
     z_tot = sum(SOIL_LAYER_DEPTHS)
 
     theta_fc = SOIL_POROSITY * (abs(PSI_SAT_SOIL) / 3.3) ** (1.0 / B_CLAPP_SOIL)
     theta_wp = SOIL_POROSITY * (abs(PSI_SAT_SOIL) / 150.0) ** (1.0 / B_CLAPP_SOIL)
     dtheta_paw = max(theta_fc - theta_wp, 0.05)
+
+    if can_use_elem_metal(w_liq_soil) and w_liq_soil.shape[0] == 5 and N_SOIL_LAYERS == 5:
+        z_top_vals = [0.0]
+        acc = 0.0
+        for d in SOIL_LAYER_DEPTHS[:-1]:
+            acc += d
+            z_top_vals.append(acc)
+        consts = [
+            *[float(d) for d in SOIL_LAYER_DEPTHS],
+            *[float(z) for z in z_top_vals],
+            float(z_tot), float(theta_wp), float(dtheta_paw), float(RHO_WATER),
+        ]
+        return dispatch_root_zone_water_5layer_metal(
+            w_liq_soil=w_liq_soil, s_root_cap=s_root_cap, consts=consts,
+        )
+
+    col_shape = w_liq_soil.shape[1:]
+    dz, z_top, _ = _get_soil_geom_tensors(dev, dtype, col_shape)
 
     z_root = torch.clamp(
         torch.clamp(s_root_cap, min=20.0) / (RHO_WATER * dtheta_paw),
@@ -862,6 +902,32 @@ def step_multilayer_soil_hydrology(
     """
     dev = w_liq.device
     dtype = w_liq.dtype
+    if can_use_elem_metal(w_liq) and w_liq.shape[0] == 5 and N_SOIL_LAYERS == 5:
+        z_top_vals = []
+        z_mid_vals = []
+        acc = 0.0
+        for d in SOIL_LAYER_DEPTHS:
+            z_top_vals.append(acc)
+            z_mid_vals.append(acc + 0.5 * d)
+            acc += d
+        dz_int_vals = [z_mid_vals[k + 1] - z_mid_vals[k] for k in range(4)]
+        z_tot = acc
+        theta_fc = SOIL_POROSITY * (abs(PSI_SAT_SOIL) / 3.3) ** (1.0 / B_CLAPP_SOIL)
+        theta_wp = SOIL_POROSITY * (abs(PSI_SAT_SOIL) / 150.0) ** (1.0 / B_CLAPP_SOIL)
+        dtheta_paw = max(theta_fc - theta_wp, 0.05)
+        consts = [
+            *[float(d) for d in SOIL_LAYER_DEPTHS],
+            *[float(z) for z in z_top_vals],
+            *[float(d) for d in dz_int_vals],
+            float(z_tot), float(SOIL_POROSITY), float(PSI_SAT_SOIL),
+            float(B_CLAPP_SOIL), float(K_SAT_SOIL), float(ICE_IMPEDANCE_OMEGA),
+            float(RHO_WATER), float(theta_wp), float(dtheta_paw),
+        ]
+        return dispatch_soil_hydro_5layer_metal(
+            w_liq=w_liq, w_ice=w_ice, rain_thru=rain_thru, melt_tot=melt_tot,
+            e_soil=e_soil, e_trans=e_trans, dew_ground=dew_ground,
+            s_root_cap=s_root_cap, is_ice=is_ice, consts=consts, dt=dt,
+        )
     col_shape = w_liq.shape[1:]
     dz, z_top, dz_int = _get_soil_geom_tensors(dev, dtype, col_shape)
     use_pure = (dev.type == "cuda") and (w_liq.shape[0] == 5)
@@ -2129,47 +2195,85 @@ def _step_surface_compacted_impl(
     chi_leaf_t = bio_t.chi_leaf if bio_t.chi_leaf is not None else torch.zeros_like(lai_exp_t)
 
     t_soil0_t = t_soil_t[0]
-    pre_land_fn = maybe_cuda_compile(_surface_land_pre_newton_core, device=dev)
-    (
-        sw_abs_t, exner_s_t, theta_1_t, theta_v1_t, rho_sfc_t, cp_air_t,
-        d_land_t, z0m_terr_t, z0h_terr_t, rsl_depth_t, has_veg_t, f_veg_rad_t,
-        has_sun_t, has_sh_t, f_sun_area_t, f_sh_area_t,
-        sw_abs_sun_t, sw_abs_sh_t, sw_abs_gnd_t, wc_cap_t, f_wet_t,
-        h_soil_base_t, r_soil_t, g_cond_coeff_t, beta_rsl_t, alpha_u_half_t,
-        t_air_sfc_t, has_snow_t, lw_refl_c_t, lw_emit_c_coef_t,
-    ) = pre_land_fn(
-        sw1d_t, sw1f_t, sw2d_t, sw2f_t,
-        avd_t, avf_t, and_t, anf_t,
-        h_exp_t, lai_exp_t, a_sn_t, temp_1_t, qv_1_t, pres_1_t, pres_sfc_t, mu0_t,
-        l_sun_t, l_sh_t, k_db_t, kd_par_t, chi_leaf_t, snow_age_t, w_liq_t[0],
-        w_ice_t[0], t_soil0_t, w_can_t, swe_t,
-    )
+    inv_dt_s = 1.0 / max(float(dt), 1.0)
+    use_gpu_land_eb = can_use_elem_metal(t_sun_t0)
+    if use_gpu_land_eb:
+        theta_air = SOIL_POROSITY * (abs(PSI_SAT_SOIL) * 1.0e3 / PSI_AIR_MM) ** (1.0 / B_CLAPP_SOIL)
+        theta_init = DSL_THETA_INIT_FRAC * SOIL_POROSITY
+        phi_air = max(SOIL_POROSITY - theta_air, 1.0e-3)
+        tau_soil = (phi_air ** 2) * (phi_air / SOIL_POROSITY) ** (3.0 / B_CLAPP_SOIL)
+        pre_consts = [
+            float(C.P_REF), float(C.KAPPA_D), float(C.ZVIR), float(C.R_D),
+            float(C.CP_D), float(C.CP_V), float(C.VON_KARMAN), float(C.GRAVITY),
+            float(C.R_V), float(C.T_FREEZE), float(C.K_THERM_SNOW),
+            float(ALB_SNOW_VIS_NEW), float(ALB_SNOW_VIS_OLD),
+            float(ALB_SNOW_NIR_NEW), float(ALB_SNOW_NIR_OLD),
+            float(SOIL_POROSITY), float(PSI_SAT_SOIL), float(B_CLAPP_SOIL),
+            float(LEAF_SCAT_VIS), float(LEAF_SCAT_NIR),
+            float(WC_MAX_PER_LAI), float(F_WET_MAX),
+            float(DSL_DMAX_MM * 1.0e-3), float(theta_init),
+            float(1.0 / max(theta_init - theta_air, 1.0e-3)), float(tau_soil),
+            float(0.5 * SOIL_LAYER_DEPTHS[0]), float(KAPPA_DRY_SOIL),
+            float(RHO_SNOWPACK), float(EMISSIVITY_LAND),
+            float(KD_PRIME_PAR / math.sqrt(1.0 - LEAF_SCAT_VIS)),
+            float(CROWN_LAI_MIN), float(CHI_LEAF_MIN), float(CHI_LEAF_MAX),
+        ]
+        (
+            sw_abs_t, exner_s_t, theta_1_t, theta_v1_t, rho_sfc_t, cp_air_t,
+            d_land_t, z0m_terr_t, z0h_terr_t, rsl_depth_t, f_veg_rad_t,
+            f_sun_area_t, f_sh_area_t, sw_abs_sun_t, sw_abs_sh_t, sw_abs_gnd_t,
+            wc_cap_t, f_wet_t, h_soil_base_t, r_soil_t, g_cond_coeff_t,
+            beta_rsl_t, alpha_u_half_t, t_air_sfc_t, lw_refl_c_t, lw_emit_c_coef_t,
+            c_sun_dt_t, c_sh_dt_t, flags_pb_f, flags_jac_f,
+        ) = dispatch_surface_land_pre_newton_metal(
+            sw1_dir_down=sw1d_t, sw1_dif_down=sw1f_t, sw2_dir_down=sw2d_t, sw2_dif_down=sw2f_t,
+            alb_vis_dir=avd_t, alb_vis_dif=avf_t, alb_nir_dir=and_t, alb_nir_dif=anf_t,
+            h_exp=h_exp_t, lai_exp=lai_exp_t, a_sn=a_sn_t,
+            temp_1=temp_1_t, qv_1=qv_1_t, pres_1=pres_1_t, pres_sfc=pres_sfc_t, mu0=mu0_t,
+            l_sun=l_sun_t, l_sh=l_sh_t, k_db_inst=k_db_t, kd_par_inst=kd_par_t,
+            chi_leaf=bio_t.chi_leaf, snow_age=snow_age_t,
+            w_liq_soil0=w_liq_t[0], w_ice_soil0=w_ice_t[0], t_soil0=t_soil0_t,
+            w_canopy=w_can_t, swe_land=swe_t, consts=pre_consts, inv_dt_s=inv_dt_s,
+        )
+        has_veg_t = lai_exp_t >= 0.01
+        has_sun_t = has_veg_t & (l_sun_t > 1.0e-4)
+        has_sh_t = has_veg_t & (l_sh_t > 1.0e-4)
+    else:
+        pre_land_fn = maybe_cuda_compile(_surface_land_pre_newton_core, device=dev)
+        (
+            sw_abs_t, exner_s_t, theta_1_t, theta_v1_t, rho_sfc_t, cp_air_t,
+            d_land_t, z0m_terr_t, z0h_terr_t, rsl_depth_t, has_veg_t, f_veg_rad_t,
+            has_sun_t, has_sh_t, f_sun_area_t, f_sh_area_t,
+            sw_abs_sun_t, sw_abs_sh_t, sw_abs_gnd_t, wc_cap_t, f_wet_t,
+            h_soil_base_t, r_soil_t, g_cond_coeff_t, beta_rsl_t, alpha_u_half_t,
+            t_air_sfc_t, has_snow_t, lw_refl_c_t, lw_emit_c_coef_t,
+        ) = pre_land_fn(
+            sw1d_t, sw1f_t, sw2d_t, sw2f_t,
+            avd_t, avf_t, and_t, anf_t,
+            h_exp_t, lai_exp_t, a_sn_t, temp_1_t, qv_1_t, pres_1_t, pres_sfc_t, mu0_t,
+            l_sun_t, l_sh_t, k_db_t, kd_par_t, chi_leaf_t, snow_age_t, w_liq_t[0],
+            w_ice_t[0], t_soil0_t, w_can_t, swe_t,
+        )
+        # Emergent biomass + canopy-airspace thermal inertia C_can(LAI, h_c) [J m^-2 K^-1]
+        # (AOBA Formulation Eq. 7.35; Swenson et al., 2019; Bonan, 2019)
+        c_can_tot_t = torch.where(has_veg_t, 4200.0 * lai_exp_t + 5500.0 * h_exp_t, torch.zeros_like(lai_exp_t))
+        c_sun_dt_t = torch.where(has_sun_t, f_sun_area_t * c_can_tot_t * inv_dt_s, torch.zeros_like(c_can_tot_t))
+        c_sh_dt_t = torch.where(has_sh_t, f_sh_area_t * c_can_tot_t * inv_dt_s, torch.zeros_like(c_can_tot_t))
 
     t_gnd_cur = torch.where(has_veg_t, t_gnd_t0, t_can_t)
     t_sun_cur = t_sun_t0
     t_sh_cur = t_sh_t0
-    # Emergent biomass + canopy-airspace thermal inertia C_can(LAI, h_c) [J m^-2 K^-1]
-    # (AOBA Formulation Eq. 7.35; Swenson et al., 2019; Bonan, 2019)
-    c_can_tot_t = torch.where(has_veg_t, 4200.0 * lai_exp_t + 5500.0 * h_exp_t, torch.zeros_like(lai_exp_t))
-    inv_dt_s = 1.0 / max(float(dt), 1.0)
-    c_sun_dt_t = torch.where(has_sun_t, f_sun_area_t * c_can_tot_t * inv_dt_s, torch.zeros_like(c_can_tot_t))
-    c_sh_dt_t = torch.where(has_sh_t, f_sh_area_t * c_can_tot_t * inv_dt_s, torch.zeros_like(c_can_tot_t))
 
     n_eb_iter = max(int(LAND_EB_ITERATIONS), 1)
     prev_dt_sun = torch.zeros_like(t_sun_cur)
     prev_dt_sh = torch.zeros_like(t_sh_cur)
     prev_dt_gnd = torch.zeros_like(t_gnd_cur)
-    use_gpu_land_eb = can_use_elem_metal(t_sun_cur)
     if use_gpu_land_eb:
         n_terr_len = int(t_sun_cur.numel())
-        flags_pb_f = (
-            has_veg_t.to(dtype) + 2.0 * has_sun_t.to(dtype) + 4.0 * has_sh_t.to(dtype)
-        )
         pb_const = torch.stack([
             pres_sfc_t, beta_rsl_t, alpha_u_half_t, lai_exp_t, k_db_t, h_exp_t,
             z0m_terr_t, f_veg_rad_t, f_sun_area_t, f_sh_area_t, flags_pb_f,
         ], dim=0).contiguous()
-        flags_jac_f = flags_pb_f + 8.0 * has_snow_t.to(dtype)
         jac_const = torch.stack([
             t_soil0_t, t_air_sfc_t, qv_1_t, r_soil_t, h_soil_base_t, a_sn_t,
             f_wet_t, w_can_t, rho_sfc_t, cp_air_t, f_veg_rad_t, f_sun_area_t,
@@ -2238,22 +2342,6 @@ def _step_surface_compacted_impl(
             t_sun_new, t_sh_new, t_gnd_new, t_gnd_final = jac_out[0], jac_out[1], jac_out[2], jac_out[3]
             dt0, dt1, dt2 = jac_out[4], jac_out[5], jac_out[6]
             q_af = jac_out[9]
-            if is_last_eb:
-                ga_land = pb_out[0]
-                qsat_sun, dq_sun, qsat_sh, dq_sh, qsat_gnd, dq_gnd = (
-                    pb_out[4], pb_out[5], pb_out[6], pb_out[7], pb_out[8], pb_out[9],
-                )
-                dt2_fin, q_melt_avail = jac_out[7], jac_out[8]
-                wh_0, wh_1, wh_2 = jac_out[10], jac_out[11], jac_out[12]
-                ww_0, ww_1, ww_2 = jac_out[13], jac_out[14], jac_out[15]
-                gh_0, gh_1, gh_2, rho_cp = jac_out[16], jac_out[17], jac_out[18], jac_out[19]
-                h_0, h_1, h_2 = jac_out[20], jac_out[21], jac_out[22]
-                g_trans_sun, g_trans_sh, g_inter_sun, g_inter_sh = (
-                    jac_out[23], jac_out[24], jac_out[25], jac_out[26],
-                )
-                g_soil_snowfree, g_snow_subl, h_soil = jac_out[27], jac_out[28], jac_out[29]
-                dry_soil_cap = jac_out[30] > 0.5
-                dhq_gnd_dT, j22_s = jac_out[31], jac_out[32]
         else:
             (
                 t_sun_new, t_sh_new, t_gnd_new, t_gnd_final, dt0, dt1, dt2, dt2_fin, q_melt_avail,
@@ -2284,23 +2372,45 @@ def _step_surface_compacted_impl(
                 prev_dt_gnd = dt2.clone()
                 q_af = q_af.clone()
 
-    post_land_fn = maybe_cuda_compile(_land_post_newton_core, device=dev)
-    (
-        t_sun_final, t_sh_final, t_skin_final, shf_l, lhf_l, evap_l,
-        e_soil, e_trans, g_into_soil, wc_next, rain_thru, melt_tot,
-        dew_ground, glacier_runoff, swe_next, smb_ice_land_t, swe_max_next, snow_age_next,
-    ) = post_land_fn(
-        t_sun_cur, t_sh_cur, t_sun_new, t_sh_new, t_gnd_new, t_gnd_final, dt2_fin,
-        q_melt_avail, q_af, wh_0, wh_1, wh_2, ww_0, ww_1, ww_2, gh_0, gh_1, gh_2,
-        ga_land, rho_sfc_t, rho_cp, h_0, h_1, h_2, g_trans_sun, g_trans_sh,
-        g_inter_sun, g_inter_sh, g_soil_snowfree, g_snow_subl, qsat_sun, dq_sun,
-        qsat_sh, dq_sh, qsat_gnd, dq_gnd, h_soil, dry_soil_cap, dhq_gnd_dT, j22_s,
-        qv_1_t, a_sn_t, has_veg_t, has_sun_t, has_sh_t, has_snow_t, is_terr_t, is_ice_t,
-        f_veg_rad_t, f_sun_area_t, f_sh_area_t, lw_refl_c_t, sw_abs_t, lwd_t, lai_exp_t,
-        wc_cap_t, w_can_t, w_avail_root_t, bio_t.s_root_cap, water_stress_t,
-        swe_t, swe_max_t, snow_age_t, w_liq_t[0], t_soil0_t, pr_t, ps_t, dt,
-        t_sun_t0, t_sh_t0, c_sun_dt_t, c_sh_dt_t,
-    )
+    if use_gpu_land_eb:
+        flags_ti_f = is_terr_t.to(dtype) + 2.0 * is_ice_t.to(dtype)
+        post_consts = [
+            float(EMISSIVITY_LAND), float(C.STEFAN_BOLTZMANN), float(C.T_FREEZE),
+            float(C.L_V0), float(C.L_S0), float(C.L_F0), float(RHO_WATER),
+            float(SOIL_LAYER_DEPTHS[0]), float(ALPHA_INTERCEPT_LIQ),
+            float(SWE_GLACIER_MAX), float(TAU_SNOW_AGE),
+        ]
+        (
+            t_sun_final, t_sh_final, t_skin_final, shf_l, lhf_l, evap_l,
+            e_soil, e_trans, g_into_soil, wc_next, rain_thru, melt_tot,
+            dew_ground, glacier_runoff, swe_next, smb_ice_land_t, swe_max_next, snow_age_next,
+        ) = dispatch_surface_land_post_newton_metal(
+            pb_out=pb_out, jac_out=jac_out, jac_const=jac_const,
+            t_sun_cur=t_sun_cur, t_sh_cur=t_sh_cur, sw_abs=sw_abs_t,
+            lai_exp=lai_exp_t, wc_cap=wc_cap_t, w_avail_root=w_avail_root_t,
+            s_root_cap=bio_t.s_root_cap, water_stress=water_stress_t,
+            swe_land=swe_t, swe_max_season=swe_max_t, snow_age=snow_age_t,
+            w_liq_soil0=w_liq_t[0], precip_rain=pr_t, precip_snow=ps_t,
+            flags_ti=flags_ti_f, consts=post_consts, dt=dt,
+        )
+    else:
+        post_land_fn = maybe_cuda_compile(_land_post_newton_core, device=dev)
+        (
+            t_sun_final, t_sh_final, t_skin_final, shf_l, lhf_l, evap_l,
+            e_soil, e_trans, g_into_soil, wc_next, rain_thru, melt_tot,
+            dew_ground, glacier_runoff, swe_next, smb_ice_land_t, swe_max_next, snow_age_next,
+        ) = post_land_fn(
+            t_sun_cur, t_sh_cur, t_sun_new, t_sh_new, t_gnd_new, t_gnd_final, dt2_fin,
+            q_melt_avail, q_af, wh_0, wh_1, wh_2, ww_0, ww_1, ww_2, gh_0, gh_1, gh_2,
+            ga_land, rho_sfc_t, rho_cp, h_0, h_1, h_2, g_trans_sun, g_trans_sh,
+            g_inter_sun, g_inter_sh, g_soil_snowfree, g_snow_subl, qsat_sun, dq_sun,
+            qsat_sh, dq_sh, qsat_gnd, dq_gnd, h_soil, dry_soil_cap, dhq_gnd_dT, j22_s,
+            qv_1_t, a_sn_t, has_veg_t, has_sun_t, has_sh_t, has_snow_t, is_terr_t, is_ice_t,
+            f_veg_rad_t, f_sun_area_t, f_sh_area_t, lw_refl_c_t, sw_abs_t, lwd_t, lai_exp_t,
+            wc_cap_t, w_can_t, w_avail_root_t, bio_t.s_root_cap, water_stress_t,
+            swe_t, swe_max_t, snow_age_t, w_liq_t[0], t_soil0_t, pr_t, ps_t, dt,
+            t_sun_t0, t_sh_t0, c_sun_dt_t, c_sh_dt_t,
+        )
 
     w_liq_hydro_t, sfc_runoff_t, sub_runoff_t = step_multilayer_soil_hydrology(
         w_liq_t, w_ice_t, rain_thru, melt_tot, e_soil, e_trans, dew_ground,
@@ -2331,20 +2441,6 @@ def _step_surface_compacted_impl(
     mu0_o = mu0.index_select(0, ocn_idx)
     f_ice_o = f_ice.index_select(0, ocn_idx)
 
-    sw_abs_o = (
-        sw1d_o * (1.0 - alb_vis_dir.index_select(0, ocn_idx))
-        + sw1f_o * (1.0 - alb_vis_dif.index_select(0, ocn_idx))
-        + sw2d_o * (1.0 - alb_nir_dir.index_select(0, ocn_idx))
-        + sw2f_o * (1.0 - alb_nir_dif.index_select(0, ocn_idx))
-    )
-    exner_1_o = torch.pow(pres_1_o / C.P_REF, C.KAPPA_D)
-    exner_s_o = torch.pow(pres_sfc_o / C.P_REF, C.KAPPA_D)
-    theta_1_o = temp_1_o / exner_1_o
-    theta_v1_o = theta_1_o * (1.0 + C.ZVIR * qv_1_o)
-    rho_sfc_o = pres_sfc_o / (C.R_D * temp_1_o * (1.0 + C.ZVIR * qv_1_o))
-    cp_air_o = C.CP_D + C.CP_V * qv_1_o
-    t_air_sfc_o = theta_1_o * exner_s_o
-
     t_ml_o = sfc.t_ocean_ml.index_select(0, ocn_idx)
     comp0_o = sfc.t_ocean_ml_comp.index_select(0, ocn_idx)
     h_ml_o = sfc.h_ocean_ml.index_select(0, ocn_idx)
@@ -2353,17 +2449,40 @@ def _step_surface_compacted_impl(
     t_si_o = sfc.t_seaice.index_select(0, ocn_idx)
     swe_si_o = sfc.swe_seaice.index_select(0, ocn_idx)
 
-    ocn_pre_fn = maybe_cuda_compile(_surface_ocean_pre_transfer_core, device=dev)
-    z0m_sea_o, z0h_sea_o, z0q_sea_o, qsat_ow_o, qsat_si_o, theta_vsfc_o = ocn_pre_fn(
-        u_star_o0, f_ice_o, t_ml_o, t_si_o, pres_sfc_o, exner_s_o,
-    )
+    use_gpu_ocn = can_use_elem_metal(t_ml_o)
+    if use_gpu_ocn:
+        ocn_pre_consts = [
+            float(C.P_REF), float(C.KAPPA_D), float(C.ZVIR), float(C.R_D),
+            float(C.CP_D), float(C.CP_V), float(KINEMATIC_VISC_AIR), float(C.GRAVITY),
+            float(C.E_TRIPLE), float(C.T_FREEZE), float(C.EPS_WATER),
+        ]
+        (
+            exner_s_o, theta_1_o, theta_v1_o, rho_sfc_o, cp_air_o, t_air_sfc_o,
+            z0m_sea_o, z0h_sea_o, z0q_sea_o, qsat_ow_o, qsat_si_o, theta_vsfc_o,
+        ) = dispatch_surface_ocean_pre_transfer_metal(
+            temp_1=temp_1_o, qv_1=qv_1_o, pres_1=pres_1_o, pres_sfc=pres_sfc_o,
+            u_star_ocean=u_star_o0, f_ice=f_ice_o, t_ocean_ml=t_ml_o, t_seaice=t_si_o,
+            consts=ocn_pre_consts,
+        )
+    else:
+        exner_1_o = torch.pow(pres_1_o / C.P_REF, C.KAPPA_D)
+        exner_s_o = torch.pow(pres_sfc_o / C.P_REF, C.KAPPA_D)
+        theta_1_o = temp_1_o / exner_1_o
+        theta_v1_o = theta_1_o * (1.0 + C.ZVIR * qv_1_o)
+        rho_sfc_o = pres_sfc_o / (C.R_D * temp_1_o * (1.0 + C.ZVIR * qv_1_o))
+        cp_air_o = C.CP_D + C.CP_V * qv_1_o
+        t_air_sfc_o = theta_1_o * exner_s_o
+        ocn_pre_fn = maybe_cuda_compile(_surface_ocean_pre_transfer_core, device=dev)
+        z0m_sea_o, z0h_sea_o, z0q_sea_o, qsat_ow_o, qsat_si_o, theta_vsfc_o = ocn_pre_fn(
+            u_star_o0, f_ice_o, t_ml_o, t_si_o, pres_sfc_o, exner_s_o,
+        )
     tr_ocn = compute_surface_transfer(
         u_1_o, v_1_o, theta_v1_o, theta_vsfc_o, z_ref_o,
         z0m_sea_o, z0h_sea_o, z0q_sea_o, rsl_depth=None,
     )
     ga_h_o = _implicit_coupled_transfer(tr_ocn.c_h, tr_ocn.wind_eff, z_ref_o, dt) * tr_ocn.wind_eff
     ga_q_o = _implicit_coupled_transfer(tr_ocn.c_q, tr_ocn.wind_eff, z_ref_o, dt) * tr_ocn.wind_eff
-    if can_use_elem_metal(t_ml_o):
+    if use_gpu_ocn:
         t_ml_next_o, comp_final_o, m_si_next_o, t_si_new_o, swe_si_next_o, shf_o, evap_o, lhf_o, lw_emit_o = (
             dispatch_surface_ocean_seaice_post_metal(
                 t_ocean_ml=t_ml_o, t_ocean_ml_comp=comp0_o, h_ocean_ml=h_ml_o,
@@ -2380,6 +2499,12 @@ def _step_surface_compacted_impl(
             )
         )
     else:
+        sw_abs_o = (
+            sw1d_o * (1.0 - alb_vis_dir.index_select(0, ocn_idx))
+            + sw1f_o * (1.0 - alb_vis_dif.index_select(0, ocn_idx))
+            + sw2d_o * (1.0 - alb_nir_dir.index_select(0, ocn_idx))
+            + sw2f_o * (1.0 - alb_nir_dif.index_select(0, ocn_idx))
+        )
         ocn_post_fn = maybe_cuda_compile(_ocean_seaice_post_core, device=dev)
         t_ml_next_o, comp_final_o, m_si_next_o, t_si_new_o, swe_si_next_o, shf_o, evap_o, lhf_o, lw_emit_o = ocn_post_fn(
             t_ml_o, comp0_o, h_ml_o, m_si_o, t_si_o, swe_si_o,
