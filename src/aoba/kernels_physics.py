@@ -6390,12 +6390,12 @@ kernel void crm_distill_closure_col(
             float f_cld_nn_raw = s_conv * rh_gate * aoba_sigmoid(RP_LOAD(7u, k) - 1.5f);
             float f_cld_eff = clamp(max(f_cld_nn_raw, q_cond_tot * 1.0e3f), 0.05f, 1.0f);
             float q_in = q_cond_tot / f_cld_eff;
-            float q_crit = om_eq * 2.5e-4f + (1.0f - om_eq) * 5.0e-5f;
+            float q_crit = om_eq * 5.0e-4f + (1.0f - om_eq) * 8.0e-5f;
             float r_c = clamp(q_in / q_crit, 0.0f, 5.0f);
             float lam_auto = 4.0f * (1.0f - exp(-(r_c * r_c)));
             float z_fall = 0.5f * scal0 + rp2_k;
             float alpha_nn = exp(1.8f * tanh(0.30f * z_fall));
-            float lam_base = om_eq * 0.55f + (1.0f - om_eq) * 1.15f;
+            float lam_base = om_eq * 0.25f + (1.0f - om_eq) * 1.00f;
             float lam_tot = alpha_nn * lam_base + sqrt(alpha_nn) * lam_auto;
             float f_fall = 1.0f - exp(-(dt / 720.0f) * lam_tot);
             float q_out = f_fall * q_cond_tot;

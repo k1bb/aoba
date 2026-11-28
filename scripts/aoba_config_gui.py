@@ -3673,7 +3673,8 @@ function renderHimawariGlobe(geo, targetCanvasId = "globeHimawari") {
       const latD = 90.0 - (rr + 0.5) * (180.0 / rH);
       const phi = latD * deg2rad;
       const sinP = Math.sin(phi), cosP = Math.cos(phi);
-      for (let cc = 0; cc < rW; cc += stepLon) {
+      const stepLonLat = Math.min(rW, Math.max(stepLon, Math.round(stepLon / Math.max(0.06, cosP))));
+      for (let cc = 0; cc < rW; cc += stepLonLat) {
         const gi = rr * rW + cc;
         const lv = lightU8 ? lightU8[gi] : 0;
         const sv = spriteU8 ? spriteU8[gi] : 0;

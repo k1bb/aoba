@@ -571,8 +571,23 @@ for (const p of ["docs/formulation.md", "docs/formulation_ja.md"]) {
         assert proc.returncode == 0, f"Studio JS LaTeX render failed: {proc.stderr}"
 
 
+def test_preset_physical_constants_invariants() -> None:
+    """Ensure no preset TOML accidentally corrupts fundamental thermodynamic constants."""
+    presets_dir = _REPO_ROOT / "config" / "presets"
+    defaults = default_config_dict()["constants"]
+    for p in sorted(presets_dir.glob("*.toml")):
+        cfg = load_aoba_toml(p)
+        consts = cfg.get("constants", {})
+        for key in ("l_f0", "l_v0", "cp_d", "r_d", "r_v", "g"):
+            if key in consts and "earth" in p.name:
+                assert abs(float(consts[key]) - float(defaults[key])) < 1.0e-3 * abs(float(defaults[key])), (
+                    f"Preset {p.name} has corrupted constant {key}={consts[key]} (default {defaults[key]})"
+                )
+
+
 if __name__ == "__main__":
     test_toml_roundtrip_and_module_sync()
+    test_preset_physical_constants_invariants()
     test_snapshot_variable_filtering()
     test_gui_server_endpoints()
     test_textbook_docs_param_coverage_and_studio_math()

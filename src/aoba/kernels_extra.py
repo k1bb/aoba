@@ -5760,8 +5760,10 @@ kernel void lgt_extract_feat_col(
         else if (isinf(x)) x = (x > 0.0f) ? 5.0f : -5.0f;
         feats_out[o + j] = x;
     }
-    bool cg = ((mix_iwp > 0.015f) && ((rain_mm + snow_mm) > 1.5f))
-           || ((mix_iwp > 0.05f) && (ccd_proxy > 2.5f));
+    bool cg = (mix_lwc > 0.005f)
+           && ((cape_proxy > 0.03f) || ((z_frz > 1.0f) && (mix_lwc > 0.015f)))
+           && (((mix_iwp > 0.015f) && ((rain_mm + snow_mm) > 1.5f))
+               || ((mix_iwp > 0.05f) && (ccd_proxy > 2.5f)));
     gate_out[c] = cg ? 1.0f : 0.0f;
 }
 

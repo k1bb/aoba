@@ -888,12 +888,18 @@ def extract_lightning_distill_features(
     )
     feats = torch.nan_to_num(feats, nan=0.0, posinf=5.0, neginf=-5.0)
     # Non-inductive ice-graupel riming gate (Takahashi 1978; Saunders et al. 1991; Price & Rind 1992):
-    # require genuine mixed-phase convective ice (mix_iwp > 15 g/m^2 with active precipitation > 1.5 mm/d,
+    # require coexisting supercooled liquid water (mix_lwc > 5 g/m^2), convective instability
+    # (cape_proxy > 0.03), and active mixed-phase ice/graupel (mix_iwp > 15 g/m^2 with precip > 1.5 mm/d,
     # or deep mixed-phase glaciated cores > 50 g/m^2 & cold-cloud depth > 2.5 km) so thin cirrus and
-    # stratiform drizzle never emit spurious background lightning glow.
+    # stably-stratified polar stratiform snowstorms (where z_frz = 0 and cape_proxy = 0) never emit
+    # spurious background lightning glow.
     conv_gate = (
-        ((mix_iwp > 0.015) & ((rain_mm + snow_mm) > 1.5))
-        | ((mix_iwp > 0.05) & (ccd_proxy_km > 2.5))
+        (mix_lwc > 0.005)
+        & ((cape_proxy > 0.03) | ((z_frz_km > 1.0) & (mix_lwc > 0.015)))
+        & (
+            ((mix_iwp > 0.015) & ((rain_mm + snow_mm) > 1.5))
+            | ((mix_iwp > 0.05) & (ccd_proxy_km > 2.5))
+        )
     ).to(rho_d.dtype)
     return feats, conv_gate
 
@@ -1183,7 +1189,7 @@ def step_ossp_distilled_lightning(
     if int(s_idx.numel()) > 0:
         with torch.no_grad():
             distill_state.net.eval()
-            use_contig_lt = (n_t * 4 < nc)
+            use_contig_lt = bool(has_pool) or (n_t * 4 < nc)
             if use_contig_lt:
                 out_s = distill_state.net(feats_all)
                 gate_s = conv_gate

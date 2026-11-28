@@ -538,12 +538,12 @@ def apply_exact_conservation_closure(
     f_cld_nn_raw = s_conv * rh_gate * torch.sigmoid(rp[7] - 1.5)
     f_cld_eff = torch.clamp(torch.maximum(f_cld_nn_raw, q_cond_tot * 1.0e3), min=0.05, max=1.0)
     q_in = q_cond_tot / f_cld_eff
-    q_crit = om_eq * 2.5e-4 + (1.0 - om_eq) * 5.0e-5
+    q_crit = om_eq * 5.0e-4 + (1.0 - om_eq) * 8.0e-5
     r_c = torch.clamp(q_in / q_crit, min=0.0, max=5.0)
     lam_auto = 4.0 * (-torch.expm1(-(r_c * r_c)))
     z_fall = 0.5 * raw_scal[:, 0].unsqueeze(0) + f_qp_logit
     alpha_nn = torch.exp(1.8 * torch.tanh(0.30 * z_fall))
-    lam_base = om_eq * 0.55 + (1.0 - om_eq) * 1.15
+    lam_base = om_eq * 0.25 + (1.0 - om_eq) * 1.00
     lam_tot = alpha_nn * lam_base + torch.sqrt(alpha_nn) * lam_auto
     f_fall = conv_f * (-torch.expm1(-(dt / 720.0) * lam_tot))
     q_out = torch.where(in_conv, f_fall * q_cond_tot, torch.zeros_like(q_cond_tot))
@@ -1943,17 +1943,23 @@ def train_student_online(
         rp1_b = p_both[:, 1, :]
         rp2_b = p_both[:, 2, :]
         rp3_b = p_both[:, 3, :]
+        rp4_b = p_both[:, 4, :]
         rp5_b = p_both[:, 5, :]
         rp6_b = p_both[:, 6, :]
+        rp7_b = p_both[:, 7, :]
         m5 = (rp5_b * s_conv_b).sum(dim=1) / s_conv_den
         m6 = (rp6_b * s_conv_b).sum(dim=1) / s_conv_den
+        strat_mask = (1.0 - s_conv_b).unsqueeze(1)
         loss_gauge = (
             0.05 * (m5.square().mean() + m6.square().mean())
             + 1.0e-4 * (rp0_b * s_conv_b).square().mean()
-            + 1.0e-4 * (rp1_b * s_conv_b).square().mean()
+            + 3.0e-4 * (rp1_b * s_conv_b).square().mean()
             + 1.0e-3 * (rp2_b * s_conv_b).square().mean()
             + 1.0e-3 * (rp3_b * s_conv_b).square().mean()
-            + 1.0e-3 * s_both[:, 0].square().mean()
+            + 5.0e-4 * (rp4_b * s_conv_b).square().mean()
+            + 5.0e-4 * (rp7_b * s_conv_b).square().mean()
+            + 1.0e-3 * (p_both * strat_mask).square().mean()
+            + 1.0e-3 * s_both.square().mean()
         )
         loss_i = loss_i + loss_gauge
 

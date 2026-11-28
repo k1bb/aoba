@@ -274,8 +274,8 @@ alb_snow_nir_old = 0.35
 emissivity_land = 0.98
 emissivity_ocean = 0.985
 mc_seaice_crit = 450.0
-alb_seaice_vis = 0.48
-alb_seaice_nir = 0.24
+alb_seaice_vis = 0.72
+alb_seaice_nir = 0.42
 
 # --- Two-Leaf Non-Rectangular-Hyperbola EEO Biosphere Parameters ---
 [biosphere]
