@@ -1661,7 +1661,7 @@ kernel void microphysics_6class_col(
 
         // 4. Class-specific terminal velocities & 5. Top-down implicit sedimentation
         float rho_fac = sqrt(clamp(1.2f / rd_safe, 0.5f, 6.0f));
-        float vi = clamp(0.22f + 0.45f * pow(max(qi / 1.0e-4f, 0.0f), 0.25f), 0.18f, 0.80f);
+        float vi = clamp(0.32f + 0.55f * pow(max(qi / 1.0e-4f, 0.0f), 0.25f), 0.28f, 1.00f);
         float vr = clamp(6.5f * pow(max(rd * qr * 1.0e3f, 1.0e-6f), 0.14f) * rho_fac, 1.0f, 9.5f);
         float vs = clamp(1.1f * pow(max(rd * qs * 1.0e3f, 1.0e-6f), 0.10f) * rho_fac, 0.3f, 2.2f);
         float vg = clamp(4.2f * pow(max(rd * qg * 1.0e3f, 1.0e-6f), 0.18f) * rho_fac, 0.8f, 8.5f);
@@ -2449,8 +2449,8 @@ kernel void explicit_lightning_charge_col(
         }
 
         float z_val = z_c[k * z_cols + zc_col];
-        if (temp >= t_freeze && z_val > z_freeze) z_freeze = z_val;
-        if ((qi_p + qs_v + qg_v) >= 1.0e-5f && z_val > z_ice_top) z_ice_top = z_val;
+        if (temp >= t_freeze && z_val < 12000.0f && z_val > z_freeze) z_freeze = z_val;
+        if ((qi_p + qs_v + qg_v) >= 1.0e-5f && z_val < 22000.0f && z_val > z_ice_top) z_ice_top = z_val;
 
         float rho_fac = sqrt(RHO_AIR_REF / rho_pos);
         float vtg = 0.0f;

@@ -5420,7 +5420,7 @@ kernel void red_sprites_col(
     float elves_rate = cg_pos * p_elves;
 
     // Blue Jets & Gigantic Jets (Pasko et al., 2002; Krehbiel et al., 2008)
-    float z_cld = clamp(4.0f + 0.85f * clamp(cold_cld_km[c], 0.0f, 16.0f), 4.0f, 17.5f);
+    float z_cld = clamp(4.8f + clamp(cold_cld_km[c], 0.0f, 14.0f), 4.8f, 18.0f);
     float n_r_cld = exp(-z_cld * (1.0f / 7.2f));
     float ov_gate = (1.0f / (1.0f + exp(-(z_cld - 11.5f) * (1.0f / 1.2f)))) * anvil_fac;
     float e_cld_eff = cmc_med * e_cld_const * ov_gate;

@@ -6390,12 +6390,12 @@ kernel void crm_distill_closure_col(
             float f_cld_nn_raw = s_conv * rh_gate * aoba_sigmoid(RP_LOAD(7u, k) - 1.5f);
             float f_cld_eff = clamp(max(f_cld_nn_raw, q_cond_tot * 1.0e3f), 0.05f, 1.0f);
             float q_in = q_cond_tot / f_cld_eff;
-            float q_crit = om_eq * 5.0e-4f + (1.0f - om_eq) * 8.0e-5f;
+            float q_crit = om_eq * 6.5e-4f + (1.0f - om_eq) * 8.0e-5f;
             float r_c = clamp(q_in / q_crit, 0.0f, 5.0f);
             float lam_auto = 4.0f * (1.0f - exp(-(r_c * r_c)));
             float z_fall = 0.5f * scal0 + rp2_k;
             float alpha_nn = exp(1.8f * tanh(0.30f * z_fall));
-            float lam_base = om_eq * 0.25f + (1.0f - om_eq) * 1.00f;
+            float lam_base = om_eq * 0.16f + (1.0f - om_eq) * 1.15f;
             float lam_tot = alpha_nn * lam_base + sqrt(alpha_nn) * lam_auto;
             float f_fall = 1.0f - exp(-(dt / 720.0f) * lam_tot);
             float q_out = f_fall * q_cond_tot;
@@ -8215,7 +8215,7 @@ kernel void land_carbon_cn_fire_prep_tile(
     float l_b = (e_u > 0.0f) ? (1.0f + 8.729f * pow(e_u, 2.155f)) : 1.0f;
     float t_fire_min = 241.0f / (1.0f + 240.0f * exp(-11.06f * fdi));
     float d_major = (ros_f + ros_b) * t_fire_min;
-    float a_fire = min((0.25f * 3.14159265359f / l_b) * (d_major * d_major), crm_dx * crm_dx);
+    float a_fire = min((0.25f * 3.14159265359f / l_b) * (d_major * d_major), max(crm_dx * crm_dx, 2.5e7f));
 
     float fc_dm = 2.0f * (0.80f * c_fuel_1h + 0.35f * eta_m_100h * c_fuel_100h);
     float i_byram = 18000.0f * fc_dm * (ros_f / 60.0f);

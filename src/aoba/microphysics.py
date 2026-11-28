@@ -480,7 +480,7 @@ def step_microphysics(
 # DeMott et al., 2010; Martin et al., 1994; Wyser, 1998)
 # ---------------------------------------------------------------------------
 # Map-free natural pre-industrial CCN & INP activation parameters
-CCN_OCEAN_BASE_CM3: float = 30.0     # Clean pre-industrial marine CCN baseline [cm^-3] (Andreae, 2009)
+CCN_OCEAN_BASE_CM3: float = 50.0     # Clean pre-industrial marine CCN baseline [cm^-3] (Andreae, 2009; Miles et al., 2000)
 CCN_LAND_BASE_CM3: float = 95.0      # Clean pre-industrial continental biogenic CCN [cm^-3] (Andreae, 2009)
 CCN_DUST_SCALE_CM3: float = 120.0    # Additional CCN per 10 ug m^-3 mineral dust [cm^-3]
 INP_DUST_ENHANCE: float = 4.0        # DeMott et al. (2010) dust immersion INP enhancement factor [-]

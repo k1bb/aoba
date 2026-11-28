@@ -538,12 +538,12 @@ def apply_exact_conservation_closure(
     f_cld_nn_raw = s_conv * rh_gate * torch.sigmoid(rp[7] - 1.5)
     f_cld_eff = torch.clamp(torch.maximum(f_cld_nn_raw, q_cond_tot * 1.0e3), min=0.05, max=1.0)
     q_in = q_cond_tot / f_cld_eff
-    q_crit = om_eq * 5.0e-4 + (1.0 - om_eq) * 8.0e-5
+    q_crit = om_eq * 6.5e-4 + (1.0 - om_eq) * 8.0e-5
     r_c = torch.clamp(q_in / q_crit, min=0.0, max=5.0)
     lam_auto = 4.0 * (-torch.expm1(-(r_c * r_c)))
     z_fall = 0.5 * raw_scal[:, 0].unsqueeze(0) + f_qp_logit
     alpha_nn = torch.exp(1.8 * torch.tanh(0.30 * z_fall))
-    lam_base = om_eq * 0.25 + (1.0 - om_eq) * 1.00
+    lam_base = om_eq * 0.16 + (1.0 - om_eq) * 1.15
     lam_tot = alpha_nn * lam_base + torch.sqrt(alpha_nn) * lam_auto
     f_fall = conv_f * (-torch.expm1(-(dt / 720.0) * lam_tot))
     q_out = torch.where(in_conv, f_fall * q_cond_tot, torch.zeros_like(q_cond_tot))

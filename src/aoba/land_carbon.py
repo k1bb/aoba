@@ -872,7 +872,8 @@ def step_land_carbon_and_fire(
     l_b = 1.0 + 8.729 * torch.pow(1.0 - torch.exp(-0.03 * torch.clamp(u_fwd_ms, max=30.0)), 2.155)
     t_fire_min = 241.0 / (1.0 + 240.0 * torch.exp(-11.06 * fdi))
     d_major_m = (ros_f + ros_b) * t_fire_min
-    a_fire_m2 = torch.clamp((0.25 * math.pi / l_b) * (d_major_m * d_major_m), max=crm_dx_m * crm_dx_m)
+    a_fire_cap = max(crm_dx_m * crm_dx_m, 2.5e7)
+    a_fire_m2 = torch.clamp((0.25 * math.pi / l_b) * (d_major_m * d_major_m), max=a_fire_cap)
 
     # Byram (1959) fireline intensity I_B [kW m^-1] & self-extinction threshold (50 kW m^-1)
     # Factor 2.0 converts kg C -> kg dry biomass; includes cured 1h grass/fine litter + moisture-damped 100h coarse litter

@@ -48,8 +48,8 @@ RHO_SNOW: float = 100.0
 RHO_GRAUPEL: float = 400.0
 Q_EPS: float = 1.0e-12
 # Scale-aware Boutle et al. (2014) / Morrison & Gettelman (2008) subgrid LWC-variance enhancement
-# for 6-class continuous exponential autoconversion: bridges 50 m LES (1350) -> 4 km CRM (13500).
-KK00_6C_SCALE_EXP: float = 0.525365
+# for 6-class continuous exponential autoconversion: bridges 50 m LES (1350) -> 2 km CRM (2350) -> 4 km CRM (2608).
+KK00_6C_SCALE_EXP: float = 0.15
 
 
 def compute_kk00_auto_coef_6c(dx_m: float = 4000.0) -> float:
@@ -317,7 +317,7 @@ def step_microphysics_six_class_2m(
 
     # 4. Class-specific terminal velocities [m s^-1] (air-density corrected sqrt(rho_0/rho))
     rho_fac = torch.sqrt(torch.clamp(1.2 / torch.clamp(rho_d, min=0.05), min=0.5, max=6.0))
-    v_ice = torch.clamp(0.22 + 0.45 * torch.pow(torch.clamp(qi / 1.0e-4, min=0.0), 0.25), min=0.18, max=0.80)
+    v_ice = torch.clamp(0.32 + 0.55 * torch.pow(torch.clamp(qi / 1.0e-4, min=0.0), 0.25), min=0.28, max=1.00)
     v_rain = torch.clamp(6.5 * torch.pow(torch.clamp(rho_d * qr * 1.0e3, min=1.0e-6), 0.14) * rho_fac, min=1.0, max=9.5)
     v_snow = torch.clamp(1.1 * torch.pow(torch.clamp(rho_d * qs * 1.0e3, min=1.0e-6), 0.10) * rho_fac, min=0.3, max=2.2)
     v_graup = torch.clamp(4.2 * torch.pow(torch.clamp(rho_d * qg * 1.0e3, min=1.0e-6), 0.18) * rho_fac, min=0.8, max=8.5)

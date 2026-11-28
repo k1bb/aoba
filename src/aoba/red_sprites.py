@@ -398,7 +398,7 @@ def _compute_red_sprites_core(
     p_elves = 0.5 * torch.erfc(torch.log(torch.clamp(i_crit_ka / i_med_ka, min=1.0e-4)) * inv_si2)
     elves_rate = cg_pos * p_elves
 
-    z_cld_km = torch.clamp(4.0 + 0.85 * torch.clamp(cold_cloud_km_cell, min=0.0, max=16.0), 4.0, 17.5)
+    z_cld_km = torch.clamp(4.8 + torch.clamp(cold_cloud_km_cell, min=0.0, max=14.0), 4.8, 18.0)
     n_ratio_cld = torch.exp(-z_cld_km / 7.2)
     overshoot_gate = torch.sigmoid((z_cld_km - 11.5) / 1.2) * anvil_fac
     e_cld_eff = (cmc_med * 1.0e3 / (2.0 * math.pi * EPSILON_0 * (3.5e3 ** 3))) * overshoot_gate

@@ -165,9 +165,11 @@ def compute_crm_lightning_and_lnox(
         )
 
         # 2. Price & Rind (1993, Eq. 1) cold-cloud depth (CCD) IC/CG partitioning
-        is_warm = temp >= C.T_FREEZE
+        # Restrict freezing level to troposphere (< 12 km) and cloud top to < 22 km so
+        # high-top models (z_top = 90 km) never pick up the warm 50 km stratopause.
+        is_warm = (temp >= C.T_FREEZE) & (zc_4d < 12000.0)
         z_freeze = torch.where(is_warm, zc_4d, torch.zeros_like(temp)).amax(dim=0)
-        has_ice = (q_i_pos + q_p_ice) >= LIGHTNING_ICE_TOP_THRESH
+        has_ice = ((q_i_pos + q_p_ice) >= LIGHTNING_ICE_TOP_THRESH) & (zc_4d < 22000.0)
         z_ice_top = torch.where(has_ice, zc_4d, torch.zeros_like(temp)).amax(dim=0)
         ccd_km_raw = torch.clamp((z_ice_top - z_freeze) * 1.0e-3, min=0.0)
         h_poly = torch.clamp(ccd_km_raw, min=5.5, max=14.0)

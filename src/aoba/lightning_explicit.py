@@ -647,10 +647,10 @@ def step_explicit_bulk_lightning_and_lnox(
     )
     flash_cg_sub = flash_tot_sub * f_cg_sub
 
-    # Cold-cloud depth diagnostic for LightningDiagnostics parity
-    is_warm = temp >= C.T_FREEZE
+    # Cold-cloud depth diagnostic for LightningDiagnostics parity (tropospheric < 12 km freezing level)
+    is_warm = (temp >= C.T_FREEZE) & (zc_4d < 12000.0)
     z_freeze = torch.where(is_warm, zc_4d, torch.zeros_like(temp)).amax(dim=0)
-    has_ice = (q_i_pos + q_s + q_g) >= 1.0e-5
+    has_ice = ((q_i_pos + q_s + q_g) >= 1.0e-5) & (zc_4d < 22000.0)
     z_ice_top = torch.where(has_ice, zc_4d, torch.zeros_like(temp)).amax(dim=0)
     ccd_km = torch.clamp((z_ice_top - z_freeze) * 1.0e-3, min=0.0)
 
