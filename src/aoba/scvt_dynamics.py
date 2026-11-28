@@ -924,12 +924,12 @@ def _step_scvt_rk3_hevi_impl(
 
         n_ac = max(1, int(math.ceil(dtau / dt_ac_max)))
         dt_ac = dtau / float(n_ac)
-        edge_c4 = q_odz = hevi_c_pre = p_cell_pre = k_slope_top_pre = None
+        edge_c4 = cell_c4 = hevi_a4 = hevi_b4 = p_cell_pre = k_slope_top_pre = None
         pres_s = dp_dThm_s = m_edge = thm_e = rtot_e = fac_z0 = fac_z1 = None
         rho_dw = rtot_w = thm_w = dl = diag = du = None
         if can_use_crm_metal(m_s):
             (
-                edge_c4, pres_s, dp_dThm_s, q_odz, hevi_c_pre, p_cell_pre, k_slope_top_pre,
+                edge_c4, cell_c4, hevi_a4, hevi_b4, p_cell_pre, k_slope_top_pre,
                 u_dot_gradz_s, tend_u_slow,
             ) = dispatch_scvt_rk3_prep_metal(
                 mesh,
@@ -1013,10 +1013,9 @@ def _step_scvt_rk3_hevi_impl(
                 w0=w0,
                 udotz0=udotz0,
                 edge_c4=edge_c4,
-                pres_s=pres_s,
-                dp_dThm_s=dp_dThm_s,
-                q_odz=q_odz,
-                hevi_c=hevi_c_pre,
+                cell_c4=cell_c4,
+                hevi_a4=hevi_a4,
+                hevi_b4=hevi_b4,
                 p_cell_init=p_cell_pre,
                 k_slope_top=k_slope_top_pre,
                 tend_u_slow=tend_u_slow,

@@ -1405,40 +1405,41 @@ kernel void scvt_fast_edge(
     device const float* p_cell     [[buffer(5)]],   // [nz, N_cells]
     device const float* u_c        [[buffer(6)]],   // [nz, N_edges]
     device float* u_n              [[buffer(7)]],   // [nz, N_edges]
-    device float* uh_fTh           [[buffer(8)]],   // [nz, N_edges, 2] interleaved (uh, fTh)
+    device float2* uh_fTh          [[buffer(8)]],   // [nz, N_edges] float2(uh, fTh)
     device float* uh_accum         [[buffer(9)]],   // [nz, N_edges]
     constant ulong4& u_p           [[buffer(10)]],  // [nz, N_cells, N_edges, accum]
     constant float4& f_p           [[buffer(11)]],  // [dt_ac, beta_hevi, gravity, 0]
-    uint gid [[thread_position_in_grid]])
+    uint e [[thread_position_in_grid]])
 {
     uint nz = uint(u_p.x);
     uint n_cells = uint(u_p.y);
     uint n_edges = uint(u_p.z);
     uint accum = uint(u_p.w);
-    if (gid >= nz * n_edges) return;
+    if (e >= n_edges) return;
 
-    uint k = gid / n_edges;
-    uint e = gid - k * n_edges;
     uint c0 = uint(c0_arr[e]);
     uint c1 = uint(c1_arr[e]);
-    uint cbase = k * n_cells;
-    float p0 = p_cell[cbase + c0];
-    float p1 = p_cell[cbase + c1];
-    float4 ec = edge_c4[gid];
-    // Symmetric-difference PGF: -(fz_avg*(p1 - p0) + fz_dif*0.5*(p1 + p0)) / (rtot_e * dc_e)
-    float pgf = -fma(ec.x, (p1 - p0), ec.y * (0.5f * (p1 + p0)));
-
-    float u0 = u_c[gid];
     float dt_ac = f_p.x;
-    float un = (u0 + dt_ac * (tend_u_sl[gid] + pgf)) / (1.0f + dt_ac * sponge_c[k]);
-    float uh = ec.z * (1.10f * un - 0.10f * u0);
 
-    u_n[gid] = un;
-    uint p2 = gid * 2u;
-    uh_fTh[p2] = uh;
-    uh_fTh[p2 + 1u] = uh * ec.w;
-    if (accum != 0u) {
-        uh_accum[gid] += uh;
+    for (uint k = 0u; k < nz; ++k) {
+        uint eidx = k * n_edges + e;
+        uint cbase = k * n_cells;
+        float p0 = p_cell[cbase + c0];
+        float p1 = p_cell[cbase + c1];
+        float4 ec = edge_c4[eidx];
+        // Symmetric-difference PGF: -(fz_avg*(p1 - p0) + fz_dif*0.5*(p1 + p0)) / (rtot_e * dc_e)
+        float pgf = -fma(ec.x, (p1 - p0), ec.y * (0.5f * (p1 + p0)));
+
+        float u0 = u_c[eidx];
+        float inv_sp = 1.0f / (1.0f + dt_ac * sponge_c[k]);
+        float un = (u0 + dt_ac * (tend_u_sl[eidx] + pgf)) * inv_sp;
+        float uh = ec.z * (1.10f * un - 0.10f * u0);
+
+        u_n[eidx] = un;
+        uh_fTh[eidx] = float2(uh, uh * ec.w);
+        if (accum != 0u) {
+            uh_accum[eidx] += uh;
+        }
     }
 }
 
@@ -1450,27 +1451,25 @@ kernel void scvt_fast_cell_hevi(
     device const float* area_edge  [[buffer(4)]],   // [N_edges]
     device const float* zw_slope_e [[buffer(5)]],   // [nz-1, N_edges]
     device const float* u_n        [[buffer(6)]],   // [nz, N_edges]
-    device const float* uh_fTh     [[buffer(7)]],   // [nz, N_edges, 2] interleaved (uh, fTh)
+    device const float2* uh_fTh    [[buffer(7)]],   // [nz, N_edges] float2(uh, fTh)
     device const float* m_c        [[buffer(8)]],   // [nz, N_cells]
     device const float* Thm_c      [[buffer(9)]],   // [nz, N_cells]
     device const float* w_c        [[buffer(10)]],  // [nz+1, N_cells]
     device const float* udotz_c    [[buffer(11)]],  // [nz-1, N_cells]
-    device const float* pres_s     [[buffer(12)]],  // [nz, N_cells]
-    device const float* dp_dThm_s  [[buffer(13)]],  // [nz, N_cells]
-    device const float* Thm_ref    [[buffer(14)]],  // [nz, N_cells]
-    device const float* tend_Thm   [[buffer(15)]],  // [nz, N_cells]
-    device const float* q_odz      [[buffer(16)]],  // [nz, N_cells]: q_load / dz_c
-    device const float* hevi_c     [[buffer(17)]],  // [7, nz-1, N_cells]: rdw, rdw/rtw, thw, dl, inv_piv, cp, 1/dz_w
-    device const float* sponge_w   [[buffer(18)]],  // [nz-1]
-    device const float* k_slope_top [[buffer(19)]], // [N_cells]
-    device float* m_n              [[buffer(20)]],  // [nz, N_cells]
-    device float* Thm_n            [[buffer(21)]],  // [nz, N_cells]
-    device float* w_n              [[buffer(22)]],  // [nz+1, N_cells]
-    device float* udotz_n          [[buffer(23)]],  // [nz-1, N_cells]
-    device float* om_accum         [[buffer(24)]],  // [nz+1, N_cells]
-    device float* p_cell_n         [[buffer(25)]],  // [nz, N_cells]
-    constant ulong4& u_p           [[buffer(26)]],  // [nz, N_cells, N_edges, (write_p<<1)|accum]
-    constant float4& f_p           [[buffer(27)]],  // [dt_ac, beta_hevi, gravity, 0]
+    device const float4* cell_c4   [[buffer(12)]],  // [nz, N_cells]: (pres_s, dp_dThm_s, Thm_s, q_odz)
+    device const float* tend_Thm   [[buffer(13)]],  // [nz, N_cells]
+    device const float4* hevi_a4   [[buffer(14)]],  // [nz-1, N_cells]: (rdw, dt*rr*idw, dt*0.5*g*rr, dl)
+    device const float4* hevi_b4   [[buffer(15)]],  // [nz-1, N_cells]: (inv_piv, cp, thw, inv_rdw)
+    device const float* sponge_w   [[buffer(16)]],  // [nz-1]
+    device const float* k_slope_top [[buffer(17)]], // [N_cells]
+    device float* m_n              [[buffer(18)]],  // [nz, N_cells]
+    device float* Thm_n            [[buffer(19)]],  // [nz, N_cells]
+    device float* w_n              [[buffer(20)]],  // [nz+1, N_cells]
+    device float* udotz_n          [[buffer(21)]],  // [nz-1, N_cells]
+    device float* om_accum         [[buffer(22)]],  // [nz+1, N_cells]
+    device float* p_cell_n         [[buffer(23)]],  // [nz, N_cells]
+    constant ulong4& u_p           [[buffer(24)]],  // [nz, N_cells, N_edges, (write_p<<1)|accum]
+    constant float4& f_p           [[buffer(25)]],  // [dt_ac, beta_hevi, gravity, 0]
     uint c [[thread_position_in_grid]])
 {
     uint nz = uint(u_p.x);
@@ -1482,18 +1481,8 @@ kernel void scvt_fast_cell_hevi(
     if (c >= n_cells) return;
 
     uint n_int = nz - 1u;
-    uint int_stride = n_int * n_cells;
-    device const float* h_rdw = hevi_c;
-    device const float* h_rr  = hevi_c + int_stride;
-    device const float* h_thw = hevi_c + 2u * int_stride;
-    device const float* h_dl  = hevi_c + 3u * int_stride;
-    device const float* h_inv = hevi_c + 4u * int_stride;
-    device const float* h_cp  = hevi_c + 5u * int_stride;
-    device const float* h_idw = hevi_c + 6u * int_stride;
-
     float dt_ac = f_p.x;
     float beta = f_p.y;
-    float gravity = f_p.z;
 
     float inv_Ac = 1.0f / area_cell[c];
     uint e_id[6];
@@ -1552,14 +1541,14 @@ kernel void scvt_fast_cell_hevi(
                     if (uz_w[d] != 0.0f) {
                         uint eid = e_id[d];
                         float u_int = 0.5f * (u_n[ebase + eid] + u_n[eb1 + eid]);
-                        uz_sum += uz_w[d] * u_int * zw_slope_e[ebase + eid];
+                        uz_sum = fma(uz_w[d], u_int * zw_slope_e[ebase + eid], uz_sum);
                     }
                 }
                 uz_next_up = uz_sum;
                 udotz_n[cidx] = uz_sum;
                 uz_old_up = udotz_c[cidx];
             }
-            rdw_up = h_rdw[cidx];
+            rdw_up = hevi_a4[cidx].x;
             om_up = rdw_up * (w_c[(k + 1u) * n_cells + c] - uz_old_up);
             if (k >= 1u && k + 2u < nz) {
                 float sgn = (om_up > 0.0f) ? 1.0f : ((om_up < 0.0f) ? -1.0f : 0.0f);
@@ -1574,13 +1563,15 @@ kernel void scvt_fast_cell_hevi(
         float d_m = 0.0f;
         float d_Th = 0.0f;
         for (uint d = 0u; d < 6u; ++d) {
-            if (div_w[d] != 0.0f) {
-                uint p2 = (ebase + e_id[d]) * 2u;
-                d_m  += div_w[d] * uh_fTh[p2];
-                d_Th += div_w[d] * uh_fTh[p2 + 1u];
+            float dw = div_w[d];
+            if (dw != 0.0f) {
+                float2 uf = uh_fTh[ebase + e_id[d]];
+                d_m  = fma(dw, uf.x, d_m);
+                d_Th = fma(dw, uf.y, d_Th);
             }
         }
 
+        float4 cc = cell_c4[cidx]; // (pres_s, dp_dThm_s, Thm_s, q_odz)
         float mk = m_0;
         float Thmk = T_0;
         float md = mk - dt_ac * (d_m + (om_up - om_dn));
@@ -1588,19 +1579,20 @@ kernel void scvt_fast_cell_hevi(
         m_dag[k] = md;
         T_dag[k] = Td;
 
-        float tr_k = Thm_ref[cidx];
-        float p_blend_k = fma(dp_dThm_s[cidx], (1.0f - beta) * (Thmk - tr_k) + beta * (Td - tr_k), pres_s[cidx]);
-        float rtot_blend_k = ((1.0f - beta) * mk + beta * md) * q_odz[cidx];
+        float tr_k = cc.z;
+        float p_blend_k = fma(cc.y, (1.0f - beta) * (Thmk - tr_k) + beta * (Td - tr_k), cc.x);
+        float rtot_blend_k = ((1.0f - beta) * mk + beta * md) * cc.w;
 
         if (k >= 1u) {
             uint m = k - 1u;
             uint midx = m * n_cells + c;
-            float rtot_bw = 0.5f * (rtot_blend_prev + rtot_blend_k);
-            float nh_imbal = (p_blend_k - p_blend_prev) * h_idw[midx] + rtot_bw * gravity;
-            float fz_phys_k = rdw_dn * w_c[cidx];
+            float4 ha = hevi_a4[midx];
+            float inv_piv = hevi_b4[midx].x;
             float rhs = -rdw_dn * (uz_next_dn - uz_old_dn)
-                        + dt_ac * (-h_rr[midx] * nh_imbal - sponge_w[m] * fz_phys_k);
-            d_prev = (m == 0u) ? (rhs * h_inv[midx]) : ((rhs - h_dl[midx] * d_prev) * h_inv[midx]);
+                        - ha.y * (p_blend_k - p_blend_prev)
+                        - ha.z * (rtot_blend_prev + rtot_blend_k)
+                        - (dt_ac * sponge_w[m]) * (rdw_dn * w_c[cidx]);
+            d_prev = (m == 0u) ? (rhs * inv_piv) : ((rhs - ha.w * d_prev) * inv_piv);
             dp[m] = d_prev;
         }
 
@@ -1625,7 +1617,7 @@ kernel void scvt_fast_cell_hevi(
         }
     }
 
-    // Pass 2 (backward k = nz-1..0): fused Thomas back-substitution + w/m/Thm update (100% SoA coalesced)
+    // Pass 2 (backward k = nz-1..0): fused Thomas back-substitution + w/m/Thm update (100% coalesced float4)
     w_n[c] = 0.0f;
     w_n[nz * n_cells + c] = 0.0f;
     float dom_up = 0.0f;
@@ -1640,14 +1632,15 @@ kernel void scvt_fast_cell_hevi(
         if (k > 0u) {
             uint m = k - 1u;
             uint midx = m * n_cells + c;
-            dom_dn = dp[m] - h_cp[midx] * dom_up;
-            thw_dn = h_thw[midx];
-            float rdw = h_rdw[midx];
+            float4 hb = hevi_b4[midx]; // (inv_piv, cp, thw, inv_rdw)
+            float rdw = hevi_a4[midx].x;
+            dom_dn = dp[m] - hb.y * dom_up;
+            thw_dn = hb.z;
             float uz_old = (m < k_top) ? udotz_c[midx] : 0.0f;
             float uz_nxt = (m < k_top) ? udotz_n[midx] : 0.0f;
             float om_old_m = rdw * (w_c[cidx] - uz_old);
             float om_new = om_old_m + dom_dn;
-            w_n[cidx] = uz_nxt + om_new / max(rdw, 1.0e-8f);
+            w_n[cidx] = uz_nxt + om_new * hb.w;
             if (accum != 0u) {
                 om_accum[cidx] += (1.0f - beta) * om_old_m + beta * om_new;
             }
@@ -1656,7 +1649,8 @@ kernel void scvt_fast_cell_hevi(
         float T_fin = T_dag[k] - b_dt * (thw_up * dom_up - thw_dn * dom_dn);
         Thm_n[cidx] = T_fin;
         if (write_p) {
-            p_cell_n[cidx] = fma(dp_dThm_s[cidx], T_fin - Thm_ref[cidx], pres_s[cidx]);
+            float4 cc = cell_c4[cidx];
+            p_cell_n[cidx] = fma(cc.y, T_fin - cc.z, cc.x);
         }
         dom_up = dom_dn;
         thw_up = thw_dn;
@@ -4640,29 +4634,32 @@ kernel void scvt_eta_edge(
     device const int* v1_arr       [[buffer(1)]],   // [N_edges]
     device const float* zeta_v     [[buffer(2)]],   // [nz, N_verts]
     device const float* f_vert     [[buffer(3)]],   // [N_verts]
-    device float* eta_e            [[buffer(4)]],   // [nz, N_edges]
-    device const uint* u_params    [[buffer(5)]],   // [nz, N_verts, N_edges]
-    uint gid [[thread_position_in_grid]])
+    device const float* u_e        [[buffer(4)]],   // [nz, N_edges]
+    device float2* eta_u           [[buffer(5)]],   // [nz, N_edges]: float2(eta_e, u_e)
+    device const uint* u_params    [[buffer(6)]],   // [nz, N_verts, N_edges]
+    uint e [[thread_position_in_grid]])
 {
     uint nz = u_params[0];
     uint n_verts = u_params[1];
     uint n_edges = u_params[2];
-    if (gid >= nz * n_edges) return;
-    uint k = gid / n_edges;
-    uint e = gid - k * n_edges;
-    uint vbase = k * n_verts;
+    if (e >= n_edges) return;
     uint v0e = uint(v0_arr[e]);
     uint v1e = uint(v1_arr[e]);
-    eta_e[gid] = 0.5f * (zeta_v[vbase + v0e] + f_vert[v0e] + zeta_v[vbase + v1e] + f_vert[v1e]);
+    float f_sum = f_vert[v0e] + f_vert[v1e];
+    for (uint k = 0u; k < nz; ++k) {
+        uint vbase = k * n_verts;
+        uint eidx = k * n_edges + e;
+        float eta = 0.5f * (zeta_v[vbase + v0e] + zeta_v[vbase + v1e] + f_sum);
+        eta_u[eidx] = float2(eta, u_e[eidx]);
+    }
 }
 
 kernel void scvt_trisk_rot_edge(
     device const int* ep_arr       [[buffer(0)]],   // [N_edges, 10]
     device const float* w_trisk    [[buffer(1)]],   // [N_edges, 10]
-    device const float* eta_e      [[buffer(2)]],   // [nz, N_edges]
-    device const float* u_e        [[buffer(3)]],   // [nz, N_edges]
-    device float* rot_out          [[buffer(4)]],   // [nz, N_edges]
-    device const uint* u_params    [[buffer(5)]],   // [nz, N_verts, N_edges]
+    device const float2* eta_u     [[buffer(2)]],   // [nz, N_edges]: float2(eta_e, u_e)
+    device float* rot_out          [[buffer(3)]],   // [nz, N_edges]
+    device const uint* u_params    [[buffer(4)]],   // [nz, N_verts, N_edges]
     uint e [[thread_position_in_grid]])
 {
     uint nz = u_params[0];
@@ -4674,15 +4671,15 @@ kernel void scvt_trisk_rot_edge(
     float wt[10];
     for (uint j = 0u; j < 10u; ++j) {
         ep[j] = uint(ep_arr[e10 + j]);
-        wt[j] = w_trisk[e10 + j];
+        wt[j] = 0.5f * w_trisk[e10 + j];
     }
     for (uint k = 0u; k < nz; ++k) {
         uint ebase = k * n_edges;
-        float eta_self = eta_e[ebase + e];
+        float eta_self = eta_u[ebase + e].x;
         float acc = 0.0f;
         for (uint j = 0u; j < 10u; ++j) {
-            uint idx = ebase + ep[j];
-            acc += wt[j] * 0.5f * (eta_self + eta_e[idx]) * u_e[idx];
+            float2 eu = eta_u[ebase + ep[j]];
+            acc = fma(wt[j], (eta_self + eu.x) * eu.y, acc);
         }
         rot_out[ebase + e] = acc;
     }
@@ -5261,10 +5258,9 @@ def run_scvt_fast_acoustic_metal(
     w0: torch.Tensor,
     udotz0: torch.Tensor,
     edge_c4: torch.Tensor,
-    pres_s: torch.Tensor,
-    dp_dThm_s: torch.Tensor,
-    q_odz: torch.Tensor,
-    hevi_c: torch.Tensor,
+    cell_c4: torch.Tensor,
+    hevi_a4: torch.Tensor,
+    hevi_b4: torch.Tensor,
     p_cell_init: torch.Tensor,
     k_slope_top: torch.Tensor,
     tend_u_slow: torch.Tensor,
@@ -5276,7 +5272,7 @@ def run_scvt_fast_acoustic_metal(
     Thm_ref: torch.Tensor,
     mesh: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Execute global SCVT horizontal acoustic + vertical HEVI loop on GPU (float4 edge + SoA cell)."""
+    """Execute global SCVT horizontal acoustic + vertical HEVI loop on GPU (float4 edge/cell + float2 flux)."""
     nz, n_cells = m0.shape
     n_edges = u0.shape[1]
     dev = m0.device
@@ -5324,16 +5320,12 @@ def run_scvt_fast_acoustic_metal(
     zw_c = zw_slope_e.contiguous()
     tu_c = tend_u_slow.contiguous()
     tth_c = tend_Thm_slow.contiguous()
-    ps_c = pres_s.contiguous()
-    dp_c = dp_dThm_s.contiguous()
-    qodz_c = q_odz.contiguous()
 
     f_p = [float(dt_ac), float(beta_hevi), float(gravity), 0.0]
     u_p_edge = [nz, n_cells, n_edges, accum_u]
 
     # Select 2 scratch banks disjoint from Thm_ref (zero pre-loop copy_ and zero stage-0/1 clone!)
-    tr_c = Thm_ref.contiguous()
-    tr_ptr = tr_c.data_ptr()
+    tr_ptr = Thm_ref.data_ptr()
     bank_a = (ws["m_a"], ws["Thm_a"], ws["u_a"], ws["w_a"], ws["udz_a"])
     bank_b = (ws["m_b"], ws["Thm_b"], ws["u_b"], ws["w_b"], ws["udz_b"])
     bank_c = (ws["m_c"], ws["Thm_c"], ws["u_c"], ws["w_c"], ws["udz_c"])
@@ -5358,13 +5350,12 @@ def run_scvt_fast_acoustic_metal(
             c0_i32, c1_i32, edge_c4, tu_c, spc_c,
             p_cell, uc,
             un, uh_fTh, ws["uh_acc"],
-            u_p_edge, f_p, threads=nz * n_edges,
+            u_p_edge, f_p, threads=n_edges,
         )
         lib.scvt_fast_cell_hevi(
             eoc_i32, esgn_c, area_c_c, dv_c, ae_c, zw_c, un, uh_fTh,
             mc_s, Tc, wc, uzc,
-            ps_c, dp_c, tr_c, tth_c, qodz_c,
-            hevi_c, spw_c, k_slope_top,
+            cell_c4, tth_c, hevi_a4, hevi_b4, spw_c, k_slope_top,
             mn_s, Tn, wn, uzn, ws["om_acc"], p_cell,
             [nz, n_cells, n_edges, (write_p << 1) | accum_u], f_p, threads=n_cells,
         )
@@ -5603,18 +5594,18 @@ def run_scvt_trisk_rot_metal(lib: Any, mesh: Any, zeta_v: torch.Tensor, u_edge: 
     nz = u_edge.shape[0]
     ne = mc["n_edges"]
     dev = u_edge.device
-    eta_key = ("eta_e", nz, ne)
-    eta_e = mc.get(eta_key)
-    if eta_e is None or eta_e.device != dev:
-        eta_e = torch.empty((nz, ne), device=dev, dtype=torch.float32)
-        mc[eta_key] = eta_e
+    eta_key = ("eta_u", nz, ne)
+    eta_u = mc.get(eta_key)
+    if eta_u is None or eta_u.device != dev:
+        eta_u = torch.empty((nz, ne, 2), device=dev, dtype=torch.float32)
+        mc[eta_key] = eta_u
     rot_out = torch.empty((nz, ne), device=dev, dtype=torch.float32)
     up = _scvt_u_param(mc, ("rot", nz), [nz, mc["n_verts"], ne], dev)
     lib.scvt_eta_edge(
-        mc["v0"], mc["v1"], zeta_v.contiguous(), mc["f_vert"], eta_e, up, threads=nz * ne,
+        mc["v0"], mc["v1"], zeta_v.contiguous(), mc["f_vert"], u_edge.contiguous(), eta_u, up, threads=ne,
     )
     lib.scvt_trisk_rot_edge(
-        mc["ep"], mc["w_trisk"], eta_e, u_edge.contiguous(), rot_out, up, threads=ne,
+        mc["ep"], mc["w_trisk"], eta_u, rot_out, up, threads=ne,
     )
     return rot_out
 

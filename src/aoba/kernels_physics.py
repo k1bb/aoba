@@ -3936,13 +3936,13 @@ kernel void scvt_rk3_prep_cell(
     device const float* sponge_w    [[buffer(12)]],  // [nz-1]
     device const float* k_slope_top [[buffer(13)]],  // [nc]
     device float* pres_s            [[buffer(14)]],  // [nz, nc]
-    device float* dp_dThm_s         [[buffer(15)]],  // [nz, nc]
-    device float* q_odz_out         [[buffer(16)]],  // [nz, nc]
-    device float* thm_s             [[buffer(17)]],  // [nz, nc]
-    device float* rtot_s            [[buffer(18)]],  // [nz, nc]
-    device float* ke_cell           [[buffer(19)]],  // [nz, nc]
-    device float* u_dot_gradz_s     [[buffer(20)]],  // [nz-1, nc]
-    device float* hevi_out          [[buffer(21)]],  // [7, nz-1, nc]: rdw, rdw/rtw, thw, dl, inv_piv, cp, 1/dz_w
+    device float4* cell_c4          [[buffer(15)]],  // [nz, nc]: (pres_s, dp_dThm_s, Thm_s, q_odz)
+    device float* thm_s             [[buffer(16)]],  // [nz, nc]
+    device float* rtot_s            [[buffer(17)]],  // [nz, nc]
+    device float* ke_cell           [[buffer(18)]],  // [nz, nc]
+    device float* u_dot_gradz_s     [[buffer(19)]],  // [nz-1, nc]
+    device float4* hevi_a4          [[buffer(20)]],  // [nz-1, nc]: (rdw, dt*rr*idw, dt*0.5*g*rr, dl)
+    device float4* hevi_b4          [[buffer(21)]],  // [nz-1, nc]: (inv_piv, cp, thw, inv_rdw)
     device float* p_cell_out        [[buffer(22)]],  // [nz, nc]
     constant ulong4& u_dim          [[buffer(23)]],  // [nz, nc, ne, same_thm0]
     constant float4& f_p0           [[buffer(24)]],  // [p_ref, r_d, gamma_d, gravity]
@@ -3966,16 +3966,6 @@ kernel void scvt_rk3_prep_cell(
     float inv_ac = 1.0f / area_c[c];
     uint k_stop = uint(k_slope_top[c] + 0.5f);
 
-    uint n_int = nz - 1u;
-    uint int_stride = n_int * nc;
-    device float* o_rdw = hevi_out;
-    device float* o_rr  = hevi_out + int_stride;
-    device float* o_thw = hevi_out + 2u * int_stride;
-    device float* o_dl  = hevi_out + 3u * int_stride;
-    device float* o_inv = hevi_out + 4u * int_stride;
-    device float* o_cp  = hevi_out + 5u * int_stride;
-    device float* o_idw = hevi_out + 6u * int_stride;
-
     uint c6 = c * 6u;
     int e_idx[6];
     float ae_w[6];
@@ -3998,6 +3988,7 @@ kernel void scvt_rk3_prep_cell(
     float c_up_prev = 0.0f;
     float q_odz_up_prev = 0.0f;
     float inv_piv_prev = 1.0f;
+    float inv_rdw_prev = 1.0f;
 
     for (uint k = 0u; k < nz; ++k) {
         uint idx = k * nc + c;
@@ -4015,8 +4006,7 @@ kernel void scvt_rk3_prep_cell(
         float q_odz = q_v / dz_v;
 
         pres_s[idx] = p_v;
-        dp_dThm_s[idx] = dp_v;
-        q_odz_out[idx] = q_odz;
+        cell_c4[idx] = float4(p_v, dp_v, T_v, q_odz);
         thm_s[idx] = thm_v;
         rtot_s[idx] = rtot_v;
         p_cell_out[idx] = same_thm0 ? p_v : fma(dp_v, Thm0[idx] - T_v, p_v);
@@ -4048,10 +4038,7 @@ kernel void scvt_rk3_prep_cell(
             float thw = 0.5f * (thm_prev + thm_v);
             float inv_dz_w = 1.0f / dz_w_int[midx];
             float rdw_ov_rtw = rdw / rtw;
-            o_rdw[midx] = rdw;
-            o_rr[midx]  = rdw_ov_rtw;
-            o_thw[midx] = thw;
-            o_idw[midx] = inv_dz_w;
+            float inv_rdw = 1.0f / max(rdw, 1.0e-8f);
 
             float fac_p = bdt2 * (rdw_ov_rtw * inv_dz_w);
             float fac_g = bdt2 * (0.5f * gravity * rdw_ov_rtw);
@@ -4062,21 +4049,25 @@ kernel void scvt_rk3_prep_cell(
                 1.0f + dt_ac * sponge_w[m] + fac_p * thw * (c_up + c_dn) + fac_g * (q_odz - q_over_dz_prev),
                 0.5f
             );
+            float dl_m = 0.0f;
+            float inv_m = 0.0f;
             if (m == 0u) {
-                o_dl[midx] = 0.0f;
-                float inv0 = 1.0f / diag_m;
-                o_inv[midx] = inv0;
-                inv_piv_prev = inv0;
+                inv_m = 1.0f / diag_m;
             } else {
-                float dl_m = -fac_p * c_dn * thm_w_prev + fac_g * q_over_dz_prev;
+                dl_m = -fac_p * c_dn * thm_w_prev + fac_g * q_over_dz_prev;
                 float du_prev = -fac_p_prev * c_up_prev * thw - fac_g_prev * q_odz_up_prev;
                 float cp_prev = du_prev * inv_piv_prev;
-                o_cp[(m - 1u) * nc + c] = cp_prev;
-                o_dl[midx] = dl_m;
-                float inv_m = 1.0f / (diag_m - dl_m * cp_prev);
-                o_inv[midx] = inv_m;
-                inv_piv_prev = inv_m;
+                hevi_b4[(m - 1u) * nc + c] = float4(inv_piv_prev, cp_prev, thm_w_prev, inv_rdw_prev);
+                inv_m = 1.0f / (diag_m - dl_m * cp_prev);
             }
+            hevi_a4[midx] = float4(
+                rdw,
+                dt_ac * rdw_ov_rtw * inv_dz_w,
+                dt_ac * 0.5f * gravity * rdw_ov_rtw,
+                dl_m
+            );
+            inv_piv_prev = inv_m;
+            inv_rdw_prev = inv_rdw;
             thm_w_prev = thw;
             fac_p_prev = fac_p;
             fac_g_prev = fac_g;
@@ -4089,7 +4080,7 @@ kernel void scvt_rk3_prep_cell(
         dp_prev = dp_v;
         q_over_dz_prev = q_odz;
     }
-    o_cp[(nz - 2u) * nc + c] = 0.0f;
+    hevi_b4[(nz - 2u) * nc + c] = float4(inv_piv_prev, 0.0f, thm_w_prev, inv_rdw_prev);
 }
 
 kernel void scvt_rk3_prep_edge(
@@ -6982,35 +6973,46 @@ kernel void ogcm_eta_edge_wet(
     device const int* v1            [[buffer(1)]],   // [ne]
     device const float* zeta_v      [[buffer(2)]],   // [nzo, nv]
     device const float* f_vert      [[buffer(3)]],   // [nv]
-    device const float* wet_ef      [[buffer(4)]],   // [nzo, ne]
-    device float* eta_e             [[buffer(5)]],   // [nzo, ne]
-    constant ulong4& u_dim          [[buffer(6)]],   // [nzo, nv, ne, pre_zeroed]
-    uint gid                        [[thread_position_in_grid]])
+    device const float* u_e         [[buffer(4)]],   // [nzo, ne]
+    device const float* wet_ef      [[buffer(5)]],   // [nzo, ne]
+    device float2* eta_u            [[buffer(6)]],   // [nzo, ne]: float2(eta_e, u_e)
+    constant ulong4& u_dim          [[buffer(7)]],   // [nzo, nv, ne, pre_zeroed]
+    uint e                          [[thread_position_in_grid]])
 {
     uint nzo = uint(u_dim.x);
     uint nv = uint(u_dim.y);
     uint ne = uint(u_dim.z);
-    if (gid >= nzo * ne) return;
-    if (wet_ef[gid] < 0.5f) {
-        if (u_dim.w == 0u) eta_e[gid] = 0.0f;
+    bool pre_zeroed = (u_dim.w != 0u);
+    if (e >= ne) return;
+    if (wet_ef[e] < 0.5f) {
+        if (!pre_zeroed) {
+            for (uint k = 0u; k < nzo; ++k) eta_u[k * ne + e] = float2(0.0f, 0.0f);
+        }
         return;
     }
-    uint k = gid / ne;
-    uint e = gid - k * ne;
     uint i0 = uint(v0[e]);
     uint i1 = uint(v1[e]);
-    uint vb = k * nv;
-    eta_e[gid] = 0.5f * ((zeta_v[vb + i0] + f_vert[i0]) + (zeta_v[vb + i1] + f_vert[i1]));
+    float f_sum = f_vert[i0] + f_vert[i1];
+    for (uint k = 0u; k < nzo; ++k) {
+        uint idx = k * ne + e;
+        if (wet_ef[idx] < 0.5f) {
+            if (pre_zeroed) break;
+            eta_u[idx] = float2(0.0f, 0.0f);
+            continue;
+        }
+        uint vb = k * nv;
+        float eta = 0.5f * (zeta_v[vb + i0] + zeta_v[vb + i1] + f_sum);
+        eta_u[idx] = float2(eta, u_e[idx]);
+    }
 }
 
 kernel void ogcm_trisk_rot_edge_wet(
     device const int* ep            [[buffer(0)]],   // [ne, 10]
     device const float* w_trisk     [[buffer(1)]],   // [ne, 10]
-    device const float* eta_e       [[buffer(2)]],   // [nzo, ne]
-    device const float* u_e         [[buffer(3)]],   // [nzo, ne]
-    device const float* wet_ef      [[buffer(4)]],   // [nzo, ne]
-    device float* rot_out           [[buffer(5)]],   // [nzo, ne]
-    constant ulong4& u_dim          [[buffer(6)]],   // [nzo, nv, ne, pre_zeroed]
+    device const float2* eta_u      [[buffer(2)]],   // [nzo, ne]: float2(eta_e, u_e)
+    device const float* wet_ef      [[buffer(3)]],   // [nzo, ne]
+    device float* rot_out           [[buffer(4)]],   // [nzo, ne]
+    constant ulong4& u_dim          [[buffer(5)]],   // [nzo, nv, ne, pre_zeroed]
     uint e                          [[thread_position_in_grid]])
 {
     uint nzo = uint(u_dim.x);
@@ -7028,7 +7030,7 @@ kernel void ogcm_trisk_rot_edge_wet(
     float wt_l[10];
     for (uint s = 0u; s < 10u; ++s) {
         ep_l[s] = uint(ep[e10 + s]);
-        wt_l[s] = w_trisk[e10 + s];
+        wt_l[s] = 0.5f * w_trisk[e10 + s];
     }
     for (uint k = 0u; k < nzo; ++k) {
         uint idx = k * ne + e;
@@ -7038,15 +7040,14 @@ kernel void ogcm_trisk_rot_edge_wet(
             continue;
         }
         uint eb = k * ne;
-        float ee = eta_e[idx];
+        float ee = eta_u[idx].x;
         float acc = 0.0f;
         for (uint s = 0u; s < 10u; ++s) {
             float w = wt_l[s];
             if (w != 0.0f) {
-                uint ei = eb + ep_l[s];
-                float ue = u_e[ei];
-                if (ue != 0.0f) {
-                    acc = fma(w * (0.5f * (ee + eta_e[ei])), ue, acc);
+                float2 eu = eta_u[eb + ep_l[s]];
+                if (eu.y != 0.0f) {
+                    acc = fma(w * (ee + eu.x), eu.y, acc);
                 }
             }
         }
@@ -10204,7 +10205,7 @@ def run_scvt_rk3_prep_metal(
     beta_hevi: float,
     dtau_stage: float = 0.0,
 ) -> tuple[torch.Tensor, ...]:
-    """Fused GPU SCVT RK3 stage prep (`scvt_rk3_prep_cell` SoA + `scvt_rk3_prep_edge` float4)."""
+    """Fused GPU SCVT RK3 stage prep (`scvt_rk3_prep_cell` float4 + `scvt_rk3_prep_edge` float4)."""
     nz, nc = m_s.shape
     ne = int(u_s.shape[1])
     dev = m_s.device
@@ -10217,13 +10218,13 @@ def run_scvt_rk3_prep_metal(
             _SCVT_PREP_WS_CACHE.pop(next(iter(_SCVT_PREP_WS_CACHE)))
         ws = {
             "pres_s": torch.empty((nz, nc), device=dev, dtype=dtype),
-            "dp_dThm_s": torch.empty((nz, nc), device=dev, dtype=dtype),
-            "q_odz": torch.empty((nz, nc), device=dev, dtype=dtype),
+            "cell_c4": torch.empty((nz, nc, 4), device=dev, dtype=dtype),
             "thm_s": torch.empty((nz, nc), device=dev, dtype=dtype),
             "rtot_s": torch.empty((nz, nc), device=dev, dtype=dtype),
             "ke_cell": torch.empty((nz, nc), device=dev, dtype=dtype),
             "u_dot_gradz_s": torch.empty((nz - 1, nc), device=dev, dtype=dtype),
-            "hevi_c": torch.empty((7, nz - 1, nc), device=dev, dtype=dtype),
+            "hevi_a4": torch.empty((nz - 1, nc, 4), device=dev, dtype=dtype),
+            "hevi_b4": torch.empty((nz - 1, nc, 4), device=dev, dtype=dtype),
             "p_cell": torch.empty((nz, nc), device=dev, dtype=dtype),
             "k_slope_top": torch.empty((nc,), device=dev, dtype=torch.float32),
             "k_slope_ptr": -1,
@@ -10242,13 +10243,13 @@ def run_scvt_rk3_prep_metal(
     k_slope_top = ws["k_slope_top"]
 
     pres_s = ws["pres_s"]
-    dp_dThm_s = ws["dp_dThm_s"]
-    q_odz = ws["q_odz"]
+    cell_c4 = ws["cell_c4"]
     thm_s = ws["thm_s"]
     rtot_s = ws["rtot_s"]
     ke_cell = ws["ke_cell"]
     u_dot_gradz_s = ws["u_dot_gradz_s"]
-    hevi_c = ws["hevi_c"]
+    hevi_a4 = ws["hevi_a4"]
+    hevi_b4 = ws["hevi_b4"]
     p_cell = ws["p_cell"]
 
     Thm_s_c = Thm_s.contiguous()
@@ -10260,8 +10261,8 @@ def run_scvt_rk3_prep_metal(
         m_s.contiguous(), Thm_s_c, Thm0_c, u_s.contiguous(),
         dz_c.contiguous(), dz_w_int.contiguous(), q_load.contiguous(),
         zw_c, sponge_w.reshape(-1).contiguous(), k_slope_top,
-        pres_s, dp_dThm_s, q_odz, thm_s, rtot_s, ke_cell, u_dot_gradz_s,
-        hevi_c, p_cell,
+        pres_s, cell_c4, thm_s, rtot_s, ke_cell, u_dot_gradz_s,
+        hevi_a4, hevi_b4, p_cell,
         u_dim,
         [float(C.P_REF), float(C.R_D), float(C.GAMMA_D), float(C.GRAVITY)],
         [float(dt_ac), float(beta_hevi), 0.0, 0.0],
@@ -10282,7 +10283,7 @@ def run_scvt_rk3_prep_metal(
         threads=nz * ne,
     )
     return (
-        edge_c4, pres_s, dp_dThm_s, q_odz, hevi_c, p_cell, k_slope_top, u_dot_gradz_s, tend_u_slow,
+        edge_c4, cell_c4, hevi_a4, hevi_b4, p_cell, k_slope_top, u_dot_gradz_s, tend_u_slow,
     )
 
 
@@ -10382,14 +10383,18 @@ def run_ogcm_trisk_coriolis_wet_metal(
     nv = int(mc["n_verts"])
     dev = u_edge.device
     zeta_v = zeta_buf if zeta_buf is not None else torch.empty((nzo, nv), device=dev, dtype=torch.float32)
-    eta_e = eta_buf if eta_buf is not None else torch.empty((nzo, ne), device=dev, dtype=torch.float32)
+    eta_u = (
+        eta_buf
+        if (eta_buf is not None and eta_buf.ndim == 3 and eta_buf.shape[-1] == 2)
+        else torch.zeros((nzo, ne, 2), device=dev, dtype=torch.float32)
+    )
     rot = rot_out if rot_out is not None else torch.empty((nzo, ne), device=dev, dtype=torch.float32)
     u_c = u_edge.contiguous()
     we_c = wet_ef.contiguous()
-    pz = 1 if (pre_zeroed and eta_buf is not None and rot_out is not None) else 0
+    pz = 1 if (pre_zeroed and eta_buf is not None and eta_buf.ndim == 3 and eta_buf.shape[-1] == 2 and rot_out is not None) else 0
     lib.ogcm_vorticity_vert_wet(mc["eov"], mc["vort_w"], u_c, wet_vf.contiguous(), zeta_v, [nzo, nv, ne, 0], threads=nzo * nv)
-    lib.ogcm_eta_edge_wet(mc["v0"], mc["v1"], zeta_v, mc["f_vert"], we_c, eta_e, [nzo, nv, ne, pz], threads=nzo * ne)
-    lib.ogcm_trisk_rot_edge_wet(mc["ep"], mc["w_trisk"], eta_e, u_c, we_c, rot, [nzo, nv, ne, pz], threads=ne)
+    lib.ogcm_eta_edge_wet(mc["v0"], mc["v1"], zeta_v, mc["f_vert"], u_c, we_c, eta_u, [nzo, nv, ne, pz], threads=ne)
+    lib.ogcm_trisk_rot_edge_wet(mc["ep"], mc["w_trisk"], eta_u, we_c, rot, [nzo, nv, ne, pz], threads=ne)
     return rot
 
 

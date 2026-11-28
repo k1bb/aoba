@@ -122,6 +122,8 @@ def _parse_buffer_param(decl_no_attr: str, buf_idx: int) -> KernelParam:
     mapping = {
         "device const float*": "f32_const_ptr",
         "device float*": "f32_ptr",
+        "device const float2*": "f32x2_const_ptr",
+        "device float2*": "f32x2_ptr",
         "device const float4*": "f32x4_const_ptr",
         "device float4*": "f32x4_ptr",
         "device const int*": "i32_const_ptr",
@@ -142,6 +144,8 @@ def _cuda_param_decl(p: KernelParam) -> str:
     decls = {
         "f32_const_ptr": f"const float* __restrict__ {p.name}",
         "f32_ptr": f"float* {p.name}",
+        "f32x2_const_ptr": f"const float2* __restrict__ {p.name}",
+        "f32x2_ptr": f"float2* {p.name}",
         "f32x4_const_ptr": f"const float4* __restrict__ {p.name}",
         "f32x4_ptr": f"float4* {p.name}",
         "i32_const_ptr": f"const int* __restrict__ {p.name}",
@@ -387,7 +391,7 @@ def _transform_non_kernel_chunk(chunk: str) -> str:
 
 def _cpp_wrapper_param(p: KernelParam) -> str:
     """Return C++ pybind11 launcher parameter type for `p`."""
-    if p.kind in ("f32_const_ptr", "f32_ptr", "f32x4_const_ptr", "f32x4_ptr", "i32_const_ptr", "u32_const_ptr"):
+    if p.kind in ("f32_const_ptr", "f32_ptr", "f32x2_const_ptr", "f32x2_ptr", "f32x4_const_ptr", "f32x4_ptr", "i32_const_ptr", "u32_const_ptr"):
         return f"const torch::Tensor& {p.name}"
     if p.kind in ("uint", "ulong"):
         return f"int64_t {p.name}"
@@ -406,6 +410,10 @@ def _cuda_call_arg(p: KernelParam) -> str:
         return f"{p.name}.data_ptr<float>()"
     if p.kind == "f32_ptr":
         return f"{p.name}.data_ptr<float>()"
+    if p.kind == "f32x2_const_ptr":
+        return f"reinterpret_cast<const float2*>({p.name}.data_ptr<float>())"
+    if p.kind == "f32x2_ptr":
+        return f"reinterpret_cast<float2*>({p.name}.data_ptr<float>())"
     if p.kind == "f32x4_const_ptr":
         return f"reinterpret_cast<const float4*>({p.name}.data_ptr<float>())"
     if p.kind == "f32x4_ptr":
@@ -464,11 +472,11 @@ def build_cuda_extension_sources(msl_src: str) -> tuple[str, str, list[KernelSpe
 
         first_tensor = next(
             p.name for p in spec.params
-            if p.kind in ("f32_const_ptr", "f32_ptr", "f32x4_const_ptr", "f32x4_ptr", "i32_const_ptr", "u32_const_ptr")
+            if p.kind in ("f32_const_ptr", "f32_ptr", "f32x2_const_ptr", "f32x2_ptr", "f32x4_const_ptr", "f32x4_ptr", "i32_const_ptr", "u32_const_ptr")
         )
         checks: list[str] = []
         for p in spec.params:
-            if p.kind in ("f32_const_ptr", "f32_ptr", "f32x4_const_ptr", "f32x4_ptr"):
+            if p.kind in ("f32_const_ptr", "f32_ptr", "f32x2_const_ptr", "f32x2_ptr", "f32x4_const_ptr", "f32x4_ptr"):
                 checks.append(
                     f'    TORCH_CHECK({p.name}.is_cuda() && {p.name}.is_contiguous() '
                     f'&& {p.name}.scalar_type() == torch::kFloat32, '
@@ -545,6 +553,8 @@ def _conv_float4(val: Any) -> list[float]:
 _CONVERTER_BY_KIND = {
     "f32_const_ptr": _conv_f32,
     "f32_ptr": _conv_f32,
+    "f32x2_const_ptr": _conv_f32,
+    "f32x2_ptr": _conv_f32,
     "f32x4_const_ptr": _conv_f32,
     "f32x4_ptr": _conv_f32,
     "i32_const_ptr": _conv_i32,
@@ -822,6 +832,12 @@ AOBA_DEVICE float fma(float a, float b, float c) { return std::fma(a, b, c); }
             elif p.kind == "f32_ptr":
                 c_params.append(f"float* {p.name}")
                 call_args.append(p.name)
+            elif p.kind == "f32x2_const_ptr":
+                c_params.append(f"const float* {p.name}")
+                call_args.append(f"reinterpret_cast<const float2*>({p.name})")
+            elif p.kind == "f32x2_ptr":
+                c_params.append(f"float* {p.name}")
+                call_args.append(f"reinterpret_cast<float2*>({p.name})")
             elif p.kind == "f32x4_const_ptr":
                 c_params.append(f"const float* {p.name}")
                 call_args.append(f"reinterpret_cast<const float4*>({p.name})")

@@ -2112,7 +2112,7 @@ def _step_ogcm_voronoi_impl(
                 "div_u": torch.zeros((nzo, nc), device=dev, dtype=dtype),
                 "div": torch.zeros((nzo, nc), device=dev, dtype=dtype),
                 "zeta": torch.zeros((nzo, nv), device=dev, dtype=dtype),
-                "eta": torch.zeros((nzo, ne), device=dev, dtype=dtype),
+                "eta": torch.zeros((nzo, ne, 2), device=dev, dtype=dtype),
                 "lap2": torch.zeros((nzo, ne), device=dev, dtype=dtype),
                 "lap4": torch.zeros((nzo, ne), device=dev, dtype=dtype),
                 "f_fixed": torch.zeros((nzo, ne), device=dev, dtype=dtype),
