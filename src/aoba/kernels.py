@@ -1970,7 +1970,10 @@ def run_crm_rk3_hevi_metal(
         n_ac0 = max(1, int(_math.ceil(rk_taus[0] / max(dt_ac_max, 0.1))))
         n_ac1 = max(1, int(_math.ceil(rk_taus[1] / max(dt_ac_max, 0.1))))
         n_ac2 = max(1, int(_math.ceil(rk_taus[2] / max(dt_ac_max, 0.1))))
-        use_smem_48 = (nz <= 48 and n_ac0 <= 63 and n_ac1 <= 63 and n_ac2 <= 63)
+        # Use 24 KB SMEM kernel on CUDA (fits 6 CTAs/SM inside A100/H100 164 KB carveout -> 1 wave),
+        # while keeping 0 B threadgroup `stage_fused_simd` on Apple Silicon MPS (where 24 KB threadgroup
+        # SRAM caps occupancy to 1 TG/core inside Metal's 32 KB limit -> 2.3x slower than stack/L1).
+        use_smem_48 = (dev.type == "cuda" and nz <= 48 and n_ac0 <= 63 and n_ac1 <= 63 and n_ac2 <= 63)
         use_fused_rk3 = (
             (dev.type == "mps" or use_smem_48)
             and n_ac0 <= 63 and n_ac1 <= 63 and n_ac2 <= 63
