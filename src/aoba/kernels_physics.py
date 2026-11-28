@@ -6246,16 +6246,24 @@ kernel void crm_distill_closure_col(
     float dm_wbal_sum = 0.0f;
     float w_qp0_sum = 0.0f;
     float w_qp_prov_sum = 0.0f;
+    float inv_pbl_g = 1.0f / (0.08f * ex0);
+    float denom_h_w = 0.0f;
+    float dm_sum_u = 0.0f;
     for (uint k = 0u; k < nz_c; ++k) {
         float sc_k = sconv_col[k];
         if (sc_k > 0.0f) {
             float ex_k = exner[k * N + c];
-            float pbl_g = clamp((ex_k - 0.90f) / 0.05f, 0.0f, 1.0f);
+            float pbl_g = clamp(1.0f - (ex0 - ex_k) * inv_pbl_g, 0.0f, 1.0f);
             float l_gate = max(col_rh_gate, pbl_g);
-            float d_temp_r = sc_k * l_gate * tanh(rp0_s[k] * 0.2f) * 0.15f;
+            float f_trop = max(pbl_g, clamp(qsat_col[k] / 3.0e-4f, 0.0f, 1.0f));
+            float wh_k = sc_k * l_gate * f_trop;
+            float wu_k = sc_k * l_gate;
+            denom_h_w += cp_d * dm_c_col[k] * wh_k;
+            dm_sum_u += dm_c_col[k] * wu_k;
+            float d_temp_r = wh_k * tanh(rp0_s[k] * 0.2f) * 0.15f;
             dh_raw += cp_d * dm_c_col[k] * d_temp_r;
-            float du_r = sc_k * l_gate * tanh(RP_LOAD(5u, k) * 0.2f) * 4.0f;
-            float dv_r = sc_k * l_gate * tanh(RP_LOAD(6u, k) * 0.2f) * 4.0f;
+            float du_r = wu_k * tanh(RP_LOAD(5u, k) * 0.2f) * 4.0f;
+            float dv_r = wu_k * tanh(RP_LOAD(6u, k) * 0.2f) * 4.0f;
             du_imp += dm_c_col[k] * du_r;
             dv_imp += dm_c_col[k] * dv_r;
             float dq_lim = l_gate * min(0.015f * qnb_col[k], 1.0e-4f);
@@ -6285,7 +6293,7 @@ kernel void crm_distill_closure_col(
                 qc0_k *= sc;
                 qi0_k *= sc;
             }
-            float l_gate = max(col_rh_gate, clamp((exner[idx] - 0.90f) / 0.05f, 0.0f, 1.0f));
+            float l_gate = max(col_rh_gate, clamp(1.0f - (ex0 - exner[idx]) * inv_pbl_g, 0.0f, 1.0f));
             float wb = l_gate * min(0.015f * qnb_col[k], 1.0e-4f);
             float dqn_bal = rp1_s[k] - dqn_corr * wb;
             float qn_tr = max(qnb_col[k] + dqn_bal, 0.0f);
@@ -6384,9 +6392,9 @@ kernel void crm_distill_closure_col(
             float qi_pf = qi_nn_or_adv + q_excess * f_ice;
             qv_n = max(qn_n - qc_pf - qi_pf, 0.0f);
 
-            float qi_cap = min(qsat_env, 1.2e-4f);
-            qc_n = min(qc_nn, 5.0e-4f);
-            qi_n = min(qi_nn_or_adv, qi_cap);
+            float qi_cap = min(qsat_env, 2.5e-4f);
+            qc_n = min(qc_pf, 7.5e-4f);
+            qi_n = min(qi_pf, qi_cap);
             float qc_fall = max(qc_pf - qc_n, 0.0f);
             float qi_fall = max(qi_pf - qi_n, 0.0f);
             qn_n = qv_n + qc_n + qi_n;
@@ -6396,7 +6404,8 @@ kernel void crm_distill_closure_col(
 
             d_m_qp += dm * (qp_n - qp0);
             float f_cld_nn = s_conv * rh_gate * aoba_sigmoid(RP_LOAD(7u, k) - 2.0f);
-            out_prof[8u * plane + idx] = max(f_cld_nn, clamp(qi_n / 2.0e-5f, 0.0f, 0.85f));
+            float f_cld_phys = max(clamp(qi_n / 2.0e-5f, 0.0f, 0.85f), clamp((qc_n - 5.0e-5f) / 4.5e-4f, 0.0f, 0.80f));
+            out_prof[8u * plane + idx] = max(f_cld_nn, f_cld_phys);
         } else {
             out_prof[8u * plane + idx] = 0.0f;
         }
@@ -6416,10 +6425,11 @@ kernel void crm_distill_closure_col(
     out_scal[2u * N + c] = col_rh_gate * aoba_sigmoid(raw_scal[rs_base + 2u] - 1.0f);
 
     float dh_precip = l_v0 * (p_tot_orig - p_sink_mass + d_m_qp) + l_f0 * (p_tot_fin * f_snow);
-    float h_corr = (dh_precip - dh_raw) / max(denom_h, 1.0f);
+    float h_corr = (dh_precip - dh_raw) / max(denom_h_w, 1.0f);
     float dT_shf_scale = (shf * dt) / (cp_d * max(dm_pbl_sum, 1.0e-3f));
-    float u_corr = (tau_x * dt - du_imp) / dm_sum_safe;
-    float v_corr = (tau_y * dt - dv_imp) / dm_sum_safe;
+    float dm_sum_u_safe = max(dm_sum_u, 1.0e-3f);
+    float u_corr = (tau_x * dt - du_imp) / dm_sum_u_safe;
+    float v_corr = (tau_y * dt - dv_imp) / dm_sum_u_safe;
 
     // Pass 3: reuse qnb_col=t_col, qp_p_col=t_pls, qsat_col=ex_col (zero new stack arrays!)
     bool use_adj = (nz <= 64u);
@@ -6441,7 +6451,12 @@ kernel void crm_distill_closure_col(
         float qv0 = max(qn0 - qc0 - qi0, 0.0f);
         float t_post_ls = (thm_post_ls[idx] * ex) / (1.0f + rv_rd * qv0);
         float d_temp_cons = 0.0f;
-        float l_gate = max(col_rh_gate, clamp((ex - 0.90f) / 0.05f, 0.0f, 1.0f));
+        float pbl_g = clamp(1.0f - (ex0 - ex) * inv_pbl_g, 0.0f, 1.0f);
+        float l_gate = max(col_rh_gate, pbl_g);
+        float qsat_k_v = (k < 64u) ? qsat_col[k] : 0.0f;
+        float f_trop = max(pbl_g, clamp(qsat_k_v / 3.0e-4f, 0.0f, 1.0f));
+        float wh_k = s_conv * l_gate * f_trop;
+        float wu_k = s_conv * l_gate;
         if (s_conv > 0.0f) {
             float pbl_sh = clamp(1.0f - (ex0 - ex) * inv_pbl_ex, 0.0f, 1.0f) * s_conv;
             float qc_n = out_prof[4u * plane + idx];
@@ -6449,8 +6464,8 @@ kernel void crm_distill_closure_col(
             float qf_plus_dqps = (k < 64u) ? rp1_s[k] : 0.0f;
             float d_temp_lat = (l_v0 * ((qc_n + qi_n) - (qc0 + qi0) + qf_plus_dqps) + l_f0 * (qi_n - qi0)) / cp_d;
             float rp0_k = (k < 64u) ? rp0_s[k] : (RP_LOAD(0u, k) * s_conv);
-            float d_temp_r = s_conv * l_gate * tanh(rp0_k * 0.2f) * 0.15f;
-            d_temp_cons = dT_shf_scale * pbl_sh + d_temp_lat + d_temp_r + h_corr * s_conv;
+            float d_temp_r = wh_k * tanh(rp0_k * 0.2f) * 0.15f;
+            d_temp_cons = dT_shf_scale * pbl_sh + d_temp_lat + d_temp_r + h_corr * wh_k;
         }
         if (use_adj) {
             qp_p_col[k] = t_post_ls;
@@ -6464,10 +6479,10 @@ kernel void crm_distill_closure_col(
             out_prof[idx] = clamp(thm_post_ls[idx], 150.0f, 50000.0f);
         }
         if (s_conv > 0.0f) {
-            float du_r = s_conv * l_gate * tanh(RP_LOAD(5u, k) * 0.2f) * 4.0f;
-            float dv_r = s_conv * l_gate * tanh(RP_LOAD(6u, k) * 0.2f) * 4.0f;
-            out_prof[6u * plane + idx] = u_pre[idx] + du_r + u_corr * s_conv;
-            out_prof[7u * plane + idx] = v_pre[idx] + dv_r + v_corr * s_conv;
+            float du_r = wu_k * tanh(RP_LOAD(5u, k) * 0.2f) * 4.0f;
+            float dv_r = wu_k * tanh(RP_LOAD(6u, k) * 0.2f) * 4.0f;
+            out_prof[6u * plane + idx] = u_pre[idx] + du_r + u_corr * wu_k;
+            out_prof[7u * plane + idx] = v_pre[idx] + dv_r + v_corr * wu_k;
         } else {
             out_prof[6u * plane + idx] = u_pre[idx];
             out_prof[7u * plane + idx] = v_pre[idx];
