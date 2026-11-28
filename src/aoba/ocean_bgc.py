@@ -893,16 +893,16 @@ def step_ocean_bgc_flexpft(
         and active_w_c is not None
     )
     if use_gpu_fct:
-        # Process tracers in B=4 chunks when GPU VRAM allows (cuts redundant 3D velocity/geometry
-        # DRAM reads in half with bit-for-bit identical Zalesak FCT+z* results; B=8 spills L2 cache).
+        # Process tracers in B=5 chunks when GPU VRAM allows (zero-advective-edge-buffer FCT
+        # halves workspace footprint so 7-9 BGC tracers complete in 2 calls instead of 3).
         if dev.type == "cuda":
             _vram_gb = float(torch.cuda.get_device_properties(dev).total_memory) / 1.0e9
-            bgc_batch = 4 if (_vram_gb >= 20.0 or nc * nzo <= 3_500_000) else 2
+            bgc_batch = 5 if (_vram_gb >= 20.0 or nc * nzo <= 3_500_000) else 2
         elif dev.type == "mps":
             _mps_gb = float(torch.mps.recommended_max_working_set_size()) / 1.0e9 if hasattr(torch.mps, "recommended_max_working_set_size") else 0.0
-            bgc_batch = 4 if (_mps_gb >= 20.0 or nc * nzo <= 3_500_000) else 2
+            bgc_batch = 5 if (_mps_gb >= 20.0 or nc * nzo <= 3_500_000) else 2
         else:
-            bgc_batch = 4 if (nc * nzo <= 3_500_000) else 2
+            bgc_batch = 5 if (nc * nzo <= 3_500_000) else 2
         znl_k = f"bgc_zero_nl_{bgc_batch}"
         zero_nl_b = cache.get(znl_k)
         if zero_nl_b is None or zero_nl_b.shape != (bgc_batch, nzo - 1, nc):

@@ -2943,6 +2943,7 @@ kernel void ogcm_bt_eta_cell(
 
 // =========================================================================
 // 21b. OGCM 3D Batched Zalesak FCT + z* + Full Redi + Kahan Kernels
+//      (Zero-Advective-Edge-Buffer: eliminates [B, nzo, ne] fl_h & ah_e)
 // =========================================================================
 
 kernel void ogcm_fct_edge(
@@ -2952,18 +2953,15 @@ kernel void ogcm_fct_edge(
     device const float* w_vor_edge  [[buffer(3)]],   // [ne]
     device const float* dz_c_int    [[buffer(4)]],   // [nzo-1, nc]
     device const float* qp          [[buffer(5)]],   // [B, nzo, nc]
-    device const float* h_u_edge    [[buffer(6)]],   // [nzo, ne]
-    device const float* h_e         [[buffer(7)]],   // [nzo, ne]
-    device const float* wet_ef      [[buffer(8)]],   // [nzo, ne]
-    device const float* wet_int_cf  [[buffer(9)]],   // [nzo-1, nc]
-    device const float* wet_int_ef  [[buffer(10)]],  // [nzo-1, ne]
-    device const float* sx_int      [[buffer(11)]],  // [nzo-1, ne]
-    device float* fl_h_out          [[buffer(12)]],  // [B, nzo, ne]
-    device float* ah_e_out          [[buffer(13)]],  // [B, nzo, ne]
-    device float* f_dif_out         [[buffer(14)]],  // [B, nzo, ne]
-    device float* s_dqdx_ew_out     [[buffer(15)]],  // [B, nzo-1, ne]
-    constant ulong4& u_dim          [[buffer(16)]],  // [B, nzo, nc, ne]
-    constant float4& f_p            [[buffer(17)]],  // [kappa_redi, enable_redi, 0, 0]
+    device const float* h_e         [[buffer(6)]],   // [nzo, ne]
+    device const float* wet_ef      [[buffer(7)]],   // [nzo, ne]
+    device const float* wet_int_cf  [[buffer(8)]],   // [nzo-1, nc]
+    device const float* wet_int_ef  [[buffer(9)]],   // [nzo-1, ne]
+    device const float* sx_int      [[buffer(10)]],  // [nzo-1, ne]
+    device float* f_dif_out         [[buffer(11)]],  // [B, nzo, ne]
+    device float* s_dqdx_ew_out     [[buffer(12)]],  // [B, nzo-1, ne]
+    constant ulong4& u_dim          [[buffer(13)]],  // [B, nzo, nc, ne]
+    constant float4& f_p            [[buffer(14)]],  // [kappa_redi, enable_redi, 0, 0]
     uint gid [[thread_position_in_grid]])
 {
     uint B = uint(u_dim.x);
@@ -2983,8 +2981,6 @@ kernel void ogcm_fct_edge(
     if (we < 0.5f) {
         for (uint b = 0u; b < B; ++b) {
             uint eidx = b * slice_e + loc;
-            fl_h_out[eidx] = 0.0f;
-            ah_e_out[eidx] = 0.0f;
             f_dif_out[eidx] = 0.0f;
             if (full_redi && k + 1u < nzo) {
                 s_dqdx_ew_out[b * slice_se + k * ne + e] = 0.0f;
@@ -2993,13 +2989,9 @@ kernel void ogcm_fct_edge(
         return;
     }
 
-    // Hoist all tracer-invariant geometry, flow, and Redi slope loads ONCE across all B tracers
+    // Hoist all tracer-invariant geometry and Redi slope loads ONCE across all B tracers
     uint c0 = uint(c0_arr[e]);
     uint c1 = uint(c1_arr[e]);
-    float hu = h_u_edge[loc];
-    float hu_pos = max(hu, 0.0f) * we;
-    float hu_neg = min(hu, 0.0f) * we;
-    float hu_half = 0.5f * hu * we;
     float inv_dc_we = inv_dc[e] * we;
     float neg_k_he = -f_p.x * h_e[loc] * we;
     uint vol_c = nzo * nc;
@@ -3034,11 +3026,7 @@ kernel void ogcm_fct_edge(
         uint q_b = b * vol_c;
         float q0 = qp[q_b + kc0];
         float q1 = qp[q_b + kc1];
-        float fl = hu_pos * q0 + hu_neg * q1;
-        float fh = hu_half * (q0 + q1);
         uint eidx = b * slice_e + loc;
-        fl_h_out[eidx] = fl;
-        ah_e_out[eidx] = (fh - fl) * we;
 
         float dq_dx = (q1 - q0) * inv_dc_we;
         if (full_redi) {
@@ -3067,20 +3055,23 @@ kernel void ogcm_fct_edge(
 }
 
 kernel void ogcm_fct_cell_td(
-    device const int* eoc           [[buffer(0)]],   // [nc, 6]
-    device const float* div_w       [[buffer(1)]],   // [nc, 6]
-    device const float* qp          [[buffer(2)]],   // [B, nzo, nc]
-    device const float* h_old_z     [[buffer(3)]],   // [nzo, nc]
-    device const float* h_new_z     [[buffer(4)]],   // [nzo, nc]
-    device const float* fl_h        [[buffer(5)]],   // [B, nzo, ne]
-    device const float* w_star      [[buffer(6)]],   // [nzo+1, nc]
-    device const float* wet_cf      [[buffer(7)]],   // [nzo, nc]
-    device const float* wet_int_cf  [[buffer(8)]],   // [nzo-1, nc]
-    device float* qp_td_out         [[buffer(9)]],   // [B, nzo, nc]
-    device float* fl_v_out          [[buffer(10)]],  // [B, nzo-1, nc]
-    device float* av_int_out        [[buffer(11)]],  // [B, nzo-1, nc]
-    constant ulong4& u_dim          [[buffer(12)]],  // [B, nzo, nc, ne]
-    constant float& dt              [[buffer(13)]],
+    device const int* c0_arr        [[buffer(0)]],   // [ne]
+    device const int* c1_arr        [[buffer(1)]],   // [ne]
+    device const int* eoc           [[buffer(2)]],   // [nc, 6]
+    device const float* div_w       [[buffer(3)]],   // [nc, 6]
+    device const float* qp          [[buffer(4)]],   // [B, nzo, nc]
+    device const float* h_old_z     [[buffer(5)]],   // [nzo, nc]
+    device const float* h_new_z     [[buffer(6)]],   // [nzo, nc]
+    device const float* h_u_edge    [[buffer(7)]],   // [nzo, ne]
+    device const float* w_star      [[buffer(8)]],   // [nzo+1, nc]
+    device const float* wet_cf      [[buffer(9)]],   // [nzo, nc]
+    device const float* wet_ef      [[buffer(10)]],  // [nzo, ne]
+    device const float* wet_int_cf  [[buffer(11)]],  // [nzo-1, nc]
+    device float* qp_td_out         [[buffer(12)]],  // [B, nzo, nc]
+    device float* fl_v_out          [[buffer(13)]],  // [B, nzo-1, nc]
+    device float* av_int_out        [[buffer(14)]],  // [B, nzo-1, nc]
+    constant ulong4& u_dim          [[buffer(15)]],  // [B, nzo, nc, ne]
+    constant float& dt              [[buffer(16)]],
     uint gid [[thread_position_in_grid]])
 {
     uint B = uint(u_dim.x);
@@ -3108,11 +3099,21 @@ kernel void ogcm_fct_cell_td(
     }
 
     uint c6 = c * 6u;
-    uint eid[6];
-    float dw[6];
+    uint ke_base = k * ne;
+    uint nb[6];
+    float u_out[6];
     for (uint d = 0u; d < 6u; ++d) {
-        eid[d] = uint(eoc[c6 + d]);
-        dw[d] = div_w[c6 + d];
+        uint e_d = uint(eoc[c6 + d]);
+        float dw_d = div_w[c6 + d];
+        if (dw_d != 0.0f && wet_ef[ke_base + e_d] > 0.5f) {
+            uint c0i = uint(c0_arr[e_d]);
+            uint c1i = uint(c1_arr[e_d]);
+            nb[d] = (c0i == c) ? c1i : c0i;
+            u_out[d] = dw_d * h_u_edge[ke_base + e_d];
+        } else {
+            nb[d] = c;
+            u_out[d] = 0.0f;
+        }
     }
     float w_b = (k + 1u < nzo) ? w_star[(k + 1u) * nc + c] : 0.0f;
     float wic_b = (k + 1u < nzo) ? wet_int_cf[loc] : 0.0f;
@@ -3120,19 +3121,21 @@ kernel void ogcm_fct_cell_td(
     float wic_a = (k > 0u) ? wet_int_cf[loc - nc] : 0.0f;
     float h_old_s = max(h_old_z[loc], 1.0f);
     float inv_h_new_wc = wc / max(h_new_z[loc], 1.0f);
-    uint slice_e = nzo * ne;
-    uint ke_base = k * ne;
 
     for (uint b = 0u; b < B; ++b) {
-        uint ebase = b * slice_e + ke_base;
+        uint qidx = b * vol + loc;
+        uint qbase = b * vol + k * nc;
+        float q0 = qp[qidx];
+
         float div_fl_h = 0.0f;
         for (uint d = 0u; d < 6u; ++d) {
-            div_fl_h = fma(dw[d], fl_h[ebase + eid[d]], div_fl_h);
+            float uo = u_out[d];
+            if (uo != 0.0f) {
+                div_fl_h += (uo >= 0.0f) ? (uo * q0) : (uo * qp[qbase + nb[d]]);
+            }
         }
         div_fl_h *= wc;
 
-        uint qidx = b * vol + loc;
-        float q0 = qp[qidx];
         float fl_below = 0.0f;
         float fl_above = 0.0f;
         if (k + 1u < nzo) {
@@ -3159,7 +3162,7 @@ kernel void ogcm_fct_bounds_ratios(
     device const float* qp          [[buffer(4)]],   // [B, nzo, nc]
     device const float* qp_td       [[buffer(5)]],   // [B, nzo, nc]
     device const float* h_new_z     [[buffer(6)]],   // [nzo, nc]
-    device const float* ah_e        [[buffer(7)]],   // [B, nzo, ne]
+    device const float* h_u_edge    [[buffer(7)]],   // [nzo, ne]
     device const float* av_int      [[buffer(8)]],   // [B, nzo-1, nc]
     device const float* wet_cf      [[buffer(9)]],   // [nzo, nc]
     device const float* wet_ef      [[buffer(10)]],  // [nzo, ne]
@@ -3190,22 +3193,22 @@ kernel void ogcm_fct_bounds_ratios(
     }
 
     uint c6 = c * 6u;
-    uint eid[6];
     uint nb[6];
-    float dw[6];
+    float h_coef[6];
     uint wet_nb_mask = 0u;
     uint ke_base = k * ne;
     for (uint d = 0u; d < 6u; ++d) {
         uint e_d = uint(eoc[c6 + d]);
-        eid[d] = e_d;
-        dw[d] = div_w[c6 + d];
-        if (wet_ef[ke_base + e_d] > 0.5f) {
+        float dw_d = div_w[c6 + d];
+        if (dw_d != 0.0f && wet_ef[ke_base + e_d] > 0.5f) {
             uint c0i = uint(c0_arr[e_d]);
             uint c1i = uint(c1_arr[e_d]);
             nb[d] = (c0i == c) ? c1i : c0i;
+            h_coef[d] = 0.5f * fabs(dw_d) * fabs(h_u_edge[ke_base + e_d]);
             wet_nb_mask |= (1u << d);
         } else {
             nb[d] = c;
+            h_coef[d] = 0.0f;
         }
     }
     bool w_dn = (k + 1u < nzo) && (wet_int_cf[loc] > 0.5f);
@@ -3213,13 +3216,11 @@ kernel void ogcm_fct_bounds_ratios(
     float h_new_s = max(h_new_z[loc], 1.0f);
     float dt_wc = dt * wc;
     float eps = 1.0e-12f;
-    uint slice_e = nzo * ne;
     uint slice_vi = (nzo - 1u) * nc;
 
     for (uint b = 0u; b < B; ++b) {
         uint qidx = b * vol + loc;
         uint qbase = b * vol + k * nc;
-        uint ebase = b * slice_e + ke_base;
         float q0 = qp[qidx];
         float qtd0 = qp_td[qidx];
         float q_max = max(q0, qtd0);
@@ -3229,14 +3230,15 @@ kernel void ogcm_fct_bounds_ratios(
         float p_minus_h = 0.0f;
         for (uint d = 0u; d < 6u; ++d) {
             if ((wet_nb_mask & (1u << d)) != 0u) {
-                float qn = qp[qbase + nb[d]];
-                float qtn = qp_td[qbase + nb[d]];
+                uint nidx = qbase + nb[d];
+                float qn = qp[nidx];
+                float qtn = qp_td[nidx];
                 q_max = max(q_max, max(qn, qtn));
                 q_min = min(q_min, min(qn, qtn));
+                float a_in = h_coef[d] * (q0 - qn);
+                p_plus_h  += max(a_in, 0.0f);
+                p_minus_h += max(-a_in, 0.0f);
             }
-            float a_in = -(dw[d] * ah_e[ebase + eid[d]]);
-            p_plus_h  += max(a_in, 0.0f);
-            p_minus_h += max(-a_in, 0.0f);
         }
 
         float p_plus_v = 0.0f;
@@ -3287,21 +3289,20 @@ kernel void ogcm_fct_limit_kahan(
     device const float* f_nl_q      [[buffer(8)]],   // [B, nzo-1, nc]
     device const float* h_old_z     [[buffer(9)]],   // [nzo, nc]
     device const float* h_new_z     [[buffer(10)]],  // [nzo, nc]
-    device const float* fl_h        [[buffer(11)]],  // [B, nzo, ne]
-    device const float* ah_e        [[buffer(12)]],  // [B, nzo, ne]
-    device const float* f_dif       [[buffer(13)]],  // [B, nzo, ne]
-    device const float* s_dqdx_ew   [[buffer(14)]],  // [B, nzo-1, ne]
-    device const float* fl_v        [[buffer(15)]],  // [B, nzo-1, nc]
-    device const float* av_int      [[buffer(16)]],  // [B, nzo-1, nc]
-    device const float* r_plus      [[buffer(17)]],  // [B, nzo, nc]
-    device const float* r_minus     [[buffer(18)]],  // [B, nzo, nc]
-    device const float* wet_cf      [[buffer(19)]],  // [nzo, nc]
-    device const float* wet_ef      [[buffer(20)]],  // [nzo, ne]
-    device const float* wet_int_cf  [[buffer(21)]],  // [nzo-1, nc]
-    device float* q_out             [[buffer(22)]],  // [B, nzo, nc]
-    device float* q_comp_out        [[buffer(23)]],  // [B, nzo, nc]
-    constant ulong4& u_dim          [[buffer(24)]],  // [B, nzo, nc, ne]
-    constant float4& f_p            [[buffer(25)]],  // [dt, kappa_redi, enable_redi, 0]
+    device const float* h_u_edge    [[buffer(11)]],  // [nzo, ne]
+    device const float* f_dif       [[buffer(12)]],  // [B, nzo, ne]
+    device const float* s_dqdx_ew   [[buffer(13)]],  // [B, nzo-1, ne]
+    device const float* fl_v        [[buffer(14)]],  // [B, nzo-1, nc]
+    device const float* av_int      [[buffer(15)]],  // [B, nzo-1, nc]
+    device const float* r_plus      [[buffer(16)]],  // [B, nzo, nc]
+    device const float* r_minus     [[buffer(17)]],  // [B, nzo, nc]
+    device const float* wet_cf      [[buffer(18)]],  // [nzo, nc]
+    device const float* wet_ef      [[buffer(19)]],  // [nzo, ne]
+    device const float* wet_int_cf  [[buffer(20)]],  // [nzo-1, nc]
+    device float* q_out             [[buffer(21)]],  // [B, nzo, nc]
+    device float* q_comp_out        [[buffer(22)]],  // [B, nzo, nc]
+    constant ulong4& u_dim          [[buffer(23)]],  // [B, nzo, nc, ne]
+    constant float4& f_p            [[buffer(24)]],  // [dt, kappa_redi, enable_redi, 0]
     uint gid [[thread_position_in_grid]])
 {
     uint B = uint(u_dim.x);
@@ -3330,24 +3331,30 @@ kernel void ogcm_fct_limit_kahan(
     uint c6 = c * 6u;
     uint ke_base = k * ne;
     uint eid[6];
-    uint c0_r[6];
-    uint c1_r[6];
+    uint nb[6];
     float dw[6];
     float aw[6];
-    float we_r[6];
+    float u_out[6];
+    float h_coef[6];
+    uint wet_e_mask = 0u;
     for (uint d = 0u; d < 6u; ++d) {
         uint e_d = uint(eoc[c6 + d]);
         eid[d] = e_d;
-        dw[d] = div_w[c6 + d];
+        float dw_d = div_w[c6 + d];
+        dw[d] = dw_d;
         aw[d] = active_w[c6 + d];
-        if (dw[d] != 0.0f) {
-            c0_r[d] = uint(c0_arr[e_d]);
-            c1_r[d] = uint(c1_arr[e_d]);
-            we_r[d] = wet_ef[ke_base + e_d];
+        if (dw_d != 0.0f && wet_ef[ke_base + e_d] > 0.5f) {
+            uint c0i = uint(c0_arr[e_d]);
+            uint c1i = uint(c1_arr[e_d]);
+            nb[d] = (c0i == c) ? c1i : c0i;
+            float hu = h_u_edge[ke_base + e_d];
+            u_out[d] = dw_d * hu;
+            h_coef[d] = 0.5f * fabs(dw_d) * fabs(hu);
+            wet_e_mask |= (1u << d);
         } else {
-            c0_r[d] = 0u;
-            c1_r[d] = 0u;
-            we_r[d] = 0.0f;
+            nb[d] = c;
+            u_out[d] = 0.0f;
+            h_coef[d] = 0.0f;
         }
     }
 
@@ -3370,25 +3377,24 @@ kernel void ogcm_fct_limit_kahan(
         uint qidx = b * vol + loc;
         uint qbase = b * vol + k * nc;
         uint ebase = b * slice_e + ke_base;
+        float rp0 = r_plus[qidx];
+        float rm0 = r_minus[qidx];
+        float qp0 = qp[qidx];
 
         float div_h = 0.0f;
         for (uint d = 0u; d < 6u; ++d) {
-            float w = dw[d];
-            if (w != 0.0f) {
-                uint eidx = ebase + eid[d];
-                float a_e = ah_e[eidx];
-                float c_lim = ((a_e >= 0.0f)
-                    ? min(r_minus[qbase + c0_r[d]], r_plus[qbase + c1_r[d]])
-                    : min(r_plus[qbase + c0_r[d]], r_minus[qbase + c1_r[d]])) * we_r[d];
-                float f_tot = fl_h[eidx] + c_lim * a_e + f_dif[eidx];
-                div_h = fma(w, f_tot, div_h);
+            if ((wet_e_mask & (1u << d)) != 0u) {
+                uint nidx = qbase + nb[d];
+                float qn = qp[nidx];
+                float uo = u_out[d];
+                float df_l = (uo >= 0.0f) ? (uo * qp0) : (uo * qn);
+                float oe = h_coef[d] * (qn - qp0);
+                float c_lim = (oe >= 0.0f) ? min(rm0, r_plus[nidx]) : min(rp0, r_minus[nidx]);
+                div_h += df_l + c_lim * oe + dw[d] * f_dif[ebase + eid[d]];
             }
         }
         div_h *= wc;
 
-        float rp0 = r_plus[qidx];
-        float rm0 = r_minus[qidx];
-        float qp0 = qp[qidx];
         uint vi_base = b * slice_vi;
         uint se_base = b * slice_se;
 
@@ -9231,8 +9237,6 @@ def run_ogcm_fct_zstar_metal(
         if len(_OGCM_FCT_WS_CACHE) >= 4:
             _OGCM_FCT_WS_CACHE.pop(next(iter(_OGCM_FCT_WS_CACHE)))
         ws = (
-            torch.empty((B, nzo, ne), device=dev, dtype=dtype),       # fl_h
-            torch.empty((B, nzo, ne), device=dev, dtype=dtype),       # ah_e
             torch.empty((B, nzo, ne), device=dev, dtype=dtype),       # f_dif
             torch.empty((B, max(nzo - 1, 1), ne), device=dev, dtype=dtype),  # s_dqdx_ew
             torch.empty((B, nzo, nc), device=dev, dtype=dtype),       # qp_td
@@ -9243,7 +9247,7 @@ def run_ogcm_fct_zstar_metal(
             torch.empty((B, nzo, nc), device=dev, dtype=dtype),       # qp
         )
         _OGCM_FCT_WS_CACHE[key] = ws
-    fl_h, ah_e, f_dif, s_dqdx_ew, qp_td, fl_v, av_int, r_plus, r_minus, qp = ws
+    f_dif, s_dqdx_ew, qp_td, fl_v, av_int, r_plus, r_minus, qp = ws
 
     torch.sub(q, q_ref, out=qp)
     qp.mul_(wet_cf.unsqueeze(0))
@@ -9272,19 +9276,19 @@ def run_ogcm_fct_zstar_metal(
     n_cell_1 = nzo * nc
 
     lib.ogcm_fct_edge(
-        c0_i32, c1_i32, idc_c, wve_c, dz_c, qp, hu_c, he_c, wef_c, wic_c, wie_c, sx_c,
-        fl_h, ah_e, f_dif, s_dqdx_ew,
+        c0_i32, c1_i32, idc_c, wve_c, dz_c, qp, he_c, wef_c, wic_c, wie_c, sx_c,
+        f_dif, s_dqdx_ew,
         u_dim, [float(kappa_redi), redi_f, 0.0, 0.0],
         threads=n_edge_1,
     )
     lib.ogcm_fct_cell_td(
-        eoc_i32, dw_c, qp, ho_c, hn_c, fl_h, ws_c, wcf_c, wic_c,
+        c0_i32, c1_i32, eoc_i32, dw_c, qp, ho_c, hn_c, hu_c, ws_c, wcf_c, wef_c, wic_c,
         qp_td, fl_v, av_int,
         u_dim, float(dt),
         threads=n_cell_1,
     )
     lib.ogcm_fct_bounds_ratios(
-        c0_i32, c1_i32, eoc_i32, dw_c, qp, qp_td, hn_c, ah_e, av_int, wcf_c, wef_c, wic_c,
+        c0_i32, c1_i32, eoc_i32, dw_c, qp, qp_td, hn_c, hu_c, av_int, wcf_c, wef_c, wic_c,
         r_plus, r_minus,
         u_dim, float(dt),
         threads=n_cell_1,
@@ -9293,7 +9297,7 @@ def run_ogcm_fct_zstar_metal(
     q_comp_out = qc_c if in_place else torch.empty_like(qc_c)
     lib.ogcm_fct_limit_kahan(
         c0_i32, c1_i32, eoc_i32, dw_c, aw_c,
-        q_c, qc_c, qp, fnl_c, ho_c, hn_c, fl_h, ah_e, f_dif, s_dqdx_ew,
+        q_c, qc_c, qp, fnl_c, ho_c, hn_c, hu_c, f_dif, s_dqdx_ew,
         fl_v, av_int, r_plus, r_minus, wcf_c, wef_c, wic_c,
         q_out, q_comp_out,
         u_dim, [float(dt), float(kappa_redi), redi_f, 0.0],
